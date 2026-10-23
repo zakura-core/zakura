@@ -754,3 +754,698 @@ fn rng_ranges_and_shuffles_spread_when_draws_are_zero() {
     assert_eq!(digits.len(), 10);
     assert!(shuffles > 900, "{shuffles} distinct shuffles");
 }
+
+/// A preemption point with no shared state behind it.
+#[track_caller]
+fn point() {
+    zakura_scheduler::hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Yield));
+}
+
+/// `n` seconds.
+fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// How many times the run advanced time.
+fn advances(result: &RunResult) -> usize {
+    result.picks.iter().filter(|p| *p == "advance-time").count()
+}
+
+#[test]
+fn futures_unordered_polls_only_the_woken_child() {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::{future::Future, pin::Pin};
+    for seed in 0..50 {
+        let (_, violation) = run_fixture(2, seed, |s| {
+            let polls = shared(RefCell::new([0u32; 3]));
+            let order = shared(RefCell::new(Vec::new()));
+            let (p, o) = (polls.clone(), order.clone());
+            let (tx, rx) = zakura_rt::sync::oneshot::channel::<()>();
+            s.spawn_root("sender", async move {
+                time::sleep(secs(15)).await;
+                let _ = tx.send(());
+            });
+            s.spawn_root("parent", async move {
+                // Two timers and a channel, each polled only when its own
+                // waker fires.
+                let children: [Pin<Box<dyn Future<Output = ()>>>; 3] = [
+                    Box::pin(time::sleep(secs(10))),
+                    Box::pin(time::sleep(secs(20))),
+                    Box::pin(async move {
+                        let _ = rx.await;
+                    }),
+                ];
+                let set = FuturesUnordered::new();
+                for (i, mut child) in children.into_iter().enumerate() {
+                    let p = p.clone();
+                    set.push(std::future::poll_fn(move |cx| {
+                        p.borrow_mut()[i] += 1;
+                        child.as_mut().poll(cx).map(|()| i)
+                    }));
+                }
+                let mut set = std::pin::pin!(set);
+                while let Some(i) = set.next().await {
+                    o.borrow_mut().push(i);
+                }
+            });
+            Box::new(move |r| {
+                let got = (*polls.borrow(), order.borrow().clone());
+                (got != ([2, 2, 2], vec![0, 2, 1]) || r.status != Status::Quiescent)
+                    .then(|| format!("{got:?}, {:?}", r.status))
+            })
+        });
+        assert_eq!(violation, None, "seed {seed}");
+    }
+}
+
+#[test]
+fn select_branch_wakes_from_its_own_timer_or_channel() {
+    // The channel fires first at 5 s, or the 10 s timer beats it.
+    for (send_at, want, want_advances) in [(5, "recv", 1), (15, "sleep", 2)] {
+        for seed in 0..20 {
+            let (result, violation) = run_fixture(2, seed, |s| {
+                let (tx, mut rx) = zakura_rt::sync::mpsc::channel::<u32>(1);
+                s.spawn_root("sender", async move {
+                    time::sleep(secs(send_at)).await;
+                    let _ = tx.send(1).await;
+                });
+                let seen = shared(Cell::new(None));
+                let out = seen.clone();
+                s.spawn_root("root", async move {
+                    let start = Instant::now();
+                    let got = zakura_rt::select! {
+                        () = time::sleep(secs(10)) => "sleep",
+                        _ = rx.recv() => "recv",
+                    };
+                    out.set(Some((got, start.elapsed())));
+                });
+                Box::new(move |r| {
+                    let want = Some((want, secs(send_at.min(10))));
+                    (seen.get() != want || r.report.timers_left != 0)
+                        .then(|| format!("{:?}, {} timers", seen.get(), r.report.timers_left))
+                })
+            });
+            assert_eq!(violation, None, "send at {send_at}, seed {seed}");
+            // The losing sleep dropped its timer, so time never visits it.
+            assert_eq!(advances(&result), want_advances, "send at {send_at}");
+        }
+    }
+}
+
+#[test]
+fn watch_lock_blocks_task_switches_until_it_drops() {
+    use zakura_scheduler::{Op, RunOutcome};
+    for seed in 0..200 {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let (tx, rx) = zakura_rt::sync::watch::channel(0u64);
+        let holding = shared(Cell::new(false));
+        let counter = Arc::new(RtAtomicU64::new(0));
+        let (h, c) = (holding.clone(), counter.clone());
+        // Keeps the channel open after the reader ends.
+        let keep = rx.clone();
+        let reader = s.spawn_root("reader", async move {
+            let value = rx.borrow();
+            h.set(true);
+            // Both points are skipped: switching to the writer here would
+            // block the run's thread on tokio's lock.
+            c.store(*value, RtOrdering::SeqCst);
+            c.fetch_add(1, RtOrdering::SeqCst);
+            h.set(false);
+            drop(value);
+            c.load(RtOrdering::SeqCst);
+        });
+        let (h, c) = (holding.clone(), counter.clone());
+        s.spawn_root("writer", async move {
+            let _keep = keep;
+            tx.send(1).unwrap();
+            tx.send_modify(|v| {
+                h.set(true);
+                c.store(*v, RtOrdering::SeqCst);
+                h.set(false);
+                *v += 1;
+            });
+            c.load(RtOrdering::SeqCst);
+        });
+        let mut walk = Walk(seed);
+        let mut reader_load_point = false;
+        while s.status() == Status::Running {
+            let ready = s.ready();
+            let task = ready[walk.pick(ready.len())].task;
+            let outcome = s.run(task);
+            assert!(!holding.get(), "seed {seed}: switched under a watch lock");
+            if let RunOutcome::Reached(at) = outcome {
+                assert!(
+                    !matches!(at.op, Op::AtomicStore | Op::AtomicRmw),
+                    "seed {seed}: a point under the lock suspended"
+                );
+                reader_load_point |= task == reader.task() && at.op == Op::AtomicLoad;
+            }
+        }
+        assert_eq!(s.status(), Status::Quiescent, "seed {seed}");
+        assert!(
+            reader_load_point,
+            "seed {seed}: points resume after release"
+        );
+        assert_eq!(sim::suppressed_points(), 3, "seed {seed}");
+        s.shutdown();
+    }
+}
+
+/// A waker that counts its wakes.
+struct CountWakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountWakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A counting waker and its count.
+fn counting_waker() -> (std::task::Waker, Arc<CountWakes>) {
+    let count = Arc::new(CountWakes(std::sync::atomic::AtomicUsize::new(0)));
+    (std::task::Waker::from(count.clone()), count)
+}
+
+#[test]
+fn repolled_sleep_keeps_only_the_latest_waker() {
+    use std::{future::Future, task::Context};
+    let (w1, c1) = counting_waker();
+    let (w2, c2) = counting_waker();
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let root = s.spawn_root("root", async move {
+        // A cancelled registration: polled once, then dropped.
+        {
+            let mut early = std::pin::pin!(time::sleep(secs(5)));
+            assert!(early
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending());
+        }
+        // A re-polled one: the second poll's waker replaces the first's.
+        let mut sleep = std::pin::pin!(time::sleep(secs(10)));
+        assert!(sleep
+            .as_mut()
+            .poll(&mut Context::from_waker(&w1))
+            .is_pending());
+        assert!(sleep
+            .as_mut()
+            .poll(&mut Context::from_waker(&w2))
+            .is_pending());
+        time::sleep(secs(20)).await;
+    });
+    run_until_waiting(&mut s, root.task());
+    assert_eq!(s.next_deadline(), Some(SimInstant::from_start(secs(10))));
+    assert_eq!(
+        s.advance_to(SimInstant::from_start(secs(10))).len(),
+        1,
+        "one registration for the re-polled sleep"
+    );
+    assert_eq!(
+        (c1.0.load(Ordering::SeqCst), c2.0.load(Ordering::SeqCst)),
+        (0, 1)
+    );
+    s.advance_to(SimInstant::from_start(secs(3_600)));
+    assert_eq!(
+        c1.0.load(Ordering::SeqCst),
+        0,
+        "the cancelled one never fires"
+    );
+}
+
+#[test]
+fn task_woken_at_the_first_deadline_cancels_a_later_timer() {
+    for seed in 0..100 {
+        let (result, violation) = run_fixture(2, seed, |s| {
+            let notify = Arc::new(Notify::new());
+            let fired = shared(Cell::new(false));
+            let (n, f) = (notify.clone(), fired.clone());
+            s.spawn_root("waiter", async move {
+                zakura_rt::select! {
+                    biased;
+                    () = n.notified() => {}
+                    () = time::sleep(secs(20)) => f.set(true),
+                }
+            });
+            s.spawn_root("canceller", async move {
+                time::sleep(secs(10)).await;
+                notify.notify_one();
+            });
+            Box::new(move |r| {
+                (fired.get() || r.status != Status::Quiescent || r.report.timers_left != 0)
+                    .then(|| format!("fired {}, {:?}", fired.get(), r.status))
+            })
+        });
+        assert_eq!(violation, None, "seed {seed}");
+        assert_eq!(advances(&result), 1, "seed {seed}: only the 10 s deadline");
+    }
+}
+
+/// Every order of three items.
+const ORDERS: [[usize; 3]; 6] = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+];
+
+#[test]
+fn mutex_release_lets_every_waiter_retry_and_one_wins() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    for order in ORDERS {
+        let config = SchedulerConfig {
+            workers: 4,
+            ..SchedulerConfig::default()
+        };
+        let mut s = Scheduler::new(config, SimInstant::ZERO);
+        let lock = Arc::new(RtMutex::new(()));
+        let winners = shared(RefCell::new(Vec::new()));
+        let l = lock.clone();
+        let holder = s.spawn_root("holder", async move {
+            let guard = l.lock().unwrap();
+            point();
+            drop(guard);
+        });
+        let waiters: Vec<_> = (0..3)
+            .map(|i| {
+                let (l, w) = (lock.clone(), winners.clone());
+                s.spawn_root("waiter", async move {
+                    let guard = l.lock().unwrap();
+                    w.borrow_mut().push(i);
+                    point();
+                    drop(guard);
+                })
+            })
+            .collect();
+        assert!(matches!(s.run(holder.task()), Reached(_))); // at lock
+        assert!(matches!(s.run(holder.task()), Reached(_))); // holding it
+        for w in &waiters {
+            assert!(matches!(s.run(w.task()), Reached(_)));
+            assert!(matches!(s.run(w.task()), Parked(_)));
+        }
+        assert!(matches!(s.run(holder.task()), Reached(_))); // released
+        let ready = s.ready();
+        for w in &waiters {
+            assert!(
+                ready.iter().any(|t| t.task == w.task() && t.mid_poll),
+                "every waiter retries"
+            );
+        }
+        let [first, second, third] = order.map(|i| waiters[i].task());
+        assert!(matches!(s.run(first), Reached(_)), "{order:?}");
+        assert!(matches!(s.run(second), Parked(_)), "{order:?}");
+        assert!(matches!(s.run(third), Parked(_)), "{order:?}");
+        assert_eq!(*winners.borrow(), [order[0]]);
+        let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+        assert_eq!(status, Status::Quiescent);
+        assert_eq!(winners.borrow().len(), 3);
+    }
+}
+
+#[test]
+fn semaphore_grants_permits_in_fifo_order_and_skips_cancelled_waiters() {
+    for cancel_b in [false, true] {
+        for seed in 0..50 {
+            let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+            let sem = Arc::new(Semaphore::new(0));
+            let order = shared(RefCell::new(Vec::new()));
+            let waiters: Vec<_> = ['a', 'b', 'c']
+                .into_iter()
+                .map(|name| {
+                    let (sem, o) = (sem.clone(), order.clone());
+                    s.spawn_root("waiter", async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        o.borrow_mut().push(name);
+                        point();
+                    })
+                })
+                .collect();
+            // Queue them in name order.
+            for w in &waiters {
+                run_until_waiting(&mut s, w.task());
+            }
+            if cancel_b {
+                waiters[1].abort();
+            }
+            let release = sem.clone();
+            s.spawn_root("releaser", async move { release.add_permits(1) });
+            let status = drive(&mut s, seed, &mut Vec::new(), &mut Vec::new());
+            assert_eq!(status, Status::Quiescent, "seed {seed}");
+            let want: &[char] = if cancel_b {
+                &['a', 'c']
+            } else {
+                &['a', 'b', 'c']
+            };
+            assert_eq!(*order.borrow(), want, "seed {seed}");
+            assert_eq!(sem.available_permits(), 1, "seed {seed}: no permit lost");
+            s.shutdown();
+        }
+    }
+}
+
+#[test]
+fn bounded_channel_admits_senders_in_fifo_order_and_skips_cancelled_ones() {
+    for cancel_second in [false, true] {
+        for seed in 0..50 {
+            let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+            let (tx, mut rx) = zakura_rt::sync::mpsc::channel::<u32>(1);
+            tx.try_send(0).expect("the channel starts empty");
+            let senders: Vec<_> = (1..=3)
+                .map(|v| {
+                    let tx = tx.clone();
+                    s.spawn_root("sender", async move {
+                        let _ = tx.send(v).await;
+                    })
+                })
+                .collect();
+            drop(tx);
+            for sender in &senders {
+                run_until_waiting(&mut s, sender.task());
+            }
+            if cancel_second {
+                senders[1].abort();
+            }
+            let got = shared(RefCell::new(Vec::new()));
+            let g = got.clone();
+            s.spawn_root("receiver", async move {
+                while let Some(v) = rx.recv().await {
+                    g.borrow_mut().push(v);
+                }
+            });
+            let status = drive(&mut s, seed, &mut Vec::new(), &mut Vec::new());
+            assert_eq!(status, Status::Quiescent, "seed {seed}");
+            let want: &[u32] = if cancel_second {
+                &[0, 1, 3]
+            } else {
+                &[0, 1, 2, 3]
+            };
+            assert_eq!(*got.borrow(), want, "seed {seed}");
+            s.shutdown();
+        }
+    }
+}
+
+/// Sets its flag when dropped.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn timeout_cancels_its_timer_or_drops_its_future() {
+    for seed in 0..50 {
+        // The value arrives at 5 s, inside the 10 s timeout. Its timer must go,
+        // or time would visit 10 s on the way to 25 s.
+        let (result, violation) = run_fixture(2, seed, |s| {
+            let (tx, rx) = zakura_rt::sync::oneshot::channel::<u32>();
+            s.spawn_root("sender", async move {
+                time::sleep(secs(5)).await;
+                let _ = tx.send(5);
+            });
+            let seen = shared(Cell::new(None));
+            let out = seen.clone();
+            s.spawn_root("root", async move {
+                let start = Instant::now();
+                let value = time::timeout(secs(10), rx).await.ok().and_then(Result::ok);
+                time::sleep(secs(20)).await;
+                out.set(Some((value, start.elapsed())));
+            });
+            Box::new(move |_| {
+                (seen.get() != Some((Some(5), secs(25)))).then(|| format!("{:?}", seen.get()))
+            })
+        });
+        assert_eq!(violation, None, "seed {seed}");
+        assert_eq!(advances(&result), 2, "seed {seed}: 5 s and 25 s only");
+
+        // The inner future never finishes, so the timeout drops it at 10 s.
+        let (_, violation) = run_fixture(2, seed, |s| {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let seen = shared(Cell::new(None));
+            let (d, out) = (dropped.clone(), seen.clone());
+            s.spawn_root("root", async move {
+                let start = Instant::now();
+                let guard = DropFlag(d.clone());
+                let inner = async move {
+                    let _guard = guard;
+                    pending::<()>().await
+                };
+                let elapsed = time::timeout(secs(10), inner).await.is_err();
+                out.set(Some((elapsed, d.load(Ordering::SeqCst), start.elapsed())));
+            });
+            Box::new(move |_| {
+                (seen.get() != Some((true, true, secs(10)))).then(|| format!("{:?}", seen.get()))
+            })
+        });
+        assert_eq!(violation, None, "seed {seed}");
+    }
+}
+
+#[test]
+fn biased_select_keeps_source_order_whatever_the_draws() {
+    let mut unbiased_firsts = std::collections::BTreeSet::new();
+    for draw in 0..8 {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        s.set_draws(move |_| draw);
+        let seen = shared(Cell::new(None));
+        let out = seen.clone();
+        let root = s.spawn_root("root", async move {
+            let biased = zakura_rt::select! {
+                biased;
+                v = std::future::ready(1) => v,
+                v = std::future::ready(2) => v,
+            };
+            let unbiased = zakura_rt::select! {
+                v = std::future::ready(1) => v,
+                v = std::future::ready(2) => v,
+            };
+            out.set(Some((biased, unbiased)));
+        });
+        while s.status() == Status::Running {
+            s.run(root.task());
+        }
+        let (biased, unbiased) = seen.get().expect("the task finished");
+        assert_eq!(biased, 1, "draw {draw}");
+        unbiased_firsts.insert(unbiased);
+    }
+    assert_eq!(unbiased_firsts.len(), 2, "draws move the unbiased start");
+}
+
+/// Ticks of a 10 ms interval with work of these lengths after each tick, as
+/// (when the tick was due, when it was seen), in ms from the start. Long work
+/// misses ticks. The 3 ms work stays inside tokio's 5 ms tolerance.
+const WORK_MS: [u64; 9] = [0, 25, 0, 3, 0, 12, 41, 7, 0];
+
+/// [`WORK_MS`] on the sim `interval`, run on the scheduler.
+fn sim_ticks(behavior: time::MissedTickBehavior) -> Vec<(u128, u128)> {
+    let ticks = shared(RefCell::new(Vec::new()));
+    let out = ticks.clone();
+    let (_, violation) = run_fixture(2, 0, move |s| {
+        s.spawn_root("ticker", async move {
+            let start = Instant::now();
+            let mut interval = time::interval(Duration::from_millis(10));
+            interval.set_missed_tick_behavior(behavior);
+            for work in WORK_MS {
+                let due = interval.tick().await;
+                let seen = start.elapsed().as_millis();
+                out.borrow_mut().push(((due - start).as_millis(), seen));
+                time::sleep(Duration::from_millis(work)).await;
+            }
+        });
+        Box::new(|r| (r.status != Status::Quiescent).then(|| format!("{:?}", r.status)))
+    });
+    assert_eq!(violation, None);
+    ticks.take()
+}
+
+/// [`WORK_MS`] on tokio's own `interval`, with tokio's clock paused.
+fn tokio_ticks(behavior: tokio::time::MissedTickBehavior) -> Vec<(u128, u128)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("a current-thread runtime builds");
+    runtime.block_on(async {
+        let start = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(behavior);
+        let mut ticks = Vec::new();
+        for work in WORK_MS {
+            let due = interval.tick().await;
+            ticks.push(((due - start).as_millis(), start.elapsed().as_millis()));
+            tokio::time::sleep(Duration::from_millis(work)).await;
+        }
+        ticks
+    })
+}
+
+#[test]
+fn interval_ticks_match_tokio_for_every_missed_tick_behavior() {
+    use tokio::time::MissedTickBehavior::{Burst, Delay, Skip};
+    let mut seen = Vec::new();
+    for behavior in [Burst, Delay, Skip] {
+        let sim = sim_ticks(behavior);
+        assert_eq!(sim, tokio_ticks(behavior), "{behavior:?}");
+        assert_eq!(sim[0], (0, 0), "{behavior:?}: the first tick is immediate");
+        seen.push(sim);
+    }
+    // The work misses ticks, so each behavior takes a different path.
+    assert!(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2]);
+}
+
+#[test]
+fn rt_join_returns_the_output_when_completion_races_abort() {
+    use zakura_scheduler::RunOutcome::{Completed, Reached};
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let target = task::spawn(async {
+        point();
+        5u32
+    });
+    let id = s.ready()[0].task;
+    while !matches!(s.run(id), Reached(at) if at.op == zakura_scheduler::Op::Yield) {}
+    target.abort();
+    let joined = shared(RefCell::new(None));
+    let out = joined.clone();
+    s.spawn_root("joiner", async move {
+        let joined = target.await;
+        *out.borrow_mut() = Some(joined);
+    });
+    assert_eq!(s.run(id), Completed);
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+    assert!(
+        matches!(*joined.borrow(), Some(Ok(5))),
+        "{:?}",
+        joined.borrow()
+    );
+}
+
+/// Counts drops of a task-owned resource.
+struct DropCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DropCount {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn join_set_abort_all_shutdown_and_drop_release_every_task() {
+    use std::sync::atomic::AtomicUsize;
+    for mode in ["abort_all", "shutdown", "drop"] {
+        for seed in 0..30 {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let seen = shared(Cell::new(None));
+            let (d, p, out) = (drops.clone(), polls.clone(), seen.clone());
+            let (result, violation) = run_fixture(2, seed, move |s| {
+                s.spawn_root("root", async move {
+                    let mut set = JoinSet::new();
+                    for _ in 0..3 {
+                        let (owned, p) = (DropCount(d.clone()), p.clone());
+                        set.spawn(async move {
+                            let _owned = owned;
+                            std::future::poll_fn(|_| {
+                                p.fetch_add(1, Ordering::SeqCst);
+                                std::task::Poll::<()>::Pending
+                            })
+                            .await
+                        });
+                    }
+                    task::yield_now().await;
+                    // Each count is read right after the last abort request,
+                    // with no point between.
+                    let (polls_at_abort, released) = match mode {
+                        "abort_all" => {
+                            set.abort_all();
+                            let polls_at_abort = p.load(Ordering::SeqCst);
+                            let mut cancelled = 0;
+                            while let Some(result) = set.join_next().await {
+                                cancelled += usize::from(result.unwrap_err().is_cancelled());
+                            }
+                            assert_eq!(cancelled, 3);
+                            (polls_at_abort, Some(d.load(Ordering::SeqCst)))
+                        }
+                        "shutdown" => {
+                            set.shutdown().await;
+                            (p.load(Ordering::SeqCst), Some(d.load(Ordering::SeqCst)))
+                        }
+                        _ => {
+                            drop(set);
+                            (p.load(Ordering::SeqCst), None)
+                        }
+                    };
+                    out.set(Some((polls_at_abort, released)));
+                });
+                Box::new(|_| None)
+            });
+            assert_eq!(violation, None);
+            let (polls_at_abort, released) = seen.get().expect("the root finished");
+            if mode != "drop" {
+                assert_eq!(
+                    released,
+                    Some(3),
+                    "{mode}, seed {seed}: released when joined"
+                );
+            }
+            assert_eq!(result.status, Status::Quiescent, "{mode}, seed {seed}");
+            assert_eq!(drops.load(Ordering::SeqCst), 3, "{mode}, seed {seed}");
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                polls_at_abort,
+                "{mode}, seed {seed}: no poll after the abort"
+            );
+            assert_eq!(result.report.cancelled, 0, "{mode}, seed {seed}");
+        }
+    }
+}
+
+#[test]
+fn dropping_a_plain_handle_detaches_but_abort_on_drop_aborts() {
+    for seed in 0..30 {
+        let done = [(); 3].map(|()| Arc::new(AtomicBool::new(false)));
+        let flags = done.clone();
+        let (result, violation) = run_fixture(2, seed, move |s| {
+            s.spawn_root("root", async move {
+                let [plain, aborting, detached] = flags;
+                let finish = |flag: Arc<AtomicBool>| async move {
+                    time::sleep(secs(1)).await;
+                    flag.store(true, Ordering::SeqCst);
+                };
+                drop(task::spawn(finish(plain)));
+                drop(task::AbortOnDropHandle::new(task::spawn(finish(aborting))));
+                drop(task::AbortOnDropHandle::new(task::spawn(finish(detached))).detach());
+            });
+            Box::new(|_| None)
+        });
+        assert_eq!(violation, None);
+        assert_eq!(result.status, Status::Quiescent, "seed {seed}");
+        let finished = done.map(|flag| flag.load(Ordering::SeqCst));
+        assert_eq!(finished, [true, false, true], "seed {seed}");
+    }
+}
+
+#[test]
+fn consecutive_runs_reset_rt_per_run_state() {
+    let suppressing_run = || {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let (_tx, rx) = zakura_rt::sync::watch::channel(0u64);
+        let counter = Arc::new(RtAtomicU64::new(0));
+        let root = s.spawn_root("root", async move {
+            let value = rx.borrow();
+            counter.store(*value, RtOrdering::SeqCst);
+        });
+        while s.status() == Status::Running {
+            s.run(root.task());
+        }
+        s.shutdown();
+    };
+    suppressing_run();
+    assert_eq!(sim::suppressed_points(), 1, "the last run's count");
+    let s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    assert_eq!(sim::suppressed_points(), 0, "a new run starts from zero");
+    drop(s);
+}

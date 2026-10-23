@@ -446,6 +446,12 @@ impl Scheduler {
 
     /// The task's stable identity: its spawn path, such as
     /// `reactor.1/peer.2`, built from labels and per-parent spawn ordinals.
+    ///
+    /// The ordinal counts earlier spawns with the same label from the same
+    /// parent, starting at 1. Root tasks share one count per label. So a new
+    /// task elsewhere in the tree, or one with another label, renames
+    /// nothing. Only an earlier same-label spawn from the same parent shifts
+    /// later ordinals.
     pub fn task_name(&self, task: TaskId) -> String {
         self.state(|s| s.tasks[task.index()].name.clone())
     }

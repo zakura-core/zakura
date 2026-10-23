@@ -41,7 +41,7 @@ fn state(stream: Stream) -> ServiceSessionState {
 }
 
 fn retry_later() -> SessionDemand {
-    SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60))
+    SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60))
 }
 
 // Opening and reopen rules.

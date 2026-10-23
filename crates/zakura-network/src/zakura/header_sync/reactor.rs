@@ -5,7 +5,7 @@ use std::{
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use zakura_chain::block;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -165,7 +165,11 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
-    Ok((handle, actions, spawn_erased(reactor.run())))
+    Ok((
+        handle,
+        actions,
+        spawn_erased_named("header_sync_reactor", reactor.run()),
+    ))
 }
 
 fn build_header_sync_reactor(

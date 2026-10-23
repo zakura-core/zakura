@@ -2941,13 +2941,12 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "10.0.1"
+version = "11.0.0"
 dependencies = [
  "bech32",
  "bitflags",
  "bitvec",
  "blake2b_simd",
- "blake2s_simd",
  "bounded-vec",
  "bs58",
  "byteorder",
@@ -3206,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3403,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.0"
+version = "13.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3640,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "clap",
  "eyre",

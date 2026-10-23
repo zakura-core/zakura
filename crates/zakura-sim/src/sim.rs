@@ -13,7 +13,7 @@ use zakura_scheduler::{
 
 use crate::{
     action::{enabled_set, Action, ActionSource, EnabledInputs, Offer, SourceId},
-    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
+    check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     observe::{Exit, Observation},
@@ -156,7 +156,8 @@ impl Sim {
         };
         // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
-        let end = match self.failure.take() {
+        let (properties, bad_report) = checked_reports(properties, end.steps);
+        let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
@@ -520,6 +521,37 @@ fn evidence_outside_run(end: &RunEnd) -> Option<HarnessFailure> {
             property: violation.property.clone(),
             step,
         })
+}
+
+/// `reports` with each step the run didn't take removed from their
+/// `Violated` evidence and `holds_since`, so the `end` record stays readable,
+/// and the failure for the first one removed.
+fn checked_reports(
+    mut reports: Vec<PropertyReport>,
+    steps: u64,
+) -> (Vec<PropertyReport>, Option<HarnessFailure>) {
+    let in_run = |step: &u64| (1..=steps).contains(step);
+    let mut failure = None;
+    for report in &mut reports {
+        // 0 means the assumptions held from the start.
+        if let Some(step) = report.holds_since.filter(|&step| step > steps) {
+            failure.get_or_insert_with(|| HarnessFailure::HoldsSinceOutsideRun {
+                property: report.property.clone(),
+                step,
+            });
+            report.holds_since = None;
+        }
+        if let PropertyOutcome::Violated { witness } = &mut report.outcome {
+            if let Some(&step) = witness.iter().find(|step| !in_run(step)) {
+                failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
+                    property: report.property.clone(),
+                    step,
+                });
+            }
+            witness.retain(in_run);
+        }
+    }
+    (reports, failure)
 }
 
 /// The `end` record for a run that ended with `end`, with `picks` its steps'

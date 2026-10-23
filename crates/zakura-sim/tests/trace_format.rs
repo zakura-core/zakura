@@ -251,6 +251,91 @@ fn evidence_outside_the_run_is_a_harness_failure() {
     }
 }
 
+/// A checker that reports one property at the run's end, built by
+/// `report` from the run's step count.
+fn reports_at_end(report: impl Fn(u64) -> PropertyReport + 'static) -> impl Checker {
+    check::FnChecker::new(
+        |_: &StepCtx<'_>| None,
+        move |end: &zakura_sim::RunEnd, _: &zakura_sim::ObservationLog| vec![report(end.steps)],
+    )
+}
+
+/// Records the workload under `checker`, and returns the run's report and
+/// the `end` record read back from its trace.
+fn run_and_read(checker: &mut dyn Checker) -> (RunReport, EndRecord) {
+    let dir = TempDir::new().unwrap();
+    let run = record_to(dir.path(), &meta(), plan(), checker);
+    let end = TraceReader::open(dir.path()).unwrap().end.unwrap();
+    (run, end)
+}
+
+/// A report for `test/at-end`.
+fn at_end(outcome: PropertyOutcome, holds_since: Option<u64>) -> PropertyReport {
+    PropertyReport {
+        property: "test/at-end".into(),
+        outcome,
+        holds_since,
+    }
+}
+
+#[test]
+fn reports_outside_the_run_are_a_harness_failure() {
+    // Evidence past the run ends it as a harness failure. The bad step is
+    // left out of the report, so the trace still reads.
+    let (run, end) = run_and_read(&mut reports_at_end(|_| {
+        at_end(
+            PropertyOutcome::Violated {
+                witness: vec![2, 99_999],
+            },
+            None,
+        )
+    }));
+    assert_eq!(
+        run.end.harness,
+        Some(HarnessFailure::EvidenceOutsideRun {
+            property: "test/at-end".into(),
+            step: 99_999,
+        })
+    );
+    let kept = at_end(PropertyOutcome::Violated { witness: vec![2] }, None);
+    assert_eq!(
+        (&run.properties[..], &end.properties[..]),
+        (&[kept.clone()][..], &[kept][..])
+    );
+
+    // So does a holds_since past the last step.
+    let (run, end) = run_and_read(&mut reports_at_end(|steps| {
+        at_end(PropertyOutcome::NotApplicable, Some(steps + 1))
+    }));
+    assert_eq!(
+        run.end.harness,
+        Some(HarnessFailure::HoldsSinceOutsideRun {
+            property: "test/at-end".into(),
+            step: run.end.steps + 1,
+        })
+    );
+    assert_eq!(end.outcome, OutcomeKind::Harness);
+    assert_eq!(
+        end.properties,
+        [at_end(PropertyOutcome::NotApplicable, None)]
+    );
+
+    // References to the run's own steps, including holds_since 0 and the
+    // last step, are fine.
+    for holds_since in [|_| 0, |steps| steps] {
+        let (run, end) = run_and_read(&mut reports_at_end(move |steps: u64| {
+            at_end(
+                PropertyOutcome::Violated {
+                    witness: vec![1, steps],
+                },
+                Some(holds_since(steps)),
+            )
+        }));
+        assert_ne!(run.end.outcome, Outcome::Harness, "{:?}", run.end.harness);
+        assert_eq!(end.properties, run.properties);
+    }
+}
+
 #[test]
 fn missing_blob() {
     let dir = TempDir::new().unwrap();

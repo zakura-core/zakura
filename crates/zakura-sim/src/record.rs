@@ -1,8 +1,8 @@
 //! The records a run emits, in traces.md's shapes.
 //!
 //! A run emits one `init` record, one record per step, drain included, and
-//! one `end` record, in that order, to a [`RecordSink`]. Trace files, `meta`,
-//! replay and the reader belong to M7 (traces.md, T1).
+//! one `end` record, in that order, to a [`RecordSink`]. A trace file puts a
+//! `meta` record before them (see [`crate::trace`]).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,7 @@ use crate::{
     check::{PropertyReport, Violation},
     end::{Drain, IdleStatus},
     plan::By,
+    trace::MetaRecord,
     HexU64, Observation,
 };
 
@@ -180,6 +181,9 @@ pub struct EndRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "Line", from = "Line")]
 pub enum Record {
+    /// A trace's line 1, as `{"meta":{...}}`. Boxed, since it's far larger
+    /// than the others and written once.
+    Meta(Box<MetaRecord>),
     /// Draws before the first step, as `{"init":{...}}`.
     Init(InitRecord),
     /// A step, as a bare object with a `step` field.
@@ -199,9 +203,16 @@ impl Record {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Line {
+    Meta(MetaLine),
     Init(InitLine),
     Step(StepRecord),
     End(EndLine),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetaLine {
+    meta: Box<MetaRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -219,6 +230,7 @@ struct EndLine {
 impl From<Record> for Line {
     fn from(record: Record) -> Self {
         match record {
+            Record::Meta(meta) => Line::Meta(MetaLine { meta }),
             Record::Init(init) => Line::Init(InitLine { init }),
             Record::Step(step) => Line::Step(step),
             Record::End(end) => Line::End(EndLine { end }),
@@ -229,6 +241,7 @@ impl From<Record> for Line {
 impl From<Line> for Record {
     fn from(line: Line) -> Self {
         match line {
+            Line::Meta(MetaLine { meta }) => Record::Meta(meta),
             Line::Init(InitLine { init }) => Record::Init(init),
             Line::Step(step) => Record::Step(step),
             Line::End(EndLine { end }) => Record::End(end),

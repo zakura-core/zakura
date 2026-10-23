@@ -30,8 +30,8 @@ use zakura_rt::{
 use zakura_scheduler::Status;
 use zakura_sim::{
     check::StepCtx, record::DrawRecord, record::Record, Checker, NoChecks, Observation,
-    ObservationLog, Plan, PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
-    Violation,
+    ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport,
+    Sim, Violation,
 };
 
 /// The property this file checks (properties.md, Discovery).
@@ -494,9 +494,11 @@ fn regenerate_wait_complete_input() {
     std::fs::write(path, &bytes).expect("the fixture directory exists");
 }
 
-/// Asserts `report` held the property at least once and never timed out
-/// the exchange.
+/// Asserts `report` ended cleanly, held the property at least once, and
+/// never timed out the exchange.
 fn assert_wakes(report: &RunReport) {
+    assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert_eq!(report.cleanup.leaked, 0, "shutdown leaked no task");
     assert_eq!(report.end.violation, None);
     assert!(
         matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable > 0),

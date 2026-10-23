@@ -658,6 +658,7 @@ fn fixed_seeds_exercise_every_session_rule() {
         total.reopen_backoffs += summary.reopen_backoffs;
         total.retirements += summary.retirements;
     }
+    println!("tier=Machine target=service_session decoder=1 {total:?}");
     let ServiceSessionReplaySummary {
         completed_offers,
         invalid_members,

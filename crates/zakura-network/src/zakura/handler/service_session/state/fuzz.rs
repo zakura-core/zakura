@@ -117,9 +117,8 @@ pub fn replay_service_session_bytes(data: &[u8]) -> ServiceSessionReplaySummary 
 
 /// Reads the replay's input choices from fuzz bytes, one draw per call.
 ///
-/// This reader stands in for the property-testing `Decisions` until that
-/// lands. Each method is one draw, so replacing the reader with `Decisions`
-/// changes no call site. An exhausted reader draws zero.
+/// Decoder v1 draws zero after exhaustion. Machine artifacts retain this
+/// decoder; simulator Plans use a separate format.
 #[derive(Debug)]
 struct InputReader<'a> {
     bytes: &'a [u8],

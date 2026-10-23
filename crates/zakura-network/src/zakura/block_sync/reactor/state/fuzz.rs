@@ -195,6 +195,10 @@ mod tests {
     const WITNESS: &[u8] = &[0, 9, 8, 2, 130, 10, 16, 19, 18, 4];
 
     #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "CI retains these applicability counters"
+    )]
     fn query_witness_exercises_refusal_stale_identity_and_reset() {
         println!(
             "tier=Machine target=block_query decoder=1 {:?}",

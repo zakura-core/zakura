@@ -180,6 +180,10 @@ mod tests {
     const WITNESS: &[u8] = &[10, 1, 2, 3, 6, 1, 0];
 
     #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "CI retains these applicability counters"
+    )]
     fn fill_witness_uses_the_retained_run() {
         println!(
             "tier=Machine target=block_fill decoder=1 {:?}",

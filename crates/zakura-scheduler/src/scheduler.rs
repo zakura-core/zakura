@@ -17,7 +17,7 @@ use corosensei::{stack::DefaultStack, Coroutine, CoroutineResult, Yielder};
 
 use crate::{
     At, CleanupReport, Draw, ObjectId, Op, ReadyTask, RunOutcome, SchedulerConfig, SimInstant,
-    Status, TaskExit, TaskId, TimerId,
+    StackPool, Status, TaskExit, TaskId, TimerId,
 };
 
 pub(crate) type BoxTask = Pin<Box<dyn Future<Output = ()>>>;
@@ -253,6 +253,7 @@ thread_local! {
     static NEXT_GEN: Cell<u64> = const { Cell::new(0) };
     static STACK_POOL: RefCell<Vec<DefaultStack>> = const { RefCell::new(Vec::new()) };
     static POOLED_SIZE: Cell<usize> = const { Cell::new(0) };
+    static STACKS_ALLOCATED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The most idle stacks one thread keeps. Pooled stacks keep the pages a run
@@ -293,9 +294,18 @@ fn take_stack(size: usize) -> DefaultStack {
     STACK_POOL
         .with(|p| p.borrow_mut().pop())
         .unwrap_or_else(|| {
+            STACKS_ALLOCATED.set(STACKS_ALLOCATED.get().saturating_add(1));
             DefaultStack::new(size)
                 .expect("stack allocation fails only when the process is out of address space")
         })
+}
+
+/// This thread's stack pool: idle stacks, and how many it ever allocated.
+pub fn stack_pool() -> StackPool {
+    StackPool {
+        idle: STACK_POOL.with(|p| p.borrow().len()),
+        allocated: STACKS_ALLOCATED.get(),
+    }
 }
 
 /// Returns a stack to this thread's pool.

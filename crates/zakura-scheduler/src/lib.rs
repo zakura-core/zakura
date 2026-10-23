@@ -28,7 +28,7 @@ pub mod hooks;
 mod scheduler;
 
 pub use hooks::JoinHandle;
-pub use scheduler::Scheduler;
+pub use scheduler::{stack_pool, Scheduler};
 
 /// A task's identity within one run, assigned in spawn order.
 ///
@@ -349,4 +349,18 @@ pub struct CleanupReport {
     pub unwind_failures: usize,
     /// Timers still registered at shutdown.
     pub timers_left: usize,
+}
+
+/// This thread's coroutine stacks, as [`stack_pool`] reports them.
+///
+/// Every stack the thread allocated is idle in the pool, in use by a run,
+/// or leaked by an unwind failure (see [`CleanupReport::unwind_failures`]).
+/// So between runs, `allocated - idle` counts leaked stacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StackPool {
+    /// Idle stacks kept for later runs. Kept on purpose, not leaked.
+    pub idle: usize,
+    /// Stacks this thread has allocated in all, because its pool had none
+    /// idle. Repeating a run of the same shape allocates none.
+    pub allocated: u64,
 }

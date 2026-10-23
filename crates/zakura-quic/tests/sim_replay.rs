@@ -118,6 +118,8 @@ struct Observations {
     digest: String,
     /// Each step: `task:point`, `deliver`, `drop` or `advance`, in order.
     steps: Vec<String>,
+    /// The timers each time advance fired, in order.
+    timers: Vec<String>,
     /// Each random draw's kind and bound.
     draws: Vec<String>,
     /// How the scenario ended: `echoed`, or the connect error.
@@ -387,6 +389,7 @@ fn run_with_transcript(
     };
 
     let mut steps = Vec::new();
+    let mut timers = Vec::new();
     loop {
         assert!(steps.len() < MAX_STEPS, "the run took {MAX_STEPS} steps");
         if sched.status() == Status::Running {
@@ -432,8 +435,9 @@ fn run_with_transcript(
             steps.push(format!("drop {id:?}"));
         } else {
             let target = target.expect("the last option is advancing time");
-            sched.advance_to(target);
+            let fired = sched.advance_to(target);
             steps.push(format!("advance {:?}", target.since_start()));
+            timers.push(format!("{fired:?}"));
         }
     }
     let cleanup = format!("{:?}", sched.shutdown());
@@ -447,6 +451,7 @@ fn run_with_transcript(
     let observations = Observations {
         digest: transcript_digest(&events, &recording.bytes),
         steps,
+        timers,
         draws: draws.take(),
         outcome,
         cleanup,
@@ -672,7 +677,7 @@ fn retry_tokens_expire_on_virtual_time() {
 
 /// M3.7: the real driver runs with no tokio runtime, and an unrelated run in
 /// between doesn't change a run: plan A, then B, then A again gives A's
-/// task identities, draws, timers and bytes both times.
+/// task identities, draws, fired timers and bytes both times.
 #[test]
 fn a_b_a_runs_keep_their_identities_decisions_and_bytes() {
     let a = Scenario::base();
@@ -682,6 +687,7 @@ fn a_b_a_runs_keep_their_identities_decisions_and_bytes() {
         ..Scenario::base()
     };
     let first = run(&a);
+    assert!(!first.timers.is_empty(), "the run fired timers");
     let other = run(&b);
     assert_eq!(run(&a), first);
     assert_ne!(other.steps, first.steps, "plan B takes other steps");

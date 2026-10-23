@@ -201,12 +201,12 @@ impl Sequencer {
         self.verified_block_tip
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn reorder_contains(&self, height: block::Height) -> bool {
         self.reorder.contains(height)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn applying_contains(&self, height: block::Height) -> bool {
         self.applying.contains_key(&height)
     }

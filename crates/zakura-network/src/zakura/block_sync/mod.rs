@@ -166,3 +166,9 @@ pub use peer_registry::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use peer_routine::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use sequencer_task::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
+};

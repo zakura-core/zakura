@@ -1,0 +1,24 @@
+[package]
+name = "zakura-sim"
+authors.workspace = true
+description = "Deterministic simulator for Zakura's P2P stack. Internal test crate, not published"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::testing"]
+# Only tests depend on it, and no published crate does.
+publish = false
+
+# The crate is empty outside the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
+[target.'cfg(zakura_sim)'.dependencies]
+zakura-scheduler = { path = "../zakura-scheduler" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[target.'cfg(zakura_sim)'.dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

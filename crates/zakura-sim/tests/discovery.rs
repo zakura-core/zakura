@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use support::{config, recorded};
+use support::{config, inputs, recorded};
 use zakura_chain::parameters::Network;
 use zakura_network::zakura::{
     framed_channel,
@@ -29,9 +29,8 @@ use zakura_rt::{
 };
 use zakura_scheduler::Status;
 use zakura_sim::{
-    check::StepCtx, record::DrawRecord, record::Record, Checker, NoChecks, Observation,
-    ObservationLog, Plan, PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
-    Violation,
+    check::StepCtx, record::DrawRecord, record::Record, Checker, Observation, ObservationLog, Plan,
+    PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim, Violation,
 };
 
 /// The property this file checks (properties.md, Discovery).
@@ -442,46 +441,45 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
 }
 
 /// The committed input that holds the source back, from
-/// [`hold_source_back`] on the code before the fix.
+/// [`hold_source_back`] on the code before the fix, where it violated the
+/// property with the witness load, final notify, `Notified`.
 const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
 
-#[test]
-#[ignore = "rewrites the committed input from the code before the fix"]
-fn regenerate_wait_complete_input() {
-    let bytes = hold_source_back().expect("the code before the fix misses the wakeup");
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/discovery-wait-complete.bin"
-    );
-    std::fs::write(path, &bytes).expect("the fixture directory exists");
-}
-
-#[test]
-fn committed_input_misses_the_wakeup() {
-    let (report, _, _) = run(Plan::from_fuzz(INPUT));
-    let violation = report.end.violation.expect("the committed input violates");
-    assert_eq!(violation.property, PROPERTY);
-    let [load, notify, notified] = violation.witness[..] else {
-        panic!("the witness is load, final notify, notified: {violation:?}");
-    };
+/// Asserts `report` held the property at least once and never timed out
+/// the exchange.
+fn assert_wakes(report: &RunReport) {
+    assert_eq!(report.end.violation, None);
     assert!(
-        load < notify && notify < notified,
-        "the source checked, the sink notified, then the source created its future: {violation:?}"
-    );
-
-    // Unchecked, the run shows what that costs: the source sits out its
-    // 2 s initial-exchange timeout.
-    let (report, _) = recorded(
-        run_config(),
-        Plan::from_fuzz(INPUT),
-        scenario,
-        &mut NoChecks,
+        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable > 0),
+        "the run reached the point the property checks: {:?}",
+        report.properties
     );
     assert!(
-        report
+        !report
             .picks
             .iter()
             .any(|p| p.identity == "advance-time:2000000000"),
-        "the exchange timed out"
+        "the exchange completed before its timeout"
     );
+}
+
+#[test]
+fn committed_input_wakes() {
+    let (report, _, _) = run(Plan::from_fuzz(INPUT));
+    assert_wakes(&report);
+}
+
+#[test]
+fn holding_the_source_back_finds_no_violation() {
+    let bytes = hold_source_back().expect_err("the fix wakes the source");
+    let (report, _, _) = run(Plan::from_fuzz(&bytes));
+    assert_wakes(&report);
+}
+
+#[test]
+fn seed_sweep_wakes() {
+    for plan in inputs(200, 64) {
+        let (report, _, _) = run(plan);
+        assert_wakes(&report);
+    }
 }

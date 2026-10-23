@@ -117,6 +117,40 @@ impl From<CleanupReport> for CleanupRecord {
     }
 }
 
+/// A violation as the `end` record holds it: the checker's [`Violation`],
+/// plus a match key for each evidence step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViolationRecord {
+    /// The property's ID, such as `sim/no-livelock`.
+    pub property: String,
+    /// The step the check failed at.
+    pub step: u64,
+    /// The steps the violation depends on, in order.
+    pub witness: Vec<u64>,
+    /// The recorded action match key of each `witness` step, in the same
+    /// order. Until match keys exist, each is the step's pick identity.
+    pub witness_keys: Vec<String>,
+    /// What the property expected.
+    pub expected: String,
+    /// What the run did.
+    pub actual: String,
+}
+
+impl ViolationRecord {
+    /// `violation`'s record, with `witness_keys` as its match keys.
+    pub fn new(violation: &Violation, witness_keys: Vec<String>) -> Self {
+        ViolationRecord {
+            property: violation.property.clone(),
+            step: violation.step,
+            witness: violation.witness.clone(),
+            witness_keys,
+            expected: violation.expected.clone(),
+            actual: violation.actual.clone(),
+        }
+    }
+}
+
 /// How the run ended.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,7 +164,7 @@ pub struct EndRecord {
     pub steps: u64,
     /// The violation, for `violation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub violation: Option<Violation>,
+    pub violation: Option<ViolationRecord>,
     /// The drain, for `budget`. Always present, `null` without a drain.
     pub drain: Option<Drain>,
     /// The failure, for `harness`.
@@ -281,6 +315,7 @@ mod tests {
                 properties: vec![PropertyReport {
                     property: "sim/no-livelock".into(),
                     outcome: PropertyOutcome::Held { applicable: 3 },
+                    holds_since: None,
                 }],
             }),
         ]

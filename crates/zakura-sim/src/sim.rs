@@ -19,6 +19,7 @@ use crate::{
     observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
+        ViolationRecord,
     },
     Identity, ObservationLog, Plan, PlanInput,
 };
@@ -147,8 +148,9 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
-        // A failure the last step's code left behind outranks the outcome.
-        let end = match self.failure.take() {
+        // A failure the last step's code left behind outranks the outcome,
+        // and so does evidence that names a step the run didn't take.
+        let end = match self.failure.take().or_else(|| evidence_outside_run(&end)) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
@@ -160,7 +162,12 @@ impl Sim {
         };
         state.log.freeze();
         let cleanup = self.shut_down();
-        sink.record(Record::End(end_record(&end, &properties, cleanup)));
+        sink.record(Record::End(end_record(
+            &end,
+            &properties,
+            cleanup,
+            &state.picks,
+        )));
         RunReport {
             end,
             properties,
@@ -502,8 +509,35 @@ fn idle_status(status: Status) -> Result<IdleStatus, HarnessFailure> {
     }
 }
 
-/// The `end` record for a run that ended with `end`.
-fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupReport) -> EndRecord {
+/// The failure for a violation that names a step the run didn't take. The
+/// `end` record keys each evidence step by its pick, so it needs real steps.
+fn evidence_outside_run(end: &RunEnd) -> Option<HarnessFailure> {
+    let violation = end.violation.as_ref()?;
+    std::iter::once(violation.step)
+        .chain(violation.witness.iter().copied())
+        .find(|step| !(1..=end.steps).contains(step))
+        .map(|step| HarnessFailure::EvidenceOutsideRun {
+            property: violation.property.clone(),
+            step,
+        })
+}
+
+/// The `end` record for a run that ended with `end`, with `picks` its steps'
+/// picks in order.
+fn end_record(
+    end: &RunEnd,
+    properties: &[PropertyReport],
+    cleanup: CleanupReport,
+    picks: &[Pick],
+) -> EndRecord {
+    let key = |step: u64| {
+        step.checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| picks.get(index))
+            .expect("evidence_outside_run ended any run whose evidence names a missing step")
+            .identity
+            .clone()
+    };
     let (outcome, status) = match end.outcome {
         Outcome::Violation => (OutcomeKind::Violation, None),
         Outcome::Budget => (OutcomeKind::Budget, None),
@@ -514,7 +548,10 @@ fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupRepor
         outcome,
         status,
         steps: end.steps,
-        violation: end.violation.clone(),
+        violation: end
+            .violation
+            .as_ref()
+            .map(|v| ViolationRecord::new(v, v.witness.iter().map(|&step| key(step)).collect())),
         drain: end.drain,
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),

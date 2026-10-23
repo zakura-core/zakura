@@ -351,6 +351,7 @@ impl Checker for WaitCompleteWakes {
         vec![PropertyReport {
             property: PROPERTY.into(),
             outcome,
+            holds_since: None,
         }]
     }
 }

@@ -58,6 +58,10 @@ pub struct PropertyReport {
     pub property: String,
     /// Its outcome.
     pub outcome: PropertyOutcome,
+    /// The step after which all the property's assumptions held. `None`
+    /// until properties declare assumptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holds_since: Option<u64>,
 }
 
 /// Which part of the run a step belongs to.

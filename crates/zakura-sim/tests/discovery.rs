@@ -150,11 +150,11 @@ fn scenario(sim: &mut Sim) {
     });
 }
 
-/// Where `DiscoveryExchangeProgress` lives, and the lines of its
-/// `complete` and `wait_complete` bodies and of the three `mark_*` notifies.
+/// Where `SharedPeerState` lives, and the lines of its
+/// mutex helper and `wait_complete` bodies and the progress notifies.
 struct Sites {
     file: &'static str,
-    /// `complete` through the end of `wait_complete`, the code a waiter runs
+    /// The mutex helper through the end of `wait_complete`, where a waiter runs
     /// between checking for completion and waiting.
     waiting: RangeInclusive<u32>,
     marks: Vec<u32>,
@@ -164,10 +164,10 @@ impl Sites {
     /// Finds the sites in the discovery service's source, so the check
     /// follows the code as it moves.
     fn find() -> Sites {
-        let file = "crates/zakura-network/src/zakura/discovery/service.rs";
+        let file = "crates/zakura-network/src/zakura/discovery/peer.rs";
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../zakura-network/src/zakura/discovery/service.rs"
+            "/../zakura-network/src/zakura/discovery/peer.rs"
         );
         let source =
             std::fs::read_to_string(path).expect("the discovery source is in the workspace");
@@ -176,19 +176,19 @@ impl Sites {
             from + lines[from..]
                 .iter()
                 .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("service.rs has `{needle}`"))
+                .unwrap_or_else(|| panic!("peer.rs has `{needle}`"))
         };
         // Lines are 1-based, and the file has far fewer than 2^32 of them.
         let line = |i: usize| (i + 1) as u32;
-        let progress = find(0, "impl DiscoveryExchangeProgress");
-        let complete = find(progress, "fn complete(&self)");
+        let progress = find(0, "impl SharedPeerState");
+        let complete = find(progress, "fn lock(&self)");
         let wait_complete = find(complete, "async fn wait_complete(&self)");
         let end = wait_complete
             + lines[wait_complete..]
                 .iter()
                 .position(|l| *l == "    }")
                 .expect("wait_complete's body closes");
-        let marks = ["fn mark_hello", "fn mark_peers", "fn mark_services"]
+        let marks = ["fn record_hello", "fn record_answer", "fn record_answer"]
             .iter()
             .map(|mark| line(find(find(progress, mark), "notify_waiters()")))
             .collect();
@@ -223,16 +223,16 @@ fn task_of(identity: &str) -> Option<&str> {
 
 /// Checks `discovery/wait-complete-wakes`, which properties.md's P6 will
 /// formalize: at the first step with no ready task after the sink has run
-/// all three `mark_*` notifies, the source must not be waiting after a point
-/// in `complete` or `wait_complete`.
+/// the Hello notify and both answer notifies, the source must have left
+/// `wait_complete`.
 struct WaitCompleteWakes {
     sites: Sites,
     /// Each task's next point, as (kind, line), from its last stop.
     next: BTreeMap<String, (String, Option<u32>)>,
     /// The step that ran each mark's notify.
     marked: Vec<Option<u64>>,
-    /// The source's last load and `notified` steps in the waiting code.
-    last_load: Option<u64>,
+    /// The source's last mutex release and `notified` steps in the waiting code.
+    last_check: Option<u64>,
     last_notified: Option<u64>,
     /// True once the source has created its `Notified` in the waiting code
     /// and hasn't checked for completion since, so it can only go on when
@@ -253,7 +253,7 @@ impl WaitCompleteWakes {
             sites,
             next: Default::default(),
             marked: vec![None; marks],
-            last_load: None,
+            last_check: None,
             last_notified: None,
             in_wait: false,
             trace: Vec::new(),
@@ -297,12 +297,18 @@ impl Checker for WaitCompleteWakes {
         if let Some(task) = task_of(&pick) {
             let ran = self.next.get(task).cloned();
             if let Some((at, Some(line))) = &ran {
-                if let Some(i) = self.sites.marks.iter().position(|m| m == line) {
+                if let Some(i) = self
+                    .sites
+                    .marks
+                    .iter()
+                    .enumerate()
+                    .position(|(i, m)| m == line && self.marked[i].is_none())
+                {
                     self.marked[i] = Some(cx.step);
                 }
                 if is_source(task) && self.sites.waiting.contains(line) {
-                    if at.starts_with("load") {
-                        self.last_load = Some(cx.step);
+                    if at.starts_with("release") {
+                        self.last_check = Some(cx.step);
                         self.in_wait = false;
                     } else if at.starts_with("notified") {
                         self.last_notified = Some(cx.step);
@@ -329,7 +335,7 @@ impl Checker for WaitCompleteWakes {
         Some(Violation {
             property: PROPERTY.into(),
             step: cx.step,
-            witness: [self.last_load, Some(final_notify), self.last_notified]
+            witness: [self.last_check, Some(final_notify), self.last_notified]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -458,11 +464,11 @@ fn reverted_fix_misses_the_wakeup() {
     let (report, _, _) = run(Plan::from_fuzz(INPUT));
     let violation = report.end.violation.expect("the committed input violates");
     assert_eq!(violation.property, PROPERTY);
-    let [load, notify, notified] = violation.witness[..] else {
-        panic!("the witness is load, final notify, notified: {violation:?}");
+    let [check, notify, notified] = violation.witness[..] else {
+        panic!("the witness is check, final notify, notified: {violation:?}");
     };
     assert!(
-        load < notify && notify < notified,
+        check < notify && notify < notified,
         "the source checked, the sink notified, then the source created its future: {violation:?}"
     );
 
@@ -527,8 +533,13 @@ fn holding_the_source_back_finds_no_violation() {
 
 #[test]
 fn seed_sweep_wakes() {
-    for plan in inputs(200, 64) {
-        let (report, _, _) = run(plan);
-        assert_wakes(&report);
+    for workers in [1, 2, 4] {
+        for plan in inputs(200, 64) {
+            let mut config = run_config();
+            config.scheduler.workers = workers;
+            let mut checker = WaitCompleteWakes::new();
+            let (report, _) = recorded(config, plan, scenario, &mut checker);
+            assert_wakes(&report);
+        }
     }
 }

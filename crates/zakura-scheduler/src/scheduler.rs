@@ -86,7 +86,7 @@ pub(crate) struct RunState {
     /// Points each task passed during shutdown, where points don't switch.
     pub(crate) cleanup_points: BTreeMap<TaskId, u32>,
     /// Tasks that passed [`CLEANUP_POINT_LIMIT`] points during shutdown. The
-    /// drain skips them, and shutdown force-unwinds them.
+    /// drain skips them, and shutdown leaks them.
     pub(crate) stuck: BTreeSet<TaskId>,
     /// Answers random draws. Taken out while it runs.
     pub(crate) draws: Option<DrawSource>,
@@ -270,8 +270,10 @@ const DRAIN_STEP_LIMIT: usize = 100_000;
 
 /// The most preemption points one task passes during shutdown. Points don't
 /// switch then, so a task spinning on a value no one will set never reaches
-/// a poll boundary. Past this it stops, and shutdown force-unwinds it.
-pub(crate) const CLEANUP_POINT_LIMIT: u32 = 100_000;
+/// a poll boundary. Past this it stops, and shutdown leaks it. The limit is
+/// high so long but finite cleanup still finishes, and a cleanup point costs
+/// only a counter, so a stuck task costs well under a second.
+pub(crate) const CLEANUP_POINT_LIMIT: u32 = 10_000_000;
 
 /// Takes this thread's run state when dropped, even if shutdown panics, so
 /// later runs on the thread can still start. During a panic it leaks what the
@@ -649,10 +651,11 @@ impl Scheduler {
     ///    can take a contended lock.
     /// 2. Every task at a poll boundary is cancelled, as an abort would. Its
     ///    future is dropped on its own stack, outside any unwind.
-    /// 3. Only a task that is still parked, as in a lock cycle, or that
-    ///    passed [`CLEANUP_POINT_LIMIT`] points in stage 1, as a spin on a
-    ///    value no one will set does, is force-unwound. Whatever that unwind
-    ///    releases drains as in stage 1.
+    /// 3. Only a task that is still parked, as in a lock cycle, is
+    ///    force-unwound. A task that passed [`CLEANUP_POINT_LIMIT`] points in
+    ///    stage 1, as a spin on a value no one will set does, is leaked
+    ///    without running its destructors. Whatever either releases drains
+    ///    as in stage 1.
     ///
     /// Check properties before calling this. A force-unwound task inside a
     /// production `catch_unwind` sees the unwind as a panic.
@@ -695,6 +698,16 @@ impl Scheduler {
             let mut co = self.coroutines[task.index()]
                 .take()
                 .expect("position found a live coroutine");
+            if self.state(|s| s.stuck.contains(&task)) {
+                // Unwinding runs the task's destructors, which can't be
+                // preempted while unwinding, so one that spins would hang
+                // cleanup. The run is over, so leak the task instead.
+                report.leaked += 1;
+                std::mem::forget(co);
+                self.finish(task, TaskExit::Cancelled);
+                self.admit();
+                continue;
+            }
             if co.started() && !co.done() {
                 report.unwound += 1;
             }

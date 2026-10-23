@@ -314,12 +314,68 @@ fn livelock_on_a_sync_spin_still_shuts_down() {
         );
         let _ = done.send((
             report.end.violation.map(|v| v.property),
-            report.cleanup.unwound,
+            report.cleanup.leaked,
         ));
     });
-    let (property, unwound) = finished
+    let (property, leaked) = finished
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the run reported after shutdown");
     assert_eq!(property.as_deref(), Some(NO_LIVELOCK));
-    assert_eq!(unwound, 1, "shutdown force-unwound the spinner");
+    assert_eq!(leaked, 1, "shutdown leaked the spinner");
+}
+
+#[test]
+fn finishing_the_last_task_is_not_a_livelock() {
+    let config = RunConfig {
+        max_steps_per_instant: 1,
+        enforce_no_livelock: true,
+        ..config(2, 100)
+    };
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("once", async {
+                // One point, so the task takes two steps at one instant.
+                let flag = zakura_rt::sync::atomic::AtomicBool::new(false);
+                let _ = flag.load(zakura_rt::sync::atomic::Ordering::Acquire);
+            });
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.steps, 2);
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Idle {
+            status: zakura_sim::IdleStatus::Quiescent
+        },
+        "{:?}",
+        report.end
+    );
+}
+
+#[test]
+fn the_end_record_counts_a_leaked_task() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (_, lines) = support::recorded(
+            livelock_config(),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                let flag = std::sync::Arc::new(zakura_rt::sync::atomic::AtomicBool::new(false));
+                sim.scheduler().spawn_root("spinner", async move {
+                    while !flag.load(zakura_rt::sync::atomic::Ordering::Acquire) {}
+                });
+            },
+            &mut NoChecks,
+        );
+        let _ = done.send(lines);
+    });
+    let lines = finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the run reported after shutdown");
+    let Ok(zakura_sim::Record::End(end)) = serde_json::from_str(lines.last().unwrap()) else {
+        panic!("the last record is end");
+    };
+    assert_eq!(end.cleanup.leaked, 1);
 }

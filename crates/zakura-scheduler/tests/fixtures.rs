@@ -340,11 +340,8 @@ fn shutdown_drops_idle_tasks_outside_an_unwind() {
 }
 
 #[test]
-fn shutdown_unwinds_a_mid_poll_spin_with_no_setter() {
-    // Runs on its own thread, so a hang fails the test instead of the suite.
-    let (done, finished) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+fn shutdown_leaks_a_mid_poll_spin_with_no_setter() {
+    let report = shutdown_report(|s| {
         let flag = shared(Atomic::default());
         let spinner = s.spawn_root("spinner", async move {
             // Nothing ever stores, and every load is a point.
@@ -354,17 +351,76 @@ fn shutdown_unwinds_a_mid_poll_spin_with_no_setter() {
             s.run(spinner.task()),
             zakura_scheduler::RunOutcome::Reached(_)
         ));
-        let report = s.shutdown();
-        let _ = done.send((report.cancelled, report.unwound));
     });
-    let counts = finished
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("shutdown stopped the spinning task");
     assert_eq!(
-        counts,
-        (0, 1),
-        "the spinner was force-unwound, not cancelled"
+        (report.cancelled, report.unwound, report.leaked),
+        (0, 0, 1),
+        "the spinner was leaked, not cancelled or unwound"
     );
+}
+
+/// Spins on `flag` when dropped, as a guard that waits for another task in
+/// its destructor would.
+struct SpinsOnDrop(Rc<Atomic>);
+
+impl Drop for SpinsOnDrop {
+    fn drop(&mut self) {
+        while self.0.load() == 0 {}
+    }
+}
+
+/// Runs `setup` on a fresh thread and returns the cleanup report, or panics
+/// if shutdown takes longer than a minute.
+fn shutdown_report(
+    setup: impl FnOnce(&mut Scheduler) + Send + 'static,
+) -> zakura_scheduler::CleanupReport {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        setup(&mut s);
+        let _ = done.send(s.shutdown());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("shutdown finished")
+}
+
+#[test]
+fn shutdown_leaks_a_stuck_task_whose_drop_spins() {
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move {
+            // Unwinding would run this guard, which spins forever.
+            let _guard = SpinsOnDrop(flag.clone());
+            while flag.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+    });
+    assert_eq!((report.leaked, report.unwound), (1, 0));
+}
+
+#[test]
+fn long_but_finite_cleanup_finishes() {
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let worker = s.spawn_root("worker", async move {
+            let _guard = SpinsOnDrop(flag.clone());
+            // More points than the first cleanup bound allowed, then the
+            // store the guard waits on.
+            for _ in 0..100_002 {
+                point();
+            }
+            flag.store(1);
+        });
+        assert!(matches!(
+            s.run(worker.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+    });
+    assert_eq!((report.leaked, report.unwound, report.cancelled), (0, 0, 0));
 }
 
 #[test]

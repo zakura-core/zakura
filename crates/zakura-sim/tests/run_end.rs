@@ -271,3 +271,32 @@ fn livelock_counts_advances_that_leave_the_clock_still() {
     assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
     assert_eq!(report.end.violation.unwrap().property, NO_LIVELOCK);
 }
+
+#[test]
+fn livelock_on_a_sync_spin_still_shuts_down() {
+    // Runs on its own thread, so a hang fails the test instead of the suite.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let report = run(
+            livelock_config(),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                let flag = std::sync::Arc::new(zakura_rt::sync::atomic::AtomicBool::new(false));
+                sim.scheduler().spawn_root("spinner", async move {
+                    // Nothing ever stores, and every load is a point.
+                    while !flag.load(zakura_rt::sync::atomic::Ordering::Acquire) {}
+                });
+            },
+            &mut NoChecks,
+        );
+        let _ = done.send((
+            report.end.violation.map(|v| v.property),
+            report.cleanup.unwound,
+        ));
+    });
+    let (property, unwound) = finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the run reported after shutdown");
+    assert_eq!(property.as_deref(), Some(NO_LIVELOCK));
+    assert_eq!(unwound, 1, "shutdown force-unwound the spinner");
+}

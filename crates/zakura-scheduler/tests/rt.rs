@@ -300,6 +300,63 @@ fn sleep_reset_into_the_past_fires_at_the_next_advance() {
     assert_eq!(result.status, Status::Quiescent);
 }
 
+#[test]
+fn clamped_timer_cancels() {
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let root = sched.spawn_root("root", async {
+        time::sleep(Duration::from_secs(20)).await;
+        let mut early = std::pin::pin!(time::sleep(Duration::from_secs(1)));
+        assert!(futures_poll_once(early.as_mut()).is_pending());
+        // A deadline 15 s in the past registers at the current 20 s.
+        early
+            .as_mut()
+            .reset(Instant::now() - Duration::from_secs(15));
+        assert_eq!(
+            zakura_scheduler::hooks::now().map(|now| now.since_start()),
+            Some(Duration::from_secs(20))
+        );
+        // Dropping the sleep cancels the timer under its clamped deadline.
+    });
+    while !root.is_finished() {
+        match sched.status() {
+            Status::Running => {
+                sched.run(root.task());
+            }
+            Status::WaitingOnTime => {
+                let next = sched.next_deadline().expect("a timer is pending");
+                sched.advance_to(next);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(sched.next_deadline(), None, "the clamped timer was removed");
+    assert_eq!(sched.shutdown().timers_left, 0);
+}
+
+#[test]
+fn second_joiner_gets_stand_in() {
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let executor = sim::executor().expect("the scheduler is installed");
+    let task = executor.spawn("boom", Box::pin(async { panic!("boom") }));
+    let ready = sched.ready()[0].task;
+    assert!(matches!(
+        sched.run(ready),
+        zakura_scheduler::RunOutcome::Panicked(_)
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut payload = || match executor.poll_join(task, &mut cx) {
+        std::task::Poll::Ready(sim::TaskExit::Panicked(payload)) => payload,
+        other => panic!("expected a panic, got {other:?}"),
+    };
+    assert_eq!(*payload().downcast::<&str>().unwrap(), "boom");
+    let stand_in = *payload().downcast::<&str>().unwrap();
+    assert!(
+        stand_in.contains("another joiner took the payload"),
+        "{stand_in}"
+    );
+    sched.shutdown();
+}
+
 /// Polls `future` once with a no-op waker.
 fn futures_poll_once<F: std::future::Future>(
     future: std::pin::Pin<&mut F>,

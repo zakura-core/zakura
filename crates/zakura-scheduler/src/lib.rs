@@ -203,6 +203,19 @@ impl Op {
     }
 }
 
+impl DrawKind {
+    /// The short name used in draw identities, such as `select` in
+    /// `select#2`.
+    pub fn name(self) -> &'static str {
+        match self {
+            DrawKind::Rng => "rng",
+            DrawKind::Select => "select",
+            DrawKind::HashSeed => "hash-seed",
+            DrawKind::StreamMap => "stream-map",
+        }
+    }
+}
+
 /// A preemption point, as a runtime primitive reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {

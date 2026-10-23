@@ -28,6 +28,7 @@ mod conn;
 mod driver;
 mod endpoint;
 mod error;
+mod inputs;
 #[cfg(test)]
 mod sim_net;
 mod socket;
@@ -46,11 +47,18 @@ pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };
-pub use socket::SocketBuffers;
+pub use inputs::{CidGeneratorFactory, EndpointInputs, InitialCidProvider};
+pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
 pub use stream::{RecvStream, SendStream};
 
-// API-5: quinn-proto types that appear in this crate's API.
-pub use quinn_proto::{ConnectionError, ConnectionStats, FrameStats, PathStats, UdpStats, VarInt};
+// API-2, API-5: quinn-proto types that appear in this crate's API.
+pub use quinn_proto::{
+    crypto::{HandshakeTokenKey, HmacKey},
+    ConnectionError, ConnectionId, ConnectionIdGenerator, ConnectionStats, FrameStats, PathStats,
+    Transmit, UdpStats, VarInt,
+};
+// rustls traits that `EndpointInputs` takes (TLS-9).
+pub use rustls::crypto::{SecureRandom, SupportedKxGroup};
 
 #[cfg(test)]
 mod tests;

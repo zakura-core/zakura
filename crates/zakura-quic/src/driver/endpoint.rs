@@ -132,12 +132,8 @@ impl<F: SocketFactory> EndpointTask<F> {
         cmds: mpsc::UnboundedReceiver<EndpointCmd>,
     ) -> Self {
         let allow_mtud = io.mtud_allowed();
-        let endpoint = quinn_proto::Endpoint::new(
-            Arc::new(shared.config.endpoint_config()),
-            None,
-            allow_mtud,
-            None,
-        );
+        let endpoint =
+            quinn_proto::Endpoint::new(Arc::new(shared.endpoint_config()), None, allow_mtud, None);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             endpoint,
@@ -664,6 +660,7 @@ mod tests {
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
             network_changes: AtomicU64::new(0),
+            inputs: crate::EndpointInputs::default(),
         });
         let addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
         let slot = Arc::new(SocketSlot {

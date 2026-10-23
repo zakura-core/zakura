@@ -341,6 +341,9 @@ fn shutdown_drops_idle_tasks_outside_an_unwind() {
 
 #[test]
 fn shutdown_leaks_a_mid_poll_spin_with_no_setter() {
+    if leaks_in_a_child("shutdown_leaks_a_mid_poll_spin_with_no_setter") {
+        return;
+    }
     let report = shutdown_report(|s| {
         let flag = shared(Atomic::default());
         let spinner = s.spawn_root("spinner", async move {
@@ -387,6 +390,9 @@ fn shutdown_report(
 
 #[test]
 fn shutdown_leaks_a_stuck_task_whose_drop_spins() {
+    if leaks_in_a_child("shutdown_leaks_a_stuck_task_whose_drop_spins") {
+        return;
+    }
     let report = shutdown_report(|s| {
         let flag = shared(Atomic::default());
         let spinner = s.spawn_root("spinner", async move {
@@ -413,6 +419,9 @@ impl Drop for SetsOnDrop {
 
 #[test]
 fn a_leak_leaks_the_waiters_that_depend_on_it() {
+    if leaks_in_a_child("a_leak_leaks_the_waiters_that_depend_on_it") {
+        return;
+    }
     use zakura_scheduler::RunOutcome::{Parked, Reached};
     let report = shutdown_report(|s| {
         let lock = shared(Mutex::new(()));
@@ -450,6 +459,9 @@ impl Drop for CountsDrops {
 
 #[test]
 fn a_stuck_task_stops_the_drain() {
+    if leaks_in_a_child("a_stuck_task_stops_the_drain") {
+        return;
+    }
     let report = shutdown_report(|s| {
         let never = shared(Atomic::default());
         let spinner = s.spawn_root("spinner", async move { while never.load() == 0 {} });
@@ -486,6 +498,9 @@ impl std::task::Wake for PanicsOnWake {
 
 #[test]
 fn a_panicking_join_waker_unwinds_nothing_after_a_leak() {
+    if leaks_in_a_child("a_panicking_join_waker_unwinds_nothing_after_a_leak") {
+        return;
+    }
     use std::future::Future;
     use zakura_scheduler::RunOutcome::{Parked, Reached};
     let (done, finished) = std::sync::mpsc::channel::<()>();
@@ -1689,6 +1704,20 @@ fn task_panic_reaches_the_harness_with_a_replaced_panic_hook() {
     assert_eq!(r.panics, ["planted panic"]);
     assert_eq!(r.status, Status::Quiescent, "the survivor finished");
     assert!(hook_calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// Reruns `test` in a child with LeakSanitizer off, for a test that leaks
+/// tasks on purpose, and checks it passed. Returns true in the parent, which
+/// should then return. In the child, returns false so the body runs.
+fn leaks_in_a_child(test: &str) -> bool {
+    if in_child(test) {
+        return false;
+    }
+    let status = rerun_in_child(test, &[("ASAN_OPTIONS", "detect_leaks=0")])
+        .wait()
+        .expect("the child is ours to wait on");
+    assert!(status.success(), "the child failed: {status}");
+    true
 }
 
 /// Names the one test a child process started by [`rerun_in_child`] runs.

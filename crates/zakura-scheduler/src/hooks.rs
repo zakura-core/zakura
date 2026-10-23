@@ -12,7 +12,9 @@ use std::{
 };
 
 use crate::{
-    scheduler::{with_run, BoxTask, RunState, TaskYielder, Yield, CLEANUP_POINT_LIMIT},
+    scheduler::{
+        with_run, BoxTask, Cmd, ForcedUnwind, RunState, TaskYielder, Yield, CLEANUP_POINT_LIMIT,
+    },
     Draw, DrawKind, ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
@@ -231,8 +233,8 @@ pub fn draw(kind: DrawKind, site: &'static std::panic::Location<'static>, bound:
 
 /// Suspends the current coroutine.
 ///
-/// Doesn't suspend while the thread is unwinding, because suspending a
-/// coroutine that corosensei is force-unwinding restarts the unwind.
+/// Doesn't suspend while the thread is unwinding, since the unwind has to
+/// reach the coroutine's root first.
 #[allow(unsafe_code)]
 fn suspend(yielder: *const TaskYielder, why: Yield) {
     if std::thread::panicking() || yielder.is_null() {
@@ -241,9 +243,13 @@ fn suspend(yielder: *const TaskYielder, why: Yield) {
     // SAFETY: the yielder lives on the current coroutine's stack for as long
     // as that coroutine runs. The scheduler sets `current` only while it has
     // resumed that coroutine, and hooks read the pointer through `current`,
-    // so the pointer is live here. Resumes after a mid-poll suspend always
-    // send `Cmd::Poll`, which this ignores.
-    unsafe { (*yielder).suspend(why) };
+    // so the pointer is live here.
+    let cmd = unsafe { (*yielder).suspend(why) };
+    // Resumes after a mid-poll suspend send `Cmd::Poll`, or `Cmd::Unwind`
+    // when shutdown force-unwinds the task from here.
+    if let Cmd::Unwind = cmd {
+        std::panic::resume_unwind(Box::new(ForcedUnwind));
+    }
 }
 
 /// A handle to a spawned task. Awaiting it waits for the task to end.

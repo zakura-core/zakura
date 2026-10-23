@@ -817,6 +817,11 @@ impl Scheduler {
     /// timers, join wakers and panic payloads, are forgotten as they are,
     /// as [`ClearRun`] does during a panic. Their stacks count as leaked in
     /// [`StackPool`](crate::StackPool).
+    ///
+    /// After an abandoned run, the caller must not wait on anything it shares
+    /// with the run's tasks, by dropping it or otherwise, since a leaked task
+    /// never releases it. [`CleanupReport::leaked`](crate::CleanupReport) is
+    /// nonzero exactly when a run was abandoned.
     fn abandon(&mut self) -> usize {
         let coroutines = std::mem::take(&mut self.coroutines);
         let live = coroutines.iter().filter(|co| co.is_some()).count();

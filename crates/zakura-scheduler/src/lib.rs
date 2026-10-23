@@ -359,7 +359,8 @@ pub struct CleanupReport {
     pub unwound: usize,
     /// Tasks leaked when a task got stuck at the cleanup point limit and
     /// shutdown abandoned the run: every task still live, plus any spawn
-    /// still queued. None of their code ran.
+    /// still queued. None of their code ran. Nonzero exactly when the run
+    /// was abandoned.
     pub leaked: usize,
     /// Forced unwinds that a task's own code caught before it suspended
     /// again. Such a task stays live, and shutdown runs it on like any other.

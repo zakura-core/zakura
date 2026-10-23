@@ -2945,7 +2945,6 @@ version = "11.0.0"
 dependencies = [
  "bech32",
  "bitflags",
- "bitvec",
  "blake2b_simd",
  "bounded-vec",
  "bs58",

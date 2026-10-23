@@ -28,6 +28,8 @@ mod conn;
 mod driver;
 mod endpoint;
 mod error;
+#[cfg(test)]
+mod sim_net;
 mod socket;
 mod stream;
 pub mod sys;

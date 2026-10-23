@@ -35,7 +35,7 @@ use zakura_chain::{
     parameters::Network,
     serialization::{DateTime32, SerializationError},
 };
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::erased;
 
 use crate::{
     constants,
@@ -1889,7 +1889,7 @@ where
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
         // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        spawn_erased(fut.instrument(negotiator_span))
+        tokio::spawn(erased(fut.instrument(negotiator_span)))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,

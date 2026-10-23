@@ -15,8 +15,10 @@ use quinn_proto::crypto::rustls::QuicClientConfig;
 use tokio::sync::mpsc;
 
 use crate::{
-    endpoint::watch_interfaces, Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo,
-    NodeAddr, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint, VarInt,
+    endpoint::watch_interfaces,
+    sim_net::{LinkModel, NetEvent, SimNet},
+    Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
+    QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
 
 const ALPN: &[u8] = b"p2p-v2/3";
@@ -112,6 +114,15 @@ fn server_with(
     decide: impl Fn(&IncomingInfo) -> Admit + Send + Sync + 'static,
 ) -> Server {
     let endpoint = QuicEndpoint::bind(NodeSecretKey::generate(), bind, config).unwrap();
+    serve_test_acceptor(endpoint, alpns, decide)
+}
+
+/// Serves a [`TestAcceptor`] on `endpoint`.
+fn serve_test_acceptor(
+    endpoint: QuicEndpoint,
+    alpns: &[&[u8]],
+    decide: impl Fn(&IncomingInfo) -> Admit + Send + Sync + 'static,
+) -> Server {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let banned = Arc::new(Mutex::new(HashSet::new()));
     let (handled_tx, handled) = mpsc::unbounded_channel();
@@ -2469,4 +2480,167 @@ async fn cancelled_discovery_dials_restore_every_slot() {
     })
     .await
     .unwrap();
+}
+
+/// An endpoint on one simulated socket at `addr`.
+fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
+    let bind = QuicBindConfig {
+        addrs: vec![addr],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with_factory(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        net.clone(),
+    )
+    .unwrap()
+}
+
+/// A simulated network whose links take 1 to 5 ms and may reorder.
+fn sim_net() -> SimNet {
+    SimNet::new(LinkModel {
+        min_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        reorder: true,
+        loss_budget: 0,
+    })
+}
+
+/// Delivers every eligible datagram once per simulated millisecond. Links
+/// from [`sim_net`] take at least 1 ms, so each datagram arrives inside its
+/// window, and the assertion checks that time never passed a deadline.
+async fn pump(net: SimNet) {
+    loop {
+        while let Some(id) = net.deliverable().first().copied() {
+            net.deliver(id).unwrap();
+        }
+        assert!(net.can_advance(), "a datagram passed its deadline");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Bounds a simulation test in virtual time. It leaves room for the 91 s the
+/// rebind test sleeps on purpose, and a hang still fails within seconds of
+/// wall time, because paused time jumps ahead while the test waits.
+const SIM_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `10.0.0.n:4000`.
+fn sim_addr(n: u8) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(10, 0, 0, n), 4000))
+}
+
+/// Tasks alive on the current runtime.
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+/// M2.6: the real driver handshakes and echoes over `SimNet`. Simulated
+/// sockets hold no OS handle, and binding one starts only its endpoint task:
+/// no kernel drop poller and no interface watcher. A production bind does
+/// start them.
+#[tokio::test(start_paused = true)]
+async fn the_driver_runs_over_simnet_without_os_sockets_or_pollers() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let before = alive_tasks();
+        let server_endpoint = sim_endpoint(&net, sim_addr(1));
+        assert_eq!(alive_tasks(), before + 1, "only the endpoint task");
+        let mut server = serve_test_acceptor(server_endpoint, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
+
+        let stats = &server.endpoint.socket_stats()[0];
+        assert_eq!(stats.buffers, SocketBuffers::default());
+        assert!(!stats.gso);
+        drop((conn, inbound));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+
+        let events = net.events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Delivered { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Dropped { .. })));
+        assert!(events.contains(&NetEvent::Unbound {
+            addr: sim_addr(1),
+            unread: 0
+        }));
+
+        // A production wildcard bind adds the interface watcher, and on
+        // Linux the kernel drop poller, beside its endpoint task.
+        let before = alive_tasks();
+        let _os =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &wildcard(), &test_config()).unwrap();
+        assert!(alive_tasks() >= before + 2);
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// Injects a fatal receive error into `addr` and waits until the endpoint
+/// has rebound or stopped.
+async fn fail_and_wait(net: &SimNet, endpoint: &QuicEndpoint, addr: SocketAddr) -> SocketStats {
+    let rebinds = endpoint.socket_stats()[0].rebinds;
+    assert!(net.fail_next_recv(addr, std::io::ErrorKind::Other));
+    loop {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let stats = endpoint.socket_stats()[0];
+        if stats.rebinds > rebinds || stats.stopped {
+            return stats;
+        }
+    }
+}
+
+/// M2.5: a SOCK-9 rebind comes from the injected factory and measures its
+/// 60 s window in virtual time. Under `std::time::Instant` the 61 s case
+/// would see almost no elapsed time and stop the socket.
+#[tokio::test(start_paused = true)]
+async fn simnet_rebinds_use_the_factory_and_virtual_time() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let _inbound = server.handled.recv().await.unwrap();
+
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (1, false));
+        let rebind = [
+            NetEvent::Unbound {
+                addr: sim_addr(1),
+                unread: 0,
+            },
+            NetEvent::Bound { addr: sim_addr(1) },
+        ];
+        assert!(net.events().windows(2).any(|pair| pair == rebind));
+        // The connection lives through the rebind.
+        assert_eq!(echo(&conn, b"after the rebind").await, b"after the rebind");
+
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, false));
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, true));
+
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
 }

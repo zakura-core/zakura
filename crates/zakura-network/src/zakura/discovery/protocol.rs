@@ -14,7 +14,6 @@ use rand_10::seq::SliceRandom;
 use thiserror::Error;
 use zakura_chain::{
     block,
-    diagnostic::task::CheckForPanics,
     primitives::ed25519::{Signature, SigningKey},
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
@@ -1688,12 +1687,13 @@ impl ZakuraDiscoveryHandle {
             current_unix_secs: current_unix_secs(),
             ..self.verification_context.clone()
         };
-        zakura_rt::task::spawn_blocking(move || {
-            let _slot = slot;
-            verify(&context)
-        })
-        .await
-        .check_for_panics_with(false)
+        crate::zakura::resume_task_panic(
+            zakura_rt::task::spawn_blocking(move || {
+                let _slot = slot;
+                verify(&context)
+            })
+            .await,
+        )
         .ok()
     }
 

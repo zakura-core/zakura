@@ -116,7 +116,7 @@ impl PeerRoutine {
             ));
             row.budget_available = Some(self.budget.available());
             row.pending_work = Some(saturating_usize(self.work.pending_len()));
-            row.received_status = Some(BoolOrU64::U64(u64::from(self.received_status)));
+            row.received_status = Some(BoolOrU64::U64(u64::from(self.state.received_status)));
         });
     }
 

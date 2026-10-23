@@ -341,8 +341,8 @@ pub struct CleanupReport {
     /// Tasks that panicked while shutdown ran them to a poll boundary or
     /// dropped their futures.
     pub panicked: usize,
-    /// Tasks still parked after the drain, such as a lock cycle, whose
-    /// coroutines were force-unwound.
+    /// Tasks still parked after the drain, such as a lock cycle, or stopped
+    /// at the cleanup point limit, whose coroutines were force-unwound.
     pub unwound: usize,
     /// Forced unwinds that a task's own code caught and didn't rethrow. The
     /// stack of such a task is leaked rather than reused.

@@ -340,6 +340,34 @@ fn shutdown_drops_idle_tasks_outside_an_unwind() {
 }
 
 #[test]
+fn shutdown_unwinds_a_mid_poll_spin_with_no_setter() {
+    // Runs on its own thread, so a hang fails the test instead of the suite.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let flag = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move {
+            // Nothing ever stores, and every load is a point.
+            while flag.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        let report = s.shutdown();
+        let _ = done.send((report.cancelled, report.unwound));
+    });
+    let counts = finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("shutdown stopped the spinning task");
+    assert_eq!(
+        counts,
+        (0, 1),
+        "the spinner was force-unwound, not cancelled"
+    );
+}
+
+#[test]
 fn shutdown_drop_can_take_a_contended_lock() {
     use zakura_scheduler::RunOutcome::{Reached, Waiting};
     // `holder` keeps the lock across an await, or stops mid-poll holding it.

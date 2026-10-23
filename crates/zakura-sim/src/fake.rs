@@ -282,8 +282,17 @@ struct Peer {
 }
 
 impl FakePeer {
-    /// A peer named `name` that takes the actions in `script`.
+    /// A peer named `name` that takes the actions in `script`, at most
+    /// `per_instant` at one instant.
+    ///
+    /// # Panics
+    ///
+    /// If `per_instant` is 0, since such a peer could never act.
     pub fn new(name: &str, script: &[&str], per_instant: u32) -> Self {
+        assert!(
+            per_instant > 0,
+            "a FakePeer needs a per_instant budget above 0"
+        );
         FakePeer(Rc::new(RefCell::new(Peer {
             name: name.to_owned(),
             script: script.iter().map(|a| (*a).to_owned()).collect(),

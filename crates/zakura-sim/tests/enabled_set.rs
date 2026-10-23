@@ -78,3 +78,9 @@ fn duplicate_identity_is_harness() {
         })
     );
 }
+
+#[test]
+#[should_panic(expected = "per_instant")]
+fn a_peer_with_no_budget_is_rejected() {
+    let _ = FakePeer::new("p1", &["hello"], 0);
+}

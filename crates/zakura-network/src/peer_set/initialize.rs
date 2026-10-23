@@ -39,7 +39,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
 };
-use zakura_node_services::task::{spawn_buffer, spawn_erased};
+use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -286,9 +286,9 @@ where
             .max(MIN_CHANNEL_SIZE),
     );
 
-    spawn_erased(
+    tokio::spawn(erased(
         batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
-    );
+    ));
 
     // Create a broadcast channel for peer inventory advertisements.
     // If it reaches capacity, this channel drops older inventory advertisements.
@@ -387,16 +387,16 @@ where
     // Using Buffer::pair returns the background service, letting us inject our cancellation
     let (peer_set, worker) =
         Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
-    spawn_erased(async move {
+    tokio::spawn(erased(async move {
         tokio::select! {
             _ = shutdown.cancelled() => {}
             _ = worker => {}
         }
-    });
+    }));
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
-    let peer_cache_updater_guard = spawn_erased(peer_cache_updater_fut.in_current_span());
+    let peer_cache_updater_guard = tokio::spawn(erased(peer_cache_updater_fut.in_current_span()));
 
     // Abort startup tasks if this initialization future is dropped before handoff.
     let mut task_handles = vec![
@@ -417,9 +417,9 @@ where
             bans,
             block_gossip_peer_ips,
         );
-        task_handles.push(AbortOnDropHandle::new(spawn_erased(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             listen_fut.in_current_span(),
-        )));
+        ))));
 
         // 2. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
@@ -429,7 +429,7 @@ where
             address_book_updater.clone(),
         );
         let initial_peers_join =
-            AbortOnDropHandle::new(spawn_erased(initial_peers_fut.in_current_span()));
+            AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
 
         // 3. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
@@ -479,11 +479,11 @@ where
             address_book_updater,
             Arc::new(AtomicBool::new(false)),
         );
-        task_handles.push(AbortOnDropHandle::new(spawn_erased(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             crawl_fut.in_current_span(),
-        )));
+        ))));
     } else {
-        task_handles.push(AbortOnDropHandle::new(spawn_erased(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             async move {
                 let _peerset_tx = peerset_tx;
                 let mut demand_rx = demand_rx;
@@ -495,7 +495,7 @@ where
                 future::pending::<Result<(), BoxError>>().await
             }
             .in_current_span(),
-        )));
+        ))));
     }
 
     // Capture the supervisor before the endpoint is moved into the keep-alive
@@ -506,10 +506,10 @@ where
 
     let returned_zakura_endpoint = zakura_endpoint.clone();
     if let Some(zakura_endpoint) = zakura_endpoint {
-        task_handles.push(AbortOnDropHandle::new(spawn_erased(async move {
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(async move {
             let _zakura_endpoint = zakura_endpoint;
             future::pending::<Result<(), BoxError>>().await
-        })));
+        }))));
     }
 
     handle_tx
@@ -614,7 +614,7 @@ where
             let outbound_connector = outbound_connector.clone();
 
             // Spawn a new task to make the outbound connection.
-            spawn_erased(
+            tokio::spawn(erased(
                 async move {
                     // Only spawn one outbound connector per
                     // `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`,
@@ -632,7 +632,7 @@ where
                         .await
                 }
                 .in_current_span(),
-            )
+            ))
             .wait_for_panics()
         })
         .collect();
@@ -1061,7 +1061,7 @@ where
     // ... instead, spawn a new task to handle this connection
     let mut peerset_tx = peerset_tx.clone();
 
-    let handshake_task = spawn_erased(
+    let handshake_task = tokio::spawn(erased(
         async move {
             let handshake_result = handshake.await;
 
@@ -1073,7 +1073,7 @@ where
             }
         }
         .in_current_span(),
-    );
+    ));
 
     Ok(handshake_task)
 }
@@ -1341,7 +1341,7 @@ where
                 // The peer crawler must be able to make progress even if some handshakes are
                 // rate-limited. So the async mutex and next peer timeout are awaited inside the
                 // spawned task.
-                let handshake_or_crawl_handle = spawn_erased(
+                let handshake_or_crawl_handle = tokio::spawn(erased(
                     async move {
                         // Try to get the next available peer for a handshake.
                         //
@@ -1382,7 +1382,7 @@ where
                         }
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(handshake_or_crawl_handle);
@@ -1391,7 +1391,7 @@ where
                 let candidates = candidates.clone();
                 let demand_tx = demand_tx.clone();
 
-                let crawl_handle = spawn_erased(
+                let crawl_handle = tokio::spawn(erased(
                     async move {
                         debug!(
                             ?tick,
@@ -1403,7 +1403,7 @@ where
                         Ok(TimerCrawlFinished)
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(crawl_handle);

@@ -16,5 +16,9 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 
+# Only the simulator build, `RUSTFLAGS="--cfg zakura_sim"`, uses these.
+[target.'cfg(zakura_sim)'.dependencies]
+pin-project-lite = { workspace = true }
+
 [lints]
 workspace = true

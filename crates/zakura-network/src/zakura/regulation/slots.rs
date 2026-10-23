@@ -1,9 +1,9 @@
 //! Owned permits for bounded collections of retained or active work.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use thiserror::Error;
-use zakura_rt::sync::{OwnedSemaphorePermit, Semaphore};
+use zakura_rt::sync::{downgrade, OwnedSemaphorePermit, Semaphore, Weak};
 
 /// A slot capacity cannot provide usable, representable permits.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
@@ -67,7 +67,7 @@ impl SlotBudget {
         WeakSlotBudget {
             #[cfg(test)]
             capacity: self.capacity,
-            permits: Arc::downgrade(&self.permits),
+            permits: downgrade(&self.permits),
         }
     }
 
@@ -174,7 +174,7 @@ impl OutputByteBudget {
     pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
         WeakOutputByteBudget {
             capacity: self.capacity,
-            bytes: Arc::downgrade(&self.bytes),
+            bytes: downgrade(&self.bytes),
         }
     }
 }

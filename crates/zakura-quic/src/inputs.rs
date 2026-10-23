@@ -20,6 +20,15 @@ pub type CidGeneratorFactory = Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + 
 /// Picks the destination connection ID of a dial's first Initial packet.
 pub type InitialCidProvider = Arc<dyn Fn() -> ConnectionId + Send + Sync>;
 
+/// Hears about each TLS provider built from an endpoint's inputs. The
+/// simulator's seeded inputs use it to tell when the last TLS user of a
+/// leaked `&'static` source is gone.
+#[cfg(any(test, zakura_sim))]
+pub(crate) trait ProviderWatch: Send + Sync {
+    /// Called with each provider built from the injected TLS inputs.
+    fn built(&self, provider: &Arc<rustls::crypto::CryptoProvider>);
+}
+
 /// The randomness an endpoint uses, input by input.
 ///
 /// An input left unset keeps its production source, so
@@ -35,6 +44,9 @@ pub struct EndpointInputs {
     token_key: Option<Arc<dyn HandshakeTokenKey>>,
     tls_random: Option<&'static dyn SecureRandom>,
     kx_groups: Option<Vec<&'static dyn SupportedKxGroup>>,
+    /// Set only by the simulator. No public method replaces it.
+    #[cfg(any(test, zakura_sim))]
+    provider_watch: Option<Arc<dyn ProviderWatch>>,
 }
 
 impl fmt::Debug for EndpointInputs {
@@ -114,6 +126,21 @@ impl EndpointInputs {
     pub fn kx_groups(mut self, groups: Vec<&'static dyn SupportedKxGroup>) -> Self {
         self.kx_groups = Some(groups);
         self
+    }
+
+    /// Tells `watch` about every TLS provider built from these inputs.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn provider_watch(mut self, watch: Arc<dyn ProviderWatch>) -> Self {
+        self.provider_watch = Some(watch);
+        self
+    }
+
+    /// Reports a provider built from these inputs to the watch, if any.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn provider_built(&self, provider: &Arc<rustls::crypto::CryptoProvider>) {
+        if let Some(watch) = &self.provider_watch {
+            watch.built(provider);
+        }
     }
 
     /// The injected TLS random source, if any.

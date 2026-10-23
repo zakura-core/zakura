@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     endpoint::watch_interfaces,
-    sim_net::{LinkModel, NetEvent, SimNet},
+    sim::{LinkModel, NetEvent, SeededInputs, SimNet, Source},
     Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
@@ -2863,6 +2863,75 @@ async fn bind_with_uses_every_injected_input() {
         assert!(SPY_KX.0.get() >= 2, "TLS key exchange");
 
         drop(conn);
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// `SeededInputs` carry a Retry handshake and a stream exchange over
+/// `SimNet`, the node keys come from the seed, and the handshake draws from
+/// every source.
+#[tokio::test(start_paused = true)]
+async fn seeded_inputs_handshake_over_simnet() {
+    const SEED: [u8; 32] = [5; 32];
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let bind = |node: u32, addr: SocketAddr, inputs: &SeededInputs| {
+            let bind = QuicBindConfig {
+                addrs: vec![addr],
+                ..loopback()
+            };
+            QuicEndpoint::bind_with(
+                SeededInputs::node_key(SEED, node),
+                &bind,
+                &test_config(),
+                net.clone(),
+                inputs.endpoint_inputs(),
+            )
+            .unwrap()
+        };
+        let server_inputs = SeededInputs::new(SEED, 0);
+        let client_inputs = SeededInputs::new(SEED, 1);
+        let mut server =
+            serve_test_acceptor(bind(0, sim_addr(1), &server_inputs), &[ALPN], |incoming| {
+                if incoming.validated {
+                    Admit::Accept
+                } else {
+                    Admit::Retry
+                }
+            });
+        let client = bind(1, sim_addr(2), &client_inputs);
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_id(), SeededInputs::node_key(SEED, 0).public());
+        assert_eq!(echo(&conn, b"seeded").await, b"seeded");
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(
+            inbound.remote_id(),
+            SeededInputs::node_key(SEED, 1).public()
+        );
+        assert!(server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| !seen.validated));
+
+        for (side, inputs) in [("server", &server_inputs), ("client", &client_inputs)] {
+            for (source, draws) in inputs.record().draws {
+                if side == "server" && source == Source::InitialDstCid {
+                    assert_eq!(draws, 0, "the server never dials");
+                } else {
+                    assert!(draws > 0, "{side}: {source:?}");
+                }
+            }
+        }
+
+        drop((conn, inbound));
         client.shutdown().await;
         server.endpoint.shutdown().await;
         pump.abort();

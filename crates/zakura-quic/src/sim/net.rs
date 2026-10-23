@@ -5,8 +5,8 @@
 //! arrives on its own: the harness picks each delivery or drop, and each one
 //! handles exactly one datagram. A datagram sent at `t` may be delivered from
 //! `t + min_delay` and must be delivered or dropped by `t + max_delay`. Time is
-//! the driver's clock (`tokio::time`), so a harness that pauses it controls
-//! both the driver and the network.
+//! the driver's runtime clock, so a harness that controls it controls both
+//! the driver and the network.
 //!
 //! Sockets bind explicit addresses and never touch the OS. They report no GSO,
 //! no MTU discovery, no buffer sizes and no inode, so the endpoint starts no
@@ -35,17 +35,17 @@ mod tests;
 
 /// How one directed link treats the datagrams sent on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LinkModel {
+pub struct LinkModel {
     /// The earliest a datagram may arrive after its send.
-    pub(crate) min_delay: Duration,
+    pub min_delay: Duration,
     /// The latest a datagram may arrive after its send. Time can't pass it
     /// while the datagram is in flight.
-    pub(crate) max_delay: Duration,
+    pub max_delay: Duration,
     /// Whether any eligible datagram may arrive next. Without it, only the
     /// link's oldest datagram in flight may.
-    pub(crate) reorder: bool,
+    pub reorder: bool,
     /// How many datagrams the link may lose over the whole run.
-    pub(crate) loss_budget: u64,
+    pub loss_budget: u64,
 }
 
 impl LinkModel {
@@ -74,21 +74,25 @@ impl Default for LinkModel {
 
 /// A directed link between two addresses.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Link {
-    pub(crate) src: SocketAddr,
-    pub(crate) dst: SocketAddr,
+pub struct Link {
+    /// The sending socket's address.
+    pub src: SocketAddr,
+    /// The address the datagrams go to.
+    pub dst: SocketAddr,
 }
 
 /// A datagram's stable identity: its link and its send sequence on that link.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct DatagramId {
-    pub(crate) link: Link,
-    pub(crate) seq: u64,
+pub struct DatagramId {
+    /// The link it was sent on.
+    pub link: Link,
+    /// Its place in that link's sends, from 0.
+    pub seq: u64,
 }
 
 /// Why a datagram never reached a socket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DropReason {
+pub enum DropReason {
     /// The harness dropped it within the link's loss budget.
     Loss,
     /// Nothing was bound to its destination when it arrived, which UDP
@@ -98,22 +102,43 @@ pub(crate) enum DropReason {
 
 /// What happened on the network, in order.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NetEvent {
+pub enum NetEvent {
     /// A socket bound `addr`.
-    Bound { addr: SocketAddr },
+    Bound {
+        /// The bound address.
+        addr: SocketAddr,
+    },
     /// The socket on `addr` closed, discarding the datagrams it hadn't read.
-    Unbound { addr: SocketAddr, unread: usize },
+    Unbound {
+        /// The address that closed.
+        addr: SocketAddr,
+        /// How many delivered datagrams it never read.
+        unread: usize,
+    },
     /// A datagram went in flight.
-    Sent { id: DatagramId, len: usize },
+    Sent {
+        /// The datagram.
+        id: DatagramId,
+        /// Its length in bytes.
+        len: usize,
+    },
     /// A datagram reached its destination's receive queue.
-    Delivered { id: DatagramId },
+    Delivered {
+        /// The datagram.
+        id: DatagramId,
+    },
     /// A datagram left the network without reaching a socket.
-    Dropped { id: DatagramId, reason: DropReason },
+    Dropped {
+        /// The datagram.
+        id: DatagramId,
+        /// Why it never arrived.
+        reason: DropReason,
+    },
 }
 
 /// Why the harness can't deliver or drop a datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NetError {
+pub enum NetError {
     /// It isn't in flight: never sent, or already delivered or dropped.
     NotInFlight,
     /// Its minimum delay hasn't passed.
@@ -232,7 +257,7 @@ impl State {
 
 /// The simulated network. Clones share it.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct SimNet {
+pub struct SimNet {
     state: Arc<Mutex<State>>,
 }
 
@@ -243,7 +268,7 @@ impl SimNet {
     /// # Panics
     ///
     /// If `default_model`'s `min_delay` exceeds its `max_delay`.
-    pub(crate) fn new(default_model: LinkModel) -> Self {
+    pub fn new(default_model: LinkModel) -> Self {
         default_model.check();
         Self {
             state: Arc::new(Mutex::new(State {
@@ -269,7 +294,7 @@ impl SimNet {
     ///
     /// If datagrams are in flight on the link, or if `model`'s `min_delay`
     /// exceeds its `max_delay`.
-    pub(crate) fn set_link(&self, link: Link, model: LinkModel) {
+    pub fn set_link(&self, link: Link, model: LinkModel) {
         model.check();
         let mut state = self.lock();
         assert!(
@@ -280,7 +305,7 @@ impl SimNet {
     }
 
     /// Binds a socket to `addr`, which must name an IP and a port.
-    pub(crate) fn bind(&self, addr: SocketAddr) -> io::Result<SimSocket> {
+    pub fn bind(&self, addr: SocketAddr) -> io::Result<SimSocket> {
         if addr.ip().is_unspecified() || addr.port() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -311,13 +336,13 @@ impl SimNet {
     }
 
     /// The datagrams in flight, oldest link and sequence first.
-    pub(crate) fn in_flight(&self) -> Vec<DatagramId> {
+    pub fn in_flight(&self) -> Vec<DatagramId> {
         self.lock().in_flight.keys().copied().collect()
     }
 
     /// The datagrams the harness may deliver now: every eligible one on a
     /// reordering link, and the oldest one on any other link once eligible.
-    pub(crate) fn deliverable(&self) -> Vec<DatagramId> {
+    pub fn deliverable(&self) -> Vec<DatagramId> {
         let now = now();
         let state = self.lock();
         state
@@ -330,7 +355,7 @@ impl SimNet {
 
     /// The datagrams the harness may drop now: any in flight on a link with
     /// loss budget left.
-    pub(crate) fn droppable(&self) -> Vec<DatagramId> {
+    pub fn droppable(&self) -> Vec<DatagramId> {
         let state = self.lock();
         state
             .in_flight
@@ -346,7 +371,7 @@ impl SimNet {
     }
 
     /// The earliest maximum-delay deadline in flight. Time must not pass it.
-    pub(crate) fn time_limit(&self) -> Option<Instant> {
+    pub fn time_limit(&self) -> Option<Instant> {
         self.lock()
             .in_flight
             .values()
@@ -357,12 +382,12 @@ impl SimNet {
     /// Whether time may move forward at all. It may not while a datagram is
     /// at its deadline, so a due datagram forces a delivery or drop instead
     /// of a zero-length advance. [`SimNet::deliverable`] is never empty then.
-    pub(crate) fn can_advance(&self) -> bool {
+    pub fn can_advance(&self) -> bool {
         self.time_limit().is_none_or(|limit| now() < limit)
     }
 
     /// The next time a datagram in flight becomes eligible, if any isn't yet.
-    pub(crate) fn next_eligible(&self) -> Option<Instant> {
+    pub fn next_eligible(&self) -> Option<Instant> {
         let now = now();
         self.lock()
             .in_flight
@@ -374,7 +399,7 @@ impl SimNet {
 
     /// Delivers one datagram to the socket bound at its destination, or
     /// drops it if none is (UDP semantics). Wakes that socket's reader.
-    pub(crate) fn deliver(&self, id: DatagramId) -> Result<(), NetError> {
+    pub fn deliver(&self, id: DatagramId) -> Result<(), NetError> {
         let now = now();
         let waker = {
             let mut state = self.lock();
@@ -406,7 +431,7 @@ impl SimNet {
     }
 
     /// Drops one datagram, spending one unit of its link's loss budget.
-    pub(crate) fn drop_datagram(&self, id: DatagramId) -> Result<(), NetError> {
+    pub fn drop_datagram(&self, id: DatagramId) -> Result<(), NetError> {
         let mut state = self.lock();
         if !state.in_flight.contains_key(&id) {
             return Err(NetError::NotInFlight);
@@ -427,7 +452,7 @@ impl SimNet {
     /// Makes the next receive on `addr` fail with `kind`, as a fatal socket
     /// error would (SOCK-9), and wakes its reader. Returns whether a socket
     /// was bound there.
-    pub(crate) fn fail_next_recv(&self, addr: SocketAddr, kind: io::ErrorKind) -> bool {
+    pub fn fail_next_recv(&self, addr: SocketAddr, kind: io::ErrorKind) -> bool {
         let waker = {
             let mut state = self.lock();
             let Some(binding) = state.sockets.get_mut(&addr) else {
@@ -443,7 +468,7 @@ impl SimNet {
     }
 
     /// Everything that happened on the network so far, in order.
-    pub(crate) fn events(&self) -> Vec<NetEvent> {
+    pub fn events(&self) -> Vec<NetEvent> {
         self.lock().events.clone()
     }
 }
@@ -465,7 +490,7 @@ impl SocketFactory for SimNet {
 /// A socket bound on a [`SimNet`]. Dropping it unbinds its address and
 /// discards the datagrams it hadn't read.
 #[derive(Debug)]
-pub(crate) struct SimSocket {
+pub struct SimSocket {
     net: SimNet,
     addr: SocketAddr,
     binding: u64,
@@ -473,7 +498,7 @@ pub(crate) struct SimSocket {
 
 impl SimSocket {
     /// The address this socket is bound to.
-    pub(crate) fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 

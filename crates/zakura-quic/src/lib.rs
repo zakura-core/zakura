@@ -29,8 +29,8 @@ mod driver;
 mod endpoint;
 mod error;
 mod inputs;
-#[cfg(test)]
-mod sim_net;
+#[cfg(any(test, zakura_sim))]
+pub mod sim;
 mod socket;
 mod stream;
 pub mod sys;

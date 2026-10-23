@@ -251,13 +251,16 @@ pub(super) fn spawn_service_session(
             .await;
         });
     }
-    workers.spawn(erased(async move {
-        let _cancel_on_exit = cancel.clone().drop_guard();
-        while running.next().await.is_some() {
-            cancel.cancel();
-        }
-        let _ = exits.send(exit);
-    }));
+    workers.spawn_named(
+        "service_session",
+        erased(async move {
+            let _cancel_on_exit = cancel.clone().drop_guard();
+            while running.next().await.is_some() {
+                cancel.cancel();
+            }
+            let _ = exits.send(exit);
+        }),
+    );
     admitted
 }
 

@@ -429,14 +429,19 @@ impl<T> JoinSet<T> {
         self.tasks.is_empty()
     }
 
-    /// Spawns `task` into the set.
+    /// Spawns `task` into the set. Like [`spawn`], it labels the task with
+    /// the caller's file. [`JoinSetExt::spawn_named`] takes a stable label.
     #[track_caller]
     pub fn spawn<F>(&mut self, task: F) -> AbortHandle
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let handle = spawn(task);
+        self.insert(spawn(task))
+    }
+
+    /// Adds the spawned `handle` to the set and returns its abort handle.
+    fn insert(&mut self, handle: JoinHandle<T>) -> AbortHandle {
         let abort = handle.abort_handle();
         self.tasks.push(handle);
         abort
@@ -480,6 +485,28 @@ impl<T> JoinSet<T> {
     pub async fn shutdown(&mut self) {
         self.abort_all();
         while self.join_next().await.is_some() {}
+    }
+}
+
+/// Adds a labeled spawn to [`JoinSet`].
+pub trait JoinSetExt<T> {
+    /// Spawns `task` into the set as [`JoinSet::spawn`] does, with `label`
+    /// naming the task as in [`spawn_named`].
+    #[track_caller]
+    fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static;
+}
+
+impl<T: 'static> JoinSetExt<T> for JoinSet<T> {
+    #[track_caller]
+    fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.insert(spawn_named(label, task))
     }
 }
 

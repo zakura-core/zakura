@@ -874,32 +874,30 @@ impl Scheduler {
                 move |yielder: &TaskYielder, mut cmd: Cmd| {
                     with_run(|s| s.tasks[id.index()].yielder = yielder as *const _);
                     let mut cx = Context::from_waker(&waker);
-                    // A forced unwind is over once it reaches here. The future
-                    // is then dropped outside any unwind, so its destructors
-                    // still count points and can be stopped.
-                    let unwound = || {
+                    // Cancels the task by dropping its future. A destructor
+                    // that parks can be force-unwound in turn, and that ends
+                    // here too, as a cancel rather than a panic. Dropping
+                    // after a forced unwind is outside any unwind, so the
+                    // destructors still count points and can be stopped.
+                    let cancel = |fut| {
+                        match catch_unwind(AssertUnwindSafe(move || drop(fut))) {
+                            Err(payload) if !payload.is::<ForcedUnwind>() => {
+                                std::panic::resume_unwind(payload)
+                            }
+                            _ => {}
+                        }
                         with_run(|s| s.unwinding = s.unwinding.filter(|t| *t != id));
                         TaskExit::Cancelled
                     };
                     loop {
                         match cmd {
                             Cmd::Poll => {}
-                            Cmd::Cancel => {
-                                drop(fut);
-                                return TaskExit::Cancelled;
-                            }
-                            Cmd::Unwind => {
-                                drop(fut);
-                                return unwound();
-                            }
+                            Cmd::Cancel | Cmd::Unwind => return cancel(fut),
                         }
                         match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx))) {
                             Ok(Poll::Ready(())) => return TaskExit::Completed,
                             Ok(Poll::Pending) => cmd = yielder.suspend(Yield::Pending),
-                            Err(payload) if payload.is::<ForcedUnwind>() => {
-                                drop(fut);
-                                return unwound();
-                            }
+                            Err(payload) if payload.is::<ForcedUnwind>() => return cancel(fut),
                             Err(payload) => std::panic::resume_unwind(payload),
                         }
                     }
@@ -925,13 +923,17 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        self.shutdown_inner();
-        // A shutdown that panicked can leave coroutines suspended. Dropping
-        // one would force-unwind it through corosensei, which can run its
-        // destructors past any bound, so forget them instead.
+        // A shutdown that panics, here or in `shutdown`, can leave coroutines
+        // suspended. Dropping one would force-unwind it through corosensei,
+        // which can run its destructors past any bound, so forget them
+        // instead, whether shutdown returns or unwinds.
+        let shut_down = catch_unwind(AssertUnwindSafe(|| self.shutdown_inner()));
         std::mem::take(&mut self.coroutines)
             .into_iter()
             .flatten()
             .for_each(std::mem::forget);
+        if let Err(payload) = shut_down {
+            std::panic::resume_unwind(payload);
+        }
     }
 }

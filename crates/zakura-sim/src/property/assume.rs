@@ -27,7 +27,9 @@ pub enum Assume {
 pub struct AssumeRecord {
     /// The assumption.
     pub assume: Assume,
-    /// Its parameters, such as the link's maximum delay.
+    /// Its parameters, such as the link's maximum delay. Written with sorted
+    /// keys, so equal records write equal trace bytes.
+    #[serde(serialize_with = "crate::trace::meta::sorted")]
     pub params: serde_json::Value,
 }
 

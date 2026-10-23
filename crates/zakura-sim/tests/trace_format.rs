@@ -26,13 +26,14 @@ use zakura_sim::{
     check::{self, PropertyOutcome, PropertyReport, StepCtx},
     end::{Drain, HarnessFailure, IdleStatus},
     plan::By,
+    property::{Assume, AssumeRecord, Status},
     record::{
         CleanupRecord, DrawRecord, EndRecord, InitRecord, OutcomeKind, StepRecord, ViolationRecord,
     },
     trace::{
         meta::{
-            AssumeRecord, BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PropertyRef,
-            PropertyStatus, SchedulerRecord, RNG, UNKNOWN,
+            BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PropertyRef,
+            SchedulerRecord, RNG, UNKNOWN,
         },
         BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
@@ -1117,7 +1118,7 @@ fn meta_bytes_ignore_key_order() {
     let with = |value: &Value| MetaRecord {
         scenario: value.clone(),
         assumptions: vec![AssumeRecord {
-            assume: "bounded-delivery".into(),
+            assume: Assume::BoundedDelivery,
             params: value.clone(),
         }],
         ..meta()
@@ -1146,7 +1147,7 @@ fn json_depth_is_bounded() {
     let at_limit = MetaRecord {
         scenario: nested(MAX_JSON_DEPTH),
         assumptions: vec![AssumeRecord {
-            assume: "bounded-delivery".into(),
+            assume: Assume::BoundedDelivery,
             params: json!({ "deep": nested(MAX_JSON_DEPTH - 1) }),
         }],
         ..meta()
@@ -1170,7 +1171,7 @@ fn json_depth_is_bounded() {
             (
                 MetaRecord {
                     assumptions: vec![AssumeRecord {
-                        assume: "bounded-delivery".into(),
+                        assume: Assume::BoundedDelivery,
                         params: nested(depth),
                     }],
                     ..meta()
@@ -1206,7 +1207,7 @@ fn floats_are_refused() {
     };
     let in_params = MetaRecord {
         assumptions: vec![AssumeRecord {
-            assume: "bounded-delivery".into(),
+            assume: Assume::BoundedDelivery,
             params: nested,
         }],
         ..meta()
@@ -1230,7 +1231,7 @@ fn floats_are_refused() {
     ));
     edit_meta(dir.path(), |meta| {
         meta["scenario"] = json!({});
-        meta["assumptions"] = json!([{ "assume": "x", "params": { "d": 2e3 } }]);
+        meta["assumptions"] = json!([{ "assume": "bounded-delivery", "params": { "d": 2e3 } }]);
     });
     assert!(matches!(
         invalid(dir.path()),
@@ -1385,6 +1386,17 @@ fn edge_usize() -> impl Strategy<Value = usize> {
 /// A string that is often empty.
 fn text() -> impl Strategy<Value = String> {
     prop_oneof![Just(String::new()), any::<String>()]
+}
+
+/// Any assumption.
+fn assume() -> impl Strategy<Value = Assume> {
+    prop_oneof![
+        Just(Assume::HonestPeer),
+        Just(Assume::BoundedDelivery),
+        Just(Assume::BoundedStorage),
+        Just(Assume::BoundedAdversary),
+        Just(Assume::StableMembership),
+    ]
 }
 
 /// A list of `u64`s, often empty.
@@ -1599,9 +1611,9 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
             },
         );
     let status = prop_oneof![
-        Just(PropertyStatus::Active),
-        any::<u32>().prop_map(|issue| PropertyStatus::Known { issue }),
-        Just(PropertyStatus::Draft),
+        Just(Status::Active),
+        any::<u32>().prop_map(|issue| Status::Known { issue }),
+        Just(Status::Draft),
     ];
     let tool = prop_oneof![
         Just(DerivationTool::Recover),
@@ -1611,7 +1623,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
     ];
     let refs = (
         vec(
-            (text(), json_value()).prop_map(|(assume, params)| AssumeRecord { assume, params }),
+            (assume(), json_value()).prop_map(|(assume, params)| AssumeRecord { assume, params }),
             0..3,
         ),
         vec(

@@ -10,7 +10,7 @@ use std::{net::IpAddr, panic::AssertUnwindSafe, time::Duration};
 
 use futures::FutureExt;
 use tracing::debug;
-use zakura_node_services::task::{erased, spawn_erased};
+use zakura_node_services::task::{erased, spawn_erased_named};
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -88,12 +88,10 @@ pub(crate) fn spawn_native_discovery_dialer(
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
 ) -> JoinHandle<()> {
-    spawn_erased(run_native_discovery_dialer(
-        endpoint,
-        discovery,
-        limits,
-        sought_services,
-    ))
+    spawn_erased_named(
+        "discovery_dialer",
+        run_native_discovery_dialer(endpoint, discovery, limits, sought_services),
+    )
 }
 
 /// Seed the discovery book with the configured bootstrap peers as trusted static
@@ -452,7 +450,7 @@ async fn run_discovery_dial_once(
     }
 
     let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
-    let dial = spawn_erased({
+    let dial = spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     });

@@ -1,11 +1,8 @@
 //! Session-local completion records without a channel or future for each request.
 
-use std::{
-    num::NonZeroU64,
-    sync::{Arc, Weak},
-};
+use std::{num::NonZeroU64, sync::Arc};
 
-use zakura_rt::sync::{Mutex, PoisonError};
+use zakura_rt::sync::{downgrade, Mutex, PoisonError, Weak};
 
 /// A caller key and a unique admission on this completion queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +49,7 @@ impl Completions {
         let pending = state.pending;
         state.completed.reserve(pending);
         Completion {
-            state: Arc::downgrade(&self.0),
+            state: downgrade(&self.0),
             id: Some(CompletionId {
                 key,
                 sequence: NonZeroU64::new(state.sequence)

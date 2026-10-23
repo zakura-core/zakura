@@ -1,0 +1,380 @@
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+use zakura_header_chain::{
+    BodyWorkAuthority, BodyWorkEpoch, BranchId, ErrorCategory, Frontier, HeaderBatchInput,
+    HeaderContextFact, HeaderGeneration, HeaderRules, HeaderWorkAuthority, InsertHeaders, SourceId,
+    TargetCompletion, ValidationLease, VerifiedGeneration,
+};
+use zakura_node_services::header_chain::{AdapterKey, TargetEntries};
+use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_GENESIS_BYTES};
+
+use super::*;
+
+/// Times to check each outcome at: submission, just before and at the adapter
+/// deadline, and the VCT repair watchdog.
+const TIMES: [Duration; 4] = [
+    Duration::ZERO,
+    ADAPTER_DEADLINE.saturating_sub(Duration::from_nanos(1)),
+    ADAPTER_DEADLINE,
+    VCT_REPAIR_WATCHDOG,
+];
+
+const FAULTS: [Fault; 3] = [Fault::Timeout, Fault::Unavailable, Fault::LocalResource];
+
+/// A clock fixed at one instant, so fixture preparation never reads the host
+/// clock.
+struct FixedClock(DateTime<Utc>);
+
+impl zakura_header_chain::Clock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+/// A normal header-target owner on a made-up branch.
+fn owner() -> HeaderSyncWorkOwner {
+    HeaderWorkAuthority {
+        header_generation: HeaderGeneration::new(2),
+        branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+    }
+    .bind(3, NonZeroU64::new(4).expect("four is nonzero"))
+    .into()
+}
+
+/// Mainnet block 1 prepared on genesis and sealed for `owner`, so an apply
+/// request holds a real sealed target.
+fn prepared_target(owner: HeaderSyncWorkOwner) -> PreparedHeaderTarget {
+    let genesis: Arc<block::Block> = BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis vector deserializes");
+    let block_1: Arc<block::Block> = BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("the block 1 vector deserializes");
+    let parent = Frontier::new(block::Height(0), genesis.hash());
+    let lease = ValidationLease::new(
+        parent,
+        vec![HeaderContextFact {
+            frontier: parent,
+            header: genesis.header.clone(),
+        }],
+        Network::Mainnet,
+        [0; 32],
+    );
+    let rules = HeaderRules::for_validation_lease(&lease).expect("Mainnet has a PoW policy");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&block_1.header)),
+        parent,
+        &rules,
+        &FixedClock(block_1.header.time),
+    )
+    .expect("Mainnet block 1 prepares on genesis");
+    PreparedHeaderTarget::from_insert(
+        &AdapterKey::new(),
+        Box::new(InsertHeaders {
+            owner,
+            source: SourceId::from_digest([5; 32]),
+            parent_hash: parent.hash,
+            target_tip_hash: block_1.hash(),
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: parent,
+            },
+            batch,
+            aux: Vec::new(),
+        }),
+    )
+}
+
+/// One request per operation, in [`HeaderOp::ALL`] order.
+fn requests() -> Vec<HeaderRequest> {
+    let source = SourceId::from_digest([6; 32]);
+    let ancestor = Frontier::new(block::Height(1), block::Hash([1; 32]));
+    let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
+    let scope = owner().header_authority();
+    let path =
+        RetainedHeaderPath::from_adapter(&AdapterKey::new(), 7, source, 8, ancestor, target, scope);
+    let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("a fresh semaphore has a permit");
+    vec![
+        HeaderRequest::ContinuationLocator {
+            permit: LocatorReadPermit::new(permit),
+        },
+        HeaderRequest::VctRepairContext {
+            owner: BodyWorkAuthority {
+                header: scope,
+                verified_generation: VerifiedGeneration::new(3),
+                body_work_epoch: BodyWorkEpoch::default(),
+            }
+            .bind(8, NonZeroU64::new(9).expect("nine is nonzero")),
+            height: target.height,
+        },
+        HeaderRequest::AcquireHeaderPath(AcquirePath {
+            source,
+            session_id: 8,
+            scope,
+            target_tip_hash: target.hash,
+            locator_hashes: vec![ancestor.hash],
+        }),
+        HeaderRequest::ReadHeaderPath {
+            path: path.clone(),
+            request: ReadPath {
+                after_hash: ancestor.hash,
+                max_header_count: 1,
+                want_tree_aux: false,
+            },
+        },
+        HeaderRequest::ReleaseHeaderPath { path },
+        HeaderRequest::PrepareHeaderTarget(PrepareHeaderTarget {
+            source,
+            owner: owner(),
+            common_ancestor: ancestor,
+            target,
+            entries: TargetEntries::try_from(Vec::new()).expect("no entries fit the cap"),
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: ancestor,
+            },
+        }),
+        HeaderRequest::ApplyHeaderTarget {
+            target: prepared_target(owner()),
+        },
+        HeaderRequest::SelectedChainContains { hash: target.hash },
+    ]
+}
+
+#[test]
+fn requests_cover_every_operation_in_order() {
+    let ops: Vec<_> = requests().iter().map(HeaderRequest::op).collect();
+    assert_eq!(ops, HeaderOp::ALL);
+    for op in HeaderOp::ALL {
+        assert_eq!(
+            op.contract().op,
+            op,
+            "{} has another op's contract",
+            op.name()
+        );
+    }
+}
+
+#[test]
+fn enabled_starts_with_engine_and_repeats() {
+    for op in HeaderOp::ALL {
+        for t in TIMES {
+            let enabled: Vec<_> = op.enabled(t).collect();
+            assert_eq!(enabled.first(), Some(&Outcome::Engine), "{}", op.name());
+            assert_eq!(enabled, op.enabled(t).collect::<Vec<_>>(), "{}", op.name());
+            let mut unique = enabled.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                enabled.len(),
+                "{} repeats an outcome",
+                op.name()
+            );
+        }
+    }
+}
+
+/// Every legal fault builds a reply of the request's own operation, and every
+/// other (operation, fault, time) is refused by both `check` and
+/// `fault_reply`.
+#[test]
+fn fault_replies_match_the_contract() {
+    for request in requests() {
+        let op = request.op();
+        for t in TIMES {
+            for fault in FAULTS {
+                let legal = op.enabled(t).any(|o| o == Outcome::Fault(fault));
+                assert_eq!(op.check(Outcome::Fault(fault), t).is_ok(), legal);
+                match request.fault_reply(fault, t) {
+                    Ok(reply) => {
+                        assert!(legal, "{} built an illegal {fault:?} at {t:?}", op.name());
+                        assert_eq!(reply.op(), op);
+                    }
+                    Err(illegal) => {
+                        assert!(!legal, "{} refused a legal {fault:?} at {t:?}", op.name());
+                        assert_eq!(
+                            illegal,
+                            IllegalOutcome {
+                                op,
+                                outcome: Outcome::Fault(fault),
+                                since_submit: t,
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn timeout_waits_for_the_adapter_deadline() {
+    let just_before = ADAPTER_DEADLINE - Duration::from_nanos(1);
+    for op in HeaderOp::ALL {
+        let gated = op.contract().faults.iter().any(|&(fault, gate)| {
+            fault == Fault::Timeout && gate == FaultGate::AfterAdapterDeadline
+        });
+        let is_target = matches!(
+            op,
+            HeaderOp::PrepareHeaderTarget | HeaderOp::ApplyHeaderTarget
+        );
+        assert_eq!(gated, !is_target, "{}", op.name());
+        let timeout = Outcome::Fault(Fault::Timeout);
+        assert!(op.check(timeout, just_before).is_err(), "{}", op.name());
+        assert_eq!(op.check(timeout, ADAPTER_DEADLINE).is_ok(), gated);
+    }
+}
+
+#[test]
+fn prepare_and_apply_fault_only_with_local_resource() {
+    for op in [HeaderOp::PrepareHeaderTarget, HeaderOp::ApplyHeaderTarget] {
+        for t in TIMES {
+            assert_eq!(
+                op.enabled(t).collect::<Vec<_>>(),
+                [Outcome::Engine, Outcome::Fault(Fault::LocalResource)],
+            );
+        }
+    }
+    for op in HeaderOp::ALL {
+        if !matches!(
+            op,
+            HeaderOp::PrepareHeaderTarget | HeaderOp::ApplyHeaderTarget
+        ) {
+            assert_eq!(
+                op.enabled(Duration::ZERO).collect::<Vec<_>>(),
+                [Outcome::Engine, Outcome::Fault(Fault::Unavailable)],
+                "{}",
+                op.name()
+            );
+        }
+    }
+}
+
+/// The local-resource fault matches the production adapter's value: a local
+/// resource failure on the request owner's branch, blamed on no peer.
+#[test]
+fn local_resource_names_the_owner_branch() {
+    for request in requests() {
+        let Some(owner) = request.owner() else {
+            continue;
+        };
+        let error = match request.fault_reply(Fault::LocalResource, Duration::ZERO) {
+            Ok(HeaderReply::PrepareHeaderTarget(Err(error)))
+            | Ok(HeaderReply::ApplyHeaderTarget(Err(error))) => error,
+            other => panic!("{} gave {other:?}", request.op().name()),
+        };
+        assert_eq!(error.category, ErrorCategory::LocalResourceOrStorage);
+        assert_eq!(
+            error.subject,
+            ErrorSubject::Branch(owner.header_authority().branch)
+        );
+        assert!(!error.is_automatic_header_peer_fault());
+    }
+}
+
+#[test]
+fn only_prepare_and_apply_report_an_owner() {
+    for request in requests() {
+        let has_owner = matches!(
+            request.op(),
+            HeaderOp::PrepareHeaderTarget | HeaderOp::ApplyHeaderTarget
+        );
+        assert_eq!(
+            request.owner().is_some(),
+            has_owner,
+            "{}",
+            request.op().name()
+        );
+        if has_owner {
+            assert_eq!(request.owner(), Some(owner()));
+        }
+    }
+}
+
+/// The three deadline kinds land where the reactor and adapter put them.
+#[test]
+fn deadlines_follow_production() {
+    use HeaderOp::*;
+    for op in HeaderOp::ALL {
+        let deadlines = op.contract().deadlines;
+        let reactor = deadlines
+            .iter()
+            .any(|d| matches!(d, Deadline::Reactor { .. }));
+        let watchdog = deadlines
+            .iter()
+            .any(|d| matches!(d, Deadline::FatalWatchdog { .. }));
+        let stages: Vec<_> = deadlines
+            .iter()
+            .filter_map(|d| match d {
+                Deadline::Adapter { stage, after } => {
+                    assert_eq!(*after, ADAPTER_DEADLINE);
+                    Some(*stage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reactor,
+            matches!(op, ContinuationLocator | VctRepairContext),
+            "{}",
+            op.name()
+        );
+        assert_eq!(
+            watchdog,
+            matches!(op, PrepareHeaderTarget | ApplyHeaderTarget),
+            "{}",
+            op.name()
+        );
+        let expected: &[AdapterStage] = match op {
+            ReadHeaderPath => &[AdapterStage::StateRead, AdapterStage::FinalizedTreeAuxRead],
+            PrepareHeaderTarget => &[AdapterStage::ValidationLeaseRead],
+            ApplyHeaderTarget => &[],
+            _ => &[AdapterStage::StateRead],
+        };
+        assert_eq!(stages, expected, "{}", op.name());
+    }
+}
+
+/// Every operation that owns capacity names the events that end it, and
+/// shutdown ends all of it.
+#[test]
+fn owned_capacity_has_release_events() {
+    use HeaderOp::*;
+    for op in HeaderOp::ALL {
+        let releases = op.contract().releases;
+        let expected: &[Release] = match op {
+            ContinuationLocator => &[Release::LocatorPermitOnFinish, Release::Shutdown],
+            AcquireHeaderPath => &[
+                Release::LeaseAbandonedAcquire,
+                Release::LeaseIdleExpired,
+                Release::Shutdown,
+            ],
+            ReadHeaderPath => &[Release::LeaseConsumedByRead, Release::Shutdown],
+            ReleaseHeaderPath => &[Release::LeaseReleased, Release::Shutdown],
+            _ => &[],
+        };
+        assert_eq!(releases, expected, "{}", op.name());
+    }
+}
+
+#[test]
+fn outcome_names_are_distinct_identity_parts() {
+    let names: Vec<_> = [
+        Outcome::Engine,
+        Outcome::Fault(Fault::Timeout),
+        Outcome::Fault(Fault::Unavailable),
+        Outcome::Fault(Fault::LocalResource),
+    ]
+    .map(Outcome::name)
+    .into();
+    assert_eq!(
+        names,
+        ["engine", "timeout", "unavailable", "local-resource"]
+    );
+    for name in names {
+        assert!(!name.contains(':'), "{name} would split a storage identity");
+    }
+}

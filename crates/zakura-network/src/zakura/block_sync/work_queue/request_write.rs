@@ -1,11 +1,11 @@
 //! Ownership from provisional download reservation through the request write.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use zakura_header_chain::BodyWorkOwner;
 use zakura_rt::sync::{
     atomic::{AtomicU8, Ordering},
-    CancellationToken,
+    downgrade, CancellationToken, Weak,
 };
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
@@ -122,7 +122,7 @@ impl RequestWrite {
         inner.request_writes.insert(
             self.owner,
             RequestWriteRegistration {
-                claim: Arc::downgrade(self),
+                claim: downgrade(self),
                 status: self.status(),
             },
         );

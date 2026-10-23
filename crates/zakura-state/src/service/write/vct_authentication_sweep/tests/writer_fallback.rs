@@ -12,18 +12,31 @@ use zakura_node_services::sync_lifecycle::{
 
 use super::*;
 use crate::service::{
-    write::{BlockWriteSender, BlockWriteTaskExit, HeaderChainObservers},
+    write::{
+        BlockWriteNotice, BlockWriteSender, BlockWriteTaskExit, HeaderChainObservers,
+        NonFinalizedWriteMessage, WriteBlockWorkerTask,
+    },
     ChainTipSender,
 };
+
+type CommitResponse =
+    oneshot::Receiver<Result<block::Hash, crate::error::CommitCheckpointVerifiedError>>;
 
 struct RunningWriter {
     senders: BlockWriteSender,
     _invalid_resets: mpsc::UnboundedReceiver<block::Hash>,
     task: Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
+    repair: watch::Receiver<VctRootRepairStatus>,
 }
 
 impl RunningWriter {
+    /// Starts the production writer with an empty checkpoint queue.
     fn start(fixture: &Fixture) -> Self {
+        Self::start_queued(fixture, &[]).0
+    }
+
+    /// Queues every block before the production loop starts, preventing an idle sweep.
+    fn start_queued(fixture: &Fixture, blocks: &[Arc<Block>]) -> (Self, Vec<CommitResponse>) {
         let live = NonFinalizedState::new(&fixture.network);
         let (tip_sender, _, _) = ChainTipSender::new(None, &fixture.network);
         let (live_sender, _) = watch::channel(live.clone());
@@ -34,31 +47,55 @@ impl RunningWriter {
             epoch: LifecycleEpoch::INITIAL,
             reason: HeaderRuntimeDetachedReason::AttachmentPending,
         });
-        let (senders, invalid_resets, _, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
-            fixture.finalized_state.clone(),
-            live,
-            tip_sender,
-            live_sender,
-            true,
-            None,
-            Some(HeaderChainWriter::new(
+        let (finalized, finalized_block_write_receiver) = mpsc::unbounded_channel();
+        let (non_finalized, non_finalized_block_write_receiver) = mpsc::unbounded_channel();
+        let (invalid_block_reset_sender, invalid_resets) = mpsc::unbounded_channel();
+        let (non_finalized_write_update_sender, _) = mpsc::unbounded_channel();
+        let (vct_root_repair_sender, repair) = watch::channel(VctRootRepairStatus::default());
+        let (block_commit_sender, _) = watch::channel(BlockWriteNotice::default());
+        let mut responses = Vec::new();
+        for block in blocks {
+            let (sender, receiver) = oneshot::channel();
+            finalized
+                .send((CheckpointVerifiedBlock::from(block.clone()), sender, 0))
+                .expect("the initial checkpoint block queues");
+            responses.push(receiver);
+        }
+        let task = WriteBlockWorkerTask {
+            finalized_block_write_receiver,
+            non_finalized_block_write_receiver,
+            finalized_state: fixture.finalized_state.clone(),
+            non_finalized_state: live,
+            invalid_block_reset_sender,
+            non_finalized_write_update_sender,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: live_sender,
+            vct_root_repair_sender,
+            block_commit_sender,
+            backup_dir_path: None,
+            header_chain: Some(HeaderChainWriter::new(
                 fixture.writer.runtime.clone(),
                 fixture.writer.config.clone(),
             )),
-            false,
-            HeaderChainObservers::new(snapshots, views, readers, statuses),
-        );
-        Self {
-            senders,
-            _invalid_resets: invalid_resets,
-            task,
-        }
+            attach_header_chain_at_handoff: false,
+            header_chain_observers: HeaderChainObservers::new(snapshots, views, readers, statuses),
+        };
+        (
+            Self {
+                senders: BlockWriteSender {
+                    finalized: Some(finalized),
+                    non_finalized: Some(non_finalized),
+                },
+                _invalid_resets: invalid_resets,
+                task: Some(Arc::new(std::thread::spawn(move || task.run()))),
+                repair,
+            },
+            responses,
+        )
     }
 
-    fn queue(
-        &self,
-        block: Arc<Block>,
-    ) -> oneshot::Receiver<Result<block::Hash, crate::error::CommitCheckpointVerifiedError>> {
+    /// Sends one checkpoint block to the running production loop.
+    fn queue(&self, block: Arc<Block>) -> CommitResponse {
         let (sender, receiver) = oneshot::channel();
         self.senders
             .finalized
@@ -69,6 +106,7 @@ impl RunningWriter {
         receiver
     }
 
+    /// Requires the queued checkpoint block to commit within the fixture deadline.
     async fn commit(&self, block: Arc<Block>) {
         let expected = block.hash();
         let hash = tokio::time::timeout(Duration::from_secs(5), self.queue(block))
@@ -226,5 +264,93 @@ async fn writer_keeps_bad_roots_pending_after_freezing() {
         Some(Height(BODY_TIP + 1))
     );
     assert_eq!(fixture.finalized_state.db.history_tree().hash(), history);
+    drop(writer);
+}
+
+/// A parked checkpoint must authenticate an available honest pair while more bodies are queued.
+#[tokio::test]
+async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
+    assert_writer_recovers_crossed_disputes(false).await;
+}
+
+/// Recovery must not require metadata beyond the blocked commit's successor.
+#[tokio::test]
+async fn writer_recovers_crossed_disputes_without_following_metadata() {
+    assert_writer_recovers_crossed_disputes(true).await;
+}
+
+/// Recovers through the production loop with no further input after the crossed repair.
+async fn assert_writer_recovers_crossed_disputes(missing_following_metadata: bool) {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    let blocked = Height(BODY_TIP + 2);
+    let successor = Height(blocked.0 + 1);
+    fixture.insert_headers(
+        missing_following_metadata.then_some(Height(successor.0 + 1)),
+        Some((successor, Corruption::AuthDataRoot)),
+    );
+    let last = if missing_following_metadata {
+        blocked
+    } else {
+        successor
+    };
+    let blocks = &fixture.chain[BODY_TIP as usize + 1..=last.0 as usize];
+    let (mut writer, responses) = RunningWriter::start_queued(&fixture, blocks);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer
+            .repair
+            .wait_for(|status| status.state == VctRootRepairState::Unavailable { height: blocked }),
+    )
+    .await
+    .expect("the parked block requests metadata repair")
+    .expect("the writer keeps the repair channel open");
+    assert!(fixture
+        .authentications(blocked)
+        .contains(&TestAuxStatus::Disputed));
+
+    // The new supplier pairs a wrong predecessor with the honest successor. Both honest
+    // payloads are now retained, but the newly admitted wrong pair ranks ahead of the dispute.
+    let insert = fixture.redelivery(blocked, Some((blocked, Corruption::SaplingRoot)), 0x80);
+    let authority = crate::HeaderChainBodyEvidenceAuthority::new_test();
+    let (sender, receiver) = oneshot::channel();
+    writer
+        .senders
+        .non_finalized
+        .as_ref()
+        .expect("the control channel is open")
+        .send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
+            prepared: authority.from_registered_header_attempt(insert),
+            rsp_tx: sender,
+        })
+        .expect("the repair response reaches the production writer");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("the repair is processed")
+            .expect("the writer answers the repair")
+            .expect("the repair is coherent"),
+        ApplyResult::Committed
+    ));
+
+    // No more peer input arrives. With H+2 metadata missing, recovery authenticates only H.
+    // The committer must then reject the wrong H+1 row and retry H using the honest row.
+    for (response, block) in responses.into_iter().zip(blocks) {
+        let hash = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("the parked writer finds the already retained honest pair")
+            .expect("the writer answers every queued block")
+            .expect("the valid checkpoint block commits");
+        assert_eq!(hash, block.hash());
+    }
+    assert_eq!(
+        fixture.finalized_state.vct_fast_count(),
+        u64::from(last.0 - BODY_TIP)
+    );
+    if missing_following_metadata {
+        assert!(fixture
+            .authentications(successor)
+            .contains(&TestAuxStatus::Rejected));
+    }
     drop(writer);
 }

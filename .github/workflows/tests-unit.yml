@@ -560,6 +560,8 @@ jobs:
       - name: Record the compiler
         run: rustc +${{ matrix.toolchain }} -Vv
       # Leak suppressions match function names, so ASan needs a symbolizer.
+      # It fails to start on the scheduler's `fixtures` binary, so that
+      # binary's one deliberate leak runs in a child with leak checks off.
       # It must be named `llvm-symbolizer`, and the runner's versioned
       # `/usr/bin/llvm-symbolizer-NN` failed to start, so check that it runs.
       - name: Find a symbolizer

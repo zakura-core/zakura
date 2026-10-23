@@ -424,6 +424,19 @@ fn shutdown_finishes_a_release_sequence_in_a_drop() {
 
 #[test]
 fn panic_in_a_leftover_drop_leaves_no_run_behind() {
+    // Shutdown panics, so the scheduler leaks the run state on purpose
+    // rather than drop it while panicking. The body runs in a child with
+    // LeakSanitizer off, so ASan builds don't report that leak.
+    if !in_child("panic_in_a_leftover_drop_leaves_no_run_behind") {
+        let status = rerun_in_child(
+            "panic_in_a_leftover_drop_leaves_no_run_behind",
+            &[("ASAN_OPTIONS", "detect_leaks=0")],
+        )
+        .wait()
+        .expect("the child is ours to wait on");
+        assert!(status.success(), "the child failed: {status}");
+        return;
+    }
     use std::sync::Arc;
     struct PanicOnDrop;
     // `Waker::noop()` has no drop to panic in, so this needs its own waker.
@@ -1467,15 +1480,35 @@ fn task_panic_reaches_the_harness_with_a_replaced_panic_hook() {
     assert!(hook_calls.load(Ordering::SeqCst) >= 1);
 }
 
-/// Set in the child process that runs [`watchdog_child_spins_in_cleanup`].
-const WATCHDOG_CHILD: &str = "ZAKURA_SCHEDULER_WATCHDOG_CHILD";
+/// Names the one test a child process started by [`rerun_in_child`] runs.
+const CHILD_TEST: &str = "ZAKURA_SCHEDULER_CHILD_TEST";
+
+/// True in the child process that [`rerun_in_child`] started for `test`.
+fn in_child(test: &str) -> bool {
+    std::env::var_os(CHILD_TEST).is_some_and(|t| t == test)
+}
+
+/// Reruns this test binary for the single test `test`, with `envs` set and
+/// its output discarded.
+fn rerun_in_child(test: &str, envs: &[(&str, &str)]) -> std::process::Child {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    Command::new(exe)
+        .args(["--exact", test, "--test-threads=1"])
+        .env(CHILD_TEST, test)
+        .envs(envs.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the test binary can rerun itself")
+}
 
 /// Hangs in cleanup on purpose, but only in the child process that
 /// [`cleanup_that_never_reaches_a_point_trips_the_watchdog`] starts.
 /// Anywhere else it returns at once.
 #[test]
 fn watchdog_child_spins_in_cleanup() {
-    if std::env::var_os(WATCHDOG_CHILD).is_none() {
+    if !in_child("watchdog_child_spins_in_cleanup") {
         return;
     }
     // A destructor that waits for a flag only another task sets. Points do
@@ -1502,22 +1535,8 @@ fn watchdog_child_spins_in_cleanup() {
 
 #[test]
 fn cleanup_that_never_reaches_a_point_trips_the_watchdog() {
-    use std::{
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut child = Command::new(exe)
-        .args([
-            "--exact",
-            "watchdog_child_spins_in_cleanup",
-            "--test-threads=1",
-        ])
-        .env(WATCHDOG_CHILD, "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the test binary can rerun itself");
+    use std::time::{Duration, Instant};
+    let mut child = rerun_in_child("watchdog_child_spins_in_cleanup", &[]);
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("the child is ours to wait on") {

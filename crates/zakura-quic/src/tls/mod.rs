@@ -90,6 +90,12 @@ impl TlsConfig {
         }
     }
 
+    /// Whether the provider is rustls' ring default, field for field.
+    #[cfg(test)]
+    pub(crate) fn uses_default_provider(&self) -> bool {
+        format!("{:?}", self.provider) == format!("{:?}", rustls::crypto::ring::default_provider())
+    }
+
     /// Builds the server config, offering `alpns` in the given order (WIRE-2).
     pub(crate) fn server_config(
         &self,
@@ -202,6 +208,59 @@ mod tests {
         spki[8] = 0x71; // Ed448's OID byte.
         assert_eq!(node_id_from_spki(&spki), None);
         assert_eq!(node_id_from_spki(id.as_bytes()), None);
+    }
+
+    /// A random source that always fills with 7s.
+    #[derive(Debug)]
+    struct Sevens;
+
+    impl rustls::crypto::SecureRandom for Sevens {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+            buf.fill(7);
+            Ok(())
+        }
+    }
+
+    static SEVENS: Sevens = Sevens;
+
+    /// TLS-9: injected inputs replace only the random source and the
+    /// key-exchange groups. The cipher suites, signature algorithms and key
+    /// provider stay ring's.
+    #[test]
+    fn injected_inputs_keep_rings_suites() {
+        let ring = rustls::crypto::ring::default_provider();
+        let x25519 = rustls::crypto::ring::kx_group::X25519;
+        let inputs = EndpointInputs::default()
+            .tls_random(&SEVENS)
+            .kx_groups(vec![x25519]);
+        let tls = TlsConfig::with_inputs(&NodeSecretKey::generate(), &inputs).unwrap();
+        let provider = &tls.provider;
+        assert_eq!(
+            format!("{:?}", provider.cipher_suites),
+            format!("{:?}", ring.cipher_suites)
+        );
+        assert_eq!(
+            format!("{:?}", provider.signature_verification_algorithms),
+            format!("{:?}", ring.signature_verification_algorithms)
+        );
+        assert_eq!(
+            format!("{:?}", provider.key_provider),
+            format!("{:?}", ring.key_provider)
+        );
+        assert_eq!(format!("{:?}", provider.secure_random), "Sevens");
+        assert_eq!(
+            provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>(),
+            [x25519.name()]
+        );
+        assert!(!tls.uses_default_provider());
+
+        let tls =
+            TlsConfig::with_inputs(&NodeSecretKey::generate(), &EndpointInputs::default()).unwrap();
+        assert!(tls.uses_default_provider());
     }
 
     /// TLS-10, TLS-11, WIRE-2: no 0-RTT, no tickets, no SNI, and the ALPNs in

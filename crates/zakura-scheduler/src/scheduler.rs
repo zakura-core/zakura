@@ -763,6 +763,17 @@ impl Scheduler {
         // `zakura-rt` executor are both still installed, since destructors
         // may call hooks or queue more. Then nothing in the state runs code.
         loop {
+            // A leftover's drop may spawn, and the new task's future may wait
+            // on what a leaked task skipped, as in `leak_all`. So once a task
+            // is stuck, queued futures are leaked too, before anything drops.
+            let leaked = self.state(|s| {
+                if s.stuck.is_empty() {
+                    return Vec::new();
+                }
+                std::mem::take(&mut s.spawn_queue)
+            });
+            report.leaked += leaked.len();
+            leaked.into_iter().for_each(std::mem::forget);
             let left = self.state(RunState::take_leftovers);
             if left.is_empty() {
                 break;

@@ -777,3 +777,69 @@ fn earlier_observation_does_not_discharge_later_trigger() {
         report.properties
     );
 }
+
+/// Opens an obligation, discharged by the spinner's second lock, for each
+/// `request-<owner>` task that exits.
+fn requests_until_second_lock(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    let triggers: Vec<usize> = cx
+        .observations()
+        .enumerate()
+        .filter(|(_, obs)| exited(obs, "request-").is_some())
+        .map(|(at, _)| at)
+        .collect();
+    for at in &triggers {
+        let obligation = cx.obligation(Some(*at), Subject::Owner("p1".to_owned()), second_lock);
+        cx.oblige(obligation);
+    }
+    if triggers.is_empty() {
+        Verdict::NotApplicable
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// True if `obs` is the spinner reaching its second lock.
+fn second_lock(_: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::TaskReached { task, at, .. } if task == "spinner.1" && at == "lock#2")
+}
+
+/// Review: with `max: 1`, the spinner's second lock is one point too many.
+/// That it also matches `discharged_by` mustn't save the obligation.
+#[test]
+fn ops_bound_counts_before_discharge() {
+    let property = Property {
+        id: SERVED,
+        claim: "a request is served within one spinner lock",
+        kind: Kind::Liveness {
+            bound: LivenessBound::Ops {
+                task: "spinner.1",
+                op: Op::Lock,
+                object: None,
+                max: 1,
+            },
+        },
+        assumes: &[],
+        needs: &[Source::Schedule],
+        status: Status::Active,
+        check: requests_until_second_lock,
+        witness: None,
+    };
+    let report = report(honest(), vec![property], Assumptions::none(), |sim| {
+        exit_after(sim, "request-p1", Duration::ZERO);
+        sim.scheduler().spawn_root("spinner", async {
+            time::sleep(Duration::from_millis(1)).await;
+            let lock = Mutex::new(());
+            for _ in 0..2 {
+                drop(lock.lock().expect("no task panics holding it"));
+            }
+        });
+    });
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Violation,
+        "{:?}",
+        report.properties
+    );
+    let violation = report.end.violation.expect("the second lock expired it");
+    assert_eq!(violation.actual, "still open after 2");
+}

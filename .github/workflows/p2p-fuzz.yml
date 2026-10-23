@@ -39,6 +39,22 @@ jobs:
             # The replay reads at most 512 input bytes.
             max_len: 512
 
+          - target: block_query
+            decoder: 1
+            witness: query_witness_exercises_refusal_stale_identity_and_reset
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_fill
+            decoder: 1
+            witness: fill_witness_uses_the_retained_run
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

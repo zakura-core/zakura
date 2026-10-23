@@ -37,8 +37,12 @@ use super::{
 use crate::zakura::block_sync::state::next_height;
 use crate::zakura::block_sync::status::StatusDelivery;
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fuzz::{replay_block_query_bytes, BlockQueryReplaySummary};
 
 /// The block-sync reactor's logical state.
 #[derive(Debug)]

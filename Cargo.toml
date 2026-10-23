@@ -10,6 +10,7 @@ members = [
         "crates/zakura-scheduler",
         "crates/zakura-sim",
         "crates/zakura-state",
+        "crates/zakura-storage",
         "crates/zakura-script",
         "crates/zakura-consensus",
         "crates/zakura-rpc",

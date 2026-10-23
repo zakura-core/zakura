@@ -391,7 +391,7 @@ jobs:
       - name: Check zakurad has no simulator packages
         if: ${{ !cancelled() }}
         run: |
-          denied='^(zakura-scheduler|zakura-sim|corosensei) '
+          denied='^(zakura-scheduler|zakura-sim|zakura-storage|corosensei) '
           hits=$(cargo tree --locked -p zakura -e normal,build --target all --prefix none | grep -E "$denied" | sort -u || true)
           if [ -n "$hits" ]; then
             echo "zakurad's dependency graph contains test-only simulator packages:"

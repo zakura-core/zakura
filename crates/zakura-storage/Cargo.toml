@@ -1,0 +1,26 @@
+[package]
+name = "zakura-storage"
+version = "0.1.0"
+authors.workspace = true
+description = "Controllable storage for Zakura's P2P simulator. Internal test crate, not published"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::testing"]
+# Only the simulator will depend on it, and no published crate does.
+publish = false
+
+[dependencies]
+zakura-chain = { path = "../zakura-chain" }
+zakura-header-chain = { path = "../zakura-header-chain" }
+zakura-node-services = { path = "../zakura-node-services" }
+
+[dev-dependencies]
+chrono = { workspace = true }
+zakura-rt = { path = "../zakura-rt" }
+zakura-test = { path = "../zakura-test" }
+
+[lints]
+workspace = true

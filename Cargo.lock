@@ -3597,6 +3597,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-storage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "zakura-chain",
+ "zakura-header-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-test",
+]
+
+[[package]]
 name = "zakura-test"
 version = "4.0.0"
 dependencies = [

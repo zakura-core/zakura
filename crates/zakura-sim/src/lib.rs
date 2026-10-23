@@ -11,5 +11,14 @@
 #![cfg(zakura_sim)]
 
 pub mod identity;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the step loop, the decider's only user, lands in the next PR"
+    )
+)]
+pub mod plan;
 
 pub use identity::{Category, Identity};
+pub use plan::{HexU64, Plan, PlanChoice, PlanError, PlanInput};

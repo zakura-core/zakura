@@ -207,6 +207,7 @@ pub fn spawn(sim: &mut Sim) {
 
 /// Where `DiscoveryExchangeProgress` lives, and the lines of its
 /// `complete` and `wait_complete` bodies and of the three `mark_*` notifies.
+#[derive(Debug, PartialEq, Eq)]
 struct Sites {
     file: &'static str,
     /// `complete` through the end of `wait_complete`, the code a waiter runs
@@ -221,11 +222,16 @@ struct Sites {
 const SERVICE_RS: &str = include_str!("../../../zakura-network/src/zakura/discovery/service.rs");
 
 impl Sites {
-    /// Finds the sites in the discovery service's source, so the check
-    /// follows the code as it moves.
+    /// The sites in [`SERVICE_RS`], so the check follows the code as it
+    /// moves.
     fn find() -> Sites {
+        Sites::parse(SERVICE_RS)
+    }
+
+    /// The sites in `source`, the text of the discovery service's file.
+    fn parse(source: &str) -> Sites {
         let file = "crates/zakura-network/src/zakura/discovery/service.rs";
-        let lines: Vec<&str> = SERVICE_RS.lines().collect();
+        let lines: Vec<&str> = source.lines().collect();
         let find = |from: usize, needle: &str| {
             from + lines[from..]
                 .iter()
@@ -440,5 +446,36 @@ pub fn run_config() -> RunConfig {
         budget: 3_000,
         drain_bound: 1_000,
         ..RunConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The checker's sites come from the embedded source, and only from the
+    /// text it's given: a copy shifted down by 100 lines moves every site by
+    /// 100, while the checker's own sites stay put.
+    #[test]
+    fn sites_come_from_the_embedded_source() {
+        let built = Sites::find();
+        assert_eq!(built, Sites::parse(SERVICE_RS));
+        assert!(built.waiting.start() < built.waiting.end());
+        assert_eq!(built.marks.len(), 3);
+
+        let shifted = Sites::parse(&format!("{}{SERVICE_RS}", "\n".repeat(100)));
+        assert_eq!(
+            shifted.waiting,
+            built.waiting.start() + 100..=built.waiting.end() + 100
+        );
+        assert_eq!(
+            shifted.marks,
+            built
+                .marks
+                .iter()
+                .map(|line| line + 100)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Sites::find(), built);
     }
 }

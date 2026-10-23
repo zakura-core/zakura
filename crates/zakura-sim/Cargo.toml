@@ -29,5 +29,9 @@ zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-quic = { path = "../zakura-quic" }
 
+# build.rs hashes the source for trace `meta` records.
+[build-dependencies]
+sha2 = { workspace = true }
+
 [lints]
 workspace = true

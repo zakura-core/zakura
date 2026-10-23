@@ -1,9 +1,10 @@
 //! The header sync version 9 publisher: one session's side of the
 //! subscriptions a peer opens on this node.
 //!
-//! [`Publications`] holds the subscription rules: slots, credit, the sent
-//! cursor ring, and tombstones. This module adds what only header sync knows:
-//! which headers each page carries, and when a subscription ends.
+//! [`Publications`](crate::zakura::regulation::Publications) holds the
+//! subscription rules: slots, credit, the sent cursor ring, and tombstones.
+//! This module adds what only header sync knows: which headers each page
+//! carries, and when a subscription ends.
 //!
 //! One task per session writes every page and terminal outcome, so an outcome
 //! always follows its subscription's pages. [`Publisher::apply`] applies each
@@ -11,7 +12,8 @@
 //! in progress, so a `Grant` never queues page jobs. A `Close` ends its
 //! subscription on the next wake and abandons that subscription's page in
 //! progress. Its terminal outcome waits for no credit or output, as
-//! [`TerminalPermit::send`] describes.
+//! [`TerminalPermit::send`](crate::zakura::regulation::TerminalPermit::send)
+//! describes.
 //!
 //! Pages come from the retained-path leases in [`Port`], one lease per page,
 //! acquired and read back to back, so a lease's idle deadline covers one read
@@ -26,10 +28,14 @@
 //! [`Port::selected_chain_contains`], which walks nothing and takes no lease.
 //! Local failures wait for an update, a selected-chain change, or a capacity
 //! release, never for a timer.
+//!
+//! [`PublisherState`] holds the subscription policy, which runs without a
+//! runtime. This module holds the resources: the lock, the task, serving
+//! permits, retained-path leases, storage calls, and output slots.
 
 use std::{
-    any::Any, collections::BTreeMap, future::Future, num::NonZeroU32, ops::Bound,
-    panic::AssertUnwindSafe, pin::Pin, sync::Arc,
+    any::Any, future::Future, num::NonZeroU32, ops::ControlFlow, panic::AssertUnwindSafe, pin::Pin,
+    sync::Arc,
 };
 
 use futures::FutureExt;
@@ -49,21 +55,23 @@ use zakura_rt::{
 };
 
 use super::{
-    entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
-    SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
+    entry_bytes, Headers, HeadersOutcomeCode, Message, SubscribeHeaders,
+    HEADERS_RESPONSE_FIXED_BYTES,
 };
 use crate::zakura::{
     header_sync::{
         reactor::selected_port_aux_delivery,
-        wire::{AuxSchema, HeaderEntry, MAX_HS_RANGE},
+        wire::{AuxSchema, HeaderEntry},
     },
-    regulation::{
-        Applied, ExecutionSlots, Publications, Push, PushPermit, PushSend, SubscriptionFault,
-        SubscriptionLimits, TerminalPermit, Totals,
-    },
+    regulation::{Applied, ExecutionSlots, Push, PushPermit, PushSend, SubscriptionFault},
     wire_codec::encode_frame,
-    Frame, FramedSend,
+    FramedSend,
 };
+
+mod state;
+
+pub(crate) use state::is_legal;
+use state::{recheck, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall, Terminal};
 
 #[cfg(test)]
 mod tests;
@@ -109,92 +117,11 @@ pub(crate) enum PublisherFault {
     UnadvertisedSchema,
 }
 
-/// The fields an update must repeat from its `Open`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct Fixed {
-    target: block::Hash,
-    schema: AuxSchema,
-}
-
-/// Why a subscription waits without a page in progress. Either kind retries
-/// after a `Grant` or a selected-chain change.
-#[derive(Clone, Debug)]
-enum Stall {
-    /// State refused a lease for capacity. Also retry when the signal is
-    /// released, because state may release it only on a later lease.
-    Capacity(ServingCapacitySignal),
-    /// A local failure.
-    Local,
-}
-
-/// Where a subscription's pages have reached.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Position {
-    /// On the path to the initial target, after the last header sent, if
-    /// any.
-    Path(Option<Frontier>),
-    /// Past the initial target, after the last header sent, or after the
-    /// target if the `Open` reached it.
-    Following(Frontier),
-}
-
-impl Position {
-    /// The header the next page extends, once there is one.
-    fn last(self) -> Option<Frontier> {
-        match self {
-            Self::Path(last) => last,
-            Self::Following(last) => Some(last),
-        }
-    }
-
-    /// Whether the subscription reached its initial target.
-    fn reached(self) -> bool {
-        matches!(self, Self::Following(_))
-    }
-}
-
-/// One live subscription's header sync state.
-#[derive(Debug)]
-struct Subscription {
-    fixed: Fixed,
-    /// The `Open` locators, until the subscription reaches its target.
-    locators: Vec<block::Hash>,
-    position: Position,
-    /// The selected tip a following run leases toward until a page reaches
-    /// it, while the selected chain still contains it.
-    pin: Option<Frontier>,
-    /// A selected tip that a check without page credit found extending the
-    /// last header sent; see [`check_following`].
-    checked_tip: Option<block::Hash>,
-    /// This node's outcome, queued until the task writes it.
-    end: Option<HeadersOutcomeCode>,
-    stall: Option<Stall>,
-}
-
-impl Subscription {
-    /// Whether the subscription reached its initial target, for the outcome
-    /// windows. A locator at the target reaches it at `Open`, even before the
-    /// publisher has served anything.
-    fn reached(&self) -> bool {
-        self.position.reached() || self.locators.contains(&self.fixed.target)
-    }
-}
-
-/// The state shared between [`Publisher::apply`] and the publisher task.
-#[derive(Debug)]
-struct Shared {
-    publications: Publications<u64, Cursor>,
-    /// Live and closing subscriptions, in the same set as `publications`.
-    subscriptions: BTreeMap<u64, Subscription>,
-    /// The subscription served last, so two subscriptions take turns.
-    last_served: Option<u64>,
-}
-
 /// One session's publisher: the handle the session reader applies updates
 /// through.
 #[derive(Debug)]
 pub(crate) struct Publisher {
-    shared: Arc<Mutex<Shared>>,
+    shared: Arc<Mutex<PublisherState>>,
     wake: Arc<Notify>,
     limits: PageLimits,
 }
@@ -217,13 +144,7 @@ impl Publisher {
         limits: PageLimits,
         cancel: CancellationToken,
     ) -> (Self, JoinHandle<()>) {
-        let limits_row = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
-            .expect("SUBSCRIBE_HEADERS is a subscription row");
-        let shared = Arc::new(Mutex::new(Shared {
-            publications: Publications::new(limits_row),
-            subscriptions: BTreeMap::new(),
-            last_served: None,
-        }));
+        let shared = Arc::new(Mutex::new(PublisherState::new()));
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);
@@ -270,393 +191,6 @@ impl Publisher {
     }
 }
 
-impl Shared {
-    /// Check `update` and apply it to the subscription tools. A refused
-    /// update changes nothing.
-    fn apply(
-        &mut self,
-        update: &SubscribeHeaders,
-        limits: PageLimits,
-    ) -> Result<Applied, PublisherFault> {
-        let id = update.subscription_id;
-        let fixed = Fixed {
-            target: update.initial_target_tip_hash,
-            schema: update.tree_aux_schema,
-        };
-        match update.operation {
-            Operation::Open => {
-                if (limits.aux_schema_mask & fixed.schema.mask_bit()) != fixed.schema.mask_bit() {
-                    return Err(PublisherFault::UnadvertisedSchema);
-                }
-                self.publications.open(
-                    id,
-                    update.update_sequence,
-                    update.added_credit,
-                    update.acknowledged,
-                )?;
-                self.subscriptions.insert(
-                    id,
-                    Subscription {
-                        fixed,
-                        locators: update.locator_hashes.clone(),
-                        position: Position::Path(None),
-                        pin: None,
-                        checked_tip: None,
-                        end: None,
-                        stall: None,
-                    },
-                );
-                Ok(Applied::Live)
-            }
-            Operation::Grant | Operation::Close => {
-                // A tombstone matches by ID and sequence only, so only a
-                // live subscription checks the fixed fields.
-                let live = self.subscriptions.get(&id);
-                if live.is_some_and(|subscription| subscription.fixed != fixed) {
-                    return Err(PublisherFault::ChangedFields);
-                }
-                let applied = if update.operation == Operation::Close {
-                    self.publications
-                        .close(&id, update.update_sequence, &update.acknowledged)?
-                } else {
-                    self.publications.grant(
-                        &id,
-                        update.update_sequence,
-                        &update.acknowledged,
-                        update.added_credit,
-                    )?
-                };
-                // New credit lets a stalled subscription retry.
-                if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    subscription.stall = None;
-                }
-                Ok(applied)
-            }
-        }
-    }
-
-    /// End every subscription that is closing or has an outcome queued, in
-    /// order, and return each terminal frame with its permit.
-    ///
-    /// An outcome this node already queued wins over `SubscriptionClosed`,
-    /// as the specification requires.
-    fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<(u64, Frame, TerminalPermit)> {
-        let due: Vec<(u64, HeadersOutcomeCode)> = self
-            .subscriptions
-            .iter()
-            .filter_map(|(&id, subscription)| match subscription.end {
-                Some(outcome) => Some((id, outcome)),
-                None if self.publications.is_closing(&id) => {
-                    Some((id, HeadersOutcomeCode::SubscriptionClosed))
-                }
-                None => None,
-            })
-            .collect();
-        due.into_iter()
-            .filter_map(|(id, outcome)| {
-                let subscription = self.subscriptions.remove(&id)?;
-                debug_assert!(
-                    is_legal(
-                        outcome,
-                        self.pages_sent(&id),
-                        subscription.reached(),
-                        self.publications.is_closing(&id),
-                    ),
-                    "the publisher queued {outcome:?} outside its window"
-                );
-                let terminal = self.publications.end(&id)?;
-                metrics::counter!(
-                    "sync.header.v9.publisher.outcome",
-                    "outcome" => outcome_label(outcome),
-                )
-                .increment(1);
-                let frame =
-                    encode_frame(&Message::<HEADER_BYTES>::HeadersOutcome(HeadersOutcome {
-                        subscription_id: id,
-                        initial_target_tip_hash: subscription.fixed.target,
-                        outcome,
-                    }))
-                    .expect("an outcome for a nonzero subscription ID always encodes");
-                Some((id, frame, terminal))
-            })
-            .collect()
-    }
-
-    /// Whether `id` has sent a page: the first page closes the window of
-    /// the outcomes legal only before it.
-    fn pages_sent(&self, id: &u64) -> bool {
-        self.publications
-            .credit(id)
-            .is_some_and(|credit| credit.consumed().objects > 0)
-    }
-
-    /// Queue `outcome` for `id`, adjusted into its window. After `Close`
-    /// arrived, the subscription ends with `SubscriptionClosed` instead.
-    fn queue_end(&mut self, id: u64, outcome: HeadersOutcomeCode) {
-        if self.publications.is_closing(&id) {
-            return;
-        }
-        let pages_sent = self.pages_sent(&id);
-        if let Some(subscription) = self.subscriptions.get_mut(&id) {
-            subscription.end = Some(in_window(outcome, pages_sent, subscription.reached()));
-        }
-    }
-
-    /// The next page or check to run, if any subscription has one.
-    ///
-    /// A subscription that follows the selected chain ends here, without a
-    /// state read and even while it is stalled, when the selected tip is no
-    /// higher than its last header and differs from it.
-    fn next_job<const HEADER_BYTES: usize>(
-        &mut self,
-        selected: Option<&EngineSnapshot>,
-        limits: PageLimits,
-    ) -> Option<Job> {
-        let ids: Vec<u64> = match self.last_served {
-            Some(last) => self
-                .subscriptions
-                .range((Bound::Excluded(last), Bound::Unbounded))
-                .chain(self.subscriptions.range(..=last))
-                .map(|(&id, _)| id)
-                .collect(),
-            None => self.subscriptions.keys().copied().collect(),
-        };
-        for id in ids {
-            let Some(unspent) = self.publications.unspent(&id) else {
-                continue;
-            };
-            let Some(subscription) = self.subscriptions.get(&id) else {
-                continue;
-            };
-            if subscription.end.is_some() {
-                continue;
-            }
-            // Superseding a follower needs no state work, so a stalled one
-            // ends as soon as the selected tip drops to or below its last
-            // header.
-            if let (Position::Following(last), Some(selected)) = (subscription.position, selected) {
-                let tip = selected.frontiers.header_best;
-                if tip != last && tip.height <= last.height {
-                    self.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
-                    continue;
-                }
-            }
-            let schema = subscription.fixed.schema;
-            let count = page_room(unspent, schema, limits, HEADER_BYTES);
-            if subscription.stall.is_some() {
-                continue;
-            }
-            let job = if let Position::Following(last) = subscription.position {
-                let Some(selected) = selected else {
-                    continue;
-                };
-                let tip = selected.frontiers.header_best;
-                // The check above ended a tip at or below the last header.
-                if tip.height <= last.height {
-                    continue;
-                }
-                // With no room for a page, check each new tip once, without
-                // a page.
-                if count == 0 && subscription.checked_tip == Some(tip.hash) {
-                    continue;
-                }
-                Job {
-                    id,
-                    initial_target: subscription.fixed.target,
-                    lease_target: tip.hash,
-                    locators: vec![last.hash],
-                    parent: Some(last),
-                    probe: false,
-                    pin: subscription.pin.filter(|pin| count > 0 && *pin != tip),
-                    following: true,
-                    count,
-                    schema,
-                    selected: Some(selected.clone()),
-                }
-            } else {
-                if count == 0 {
-                    continue;
-                }
-                let target = subscription.fixed.target;
-                let last = subscription.position.last();
-                Job {
-                    id,
-                    initial_target: target,
-                    lease_target: target,
-                    locators: match last {
-                        Some(last) => vec![last.hash],
-                        None => subscription.locators.clone(),
-                    },
-                    parent: last,
-                    // Before the first page, check that the target is still
-                    // selected.
-                    probe: last.is_none()
-                        && selected
-                            .is_some_and(|selected| selected.frontiers.header_best.hash != target),
-                    pin: None,
-                    following: false,
-                    count,
-                    schema,
-                    selected: selected.cloned(),
-                }
-            };
-            self.last_served = Some(id);
-            return Some(job);
-        }
-        None
-    }
-
-    /// Record a finished job's result for its subscription.
-    ///
-    /// A stall waits for the next selected-chain change, among other wakes,
-    /// so it is not recorded when the chain `moved` since the job read it:
-    /// that change already passed, and the next pass retries at once. Nor is
-    /// a check's tip, because state may have answered on a chain the
-    /// selection has since left, even if the tip hash is the same again.
-    fn finish(&mut self, id: u64, output: Output, moved: bool) {
-        match output {
-            Output::ReachedAtOpen(target) => {
-                if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    subscription.position = Position::Following(target);
-                    subscription.locators = Vec::new();
-                }
-            }
-            Output::End(outcome) => self.queue_end(id, outcome),
-            Output::Extends(_) if moved => {}
-            Output::Extends(tip) => {
-                if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    subscription.checked_tip = Some(tip);
-                }
-            }
-            Output::Retry(reason) => {
-                metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => reason)
-                    .increment(1);
-            }
-            Output::Stall(stall, reason) => {
-                metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
-                    .increment(1);
-                if moved {
-                    return;
-                }
-                if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    subscription.stall = Some(stall);
-                }
-            }
-            Output::Page(_) => unreachable!("pages commit through `commit`"),
-        }
-    }
-
-    /// Spend credit and a cursor for `page`. Returns whether to send it.
-    ///
-    /// A subscription that ended, is closing, or has its own outcome queued
-    /// sends no more pages.
-    fn commit(&mut self, id: u64, page: &Page) -> bool {
-        let Some(subscription) = self.subscriptions.get_mut(&id) else {
-            return false;
-        };
-        if subscription.end.is_some() {
-            return false;
-        }
-        debug_assert!(
-            subscription
-                .position
-                .last()
-                .is_none_or(|last| last == page.parent),
-            "one page is in progress at a time, so it extends the last one sent"
-        );
-        let Some(consumed) = self
-            .publications
-            .credit(&id)
-            .map(|credit| credit.consumed())
-        else {
-            return false;
-        };
-        // Widening usize to u64 is lossless on supported targets.
-        let bytes = page.frame.payload.len() as u64;
-        let cursor = Cursor {
-            height: page.last.height,
-            hash: page.last.hash,
-            headers: consumed.objects.saturating_add(u64::from(page.count)),
-            bytes: consumed.bytes.saturating_add(bytes),
-        };
-        if self
-            .publications
-            .reserve_page(&id, page.count, page.frame.payload.len(), cursor)
-            .is_err()
-        {
-            return false;
-        }
-        subscription.checked_tip = None;
-        subscription.position = if page.reaches_target || subscription.position.reached() {
-            subscription.locators = Vec::new();
-            subscription.pin = (page.target != page.last).then_some(page.target);
-            Position::Following(page.last)
-        } else {
-            Position::Path(Some(page.last))
-        };
-        true
-    }
-
-    /// Clear every stall after the selected chain changed, or else the
-    /// capacity stalls whose signal was released.
-    fn clear_stalls(&mut self, all: bool) {
-        for subscription in self.subscriptions.values_mut() {
-            let clear = match &subscription.stall {
-                Some(Stall::Local) => all,
-                Some(Stall::Capacity(signal)) => all || signal.is_released(),
-                None => false,
-            };
-            if clear {
-                subscription.stall = None;
-            }
-        }
-    }
-
-    /// The capacity signals stalled subscriptions wait on.
-    fn capacity_signals(&self) -> Vec<ServingCapacitySignal> {
-        self.subscriptions
-            .values()
-            .filter_map(|subscription| match &subscription.stall {
-                Some(Stall::Capacity(signal)) => Some(signal.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-/// Whether `outcome` is legal for a subscription that has or has not sent a
-/// page, reached its target, and received `Close`: the window table of the
-/// specification.
-pub(crate) fn is_legal(
-    outcome: HeadersOutcomeCode,
-    pages_sent: bool,
-    reached: bool,
-    close_received: bool,
-) -> bool {
-    use HeadersOutcomeCode::*;
-    match outcome {
-        NoLocatorIntersection | TargetNotRetained | TargetNotSelected => !pages_sent,
-        HistoryPruned => !reached,
-        SubscriptionSuperseded => true,
-        SubscriptionClosed => close_received,
-    }
-}
-
-/// `outcome`, adjusted into its window. `SubscriptionClosed` is not one of
-/// this node's own outcomes.
-fn in_window(outcome: HeadersOutcomeCode, pages_sent: bool, reached: bool) -> HeadersOutcomeCode {
-    use HeadersOutcomeCode::*;
-    match outcome {
-        NoLocatorIntersection | TargetNotRetained | TargetNotSelected if !pages_sent => outcome,
-        NoLocatorIntersection | TargetNotRetained | TargetNotSelected | HistoryPruned
-            if !reached =>
-        {
-            HistoryPruned
-        }
-        _ => SubscriptionSuperseded,
-    }
-}
-
 /// A stable metric label for `outcome`.
 fn outcome_label(outcome: HeadersOutcomeCode) -> &'static str {
     use HeadersOutcomeCode::*;
@@ -670,21 +204,6 @@ fn outcome_label(outcome: HeadersOutcomeCode) -> &'static str {
     }
 }
 
-/// The most headers the next page may carry: the advertised count and byte
-/// limits, the unspent header and byte credit, and [`MAX_HS_RANGE`]. Zero
-/// means no legal page fits.
-fn page_room(unspent: Totals, schema: AuxSchema, limits: PageLimits, header_bytes: usize) -> u32 {
-    // Widening usize to u64 is lossless on supported targets.
-    let entry = entry_bytes(header_bytes, schema) as u64;
-    let fixed = HEADERS_RESPONSE_FIXED_BYTES as u64;
-    let fit = |bytes: u64| bytes.saturating_sub(fixed) / entry;
-    let count = u64::from(limits.max_headers.min(MAX_HS_RANGE))
-        .min(unspent.objects)
-        .min(fit(u64::from(limits.max_bytes)))
-        .min(fit(unspent.bytes));
-    u32::try_from(count).expect("the count is at most MAX_HS_RANGE")
-}
-
 /// The largest encoding of a page of `count` headers under `schema`.
 fn page_bytes(count: u32, schema: AuxSchema, header_bytes: usize) -> usize {
     // Widening u32 to usize is lossless on supported targets.
@@ -693,64 +212,13 @@ fn page_bytes(count: u32, schema: AuxSchema, header_bytes: usize) -> usize {
 
 /// Lock `shared`, recovering from a poisoned lock: every update leaves the
 /// state consistent before it can panic.
-fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+fn lock(shared: &Mutex<PublisherState>) -> MutexGuard<'_, PublisherState> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// One page's work: the lease to take and the page it may produce.
-#[derive(Clone, Debug)]
-struct Job {
-    id: u64,
-    initial_target: block::Hash,
-    /// The initial target on the path, then the selected tip.
-    lease_target: block::Hash,
-    locators: Vec<block::Hash>,
-    /// The header the page must extend, once a page was sent or the target
-    /// was reached.
-    parent: Option<Frontier>,
-    /// Whether to check, at the first page, that the selected chain still
-    /// contains the initial target.
-    probe: bool,
-    /// An older selected tip a following page leases toward instead of
-    /// `lease_target`, if the selected chain still contains it.
-    pin: Option<Frontier>,
-    following: bool,
-    count: u32,
-    schema: AuxSchema,
-    /// The selected chain the lease scope comes from.
-    selected: Option<EngineSnapshot>,
-}
-
-/// An encoded page and where it leaves its subscription.
-#[derive(Debug)]
-struct Page {
-    parent: Frontier,
-    last: Frontier,
-    /// The lease target the page lies toward.
-    target: Frontier,
-    count: u32,
-    reaches_target: bool,
-    frame: Frame,
-}
-
-/// What a job found.
-#[derive(Debug)]
-enum Output {
-    Page(Page),
-    /// A locator was the initial target, so there is no path to serve.
-    ReachedAtOpen(Frontier),
-    End(HeadersOutcomeCode),
-    Stall(Stall, &'static str),
-    /// The page left the selected chain while in progress. Read again.
-    Retry(&'static str),
-    /// A check without page credit found this selected tip extending the
-    /// last header sent.
-    Extends(block::Hash),
 }
 
 /// Everything the publisher task owns besides its stream.
 struct Task {
-    shared: Arc<Mutex<Shared>>,
+    shared: Arc<Mutex<PublisherState>>,
     wake: Arc<Notify>,
     port: Arc<dyn Port>,
     push: Push,
@@ -792,61 +260,50 @@ async fn publish<const HEADER_BYTES: usize>(
 ) {
     let mut selected = task.port.selected_chain();
     let mut selected_open = true;
-    // The page in progress, with its subscription and the selected chain its
-    // job read.
-    let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
+    // The page in progress, under the key state recorded for its job.
+    let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
-        let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
-        for (id, frame, terminal) in ended {
+        for outcome in lock(&task.shared).end_due::<HEADER_BYTES>() {
+            metrics::counter!(
+                "sync.header.v9.publisher.outcome",
+                "outcome" => outcome_label(outcome),
+            )
+            .increment(1);
+        }
+        loop {
+            let Some(terminal) = lock(&task.shared).next_terminal() else {
+                break;
+            };
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
-            if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
+            if terminal.abandons.is_some()
+                && work.as_ref().map(|(working, _)| *working) == terminal.abandons
+            {
                 work = None;
             }
-            let terminal = terminal.send(&send, frame);
-            zakura_rt::pin!(terminal);
-            // A full queue must not keep a cancelled session's task alive,
-            // hide a page job's panic, or stop another subscription's page.
-            // That page settles at once: its job gives its execution slots
-            // back, and a page that holds the queue slot this terminal waits
-            // for is queued instead of kept. A page whose subscription ends
-            // later in this batch fails its commit and is dropped.
-            loop {
-                zakura_rt::select! {
-                    biased;
-                    () = cancel.cancelled() => return,
-                    Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-                    progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
-                        if work.is_some() =>
-                    {
-                        let (id, seen, _) = work.take().expect("the page in progress just finished");
-                        if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
-                            return;
-                        }
-                    }
-                    sent = &mut terminal => {
-                        if !sent {
-                            return;
-                        }
-                        break;
-                    }
-                }
+            let written = write_terminal(
+                &task.shared,
+                &selected,
+                &send,
+                terminal,
+                &mut work,
+                &mut panicked,
+                &cancel,
+            );
+            if written.await.is_break() {
+                return;
             }
         }
         if work.is_none() {
             let snapshot = selected.borrow().clone();
             let mut shared = lock(&task.shared);
             let job = shared.next_job::<HEADER_BYTES>(snapshot.as_ref(), task.limits);
-            let ending = shared
-                .subscriptions
-                .values()
-                .any(|subscription| subscription.end.is_some());
+            let ending = shared.end_queued();
             drop(shared);
             if let Some(job) = job {
-                let id = job.id;
-                let seen = job.selected.clone();
+                let key = job.key;
                 let page = start_page::<HEADER_BYTES>(&task, job, &send, selected.clone());
-                work = Some((id, seen, page));
+                work = Some((key, page));
             }
             if ending {
                 continue;
@@ -857,54 +314,109 @@ async fn publish<const HEADER_BYTES: usize>(
         // it. Each wake still reaches `end_due` on the next pass.
         zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => {
+                lock(&task.shared).cancelled();
+                return;
+            }
             // See `Publisher::spawn`.
             Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-            progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
+            progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
                 if work.is_some() =>
             {
-                let (id, seen, _) = work.take().expect("the page in progress just finished");
-                if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                let (key, _) = work.take().expect("the page in progress just finished");
+                if settle(&task.shared, &selected, key, progress).is_break() {
                     return;
                 }
             }
             () = task.wake.notified() => {}
             changed = selected.changed(), if selected_open => {
                 if changed.is_ok() {
-                    lock(&task.shared).clear_stalls(true);
+                    lock(&task.shared).selected_changed();
                 } else {
                     selected_open = false;
                 }
             }
-            () = any_released(capacity) => lock(&task.shared).clear_stalls(false),
+            () = any_released(capacity) => {
+                let mut shared = lock(&task.shared);
+                let released: Vec<ServingCapacitySignal> = shared
+                    .capacity_signals()
+                    .into_iter()
+                    .filter(ServingCapacitySignal::is_released)
+                    .collect();
+                shared.capacity_released(&released);
+            }
         }
     }
 }
 
-/// Apply a finished page or job to subscription `id`, whose job read the
-/// selected chain `seen`. Returns false when the stream closed.
-fn settle(
-    shared: &Mutex<Shared>,
+/// Write `terminal` on `send`, and report the result to state.
+///
+/// A full queue must not keep a cancelled session's task alive, hide a page
+/// job's panic, or stop another subscription's page. That page settles at
+/// once: its job gives its execution slots back, and a page that holds the
+/// queue slot this terminal waits for is queued instead of kept. A page whose
+/// subscription ended in the same batch fails its commit and is dropped.
+async fn write_terminal<'a>(
+    shared: &Mutex<PublisherState>,
     selected: &watch::Receiver<Option<EngineSnapshot>>,
-    id: u64,
-    seen: Option<&EngineSnapshot>,
+    send: &'a FramedSend,
+    terminal: Terminal,
+    work: &mut Option<(JobKey, Work<'a>)>,
+    panicked: &mut mpsc::Receiver<Box<dyn Any + Send>>,
+    cancel: &CancellationToken,
+) -> ControlFlow<Exit> {
+    let written = terminal.permit.send(send, terminal.frame);
+    zakura_rt::pin!(written);
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return ControlFlow::Break(lock(shared).cancelled()),
+            Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
+            progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
+                if work.is_some() =>
+            {
+                let (key, _) = work.take().expect("the page in progress just finished");
+                settle(shared, selected, key, progress)?;
+            }
+            written = &mut written => return lock(shared).terminal_written(written),
+        }
+    }
+}
+
+/// Report the finished page or result of job `key` to state, and write a
+/// page that state commits. Breaks when the stream or the runtime closed.
+fn settle(
+    shared: &Mutex<PublisherState>,
+    selected: &watch::Receiver<Option<EngineSnapshot>>,
+    key: JobKey,
     progress: Progress<'_>,
-) -> bool {
+) -> ControlFlow<Exit> {
     match progress {
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
         Progress::Page(page, slot) => {
-            if lock(shared).commit(id, &page) {
+            if lock(shared).commit(key, &page) {
                 slot.send(page.frame);
             }
-            true
+            ControlFlow::Continue(())
         }
         Progress::Other(output) => {
-            let moved = selected.borrow().as_ref() != seen;
-            lock(shared).finish(id, output, moved);
-            true
+            match &output {
+                Output::Retry(reason) => {
+                    metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => *reason)
+                        .increment(1);
+                }
+                Output::Stall(_, reason) => {
+                    metrics::counter!("sync.header.v9.publisher.stall", "reason" => *reason)
+                        .increment(1);
+                }
+                _ => {}
+            }
+            let latest = selected.borrow().clone();
+            lock(shared).finish(key, output, latest.as_ref());
+            ControlFlow::Continue(())
         }
-        Progress::Closed => false,
+        Progress::Closed => ControlFlow::Break(lock(shared).closed()),
     }
 }
 
@@ -985,12 +497,11 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// Whether the latest selected chain still contains the last header of a
 /// following `page`, whose job read the selected chain `seen`.
 ///
-/// It asks state only when the selected chain moved since `seen` and its tip
-/// is neither the page's lease target nor its last header. Only a reply that
-/// confirms the page keeps it. Anything else drops the page, and the next pass
-/// leases again from the last header sent, where the usual stall and outcome
-/// rules apply. The query is state work, so it waits for execution slots
-/// through `push` as the page's read did.
+/// It asks state only when [`recheck`] returns [`Recheck::Query`]. Only a
+/// reply that confirms the page keeps it. Anything else drops the page, and
+/// the next pass leases again from the last header sent, where the usual
+/// stall and outcome rules apply. The query is state work, so it waits for
+/// execution slots through `push` as the page's read did.
 ///
 /// One query is enough: state answers from its latest committed chain, which
 /// is at least as new as the watch. A reorganization can still overtake any
@@ -1004,15 +515,11 @@ async fn still_selected(
     seen: Option<EngineSnapshot>,
     page: &Page,
 ) -> bool {
-    let Some(latest) = selected.borrow().clone() else {
-        return true;
-    };
-    let tip = latest.frontiers.header_best;
-    if seen.as_ref() == Some(&latest) || tip == page.target || tip == page.last {
-        return true;
-    }
-    if tip.height <= page.last.height {
-        return false;
+    let latest = selected.borrow().clone();
+    match recheck(seen.as_ref(), latest.as_ref(), page) {
+        Recheck::Keep => return true,
+        Recheck::Drop => return false,
+        Recheck::Query => {}
     }
     let _execution = push.execution().await;
     match port.selected_chain_contains(page.last.hash).await {

@@ -382,7 +382,7 @@ async fn read_page(
 ) -> Result<(), SinkReject> {
     use crate::zakura::header_sync::{
         config::REGTEST_HEADER_BYTES,
-        pipe::run_peer,
+        peer::run_peer,
         v9::{LeaseOwner, Publisher},
     };
 

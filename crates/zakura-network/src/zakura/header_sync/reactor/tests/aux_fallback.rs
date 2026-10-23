@@ -393,13 +393,11 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
     reactor.handle_outcome(
         peer.clone(),
         1,
-        v9::Ended {
-            id: open.subscription_id,
-            outcome: HeadersOutcomeCode::HistoryPruned,
-            pages: 0,
-            reached: false,
-            accepted: open.acknowledged,
-        },
+        v9::Ended::seeded(
+            open.subscription_id,
+            HeadersOutcomeCode::HistoryPruned,
+            open.acknowledged,
+        ),
     );
     assert!(reactor
         .state

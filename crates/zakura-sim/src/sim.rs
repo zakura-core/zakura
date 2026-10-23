@@ -87,7 +87,8 @@ pub struct RunReport {
 
 /// One simulated run.
 pub struct Sim {
-    sched: Scheduler,
+    /// `None` once shut down.
+    sched: Option<Scheduler>,
     /// Shared with the draw callback. See [`draws`].
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
@@ -110,7 +111,7 @@ impl Sim {
         let failure = Failure::default();
         draws::install(&mut sched, &choices, &failure);
         Sim {
-            sched,
+            sched: Some(sched),
             choices,
             failure,
             sources: Vec::new(),
@@ -121,7 +122,7 @@ impl Sim {
     /// The run's scheduler, for setup such as spawning the tasks under test.
     /// Draws in setup code are recorded in the `init` record.
     pub fn scheduler(&mut self) -> &mut Scheduler {
-        &mut self.sched
+        self.sched_mut()
     }
 
     /// Adds a source of actions outside the scheduler.
@@ -157,9 +158,8 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
-        self.choices.borrow_mut().set_owner(Owner::Done);
         state.log.freeze();
-        let cleanup = self.sched.shutdown();
+        let cleanup = self.shut_down();
         sink.record(Record::End(end_record(&end, &properties, cleanup)));
         RunReport {
             end,
@@ -169,6 +169,36 @@ impl Sim {
             picks: state.picks,
             resolved: self.choices.borrow().decider.resolved(),
         }
+    }
+
+    /// The run's scheduler, until shutdown.
+    fn sched(&self) -> &Scheduler {
+        self.sched
+            .as_ref()
+            .expect("only run and drop shut the scheduler down, and nothing uses it after")
+    }
+
+    /// [`sched`](Self::sched), mutably.
+    fn sched_mut(&mut self) -> &mut Scheduler {
+        self.sched
+            .as_mut()
+            .expect("only run and drop shut the scheduler down, and nothing uses it after")
+    }
+
+    /// Shuts the scheduler down, once. If it abandoned the run, which it does
+    /// only when a task got stuck, the sources are forgotten too, since
+    /// dropping one could wait on something a leaked task never released.
+    fn shut_down(&mut self) -> CleanupReport {
+        let Some(sched) = self.sched.take() else {
+            return CleanupReport::default();
+        };
+        // Cleanup draws take the rotating default, unrecorded.
+        self.choices.borrow_mut().set_owner(Owner::Done);
+        let cleanup = sched.shutdown();
+        if cleanup.leaked > 0 {
+            std::mem::forget(std::mem::take(&mut self.sources));
+        }
+        cleanup
     }
 
     /// Steps until the run ends.
@@ -195,7 +225,7 @@ impl Sim {
                 // Exhausted only if the bound cut off work still waiting.
                 return st.end_budget(drained, !ready.is_empty());
             }
-            let now = self.sched.now();
+            let now = self.sched().now();
             let offers: Vec<Offer> = match phase {
                 Phase::Live => self.sources.iter().map(|s| offer(&**s, now)).collect(),
                 Phase::Drain => Vec::new(),
@@ -204,7 +234,7 @@ impl Sim {
                 phase,
                 now,
                 ready: &ready,
-                next_deadline: self.sched.next_deadline(),
+                next_deadline: self.sched().next_deadline(),
                 offers: &offers,
             }) {
                 Ok(enabled) => enabled,
@@ -217,7 +247,7 @@ impl Sim {
             if enabled.is_empty() {
                 return match phase {
                     Phase::Drain => st.end_budget(drained, false),
-                    Phase::Live => match idle_status(self.sched.status()) {
+                    Phase::Live => match idle_status(self.sched().status()) {
                         Ok(status) => st.end(Outcome::Idle { status }),
                         Err(failure) => st.end_harness(failure),
                     },
@@ -284,7 +314,7 @@ impl Sim {
             };
             // Only a clock that moved ends the instant. An advance to now, or
             // a step where tasks wait while a source acts, doesn't.
-            if self.sched.now() > now {
+            if self.sched().now() > now {
                 at_instant = 0;
             } else {
                 at_instant += 1;
@@ -294,8 +324,8 @@ impl Sim {
                 pick: &chosen.identity,
                 enabled: &enabled,
                 phase,
-                now: self.sched.now(),
-                status: self.sched.status(),
+                now: self.sched().now(),
+                status: self.sched().status(),
                 log: &st.log,
             };
             let violation = checker.after_step(&cx);
@@ -336,13 +366,13 @@ impl Sim {
     /// run that ends this way isn't spinning, however many steps its last
     /// instant took.
     fn nothing_enabled(&self, ready: &[(Identity, TaskId)]) -> bool {
-        let now = self.sched.now();
+        let now = self.sched().now();
         let offers: Vec<Offer> = self.sources.iter().map(|s| offer(&**s, now)).collect();
         enabled_set(&EnabledInputs {
             phase: Phase::Live,
             now,
             ready,
-            next_deadline: self.sched.next_deadline(),
+            next_deadline: self.sched().next_deadline(),
             offers: &offers,
         })
         .is_ok_and(|enabled| enabled.is_empty())
@@ -353,7 +383,7 @@ impl Sim {
         match action {
             Action::RunTask(task) => {
                 let name = st.names[&task].clone();
-                let obs = match self.sched.run(task) {
+                let obs = match self.sched_mut().run(task) {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
@@ -368,7 +398,7 @@ impl Sim {
                 st.log.push(obs);
             }
             Action::AdvanceTime(to) => {
-                let fired = self.sched.advance_to(to).len();
+                let fired = self.sched_mut().advance_to(to).len();
                 st.log.push(Observation::TimeAdvanced {
                     // u64 nanoseconds cover 584 years of virtual time.
                     to_ns: u64::try_from(to.since_start().as_nanos()).unwrap_or(u64::MAX),
@@ -382,14 +412,14 @@ impl Sim {
     /// The scheduler's ready tasks with their identities. Records each task
     /// seen for the first time as spawned.
     fn ready(&self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
-        let ready = self.sched.ready();
+        let ready = self.sched().ready();
         let mut out = Vec::with_capacity(ready.len());
         for r in ready {
             let name = match st.names.get(&r.task) {
                 Some(name) => name.clone(),
                 None => {
                     // A task's name never changes, so it's read once.
-                    let name = self.sched.task_name(r.task);
+                    let name = self.sched().task_name(r.task);
                     if name.contains(':') {
                         return Err(HarnessFailure::TaskNameHasColon { name });
                     }
@@ -486,6 +516,14 @@ fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupRepor
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
         properties: properties.to_vec(),
+    }
+}
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        // A sim dropped without `run` still shuts down, and forgets its
+        // sources the same way when the run was abandoned.
+        self.shut_down();
     }
 }
 

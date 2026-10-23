@@ -19,13 +19,13 @@ fn zakura_sim(args: &[&str]) -> Output {
 fn record_an_input() {
     let dir = TempDir::new().unwrap();
     let input = dir.path().join("input");
-    // Scenario bytes for the planted race on 2 workers, then Plan bytes.
+    // Discovery's scenario prefix is empty, so these are all Plan bytes.
     std::fs::write(&input, [0, 1, 7, 3, 9, 1, 4, 2]).unwrap();
     let out = dir.path().join("trace");
     let output = zakura_sim(&[
         "record",
         "--sim",
-        "race/lost-update",
+        "discovery/wait-complete",
         "--input",
         input.to_str().unwrap(),
         "--out",
@@ -33,11 +33,8 @@ fn record_an_input() {
     ]);
     assert!(output.status.success(), "{output:?}");
     let trace = TraceReader::open(&out).unwrap();
-    assert_eq!(trace.meta.sim, "race/lost-update");
-    assert_eq!(
-        trace.meta.scenario,
-        serde_json::json!({ "variant": "base", "workers": 2 })
-    );
+    assert_eq!(trace.meta.sim, "discovery/wait-complete");
+    assert_eq!(trace.meta.scenario, serde_json::json!({}));
     assert_eq!(
         std::fs::read(out.join(INPUT_FILE)).unwrap(),
         std::fs::read(&input).unwrap()
@@ -92,15 +89,21 @@ fn usage_errors_exit_2() {
         vec![
             "record",
             "--sim",
-            "race/ab-ba",
+            "header-sync/smoke",
             "--out",
             out.to_str().unwrap(),
         ],
-        vec!["record", "--sim", "race/ab-ba", "--sim", "race/ab-ba"],
         vec![
             "record",
             "--sim",
-            "race/ab-ba",
+            "header-sync/smoke",
+            "--sim",
+            "header-sync/smoke",
+        ],
+        vec![
+            "record",
+            "--sim",
+            "header-sync/smoke",
             "--scenario",
             "not json",
             "--plan",
@@ -124,9 +127,9 @@ fn a_scenario_that_does_not_fit_fails() {
     let output = zakura_sim(&[
         "record",
         "--sim",
-        "race/ab-ba",
+        "header-sync/smoke",
         "--scenario",
-        r#"{"variant":"sideways","workers":2}"#,
+        r#"{"peers":2}"#,
         "--plan",
         plan.to_str().unwrap(),
         "--out",

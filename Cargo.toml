@@ -61,7 +61,6 @@ base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = { version = "=4.0.0", package = "zakura-bellman" }
 bitflags = "2.9"
-bitvec = "1.0"
 blake2b_simd = "1.0"
 bls12_381 = { version = "=4.0.0", package = "zakura-bls12-381" }
 bs58 = "0.5"

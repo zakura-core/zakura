@@ -352,3 +352,35 @@ fn peer_waits_for_its_opening_across_an_unrelated_advance() {
         "the second action ran at {at} ns: {times:?}"
     );
 }
+
+#[test]
+fn a_raw_timer_behind_the_clock_fires_now() {
+    let report = run(
+        config(1, 100),
+        zakura_sim::Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("late", async {
+                time::sleep(Duration::from_millis(10)).await;
+                // The raw hook, unlike `zakura-rt`, doesn't clamp a deadline
+                // that's already past.
+                let mut registered = false;
+                std::future::poll_fn(|cx| {
+                    if registered {
+                        return std::task::Poll::Ready(());
+                    }
+                    registered = true;
+                    zakura_scheduler::hooks::register_timer(SimInstant::ZERO, cx.waker());
+                    std::task::Poll::Pending
+                })
+                .await;
+            });
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(advances(&report), [10 * MS, 10 * MS]);
+    assert!(report.log.entries().iter().any(|e| matches!(
+        &e.obs,
+        Observation::TaskExited { task, .. } if task == "late.1"
+    )));
+    assert!(matches!(report.end.outcome, Outcome::Idle { .. }));
+}

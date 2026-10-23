@@ -329,12 +329,24 @@ fn deadlines_follow_production() {
             op.name()
         );
         let expected: &[AdapterStage] = match op {
-            ReadHeaderPath => &[AdapterStage::StateRead, AdapterStage::FinalizedTreeAuxRead],
+            ReadHeaderPath => &[
+                AdapterStage::StateRead,
+                AdapterStage::FinalizedBodySizesRead,
+                AdapterStage::FinalizedTreeAuxRead,
+            ],
             PrepareHeaderTarget => &[AdapterStage::ValidationLeaseRead],
             ApplyHeaderTarget => &[],
             _ => &[AdapterStage::StateRead],
         };
         assert_eq!(stages, expected, "{}", op.name());
+        // Only the body-size stage serves a degraded reply instead of failing.
+        for stage in stages {
+            assert_eq!(
+                stage.degrades(),
+                stage == AdapterStage::FinalizedBodySizesRead,
+                "{stage:?}"
+            );
+        }
     }
 }
 

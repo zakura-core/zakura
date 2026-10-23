@@ -56,7 +56,12 @@
 //! moment later, and a release can time out after releasing. Histories where
 //! the work ran anyway after a fault are excluded for now, as is the API
 //! draft's Ambiguous outcome. Both would need an operation split into
-//! separate execute and reply stages.
+//! separate execute and reply stages. A page read whose tree-root stage fails
+//! after its path read consumed the lease is one of these histories.
+//!
+//! The body-size fallback needs no outcome of its own. Header fixtures commit
+//! no block bodies, so the engine adapter serves every size as unknown, which
+//! is the same page the fallback gives.
 //!
 //! # Execution
 //!
@@ -82,11 +87,19 @@
 //!   reactor drops its future and treats the result as missing. The operation
 //!   stays pending.
 //! * The production adapter wraps each state read in [`ADAPTER_DEADLINE`].
-//!   That bounds the whole operation for the locator, VCT context, path,
-//!   membership and release calls. A page read with tree roots makes further
-//!   state reads, each bounded the same way. For prepare it bounds only the
-//!   validation-lease read, and the result is `local-resource`. Apply has no
-//!   adapter deadline. Its 30 s loop only logs diagnostics.
+//!   That bounds the whole operation for the locator, VCT context, acquire,
+//!   membership and release calls. A page read has up to three stages, in
+//!   order, each bounded the same way:
+//!   1. The path read, which consumes the lease when it returns a page.
+//!   2. The committed body sizes of a nonempty page's headers. If this read
+//!      fails or times out, the reply is still a successful `Page` with every
+//!      size unknown.
+//!   3. The finalized tree roots, only when the caller asked for them. A
+//!      failure here fails the read with `timeout` or `unavailable`.
+//!
+//!   For prepare it bounds only the validation-lease read, and the result is
+//!   `local-resource`. Apply has no adapter deadline. Its 30 s loop only logs
+//!   diagnostics.
 //! * The 30 min VCT repair deadline ([`VCT_REPAIR_WATCHDOG`]) is a fatal
 //!   watchdog, not a timeout. It covers prepare and apply for a selected
 //!   auxiliary repair. When it passes the reactor reports a fatal event and the
@@ -213,12 +226,23 @@ pub enum AdapterStage {
     /// The operation's own state read, which bounds the whole operation
     /// unless more stages follow it.
     StateRead,
+    /// The body-size read a page read makes for a nonempty page. Its failure
+    /// degrades the page instead of failing it.
+    FinalizedBodySizesRead,
     /// The finalized-root reads a page read makes when the caller asked for
     /// tree roots.
     FinalizedTreeAuxRead,
     /// Prepare's validation-lease read. The rest of preparation has no
     /// deadline.
     ValidationLeaseRead,
+}
+
+impl AdapterStage {
+    /// Whether a failure or timeout at this stage still gives a successful
+    /// reply. Only the body-size read does: it serves every size as unknown.
+    pub const fn degrades(self) -> bool {
+        matches!(self, AdapterStage::FinalizedBodySizesRead)
+    }
 }
 
 /// A deadline around an operation. The module doc explains each kind.
@@ -380,6 +404,10 @@ static CONTRACTS: [OpContract; 8] = [
         faults: PORT_FAULTS,
         deadlines: &[
             STATE_READ_DEADLINE,
+            Deadline::Adapter {
+                stage: AdapterStage::FinalizedBodySizesRead,
+                after: ADAPTER_DEADLINE,
+            },
             Deadline::Adapter {
                 stage: AdapterStage::FinalizedTreeAuxRead,
                 after: ADAPTER_DEADLINE,

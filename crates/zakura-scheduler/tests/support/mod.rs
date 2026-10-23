@@ -35,11 +35,11 @@ pub struct RunResult {
 }
 
 /// A seeded random walk over the options at each step.
-struct Walk(u64);
+pub struct Walk(pub u64);
 
 impl Walk {
     /// Picks an index below `n` (SplitMix64).
-    fn pick(&mut self, n: usize) -> usize {
+    pub fn pick(&mut self, n: usize) -> usize {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -68,10 +68,23 @@ pub fn run_fixture(
     };
     let mut sched = Scheduler::new(config, SimInstant::ZERO);
     let check = setup(&mut sched);
-    let mut walk = Walk(seed);
     let mut picks = Vec::new();
     let mut panics = Vec::new();
-    let status = loop {
+    let status = drive(&mut sched, seed, &mut picks, &mut panics);
+    finish(sched, status, picks, panics, check)
+}
+
+/// Picks ready tasks at random with `seed` until the run can't go on,
+/// advancing time only when no task is ready. Appends each pick, as in
+/// [`RunResult::picks`], and each panic message.
+pub fn drive(
+    sched: &mut Scheduler,
+    seed: u64,
+    picks: &mut Vec<String>,
+    panics: &mut Vec<String>,
+) -> Status {
+    let mut walk = Walk(seed);
+    loop {
         if picks.len() >= MAX_STEPS {
             panic!("fixture didn't finish in {MAX_STEPS} steps");
         }
@@ -79,19 +92,47 @@ pub fn run_fixture(
             Status::Running => {
                 let ready = sched.ready();
                 let t = ready[walk.pick(ready.len())];
-                picks.push(format!("{}:{}", sched.task_name(t.task), t.at));
-                if let RunOutcome::Panicked(msg) = sched.run(t.task) {
-                    panics.push(msg);
-                }
+                pick(sched, t.task, picks, panics);
             }
             Status::WaitingOnTime => {
                 let next = sched.next_deadline().expect("WaitingOnTime has a timer");
                 sched.advance_to(next);
                 picks.push("advance-time".into());
             }
-            other => break other,
+            other => return other,
         }
-    };
+    }
+}
+
+/// Runs `task` for one step, recording the pick and any panic.
+fn pick(
+    sched: &mut Scheduler,
+    task: TaskId,
+    picks: &mut Vec<String>,
+    panics: &mut Vec<String>,
+) -> RunOutcome {
+    let at = sched
+        .ready()
+        .into_iter()
+        .find(|t| t.task == task)
+        .expect("only ready tasks are picked")
+        .at;
+    picks.push(format!("{}:{at}", sched.task_name(task)));
+    let outcome = sched.run(task);
+    if let RunOutcome::Panicked(msg) = &outcome {
+        panics.push(msg.clone());
+    }
+    outcome
+}
+
+/// Shuts the run down and applies the fixture's check.
+fn finish(
+    sched: Scheduler,
+    status: Status,
+    picks: Vec<String>,
+    panics: Vec<String>,
+    check: Check,
+) -> (RunResult, Option<String>) {
     let report = sched.shutdown();
     let result = RunResult {
         status,
@@ -102,6 +143,51 @@ pub fn run_fixture(
     };
     let violation = check(&result);
     (result, violation)
+}
+
+/// Replays a saved schedule: a list of task names, such as `inc_a.1`, to
+/// run in order. A name whose task already finished is skipped, so a fixed
+/// version with fewer steps can replay the schedule of a planted race. After
+/// the schedule, the run goes on with seed 0, as [`run_fixture`] would.
+///
+/// Returns an error naming the first entry whose task isn't ready, as when
+/// one worker rules out an interleaving.
+pub fn replay(
+    workers: u16,
+    schedule: &[&str],
+    setup: impl FnOnce(&mut Scheduler) -> Check,
+) -> Result<(RunResult, Option<String>), String> {
+    let config = SchedulerConfig {
+        workers,
+        stack_size: 64 * 1024,
+        ..SchedulerConfig::default()
+    };
+    let mut sched = Scheduler::new(config, SimInstant::ZERO);
+    let check = setup(&mut sched);
+    let mut picks = Vec::new();
+    let mut panics = Vec::new();
+    let mut finished = std::collections::BTreeSet::new();
+    for (step, name) in schedule.iter().enumerate() {
+        if finished.contains(name) {
+            continue;
+        }
+        let Some(task) = sched
+            .ready()
+            .into_iter()
+            .find(|t| sched.task_name(t.task) == *name)
+        else {
+            return Err(format!("step {step}: {name} isn't ready"));
+        };
+        let outcome = pick(&mut sched, task.task, &mut picks, &mut panics);
+        if matches!(
+            outcome,
+            RunOutcome::Completed | RunOutcome::Cancelled | RunOutcome::Panicked(_)
+        ) {
+            finished.insert(*name);
+        }
+    }
+    let status = drive(&mut sched, 0, &mut picks, &mut panics);
+    Ok(finish(sched, status, picks, panics, check))
 }
 
 /// The first seed below `seeds` whose run violates the fixture's check.
@@ -128,6 +214,15 @@ impl Atomic {
     pub fn store(&self, v: u64) {
         hooks::preempt(Point::here(Op::AtomicStore));
         self.0.set(v)
+    }
+
+    /// Adds `v` in one step, with one preemption point before it.
+    #[track_caller]
+    pub fn fetch_add(&self, v: u64) -> u64 {
+        hooks::preempt(Point::here(Op::AtomicRmw));
+        let old = self.0.get();
+        self.0.set(old + v);
+        old
     }
 
     /// Reads without a preemption point, for checks.

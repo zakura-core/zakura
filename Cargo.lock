@@ -3549,6 +3549,7 @@ dependencies = [
 name = "zakura-sim"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "proptest",
  "rand 0.10.2",
  "serde",

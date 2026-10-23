@@ -17,6 +17,9 @@ zakura-scheduler = { path = "../zakura-scheduler" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# O_NOFOLLOW and O_NONBLOCK, so the trace reader never follows a symlink or
+# blocks on a FIFO.
+libc = { workspace = true }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }

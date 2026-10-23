@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     meta::{hex, MetaRecord},
-    read::{Missing, ReadError},
-    BLOBS_DIR, TRACE_FILE,
+    read::{read_bounded, Missing, ReadError},
+    BLOBS_DIR, MAX_BLOB_BYTES, TRACE_FILE,
 };
 use crate::{Record, RecordSink};
 
@@ -105,7 +105,8 @@ impl BlobStore {
 
     /// The blob named `sha256`, from the first directory that has it. A copy
     /// whose contents don't hash to its name is a [`Missing::DigestMismatch`],
-    /// even when a later directory has a good one.
+    /// even when a later directory has a good one. A copy that isn't a
+    /// regular file, or is over [`MAX_BLOB_BYTES`], is refused.
     pub fn get(&self, sha256: &str) -> Result<Vec<u8>, ReadError> {
         let missing = || {
             ReadError::Missing(Missing::MissingBlob {
@@ -117,15 +118,14 @@ impl BlobStore {
             return Err(missing());
         }
         for dir in &self.dirs {
-            match fs::read(dir.join(sha256)) {
-                Ok(bytes) if hex(&Sha256::digest(&bytes)) == sha256 => return Ok(bytes),
-                Ok(_) => {
+            match read_bounded(&dir.join(sha256), MAX_BLOB_BYTES)? {
+                Some(bytes) if hex(&Sha256::digest(&bytes)) == sha256 => return Ok(bytes),
+                Some(_) => {
                     return Err(ReadError::Missing(Missing::DigestMismatch {
                         sha256: sha256.to_owned(),
                     }))
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ReadError::Io(error)),
+                None => {}
             }
         }
         Err(missing())

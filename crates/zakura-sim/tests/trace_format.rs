@@ -34,8 +34,8 @@ use zakura_sim::{
             AssumeRecord, BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PropertyRef,
             PropertyStatus, SchedulerRecord, RNG, UNKNOWN,
         },
-        BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, TraceReader,
-        TRACE_FILE,
+        BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
+        TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
     },
     Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RunConfig, RunReport, Sim,
     Violation,
@@ -355,6 +355,122 @@ fn blob_store_looks_in_the_trace_first() {
         BlobStore::for_trace(Path::new("t")),
         BlobStore::new(vec![PathBuf::from("t/blobs"), BlobStore::committed()])
     );
+}
+
+/// The reason `result` was refused, or a panic naming what it was instead.
+fn refusal<T: std::fmt::Debug>(result: Result<T, ReadError>) -> Refusal {
+    match result {
+        Err(ReadError::Refused { reason, .. }) => reason,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A file at `path` that reads as `len` zero bytes, without using the disk.
+fn sparse(path: &Path, len: u64) {
+    fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_are_refused() {
+    // A digest-named symlink whose target has that digest still isn't read.
+    let (dir, outside) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let digest = BlobStore::new(vec![outside.path().into()])
+        .put(b"outside the store")
+        .unwrap();
+    let blobs = dir.path().join("blobs");
+    fs::create_dir(&blobs).unwrap();
+    std::os::unix::fs::symlink(outside.path().join(&digest), blobs.join(&digest)).unwrap();
+    let store = BlobStore::for_trace(dir.path());
+    assert_eq!(refusal(store.get(&digest)), Refusal::NotRegularFile);
+
+    // So is a trace file that's a symlink.
+    let real = recorded(plan());
+    let linked = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(real.path().join(TRACE_FILE), linked.path().join(TRACE_FILE))
+        .unwrap();
+    assert_eq!(
+        refusal(TraceReader::open(linked.path())),
+        Refusal::NotRegularFile
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_blob_is_refused_without_blocking() {
+    let dir = TempDir::new().unwrap();
+    let blobs = dir.path().join("blobs");
+    fs::create_dir(&blobs).unwrap();
+    let digest = sha256(b"never written");
+    let status = Command::new("mkfifo")
+        .arg(blobs.join(&digest))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let store = BlobStore::for_trace(dir.path());
+    // A read that blocks would hang the test, so it runs on its own thread.
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(store.get(&digest).map_err(|error| error.to_string()));
+    });
+    let result = result
+        .recv_timeout(Duration::from_secs(10))
+        .expect("reading a FIFO blob doesn't block");
+    assert!(result.unwrap_err().contains("isn't a regular file"));
+}
+
+#[test]
+fn oversized_files_are_refused() {
+    // Each file is sparse, so the test costs no disk and the reader must
+    // refuse it before reading.
+    let dir = TempDir::new().unwrap();
+    let blobs = dir.path().join("blobs");
+    fs::create_dir(&blobs).unwrap();
+    let digest = sha256(b"huge");
+    sparse(&blobs.join(&digest), MAX_BLOB_BYTES + 1);
+    assert_eq!(
+        refusal(BlobStore::for_trace(dir.path()).get(&digest)),
+        Refusal::TooLarge {
+            limit: MAX_BLOB_BYTES
+        }
+    );
+
+    let dir = TempDir::new().unwrap();
+    let meta = MetaRecord {
+        input: Some(InputRef {
+            sha256: sha256(b"input"),
+            len: 5,
+        }),
+        ..meta()
+    };
+    record_to(dir.path(), &meta, plan(), &mut NoChecks);
+    sparse(&dir.path().join("input.bin"), MAX_INPUT_BYTES + 1);
+    assert_eq!(
+        refusal(TraceReader::open(dir.path())),
+        Refusal::TooLarge {
+            limit: MAX_INPUT_BYTES
+        }
+    );
+
+    let dir = TempDir::new().unwrap();
+    sparse(&dir.path().join(TRACE_FILE), MAX_TRACE_BYTES + 1);
+    assert_eq!(
+        refusal(TraceReader::open(dir.path())),
+        Refusal::TooLarge {
+            limit: MAX_TRACE_BYTES
+        }
+    );
+}
+
+#[test]
+fn long_line_is_refused() {
+    let dir = recorded(plan());
+    let mut lines = lines(dir.path());
+    let mut step: Value = serde_json::from_str(&lines[2]).unwrap();
+    step["pick"] = json!("x".repeat(MAX_LINE_BYTES));
+    lines[2] = step.to_string();
+    write_lines(dir.path(), &lines);
+    assert_eq!(invalid(dir.path()), Invalid::LineTooLong { line: 3 });
 }
 
 #[test]

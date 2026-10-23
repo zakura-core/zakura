@@ -1,7 +1,9 @@
 //! Reading a trace directory back, strictly.
 
 use std::{
-    fmt, fs, io,
+    fmt,
+    fs::OpenOptions,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{
     meta::{hex, MetaRecord},
     write::{is_sha256, BlobStore},
-    INPUT_FILE, TRACE_FILE,
+    INPUT_FILE, MAX_INPUT_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
 };
 use crate::record::{EndRecord, InitRecord, Record, StepRecord, CONTRACT_VERSION, FORMAT_VERSION};
 
@@ -64,15 +66,28 @@ impl TraceReader {
     /// in the record order, and the step numbers it names, then every blob
     /// `meta` names.
     pub fn open_prefix(dir: &Path) -> Result<Trace, ReadError> {
-        let bytes = fs::read(dir.join(TRACE_FILE)).map_err(ReadError::Io)?;
+        let path = dir.join(TRACE_FILE);
+        let bytes = read_bounded(&path, MAX_TRACE_BYTES)?.ok_or_else(|| {
+            ReadError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} doesn't exist", path.display()),
+            ))
+        })?;
         let id = hex(&Sha256::digest(&bytes));
         let mut lines = bytes.split_inclusive(|&byte| byte == b'\n').peekable();
-        let meta = read_meta(lines.next().ok_or(Invalid::MissingMeta)?)?;
+        let first = lines.next().ok_or(Invalid::MissingMeta)?;
+        if first.len() > MAX_LINE_BYTES {
+            return Err(Invalid::LineTooLong { line: 1 }.into());
+        }
+        let meta = read_meta(first)?;
 
         let mut parsed = Parsed::default();
         let mut number = 1;
         while let Some(line) = lines.next() {
             number += 1;
+            if line.len() > MAX_LINE_BYTES {
+                return Err(Invalid::LineTooLong { line: number }.into());
+            }
             let torn = lines.peek().is_none() && !line.ends_with(b"\n");
             let record = match serde_json::from_slice::<Record>(strip_newline(line)) {
                 Ok(record) => record,
@@ -253,15 +268,11 @@ fn check_artifacts(dir: &Path, meta: &MetaRecord) -> Result<(), ReadError> {
         store.get(&blob.sha256)?;
     }
     if let Some(input) = &meta.input {
-        let bytes = match fs::read(dir.join(INPUT_FILE)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(Missing::MissingBlob {
-                    sha256: input.sha256.clone(),
-                }
-                .into())
+        let Some(bytes) = read_bounded(&dir.join(INPUT_FILE), MAX_INPUT_BYTES)? else {
+            return Err(Missing::MissingBlob {
+                sha256: input.sha256.clone(),
             }
-            Err(error) => return Err(ReadError::Io(error)),
+            .into());
         };
         // A usize always fits in a u64 on supported targets.
         if hex(&Sha256::digest(&bytes)) != input.sha256 || bytes.len() as u64 != input.len {
@@ -272,6 +283,57 @@ fn check_artifacts(dir: &Path, meta: &MetaRecord) -> Result<(), ReadError> {
         }
     }
     Ok(())
+}
+
+/// Reads the regular file at `path`, or `None` if nothing is there. Refuses
+/// a symlink, anything else that isn't a regular file, such as a FIFO or a
+/// device, and a file over `limit` bytes, and never allocates past `limit`.
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, ReadError> {
+    let refused = |reason| ReadError::Refused {
+        path: path.to_owned(),
+        reason,
+    };
+    match path.symlink_metadata() {
+        Ok(meta) if !meta.is_file() => return Err(refused(Refusal::NotRegularFile)),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ReadError::Io(error)),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // The path could change between the check above and the open. Refusing
+    // to follow a symlink, and not blocking on a FIFO, keeps the open safe.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if path.symlink_metadata().is_ok_and(|meta| !meta.is_file()) => {
+            return Err(refused(Refusal::NotRegularFile))
+        }
+        Err(error) => return Err(ReadError::Io(error)),
+    };
+    let meta = file.metadata().map_err(ReadError::Io)?;
+    if !meta.is_file() {
+        return Err(refused(Refusal::NotRegularFile));
+    }
+    if meta.len() > limit {
+        return Err(refused(Refusal::TooLarge { limit }));
+    }
+    let mut bytes = Vec::new();
+    // The file can grow after the size check, so the read stops one byte
+    // past the limit.
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(ReadError::Io)?;
+    // A usize always fits in a u64 on supported targets.
+    if bytes.len() as u64 > limit {
+        return Err(refused(Refusal::TooLarge { limit }));
+    }
+    Ok(Some(bytes))
 }
 
 /// `line` without its trailing newline, if any.
@@ -286,8 +348,27 @@ pub enum ReadError {
     Invalid(Invalid),
     /// A blob or `input.bin` the trace names is missing or wrong.
     Missing(Missing),
+    /// The reader refused to read a file.
+    Refused {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        reason: Refusal,
+    },
     /// A file couldn't be read.
     Io(io::Error),
+}
+
+/// Why the reader refused a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// It's a symlink, a FIFO, a device or a directory.
+    NotRegularFile,
+    /// It's over its size limit (see [`super::MAX_TRACE_BYTES`]).
+    TooLarge {
+        /// The limit, in bytes.
+        limit: u64,
+    },
 }
 
 /// How a trace file is invalid. Lines count from 1.
@@ -303,6 +384,11 @@ pub enum Invalid {
     },
     /// The file is empty, or line 1 isn't `meta`.
     MissingMeta,
+    /// The line is over [`super::MAX_LINE_BYTES`].
+    LineTooLong {
+        /// The line.
+        line: usize,
+    },
     /// This build can't read the trace's `format`, or it was written under
     /// another `contract`.
     UnsupportedVersion {
@@ -379,6 +465,14 @@ impl fmt::Display for ReadError {
         match self {
             ReadError::Invalid(invalid) => invalid.fmt(f),
             ReadError::Missing(missing) => missing.fmt(f),
+            ReadError::Refused {
+                path,
+                reason: Refusal::NotRegularFile,
+            } => write!(f, "{} isn't a regular file", path.display()),
+            ReadError::Refused {
+                path,
+                reason: Refusal::TooLarge { limit },
+            } => write!(f, "{} is over {limit} bytes", path.display()),
             ReadError::Io(error) => write!(f, "couldn't read the trace: {error}"),
         }
     }
@@ -388,7 +482,7 @@ impl std::error::Error for ReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ReadError::Io(error) => Some(error),
-            ReadError::Invalid(_) | ReadError::Missing(_) => None,
+            ReadError::Invalid(_) | ReadError::Missing(_) | ReadError::Refused { .. } => None,
         }
     }
 }
@@ -398,6 +492,7 @@ impl fmt::Display for Invalid {
         match self {
             Invalid::Malformed { line, reason } => write!(f, "line {line} is malformed: {reason}"),
             Invalid::MissingMeta => f.write_str("line 1 isn't a meta record"),
+            Invalid::LineTooLong { line } => write!(f, "line {line} is too long"),
             Invalid::UnsupportedVersion { field, found } => {
                 write!(f, "unsupported {field} version {found}")
             }

@@ -323,6 +323,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
                 outcome: outcome(property, state),
+                holds_since: state.holds_since.map(|(step, _)| step),
             })
             .collect()
     }

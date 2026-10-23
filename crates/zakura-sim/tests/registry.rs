@@ -229,6 +229,7 @@ impl Checker for Recorder {
         vec![PropertyReport {
             property: "test/recorder".to_owned(),
             outcome: PropertyOutcome::NotApplicable,
+            holds_since: None,
         }]
     }
 

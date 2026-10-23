@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 use zakura_scheduler::SchedulerConfig;
 
 use super::MAX_JSON_DEPTH;
-use crate::RunConfig;
+pub use crate::property::AssumeRecord;
+use crate::{property::Status, RunConfig};
 
 /// The random stream algorithm and its version, as `meta.rng` names it.
 pub const RNG: &str = "splitmix64-v1";
@@ -202,19 +203,6 @@ impl BuildInfo {
     }
 }
 
-/// One assumption a scenario declares, with its parameters (properties.md,
-/// Assumptions). Empty until the property registry lands.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AssumeRecord {
-    /// The assumption, such as `bounded-delivery`.
-    pub assume: String,
-    /// Its parameters, such as the link's maximum delay. Written with sorted
-    /// keys (see [`sorted`]).
-    #[serde(serialize_with = "sorted")]
-    pub params: Value,
-}
-
 /// The scheduler limits a run used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,22 +270,7 @@ pub struct PropertyRef {
     /// The property's ID.
     pub id: String,
     /// Its status when the trace was written.
-    pub status: PropertyStatus,
-}
-
-/// A property's status (properties.md, Statuses).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub enum PropertyStatus {
-    /// An enforced claim.
-    Active,
-    /// An open bug violates it.
-    Known {
-        /// The bug's issue number.
-        issue: u32,
-    },
-    /// The claim itself is under test.
-    Draft,
+    pub status: Status,
 }
 
 /// The `input.bin` bytes that produced a run.
@@ -342,7 +315,7 @@ pub enum DerivationTool {
 /// insertion order when its `preserve_order` feature is on, which another
 /// workspace crate turns on, so `{"a":1,"z":2}` and `{"z":2,"a":1}` would
 /// compare equal but write different bytes and trace IDs.
-fn sorted<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn sorted<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
     Sorted(value).serialize(serializer)
 }
 

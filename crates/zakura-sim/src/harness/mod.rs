@@ -9,11 +9,14 @@
 pub mod discovery;
 pub mod fixtures;
 pub mod header_sync;
+mod record;
 
 use std::{fmt, rc::Rc};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+
+pub use record::{record, RecordError, RecordInput};
 
 use crate::{
     check::{Checker, PropertyReport, StepCtx, Violation},

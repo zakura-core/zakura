@@ -12,7 +12,7 @@ use std::{
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
-use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
+use quinn_proto::{ClientConfig, TransportConfig, VarInt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
@@ -24,6 +24,7 @@ use crate::{
         ConnRef, Connecting, Handshake,
     },
     error::{BindError, ConnectError},
+    inputs::EndpointInputs,
     key::{NodeAddr, NodeId, NodeSecretKey},
     socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
@@ -134,9 +135,20 @@ pub(crate) struct Shared {
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
     pub(crate) network_changes: AtomicU64,
+    /// The injected randomness. Applied where each config is built: socket
+    /// endpoint configs, `serve` and every dial.
+    pub(crate) inputs: EndpointInputs,
 }
 
 impl Shared {
+    /// One socket's endpoint config, with the injected seed, reset key and
+    /// CID generator.
+    pub(crate) fn endpoint_config(&self) -> quinn_proto::EndpointConfig {
+        let mut config = self.config.endpoint_config();
+        self.inputs.apply_endpoint(&mut config);
+        config
+    }
+
     /// A connection's transport config, with its own instrumented controller
     /// (OBS-12).
     pub(crate) fn connection_transport(
@@ -196,17 +208,22 @@ impl QuicEndpoint {
             send_buffer_bytes: config.send_buffer_bytes as usize,
             offload: config.gso,
         };
-        Self::bind_with_factory(secret, bind, config, factory)
+        Self::bind_with(secret, bind, config, factory, EndpointInputs::default())
     }
 
-    /// Binds one socket per address in `bind` through `factory`, which also
-    /// builds every SOCK-9 replacement. Only a socket with an inode gets the
-    /// SOCK-7 poller, and only one with buffer sizes gets the SOCK-5 gauges.
-    pub(crate) fn bind_with_factory<F: SocketFactory>(
+    /// Binds one socket per address in `bind` through `factory`, with the
+    /// randomness in `inputs` (API-2).
+    ///
+    /// `factory` also builds every SOCK-9 replacement. Only a socket with an
+    /// inode gets the SOCK-7 poller, and only one with buffer sizes gets the
+    /// SOCK-5 gauges. [`Self::bind`] is this with OS sockets and
+    /// `EndpointInputs::default()`, so production nodes use `bind`.
+    pub fn bind_with<F: SocketFactory>(
         secret: NodeSecretKey,
         bind: &QuicBindConfig,
         config: &QuicConfig,
         factory: F,
+        inputs: EndpointInputs,
     ) -> Result<Self, BindError> {
         config.validate()?;
         if bind.addrs.is_empty() {
@@ -221,7 +238,7 @@ impl QuicEndpoint {
             id: secret.public(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
-            tls: TlsConfig::new(&secret),
+            tls: TlsConfig::with_inputs(&secret, &inputs)?,
             pending: PendingTable::default(),
             connections: ConnectionSlots::new(
                 bind.max_connections,
@@ -232,6 +249,7 @@ impl QuicEndpoint {
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
             network_changes: AtomicU64::new(0),
+            inputs,
         });
         let factory = Arc::new(factory);
         let mut bound = Vec::with_capacity(bind.addrs.len());
@@ -389,7 +407,7 @@ impl QuicEndpoint {
         let acceptor: Arc<dyn Acceptor> = Arc::new(acceptor);
         let alpns = acceptor.alpns();
         let crypto = self.inner.shared.tls.server_config(alpns.clone())?;
-        let mut server = ServerConfig::with_crypto(Arc::new(crypto));
+        let mut server = self.inner.shared.inputs.server_config(Arc::new(crypto));
         self.inner.shared.config.apply_server_limits(&mut server);
         let server = Arc::new(server);
 
@@ -547,6 +565,7 @@ impl QuicEndpoint {
     ) -> Result<(ConnRef, Handshake), ConnectError> {
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
+        self.inner.shared.inputs.apply_client(&mut client);
         client.transport_config(
             self.inner
                 .shared

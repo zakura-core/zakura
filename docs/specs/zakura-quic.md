@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-22. Version 0.11.
+Status: draft for review, 2026-10-22. Version 0.12.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -25,7 +25,10 @@ inbound refusal while keeping the full dial reserve for maintained connections;
 §17h explains it. Version 0.11 adds the socket seam: a socket factory binds
 every socket, so a simulation can inject sockets that never reach the OS. It
 changes SOCK-3 to SOCK-5, SOCK-7, SOCK-9 and SOCK-13, and adds a §16 row;
-§17i lists each change.
+§17i lists each change. Version 0.12 adds `bind_with`, which takes the socket
+factory and the endpoint inputs, so a simulation can replay a handshake byte
+for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
+each change.
 
 ## 0. Conventions
 
@@ -48,6 +51,10 @@ Terms:
 - **Socket factory**: what binds an endpoint's sockets, at bind and for each
   SOCK-9 rebind. The production factory binds OS UDP sockets. A simulation
   injects its own factory, whose sockets are **injected sockets**.
+- **Endpoint inputs**: the randomness `bind_with` takes in place of the
+  production sources: the endpoint RNG seed, the stateless-reset and Retry
+  token keys, the connection ID generator, the client's initial destination
+  connection ID, and the TLS random source and key-exchange groups (API-2).
 - **Admitted IP**: the source IP of the `Incoming` that `admit` accepted, or the
   IP a dial connected to. It never changes for the life of the connection.
 
@@ -156,7 +163,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
   `Conn::remote_id()` MUST return only a key proven this way.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
-  TLS 1.3 cipher suites.
+  TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
+  `bind_with` MAY replace the provider's random source and key-exchange
+  groups, and nothing else.
 - **TLS-10.** The server MUST refuse 0-RTT (`max_early_data_size = 0`). The
   client MUST NOT send 0-RTT data. Session tickets MAY be issued; they don't
   affect 1-RTT compatibility.
@@ -426,7 +435,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
   `ring::hmac::Key` for resets. Each key is random per startup and never
-  persists. Iroh's BLAKE3 keys go away.
+  persists. `bind` keeps these defaults. `bind_with` MAY take both keys as
+  endpoint inputs. Iroh's BLAKE3 keys go away.
 - **ADM-11.** The endpoint task MUST remove a connection from its table only
   when `quinn-proto` reports the connection drained, and MUST NOT pass
   `quinn-proto` an event for a connection it already removed. A connection
@@ -749,6 +759,16 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
+  - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
+    which binds every socket through the factory and takes its randomness
+    from the endpoint inputs. An input left unset keeps its production
+    source, so `bind` is `bind_with` with the production factory and
+    `EndpointInputs::default()`. The public types it takes are the socket
+    trait `UdpIo`, its receive metadata `RecvMeta`, `SocketFactory` and its
+    `BoundSocket`, and `EndpointInputs`. The crate re-exports the
+    `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
+    `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
+    and `SupportedKxGroup`;
   - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
     and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
     `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
@@ -951,6 +971,7 @@ this release tolerates, and keep each hard change explicit.
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
+| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's default, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
@@ -1227,3 +1248,24 @@ Changed:
   allow MTU discovery and never triggers the GSO probe.
 - **§16.** Adds a test that runs an endpoint on injected sockets without any
   OS access.
+
+## 17j. Changes in version 0.12
+
+`QuicEndpoint::bind_with` takes a socket factory and the endpoint inputs, so
+a deterministic simulation can give two runs the same randomness and get the
+same datagrams. `bind` keeps every production source. The Retry token time
+and the TLS certificate-check time aren't endpoint inputs. They come from the
+runtime's UTC clock in a later version.
+
+Changed:
+
+- **API-2.** Adds `bind_with`, `EndpointInputs`, the socket seam types and
+  the re-exports they need. The seam was crate-private in version 0.11.
+- **TLS-9.** `bind_with` may replace the provider's random source and
+  key-exchange groups. The cipher suites stay ring's defaults. ring's own
+  key-exchange groups draw from `SystemRandom` directly, so a seeded random
+  source alone doesn't fix the key shares.
+- **ADM-10.** `bind_with` may take the Retry token key and the
+  stateless-reset key as inputs. `bind` keeps random keys per startup.
+- **§16.** Adds a test that `bind` injects nothing and that `bind_with` uses
+  every input it takes.

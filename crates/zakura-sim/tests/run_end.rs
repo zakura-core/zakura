@@ -393,3 +393,51 @@ fn an_abandoned_run_forgets_its_sources() {
 fn dropping_a_sim_that_abandons_forgets_its_sources() {
     abandoned_sim_with_a_waiting_source(drop);
 }
+
+/// A waker that panics when woken.
+struct PanicsOnWake;
+
+impl std::task::Wake for PanicsOnWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        panic!("this waker panics");
+    }
+}
+
+#[test]
+fn a_sim_whose_shutdown_panics_forgets_its_sources() {
+    use std::future::Future;
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Signals when the thread ends, even by a panic.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _done = Done(done);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sim = zakura_sim::Sim::new(livelock_config(), Plan::from_fuzz(&[]));
+        sim.add_source(Box::new(WaitsOnDrop(flag.clone())));
+        // A ends first in shutdown, and its joiner's waker panics.
+        let mut a = sim
+            .scheduler()
+            .spawn_root("a", std::future::pending::<()>());
+        // B's guard would set the flag, but the panic leaves B suspended.
+        let guard = SetsOnDrop(flag);
+        let b = sim.scheduler().spawn_root("b", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+        sim.scheduler().run(a.task());
+        sim.scheduler().run(b.task());
+        let waker = std::task::Waker::from(std::sync::Arc::new(PanicsOnWake));
+        assert!(std::pin::Pin::new(&mut a)
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending());
+        drop(sim);
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the sim was dropped without waiting on its source");
+}

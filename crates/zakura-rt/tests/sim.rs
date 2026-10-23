@@ -15,7 +15,7 @@ use std::{
 use support::run;
 use zakura_rt::{
     sim::{self, Op},
-    task::{self, AbortOnDropHandle, JoinSet},
+    task::{self, AbortOnDropHandle, JoinSet, JoinSetExt},
     time::{self, Instant, MissedTickBehavior},
 };
 
@@ -225,6 +225,30 @@ fn join_set_returns_each_task_and_aborts_the_rest_on_drop() {
     });
     assert_eq!(joined, [1, 2], "tasks join in the order they finish");
     assert!(left);
+}
+
+#[test]
+fn join_set_spawn_named_labels_the_task() {
+    let ((joined, aborted), report) = run(async {
+        let mut set = JoinSet::new();
+        set.spawn_named("worker", async { 4 });
+        set.spawn(async { 5 });
+        set.spawn_named("parked", pending::<i32>()).abort();
+        let mut joined = Vec::new();
+        let mut aborted = 0;
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(value) => joined.push(value),
+                Err(error) if error.is_cancelled() => aborted += 1,
+                Err(error) => panic!("unexpected join error: {error}"),
+            }
+        }
+        (joined, aborted)
+    });
+    assert_eq!(joined, [4, 5]);
+    assert_eq!(aborted, 1);
+    assert_eq!(report.labels, ["root", "worker", file!(), "parked"]);
+    assert_eq!(report.count(Op::Spawn), 3);
 }
 
 #[test]

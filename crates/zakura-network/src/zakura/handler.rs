@@ -37,7 +37,7 @@ use zakura_rt::{
         broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
         MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
     },
-    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet},
+    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
     time::{timeout, Instant},
 };
 
@@ -3617,13 +3617,10 @@ impl ZakuraProtocolHandler {
                 }
             };
         }
-        admission.workers.spawn(request_stream_worker(
-            send,
-            recv,
-            prelude,
-            context,
-            self.registry.clone(),
-        ));
+        admission.workers.spawn_named(
+            "request_stream_worker",
+            request_stream_worker(send, recv, prelude, context, self.registry.clone()),
+        );
         None
     }
 

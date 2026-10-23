@@ -97,6 +97,29 @@ pub mod task {
         tokio::spawn(future)
     }
 
+    /// Adds a labeled spawn to [`JoinSet`].
+    pub trait JoinSetExt<T> {
+        /// Spawns `task` into the set as `JoinSet::spawn` does. `label` names
+        /// the task as in [`spawn_named`], and production ignores it.
+        #[track_caller]
+        fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+        where
+            F: Future<Output = T> + Send + 'static,
+            T: Send + 'static;
+    }
+
+    impl<T: 'static> JoinSetExt<T> for JoinSet<T> {
+        #[track_caller]
+        fn spawn_named<F>(&mut self, label: &'static str, task: F) -> AbortHandle
+        where
+            F: Future<Output = T> + Send + 'static,
+            T: Send + 'static,
+        {
+            let _ = label;
+            self.spawn(task)
+        }
+    }
+
     /// Spawns `future` as [`spawn`] does, or returns `None` outside a tokio
     /// runtime instead of panicking.
     ///

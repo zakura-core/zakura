@@ -166,3 +166,61 @@ fn draws_keep_order_within_step() {
         .collect();
     assert_eq!(with_draws, [["root.1:rng#1", "root.1:hash-seed#1"]]);
 }
+
+#[test]
+fn a_checker_draw_is_a_harness_failure() {
+    let mut checker = zakura_sim::check::after_step(|_| {
+        // The run's first hashed map draws its hash seed.
+        let _: HashMap<u8, u8> = HashMap::default();
+        None
+    });
+    let (report, lines) = recorded(
+        config(2, 100),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("root", async {});
+        },
+        &mut checker,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    assert_eq!(
+        report.end.harness,
+        Some(zakura_sim::HarnessFailure::DrawOutsideStep)
+    );
+    assert!(
+        draws(&lines).is_empty(),
+        "the checker's draw took no plan input"
+    );
+}
+
+#[test]
+fn cleanup_draws_rotate_so_a_select_loop_exits() {
+    // Runs on its own thread, so a hang fails the test instead of the suite.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let config = zakura_sim::RunConfig {
+            drain_bound: 0,
+            ..config(2, 1)
+        };
+        let (report, _) = recorded(
+            config,
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("looper", async {
+                    loop {
+                        zakura_rt::select! {
+                            () = std::future::ready(()) => continue,
+                            () = std::future::ready(()) => break,
+                        }
+                    }
+                });
+            },
+            &mut NoChecks,
+        );
+        let _ = done.send(report.end.outcome);
+    });
+    let outcome = finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("shutdown finished the select loop");
+    assert_eq!(outcome, Outcome::Budget);
+}

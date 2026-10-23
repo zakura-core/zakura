@@ -98,6 +98,8 @@ pub struct CleanupRecord {
     pub unwound: usize,
     /// Forced unwinds a task caught.
     pub unwind_failures: usize,
+    /// Tasks stuck in cleanup, leaked without running their destructors.
+    pub leaked: usize,
     /// Timers still registered.
     pub timers_left: usize,
 }
@@ -109,6 +111,7 @@ impl From<CleanupReport> for CleanupRecord {
             panicked: report.panicked,
             unwound: report.unwound,
             unwind_failures: report.unwind_failures,
+            leaked: report.leaked,
             timers_left: report.timers_left,
         }
     }
@@ -291,7 +294,7 @@ mod tests {
             [
                 r#"{"init":{"draws":[{"draw":"setup:hash-seed#1","bound":"0x0","value":"0x9f2c4e1a77d0b351","by":"bytes"}]}}"#,
                 r#"{"step":41,"pick":"task:root.1:select#3","options":3,"by":"bytes","offset":17,"draws":[{"draw":"root.1:select#5","bound":"0x4","value":"0x2","by":"default"}],"obs":"5d1e09aa3c4f7b21"}"#,
-                r#"{"end":{"outcome":"idle","status":"deadlock","steps":42,"drain":null,"cleanup":{"cancelled":0,"panicked":0,"unwound":0,"unwind_failures":0,"timers_left":0},"properties":[{"property":"sim/no-livelock","outcome":{"held":{"applicable":3}}}]}}"#,
+                r#"{"end":{"outcome":"idle","status":"deadlock","steps":42,"drain":null,"cleanup":{"cancelled":0,"panicked":0,"unwound":0,"unwind_failures":0,"leaked":0,"timers_left":0},"properties":[{"property":"sim/no-livelock","outcome":{"held":{"applicable":3}}}]}}"#,
             ]
         );
     }

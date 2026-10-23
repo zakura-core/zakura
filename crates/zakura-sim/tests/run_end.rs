@@ -353,3 +353,29 @@ fn finishing_the_last_task_is_not_a_livelock() {
         report.end
     );
 }
+
+#[test]
+fn the_end_record_counts_a_leaked_task() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (_, lines) = support::recorded(
+            livelock_config(),
+            Plan::from_fuzz(&[]),
+            |sim| {
+                let flag = std::sync::Arc::new(zakura_rt::sync::atomic::AtomicBool::new(false));
+                sim.scheduler().spawn_root("spinner", async move {
+                    while !flag.load(zakura_rt::sync::atomic::Ordering::Acquire) {}
+                });
+            },
+            &mut NoChecks,
+        );
+        let _ = done.send(lines);
+    });
+    let lines = finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the run reported after shutdown");
+    let Ok(zakura_sim::Record::End(end)) = serde_json::from_str(lines.last().unwrap()) else {
+        panic!("the last record is end");
+    };
+    assert_eq!(end.cleanup.leaked, 1);
+}

@@ -15,7 +15,10 @@ use std::sync::Arc;
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer};
 
-use crate::key::{NodeId, NodeSecretKey, KEY_LENGTH};
+use crate::{
+    inputs::EndpointInputs,
+    key::{NodeId, NodeSecretKey, KEY_LENGTH},
+};
 
 pub(crate) mod resolver;
 pub(crate) mod verifier;
@@ -48,11 +51,42 @@ pub(crate) struct TlsConfig {
 
 impl TlsConfig {
     pub(crate) fn new(secret_key: &NodeSecretKey) -> Self {
+        Self::with_provider(secret_key, rustls::crypto::ring::default_provider())
+    }
+
+    /// TLS state whose provider takes its random source and key-exchange
+    /// groups from `inputs`, when they're set (TLS-9).
+    ///
+    /// With either one injected, this builds a client config once, so groups
+    /// that can't carry TLS 1.3 fail at bind rather than at the first dial.
+    pub(crate) fn with_inputs(
+        secret_key: &NodeSecretKey,
+        inputs: &EndpointInputs,
+    ) -> Result<Self, TlsConfigError> {
+        let random = inputs.injected_tls_random();
+        let groups = inputs.injected_kx_groups();
+        if random.is_none() && groups.is_none() {
+            return Ok(Self::new(secret_key));
+        }
+        // TLS-9: everything but these two fields stays ring's default.
+        let mut provider = rustls::crypto::ring::default_provider();
+        if let Some(random) = random {
+            provider.secure_random = random;
+        }
+        if let Some(groups) = groups {
+            provider.kx_groups = groups.to_vec();
+        }
+        let tls = Self::with_provider(secret_key, provider);
+        tls.client_config(secret_key.public(), &[b"zakura-quic/check"])?;
+        Ok(tls)
+    }
+
+    fn with_provider(secret_key: &NodeSecretKey, provider: rustls::crypto::CryptoProvider) -> Self {
         Self {
             cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(secret_key)),
             client_verifier: Arc::new(verifier::ClientCertificateVerifier),
             // TLS-9: rustls' ring provider with its default TLS 1.3 suites.
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            provider: Arc::new(provider),
         }
     }
 

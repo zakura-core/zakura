@@ -2488,11 +2488,12 @@ fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
         addrs: vec![addr],
         ..loopback()
     };
-    QuicEndpoint::bind_with_factory(
+    QuicEndpoint::bind_with(
         NodeSecretKey::generate(),
         &bind,
         &test_config(),
         net.clone(),
+        crate::EndpointInputs::default(),
     )
     .unwrap()
 }

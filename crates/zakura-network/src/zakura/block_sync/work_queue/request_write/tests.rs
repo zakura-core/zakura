@@ -354,6 +354,33 @@ fn reset_before_publication_cannot_return_a_replacement_take() {
     assert_eq!(f.budget.reserved(), 0);
 }
 
+#[tokio::test]
+async fn queued_expiry_wakes_waiters_after_commit_settles_every_byte() {
+    let mut f = Fixture::new();
+    let claim = f.take(1);
+    assert!(claim.publish(|| {}));
+    let released = f.work.advance_floor(block::Height(2));
+    assert_eq!(released, 200);
+    f.budget.release(released);
+
+    let available = f.work.subscribe_available().notified();
+    tokio::pin!(available);
+    available.as_mut().enable();
+    let outcome = f
+        .work
+        .release_reserved_and_return_items_detailed_for_owner(claim.owner(), []);
+    assert!(outcome.request_was_unwritten);
+    assert_eq!(outcome.released_bytes, 0);
+    assert_eq!(outcome.returned_count, 0);
+    tokio::time::timeout(Duration::from_secs(1), available)
+        .await
+        .expect("expiring the queued frame wakes waiters even without returned work or bytes");
+    assert!(!claim.try_start());
+    drop(claim);
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.reserved_bytes(), 0);
+}
+
 #[test]
 fn reset_cancels_a_started_request_but_only_skips_a_queued_request() {
     for started in [false, true] {

@@ -8,7 +8,7 @@ use zakura_rt::sync::{
     downgrade, CancellationToken, Weak,
 };
 
-use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
+use super::{block, WorkItem, WorkQueue};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
@@ -93,13 +93,7 @@ impl RequestWrite {
     /// until return, even if a closed queue immediately discards its copy.
     pub(in crate::zakura::block_sync) fn publish(self: &Arc<Self>, publish: impl FnOnce()) -> bool {
         let mut inner = self.work.lock();
-        if self.cancel.is_cancelled()
-            || self.items.is_empty()
-            || !self.items.iter().all(|(height, taken)| {
-                inner.in_flight.get(height).is_some_and(|item| {
-                    item.owner == Some(self.owner) && item.hash == taken.hash && item.provisional
-                })
-            })
+        if self.cancel.is_cancelled() || !inner.state.is_unpublished_claim(self.owner, &self.items)
         {
             return false;
         }
@@ -108,17 +102,12 @@ impl RequestWrite {
             UNPUBLISHED,
             "a request is published once"
         );
-        for (height, _) in &self.items {
-            let item = inner
-                .in_flight
-                .get_mut(height)
-                .expect("every provisional item was checked under this lock");
-            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            item.provisional = false;
-            let charge = item.estimated_bytes;
-            inner.in_flight_reserved.add(charge);
-        }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
+        // The funded estimate transfers from this attempt's guard to the work ledger.
+        let transferred = inner.state.publish_claim(&self.items);
+        debug_assert_eq!(
+            transferred, self.estimated_bytes,
+            "an in-flight estimate never changes between take and publication"
+        );
         inner.request_writes.insert(
             self.owner,
             RequestWriteRegistration {
@@ -181,12 +170,7 @@ impl FrameWriteClaim for RequestWrite {
     fn try_start(&self) -> bool {
         let inner = self.work.lock();
         let current = !self.cancel.is_cancelled()
-            && self.items.iter().all(|(height, _)| {
-                inner
-                    .in_flight
-                    .get(height)
-                    .is_some_and(|item| item.owner == Some(self.owner) && item.budget.is_reserved())
-            });
+            && inner.state.is_published_claim(self.owner, self.heights());
         if !current {
             self.expire_unwritten();
             return false;

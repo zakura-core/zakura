@@ -291,14 +291,14 @@ fn livelock_on_a_sync_spin_still_shuts_down() {
         );
         let _ = done.send((
             report.end.violation.map(|v| v.property),
-            report.cleanup.unwound,
+            report.cleanup.leaked,
         ));
     });
-    let (property, unwound) = finished
+    let (property, leaked) = finished
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the run reported after shutdown");
     assert_eq!(property.as_deref(), Some(NO_LIVELOCK));
-    assert_eq!(unwound, 1, "shutdown force-unwound the spinner");
+    assert_eq!(leaked, 1, "shutdown leaked the spinner");
 }
 
 #[test]

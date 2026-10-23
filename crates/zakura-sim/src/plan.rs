@@ -436,6 +436,31 @@ mod tests {
     }
 
     #[test]
+    fn wide_bounds_take_four_and_eight_bytes() {
+        let mut d = bytes(&[
+            0x34, 0x12, // bound 0x1_0000: two bytes
+            0x78, 0x56, 0x34, 0x12, // bound 0x1_0001: four bytes
+            0xff, 0xff, 0xff, 0xff, // bound 2^32: four bytes
+            1, 2, 3, 4, 5, 6, 7, 8, // bound 2^32 + 1: eight bytes
+        ]);
+        let cases = [
+            (0x1_0000, 0x1234, 0),
+            (0x1_0001, 0x1234_5678 % 0x1_0001, 2),
+            (1 << 32, 0xffff_ffff, 6),
+            ((1 << 32) + 1, 0x0807_0605_0403_0201 % ((1 << 32) + 1), 10),
+        ];
+        for (bound, value, offset) in cases {
+            let answer = d.draw(bound, 1).unwrap();
+            assert_eq!(
+                (answer.value, answer.by, answer.offset),
+                (value, By::Bytes, Some(offset)),
+                "bound {bound:#x}"
+            );
+        }
+        assert_eq!(d.draw(2, 1).unwrap().by, By::Default, "all 18 bytes used");
+    }
+
+    #[test]
     fn truncated_input_pads_then_runs_out() {
         // Two bytes wanted, one left: the value is 0x0001, still from bytes.
         let mut d = bytes(&[9, 1]);

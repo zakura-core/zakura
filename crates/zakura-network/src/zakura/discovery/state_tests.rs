@@ -6,21 +6,29 @@
 
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
+#[cfg(test)]
 use proptest::prelude::*;
+#[cfg(test)]
 use rand_10::{rngs::StdRng, SeedableRng};
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::collections::hash_map::RandomState;
 
+#[cfg(test)]
+use std::collections::HashSet;
+
+#[cfg(test)]
+use super::protocol::RecordVerdict;
+
 use super::protocol::{
     DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
-    DiscoveryServiceSummary, ImportOutcome, RecordVerdict, ServiceSummaryEnvelope, Services,
-    ZakuraDiscoveryBook, ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig,
-    ZakuraDiscoveryLocalConfig, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
+    DiscoveryServiceSummary, ImportOutcome, ServiceSummaryEnvelope, Services, ZakuraDiscoveryBook,
+    ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraNodeRecord,
+    ZakuraNodeRecordBody, ZakuraServiceId,
 };
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
@@ -33,6 +41,7 @@ const START: u64 = 1_700_000_000;
 const CHAIN_ID: [u8; 32] = [7; 32];
 const SKEW: u64 = 300;
 const LIVE_SUMMARY_TTL: u64 = 30;
+#[cfg(test)]
 const DISCLOSURE_EPOCH: u64 = 600;
 
 const BOOK_MAX_RECORDS: usize = 4;
@@ -141,6 +150,7 @@ enum BookOp {
     },
     DialSuccess(usize),
     DialFailure(usize),
+    #[cfg(test)]
     Sample {
         requester: usize,
         limit: usize,
@@ -148,6 +158,7 @@ enum BookOp {
     Advance(u64),
 }
 
+#[cfg(test)]
 fn supplier() -> impl Strategy<Value = Supplier> {
     prop_oneof![
         2 => Just(Supplier::Author),
@@ -156,6 +167,7 @@ fn supplier() -> impl Strategy<Value = Supplier> {
     ]
 }
 
+#[cfg(test)]
 fn book_op() -> impl Strategy<Value = BookOp> {
     prop_oneof![
         6 => (0..AUTHORS, 0u64..4, -400i64..120, supplier()).prop_map(
@@ -339,6 +351,7 @@ impl BookModel {
         }
     }
 
+    #[cfg(test)]
     fn is_sample_eligible(&self, node_id: NodeId, now: u64) -> bool {
         self.entries
             .get(&node_id)
@@ -373,101 +386,168 @@ fn observed_entry(book: &ZakuraDiscoveryBook, node_id: NodeId) -> Option<ModelEn
     })
 }
 
-proptest! {
-    // Each import signs and verifies a record, which is slow in debug builds.
-    #![proptest_config(ProptestConfig::with_cases(48))]
+const BOOK_PROPERTY: &str = "discovery/record-book";
+/// Applicability counters for a decoder-v1 discovery history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryBookReplaySummary {
+    /// Operations compared with the model.
+    pub transitions: usize,
+    /// Signed record import results checked.
+    pub imports: usize,
+    /// Imports rejected by the relay quota.
+    pub relay_rejections: usize,
+    /// Imports rejected as expired.
+    pub expired_imports: usize,
+    /// Dial metadata updates checked.
+    pub dial_updates: usize,
+    /// Nonzero clock advances checked.
+    pub time_advances: usize,
+}
+fn run_book(
+    ops: impl IntoIterator<Item = BookOp>,
+    #[allow(unused_variables)] seed: u64,
+    mut after_step: impl FnMut(&mut ZakuraDiscoveryBook, u64),
+) -> DiscoveryBookReplaySummary {
+    let mut summary = DiscoveryBookReplaySummary::default();
+    let local = secret(1).public();
+    let limits = ZakuraDiscoveryBookLimits {
+        max_records: BOOK_MAX_RECORDS,
+        max_records_per_source: BOOK_MAX_PER_RELAY,
+        max_imported_records_per_response: SAMPLE_WINDOW,
+        ..ZakuraDiscoveryBookLimits::default()
+    };
+    let mut book = ZakuraDiscoveryBook::with_local_node_id(limits, local);
+    let mut model = BookModel::default();
+    #[cfg(test)]
+    let mut rng = StdRng::seed_from_u64(seed);
+    #[cfg(test)]
+    let mut disclosed: HashMap<(usize, u64), HashSet<NodeId>> = HashMap::new();
+    let authors: Vec<NodeSecretKey> = (0..AUTHORS).map(author).collect();
+    let mut now = START;
 
-    /// After every step the book holds exactly the model's entries, with the
-    /// model's sequence, expiry, provenance, confirmation, and dial metadata.
-    /// Each import returns the model's outcome, so the per-relay quota and
-    /// the record bound hold. Every sample discloses only confirmed unexpired
-    /// records, and one requester learns at most one window of node ids per
-    /// disclosure epoch.
-    #[test]
-    fn book_matches_independent_model(
-        seed in any::<u64>(),
-        ops in prop::collection::vec(book_op(), 1..64),
-    ) {
-        let local = secret(1).public();
-        let limits = ZakuraDiscoveryBookLimits {
-            max_records: BOOK_MAX_RECORDS,
-            max_records_per_source: BOOK_MAX_PER_RELAY,
-            max_imported_records_per_response: SAMPLE_WINDOW,
-            ..ZakuraDiscoveryBookLimits::default()
-        };
-        let mut book = ZakuraDiscoveryBook::with_local_node_id(limits, local);
-        let mut model = BookModel::default();
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut disclosed: HashMap<(usize, u64), HashSet<NodeId>> = HashMap::new();
-        let authors: Vec<NodeSecretKey> = (0..AUTHORS).map(author).collect();
-        let mut now = START;
-
-        for op in ops {
-            match op {
-                BookOp::Import { author, sequence, expires_in, supplier } => {
-                    let signer = &authors[author];
-                    let node_id = signer.public();
-                    let expires = now.saturating_add_signed(expires_in);
-                    let address = 10 + u8::try_from(author).expect("test indexes are small");
-                    let record = record(signer, address, sequence, expires);
-                    let context = context(now);
-                    let (source, result) = match supplier {
-                        Supplier::Author => {
-                            (Some(node_id), book.import_record(record, Some(node_id), now, &context))
-                        }
-                        Supplier::Relay(index) => {
-                            // Relayed records take the production path: verify, then install.
-                            let verified = VerifiedRecord::verify(record, &context)
-                                .expect("generated records are authentic");
-                            let source = Some(relay(index));
-                            (source, book.import_verified_record(verified, source, now, &context))
-                        }
-                        Supplier::Nobody => (None, book.import_record(record, None, now, &context)),
-                    };
-                    let expected = model.import(node_id, sequence, expires, source, now);
-                    prop_assert_eq!(import_result(result), expected);
-                }
-                BookOp::DialSuccess(author) => {
-                    let node_id = authors[author].public();
-                    book.mark_dial_success(&node_id, now);
-                    model.dial_success(node_id, now);
-                }
-                BookOp::DialFailure(author) => {
-                    let node_id = authors[author].public();
-                    book.mark_dial_failure(&node_id, now);
-                    model.dial_failure(node_id);
-                }
-                BookOp::Sample { requester, limit } => {
-                    let sample = book.sample_peers_with_rng(limit, &[], &[], now, relay(requester), &mut rng);
-                    prop_assert!(sample.len() <= limit.min(SAMPLE_WINDOW));
-                    let ids: HashSet<NodeId> = sample.iter().map(|record| record.body.node_id).collect();
-                    prop_assert_eq!(ids.len(), sample.len(), "a sample repeats no node");
-                    for record in &sample {
-                        let node_id = record.body.node_id;
-                        prop_assert!(model.is_sample_eligible(node_id, now), "disclosed {:?}", node_id);
-                        prop_assert_eq!(
-                            Some(record.body.sequence),
-                            model.entries.get(&node_id).map(|entry| entry.sequence)
-                        );
-                    }
-                    let window = disclosed.entry((requester, now / DISCLOSURE_EPOCH)).or_default();
-                    window.extend(ids);
-                    prop_assert!(window.len() <= SAMPLE_WINDOW, "one requester saw {} ids in an epoch", window.len());
-                }
-                BookOp::Advance(secs) => now += secs,
-            }
-
-            prop_assert_eq!(book.discovered_len(), model.entries.len());
-            prop_assert!(model.entries.len() <= BOOK_MAX_RECORDS);
-            for signer in &authors {
+    for op in ops {
+        summary.transitions += 1;
+        match op {
+            BookOp::Import {
+                author,
+                sequence,
+                expires_in,
+                supplier,
+            } => {
+                let signer = &authors[author];
                 let node_id = signer.public();
-                prop_assert_eq!(observed_entry(&book, node_id), model.entries.get(&node_id).cloned());
+                let expires = now.saturating_add_signed(expires_in);
+                let address = 10 + u8::try_from(author).expect("test indexes are small");
+                let record = record(signer, address, sequence, expires);
+                let context = context(now);
+                let (source, result) = match supplier {
+                    Supplier::Author => (
+                        Some(node_id),
+                        book.import_record(record, Some(node_id), now, &context),
+                    ),
+                    Supplier::Relay(index) => {
+                        // Relayed records take the production path: verify, then install.
+                        let verified = VerifiedRecord::verify(record, &context)
+                            .expect("generated records are authentic");
+                        let source = Some(relay(index));
+                        (
+                            source,
+                            book.import_verified_record(verified, source, now, &context),
+                        )
+                    }
+                    Supplier::Nobody => (None, book.import_record(record, None, now, &context)),
+                };
+                summary.imports += 1;
+                let expected = model.import(node_id, sequence, expires, source, now);
+                summary.relay_rejections += usize::from(expected == Expected::RelayFull);
+                summary.expired_imports += usize::from(expected == Expected::Expired);
+                assert_eq!(import_result(result), expected, "{BOOK_PROPERTY}");
             }
-            for index in 0..RELAYS {
-                prop_assert!(model.relayed_by(relay(index)) <= BOOK_MAX_PER_RELAY);
+            BookOp::DialSuccess(author) => {
+                summary.dial_updates += 1;
+                let node_id = authors[author].public();
+                book.mark_dial_success(&node_id, now);
+                model.dial_success(node_id, now);
+            }
+            BookOp::DialFailure(author) => {
+                summary.dial_updates += 1;
+                let node_id = authors[author].public();
+                book.mark_dial_failure(&node_id, now);
+                model.dial_failure(node_id);
+            }
+            #[cfg(test)]
+            BookOp::Sample { requester, limit } => {
+                let sample =
+                    book.sample_peers_with_rng(limit, &[], &[], now, relay(requester), &mut rng);
+                assert!(sample.len() <= limit.min(SAMPLE_WINDOW), "{BOOK_PROPERTY}");
+                let ids: HashSet<NodeId> =
+                    sample.iter().map(|record| record.body.node_id).collect();
+                assert_eq!(
+                    ids.len(),
+                    sample.len(),
+                    "{BOOK_PROPERTY}: a sample repeats no node"
+                );
+                for record in &sample {
+                    let node_id = record.body.node_id;
+                    assert!(
+                        model.is_sample_eligible(node_id, now),
+                        "{BOOK_PROPERTY}: disclosed {:?}",
+                        node_id
+                    );
+                    assert_eq!(
+                        Some(record.body.sequence),
+                        model.entries.get(&node_id).map(|entry| entry.sequence),
+                        "{BOOK_PROPERTY}"
+                    );
+                }
+                let window = disclosed
+                    .entry((requester, now / DISCLOSURE_EPOCH))
+                    .or_default();
+                window.extend(ids);
+                assert!(
+                    window.len() <= SAMPLE_WINDOW,
+                    "{BOOK_PROPERTY}: one requester saw {} ids in an epoch",
+                    window.len()
+                );
+            }
+            BookOp::Advance(secs) => {
+                summary.time_advances += usize::from(secs > 0);
+                now += secs;
             }
         }
+
+        after_step(&mut book, now);
+        assert_eq!(
+            book.discovered_len(),
+            model.entries.len(),
+            "{BOOK_PROPERTY}"
+        );
+        assert!(model.entries.len() <= BOOK_MAX_RECORDS, "{BOOK_PROPERTY}");
+        for signer in &authors {
+            let node_id = signer.public();
+            assert_eq!(
+                observed_entry(&book, node_id),
+                model.entries.get(&node_id).cloned(),
+                "{BOOK_PROPERTY}"
+            );
+        }
+        for index in 0..RELAYS {
+            assert!(
+                model.relayed_by(relay(index)) <= BOOK_MAX_PER_RELAY,
+                "{BOOK_PROPERTY}"
+            );
+        }
     }
+
+    summary
+}
+#[cfg(test)]
+proptest! {
+ #![proptest_config(ProptestConfig::with_cases(48))]
+ #[test]
+ fn book_matches_independent_model(seed in any::<u64>(), ops in prop::collection::vec(book_op(), 1..64)) { run_book(ops, seed, |_, _| {}); }
+ #[test]
+ fn book_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { replay_discovery_book_bytes(&bytes); }
 }
 
 // DiscoveryState model.
@@ -571,6 +651,7 @@ enum StateOp {
     Advance(u64),
 }
 
+#[cfg(test)]
 fn state_op() -> impl Strategy<Value = StateOp> {
     let key = || (0..PEERS, 0u64..3, 0u64..3);
     prop_oneof![
@@ -682,114 +763,189 @@ impl StateModel {
     }
 }
 
-proptest! {
-    /// After every step, admitted sessions, slot counts, and each peer's
-    /// service hints and live summaries match the model. A `Hello` or
-    /// `Services` from a session that is no longer admitted installs nothing,
-    /// so a late verification result cannot act for its replacement.
-    #[test]
-    fn discovery_state_matches_independent_model(ops in prop::collection::vec(state_op(), 1..64)) {
-        let mut state = discovery_state();
-        let mut model = StateModel::new();
-        let mut pending: Vec<(usize, ZakuraConnId, u64, VerifiedRecord)> = Vec::new();
-        // Each peer's `Hello` verifies once; every start reuses the evidence.
-        let hellos: Vec<VerifiedRecord> = (0..PEERS)
-            .map(|peer| VerifiedRecord::verify(hello(peer), &context(START)).expect("generated records are authentic"))
-            .collect();
-        let mut now = START;
+const STATE_PROPERTY: &str = "discovery/session-installation";
+/// Applicability counters for a decoder-v1 discovery history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryStateReplaySummary {
+    /// Operations decoded.
+    pub transitions: usize,
+    /// Session admission decisions checked.
+    pub admissions: usize,
+    /// Current-session verification results installed.
+    pub installed_hellos: usize,
+    /// Superseded verification results rejected.
+    pub stale_hellos: usize,
+    /// Current connected-session summaries accepted.
+    pub live_summaries: usize,
+    /// Nonzero clock advances checked.
+    pub time_advances: usize,
+}
+fn run_state(
+    ops: impl IntoIterator<Item = StateOp>,
+    mut after_step: impl FnMut(&mut DiscoveryState, &StateModel),
+) -> DiscoveryStateReplaySummary {
+    let mut summary = DiscoveryStateReplaySummary::default();
+    let mut state = discovery_state();
+    let mut model = StateModel::new();
+    let mut pending: Vec<(usize, ZakuraConnId, u64, VerifiedRecord)> = Vec::new();
+    // Each peer's `Hello` verifies once; every start reuses the evidence.
+    let hellos: Vec<VerifiedRecord> = (0..PEERS)
+        .map(|peer| {
+            VerifiedRecord::verify(hello(peer), &context(START))
+                .expect("generated records are authentic")
+        })
+        .collect();
+    let mut now = START;
 
-        for op in ops {
-            match op {
-                StateOp::Admit { peer, conn_id, session_id, outbound } => {
-                    let decision = state.admit_session(session(peer, conn_id, session_id), direction(outbound));
-                    prop_assert_eq!(decision, model.admit(peer, conn_id, session_id, outbound));
+    for op in ops {
+        summary.transitions += 1;
+        match op {
+            StateOp::Admit {
+                peer,
+                conn_id,
+                session_id,
+                outbound,
+            } => {
+                summary.admissions += 1;
+                let decision =
+                    state.admit_session(session(peer, conn_id, session_id), direction(outbound));
+                assert_eq!(
+                    decision,
+                    model.admit(peer, conn_id, session_id, outbound),
+                    "{STATE_PROPERTY}"
+                );
+            }
+            StateOp::RemoveSession {
+                peer,
+                conn_id,
+                session_id,
+            } => {
+                state.remove_session(&session(peer, conn_id, session_id));
+                if model.is_current(peer, conn_id, session_id) {
+                    model.peers[peer].admitted = None;
                 }
-                StateOp::RemoveSession { peer, conn_id, session_id } => {
-                    state.remove_session(&session(peer, conn_id, session_id));
-                    if model.is_current(peer, conn_id, session_id) {
-                        model.peers[peer].admitted = None;
-                    }
+            }
+            StateOp::RemoveConnection { peer, conn_id } => {
+                state.remove_connection(&session(peer, conn_id, 0).peer_id, conn_id);
+                if model.peers[peer]
+                    .admitted
+                    .is_some_and(|(conn, _, _)| conn == conn_id)
+                {
+                    model.peers[peer].admitted = None;
                 }
-                StateOp::RemoveConnection { peer, conn_id } => {
-                    state.remove_connection(&session(peer, conn_id, 0).peer_id, conn_id);
-                    if model.peers[peer].admitted.is_some_and(|(conn, _, _)| conn == conn_id) {
-                        model.peers[peer].admitted = None;
-                    }
+            }
+            StateOp::SetConnected { peer, connected } => model.peers[peer].connected = connected,
+            StateOp::StartHello {
+                peer,
+                conn_id,
+                session_id,
+            } => {
+                pending.push((peer, conn_id, session_id, hellos[peer].clone()));
+            }
+            StateOp::FinishHello(index) => {
+                if pending.is_empty() {
+                    continue;
                 }
-                StateOp::SetConnected { peer, connected } => model.peers[peer].connected = connected,
-                StateOp::StartHello { peer, conn_id, session_id } => {
-                    pending.push((peer, conn_id, session_id, hellos[peer].clone()));
-                }
-                StateOp::FinishHello(index) => {
-                    if pending.is_empty() {
-                        continue;
-                    }
-                    let (peer, conn_id, session_id, verified) = pending.remove(index % pending.len());
-                    let result = state.install_session_record(
-                        &session(peer, conn_id, session_id),
-                        verified,
-                        now,
-                    );
-                    if model.is_current(peer, conn_id, session_id) {
-                        let expected = if model.peers[peer].in_book {
-                            ImportOutcome::MetadataUpdated
-                        } else {
-                            ImportOutcome::Added
-                        };
-                        prop_assert_eq!(result.ok(), Some(expected));
-                        model.peers[peer].in_book = true;
-                        model.peers[peer].hinted = true;
+                let (peer, conn_id, session_id, verified) = pending.remove(index % pending.len());
+                let result = state.install_session_record(
+                    &session(peer, conn_id, session_id),
+                    verified,
+                    now,
+                );
+                if model.is_current(peer, conn_id, session_id) {
+                    summary.installed_hellos += 1;
+                    let expected = if model.peers[peer].in_book {
+                        ImportOutcome::MetadataUpdated
                     } else {
-                        prop_assert!(matches!(result, Err(SessionRecordError::Superseded)));
-                    }
-                }
-                StateOp::ReceiveServices { peer, conn_id, session_id, ttl } => {
-                    let node_id = peer_secret(peer).public();
-                    let connected = model.connected_node_ids();
-                    state
-                        .receive_session_live_summaries(
-                            &session(peer, conn_id, session_id),
-                            node_id,
-                            services(node_id, now + ttl),
-                            &connected,
-                            now,
-                        )
-                        .expect("generated summaries decode");
-                    model.sync(now);
-                    if model.peers[peer].connected && model.is_current(peer, conn_id, session_id) {
-                        model.peers[peer].live_until = Some((now + ttl).min(now + LIVE_SUMMARY_TTL));
-                    }
-                }
-                StateOp::Advance(secs) => now += secs,
-            }
-
-            let connected = model.connected_node_ids();
-            model.sync(now);
-            for (index, peer) in model.peers.iter().enumerate() {
-                let node_id = peer_secret(index).public();
-                let has_entry = peer.hinted || peer.live_until.is_some();
-                prop_assert_eq!(
-                    state.active_services(node_id, &connected, now).is_some(),
-                    peer.connected && has_entry,
-                    "peer {} service hints", index
-                );
-                prop_assert_eq!(
-                    state
-                        .live_service_summaries(node_id, &connected, now)
-                        .map(|summaries| !summaries.is_empty()),
-                    (peer.connected && has_entry).then_some(peer.live_until.is_some()),
-                    "peer {} live summaries", index
-                );
-                if let Some((conn_id, session_id, _)) = peer.admitted {
-                    prop_assert!(state.is_current_session(&session(index, conn_id, session_id)));
+                        ImportOutcome::Added
+                    };
+                    assert_eq!(result.ok(), Some(expected), "{STATE_PROPERTY}");
+                    model.peers[peer].in_book = true;
+                    model.peers[peer].hinted = true;
+                } else {
+                    summary.stale_hellos += 1;
+                    assert!(
+                        matches!(result, Err(SessionRecordError::Superseded)),
+                        "{STATE_PROPERTY}"
+                    );
                 }
             }
-            prop_assert_eq!(
-                state.peer_snapshot(),
-                ServicePeerSnapshot::new(model.admitted_in(false), model.admitted_in(true), peer_limits())
-            );
+            StateOp::ReceiveServices {
+                peer,
+                conn_id,
+                session_id,
+                ttl,
+            } => {
+                let node_id = peer_secret(peer).public();
+                let connected = model.connected_node_ids();
+                state
+                    .receive_session_live_summaries(
+                        &session(peer, conn_id, session_id),
+                        node_id,
+                        services(node_id, now + ttl),
+                        &connected,
+                        now,
+                    )
+                    .expect("generated summaries decode");
+                model.sync(now);
+                if model.peers[peer].connected && model.is_current(peer, conn_id, session_id) {
+                    summary.live_summaries += 1;
+                    model.peers[peer].live_until = Some((now + ttl).min(now + LIVE_SUMMARY_TTL));
+                }
+            }
+            StateOp::Advance(secs) => {
+                summary.time_advances += usize::from(secs > 0);
+                now += secs;
+            }
         }
+
+        after_step(&mut state, &model);
+        let connected = model.connected_node_ids();
+        model.sync(now);
+        for (index, peer) in model.peers.iter().enumerate() {
+            let node_id = peer_secret(index).public();
+            let has_entry = peer.hinted || peer.live_until.is_some();
+            assert_eq!(
+                state.active_services(node_id, &connected, now).is_some(),
+                peer.connected && has_entry,
+                "{STATE_PROPERTY}: peer {} service hints",
+                index
+            );
+            assert_eq!(
+                state
+                    .live_service_summaries(node_id, &connected, now)
+                    .map(|summaries| !summaries.is_empty()),
+                (peer.connected && has_entry).then_some(peer.live_until.is_some()),
+                "{STATE_PROPERTY}: peer {} live summaries",
+                index
+            );
+            if let Some((conn_id, session_id, _)) = peer.admitted {
+                assert!(
+                    state.is_current_session(&session(index, conn_id, session_id)),
+                    "{STATE_PROPERTY}"
+                );
+            }
+        }
+        assert_eq!(
+            state.peer_snapshot(),
+            ServicePeerSnapshot::new(
+                model.admitted_in(false),
+                model.admitted_in(true),
+                peer_limits()
+            ),
+            "{STATE_PROPERTY}"
+        );
     }
+
+    summary
+}
+#[cfg(test)]
+proptest! {
+ #![proptest_config(ProptestConfig::with_cases(256))]
+ #[test]
+ fn discovery_state_matches_independent_model(ops in prop::collection::vec(state_op(), 1..64)) { run_state(ops, |_, _| {}); }
+ #[test]
+ fn state_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { replay_discovery_state_bytes(&bytes); }
 }
 
 // Worked scenarios.
@@ -940,4 +1096,187 @@ fn self_record_sequence_resumes_after_the_persisted_sequence() {
     let expires = current.body.expires_at_unix_secs;
     assert!(state.self_record_is_fresh(&current, expires - refresh - 1));
     assert!(!state.self_record_is_fresh(&current, expires - refresh));
+}
+
+/// Replay decoder-v1 quadruples against the record-book model.
+/// Read at most 512 bytes. Sampling needs a controlled disclosure key and is excluded.
+pub fn replay_discovery_book_bytes(data: &[u8]) -> DiscoveryBookReplaySummary {
+    run_book(decode_book(data), 0, |_, _| {})
+}
+
+fn decode_book(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let author = usize::from(b) % AUTHORS;
+        match a % 6 {
+            0..=2 => BookOp::Import {
+                author,
+                sequence: u64::from(c % 4),
+                expires_in: i64::from(d) * 2 - 400,
+                supplier: match a % 3 {
+                    0 => Supplier::Author,
+                    1 => Supplier::Relay(usize::from(b) / AUTHORS % RELAYS),
+                    _ => Supplier::Nobody,
+                },
+            },
+            3 => BookOp::DialSuccess(author),
+            4 => BookOp::DialFailure(author),
+            _ => BookOp::Advance(u64::from(d) * 3),
+        }
+    })
+}
+
+/// Replay decoder-v1 quadruples against the session-installation model.
+/// Read at most 512 bytes. All verification completions retain their session key.
+pub fn replay_discovery_state_bytes(data: &[u8]) -> DiscoveryStateReplaySummary {
+    run_state(decode_state(data), |_, _| {})
+}
+
+fn decode_state(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let peer = usize::from(b) % PEERS;
+        let conn_id = u64::from(c % 3);
+        let session_id = u64::from(d % 3);
+        match a % 8 {
+            0 => StateOp::Admit {
+                peer,
+                conn_id,
+                session_id,
+                outbound: b & 128 != 0,
+            },
+            1 => StateOp::RemoveSession {
+                peer,
+                conn_id,
+                session_id,
+            },
+            2 => StateOp::RemoveConnection { peer, conn_id },
+            3 => StateOp::SetConnected {
+                peer,
+                connected: c & 1 == 0,
+            },
+            4 => StateOp::StartHello {
+                peer,
+                conn_id,
+                session_id,
+            },
+            5 => StateOp::FinishHello(usize::from(b)),
+            6 => StateOp::ReceiveServices {
+                peer,
+                conn_id,
+                session_id,
+                ttl: u64::from(d) + 1,
+            },
+            _ => StateOp::Advance(u64::from(d)),
+        }
+    })
+}
+
+#[cfg(test)]
+const BOOK_WITNESS: &[u8] = &[
+    1, 0, 0, 255, 1, 1, 0, 255, 1, 2, 0, 255, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 255, 5, 0, 0, 255,
+    0, 0, 2, 0,
+];
+#[cfg(test)]
+const STATE_WITNESS: &[u8] = &[
+    0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 1, 5, 0, 0, 0, 4, 0, 1, 1, 5, 0, 0, 0, 6, 0, 1, 1,
+    7, 0, 0, 40, 1, 0, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn discovery_book_witness_exercises_provenance_quota_and_expiry() {
+    let summary = replay_discovery_book_bytes(BOOK_WITNESS);
+    assert_eq!(
+        summary,
+        DiscoveryBookReplaySummary {
+            transitions: 8,
+            imports: 5,
+            relay_rejections: 1,
+            expired_imports: 1,
+            dial_updates: 2,
+            time_advances: 1
+        }
+    );
+    assert_eq!(
+        replay_discovery_book_bytes(&[]),
+        DiscoveryBookReplaySummary::default()
+    );
+    println!("tier=Machine target=discovery_book decoder=1 {summary:?}");
+}
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn discovery_state_witness_exercises_stale_verification_and_expiry() {
+    let summary = replay_discovery_state_bytes(STATE_WITNESS);
+    assert_eq!(
+        summary,
+        DiscoveryStateReplaySummary {
+            transitions: 10,
+            admissions: 2,
+            installed_hellos: 1,
+            stale_hellos: 1,
+            live_summaries: 1,
+            time_advances: 1
+        }
+    );
+    assert_eq!(
+        replay_discovery_state_bytes(&[]),
+        DiscoveryStateReplaySummary::default()
+    );
+    println!("tier=Machine target=discovery_state decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "discovery/record-book")]
+fn discovery_book_witness_rejects_unearned_confirmation() {
+    run_book(decode_book(BOOK_WITNESS), 0, |book, now| {
+        book.mark_dial_success(&author(0).public(), now);
+    });
+}
+
+#[test]
+#[should_panic(expected = "discovery/record-book")]
+fn discovery_book_witness_rejects_extra_dial_failure() {
+    run_book(decode_book(BOOK_WITNESS), 0, |book, now| {
+        book.mark_dial_failure(&author(0).public(), now);
+    });
+}
+
+#[test]
+#[should_panic(expected = "discovery/session-installation")]
+fn discovery_state_witness_rejects_lost_admission() {
+    run_state(decode_state(STATE_WITNESS), |state, model| {
+        if let Some((conn, id, _)) = model.peers[0].admitted {
+            state.remove_session(&session(0, conn, id));
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "discovery/session-installation")]
+fn discovery_state_witness_rejects_unearned_service_hint() {
+    run_state(decode_state(STATE_WITNESS), |state, model| {
+        if model.peers[0].connected {
+            if let Some((conn, id, _)) = model.peers[0].admitted {
+                let verified = VerifiedRecord::verify(hello(0), &context(START))
+                    .expect("fixture is authentic");
+                state
+                    .install_session_record(&session(0, conn, id), verified, START)
+                    .expect("session is current");
+            }
+        }
+    });
 }

@@ -560,14 +560,17 @@ jobs:
       - name: Record the compiler
         run: rustc +${{ matrix.toolchain }} -Vv
       # Leak suppressions match function names, so ASan needs a symbolizer.
+      # It must be named `llvm-symbolizer`, and the runner's versioned
+      # `/usr/bin/llvm-symbolizer-NN` failed to start, so check that it runs.
       - name: Find a symbolizer
         if: matrix.mode == 'asan'
         run: |
-          symbolizer="$(command -v llvm-symbolizer || find /usr/bin -name 'llvm-symbolizer-*' | sort -V | tail -n1)"
-          if [ -z "$symbolizer" ]; then
+          symbolizer="$(command -v llvm-symbolizer || find /usr/lib -path '/usr/lib/llvm-*/bin/llvm-symbolizer' | sort -V | tail -n1)"
+          if [ -z "$symbolizer" ] || ! "$symbolizer" --version > /dev/null; then
             sudo apt-get install -y llvm
             symbolizer="$(command -v llvm-symbolizer)"
           fi
+          "$symbolizer" --version | head -n2
           echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
       - name: Test the scheduler and runtime
         run: cargo +${{ matrix.toolchain }} test --locked -p zakura-rt -p zakura-scheduler ${{ matrix.args }}

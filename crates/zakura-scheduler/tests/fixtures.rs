@@ -1347,6 +1347,7 @@ struct CleanupReportSummary {
 
 #[test]
 fn forced_unwind_passes_through_a_production_catch_unwind() {
+    let stacks_before = unaccounted_stacks();
     for rethrow in [false, true] {
         let (report, caught, saw) = cycle_in_catch_unwind(rethrow);
         // Only the parked pair is affected, and only `ab` is force-unwound:
@@ -1365,6 +1366,11 @@ fn forced_unwind_passes_through_a_production_catch_unwind() {
             saw,
             Some(true),
             "a guard in the frame drops while unwinding"
+        );
+        assert_eq!(
+            unaccounted_stacks(),
+            stacks_before,
+            "rethrow {rethrow}: no stack leaked"
         );
         // The thread can start another run.
         drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));

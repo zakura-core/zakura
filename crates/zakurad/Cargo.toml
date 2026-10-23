@@ -118,12 +118,12 @@ error-debug = ["eyre/track-caller"]
 # Release builds are defined as "cfg(not(debug_assertions))".
 # https://docs.rs/tracing/latest/tracing/level_filters/index.html#compile-time-filters
 release_max_level_warn = ["tracing/release_max_level_warn"]
-release_max_level_info = ["tracing/release_max_level_info", "log/release_max_level_info"]
+release_max_level_info = ["tracing/release_max_level_info"]
 release_max_level_debug = ["tracing/release_max_level_debug"]
 
 max_level_warn = ["tracing/max_level_warn"]
 max_level_info = ["tracing/max_level_info"]
-max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
+max_level_debug = ["tracing/max_level_debug"]
 
 # Testing features that activate extra dependencies
 proptest-impl = [
@@ -200,12 +200,6 @@ webpki-roots = "1"
 bytes = { workspace = true }
 
 # prod feature prometheus
-
-# prod feature release_max_level_info
-#
-# zakurad uses tracing for logging,
-# we only use `log` to set and print the static log levels in transitive dependencies
-log = { workspace = true }
 
 
 # test feature proptest-impl

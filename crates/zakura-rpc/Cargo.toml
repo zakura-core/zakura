@@ -108,8 +108,8 @@ zakura-network = { path = "../zakura-network", version = "11.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0" }
-rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
 

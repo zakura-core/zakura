@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
 rand_10 = { workspace = true }
+tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
 # For the header-sync and discovery scenarios.

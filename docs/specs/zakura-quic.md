@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-22. Version 0.12.
+Status: draft for review, 2026-10-23. Version 0.13.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -28,7 +28,8 @@ changes SOCK-3 to SOCK-5, SOCK-7, SOCK-9 and SOCK-13, and adds a §16 row;
 §17i lists each change. Version 0.12 adds `bind_with`, which takes the socket
 factory and the endpoint inputs, so a simulation can replay a handshake byte
 for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
-each change.
+each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
+come from the runtime a simulation controls; §17k explains it.
 
 ## 0. Conventions
 
@@ -81,7 +82,7 @@ Terms:
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
   `bytes`, `curve25519-dalek`, `ed25519-zebra`, `futures`, `hex`, `libc`,
   `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
-  `socket2`, `thiserror`, `tokio`, `tracing` and `zeroize`.
+  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -1269,3 +1270,17 @@ Changed:
   stateless-reset key as inputs. `bind` keeps random keys per startup.
 - **§16.** Adds a test that `bind` injects nothing and that `bind_with` uses
   every input it takes.
+
+## 17k. Changes in version 0.13
+
+The driver reads its clocks through `zakura-rt`, the runtime layer that a
+deterministic simulation controls. In production each `zakura-rt` name is the
+tokio or std item the code used before, so behavior doesn't change.
+
+Changed:
+
+- **DEP-2.** Adds `zakura-rt`. The driver's monotonic clock and timers, the
+  Retry token time and the TLS certificate-check time come from it. In a
+  simulated run the two UTC readings follow the scenario clock, so Retry
+  tokens and certificate checks never read the host clock. Tasks, channels
+  and locks move onto `zakura-rt` in later changes.

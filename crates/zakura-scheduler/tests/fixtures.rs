@@ -1604,3 +1604,13 @@ fn stacks_past_the_pool_limit_are_freed_without_a_false_leak() {
         zakura_scheduler::stack_pool()
     );
 }
+
+#[test]
+fn draw_kind_names_are_pinned() {
+    use zakura_scheduler::DrawKind::{HashSeed, Rng, Select, StreamMap};
+    // Draw identities and traces carry these names, so a rename fails here.
+    assert_eq!(
+        [Rng, Select, HashSeed, StreamMap].map(|kind| kind.name()),
+        ["rng", "select", "hash-seed", "stream-map"]
+    );
+}

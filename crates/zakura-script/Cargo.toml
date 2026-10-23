@@ -1,6 +1,6 @@
 [package]
 name = "zakura-script"
-version = "5.0.0"
+version = "5.0.1"
 authors.workspace = true
 description = "Zakura transparent script verification. Internal crate, published to support cargo install zakura"
 license.workspace = true

@@ -18,4 +18,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "cadence"
+path = "fuzz_targets/cadence.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

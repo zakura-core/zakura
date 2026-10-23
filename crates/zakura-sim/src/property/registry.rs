@@ -164,7 +164,8 @@ impl std::error::Error for RegistryError {}
 ///    stops holding, the property's open obligations end, and the property
 ///    is `Inconclusive` with `assumption-lost`.
 /// 2. While the assumptions hold, it runs the check and keeps the
-///    obligations the check opens. Each `Holds` counts as applicable.
+///    obligations the check opens. Each `Holds` counts as applicable, and
+///    the first `Holds` or `Violated` emits `Lifecycle::Applicable`.
 /// 3. It walks the step's observations in order. A point first counts
 ///    toward each `Ops` bound it reaches, and expires that obligation once
 ///    past `max`. Then the observation discharges the oldest open obligation
@@ -191,6 +192,9 @@ struct PropertyState {
     declared: bool,
     /// Evaluations that returned `Holds`.
     applicable: u32,
+    /// True once an evaluation returned `Holds` or `Violated`, and the
+    /// `Applicable` event went out.
+    announced: bool,
     /// The first violation.
     violation: Option<Violation>,
     /// Open obligations, oldest first.
@@ -340,13 +344,13 @@ fn step_property<S: HasView>(
 
     let mut violation = None;
     let mut ccx = CheckCtx::new(cx, handle, property);
-    match (property.check)(&mut ccx) {
-        Verdict::Holds => {
-            if state.applicable == 0 {
-                events.push(event(Lifecycle::Applicable));
-            }
-            state.applicable = state.applicable.saturating_add(1);
-        }
+    let verdict = (property.check)(&mut ccx);
+    if verdict != Verdict::NotApplicable && !state.announced {
+        state.announced = true;
+        events.push(event(Lifecycle::Applicable));
+    }
+    match verdict {
+        Verdict::Holds => state.applicable = state.applicable.saturating_add(1),
         Verdict::NotApplicable => {}
         Verdict::Violated(v) => violation = Some(v),
     }

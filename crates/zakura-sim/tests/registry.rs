@@ -863,3 +863,41 @@ fn ops_bound_on_poll_rejected() {
         Some(RegistryError::OpsPoll { id: SERVED })
     );
 }
+
+/// Applies only once the counter passes 1, and then fails.
+fn level_violated_when_applicable(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    match cx.view() {
+        level if level > 1 => cx.violated("level at most 1", format!("level {level}")),
+        _ => Verdict::NotApplicable,
+    }
+}
+
+/// Review: a check that goes straight from `NotApplicable` to `Violated`
+/// still applied, so the registry emits `Lifecycle::Applicable` for it.
+#[test]
+fn first_violation_emits_applicable() {
+    let world = honest();
+    let task_world = world.clone();
+    let property = Property {
+        check: level_violated_when_applicable,
+        ..level(Status::Known { issue: 1523 })
+    };
+    let (report, _, recorder) = run_with(
+        world,
+        vec![property],
+        Assumptions::none(),
+        Recorder::default(),
+        |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
+            });
+        },
+    );
+    assert!(matches!(
+        outcome(&report, &LEVEL),
+        PropertyOutcome::Violated { .. }
+    ));
+    assert_eq!(recorder.points(), [Lifecycle::Applicable]);
+}

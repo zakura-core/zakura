@@ -1,7 +1,7 @@
 //! Note and value commitments.
 
 use crate::serialization::ZcashReader;
-use std::{fmt, io};
+use std::{fmt, io, sync::LazyLock};
 
 use group::{
     ff::{FromUniformBytes, PrimeField},
@@ -11,7 +11,6 @@ use halo2::{
     arithmetic::{Coordinates, CurveAffine},
     pasta::pallas,
 };
-use lazy_static::lazy_static;
 use rand_core::{CryptoRng, RngCore};
 
 use crate::{
@@ -253,10 +252,8 @@ impl ValueCommitment {
     }
 }
 
-lazy_static! {
-    static ref V: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"v");
-    static ref R: pallas::Point = pallas_group_hash(b"z.cash:Orchard-cv", b"r");
-}
+static V: LazyLock<pallas::Point> = LazyLock::new(|| pallas_group_hash(b"z.cash:Orchard-cv", b"v"));
+static R: LazyLock<pallas::Point> = LazyLock::new(|| pallas_group_hash(b"z.cash:Orchard-cv", b"r"));
 
 #[cfg(test)]
 mod tests {

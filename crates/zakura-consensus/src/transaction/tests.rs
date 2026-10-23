@@ -6719,7 +6719,7 @@ fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::Shi
 /// The Halo2 proof cache, exercised end to end through the transaction verifier.
 ///
 /// This is one test rather than three because all three claims need the same transaction and a
-/// cold cache for it. The Halo2 verifiers are process-wide `Lazy` statics, so only one test can
+/// cold cache for it. The Halo2 verifiers are process-wide `LazyLock` statics, so only one test can
 /// ever see that transaction's cache entry cold.
 ///
 /// It runs on [`zakura_test::MULTI_THREADED_RUNTIME`] because it reaches a global verifier.

@@ -48,7 +48,6 @@ bench = ["zakura-test"]
 [dependencies]
 
 getset = { workspace = true }
-lazy_static = { workspace = true }
 bitvec = { workspace = true }
 bitflags = { workspace = true }
 blake2b_simd = { workspace = true }

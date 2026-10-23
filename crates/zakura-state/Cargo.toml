@@ -84,7 +84,6 @@ indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
 eyre = { workspace = true }
 
-once_cell = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 
 hex = { workspace = true, features = ["serde"] }

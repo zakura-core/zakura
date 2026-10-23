@@ -60,7 +60,6 @@ indexmap = { workspace = true, features = ["serde"] }
 getset = { workspace = true }
 derive-new = { workspace = true }
 thiserror = { workspace = true }
-lazy_static = { workspace = true }
 
 # RPC endpoint basic auth
 base64 = { workspace = true }

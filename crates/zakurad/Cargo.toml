@@ -165,7 +165,6 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 clap = { workspace = true, features = ["cargo", "derive"] }
 chrono = { workspace = true }
 indexmap = { workspace = true }
-lazy_static = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }

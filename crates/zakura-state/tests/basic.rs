@@ -2,10 +2,9 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use eyre::Report;
-use once_cell::sync::Lazy;
 use tracing::Instrument;
 
 use zakura_chain::{
@@ -17,9 +16,9 @@ use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use zakura_state::*;
 
-static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -38,9 +37,9 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
     ]
 });
 
-static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES[..])
             .unwrap()

@@ -818,62 +818,83 @@ fn git(dir: &Path, args: &[&str]) {
 
 #[test]
 fn provenance_tracks_unstaged_edits() {
+    use provenance::{Provenance, SOURCE_PATHS, UNKNOWN};
+
+    // A workspace laid out like this one. build.rs reads provenance from
+    // its own crate directory, so the test does too.
     let root = TempDir::new().unwrap();
     let repo = root.path().join("repo");
-    fs::create_dir(&repo).unwrap();
+    for (path, text) in [
+        ("Cargo.toml", "[workspace]\n"),
+        (".gitignore", "target/\n"),
+        ("crates/sim/src/lib.rs", "fn a() {}\n"),
+        ("crates/other/src/lib.rs", "fn b() {}\n"),
+        ("docs/notes.md", "notes\n"),
+    ] {
+        fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
+        fs::write(repo.join(path), text).unwrap();
+    }
     git(&repo, &["init", "-q"]);
-    fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
-    fs::write(repo.join(".gitignore"), "target/\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "one"]);
+    let read = |checkout: &Path| Provenance::read(&checkout.join("crates/sim"), SOURCE_PATHS);
 
-    let clean = provenance::Provenance::read(&repo);
+    let clean = read(&repo);
     assert!(!clean.dirty);
     assert_eq!(clean.git.len(), 40);
     assert_eq!(clean.source.len(), 64);
 
-    // An ignored file changes nothing.
-    fs::create_dir(repo.join("target")).unwrap();
-    fs::write(repo.join("target/out"), "built").unwrap();
-    assert_eq!(provenance::Provenance::read(&repo), clean);
+    // An unstaged edit to the crate itself, a sibling crate, or the
+    // workspace manifest changes the source and marks the tree dirty.
+    for path in [
+        "crates/sim/src/lib.rs",
+        "crates/other/src/lib.rs",
+        "Cargo.toml",
+    ] {
+        let before = fs::read_to_string(repo.join(path)).unwrap();
+        fs::write(repo.join(path), format!("{before}// edited\n")).unwrap();
+        let edited = read(&repo);
+        assert!(edited.dirty, "{path}");
+        assert_eq!(edited.git, clean.git);
+        assert_ne!(edited.source, clean.source, "{path}");
+        fs::write(repo.join(path), before).unwrap();
+        assert_eq!(read(&repo), clean, "{path} restored");
+    }
 
-    // An unstaged edit changes the source and marks the tree dirty.
-    fs::write(repo.join("lib.rs"), "fn b() {}\n").unwrap();
-    let edited = provenance::Provenance::read(&repo);
-    assert!(edited.dirty);
-    assert_eq!(edited.git, clean.git);
-    assert_ne!(edited.source, clean.source);
-
-    // So does an untracked file.
-    fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
-    fs::write(repo.join("new.rs"), "fn c() {}\n").unwrap();
-    let untracked = provenance::Provenance::read(&repo);
+    // So does an untracked source file.
+    fs::write(repo.join("crates/sim/src/new.rs"), "fn c() {}\n").unwrap();
+    let untracked = read(&repo);
     assert!(untracked.dirty);
     assert_ne!(untracked.source, clean.source);
-    fs::remove_file(repo.join("new.rs")).unwrap();
-    assert_eq!(provenance::Provenance::read(&repo), clean);
+    fs::remove_file(repo.join("crates/sim/src/new.rs")).unwrap();
+
+    // Ignored files and files outside the source paths change nothing.
+    fs::create_dir(repo.join("target")).unwrap();
+    fs::write(repo.join("target/out"), "built").unwrap();
+    fs::write(repo.join("docs/notes.md"), "edited notes\n").unwrap();
+    assert_eq!(read(&repo), clean);
 
     // A linked worktree of the same commit has the same source, and its own
     // git dir, which is what build.rs watches.
     let linked = root.path().join("linked");
     git(&repo, &["worktree", "add", "-q", linked.to_str().unwrap()]);
-    let worktree = provenance::Provenance::read(&linked);
+    let worktree = read(&linked);
     assert_eq!((worktree.dirty, &worktree.source), (false, &clean.source));
     let git_dir = worktree.git_dir.clone().unwrap();
     assert_ne!(Some(&git_dir), clean.git_dir.as_ref());
     assert!(git_dir.join("HEAD").exists());
-    fs::write(linked.join("lib.rs"), "fn d() {}\n").unwrap();
-    let edited = provenance::Provenance::read(&linked);
+    fs::write(linked.join("crates/sim/src/lib.rs"), "fn d() {}\n").unwrap();
+    let edited = read(&linked);
     assert!(edited.dirty);
     assert_ne!(edited.source, clean.source);
 
     // Outside any repository, provenance is unknown and never clean.
     let outside = TempDir::new().unwrap();
-    let unknown = provenance::Provenance::read(outside.path());
+    let unknown = Provenance::read(outside.path(), SOURCE_PATHS);
     assert!(unknown.dirty);
     assert_eq!(
         (unknown.git.as_str(), unknown.source.as_str()),
-        (provenance::UNKNOWN, provenance::UNKNOWN)
+        (UNKNOWN, UNKNOWN)
     );
 }
 

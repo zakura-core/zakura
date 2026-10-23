@@ -13,7 +13,7 @@ use std::{
 #[path = "build/provenance.rs"]
 mod provenance;
 
-use provenance::{file_digest, Provenance, UNKNOWN};
+use provenance::{file_digest, Provenance, SOURCE_PATHS, UNKNOWN};
 
 /// Separates list entries in one environment variable. cfg values may hold
 /// commas and spaces, but not this.
@@ -34,12 +34,18 @@ fn main() {
         .and_then(Path::parent)
         .expect("the crate lives at crates/zakura-sim in the workspace");
     let lockfile = workspace.join("Cargo.lock");
-    let provenance = Provenance::read(&manifest);
+    let provenance = Provenance::read(&manifest, SOURCE_PATHS);
     if let Some(git_dir) = &provenance.git_dir {
         rerun_if_changed(git_dir);
     }
-    rerun_if_changed(&workspace.join("crates"));
-    rerun_if_changed(&lockfile);
+    for path in SOURCE_PATHS {
+        let path = workspace.join(path);
+        // Cargo reruns a script on every build while a watched path is
+        // missing.
+        if path.exists() {
+            rerun_if_changed(&path);
+        }
+    }
 
     emit("GIT", &provenance.git);
     emit("DIRTY", if provenance.dirty { "1" } else { "0" });

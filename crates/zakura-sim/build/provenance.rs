@@ -14,16 +14,29 @@ use sha2::{Digest, Sha256};
 /// What a build records when it can't read a value.
 pub const UNKNOWN: &str = "unknown";
 
-/// A checkout's git state and a digest of its source files.
+/// The paths, relative to the repository root, whose contents can change a
+/// workspace build: every crate, the workspace manifest and lockfile, Cargo's
+/// config, and the toolchain pin. `source` and `dirty` cover exactly these,
+/// and `build.rs` reruns when any of them changes. Docs, CI and deploy files
+/// can't change the binary, so they're left out.
+pub const SOURCE_PATHS: &[&str] = &[
+    "crates",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo",
+    "rust-toolchain.toml",
+];
+
+/// A checkout's git state and a digest of its build inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provenance {
     /// `HEAD`'s commit, or [`UNKNOWN`].
     pub git: String,
-    /// True if `git status` lists any change, untracked files included, or if
-    /// git couldn't say.
+    /// True if `git status` lists any change under the source paths,
+    /// untracked files included, or if git couldn't say.
     pub dirty: bool,
-    /// SHA-256 over every tracked and untracked file that git doesn't ignore,
-    /// or [`UNKNOWN`].
+    /// SHA-256 over every tracked and untracked file under the source paths
+    /// that git doesn't ignore, or [`UNKNOWN`].
     pub source: String,
     /// The git dir, which changes on every stage, commit and checkout. `None`
     /// when git couldn't name it.
@@ -31,26 +44,37 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// Reads the provenance of the checkout that holds `dir`. A failed git
-    /// command leaves its field [`UNKNOWN`] and marks the build dirty, so
+    /// Reads the provenance of the checkout that holds `dir`, which may be
+    /// any directory inside it, over `paths` relative to its root. A failed
+    /// git command leaves its field [`UNKNOWN`] and marks the build dirty, so
     /// unknown provenance never counts as clean.
-    pub fn read(dir: &Path) -> Provenance {
+    pub fn read(dir: &Path, paths: &[&str]) -> Provenance {
         let head = git(dir, &["rev-parse", "HEAD"]);
-        let status = git(dir, &["status", "--porcelain"]);
-        let files = git(
-            dir,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        );
         let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"]);
-        let source = match (git(dir, &["rev-parse", "--show-toplevel"]), files) {
-            (Some(top), Some(files)) => source_digest(Path::new(top.trim()), &files),
-            _ => None,
+        // Every path-listing command runs from the root, since git lists
+        // paths relative to the directory it runs in.
+        let top = git(dir, &["rev-parse", "--show-toplevel"]).map(|top| PathBuf::from(top.trim()));
+        let (status, source) = match &top {
+            Some(top) => {
+                let status = git(top, &[&["status", "--porcelain", "--"], paths].concat());
+                let files = git(
+                    top,
+                    &[
+                        &[
+                            "ls-files",
+                            "-z",
+                            "--cached",
+                            "--others",
+                            "--exclude-standard",
+                            "--",
+                        ],
+                        paths,
+                    ]
+                    .concat(),
+                );
+                (status, files.and_then(|files| source_digest(top, &files)))
+            }
+            None => (None, None),
         };
         Provenance {
             dirty: head.is_none() || status.is_none_or(|status| !status.is_empty()),

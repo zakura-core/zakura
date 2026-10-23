@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 keywords.workspace = true
 categories = ["development-tools::testing"]
-# Only tests depend on it, and no published crate does.
+# Only tests and the `zakura-sim` binary use it, and no published crate does.
 publish = false
 
 # The crate is empty outside the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
@@ -20,6 +20,13 @@ sha2 = { workspace = true }
 # O_NOFOLLOW and O_NONBLOCK, so the trace reader never follows a symlink or
 # blocks on a FIFO.
 libc = { workspace = true }
+# The harness registry's scenarios: the race fixtures, discovery and header
+# sync.
+zakura-rt = { path = "../zakura-rt" }
+zakura-chain = { path = "../zakura-chain" }
+zakura-network = { path = "../zakura-network" }
+zakura-node-services = { path = "../zakura-node-services" }
+zakura-quic = { path = "../zakura-quic" }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
@@ -29,12 +36,6 @@ rand_10 = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
 tokio-stream = { workspace = true }
-zakura-rt = { path = "../zakura-rt" }
-# For the header-sync and discovery scenarios.
-zakura-chain = { path = "../zakura-chain" }
-zakura-network = { path = "../zakura-network" }
-zakura-node-services = { path = "../zakura-node-services" }
-zakura-quic = { path = "../zakura-quic" }
 
 # build.rs hashes the source for trace `meta` records.
 [build-dependencies]

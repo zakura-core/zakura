@@ -10,7 +10,10 @@ use support::{config, inputs, run};
 use zakura_rt::{sync::Mutex, task};
 use zakura_scheduler::hooks;
 use zakura_scheduler::Status;
-use zakura_sim::{check, fake::FakeStorage, IdleStatus, NoChecks, Outcome, Plan, PlanInput, Sim};
+use zakura_sim::{
+    check, fake::FakeStorage, observe::Exit, IdleStatus, NoChecks, Observation, Outcome, Plan,
+    PlanInput, Sim,
+};
 
 /// The idle status a run under `plan` with `workers` ends with.
 fn idle(workers: u16, plan: PlanInput, setup: impl FnOnce(&mut Sim)) -> IdleStatus {
@@ -112,5 +115,11 @@ fn storage_completion_releases_apparent_deadlock() {
             .picks
             .iter()
             .any(|p| p.identity.starts_with("storage:store:1:")));
+        // Quiescence counts a panicked task as finished, so check the exit.
+        let exit = report.log.entries().iter().find_map(|e| match &e.obs {
+            Observation::TaskExited { task, exit } if task == "waiter.1" => Some(*exit),
+            _ => None,
+        });
+        assert_eq!(exit, Some(Exit::Completed));
     }
 }

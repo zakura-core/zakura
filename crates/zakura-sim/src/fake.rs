@@ -65,7 +65,14 @@ struct Datagram {
 impl FakeNet {
     /// A network whose delivery window is `min..=max` after sending, and
     /// that may drop `drops` datagrams.
+    ///
+    /// # Panics
+    ///
+    /// If `min` is after `max`. Time would stop at the deadline before
+    /// delivery opened, and the run would look idle with a datagram in
+    /// flight.
     pub fn new(min: Duration, max: Duration, drops: u32) -> Self {
+        assert!(min <= max, "a FakeNet's min delay must not exceed its max");
         FakeNet(Rc::new(RefCell::new(Net {
             min,
             max,
@@ -264,7 +271,8 @@ impl ActionSource for FakeStorage {
 
 /// A fake peer that takes scripted actions in order, at most `per_instant`
 /// per virtual instant. Once that budget is spent, the next action opens one
-/// second later, so time can advance.
+/// second later, even if time moves sooner for another reason, so the node
+/// can go idle and time can advance.
 #[derive(Clone, Debug)]
 pub struct FakePeer(Rc<RefCell<Peer>>);
 
@@ -275,16 +283,29 @@ struct Peer {
     per_instant: u32,
     /// The instant of the last action, and how many actions it took.
     spent: (SimInstant, u32),
+    /// The earliest instant the next action may run. Spending the budget at
+    /// `t` moves it to `t + 1 s`, however time moves in between.
+    opens_at: SimInstant,
 }
 
 impl FakePeer {
-    /// A peer named `name` that takes the actions in `script`.
+    /// A peer named `name` that takes the actions in `script`, at most
+    /// `per_instant` at one instant.
+    ///
+    /// # Panics
+    ///
+    /// If `per_instant` is 0, since such a peer could never act.
     pub fn new(name: &str, script: &[&str], per_instant: u32) -> Self {
+        assert!(
+            per_instant > 0,
+            "a FakePeer needs a per_instant budget above 0"
+        );
         FakePeer(Rc::new(RefCell::new(Peer {
             name: name.to_owned(),
             script: script.iter().map(|a| (*a).to_owned()).collect(),
             per_instant,
             spent: (SimInstant::ZERO, 0),
+            opens_at: SimInstant::ZERO,
         })))
     }
 
@@ -295,9 +316,9 @@ impl FakePeer {
 }
 
 impl Peer {
-    /// True if the budget for `now` allows another action.
+    /// True if the next action may run at `now`.
     fn can_act(&self, now: SimInstant) -> bool {
-        self.spent.0 != now || self.spent.1 < self.per_instant
+        now >= self.opens_at
     }
 }
 
@@ -312,7 +333,7 @@ impl ActionSource for FakePeer {
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         let peer = self.0.borrow();
         if !peer.script.is_empty() && !peer.can_act(now) {
-            out.push(Boundary::Opens(after(now, Duration::from_secs(1))));
+            out.push(Boundary::Opens(peer.opens_at));
         }
     }
 
@@ -327,6 +348,9 @@ impl ActionSource for FakePeer {
             (at, n) if at == now => (at, n + 1),
             _ => (now, 1),
         };
+        if peer.spent.1 >= peer.per_instant {
+            peer.opens_at = after(now, Duration::from_secs(1));
+        }
         let name = peer.name.clone();
         drop(peer);
         event(log, "peer", format!("{name}:{action}"));
@@ -373,8 +397,8 @@ mod tests {
         latency: u64,
         script: Vec<u8>,
         per_instant: u32,
-        /// (instant, actions taken then).
-        spent: (u64, u32),
+        /// When the peer's next action may run.
+        opens_at: u64,
     }
 
     fn world() -> impl Strategy<Value = World> {
@@ -387,14 +411,17 @@ mod tests {
                 proptest::collection::vec((0u64..20, any::<bool>()), 0..4),
                 0u64..10,
             ),
-            (
-                proptest::collection::vec(0u8..3, 0..3),
-                1u32..3,
-                (0u64..20, 0u32..3),
-            ),
+            (proptest::collection::vec(0u8..3, 0..3), 1u32..3, 0u64..30),
         )
             .prop_map(
-                |((now, ready), next, datagrams, drops, (ops, latency), (script, per, spent))| {
+                |(
+                    (now, ready),
+                    next,
+                    datagrams,
+                    drops,
+                    (ops, latency),
+                    (script, per, opens_at),
+                )| {
                     World {
                         now,
                         ready,
@@ -406,7 +433,7 @@ mod tests {
                         latency,
                         script,
                         per_instant: per,
-                        spent,
+                        opens_at,
                     }
                 },
             )
@@ -458,7 +485,8 @@ mod tests {
             name: "p1".into(),
             script: w.script.iter().map(|a| format!("a{a}")).collect(),
             per_instant: w.per_instant,
-            spent: (ms(w.spent.0), w.spent.1),
+            spent: (SimInstant::ZERO, 0),
+            opens_at: ms(w.opens_at),
         })));
         (net, storage, peer)
     }
@@ -499,12 +527,11 @@ mod tests {
             }
         }
         if let Some(action) = w.script.first() {
-            let budget_left = w.spent.0 != w.now || w.spent.1 < w.per_instant;
-            if budget_left {
+            if w.now >= w.opens_at {
                 let key = format!("p1:a{action}");
                 out.push((4, key.clone(), format!("peer:{key}")));
             } else {
-                later.push(w.now + 1_000);
+                later.push(w.opens_at);
             }
         }
         if ready.is_empty() && deadlines.iter().all(|d| *d > w.now) {

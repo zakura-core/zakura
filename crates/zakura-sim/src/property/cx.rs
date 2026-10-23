@@ -92,7 +92,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// # Panics
     ///
     /// If its key names another property, or its bound is an `Ops` bound
-    /// that names an object.
+    /// that names an object or counts polls.
     pub fn oblige(&mut self, obligation: Obligation) {
         assert_eq!(
             &obligation.key.property,
@@ -108,6 +108,16 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
                 }
             ),
             "Ops bounds that name an object wait for zakura#1643"
+        );
+        assert!(
+            !matches!(
+                obligation.bound,
+                LivenessBound::Ops {
+                    op: zakura_scheduler::Op::Poll,
+                    ..
+                }
+            ),
+            "no observation counts toward an Ops bound on polls"
         );
         self.obliged.push(obligation);
     }

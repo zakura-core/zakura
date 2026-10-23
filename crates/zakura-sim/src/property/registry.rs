@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, fmt, rc::Rc};
 
-use zakura_scheduler::SimInstant;
+use zakura_scheduler::{Op, SimInstant};
 
 use super::{
     Assume, Assumptions, CheckCtx, HasView, Inconclusive, Kind, LivenessBound, Obligation,
@@ -83,7 +83,7 @@ pub struct Registry<S: HasView> {
 
 impl<S: HasView> Registry<S> {
     /// A registry of `properties`, in order. Fails on a duplicate ID, or on
-    /// an `Ops` bound that names an object.
+    /// an `Ops` bound that names an object or counts polls.
     pub fn new(properties: Vec<Property<S>>) -> Result<Self, RegistryError> {
         let mut ids = BTreeSet::new();
         for property in &properties {
@@ -93,15 +93,19 @@ impl<S: HasView> Registry<S> {
                 });
             }
             if let Kind::Liveness {
-                bound:
-                    LivenessBound::Ops {
-                        object: Some(_), ..
-                    },
+                bound: LivenessBound::Ops { op, object, .. },
             } = property.kind
             {
-                return Err(RegistryError::OpsObject {
-                    id: property.id.clone(),
-                });
+                if object.is_some() {
+                    return Err(RegistryError::OpsObject {
+                        id: property.id.clone(),
+                    });
+                }
+                if op == Op::Poll {
+                    return Err(RegistryError::OpsPoll {
+                        id: property.id.clone(),
+                    });
+                }
             }
         }
         Ok(Registry { properties })
@@ -126,6 +130,11 @@ pub enum RegistryError {
         /// The property.
         id: PropertyId,
     },
+    /// An `Ops` bound counts `Op::Poll`, which no observation reports.
+    OpsPoll {
+        /// The property.
+        id: PropertyId,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -137,6 +146,9 @@ impl fmt::Display for RegistryError {
                 f,
                 "{id} has an Ops bound that names an object, which waits for zakura#1643"
             ),
+            RegistryError::OpsPoll { id } => {
+                write!(f, "{id} has an Ops bound on polls, which nothing observes")
+            }
         }
     }
 }

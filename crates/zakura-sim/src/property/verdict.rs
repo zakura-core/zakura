@@ -80,7 +80,8 @@ pub enum LivenessBound {
     Ops {
         /// The task's name, such as `reactor.1`.
         task: &'static str,
-        /// The operation counted.
+        /// The operation counted. Not `Op::Poll`: a poll boundary logs
+        /// `TaskWaiting`, never a point, so a registry rejects it.
         op: Op,
         /// The runtime object's creation label. Matching on it waits for the
         /// scheduler to keep `Point.object` in its observations

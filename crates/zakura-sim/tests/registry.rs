@@ -843,3 +843,23 @@ fn ops_bound_counts_before_discharge() {
     let violation = report.end.violation.expect("the second lock expired it");
     assert_eq!(violation.actual, "still open after 2");
 }
+
+/// Review: a poll boundary logs `TaskWaiting`, never a `poll` point, so an
+/// `Ops` bound on `Op::Poll` would never count. `Registry::new` rejects it.
+#[test]
+fn ops_bound_on_poll_rejected() {
+    let property = request_served(
+        LivenessBound::Ops {
+            task: "reactor.1",
+            op: Op::Poll,
+            object: None,
+            max: 1,
+        },
+        Status::Active,
+        &[],
+    );
+    assert_eq!(
+        Registry::new(vec![property]).err(),
+        Some(RegistryError::OpsPoll { id: SERVED })
+    );
+}

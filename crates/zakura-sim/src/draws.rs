@@ -24,6 +24,9 @@ pub(crate) enum Owner {
     Task { task: TaskId, name: String },
     /// A step that runs no task, such as a time advance.
     NoTask,
+    /// Between steps, while the loop gathers the enabled set or runs the
+    /// checker. A draw here is a harness failure.
+    Harness,
     /// The run has ended. Cleanup draws aren't recorded.
     Done,
 }
@@ -62,8 +65,10 @@ impl Choices {
     /// Answers `draw` from the plan and records it, or reports why the draw
     /// can't be attributed.
     fn answer(&mut self, draw: &Draw) -> Result<u64, HarnessFailure> {
-        if self.owner == Owner::Done {
-            return Ok(default_draw(draw.bound, 1));
+        match self.owner {
+            Owner::Done => return Ok(default_draw(draw.bound, 1)),
+            Owner::Harness => return Err(HarnessFailure::DrawOutsideStep),
+            Owner::Setup | Owner::Task { .. } | Owner::NoTask => {}
         }
         let kind = kind_name(draw.kind).ok_or(HarnessFailure::UnknownDrawKind)?;
         let owner = match (&self.owner, draw.task) {

@@ -141,6 +141,11 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
+        // A failure the last step's code left behind outranks the outcome.
+        let end = match self.failure.take() {
+            Some(failure) => state.end_harness(failure),
+            None => end,
+        };
         self.choices.borrow_mut().set_owner(Owner::Done);
         let properties = checker.at_end(&end, &state.log);
         state.log.freeze();
@@ -163,6 +168,8 @@ impl Sim {
         st: &mut State,
         sink: &mut dyn RecordSink,
     ) -> RunEnd {
+        // Draws are harness failures except while a step runs.
+        self.choices.borrow_mut().set_owner(Owner::Harness);
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -243,7 +250,7 @@ impl Sim {
             self.execute(chosen.action, st);
             let draws = {
                 let mut choices = self.choices.borrow_mut();
-                choices.set_owner(Owner::NoTask);
+                choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
 
@@ -280,7 +287,11 @@ impl Sim {
                 status: self.sched.status(),
                 log: &st.log,
             };
-            let violation = checker.after_step(&cx).or_else(|| {
+            let violation = checker.after_step(&cx);
+            if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
+            let violation = violation.or_else(|| {
                 let spinning = phase == Phase::Live
                     && self.config.enforce_no_livelock
                     && at_instant > self.config.max_steps_per_instant;

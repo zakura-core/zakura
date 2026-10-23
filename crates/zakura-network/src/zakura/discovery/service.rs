@@ -1040,8 +1040,15 @@ impl DiscoveryExchangeProgress {
     }
 
     async fn wait_complete(&self) {
-        while !self.complete() {
-            self.notify.notified().await;
+        loop {
+            // Created before the check, so a mark that lands between the
+            // check and the await still wakes it. `notify_waiters` stores no
+            // permit for a future created after it.
+            let notified = self.notify.notified();
+            if self.complete() {
+                return;
+            }
+            notified.await;
         }
     }
 }

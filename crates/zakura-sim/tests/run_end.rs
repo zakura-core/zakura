@@ -300,3 +300,33 @@ fn livelock_on_a_sync_spin_still_shuts_down() {
     assert_eq!(property.as_deref(), Some(NO_LIVELOCK));
     assert_eq!(unwound, 1, "shutdown force-unwound the spinner");
 }
+
+#[test]
+fn finishing_the_last_task_is_not_a_livelock() {
+    let config = RunConfig {
+        max_steps_per_instant: 1,
+        enforce_no_livelock: true,
+        ..config(2, 100)
+    };
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("once", async {
+                // One point, so the task takes two steps at one instant.
+                let flag = zakura_rt::sync::atomic::AtomicBool::new(false);
+                let _ = flag.load(zakura_rt::sync::atomic::Ordering::Acquire);
+            });
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.steps, 2);
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Idle {
+            status: zakura_sim::IdleStatus::Quiescent
+        },
+        "{:?}",
+        report.end
+    );
+}

@@ -225,7 +225,8 @@ impl Sim {
             let violation = checker.after_step(&cx).or_else(|| {
                 let spinning = phase == Phase::Live
                     && self.config.enforce_no_livelock
-                    && at_instant > self.config.max_steps_per_instant;
+                    && at_instant > self.config.max_steps_per_instant
+                    && !self.nothing_enabled(&ready);
                 spinning.then(|| Violation {
                     property: NO_LIVELOCK.to_owned(),
                     step: st.step,
@@ -249,6 +250,22 @@ impl Sim {
                 return end;
             }
         }
+    }
+
+    /// True if no action is enabled now, so the run is about to end idle. A
+    /// run that ends this way isn't spinning, however many steps its last
+    /// instant took.
+    fn nothing_enabled(&self, ready: &[(Identity, TaskId)]) -> bool {
+        let now = self.sched.now();
+        let offers: Vec<Offer> = self.sources.iter().map(|s| offer(&**s, now)).collect();
+        enabled_set(&EnabledInputs {
+            phase: Phase::Live,
+            now,
+            ready,
+            next_deadline: self.sched.next_deadline(),
+            offers: &offers,
+        })
+        .is_ok_and(|enabled| enabled.is_empty())
     }
 
     /// Runs `action` and records what it did.

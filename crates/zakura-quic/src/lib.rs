@@ -46,11 +46,13 @@ pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,
 };
-pub use socket::SocketBuffers;
+pub use socket::{BoundSocket, RecvMeta, SocketBuffers, SocketFactory, UdpIo};
 pub use stream::{RecvStream, SendStream};
 
 // API-5: quinn-proto types that appear in this crate's API.
-pub use quinn_proto::{ConnectionError, ConnectionStats, FrameStats, PathStats, UdpStats, VarInt};
+pub use quinn_proto::{
+    ConnectionError, ConnectionStats, FrameStats, PathStats, Transmit, UdpStats, VarInt,
+};
 
 #[cfg(test)]
 mod tests;

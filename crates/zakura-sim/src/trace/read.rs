@@ -15,7 +15,10 @@ use super::{
     write::{is_sha256, BlobStore},
     INPUT_FILE, MAX_INPUT_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
 };
-use crate::record::{EndRecord, InitRecord, Record, StepRecord, CONTRACT_VERSION, FORMAT_VERSION};
+use crate::{
+    check::PropertyOutcome,
+    record::{EndRecord, InitRecord, Record, StepRecord, CONTRACT_VERSION, FORMAT_VERSION},
+};
 
 /// A trace read from disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,8 +191,9 @@ impl Parsed {
         Ok(())
     }
 
-    /// Checks that `end` counts the file's steps, and that its violation
-    /// names only steps in the file, with one match key per evidence step.
+    /// Checks that `end` counts the file's steps, that its violation names
+    /// only steps in the file, with one match key per evidence step, and that
+    /// each property report's evidence and `holds_since` do too.
     fn check_references(&self, line: usize, end: &EndRecord) -> Result<(), Invalid> {
         let steps = self.steps.last().map_or(0, |step| step.step);
         let in_trace = |step: u64| (1..=steps).contains(&step);
@@ -198,6 +202,18 @@ impl Parsed {
                 in_trace(violation.step)
                     && violation.witness.iter().all(|&step| in_trace(step))
                     && violation.witness_keys.len() == violation.witness.len()
+            })
+            && end.properties.iter().all(|report| {
+                // 0 means the assumptions held from the start.
+                report.holds_since.is_none_or(|step| step <= steps)
+                    && match &report.outcome {
+                        PropertyOutcome::Violated { witness } => {
+                            witness.iter().all(|&step| in_trace(step))
+                        }
+                        PropertyOutcome::Held { .. }
+                        | PropertyOutcome::NotApplicable
+                        | PropertyOutcome::Inconclusive { .. } => true,
+                    }
             });
         if good {
             Ok(())
@@ -420,8 +436,9 @@ pub enum Invalid {
         /// The last step it has.
         steps: u64,
     },
-    /// `end` counts other steps than the file has, or its violation names a
-    /// step outside the file or lacks a match key per evidence step.
+    /// `end` counts other steps than the file has, its violation names a step
+    /// outside the file or lacks a match key per evidence step, or a property
+    /// report's evidence or `holds_since` names a step outside the file.
     BadReference {
         /// The `end` line.
         line: usize,

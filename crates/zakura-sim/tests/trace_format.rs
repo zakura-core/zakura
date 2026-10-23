@@ -770,7 +770,44 @@ fn strict_reader() {
         edit_end(&|end| end["violation"]["witness_keys"] = json!(["only one"])),
         bad_reference.clone(),
     );
-    check(edit_end(&|end| end["steps"] = json!(1)), bad_reference);
+    check(
+        edit_end(&|end| end["steps"] = json!(1)),
+        bad_reference.clone(),
+    );
+
+    // So must every property report's evidence and holds_since.
+    let steps = serde_json::from_str::<Value>(&good[n - 1]).unwrap()["end"]["steps"]
+        .as_u64()
+        .unwrap();
+    let report = |witness: u64, holds_since: u64| {
+        json!([{
+            "property": "test/fails-at-5",
+            "outcome": { "violated": { "witness": [2, witness] } },
+            "holds_since": holds_since,
+        }])
+    };
+    check(
+        edit_end(&|end| end["properties"] = report(99, steps)),
+        bad_reference.clone(),
+    );
+    check(
+        edit_end(&|end| end["properties"] = report(0, steps)),
+        bad_reference.clone(),
+    );
+    check(
+        edit_end(&|end| end["properties"] = report(steps, steps + 1)),
+        bad_reference,
+    );
+    write_lines(
+        dir.path(),
+        &edit_end(&|end| end["properties"] = report(steps, steps)),
+    );
+    TraceReader::open(dir.path()).unwrap();
+    write_lines(
+        dir.path(),
+        &edit_end(&|end| end["properties"] = report(5, 0)),
+    );
+    TraceReader::open(dir.path()).unwrap();
     check(Vec::new(), Invalid::MissingMeta);
 }
 

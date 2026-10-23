@@ -759,6 +759,144 @@ fn a_caught_unwind_that_gets_stuck_abandons_the_run() {
 }
 
 #[test]
+fn a_panic_in_a_direct_drop_unwinds_nothing() {
+    if !leaks_in_a_child("a_panic_in_a_direct_drop_unwinds_nothing") {
+        panic_in_shutdown_unwinds_nothing(drop);
+    }
+}
+
+#[test]
+fn a_panic_in_shutdown_unwinds_nothing() {
+    if !leaks_in_a_child("a_panic_in_shutdown_unwinds_nothing") {
+        panic_in_shutdown_unwinds_nothing(|s| {
+            s.shutdown();
+        });
+    }
+}
+
+/// Ends a scheduler with `end` while a joiner's waker panics during its
+/// shutdown, and checks that a task parked on a lock was never unwound.
+fn panic_in_shutdown_unwinds_nothing(end: fn(Scheduler)) {
+    use std::{
+        future::Future,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use zakura_scheduler::RunOutcome::{Parked, Waiting};
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Signals when the thread ends, even by a panic.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _done = Done(done);
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let lock = shared(Mutex::new(()));
+        let held = lock.clone();
+        // A waits forever, and its joiner's waker panics when A is cancelled.
+        let mut a = s.spawn_root("a", std::future::pending::<()>());
+        // H holds the lock across an await, so B stays parked on it.
+        let h = s.spawn_root("h", async move {
+            let _held = held.lock();
+            std::future::pending::<()>().await
+        });
+        // B parks on the lock. Unwinding B would run its guard.
+        let b = s.spawn_root("b", async move {
+            let _ran = SetsFlag(flag);
+            drop(lock.lock());
+        });
+        assert_eq!(s.run(a.task()), Waiting);
+        while s.run(h.task()) != Waiting {}
+        while !matches!(s.run(b.task()), Parked(_)) {}
+        let waker = Waker::from(std::sync::Arc::new(PanicsOnWake));
+        let polled = std::pin::Pin::new(&mut a).poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The waker's panic ends this thread.
+        end(s);
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the thread ended");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "B was not unwound"
+    );
+}
+
+/// When woken, polls a join handle and keeps the exit it reports.
+struct RecordsExit {
+    handle: zakura_scheduler::JoinHandle,
+    exit: std::sync::Mutex<Option<TaskExit>>,
+}
+
+impl std::task::Wake for RecordsExit {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        use std::future::Future;
+        let mut handle = self.handle;
+        let noop = std::task::Context::from_waker(Waker::noop());
+        let mut cx = noop;
+        if let Poll::Ready(exit) = std::pin::Pin::new(&mut handle).poll(&mut cx) {
+            *self.exit.lock().unwrap() = Some(exit);
+        }
+    }
+}
+
+/// Locks its mutex when dropped, as a cancellation destructor might.
+struct LocksOnDrop(Rc<Mutex<()>>);
+
+impl Drop for LocksOnDrop {
+    fn drop(&mut self) {
+        drop(self.0.lock());
+    }
+}
+
+#[test]
+fn a_forced_unwind_out_of_a_cancellation_drop_is_a_cancel() {
+    use std::{future::Future, sync::Arc};
+    use zakura_scheduler::RunOutcome::Waiting;
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let (la, lb) = (shared(Mutex::new(())), shared(Mutex::new(())));
+    let (a_la, a_lb) = (la.clone(), lb.clone());
+    // A and B each hold a lock across an await, and their cancellation
+    // destructors each park on the other's lock.
+    let mut a = s.spawn_root("a", async move {
+        let _held = a_la.lock();
+        let _then = LocksOnDrop(a_lb);
+        std::future::pending::<()>().await
+    });
+    let b = s.spawn_root("b", async move {
+        let _held = lb.lock();
+        let _then = LocksOnDrop(la);
+        std::future::pending::<()>().await
+    });
+    while s.run(a.task()) != Waiting {}
+    while s.run(b.task()) != Waiting {}
+    let joiner = Arc::new(RecordsExit {
+        handle: a,
+        exit: std::sync::Mutex::new(None),
+    });
+    let waker = Waker::from(joiner.clone());
+    assert!(std::pin::Pin::new(&mut a)
+        .poll(&mut std::task::Context::from_waker(&waker))
+        .is_pending());
+    let report = s.shutdown();
+    assert_eq!(
+        *joiner.exit.lock().unwrap(),
+        Some(TaskExit::Cancelled),
+        "the forced unwind ended A as cancelled"
+    );
+    assert_eq!((report.unwound, report.panicked), (1, 0));
+}
+
+#[test]
 fn long_but_finite_cleanup_finishes() {
     let report = shutdown_report(|s| {
         let flag = shared(Atomic::default());

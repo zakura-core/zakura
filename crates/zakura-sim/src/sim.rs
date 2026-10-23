@@ -186,17 +186,20 @@ impl Sim {
     }
 
     /// Shuts the scheduler down, once. If it abandoned the run, which it does
-    /// only when a task got stuck, the sources are forgotten too, since
-    /// dropping one could wait on something a leaked task never released.
+    /// only when a task got stuck, or it panicked, which leaves tasks
+    /// suspended, the sources are forgotten too, since dropping one could
+    /// wait on something a leaked task never released.
     fn shut_down(&mut self) -> CleanupReport {
         let Some(sched) = self.sched.take() else {
             return CleanupReport::default();
         };
         // Cleanup draws take the rotating default, unrecorded.
         self.choices.borrow_mut().set_owner(Owner::Done);
+        // Held aside, so a shutdown that unwinds forgets them.
+        let sources = std::mem::ManuallyDrop::new(std::mem::take(&mut self.sources));
         let cleanup = sched.shutdown();
-        if cleanup.leaked > 0 {
-            std::mem::forget(std::mem::take(&mut self.sources));
+        if cleanup.leaked == 0 {
+            self.sources = std::mem::ManuallyDrop::into_inner(sources);
         }
         cleanup
     }
@@ -522,7 +525,7 @@ fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupRepor
 impl Drop for Sim {
     fn drop(&mut self) {
         // A sim dropped without `run` still shuts down, and forgets its
-        // sources the same way when the run was abandoned.
+        // sources in the same cases.
         self.shut_down();
     }
 }

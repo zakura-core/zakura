@@ -37,8 +37,8 @@ use zakura_sim::{
         BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
     },
-    Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RunConfig, RunReport, Sim,
-    Violation,
+    Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RecordSink, RunConfig,
+    RunReport, Sim, Violation,
 };
 
 /// Three tasks that share a lock, sleep and yield, so runs take time
@@ -460,6 +460,45 @@ fn oversized_files_are_refused() {
             limit: MAX_TRACE_BYTES
         }
     );
+}
+
+#[test]
+fn writer_keeps_to_the_line_limit() {
+    // A meta line over the limit fails before the file exists.
+    let dir = TempDir::new().unwrap();
+    let huge = MetaRecord {
+        scenario: json!("x".repeat(MAX_LINE_BYTES)),
+        ..meta()
+    };
+    let error = FileSink::create(dir.path(), &huge).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!dir.path().join(TRACE_FILE).exists());
+
+    // A step over the limit isn't written, and neither is anything after
+    // it. The file stays a readable prefix, and finish reports the error.
+    let dir = TempDir::new().unwrap();
+    let mut sink = FileSink::create(dir.path(), &meta()).unwrap();
+    let step = |step: u64, pick: String| {
+        Record::Step(StepRecord {
+            step,
+            pick,
+            key: None,
+            options: 1,
+            by: By::Forced,
+            offset: None,
+            draws: Vec::new(),
+            obs: None,
+        })
+    };
+    sink.record(Record::Init(InitRecord::default()));
+    sink.record(step(1, "task:a.1:poll#1".into()));
+    sink.record(step(2, "x".repeat(MAX_LINE_BYTES)));
+    sink.record(step(3, "task:a.1:poll#2".into()));
+    let error = sink.finish().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+    assert_eq!(prefix.steps.len(), 1);
+    assert_eq!(invalid(dir.path()), Invalid::Truncated { steps: 1 });
 }
 
 #[test]

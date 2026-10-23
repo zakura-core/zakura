@@ -1,4 +1,8 @@
 //! Clock abstraction used by Zakura transport rate-limit logic.
+//!
+//! The clock is `zakura_rt::time`'s. [`RealClock`] reads it, so the
+//! simulator's virtual clock drives rate limits too. The trait only lets unit
+//! tests step time by hand.
 
 use zakura_rt::time::Instant;
 

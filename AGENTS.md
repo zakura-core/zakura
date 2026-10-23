@@ -17,7 +17,7 @@ Zakura is a Rust workspace; the member crates live under `crates/`. Main crates 
 
 - `crates/zakurad/` (node CLI/orchestration),
 - core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
-- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/zakura-rt/`, and `crates/xtask/`.
+- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/zakura-rt/`, `crates/zakura-scheduler/` (the simulator's deterministic scheduler, unpublished), and `crates/xtask/`.
 
 Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/` and crate READMEs. CI and policy automation live in `.github/workflows/`.
 

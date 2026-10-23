@@ -61,6 +61,9 @@ audit-as-crates-io = false
 [policy.zakura-rt]
 audit-as-crates-io = false
 
+[policy.zakura-scheduler]
+criteria = "safe-to-run"
+
 [policy.zakura-script]
 audit-as-crates-io = false
 

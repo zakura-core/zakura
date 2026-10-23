@@ -294,7 +294,9 @@ fn only_prepare_and_apply_report_an_owner() {
     }
 }
 
-/// The three deadline kinds land where the reactor and adapter put them.
+/// The three deadline kinds land where the reactor and adapter put them. An
+/// adapter deadline bounds one state read, so a page read lists each of its
+/// five reads as its own stage with a fresh 30 s deadline.
 #[test]
 fn deadlines_follow_production() {
     use HeaderOp::*;
@@ -332,13 +334,22 @@ fn deadlines_follow_production() {
             ReadHeaderPath => &[
                 AdapterStage::StateRead,
                 AdapterStage::FinalizedBodySizesRead,
-                AdapterStage::FinalizedTreeAuxRead,
+                AdapterStage::FinalizedTipRead,
+                AdapterStage::FinalizedHashRead,
+                AdapterStage::FinalizedRootsRead,
             ],
             PrepareHeaderTarget => &[AdapterStage::ValidationLeaseRead],
             ApplyHeaderTarget => &[],
             _ => &[AdapterStage::StateRead],
         };
         assert_eq!(stages, expected, "{}", op.name());
+        for (i, stage) in stages.iter().enumerate() {
+            assert!(
+                !stages[i + 1..].contains(stage),
+                "{} repeats {stage:?}",
+                op.name()
+            );
+        }
         // Only the body-size stage serves a degraded reply instead of failing.
         for stage in stages {
             assert_eq!(

@@ -60,7 +60,7 @@
 //! moment later, and a release can time out after releasing. Histories where
 //! the work ran anyway after a fault are excluded for now, as is the API
 //! draft's Ambiguous outcome. Both would need an operation split into
-//! separate execute and reply stages. A page read whose tree-root stage fails
+//! separate execute and reply stages. A page read whose tree-root reads fail
 //! after its path read consumed the lease is one of these histories.
 //!
 //! The body-size fallback needs no outcome of its own. Header fixtures commit
@@ -90,16 +90,23 @@
 //!   timeout ([`REACTOR_REQUEST_TIMEOUT`] by default). When it fires the
 //!   reactor drops its future and treats the result as missing. The operation
 //!   stays pending.
-//! * The production adapter wraps each state read in [`ADAPTER_DEADLINE`].
-//!   That bounds the whole operation for the locator, VCT context, acquire,
-//!   membership and release calls. A page read has up to three stages, in
-//!   order, each bounded the same way:
+//! * The production adapter wraps each state read in its own fresh
+//!   [`ADAPTER_DEADLINE`], counted from that read's start. That bounds the
+//!   whole operation for the locator, VCT context, acquire, membership and
+//!   release calls, which make one read each. A page read makes up to five
+//!   reads, in order:
 //!   1. The path read, which consumes the lease when it returns a page.
 //!   2. The committed body sizes of a nonempty page's headers. If this read
 //!      fails or times out, the reply is still a successful `Page` with every
 //!      size unknown.
-//!   3. The finalized tree roots, only when the caller asked for them. A
-//!      failure here fails the read with `timeout` or `unavailable`.
+//!   3. The finalized tip, when the caller asked for tree roots.
+//!   4. The selected hash at the page's last finalized height, when the page
+//!      reaches the finalized range.
+//!   5. That finalized range's roots, when the hash matches the page.
+//!
+//!   A failure or timeout in reads 3 to 5 fails the page read with `timeout`
+//!   or `unavailable`. Since each read has its own deadline, a page read whose
+//!   five reads each take 20 s succeeds after 100 s.
 //!
 //!   For prepare it bounds only the validation-lease read, and the result is
 //!   `local-resource`. Apply has no adapter deadline. Its 30 s loop only logs
@@ -233,9 +240,14 @@ pub enum AdapterStage {
     /// The body-size read a page read makes for a nonempty page. Its failure
     /// degrades the page instead of failing it.
     FinalizedBodySizesRead,
-    /// The finalized-root reads a page read makes when the caller asked for
-    /// tree roots.
-    FinalizedTreeAuxRead,
+    /// The finalized tip read, the first tree-root read of a page read that
+    /// asked for tree roots.
+    FinalizedTipRead,
+    /// The selected-hash read that checks the page's last finalized header
+    /// before roots are attached.
+    FinalizedHashRead,
+    /// The read of the finalized range's roots.
+    FinalizedRootsRead,
     /// Prepare's validation-lease read. The rest of preparation has no
     /// deadline.
     ValidationLeaseRead,
@@ -257,11 +269,13 @@ pub enum Deadline {
         /// The default timeout.
         after: Duration,
     },
-    /// The adapter fails `stage` at `after`.
+    /// The adapter fails one state read, `stage`, `after` that read starts.
+    /// Each stage gets its own deadline, so an operation's stages can take
+    /// longer than `after` in total and still succeed.
     Adapter {
         /// The state read it bounds.
         stage: AdapterStage,
-        /// The deadline.
+        /// The deadline, counted from the read's start.
         after: Duration,
     },
     /// The reactor reports a fatal event at `after` and keeps the operation.
@@ -413,7 +427,15 @@ static CONTRACTS: [OpContract; 8] = [
                 after: ADAPTER_DEADLINE,
             },
             Deadline::Adapter {
-                stage: AdapterStage::FinalizedTreeAuxRead,
+                stage: AdapterStage::FinalizedTipRead,
+                after: ADAPTER_DEADLINE,
+            },
+            Deadline::Adapter {
+                stage: AdapterStage::FinalizedHashRead,
+                after: ADAPTER_DEADLINE,
+            },
+            Deadline::Adapter {
+                stage: AdapterStage::FinalizedRootsRead,
                 after: ADAPTER_DEADLINE,
             },
         ],

@@ -5,6 +5,7 @@
 //! it checks. Answers come from a [`QueryState`] claim, the only way to mint
 //! an [`AdmittedAnswer`].
 
+#[cfg(test)]
 use proptest::prelude::*;
 
 use super::super::{
@@ -58,6 +59,7 @@ const WAIT_FOR_ANSWERS: PeerOutput = PeerOutput::WaitForAnswers {
 const END_OPEN: PeerOutput = PeerOutput::End { close: None };
 
 /// A session that sent its exchange and waits for its answers.
+#[cfg(test)]
 fn waiting_session() -> PeerState {
     let mut state = PeerState::default();
     assert_eq!(state.start(), then(PeerOutput::Exchange));
@@ -69,6 +71,7 @@ fn waiting_session() -> PeerState {
 }
 
 /// Records every part of the exchange.
+#[cfg(test)]
 fn complete(state: &mut PeerState) {
     state.record_hello();
     state.record_answer(&admitted(QueryKind::Peers));
@@ -76,6 +79,7 @@ fn complete(state: &mut PeerState) {
 }
 
 /// Ends the initial wait with `wait` on a current session.
+#[cfg(test)]
 fn settle_initial(state: &mut PeerState, wait: InitialWait) -> PeerStep {
     assert_eq!(
         state.on_input(PeerInput::InitialWaitEnded(wait)),
@@ -298,6 +302,7 @@ enum Event {
     Outcome(u8),
 }
 
+#[cfg(test)]
 fn event() -> impl Strategy<Value = Event> {
     prop_oneof![
         1 => Just(Event::Hello),
@@ -473,76 +478,191 @@ impl Model {
     }
 }
 
+const PROPERTY: &str = "discovery/session-policy";
+
+/// Applicable transitions in a decoder-v1 discovery session history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct DiscoverySessionReplaySummary {
+    /// IO outcomes checked against the model.
+    pub transitions: usize,
+    /// Session success or failure charges.
+    pub charges: usize,
+    /// Ownership checks after answer settlement.
+    pub closing_owner_checks: usize,
+    /// Connection closes after the required checks.
+    pub closes: usize,
+}
+
+/// Replay at most 512 bytes through the discovery peer's existing model.
+///
+/// Low bits select Hello, Peers, Services or an IO outcome. High bits select the
+/// legal outcome for the current step. Model disagreements name the property ID.
+pub fn replay_discovery_session_bytes(data: &[u8]) -> DiscoverySessionReplaySummary {
+    let events = data.iter().take(512).map(|byte| match byte & 3 {
+        0 => Event::Hello,
+        1 => Event::Answer(QueryKind::Peers),
+        2 => Event::Answer(QueryKind::Services),
+        _ => Event::Outcome(byte >> 2),
+    });
+    run(events, |_, _| {})
+}
+
+fn run(
+    events: impl IntoIterator<Item = Event>,
+    mut after_transition: impl FnMut(PeerInput, &mut PeerStep),
+) -> DiscoverySessionReplaySummary {
+    let mut state = PeerState::default();
+    let mut model = Model {
+        hello: false,
+        peers: false,
+        services: false,
+        line: Line::Exchange,
+        continued: None,
+    };
+    assert_eq!(
+        state.start(),
+        then(PeerOutput::Exchange),
+        "{PROPERTY}: initial output"
+    );
+    let mut summary = DiscoverySessionReplaySummary::default();
+    let mut sole_then_settled = false;
+    let mut replaced = false;
+    for event in events {
+        match event {
+            Event::Hello => {
+                state.record_hello();
+                model.hello = true;
+            }
+            Event::Answer(kind) => {
+                state.record_answer(&admitted(kind));
+                match kind {
+                    QueryKind::Peers => model.peers = true,
+                    QueryKind::Services => model.services = true,
+                }
+            }
+            Event::Outcome(choice) => {
+                let input = model.outcome(choice);
+                match input {
+                    PeerInput::CurrentSession { current: false }
+                    | PeerInput::Owners(Ownership::Superseded) => replaced = true,
+                    PeerInput::Owners(Ownership::Shared) => sole_then_settled = false,
+                    PeerInput::AnswersSettled => {
+                        sole_then_settled = true;
+                        summary.closing_owner_checks += 1;
+                    }
+                    _ => {}
+                }
+                let expected = model.after(input);
+                let mut step = state.on_input(input);
+                after_transition(input, &mut step);
+                assert_eq!(step, expected, "{PROPERTY}: next operation");
+                summary.transitions += 1;
+                match step.charge {
+                    Some(SessionCharge::Succeed | SessionCharge::Fail) => summary.charges += 1,
+                    Some(SessionCharge::Retire) => assert!(
+                        matches!(step.next, PeerOutput::End { close: Some(_) }),
+                        "{PROPERTY}: retirement requires close"
+                    ),
+                    None => {}
+                }
+                assert!(summary.charges <= 1, "{PROPERTY}: one session charge");
+                if let PeerOutput::End { close } = step.next {
+                    if close.is_some() {
+                        assert!(
+                            sole_then_settled,
+                            "{PROPERTY}: answers settled before close"
+                        );
+                        assert!(!replaced, "{PROPERTY}: replacement forbids close");
+                        assert_eq!(
+                            step.charge,
+                            Some(SessionCharge::Retire),
+                            "{PROPERTY}: close retires"
+                        );
+                        summary.closes += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            state.is_complete(),
+            model.complete(),
+            "{PROPERTY}: exchange completion"
+        );
+    }
+    summary
+}
+
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Every step matches the independent model. Across the session: the
-    /// connection closes only after a sole-owner check and the answer wait,
-    /// a close always retires the session's record, a replaced session never
-    /// closes the connection, and at most one success or failure is charged.
     #[test]
     fn sessions_match_independent_model(events in proptest::collection::vec(event(), 1..64)) {
-        let mut state = PeerState::default();
-        let mut model = Model {
-            hello: false,
-            peers: false,
-            services: false,
-            line: Line::Exchange,
-            continued: None,
-        };
-        prop_assert_eq!(state.start(), then(PeerOutput::Exchange));
-
-        let mut counted = 0;
-        let mut sole_then_settled = false;
-        let mut replaced = false;
-        for event in events {
-            match event {
-                Event::Hello => {
-                    state.record_hello();
-                    model.hello = true;
-                }
-                Event::Answer(kind) => {
-                    state.record_answer(&admitted(kind));
-                    match kind {
-                        QueryKind::Peers => model.peers = true,
-                        QueryKind::Services => model.services = true,
-                    }
-                }
-                Event::Outcome(choice) => {
-                    let input = model.outcome(choice);
-                    match input {
-                        PeerInput::CurrentSession { current: false }
-                        | PeerInput::Owners(Ownership::Superseded) => replaced = true,
-                        PeerInput::Owners(Ownership::Shared) => sole_then_settled = false,
-                        PeerInput::AnswersSettled => sole_then_settled = true,
-                        _ => {}
-                    }
-                    let expected = model.after(input);
-                    let step = state.on_input(input);
-                    prop_assert_eq!(step, expected);
-
-                    match step.charge {
-                        Some(SessionCharge::Succeed | SessionCharge::Fail) => counted += 1,
-                        Some(SessionCharge::Retire) => prop_assert!(
-                            matches!(step.next, PeerOutput::End { close: Some(_) }),
-                            "only a close retires the record"
-                        ),
-                        None => {}
-                    }
-                    prop_assert!(counted <= 1, "a session is charged at most once");
-                    if let PeerOutput::End { close } = step.next {
-                        if close.is_some() {
-                            prop_assert!(sole_then_settled, "a close follows the answer wait");
-                            prop_assert!(!replaced, "a replaced session never closes");
-                            prop_assert_eq!(step.charge, Some(SessionCharge::Retire));
-                        }
-                        break;
-                    }
-                }
-            }
-            prop_assert_eq!(state.is_complete(), model.complete());
-        }
+        run(events, |_, _| {});
     }
+
+    #[test]
+    fn discovery_session_bytes_match_the_same_model(bytes in proptest::collection::vec(any::<u8>(), 0..=512)) {
+        replay_discovery_session_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[0, 1, 2, 7, 11, 7, 11, 3, 11, 3];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn discovery_session_witness_reaches_close_after_recheck() {
+    let summary = replay_discovery_session_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        DiscoverySessionReplaySummary {
+            transitions: 7,
+            charges: 1,
+            closing_owner_checks: 1,
+            closes: 1
+        }
+    );
+    assert_eq!(
+        replay_discovery_session_bytes(&[]),
+        DiscoverySessionReplaySummary::default()
+    );
+    println!("tier=Machine target=discovery_session decoder=1 {summary:?}");
+}
+
+#[cfg(test)]
+fn closing_events() -> impl Iterator<Item = Event> {
+    [
+        Event::Hello,
+        Event::Answer(QueryKind::Peers),
+        Event::Answer(QueryKind::Services),
+    ]
+    .into_iter()
+    .chain([1, 2, 1, 2, 0, 2, 0].into_iter().map(Event::Outcome))
+}
+
+#[test]
+#[should_panic(expected = "discovery/session-policy")]
+fn discovery_session_witness_rejects_skipping_the_owner_recheck() {
+    run(closing_events(), |input, step| {
+        if input == PeerInput::AnswersSettled {
+            step.next = PeerOutput::MarkShortLived;
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "discovery/session-policy")]
+fn discovery_session_witness_rejects_losing_the_success_charge() {
+    run(closing_events(), |_, step| {
+        if step.charge == Some(SessionCharge::Succeed) {
+            step.charge = None;
+        }
+    });
 }
 
 #[test]

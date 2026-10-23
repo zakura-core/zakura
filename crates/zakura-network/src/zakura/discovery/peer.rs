@@ -9,8 +9,10 @@
 //! to a close.
 
 mod state;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 
 use std::{sync::Arc, time::Duration};
 

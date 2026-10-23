@@ -31,8 +31,10 @@ use crate::zakura::{
 };
 
 mod state;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod state_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state_tests::{replay_candidate_dial_bytes, CandidateDialReplaySummary};
 
 use state::{CandidateDialerState, DialAttemptKey};
 

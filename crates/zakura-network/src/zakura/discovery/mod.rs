@@ -27,11 +27,21 @@ pub(crate) use candidate_dialer::{
     insert_static_bootstrap_candidates, spawn_native_discovery_dialer,
 };
 pub(crate) use dialer::{parse_bootstrap_peer, spawn_native_bootstrap_dialer};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 #[cfg(test)]
 pub(crate) use protocol::discovery_dial_slot_limit;
 pub use protocol::*;
 pub(crate) use redial::{native_dial_supervised, RedialPolicy};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use redial::{replay_redial_bytes, RedialReplaySummary};
 pub(crate) use runtime::{
     build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
 };
 pub use service::{DiscoveryPeerSession, DiscoveryService};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use requester::{replay_discovery_query_bytes, DiscoveryQueryReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use candidate_dialer::{replay_candidate_dial_bytes, CandidateDialReplaySummary};

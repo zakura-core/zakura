@@ -86,3 +86,52 @@ pure decisions. They do not prove asynchronous reservation cleanup.
 Each target receives its own 900-second daily and 3,600-second weekly budget.
 Keep the existing session budget intact. The planned P1 registry will index the
 local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+
+## Discovery session and redial targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_session` | `discovery/session-policy` | `discovery_session_witness_reaches_close_after_recheck` |
+| `discovery_redial` | `discovery/redial-policy` | `redial_witness_exercises_limits_resets_and_lagging_registration` |
+
+Both decoder-v1 targets read at most 512 bytes and reuse their existing
+independent models for proptest and cargo-fuzz. Empty inputs report zero
+applicability. Each target retains its own daily and weekly budget.
+
+`discovery_session` decodes hello, admitted answers and operation outcomes.
+It checks exchange completion, single settlement, and ownership checks before
+close. Its witness reaches a close after the answer wait and ownership recheck.
+Two planted failures skip the recheck or discard the success charge.
+
+`discovery_redial` uses three header bytes for policy and backoff bounds.
+Each remaining triple selects an attempt and registration lifetime. Its witness
+checks local limits, backoff growth, registration upgrades, resets and stopping.
+Two planted failures reset a failed attempt or charge a local limit.
+
+These targets check pure policies. They do not prove worker cancellation or
+connection ownership across scheduled IO. The planned P1 registry will index
+the local IDs and witnesses.
+
+## Discovery query and candidate targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_query` | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
+| `discovery_candidate` | `discovery/dial-attempts` | `candidate_witness_exercises_identity_backoff_and_local_limits` |
+
+Both decoder-v1 targets share their existing proptest models with cargo-fuzz.
+They read at most 512 bytes and report zero applicability for empty histories.
+Each target has its own 900-second daily and 3,600-second weekly budget.
+
+`discovery_query` decodes reservation, queue, release and claim operations.
+Its model calculates wire caps independently and checks that an answer claims
+its own reservation once. Its witness exercises refusal, unsent release, an
+exact-cap answer, an oversized answer and a stale claim. Planted failures lose
+a reservation or release a queued query.
+
+`discovery_candidate` decodes triples into dial, completion, duplicate, round
+and logical-time operations. Its model tracks canonical IP reservations and
+per-node backoff. Its witness exercises a duplicate completion, failure backoff
+and a local-limit pause. Planted failures release reservations early or discard
+backoff. Final cleanup settles every remaining logical reservation. This does
+not prove that an asynchronous worker releases its admission permit.

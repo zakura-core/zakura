@@ -309,7 +309,10 @@ compile_error!(
 /// The pipe and hooks are boxed so every service spawns the same task type and
 /// shares one copy of tokio's per-task code. Pipes start once per peer stream, so
 /// the extra allocation is negligible.
+///
+/// `label` names the task for [`zakura_rt::task::spawn_named`].
 pub(crate) fn spawn_supervised_pipe(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     cancel: CancellationToken,
     on_teardown: impl FnOnce() + Send + 'static,
@@ -317,6 +320,7 @@ pub(crate) fn spawn_supervised_pipe(
     pipe: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
     spawn_boxed_pipe(
+        label,
         peer_id,
         cancel,
         Box::new(on_teardown),
@@ -331,14 +335,16 @@ type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// A boxed teardown or panic hook for a supervised task.
 type BoxedHook = Box<dyn FnOnce() + Send>;
 
+/// [`spawn_supervised_pipe`] after boxing.
 fn spawn_boxed_pipe(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     cancel: CancellationToken,
     on_teardown: BoxedHook,
     on_panic: BoxedHook,
     pipe: BoxedTask,
 ) -> JoinHandle<()> {
-    zakura_rt::task::spawn(async move {
+    zakura_rt::task::spawn_named(label, async move {
         let _teardown = PipeTeardown {
             peer_id,
             cancel,
@@ -407,7 +413,10 @@ impl<F: FnOnce(), P: FnOnce()> Drop for PeerTaskTeardown<F, P> {
 /// Like [`spawn_supervised_pipe`], the task and hooks are boxed so every caller
 /// shares one task type. Use [`spawn_supervised_peer_task_unboxed`] for tasks
 /// spawned per request rather than per connection or session.
+///
+/// `label` names the task for [`zakura_rt::task::spawn_named`].
 pub(crate) fn spawn_supervised_peer_task(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
@@ -416,7 +425,7 @@ pub(crate) fn spawn_supervised_peer_task(
     let on_teardown: BoxedHook = Box::new(on_teardown);
     let on_panic: BoxedHook = Box::new(on_panic);
     let task: BoxedTask = Box::pin(task);
-    spawn_supervised_peer_task_unboxed(peer_id, on_teardown, on_panic, task)
+    spawn_supervised_peer_task_unboxed(label, peer_id, on_teardown, on_panic, task)
 }
 
 /// [`spawn_supervised_peer_task`] without boxing, for tasks spawned per request.
@@ -424,12 +433,13 @@ pub(crate) fn spawn_supervised_peer_task(
 /// Each distinct task type gets its own copy of tokio's per-task code, so use this
 /// only where the extra allocation of the boxed variant would land on a hot path.
 pub(crate) fn spawn_supervised_peer_task_unboxed(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
     task: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
-    zakura_rt::task::spawn(async move {
+    zakura_rt::task::spawn_named(label, async move {
         let _teardown = PeerTaskTeardown {
             peer_id,
             on_teardown: Some(on_teardown),
@@ -486,7 +496,7 @@ pub mod supervised_spawn_bench {
         peer_id: ZakuraPeerId,
         task: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
-        super::spawn_supervised_peer_task(peer_id, || {}, || {}, task)
+        super::spawn_supervised_peer_task("bench_peer_task", peer_id, || {}, || {}, task)
     }
 
     /// Spawn `task` through the unboxed path used for per-request serving tasks.
@@ -494,7 +504,7 @@ pub mod supervised_spawn_bench {
         peer_id: ZakuraPeerId,
         task: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
-        super::spawn_supervised_peer_task_unboxed(peer_id, || {}, || {}, task)
+        super::spawn_supervised_peer_task_unboxed("bench_peer_task", peer_id, || {}, || {}, task)
     }
 }
 
@@ -639,6 +649,7 @@ mod tests {
         // Production drops this handle to detach the task; here we await it to
         // observe the contained panic.
         let handle = spawn_supervised_pipe(
+            "test_pipe",
             peer_id(),
             cancel.clone(),
             move || flag.store(true, Ordering::SeqCst),
@@ -684,6 +695,7 @@ mod tests {
         // Production drops this handle to detach the task; here we await it to
         // observe the contained panic.
         let handle = spawn_supervised_peer_task(
+            "test_peer_task",
             peer_id(),
             move || teardown_flag.store(true, Ordering::SeqCst),
             move || disconnect_flag.store(true, Ordering::SeqCst),
@@ -720,6 +732,7 @@ mod tests {
         let disconnect_flag = disconnected.clone();
 
         let handle = spawn_supervised_peer_task(
+            "test_peer_task",
             peer_id(),
             move || teardown_flag.store(true, Ordering::SeqCst),
             move || disconnect_flag.store(true, Ordering::SeqCst),

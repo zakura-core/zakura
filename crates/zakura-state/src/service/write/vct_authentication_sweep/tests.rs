@@ -508,6 +508,32 @@ impl Fixture {
         marker: u8,
     ) -> ApplyResult {
         let snapshot = self.writer.runtime.publisher().snapshot();
+        let insert = self.redelivery(height, corruption, marker);
+        self.writer
+            .runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(insert),
+                },
+                &TransitionContext {
+                    config: &self.writer.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the selected auxiliary replacement applies")
+    }
+
+    /// Builds a supplier response for the selected repair range without applying it.
+    fn redelivery(
+        &self,
+        height: Height,
+        corruption: Option<(Height, Corruption)>,
+        marker: u8,
+    ) -> Box<InsertHeaders> {
+        let snapshot = self.writer.runtime.publisher().snapshot();
         let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
             u64::from(marker),
             NonZeroU64::new(1).expect("one is nonzero"),
@@ -576,33 +602,19 @@ impl Fixture {
                 )
             })
             .collect();
-        self.writer
-            .runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: snapshot.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner,
-                        source,
-                        parent_hash: parent.hash(),
-                        target_tip_hash: request_target.hash,
-                        completion: TargetCompletion::SelectedAuxiliaryRepair {
-                            common_ancestor: Frontier::new(Height(first_height - 1), parent.hash()),
-                            selected_target: request_target,
-                            episode: context.episode,
-                        },
-                        batch,
-                        aux,
-                    })),
-                },
-                &TransitionContext {
-                    config: &self.writer.config,
-                    clock: &SystemClock,
-                    full_state_authority: None,
-                    retention_references: &[],
-                },
-            )
-            .expect("the selected auxiliary replacement applies")
+        Box::new(InsertHeaders {
+            owner,
+            source,
+            parent_hash: parent.hash(),
+            target_tip_hash: request_target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: Frontier::new(Height(first_height - 1), parent.hash()),
+                selected_target: request_target,
+                episode: context.episode,
+            },
+            batch,
+            aux,
+        })
     }
 
     fn authentications(&self, height: Height) -> Vec<TestAuxStatus> {
@@ -1485,5 +1497,145 @@ fn missing_branch_id_does_not_implicate_auxiliary_deliveries() {
     assert!(
         attribute_verification_failure(&window, height, successor, height, &malformed_tree)
             .is_some()
+    );
+}
+
+/// Boundary recovery needs only H and H+1, and reports progress only once.
+#[test]
+fn commit_boundary_recovery_is_local_and_idempotent() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    let height = Height(BODY_TIP + 1);
+    fixture.insert_headers(Some(Height(height.0 + 2)), None);
+    let frontier = Frontier::new(height, fixture.chain[height.0 as usize].hash());
+    let tip_before = fixture.finalized_state.db.tip();
+    assert!(
+        recover_commit_boundary(&fixture.finalized_state, &fixture.writer, frontier)
+            .expect("the selected boundary is coherent")
+    );
+    assert_eq!(
+        fixture.authentication(height),
+        Some(TestAuxStatus::Authenticated)
+    );
+    assert_eq!(
+        fixture.authentication(Height(height.0 + 1)),
+        Some(TestAuxStatus::Unauthenticated)
+    );
+    let authenticated = fixture.writer.runtime.publisher().snapshot();
+    assert!(
+        !recover_commit_boundary(&fixture.finalized_state, &fixture.writer, frontier)
+            .expect("the selected boundary remains coherent")
+    );
+    assert_eq!(fixture.writer.runtime.publisher().snapshot(), authenticated);
+    assert_eq!(fixture.finalized_state.db.tip(), tip_before);
+}
+
+/// Exhausting a bad pair must not report progress or mutate the header state.
+#[test]
+fn commit_boundary_recovery_exhausts_bad_pairs_without_progress() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    let height = Height(BODY_TIP + 1);
+    fixture.insert_headers(None, Some((Height(height.0 + 1), Corruption::AuthDataRoot)));
+    let frontier = Frontier::new(height, fixture.chain[height.0 as usize].hash());
+    let before = fixture.writer.runtime.publisher().snapshot();
+    for _ in 0..2 {
+        assert!(
+            !recover_commit_boundary(&fixture.finalized_state, &fixture.writer, frontier)
+                .expect("the bad pair is coherent")
+        );
+        assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
+    }
+}
+
+/// The committed history tree cannot authorize recovery on another branch or above the next body.
+#[test]
+fn commit_boundary_recovery_requires_the_next_selected_body() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, None);
+    let before = fixture.writer.runtime.publisher().snapshot();
+    for frontier in [
+        Frontier::new(Height(BODY_TIP + 1), block::Hash([0xff; 32])),
+        Frontier::new(
+            Height(BODY_TIP + 2),
+            fixture.chain[BODY_TIP as usize + 2].hash(),
+        ),
+    ] {
+        assert!(
+            !recover_commit_boundary(&fixture.finalized_state, &fixture.writer, frontier)
+                .expect("the selected projection is coherent")
+        );
+    }
+    assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
+}
+
+/// The candidate-count bound must permit the honest pair at the end of a full search.
+#[test]
+fn boundary_search_reaches_the_last_of_1024_pairs() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, None);
+    let height = Height(BODY_TIP + 1);
+    let VctAuxiliaryWindowRead::Ready(honest) = fixture
+        .writer
+        .vct_auxiliary_window(height, fixture.chain[height.0 as usize].hash())
+        .expect("the honest boundary is coherent")
+    else {
+        panic!("the fixture supplies both deliveries");
+    };
+    let mut windows = Vec::new();
+    for current in 0u8..32 {
+        for successor in 0u8..32 {
+            let mut window = (*honest).clone();
+            if current < 31 {
+                // Keep each current delivery's identity stable across its successor group.
+                window.delivery.delivery_id = EvidenceId::from_digest([current; 32]);
+                let mut root = [0; 32];
+                root[0] = current + 1;
+                window
+                    .delivery
+                    .tree_aux
+                    .as_mut()
+                    .expect("the current roots exist")
+                    .sapling_root =
+                    sapling::tree::Root::try_from(root).expect("a small scalar is canonical");
+            }
+            if successor < 31 {
+                let witness = window.successor.as_mut().expect("the successor exists");
+                let delivery = witness
+                    .delivery
+                    .as_mut()
+                    .expect("the successor roots exist");
+                delivery.delivery_id = EvidenceId::from_digest([successor; 32]);
+                let roots = delivery
+                    .tree_aux
+                    .as_mut()
+                    .expect("the successor roots exist");
+                let mut auth_root = <[u8; 32]>::from(roots.auth_data_root);
+                auth_root[0] ^= successor + 1;
+                roots.auth_data_root = AuthDataRoot::from(auth_root);
+                witness.auth_data_root = Some(roots.auth_data_root);
+            }
+            windows.push(window);
+        }
+    }
+    assert_eq!(windows.len(), 1024);
+    let history_tree = fixture.finalized_state.db.history_tree();
+    let verified = authenticate_boundary_pairs(
+        &fixture.writer,
+        &fixture.network,
+        &history_tree,
+        &windows,
+        honest.engine_snapshot.header_generation,
+    )
+    .expect("the search reaches the last pair");
+    assert_eq!(
+        verified.as_ref().map(|tree| tree.current_height()),
+        Some(height)
+    );
+    assert_eq!(
+        fixture.authentication(height),
+        Some(TestAuxStatus::Authenticated)
     );
 }

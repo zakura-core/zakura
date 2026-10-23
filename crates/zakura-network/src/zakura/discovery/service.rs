@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::HashMap,
@@ -445,6 +445,7 @@ impl Service for DiscoveryService {
         let panic_connection_cancel = connection_cancel.clone();
         let panic_close_cause = close_cause.clone();
         spawn_supervised_peer_task(
+            "discovery_admission",
             admit_peer_id,
             || {},
             move || {
@@ -497,7 +498,7 @@ impl Service for DiscoveryService {
             .remove_connection(peer, conn_id);
         let handle = self.handle.clone();
         let peer = peer.clone();
-        spawn_erased(async move {
+        spawn_erased_named("discovery_remove_peer", async move {
             handle.remove_peer(&peer, conn_id).await;
         });
     }
@@ -598,7 +599,14 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     };
     // Let the returned handle drop to detach the supervised reader task; the
     // `PipeTeardown` still runs on every exit path.
-    spawn_supervised_pipe(peer_id.clone(), sink_service_cancel, || {}, on_panic, pipe);
+    spawn_supervised_pipe(
+        "discovery_pipe",
+        peer_id.clone(),
+        sink_service_cancel,
+        || {},
+        on_panic,
+        pipe,
+    );
 
     let io = PeerIO {
         handle,
@@ -620,6 +628,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     // the async session removal through the registry. Normal exits end the
     // session in `PeerIO::run`, so `on_panic` is the panic-only path.
     spawn_supervised_peer_task(
+        "discovery_source",
         peer_id,
         || {},
         move || {

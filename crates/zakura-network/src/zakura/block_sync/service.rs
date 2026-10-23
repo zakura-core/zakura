@@ -463,7 +463,8 @@ impl BlockSyncService {
         reserved: bool,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
-            return SessionDemand::RetryAt(deadline);
+            // Block sync still runs on std's clock.
+            return SessionDemand::RetryAt(deadline.into());
         }
 
         if !reserved && self.inner.routine_wiring.is_some() {
@@ -906,6 +907,7 @@ impl Service for BlockSyncService {
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
+            "block_sync_pipe",
             peer_id.clone(),
             service_cancel_token.clone(),
             on_teardown,

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use zakura_chain::{block, diagnostic::task::CheckForPanics};
+use zakura_chain::block;
 
 use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
@@ -10,6 +10,7 @@ use crate::zakura::{
     regulation::{
         Produce, Responded, ResponseCap, ResponseSink, ServeEnd, SinkProgress, WorkLease,
     },
+    resume_task_panic,
     wire_codec::WireError,
 };
 
@@ -91,11 +92,12 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         // Copying up to the response cap into frames can still take a while.
         // Await the actual job, even after session cancellation, and keep the
         // source's lease with its retained blocks.
-        zakura_rt::task::spawn_blocking(move || {
-            encode_response(requested, read_range.count(), max_body_bytes, result, sink)
-        })
-        .await
-        .check_for_panics_with(false)
+        resume_task_panic(
+            zakura_rt::task::spawn_blocking(move || {
+                encode_response(requested, read_range.count(), max_body_bytes, result, sink)
+            })
+            .await,
+        )
         .map_err(|_| ServeEnd::Cancelled)?
     }
 

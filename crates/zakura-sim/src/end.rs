@@ -33,7 +33,7 @@ impl fmt::Display for HarnessFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HarnessFailure::TaskNameHasColon { name } => {
-                write!(f, "task name {name:?} contains ':'")
+                write!(f, "task name `{name}` contains ':'")
             }
             HarnessFailure::DuplicateIdentity { identity } => {
                 write!(f, "two enabled actions are both {identity}")

@@ -71,6 +71,16 @@ pub enum PlanChoice {
     Draw(HexU64),
 }
 
+impl fmt::Display for PlanChoice {
+    /// `pick <identity>` or `draw <hex>`, a stable form for records.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanChoice::Pick(identity) => write!(f, "pick {identity}"),
+            PlanChoice::Draw(value) => write!(f, "draw {value}"),
+        }
+    }
+}
+
 /// Where a run's choices come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanInput {
@@ -117,7 +127,7 @@ impl fmt::Display for PlanError {
             PlanError::Mismatch { wanted, found } => {
                 write!(
                     f,
-                    "the run asked for a {wanted}, but the script has {found:?}"
+                    "the run asked for a {wanted}, but the script has {found}"
                 )
             }
         }

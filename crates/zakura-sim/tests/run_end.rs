@@ -271,3 +271,26 @@ fn livelock_counts_advances_that_leave_the_clock_still() {
     assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
     assert_eq!(report.end.violation.unwrap().property, NO_LIVELOCK);
 }
+
+#[test]
+fn harness_text_in_records_has_no_debug_output() {
+    let script = zakura_sim::PlanInput::Script(Plan {
+        choices: vec![zakura_sim::PlanChoice::Draw(zakura_sim::HexU64(42))],
+    });
+    let (_, lines) = support::recorded(
+        config(2, 100),
+        script,
+        |sim| {
+            sim.scheduler().spawn_root("a", async {});
+            sim.scheduler().spawn_root("b", async {});
+        },
+        &mut NoChecks,
+    );
+    let Ok(zakura_sim::Record::End(end)) = serde_json::from_str(lines.last().unwrap()) else {
+        panic!("the last record is end");
+    };
+    assert_eq!(
+        end.harness.as_deref(),
+        Some("the run asked for a pick, but the script has draw 0x2a")
+    );
+}

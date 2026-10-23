@@ -31,7 +31,17 @@ pub(crate) enum Cmd {
     Poll,
     /// Drop the future without polling it. Only sent at a poll boundary.
     Cancel,
+    /// Unwind from where the task is suspended with a [`ForcedUnwind`]
+    /// payload, which the coroutine's root catches. Shutdown sends it to a
+    /// task still parked after the drain. At a poll boundary it acts as
+    /// `Cancel`.
+    Unwind,
 }
+
+/// The panic payload of a forced unwind. Shutdown drives the unwind itself,
+/// rather than through corosensei's `force_unwind`, which resumes a task that
+/// suspends mid-unwind instead of returning to the scheduler.
+pub(crate) struct ForcedUnwind;
 
 /// Why a coroutine handed control back.
 pub(crate) enum Yield {
@@ -88,6 +98,12 @@ pub(crate) struct RunState {
     /// Tasks that passed [`CLEANUP_POINT_LIMIT`] points during shutdown. The
     /// drain stops at the first, and shutdown abandons the run.
     pub(crate) stuck: BTreeSet<TaskId>,
+    /// The task shutdown is force-unwinding. It's cleared when the task
+    /// ends, so one still set afterwards caught the unwind and kept going.
+    pub(crate) unwinding: Option<TaskId>,
+    /// Tasks shutdown has force-unwound once. One that parks again is
+    /// treated as stuck.
+    unwind_tried: BTreeSet<TaskId>,
     /// Answers random draws. Taken out while it runs.
     pub(crate) draws: Option<DrawSource>,
     /// Panic payloads of tasks that panicked, until a joiner takes them.
@@ -442,6 +458,8 @@ impl Scheduler {
                 shutting_down: false,
                 cleanup_points: BTreeMap::new(),
                 stuck: BTreeSet::new(),
+                unwinding: None,
+                unwind_tried: BTreeSet::new(),
                 draws: None,
                 #[cfg(zakura_sim)]
                 panics: BTreeMap::new(),
@@ -531,11 +549,19 @@ impl Scheduler {
     /// Resumes a ready `task`, ignoring the worker limit. Shared by
     /// [`run`](Self::run) and the shutdown drain.
     fn step(&mut self, task: TaskId) -> RunOutcome {
+        self.resume(task, None)
+    }
+
+    /// [`step`](Self::step), or with `forced` sent instead of the usual
+    /// command, as shutdown's forced unwind does.
+    fn resume(&mut self, task: TaskId, forced: Option<Cmd>) -> RunOutcome {
         let cmd = self.state(|s| {
             s.current = Some(task);
             s.ready.remove(&task);
             let starts_poll = s.mid_poll.insert(task);
-            if starts_poll && s.cancel_requested.contains(&task) {
+            if let Some(cmd) = forced {
+                cmd
+            } else if starts_poll && s.cancel_requested.contains(&task) {
                 Cmd::Cancel
             } else {
                 Cmd::Poll
@@ -594,6 +620,9 @@ impl Scheduler {
             let co = self.coroutines[task.index()]
                 .take()
                 .expect("the coroutine was live when it was resumed");
+            // A task that caught a forced unwind but still ended is unwound
+            // as cleanly as one the unwind reached.
+            self.state(|s| s.unwinding = s.unwinding.filter(|t| *t != task));
             return_stack(co.into_stack());
             self.finish(task, exit);
         }
@@ -733,25 +762,30 @@ impl Scheduler {
             else {
                 break;
             };
-            let mut co = self.coroutines[task.index()]
-                .take()
-                .expect("position found a live coroutine");
-            if co.started() && !co.done() {
+            // A task that caught an earlier forced unwind and parked again
+            // may never let go, so it counts as stuck.
+            if !self.state(|s| s.unwind_tried.insert(task)) {
+                self.state(|s| s.stuck.insert(task));
+                continue;
+            }
+            if self.coroutines[task.index()]
+                .as_ref()
+                .is_some_and(|co| co.started() && !co.done())
+            {
                 report.unwound += 1;
             }
-            self.state(|s| s.current = Some(task));
-            let unwound = catch_unwind(AssertUnwindSafe(|| co.force_unwind()));
-            self.state(|s| s.current = None);
-            if unwound.is_ok() && co.done() {
-                return_stack(co.into_stack());
-            } else {
-                // The task caught the unwind and kept going. Its stack still
-                // holds live frames, so it can't be reused or freed safely.
+            self.state(|s| {
+                s.unwinding = Some(task);
+                s.parked.values_mut().for_each(|p| p.retain(|t| *t != task));
+            });
+            // Through `resume`, so whatever the task does next, finishing,
+            // reaching a point, parking or getting stuck, comes back here.
+            self.resume(task, Some(Cmd::Unwind));
+            if self.state(|s| s.unwinding.take() == Some(task)) {
+                // The task caught the unwind and kept going. It's live
+                // again, and the next drain runs it as any other task.
                 report.unwind_failures += 1;
-                std::mem::forget(co);
             }
-            self.finish(task, TaskExit::Cancelled);
-            self.admit();
         }
         // Drop what's left outside the borrow, while the run and the
         // `zakura-rt` executor are both still installed, since destructors
@@ -835,14 +869,33 @@ impl Scheduler {
                 move |yielder: &TaskYielder, mut cmd: Cmd| {
                     with_run(|s| s.tasks[id.index()].yielder = yielder as *const _);
                     let mut cx = Context::from_waker(&waker);
+                    // A forced unwind is over once it reaches here. The future
+                    // is then dropped outside any unwind, so its destructors
+                    // still count points and can be stopped.
+                    let unwound = || {
+                        with_run(|s| s.unwinding = s.unwinding.filter(|t| *t != id));
+                        TaskExit::Cancelled
+                    };
                     loop {
-                        if let Cmd::Cancel = cmd {
-                            drop(fut);
-                            return TaskExit::Cancelled;
+                        match cmd {
+                            Cmd::Poll => {}
+                            Cmd::Cancel => {
+                                drop(fut);
+                                return TaskExit::Cancelled;
+                            }
+                            Cmd::Unwind => {
+                                drop(fut);
+                                return unwound();
+                            }
                         }
-                        match fut.as_mut().poll(&mut cx) {
-                            Poll::Ready(()) => return TaskExit::Completed,
-                            Poll::Pending => cmd = yielder.suspend(Yield::Pending),
+                        match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx))) {
+                            Ok(Poll::Ready(())) => return TaskExit::Completed,
+                            Ok(Poll::Pending) => cmd = yielder.suspend(Yield::Pending),
+                            Err(payload) if payload.is::<ForcedUnwind>() => {
+                                drop(fut);
+                                return unwound();
+                            }
+                            Err(payload) => std::panic::resume_unwind(payload),
                         }
                     }
                 },
@@ -868,5 +921,12 @@ impl Scheduler {
 impl Drop for Scheduler {
     fn drop(&mut self) {
         self.shutdown_inner();
+        // A shutdown that panicked can leave coroutines suspended. Dropping
+        // one would force-unwind it through corosensei, which can run its
+        // destructors past any bound, so forget them instead.
+        std::mem::take(&mut self.coroutines)
+            .into_iter()
+            .flatten()
+            .for_each(std::mem::forget);
     }
 }

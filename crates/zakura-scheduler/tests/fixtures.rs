@@ -710,6 +710,55 @@ fn no_code_runs_after_a_task_is_stuck() {
 }
 
 #[test]
+fn a_caught_unwind_that_gets_stuck_abandons_the_run() {
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    if leaks_in_a_child("a_caught_unwind_that_gets_stuck_abandons_the_run") {
+        return;
+    }
+    let b_ran = Arc::new(AtomicBool::new(false));
+    let flag = b_ran.clone();
+    let report = shutdown_report(move |s| {
+        let (l1, l2) = (shared(Mutex::new(())), shared(Mutex::new(())));
+        let b_flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_l1, a_l2, a_waits) = (l1.clone(), l2.clone(), b_flag);
+        // A holds l1, waits for l2 in a lock cycle with B, catches the
+        // forced unwind, then spins until the cleanup bound stops it. Its
+        // guard waits on a flag B never sets.
+        let a = s.spawn_root("a", async move {
+            let _waits = SpinsOnDrop(a_waits);
+            let _l1 = a_l1.lock();
+            point();
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(a_l2.lock())));
+            while never.load() == 0 {}
+        });
+        // B holds l2 and waits for l1. Its guard would set B's ran flag.
+        let b = s.spawn_root("b", async move {
+            let _ran = SetsFlag(flag);
+            let _l2 = l2.lock();
+            point();
+            drop(l1.lock());
+        });
+        for task in [a.task(), a.task(), b.task(), b.task()] {
+            assert!(matches!(s.run(task), Reached(_)));
+        }
+        for task in [a.task(), b.task()] {
+            let parked = (0..10).any(|_| matches!(s.run(task), Parked(_)));
+            assert!(parked, "the task parks in the lock cycle");
+        }
+    });
+    assert!(
+        !b_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "B's guard never ran"
+    );
+    assert_eq!((report.leaked, report.cancelled), (2, 0), "A and B");
+}
+
+#[test]
 fn long_but_finite_cleanup_finishes() {
     let report = shutdown_report(|s| {
         let flag = shared(Atomic::default());

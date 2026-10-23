@@ -23,7 +23,7 @@
 //! | `continuation_locator` | reactor, `QueryHeaderLocator` | `Some(locator)`, or `None` before handoff | `unavailable`, `timeout` after 30 s |
 //! | `vct_repair_context` | reactor, `QueryVctRepairContext` | `Resolved`, `Stale` | `unavailable`, `timeout` after 30 s |
 //! | `acquire_header_path` | v9 publisher page job | `Acquired`, `TargetNotRetained`, `NoLocatorIntersection`, `HistoryPruned`, `CapacityBusy` or `Busy` per [`AcquireRefusal`]. An empty or oversized locator gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
-//! | `read_header_path` | v9 publisher page job | `Page`, `Unavailable`. A foreign path gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
+//! | `read_header_path` | v9 publisher page job | `Page`, `Unavailable`. A foreign path or an out-of-bounds page count gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `release_header_path` | v9 publisher page job | `Ok(())`, also on repeats. A foreign path gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `prepare_header_target` | reactor, `PrepareHeaderTarget` | a sealed target, `stale_target`, `unknown_anchor`, validation and body-size errors | `local-resource` |
 //! | `apply_header_target` | reactor, `ApplyHeaderTarget` | `Applied`, `ResourceStalled`, `stale_target`, `invalid_header`, `auxiliary_capacity`, `local_resource` | `local-resource` |
@@ -128,9 +128,11 @@
 //! * an `Acquired` reply nobody receives drops it
 //! * its 30 s idle deadline passes, and some later acquire or read sweeps it
 //!
-//! The sweep isn't per peer. Each acquire, and each read that passes its
-//! bounds check, first ends every lease past its idle deadline, whoever holds
-//! it, and fires the waiting capacity signals. So if peer A leaves a lease
+//! The sweep isn't per peer. Each acquire and read whose [`InputCheck`]s
+//! pass first ends every lease past its idle deadline, whoever holds it, and
+//! fires the waiting capacity signals. One that fails an input check returns
+//! `Err(Unavailable)` before reaching the lease registry, so it sweeps
+//! nothing. So if peer A leaves a lease
 //! idle for 30 s, peer B's next acquire ends it and can take the freed slot.
 //! A then sees `Unavailable` on its next read. Shutdown ends everything.
 //!
@@ -361,10 +363,35 @@ pub struct OpContract {
     /// The events that end capacity the operation creates or holds. Empty if
     /// it owns none.
     pub releases: &'static [Release],
+    /// The checks on the request that run before any lease state is
+    /// touched. A failed check gives `Err(Unavailable)`.
+    pub input_checks: &'static [InputCheck],
     /// Whether the operation first ends every peer's lease that's past its
-    /// idle deadline, as `RetainedPathLeaseRegistry::expire` does. For a read,
-    /// only once the page count passes its bounds check.
+    /// idle deadline, as `RetainedPathLeaseRegistry::expire` does, once its
+    /// input checks pass. See [`OpContract::sweeps`].
     pub sweeps_idle_leases: bool,
+}
+
+/// A request check that runs before the lease registry, so a request that
+/// fails it changes no lease and fires no capacity signal.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum InputCheck {
+    /// An acquire's locator has between 1 and `MAX_HEADER_LOCATOR_HASHES`
+    /// hashes (`acquire_retained_path`).
+    LocatorCount,
+    /// The adapter issued the path's handle (`RetainedHeaderPath::adapter_identity`).
+    AdapterHandle,
+    /// A read asks for between 1 and `MAX_HEADER_SYNC_HEIGHT_RANGE` headers
+    /// (`read_retained_path`).
+    PageCount,
+}
+
+impl OpContract {
+    /// Whether the operation sweeps idle leases, given the input check it
+    /// failed, if any.
+    pub fn sweeps(&self, failed: Option<InputCheck>) -> bool {
+        self.sweeps_idle_leases && failed.is_none()
+    }
 }
 
 /// The faults of the operations that return `PortError`.
@@ -397,6 +424,7 @@ static CONTRACTS: [OpContract; 8] = [
         faults: PORT_FAULTS,
         deadlines: REACTOR_READ_DEADLINES,
         releases: &[Release::LocatorPermitOnFinish, Release::Shutdown],
+        input_checks: &[],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -404,6 +432,7 @@ static CONTRACTS: [OpContract; 8] = [
         faults: PORT_FAULTS,
         deadlines: REACTOR_READ_DEADLINES,
         releases: &[],
+        input_checks: &[],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -415,6 +444,7 @@ static CONTRACTS: [OpContract; 8] = [
             Release::LeaseIdleExpired,
             Release::Shutdown,
         ],
+        input_checks: &[InputCheck::LocatorCount],
         sweeps_idle_leases: true,
     },
     OpContract {
@@ -444,6 +474,7 @@ static CONTRACTS: [OpContract; 8] = [
             Release::LeaseIdleExpired,
             Release::Shutdown,
         ],
+        input_checks: &[InputCheck::AdapterHandle, InputCheck::PageCount],
         sweeps_idle_leases: true,
     },
     OpContract {
@@ -455,6 +486,7 @@ static CONTRACTS: [OpContract; 8] = [
             Release::LeaseIdleExpired,
             Release::Shutdown,
         ],
+        input_checks: &[InputCheck::AdapterHandle],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -470,6 +502,7 @@ static CONTRACTS: [OpContract; 8] = [
             },
         ],
         releases: &[],
+        input_checks: &[],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -479,6 +512,7 @@ static CONTRACTS: [OpContract; 8] = [
             after: VCT_REPAIR_WATCHDOG,
         }],
         releases: &[],
+        input_checks: &[],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -486,6 +520,7 @@ static CONTRACTS: [OpContract; 8] = [
         faults: PORT_FAULTS,
         deadlines: &[STATE_READ_DEADLINE],
         releases: &[],
+        input_checks: &[],
         sweeps_idle_leases: false,
     },
 ];

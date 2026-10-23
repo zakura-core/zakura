@@ -454,3 +454,29 @@ fn any_peers_acquire_or_read_sweeps_idle_leases() {
     let b_runs = AcquireHeaderPath.contract();
     assert!(b_runs.sweeps_idle_leases && a_holds.releases.contains(&Release::LeaseIdleExpired));
 }
+
+/// B's acquire with an empty locator fails `LocatorCount` before
+/// `RetainedPathLeaseRegistry::reserve`, so it leaves A's expired lease and
+/// its capacity signal untouched. Only a request that passes every input
+/// check sweeps.
+#[test]
+fn a_failed_input_check_skips_the_sweep() {
+    use HeaderOp::*;
+    for op in HeaderOp::ALL {
+        let contract = op.contract();
+        let expected: &[InputCheck] = match op {
+            AcquireHeaderPath => &[InputCheck::LocatorCount],
+            ReadHeaderPath => &[InputCheck::AdapterHandle, InputCheck::PageCount],
+            ReleaseHeaderPath => &[InputCheck::AdapterHandle],
+            _ => &[],
+        };
+        assert_eq!(contract.input_checks, expected, "{}", op.name());
+        assert_eq!(contract.sweeps(None), contract.sweeps_idle_leases);
+        for &check in contract.input_checks {
+            assert!(!contract.sweeps(Some(check)), "{} {check:?}", op.name());
+        }
+    }
+    let b_acquire = AcquireHeaderPath.contract();
+    assert!(!b_acquire.sweeps(Some(InputCheck::LocatorCount)));
+    assert!(b_acquire.sweeps(None));
+}

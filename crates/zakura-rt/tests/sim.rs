@@ -402,3 +402,35 @@ fn utc_now_outside_a_run_reads_the_host_clock() {
     let now = time::utc_now();
     assert!(before <= now && now <= std::time::SystemTime::now());
 }
+
+/// `JoinSet::shutdown` aborts every task, then returns only after each one
+/// has ended, as tokio's does: a pending task's future is dropped before
+/// `shutdown` returns, and the set ends up empty.
+#[test]
+fn join_set_shutdown_aborts_and_waits_for_every_task() {
+    /// Sets its flag when the future holding it is dropped.
+    struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let (dropped, _) = run(async {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut set = JoinSet::new();
+        let guard = SetOnDrop(dropped.clone());
+        let waiting = set.spawn(async move {
+            let _guard = guard;
+            pending::<()>().await;
+        });
+        let sleeping = set.spawn(time::sleep(Duration::from_secs(60)));
+        set.spawn(async {});
+        set.shutdown().await;
+        assert!(set.is_empty());
+        assert!(waiting.is_finished() && sleeping.is_finished());
+        dropped.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    assert!(dropped);
+}

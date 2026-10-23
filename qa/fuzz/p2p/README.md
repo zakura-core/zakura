@@ -135,3 +135,37 @@ per-node backoff. Its witness exercises a duplicate completion, failure backoff
 and a local-limit pause. Planted failures release reservations early or discard
 backoff. Final cleanup settles every remaining logical reservation. This does
 not prove that an asynchronous worker releases its admission permit.
+
+## Block ownership and lifecycle targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `block_work_ownership` | `block/work-ownership` | `work_witness_exercises_reset_stale_return_and_settlement` |
+| `block_peer_registry` | `block/peer-registry` | `registry_witness_exercises_replacement_and_exact_owner` |
+| `block_retry_authority` | `block/retry-authority` | `retry_witness_exercises_expiry_and_authority_changes` |
+| `block_request_lifecycle` | `block/request-lifecycle` | `lifecycle_witness_exercises_replacement_timeout_and_skipped_write` |
+
+These decoder-v1 targets reuse the owning modules' independent models. Proptest
+and cargo-fuzz call the same driver. Each decoder reads at most 512 bytes in
+four-byte operations. Empty inputs report zero applicability. Each target has
+two planted failures that must name its property ID, and its own daily and
+weekly fuzz budget.
+
+`block_work_ownership` tracks each height's location, exact claim owner and
+charged bytes. The witness resets between two published claims, returns the
+stale claim, and settles exactly the charged bytes.
+
+`block_peer_registry` tracks admitted session generations and outstanding
+request owners. The witness rejects stale-generation operations and a removal
+that names the wrong request owner.
+
+`block_retry_authority` tracks supplier-local deferrals and all-supplier alarms.
+The witness changes authority and advances logical time through expiry.
+
+`block_request_lifecycle` tracks requests, transport-start facts and no-progress
+charges. The witness expires one written request and one unwritten request,
+matches a replacement request, and resets the remaining window.
+
+These ledgers prove logical state transitions. Scheduled IO still needs separate
+proof that the actual guard or permit settles with its owner. P1 will register
+these local property IDs when its shared schema exists.

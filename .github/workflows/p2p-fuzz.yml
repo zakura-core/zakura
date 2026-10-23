@@ -97,6 +97,38 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: block_work_ownership
+            decoder: 1
+            witness: work_witness_exercises_reset_stale_return_and_settlement
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_retry_authority
+            decoder: 1
+            witness: retry_witness_exercises_expiry_and_authority_changes
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_peer_registry
+            decoder: 1
+            witness: registry_witness_exercises_replacement_and_exact_owner
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_request_lifecycle
+            decoder: 1
+            witness: lifecycle_witness_exercises_replacement_timeout_and_skipped_write
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

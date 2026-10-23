@@ -261,7 +261,7 @@ impl OutstandingRequests {
     }
 
     /// Recompute every index and total from the requests themselves.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn assert_consistent(&self) {
         let reserved = self.requests.values().fold(0u64, |acc, request| {
             acc.saturating_add(request.reserved_bytes())

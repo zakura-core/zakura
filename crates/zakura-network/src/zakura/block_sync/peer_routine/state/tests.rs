@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 use proptest::prelude::*;
 use zakura_chain::block;
 
@@ -52,6 +53,7 @@ enum Input {
     Reset,
 }
 
+#[cfg(test)]
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         3 => (1..=MAX_HEIGHT, 1u32..=2, 1u64..3_000)
@@ -254,7 +256,7 @@ impl Harness {
 }
 
 /// Apply `input` to both sides and check the decisions that it produced.
-fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), TestCaseError> {
+fn step(model: &mut Model, harness: &mut Harness, input: Input) {
     match input {
         Input::Issue {
             start,
@@ -264,7 +266,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
             let end = start + count - 1;
             // The work queue gives each height one owner at a time.
             if end > MAX_HEIGHT || (start..=end).any(|height| model.covering(height).is_some()) {
-                return Ok(());
+                return;
             }
             let sequence = model.next_sequence;
             model.next_sequence += 1;
@@ -287,7 +289,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
         }
         Input::WriteStarted { pick } => {
             let Some(sequence) = model.pick(pick, false) else {
-                return Ok(());
+                return;
             };
             model
                 .requests
@@ -300,14 +302,17 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
             let covering = model.covering(height);
             // A peer can answer only a request whose frame it received.
             if covering.is_some_and(|sequence| !model.requests[&sequence].written) {
-                return Ok(());
+                return;
             }
             let decision = harness
                 .state
                 .match_body(block::Height(height), hash(height, tampered));
             match covering {
                 None => {
-                    prop_assert!(matches!(decision, BodyMatch::Unmatched), "{decision:?}");
+                    assert!(
+                        matches!(decision, BodyMatch::Unmatched),
+                        "{PROPERTY}: {decision:?}"
+                    );
                     // The work still wants an untampered body.
                     if !tampered {
                         harness.state.record_late_body(model.now, LIVENESS_TIMEOUT);
@@ -316,22 +321,25 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                 }
                 // A repeated height is a duplicate before its hash is compared.
                 Some(sequence) if model.requests[&sequence].received.contains(&height) => {
-                    prop_assert!(matches!(decision, BodyMatch::Duplicate), "{decision:?}");
+                    assert!(
+                        matches!(decision, BodyMatch::Duplicate),
+                        "{PROPERTY}: {decision:?}"
+                    );
                 }
                 Some(sequence) if tampered => {
                     let BodyMatch::PayloadMismatch { owner, requested } = decision else {
-                        return Err(TestCaseError::fail(format!("{decision:?}")));
+                        panic!("{PROPERTY}: {decision:?}");
                     };
                     // The fault names the exact request the body answered.
-                    prop_assert_eq!(owner, Harness::owner(sequence));
-                    prop_assert_eq!(requested, hash(height, false));
+                    assert_eq!(owner, Harness::owner(sequence), "{PROPERTY}");
+                    assert_eq!(requested, hash(height, false), "{PROPERTY}");
                 }
                 Some(sequence) => {
                     let BodyMatch::Matched(matched) = decision else {
-                        return Err(TestCaseError::fail(format!("{decision:?}")));
+                        panic!("{PROPERTY}: {decision:?}");
                     };
-                    prop_assert_eq!(matched.key, harness.keys[&sequence]);
-                    prop_assert_eq!(matched.owner, Harness::owner(sequence));
+                    assert_eq!(matched.key, harness.keys[&sequence], "{PROPERTY}");
+                    assert_eq!(matched.owner, Harness::owner(sequence), "{PROPERTY}");
                     let complete = harness.state.record_body(
                         matched.key,
                         block::Height(height),
@@ -343,7 +351,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                     let request = model.requests.get_mut(&sequence).expect("live");
                     request.received.insert(height);
                     let model_complete = request.received.len() == request.count as usize;
-                    prop_assert_eq!(complete, model_complete);
+                    assert_eq!(complete, model_complete, "{PROPERTY}");
                     if complete {
                         harness.finish(matched.key, Disposition::Satisfied);
                         model.remove(sequence);
@@ -358,7 +366,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
             floor,
         } => {
             let Some(sequence) = model.pick(pick, true) else {
-                return Ok(());
+                return;
             };
             let outcome = if unavailable {
                 Outcome::Unavailable
@@ -390,10 +398,10 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
             } else {
                 Disposition::RetryMissing
             };
-            prop_assert_eq!(ending.key, harness.keys[&sequence]);
-            prop_assert_eq!(ending.owner, Harness::owner(sequence));
-            prop_assert_eq!(&ending.stale_heights, &stale);
-            prop_assert_eq!(ending.disposition, expected);
+            assert_eq!(ending.key, harness.keys[&sequence], "{PROPERTY}");
+            assert_eq!(ending.owner, Harness::owner(sequence), "{PROPERTY}");
+            assert_eq!(&ending.stale_heights, &stale, "{PROPERTY}");
+            assert_eq!(ending.disposition, expected, "{PROPERTY}");
             harness.finish(ending.key, ending.disposition);
             model.remove(sequence);
             if expected == Disposition::Satisfied {
@@ -406,13 +414,13 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                 .values()
                 .any(|request| request.start == start)
             {
-                return Ok(());
+                return;
             }
             let ending =
                 harness
                     .state
                     .on_ending(block::Height(start), Outcome::Done, block::Height(0));
-            prop_assert!(ending.is_none(), "{ending:?}");
+            assert!(ending.is_none(), "{PROPERTY}: {ending:?}");
         }
         Input::Expire { advance_ms } => {
             model.now += Duration::from_millis(advance_ms);
@@ -446,8 +454,8 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                     .collect()
             };
             // Only a started write charges the peer with a timeout.
-            prop_assert_eq!(owners(&expired.skipped), expect(false));
-            prop_assert_eq!(owners(&expired.timed_out), expect(true));
+            assert_eq!(owners(&expired.skipped), expect(false), "{PROPERTY}");
+            assert_eq!(owners(&expired.timed_out), expect(true), "{PROPERTY}");
             // Skipped requests retire first, each refunding its own probe.
             for (sequence, _) in model_due.iter().filter(|(_, started)| !started) {
                 if model.charged.contains(sequence) {
@@ -478,7 +486,7 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
 }
 
 /// Compare every live request and the no-progress accounting with the model.
-fn check(model: &Model, harness: &Harness) -> Result<(), TestCaseError> {
+fn check(model: &Model, harness: &Harness) {
     let window = &harness.state.window;
     window.outstanding.assert_consistent();
     // Request isolation: each live request holds exactly its own facts.
@@ -515,45 +523,209 @@ fn check(model: &Model, harness: &Harness) -> Result<(), TestCaseError> {
             )
         })
         .collect();
-    prop_assert_eq!(live, expected);
+    assert_eq!(live, expected, "{PROPERTY}");
     // Fault attribution: only requests the peer saw count toward its stall.
-    prop_assert_eq!(window.requests_without_block_progress, model.streak);
-    prop_assert_eq!(window.block_liveness_deadline, model.liveness);
+    assert_eq!(
+        window.requests_without_block_progress, model.streak,
+        "{PROPERTY}"
+    );
+    assert_eq!(window.block_liveness_deadline, model.liveness, "{PROPERTY}");
     // Deadline choice: the next wake is the earliest owed deadline.
     let earliest = model.earliest_deadline();
-    prop_assert_eq!(
+    assert_eq!(
         harness.state.next_wake(SharedDeadlines::default()),
-        earliest
+        earliest,
+        "{PROPERTY}"
     );
     let retry_filter = model.now + Duration::from_millis(1);
-    prop_assert_eq!(
+    assert_eq!(
         harness.state.next_wake(SharedDeadlines {
             retry_filter: Some(retry_filter),
             ..SharedDeadlines::default()
         }),
-        Some(earliest.map_or(retry_filter, |earliest| earliest.min(retry_filter)))
+        Some(earliest.map_or(retry_filter, |earliest| earliest.min(retry_filter))),
+        "{PROPERTY}"
     );
-    prop_assert_eq!(
+    assert_eq!(
         harness.state.deadlines_due(model.now),
-        earliest.is_some_and(|earliest| earliest <= model.now)
+        earliest.is_some_and(|earliest| earliest <= model.now),
+        "{PROPERTY}"
     );
-    Ok(())
 }
 
+const PROPERTY: &str = "block/request-lifecycle";
+
+/// Applicable request operations in a decoder-v1 history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct RequestLifecycleReplaySummary {
+    /// Inputs checked against the independent model.
+    pub transitions: usize,
+    /// Nonoverlapping requests issued.
+    pub issued: u64,
+    /// Started writes that expired.
+    pub written_timeouts: usize,
+    /// Unstarted writes that expired without charging the peer.
+    pub skipped_writes: usize,
+    /// New valid bodies matched to a written request.
+    pub matched_bodies: usize,
+    /// Endings without a live request at that start.
+    pub stale_endings: usize,
+    /// Resets checked.
+    pub resets: usize,
+}
+
+/// Replay decoder-v1 quadruples against the existing request lifecycle model.
+/// Read at most 512 bytes. Requests and logical time stay bounded by the decoder.
+pub fn replay_request_lifecycle_bytes(data: &[u8]) -> RequestLifecycleReplaySummary {
+    run(decode(data), |_| {})
+}
+
+fn decode(data: &[u8]) -> impl Iterator<Item = Input> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let height = u32::from(b) % MAX_HEIGHT + 1;
+        match a % 7 {
+            0 => Input::Issue {
+                start: height,
+                count: u32::from(c % 2) + 1,
+                due_ms: u64::from(d) * 10 + 1,
+            },
+            1 => Input::WriteStarted {
+                pick: usize::from(b),
+            },
+            2 => Input::Body {
+                height,
+                tampered: c & 1 != 0,
+            },
+            3 => Input::Ending {
+                pick: usize::from(b),
+                unavailable: c & 1 != 0,
+                floor: u32::from(d) % (MAX_HEIGHT + 1),
+            },
+            4 => Input::LateEnding { start: height },
+            5 => Input::Expire {
+                advance_ms: u64::from(b) * 10 + 1,
+            },
+            _ => Input::Reset,
+        }
+    })
+}
+
+fn run(
+    inputs: impl IntoIterator<Item = Input>,
+    mut after_step: impl FnMut(&mut Harness),
+) -> RequestLifecycleReplaySummary {
+    let mut model = Model::new(Instant::now());
+    let mut harness = Harness::new();
+    let mut summary = RequestLifecycleReplaySummary::default();
+    for input in inputs {
+        summary.transitions += 1;
+        match &input {
+            Input::Body {
+                height,
+                tampered: false,
+            } => {
+                summary.matched_bodies +=
+                    usize::from(model.covering(*height).is_some_and(|sequence| {
+                        let request = &model.requests[&sequence];
+                        request.written && !request.received.contains(height)
+                    }));
+            }
+            Input::LateEnding { start } => {
+                summary.stale_endings += usize::from(
+                    !model
+                        .requests
+                        .values()
+                        .any(|request| request.start == *start),
+                );
+            }
+            Input::Expire { advance_ms } => {
+                let now = model.now + Duration::from_millis(*advance_ms);
+                for request in model
+                    .requests
+                    .values()
+                    .filter(|request| request.deadline <= now)
+                {
+                    if request.written {
+                        summary.written_timeouts += 1;
+                    } else {
+                        summary.skipped_writes += 1;
+                    }
+                }
+            }
+            Input::Reset => summary.resets += 1,
+            _ => {}
+        }
+        step(&mut model, &mut harness, input);
+        after_step(&mut harness);
+        check(&model, &harness);
+    }
+    summary.issued = model.next_sequence - 1;
+    summary
+}
+
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Writes, bodies, endings, expiry, resets, and replacements keep each
-    /// request's facts, the next deadline, and the stall accounting equal to
-    /// the model's.
     #[test]
     fn request_lifecycle_matches_the_model(inputs in prop::collection::vec(input(), 1..80)) {
-        let mut model = Model::new(Instant::now());
-        let mut harness = Harness::new();
-        for input in inputs {
-            step(&mut model, &mut harness, input)?;
-        }
+        run(inputs, |_| {});
     }
+    #[test]
+    fn lifecycle_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_request_lifecycle_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[
+    0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0,
+    5, 0, 0, 0, 0, 2, 0, 0, 6, 0, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn lifecycle_witness_exercises_replacement_timeout_and_skipped_write() {
+    let summary = replay_request_lifecycle_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        RequestLifecycleReplaySummary {
+            transitions: 11,
+            issued: 4,
+            written_timeouts: 1,
+            skipped_writes: 1,
+            matched_bodies: 1,
+            stale_endings: 1,
+            resets: 1,
+        }
+    );
+    assert_eq!(
+        replay_request_lifecycle_bytes(&[]),
+        RequestLifecycleReplaySummary::default()
+    );
+    println!("tier=Machine target=block_request_lifecycle decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "block/request-lifecycle")]
+fn lifecycle_witness_rejects_lost_no_progress_charge() {
+    run(decode(WITNESS), |harness| {
+        harness.state.window.requests_without_block_progress = 0;
+    });
+}
+
+#[test]
+#[should_panic(expected = "block/request-lifecycle")]
+fn lifecycle_witness_rejects_lost_liveness_deadline() {
+    run(decode(WITNESS), |harness| {
+        harness.state.window.block_liveness_deadline = None;
+    });
 }
 
 /// A body that arrives after its request timed out matches the replacement
@@ -586,7 +758,7 @@ fn a_late_body_matches_only_the_replacement_request() {
         },
     ];
     for input in inputs {
-        step(&mut model, &mut harness, input).unwrap();
+        step(&mut model, &mut harness, input);
     }
     assert!(model.requests.is_empty());
     assert_eq!(model.next_sequence, 3);

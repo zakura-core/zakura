@@ -229,7 +229,12 @@ impl Sim {
         let mut drained = 0;
         let mut at_instant = 0;
         loop {
-            if phase == Phase::Live && st.step >= self.config.budget {
+            // A run whose last live step left nothing enabled stays live, so
+            // it ends idle below rather than at its budget.
+            if phase == Phase::Live
+                && st.step >= self.config.budget
+                && !self.nothing_enabled(&ready)
+            {
                 phase = Phase::Drain;
             }
             if phase == Phase::Drain && drained >= self.config.drain_bound {
@@ -241,6 +246,11 @@ impl Sim {
                 Phase::Live => self.sources.iter().map(|s| offer(&**s, now)).collect(),
                 Phase::Drain => Vec::new(),
             };
+            // A source that drew while offering, here or in the idle check
+            // above, ends the run before anything else runs.
+            if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
             let enabled = match enabled_set(&EnabledInputs {
                 phase,
                 now,

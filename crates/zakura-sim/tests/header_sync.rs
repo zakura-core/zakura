@@ -56,8 +56,12 @@ fn run(plan: PlanInput) -> (RunReport, Vec<String>) {
 
 #[test]
 fn header_sync_runs_and_replays() {
+    let mut runs = std::collections::BTreeSet::new();
     for plan in inputs(8, 64) {
         let (report, first) = run(plan.clone());
+        assert_eq!(report.cleanup.panicked, 0, "no task panicked in cleanup");
+        let picks: Vec<String> = report.picks.iter().map(|p| p.identity.clone()).collect();
+        runs.insert(picks);
         assert!(
             matches!(report.end.outcome, Outcome::Budget | Outcome::Idle { .. }),
             "{:?}",
@@ -82,4 +86,6 @@ fn header_sync_runs_and_replays() {
         );
         assert_eq!(run(plan).1, first, "the same plan replays the same records");
     }
+    // Otherwise replaying would pass even if the plan were ignored.
+    assert!(runs.len() > 1, "different plans took different paths");
 }

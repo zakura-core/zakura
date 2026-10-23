@@ -868,6 +868,24 @@ mod tests {
         );
     }
 
+    /// M3.7's bypass inventory: every runtime path left in `zakura-network`'s
+    /// v2 code and in `zakura-quic` has an allowlist entry with its reason,
+    /// and every `zakura-quic` entry says why a simulated run never reaches
+    /// that path or why it's harness code.
+    #[test]
+    fn the_repository_inventories_every_runtime_bypass() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("xtask lives at crates/xtask");
+        check(repo_root).expect("every runtime path is on the allowlist");
+        for (file, path, reason) in ALLOWED {
+            if file.starts_with("crates/zakura-quic/") {
+                assert!(reason.contains("simulated run"), "{file} {path}: {reason}");
+            }
+        }
+    }
+
     /// A `test` or `zakura_sim` gate compiles the code in simulated runs, so
     /// the check covers it. Harness modules under that gate need allowlist
     /// entries.

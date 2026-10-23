@@ -247,21 +247,48 @@ impl SeededInputs {
     /// Each call shares the same streams and keys. They hold the node's TLS
     /// slot even if a caller replaces every other input.
     pub fn endpoint_inputs(&self) -> EndpointInputs {
-        let cids = self.streams.clone();
-        let initial = self.streams.clone();
-        EndpointInputs::default()
-            .rng_seed(self.rng_seed)
-            .reset_key(Arc::new(self.reset_key.clone()))
-            .cid_generator(Arc::new(move || {
+        self.inputs_without(None)
+    }
+
+    /// [`SeededInputs::endpoint_inputs`] with `source` left unset, so that
+    /// one source keeps its production, OS-random default. Replay tests use
+    /// it to show each source matters.
+    pub fn endpoint_inputs_without(&self, source: Source) -> EndpointInputs {
+        self.inputs_without(Some(source))
+    }
+
+    /// Endpoint inputs with every source but `omitted` set.
+    fn inputs_without(&self, omitted: Option<Source>) -> EndpointInputs {
+        let set = |source| omitted != Some(source);
+        let mut inputs = EndpointInputs::default();
+        if set(Source::RngSeed) {
+            inputs = inputs.rng_seed(self.rng_seed);
+        }
+        if set(Source::ResetKey) {
+            inputs = inputs.reset_key(Arc::new(self.reset_key.clone()));
+        }
+        if set(Source::Cid) {
+            let cids = self.streams.clone();
+            inputs = inputs.cid_generator(Arc::new(move || {
                 Box::new(SeededCidGenerator::new(cids.clone())) as Box<dyn ConnectionIdGenerator>
-            }))
-            .initial_dst_cid(Arc::new(move || {
+            }));
+        }
+        if set(Source::InitialDstCid) {
+            let initial = self.streams.clone();
+            inputs = inputs.initial_dst_cid(Arc::new(move || {
                 ConnectionId::new(&initial.draw_array::<INITIAL_DST_CID_LEN>(Source::InitialDstCid))
-            }))
-            .token_key(Arc::new(self.token_key.clone()))
-            .tls_random(self.streams.slot)
-            .kx_groups(vec![self.streams.slot as &'static dyn SupportedKxGroup])
-            .provider_watch(self.lease.clone())
+            }));
+        }
+        if set(Source::TokenKey) {
+            inputs = inputs.token_key(Arc::new(self.token_key.clone()));
+        }
+        if set(Source::TlsRandom) {
+            inputs = inputs.tls_random(self.streams.slot);
+        }
+        if set(Source::KeyExchange) {
+            inputs = inputs.kx_groups(vec![self.streams.slot as &'static dyn SupportedKxGroup]);
+        }
+        inputs.provider_watch(self.lease.clone())
     }
 
     /// The seed, node and draw counts so far.

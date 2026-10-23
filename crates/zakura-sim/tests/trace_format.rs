@@ -473,6 +473,64 @@ fn long_line_is_refused() {
     assert_eq!(invalid(dir.path()), Invalid::LineTooLong { line: 3 });
 }
 
+/// The files in `dir`, sorted.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+#[test]
+fn put_never_writes_through_a_symlink() {
+    let (store_dir, outside) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let victim = outside.path().join("victim");
+    fs::write(&victim, b"not a blob").unwrap();
+    let digest = sha256(b"payload");
+    std::os::unix::fs::symlink(&victim, store_dir.path().join(&digest)).unwrap();
+
+    let store = BlobStore::new(vec![store_dir.path().into()]);
+    assert_eq!(store.put(b"payload").unwrap(), digest);
+    assert_eq!(fs::read(&victim).unwrap(), b"not a blob");
+    let blob = store_dir.path().join(&digest);
+    assert!(blob.symlink_metadata().unwrap().is_file());
+    assert_eq!(store.get(&digest).unwrap(), b"payload");
+    assert_eq!(listing(store_dir.path()), [digest]);
+}
+
+#[cfg(unix)]
+#[test]
+fn put_keeps_a_verified_blob_and_replaces_a_corrupt_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let store = BlobStore::new(vec![dir.path().into()]);
+    let digest = store.put(b"chain").unwrap();
+    let blob = dir.path().join(&digest);
+
+    // A verified copy isn't opened for writing at all, so a read-only one
+    // stays as it is.
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(store.put(b"chain").unwrap(), digest);
+    assert_eq!(fs::read(&blob).unwrap(), b"chain");
+
+    // A corrupt copy is replaced whole, and no temporary file is left.
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&blob, b"torn").unwrap();
+    let before = blob.symlink_metadata().unwrap();
+    assert_eq!(store.put(b"chain").unwrap(), digest);
+    assert_eq!(store.get(&digest).unwrap(), b"chain");
+    assert_ne!(
+        std::os::unix::fs::MetadataExt::ino(&blob.symlink_metadata().unwrap()),
+        std::os::unix::fs::MetadataExt::ino(&before),
+        "the corrupt copy was renamed over, not rewritten in place"
+    );
+    assert_eq!(listing(dir.path()), [digest]);
+}
+
 #[test]
 fn malformed_line() {
     let dir = recorded(plan());

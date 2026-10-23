@@ -4,6 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use sha2::{Digest, Sha256};
@@ -92,15 +93,42 @@ impl BlobStore {
 
     /// Writes `bytes` to the first directory, named by their SHA-256, and
     /// returns the digest.
+    ///
+    /// Older traces may reference the blob, so a regular file that already
+    /// holds it is kept untouched. Anything else at that name, such as a
+    /// corrupt copy or a symlink, is replaced by renaming a complete temporary
+    /// file over it, which never follows a symlink and never leaves a partial
+    /// blob. Fails for more than [`MAX_BLOB_BYTES`], which the reader would
+    /// refuse.
     pub fn put(&self, bytes: &[u8]) -> io::Result<String> {
+        // A usize always fits in a u64 on supported targets.
+        if bytes.len() as u64 > MAX_BLOB_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a blob holds at most {MAX_BLOB_BYTES} bytes"),
+            ));
+        }
         let sha256 = hex(&Sha256::digest(bytes));
         let dir = self
             .dirs
             .first()
             .ok_or_else(|| io::Error::other("a blob store needs a directory"))?;
         fs::create_dir_all(dir)?;
-        fs::write(dir.join(&sha256), bytes)?;
-        Ok(sha256)
+        let path = dir.join(&sha256);
+        if let Ok(Some(existing)) = read_bounded(&path, MAX_BLOB_BYTES) {
+            if hex(&Sha256::digest(&existing)) == sha256 {
+                return Ok(sha256);
+            }
+        }
+        let (temp, mut file) = temp_file(dir, &sha256)?;
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temp, &path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        written.map(|()| sha256)
     }
 
     /// The blob named `sha256`, from the first directory that has it. A copy
@@ -129,6 +157,22 @@ impl BlobStore {
             }
         }
         Err(missing())
+    }
+}
+
+/// Creates a new, uniquely named file in `dir` for the blob `sha256`. Its
+/// name starts with `.`, so it can never be taken for a blob.
+fn temp_file(dir: &Path, sha256: &str) -> io::Result<(PathBuf, File)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(".{sha256}.{}.{n}.tmp", std::process::id()));
+        // create_new refuses an existing path, a symlink included.
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 

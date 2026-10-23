@@ -432,8 +432,9 @@ fn panic_in_a_leftover_drop_leaves_no_run_behind() {
             "panic_in_a_leftover_drop_leaves_no_run_behind",
             &[("ASAN_OPTIONS", "detect_leaks=0")],
         )
-        .wait()
-        .expect("the child is ours to wait on");
+        .wait_with_output()
+        .expect("the child is ours to wait on")
+        .status;
         assert!(status.success(), "the child failed: {status}");
         return;
     }
@@ -1140,7 +1141,10 @@ const STARVATION_SCHEDULE: &[&str] = &["holder.1", "holder.1", "holder.1", "wait
 #[test]
 fn saved_schedules_for_lock_cycle_and_starvation() {
     // `noise` waits on its timer while the pair parks. Once time moves, it's
-    // ready but has no worker, and the cycle still reports `Deadlock`.
+    // ready but has no worker, and the cycle still reports `Deadlock`. That's
+    // the one shape `status()` already handles. With a spare worker, or with
+    // the timer still pending, the cycle shows as `Running` or
+    // `WaitingOnTime` instead (#1635).
     let (r, _) = replay(2, AB_BA_WITH_NOISE_SCHEDULE, ab_ba(true)).expect("replays");
     assert_eq!(r.status, Status::Deadlock);
     assert!(
@@ -1346,6 +1350,7 @@ struct CleanupReportSummary {
 
 #[test]
 fn forced_unwind_passes_through_a_production_catch_unwind() {
+    let stacks_before = unaccounted_stacks();
     for rethrow in [false, true] {
         let (report, caught, saw) = cycle_in_catch_unwind(rethrow);
         // Only the parked pair is affected, and only `ab` is force-unwound:
@@ -1364,6 +1369,11 @@ fn forced_unwind_passes_through_a_production_catch_unwind() {
             saw,
             Some(true),
             "a guard in the frame drops while unwinding"
+        );
+        assert_eq!(
+            unaccounted_stacks(),
+            stacks_before,
+            "rethrow {rethrow}: no stack leaked"
         );
         // The thread can start another run.
         drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
@@ -1488,37 +1498,40 @@ fn in_child(test: &str) -> bool {
     std::env::var_os(CHILD_TEST).is_some_and(|t| t == test)
 }
 
-/// Reruns this test binary for the single test `test`, with `envs` set and
-/// its output discarded.
+/// Reruns this test binary for the single test `test`, with `envs` set. The
+/// child's stdout, uncaptured by the test harness, is piped back.
 fn rerun_in_child(test: &str, envs: &[(&str, &str)]) -> std::process::Child {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().expect("the test binary has a path");
     Command::new(exe)
-        .args(["--exact", test, "--test-threads=1"])
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env(CHILD_TEST, test)
         .envs(envs.iter().copied())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("the test binary can rerun itself")
 }
+
+/// What the watchdog child prints right before its cleanup starts.
+const CLEANUP_STARTED: &str = "zakura-scheduler watchdog child: cleanup started";
 
 /// Hangs in cleanup on purpose, but only in the child process that
 /// [`cleanup_that_never_reaches_a_point_trips_the_watchdog`] starts.
 /// Anywhere else it returns at once.
 #[test]
 fn watchdog_child_spins_in_cleanup() {
+    use std::io::Write;
     if !in_child("watchdog_child_spins_in_cleanup") {
         return;
     }
-    // A destructor that waits for a flag only another task sets. Points do
-    // nothing during shutdown, so it never lets that task run.
+    // A destructor that waits for a flag only another task sets, with no
+    // preemption point, so the scheduler can never switch to that task. A cap
+    // on points per task during shutdown wouldn't stop it either.
     struct SpinOnDrop(Rc<Cell<bool>>);
     impl Drop for SpinOnDrop {
         fn drop(&mut self) {
-            while !self.0.get() {
-                point();
-            }
+            while !self.0.get() {}
         }
     }
     let flag = shared(Cell::new(false));
@@ -1530,13 +1543,36 @@ fn watchdog_child_spins_in_cleanup() {
     });
     s.spawn_root("setter", async move { flag.set(true) });
     assert_eq!(s.run(spinner.task()), zakura_scheduler::RunOutcome::Waiting);
+    // The test harness prints `test <name> ... ` first, without a newline.
+    writeln!(std::io::stdout(), "{CLEANUP_STARTED}").expect("stdout is piped to the parent");
     s.shutdown();
 }
 
 #[test]
 fn cleanup_that_never_reaches_a_point_trips_the_watchdog() {
-    use std::time::{Duration, Instant};
+    use std::{
+        io::{BufRead, BufReader},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
     let mut child = rerun_in_child("watchdog_child_spins_in_cleanup", &[]);
+    // The child must reach its cleanup, so a slow or hung startup can't pass.
+    let stdout = child.stdout.take().expect("the child's stdout is piped");
+    let (started, wait_started) = mpsc::channel();
+    std::thread::spawn(move || {
+        let reached = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.ends_with(CLEANUP_STARTED));
+        if reached {
+            let _ = started.send(());
+        }
+    });
+    if wait_started.recv_timeout(Duration::from_secs(30)).is_err() {
+        let _ = child.kill();
+        let status = child.wait().expect("the child can be reaped");
+        panic!("the child never reached its cleanup: {status}");
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("the child is ours to wait on") {
@@ -1602,5 +1638,15 @@ fn stacks_past_the_pool_limit_are_freed_without_a_false_leak() {
         before,
         "{:?}",
         zakura_scheduler::stack_pool()
+    );
+}
+
+#[test]
+fn draw_kind_names_are_pinned() {
+    use zakura_scheduler::DrawKind::{HashSeed, Rng, Select, StreamMap};
+    // Draw identities and traces carry these names, so a rename fails here.
+    assert_eq!(
+        [Rng, Select, HashSeed, StreamMap].map(|kind| kind.name()),
+        ["rng", "select", "hash-seed", "stream-map"]
     );
 }

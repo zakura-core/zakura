@@ -1821,24 +1821,21 @@ fn zakura_rpc_conflict() -> Result<()> {
         return Ok(());
     }
 
-    // Write a configuration that has RPC listen_addr set
-    // [Note on port conflict](#Note on port conflict)
-    //
-    // This is the required setting to detect port conflicts.
-    let mut config = common::config::random_known_rpc_port_config(false, &Mainnet)?;
+    let mut config = os_assigned_rpc_port_config(false, &Mainnet)?;
 
     let dir1 = testdir()?.with_config(&mut config)?;
-    let regex1 = regex::escape(&format!(
-        r"Opened RPC endpoint at {}",
-        config.rpc.listen_addr.unwrap(),
-    ));
+    let mut node1 = dir1
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // From another folder create a configuration with the same endpoint.
-    // `rpc.listen_addr` will be the same in the 2 nodes.
-    // But they will have different Zcash listeners (auto port) and states (ephemeral)
+    // Keep the OS-assigned port bound until the second node tries to use it.
+    config.rpc.listen_addr = Some(read_listen_addr_from_logs(
+        &mut node1,
+        OPENED_RPC_ENDPOINT_MSG,
+    )?);
     let dir2 = testdir()?.with_config(&mut config)?;
 
-    check_config_conflict(dir1, regex1.as_str(), dir2, "Address already in use")?;
+    check_running_node_conflict(node1, dir2, "Address already in use")?;
 
     Ok(())
 }
@@ -1907,6 +1904,20 @@ where
     // Wait until node1 has used the conflicting resource.
     node1.expect_stdout_line_matches(first_stdout_regex)?;
 
+    check_running_node_conflict(node1, second_dir, second_stderr_regex)
+}
+
+/// Checks that a second node fails to acquire a resource held by a running node,
+/// then shuts down both nodes and checks their exit statuses.
+fn check_running_node_conflict<T, U>(
+    mut node1: zakura_test::command::TestChild<T>,
+    second_dir: U,
+    second_stderr_regex: &str,
+) -> Result<()>
+where
+    T: std::fmt::Debug,
+    U: ZakuradTestDirExt + std::fmt::Debug,
+{
     // Spawn the second node and wait for the expected resource conflict.
     let mut node2 = second_dir
         .spawn_child(args!["start"])?

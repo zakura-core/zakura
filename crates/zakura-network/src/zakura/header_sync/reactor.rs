@@ -1,21 +1,18 @@
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet, VecDeque},
-    future::Future,
-    num::NonZeroU64,
-    panic::AssertUnwindSafe,
+    cell::Cell, collections::VecDeque, future::Future, num::NonZeroU64, panic::AssertUnwindSafe,
     pin::Pin,
 };
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use tokio::{
-    sync::{mpsc, watch},
+use zakura_chain::block;
+use zakura_node_services::task::spawn_erased_named;
+use zakura_quic::NodeId;
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{mpsc, watch, Semaphore},
     task::JoinHandle,
     time::{self, Instant},
 };
-use zakura_chain::block;
-use zakura_node_services::task::spawn_erased;
-use zakura_quic::NodeId;
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES},
@@ -168,7 +165,11 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
-    Ok((handle, actions, spawn_erased(reactor.run())))
+    Ok((
+        handle,
+        actions,
+        spawn_erased_named("header_sync_reactor", reactor.run()),
+    ))
 }
 
 fn build_header_sync_reactor(
@@ -261,7 +262,7 @@ fn build_header_sync_reactor(
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
         pending_locator_queries: HashSet::new(),
-        locator_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(
+        locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
@@ -375,7 +376,7 @@ struct HeaderSyncReactor {
     /// Peers with one direct continuation-locator read currently in flight.
     pending_locator_queries: HashSet<ZakuraPeerId>,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
-    locator_capacity: std::sync::Arc<tokio::sync::Semaphore>,
+    locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
     scheduling_revision: u64,
     last_scheduling_opportunity: Option<SchedulingOpportunity>,
@@ -877,7 +878,7 @@ impl HeaderSyncReactor {
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
                 completion = async {
@@ -905,7 +906,7 @@ impl HeaderSyncReactor {
                     Some(event) => self.handle_event(event),
                     None => break HeaderRequestTerminal::Shutdown,
                 },
-                _ = tokio::task::yield_now(), if handled_event => {},
+                _ = zakura_rt::task::yield_now(), if handled_event => {},
                 changed = async {
                     match committed_snapshots.as_mut() {
                         Some(snapshots) => snapshots.changed().await,
@@ -4211,7 +4212,7 @@ impl HeaderSyncReactor {
                     target_tip_hash: _,
                     scope,
                 } => Box::pin(async move {
-                    let locator = match tokio::time::timeout(
+                    let locator = match zakura_rt::time::timeout(
                         request_timeout,
                         header_chain.continuation_locator(
                             locator_permit
@@ -4239,7 +4240,7 @@ impl HeaderSyncReactor {
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
                     Box::pin(async move {
-                        let result = match tokio::time::timeout(
+                        let result = match zakura_rt::time::timeout(
                             request_timeout,
                             header_chain.vct_repair_context(owner, height),
                         )

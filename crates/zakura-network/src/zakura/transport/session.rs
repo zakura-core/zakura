@@ -4,8 +4,7 @@
 //! one receive half, one bounded send half, and the peer cancellation token.
 
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::{mpsc, CancellationToken};
 
 use super::{Frame, FramedRecv, FramedSend};
 use crate::{zakura::ZakuraPeerId, BoxError};

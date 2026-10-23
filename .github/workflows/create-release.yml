@@ -314,6 +314,11 @@ jobs:
       release_tag: ${{ needs.validate.outputs.release_tag }}
       checkout_ref: ${{ needs.validate.outputs.target_sha }}
       stage_release_assets: true
+    # Called workflows do not see caller secrets unless passed explicitly.
+    # Without this, the staging build jobs pull Docker images anonymously
+    # and intermittently fail on Docker Hub's shared data limit.
+    secrets:
+      DOCKERHUB_TOKEN_ZAKURA: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
   publish:
     name: Publish release and create tag

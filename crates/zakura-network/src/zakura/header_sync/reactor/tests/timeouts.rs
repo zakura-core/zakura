@@ -12,6 +12,7 @@ use super::*;
 use crate::zakura::{
     header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, testkit::TraceCapture,
 };
+use tokio::time;
 
 #[derive(Debug)]
 struct PendingVctLocalPort {

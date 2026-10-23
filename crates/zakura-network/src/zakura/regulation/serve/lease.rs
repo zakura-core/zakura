@@ -1,8 +1,8 @@
 //! Execution ownership for one admitted request.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::{CancellationToken, Mutex};
 
 use super::capacity::PeerBudgets;
 use crate::zakura::regulation::SlotPermit;

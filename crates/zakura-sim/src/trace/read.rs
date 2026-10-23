@@ -274,6 +274,9 @@ fn read_meta(line: &[u8]) -> Result<MetaRecord, Invalid> {
             return Err(malformed(format!("`{digest}` isn't a SHA-256")));
         }
     }
+    if let Some(field) = meta.too_deep_field() {
+        return Err(malformed(format!("meta.{field} nests too deep")));
+    }
     if let Some(field) = meta.float_field() {
         return Err(malformed(format!("meta.{field} holds a float")));
     }

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use super::{
     meta::{hex, MetaRecord},
     read::{read_bounded, refuse_symlinked_dir, Missing, ReadError},
-    BLOBS_DIR, MAX_BLOB_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
+    BLOBS_DIR, MAX_BLOB_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
 };
 use crate::{Record, RecordSink};
 
@@ -39,7 +39,8 @@ pub struct FileSink {
 impl FileSink {
     /// Creates `dir` if needed and starts its `trace.jsonl` with `meta`.
     /// Fails if the file already exists, so a trace is never overwritten, or
-    /// if `meta` holds a float (see [`MetaRecord::float_field`]).
+    /// if `meta` nests too deep or holds a float (see
+    /// [`MetaRecord::too_deep_field`] and [`MetaRecord::float_field`]).
     pub fn create(dir: &Path, meta: &MetaRecord) -> io::Result<Self> {
         Self::create_limited(dir, meta, MAX_TRACE_BYTES)
     }
@@ -50,6 +51,12 @@ impl FileSink {
         meta: &MetaRecord,
         max_bytes: u64,
     ) -> io::Result<Self> {
+        if let Some(field) = meta.too_deep_field() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("meta.{field} nests more than {MAX_JSON_DEPTH} levels deep"),
+            ));
+        }
         if let Some(field) = meta.float_field() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

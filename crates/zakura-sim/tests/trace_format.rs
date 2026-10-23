@@ -35,7 +35,8 @@ use zakura_sim::{
             PropertyStatus, SchedulerRecord, RNG, UNKNOWN,
         },
         BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
-        TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
+        TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
+        MAX_TRACE_BYTES, TRACE_FILE,
     },
     Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RecordSink, RunConfig,
     RunReport, Sim, Violation,
@@ -1092,6 +1093,68 @@ fn meta_bytes_ignore_key_order() {
     assert_eq!(a.meta, b.meta);
     let line = Record::Meta(Box::new(a.meta)).to_line();
     assert!(line.contains(r#""scenario":{"a":1,"z":{"b":2,"y":[{"c":3,"x":4}]}}"#));
+}
+
+/// `depth` arrays nested around `0`.
+fn nested(depth: usize) -> Value {
+    (0..depth).fold(json!(0), |inner, _| Value::Array(vec![inner]))
+}
+
+#[test]
+fn json_depth_is_bounded() {
+    // At the limit, in either field, a trace writes and reads back.
+    let at_limit = MetaRecord {
+        scenario: nested(MAX_JSON_DEPTH),
+        assumptions: vec![AssumeRecord {
+            assume: "bounded-delivery".into(),
+            params: json!({ "deep": nested(MAX_JSON_DEPTH - 1) }),
+        }],
+        ..meta()
+    };
+    assert_eq!(at_limit.too_deep_field(), None);
+    let dir = TempDir::new().unwrap();
+    record_to(dir.path(), &at_limit, plan(), &mut NoChecks);
+    TraceReader::open(dir.path()).unwrap();
+
+    // One level more fails before the file exists. That includes depths
+    // serde_json itself can no longer parse inside a record.
+    for depth in [MAX_JSON_DEPTH + 1, 126, 130] {
+        for (meta, field) in [
+            (
+                MetaRecord {
+                    scenario: nested(depth),
+                    ..meta()
+                },
+                "scenario",
+            ),
+            (
+                MetaRecord {
+                    assumptions: vec![AssumeRecord {
+                        assume: "bounded-delivery".into(),
+                        params: nested(depth),
+                    }],
+                    ..meta()
+                },
+                "assumptions",
+            ),
+        ] {
+            assert_eq!(meta.too_deep_field(), Some(field), "{field} at {depth}");
+            let dir = TempDir::new().unwrap();
+            let error = FileSink::create(dir.path(), &meta).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!dir.path().join(TRACE_FILE).exists());
+        }
+    }
+
+    // A deeper value written by hand is malformed.
+    let dir = recorded(plan());
+    edit_meta(dir.path(), |meta| {
+        meta["scenario"] = nested(MAX_JSON_DEPTH + 1)
+    });
+    assert!(matches!(
+        invalid(dir.path()),
+        Invalid::Malformed { line: 1, .. }
+    ));
 }
 
 #[test]

@@ -47,3 +47,10 @@ pub const MAX_BLOB_BYTES: u64 = 256 << 20;
 
 /// The largest `input.bin` the reader accepts.
 pub const MAX_INPUT_BYTES: u64 = 16 << 20;
+
+/// The deepest nesting of arrays and objects that `meta.scenario` and an
+/// assumption's `params` may hold. serde_json stops parsing at 128 levels,
+/// and the record around these values adds up to 4 (`{"meta":{"assumptions":
+/// [{"params":...`), so this keeps a written line well inside what the reader
+/// can parse.
+pub const MAX_JSON_DEPTH: usize = 100;

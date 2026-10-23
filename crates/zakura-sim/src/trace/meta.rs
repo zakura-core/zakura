@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zakura_scheduler::SchedulerConfig;
 
+use super::MAX_JSON_DEPTH;
 use crate::RunConfig;
 
 /// The random stream algorithm and its version, as `meta.rng` names it.
@@ -55,6 +56,22 @@ pub struct MetaRecord {
 }
 
 impl MetaRecord {
+    /// The first field nested deeper than [`MAX_JSON_DEPTH`]: `scenario` or
+    /// `assumptions`. Only these two fields take arbitrary JSON.
+    pub fn too_deep_field(&self) -> Option<&'static str> {
+        if deeper_than(&self.scenario, MAX_JSON_DEPTH) {
+            Some("scenario")
+        } else if self
+            .assumptions
+            .iter()
+            .any(|a| deeper_than(&a.params, MAX_JSON_DEPTH))
+        {
+            Some("assumptions")
+        } else {
+            None
+        }
+    }
+
     /// The first field that holds a float: `scenario` or `assumptions`.
     /// Records hold no floats (traces.md, Records), and only these two
     /// fields take arbitrary JSON.
@@ -69,7 +86,22 @@ impl MetaRecord {
     }
 }
 
-/// True if `value` holds a float at any depth.
+/// True if `value` nests arrays and objects more than `limit` deep. A scalar
+/// is depth 0 and `[0]` is depth 1. The walk stops past `limit`, so a value
+/// of any depth can't overflow the stack here.
+fn deeper_than(value: &Value, limit: usize) -> bool {
+    let Some(inner) = limit.checked_sub(1) else {
+        return matches!(value, Value::Array(_) | Value::Object(_));
+    };
+    match value {
+        Value::Array(items) => items.iter().any(|item| deeper_than(item, inner)),
+        Value::Object(map) => map.values().any(|item| deeper_than(item, inner)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+/// True if `value` holds a float at any depth. Callers check
+/// [`deeper_than`] first, so the walk stays shallow.
 fn has_float(value: &Value) -> bool {
     match value {
         Value::Number(number) => number.is_f64(),

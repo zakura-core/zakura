@@ -341,6 +341,7 @@ enum Next {
 /// successive `select!` polls in one task rotate through their branches
 /// instead of always starting at branch 0. A bound-0 draw, a seed, gets 0.
 pub(crate) fn default_draw(bound: u64, ordinal: u32) -> u64 {
+    debug_assert!(ordinal >= 1, "draw ordinals count from 1");
     match bound {
         0 => 0,
         bound => u64::from(ordinal.saturating_sub(1)) % bound,
@@ -480,6 +481,13 @@ mod tests {
         let values: Vec<_> = (1..=7).map(|n| default_draw(3, n)).collect();
         assert_eq!(values, [0, 1, 2, 0, 1, 2, 0]);
         assert_eq!(default_draw(0, 5), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "draw ordinals count from 1")]
+    fn default_draw_rejects_ordinal_zero() {
+        default_draw(3, 0);
     }
 
     #[test]

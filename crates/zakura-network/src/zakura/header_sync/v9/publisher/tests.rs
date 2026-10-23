@@ -11,11 +11,7 @@ use std::{
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::work::difficulty::U256;
-use zakura_header_chain::{
-    AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
-    SuffixWork, VerifiedGeneration,
-};
+use zakura_header_chain::{BodyWorkOwner, HeaderLocator};
 use zakura_node_services::header_chain::{
     AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, VctRepairContextReply,
@@ -36,7 +32,7 @@ use crate::zakura::{
 };
 
 mod load;
-mod state_machine;
+use super::machine_tests::snapshot;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -64,24 +60,6 @@ fn serve_limits() -> ServeLimits {
         node_output_responses: 16,
         peer_output_bytes: 1 << 20,
         node_output_bytes: 1 << 22,
-    }
-}
-
-/// A selected chain ending at `tip`.
-fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot {
-    EngineSnapshot {
-        mode: EngineMode::Integrated,
-        state_version: StateVersion::new(generation),
-        header_generation: HeaderGeneration::new(generation),
-        verified_generation: VerifiedGeneration::new(1),
-        frontiers: FrontierSet {
-            finalized: genesis,
-            header_best: tip,
-            verified_best: genesis,
-        },
-        header_best_score: ChainScore::new(SuffixWork::new(U256::from(tip.height.0)), tip.hash),
-        oldest_retained_height: block::Height(0),
-        alarms: AlarmSet::default(),
     }
 }
 

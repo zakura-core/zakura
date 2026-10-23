@@ -153,6 +153,14 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: header_publisher
+            decoder: 1
+            witness: publisher_witness_exercises_credit_terminal_and_stale_page
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

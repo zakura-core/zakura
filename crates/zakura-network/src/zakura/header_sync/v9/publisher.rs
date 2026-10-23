@@ -68,7 +68,12 @@ use crate::zakura::{
     FramedSend,
 };
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+#[path = "publisher/tests/state_machine.rs"]
+mod machine_tests;
 mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use machine_tests::{replay_header_publisher_bytes, HeaderPublisherReplaySummary};
 
 pub(crate) use state::is_legal;
 use state::{recheck, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall, Terminal};

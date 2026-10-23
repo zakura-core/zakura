@@ -7,6 +7,7 @@
 //! without knowing its type.
 
 pub mod discovery;
+pub mod fixtures;
 pub mod header_sync;
 
 use std::{fmt, rc::Rc};
@@ -197,6 +198,12 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
+    entry::<fixtures::Race<fixtures::LostUpdate>>(),
+    entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
+    entry::<fixtures::Race<fixtures::MissedNotify>>(),
+    entry::<fixtures::Race<fixtures::TimerCancel>>(),
+    entry::<fixtures::Race<fixtures::AbBa>>(),
+    entry::<fixtures::Race<fixtures::AbortWithoutJoin>>(),
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
 ];

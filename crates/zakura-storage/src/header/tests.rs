@@ -86,14 +86,14 @@ fn prepared_target(owner: HeaderSyncWorkOwner) -> PreparedHeaderTarget {
     )
 }
 
-/// One request per operation, in [`HeaderOp::ALL`] order.
-fn requests() -> Vec<HeaderRequest> {
+/// One request per operation, in [`HeaderOp::ALL`] order, with path handles
+/// that `key` issued.
+fn requests(key: &AdapterKey) -> Vec<HeaderRequest> {
     let source = SourceId::from_digest([6; 32]);
     let ancestor = Frontier::new(block::Height(1), block::Hash([1; 32]));
     let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
     let scope = owner().header_authority();
-    let path =
-        RetainedHeaderPath::from_adapter(&AdapterKey::new(), 7, source, 8, ancestor, target, scope);
+    let path = RetainedHeaderPath::from_adapter(key, 7, source, 8, ancestor, target, scope);
     let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
         .try_acquire_owned()
         .expect("a fresh semaphore has a permit");
@@ -145,7 +145,10 @@ fn requests() -> Vec<HeaderRequest> {
 
 #[test]
 fn requests_cover_every_operation_in_order() {
-    let ops: Vec<_> = requests().iter().map(HeaderRequest::op).collect();
+    let ops: Vec<_> = requests(&AdapterKey::new())
+        .iter()
+        .map(HeaderRequest::op)
+        .collect();
     assert_eq!(ops, HeaderOp::ALL);
     for op in HeaderOp::ALL {
         assert_eq!(
@@ -182,13 +185,17 @@ fn enabled_starts_with_engine_and_repeats() {
 /// `fault_reply`.
 #[test]
 fn fault_replies_match_the_contract() {
-    for request in requests() {
+    let key = AdapterKey::new();
+    for request in requests(&key) {
         let op = request.op();
         for t in TIMES {
             for fault in FAULTS {
-                let legal = op.enabled(t).any(|o| o == Outcome::Fault(fault));
+                let enabled = request.enabled(&key, t);
+                assert_eq!(enabled, op.enabled(t).collect::<Vec<_>>());
+                let legal = enabled.contains(&Outcome::Fault(fault));
                 assert_eq!(op.check(Outcome::Fault(fault), t).is_ok(), legal);
-                match request.fault_reply(fault, t) {
+                assert_eq!(request.check(&key, Outcome::Fault(fault), t).is_ok(), legal);
+                match request.fault_reply(&key, fault, t) {
                     Ok(reply) => {
                         assert!(legal, "{} built an illegal {fault:?} at {t:?}", op.name());
                         assert_eq!(reply.op(), op);
@@ -257,11 +264,12 @@ fn prepare_and_apply_fault_only_with_local_resource() {
 /// resource failure on the request owner's branch, blamed on no peer.
 #[test]
 fn local_resource_names_the_owner_branch() {
-    for request in requests() {
+    let key = AdapterKey::new();
+    for request in requests(&key) {
         let Some(owner) = request.owner() else {
             continue;
         };
-        let error = match request.fault_reply(Fault::LocalResource, Duration::ZERO) {
+        let error = match request.fault_reply(&key, Fault::LocalResource, Duration::ZERO) {
             Ok(HeaderReply::PrepareHeaderTarget(Err(error)))
             | Ok(HeaderReply::ApplyHeaderTarget(Err(error))) => error,
             other => panic!("{} gave {other:?}", request.op().name()),
@@ -277,7 +285,8 @@ fn local_resource_names_the_owner_branch() {
 
 #[test]
 fn only_prepare_and_apply_report_an_owner() {
-    for request in requests() {
+    let key = AdapterKey::new();
+    for request in requests(&key) {
         let has_owner = matches!(
             request.op(),
             HeaderOp::PrepareHeaderTarget | HeaderOp::ApplyHeaderTarget
@@ -398,12 +407,19 @@ fn outcome_names_are_distinct_identity_parts() {
         Outcome::Fault(Fault::Timeout),
         Outcome::Fault(Fault::Unavailable),
         Outcome::Fault(Fault::LocalResource),
+        Outcome::Rejected,
     ]
     .map(Outcome::name)
     .into();
     assert_eq!(
         names,
-        ["engine", "timeout", "unavailable", "local-resource"]
+        [
+            "engine",
+            "timeout",
+            "unavailable",
+            "local-resource",
+            "rejected"
+        ]
     );
     for name in names {
         assert!(!name.contains(':'), "{name} would split a storage identity");
@@ -479,4 +495,51 @@ fn a_failed_input_check_skips_the_sweep() {
     let b_acquire = AcquireHeaderPath.contract();
     assert!(!b_acquire.sweeps(Some(InputCheck::LocatorCount)));
     assert!(b_acquire.sweeps(None));
+}
+
+/// Rule A: a read or release with another adapter's handle gets the
+/// adapter's rejection before any deadline starts, so at 30 s it still has
+/// no `timeout`, no `unavailable` fault and no engine result.
+#[test]
+fn a_foreign_handle_has_only_the_rejection() {
+    let ours = AdapterKey::new();
+    let theirs = AdapterKey::new();
+    for request in requests(&theirs) {
+        let op = request.op();
+        assert_eq!(request.rejected_by(&theirs), None, "{}", op.name());
+        assert!(request.rejection_reply(&theirs).is_none());
+        if !matches!(op, HeaderOp::ReadHeaderPath | HeaderOp::ReleaseHeaderPath) {
+            assert_eq!(request.rejected_by(&ours), None, "{}", op.name());
+            continue;
+        }
+        assert_eq!(request.rejected_by(&ours), Some(InputCheck::AdapterHandle));
+        assert!(!op.contract().sweeps(request.rejected_by(&ours)));
+        for t in TIMES {
+            assert_eq!(
+                request.enabled(&ours, t),
+                [Outcome::Rejected],
+                "{}",
+                op.name()
+            );
+            assert!(request.check(&ours, Outcome::Rejected, t).is_ok());
+            assert!(request.check(&ours, Outcome::Engine, t).is_err());
+            for fault in FAULTS {
+                assert!(request.fault_reply(&ours, fault, t).is_err(), "{fault:?}");
+            }
+        }
+        match request.rejection_reply(&ours) {
+            Some(HeaderReply::ReadHeaderPath(Err(PortError::Unavailable { source: None })))
+                if op == HeaderOp::ReadHeaderPath => {}
+            Some(HeaderReply::ReleaseHeaderPath(Err(PortError::Unavailable { source: None })))
+                if op == HeaderOp::ReleaseHeaderPath => {}
+            other => panic!("{} rejected with {other:?}", op.name()),
+        }
+    }
+    for check in [InputCheck::LocatorCount, InputCheck::PageCount] {
+        assert!(
+            !check.in_adapter(),
+            "state runs {check:?} under the deadline"
+        );
+    }
+    assert!(InputCheck::AdapterHandle.in_adapter());
 }

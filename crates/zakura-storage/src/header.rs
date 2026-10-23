@@ -32,8 +32,15 @@
 //! # Outcomes
 //!
 //! An [`Outcome`] or [`HeaderReply`] can be built freely, so the contract only
-//! holds if ST3 calls [`HeaderOp::check`] at its completion boundary, before
-//! it runs or replies.
+//! holds if ST3 calls [`HeaderRequest::check`] at its completion boundary,
+//! before it runs or replies.
+//!
+//! Input checks the adapter runs itself come first. A request that fails one,
+//! such as a read with another adapter's path handle, gets the adapter's
+//! rejection before any state read or deadline starts. So its only legal
+//! outcome is [`Outcome::Rejected`], and [`HeaderRequest::enabled`] offers no
+//! engine result or fault for it. Checks that state runs, like the locator and
+//! page counts, run under the adapter's deadline, so they are engine results.
 //!
 //! [`Outcome::Engine`] runs the operation against the engine and returns what
 //! it computes. Every engine result in the table comes only from the engine.
@@ -172,9 +179,9 @@ use zakura_header_chain::{
     BodyWorkOwner, ErrorSubject, HeaderChainError, HeaderLocator, HeaderSyncWorkOwner,
 };
 use zakura_node_services::header_chain::{
-    AcquirePath, AcquirePathReply, ApplyHeaderTargetReply, LocatorReadPermit, PortError,
-    PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath, ReadPathReply,
-    RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
+    AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetReply, LocatorReadPermit,
+    PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
+    ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
 
 #[cfg(test)]
@@ -222,6 +229,9 @@ pub enum Outcome {
     Engine,
     /// Return a typed fault without running the operation.
     Fault(Fault),
+    /// Return the adapter's rejection of a request that failed one of its
+    /// own input checks. The only legal outcome for such a request.
+    Rejected,
 }
 
 /// A fault the run may choose instead of running an operation. The module
@@ -398,6 +408,15 @@ pub enum InputCheck {
     PageCount,
 }
 
+impl InputCheck {
+    /// Whether the adapter runs this check itself, before any state read and
+    /// so before any deadline. Only these checks decide a request's outcome
+    /// on their own. State runs the others under the adapter's deadline.
+    pub const fn in_adapter(self) -> bool {
+        matches!(self, InputCheck::AdapterHandle)
+    }
+}
+
 impl OpContract {
     /// Whether the operation sweeps idle leases, given the input check it
     /// failed, if any.
@@ -570,9 +589,10 @@ impl HeaderOp {
         &CONTRACTS[self as usize]
     }
 
-    /// The outcomes legal `since_submit` after submission, in canonical
-    /// order: [`Outcome::Engine`] first, then the legal faults in contract
-    /// order.
+    /// The outcomes legal `since_submit` after submission for a request that
+    /// passes its adapter-side input checks, in canonical order:
+    /// [`Outcome::Engine`] first, then the legal faults in contract order.
+    /// [`HeaderRequest::enabled`] applies those checks.
     pub fn enabled(self, since_submit: Duration) -> impl Iterator<Item = Outcome> {
         let faults = self
             .contract()
@@ -586,7 +606,9 @@ impl HeaderOp {
         std::iter::once(Outcome::Engine).chain(faults)
     }
 
-    /// Whether [`Self::enabled`] offers `outcome` at `since_submit`.
+    /// Whether [`Self::enabled`] offers `outcome` at `since_submit`, for a
+    /// request that passes its adapter-side input checks. ST3 calls
+    /// [`HeaderRequest::check`], which also applies those.
     pub fn check(self, outcome: Outcome, since_submit: Duration) -> Result<(), IllegalOutcome> {
         if self.enabled(since_submit).any(|legal| legal == outcome) {
             Ok(())
@@ -609,6 +631,7 @@ impl Outcome {
             Outcome::Fault(Fault::Timeout) => "timeout",
             Outcome::Fault(Fault::Unavailable) => "unavailable",
             Outcome::Fault(Fault::LocalResource) => "local-resource",
+            Outcome::Rejected => "rejected",
         }
     }
 }
@@ -728,16 +751,82 @@ impl HeaderRequest {
         }
     }
 
+    /// The first adapter-side input check this request fails, for the
+    /// adapter holding `key`. The contract's `input_checks` are the source.
+    pub fn rejected_by(&self, key: &AdapterKey) -> Option<InputCheck> {
+        self.op()
+            .contract()
+            .input_checks
+            .iter()
+            .copied()
+            .filter(|check| check.in_adapter())
+            .find(|check| match check {
+                InputCheck::AdapterHandle => match self {
+                    HeaderRequest::ReadHeaderPath { path, .. }
+                    | HeaderRequest::ReleaseHeaderPath { path } => {
+                        path.adapter_identity(key).is_none()
+                    }
+                    _ => false,
+                },
+                InputCheck::LocatorCount | InputCheck::PageCount => false,
+            })
+    }
+
+    /// The outcomes legal for this request `since_submit` after submission,
+    /// for the adapter holding `key`. Only [`Outcome::Rejected`] if an
+    /// adapter-side input check fails, and [`HeaderOp::enabled`] otherwise.
+    pub fn enabled(&self, key: &AdapterKey, since_submit: Duration) -> Vec<Outcome> {
+        if self.rejected_by(key).is_some() {
+            vec![Outcome::Rejected]
+        } else {
+            self.op().enabled(since_submit).collect()
+        }
+    }
+
+    /// Whether [`Self::enabled`] offers `outcome`.
+    pub fn check(
+        &self,
+        key: &AdapterKey,
+        outcome: Outcome,
+        since_submit: Duration,
+    ) -> Result<(), IllegalOutcome> {
+        if self.enabled(key, since_submit).contains(&outcome) {
+            Ok(())
+        } else {
+            Err(IllegalOutcome {
+                op: self.op(),
+                outcome,
+                since_submit,
+            })
+        }
+    }
+
+    /// The adapter's rejection, if this request fails an adapter-side input
+    /// check. It's `PortError::Unavailable` with no source, as the
+    /// production adapter returns.
+    pub fn rejection_reply(&self, key: &AdapterKey) -> Option<HeaderReply> {
+        self.rejected_by(key)?;
+        let rejected = || PortError::Unavailable { source: None };
+        match self {
+            HeaderRequest::ReadHeaderPath { .. } => {
+                Some(HeaderReply::ReadHeaderPath(Err(rejected())))
+            }
+            HeaderRequest::ReleaseHeaderPath { .. } => {
+                Some(HeaderReply::ReleaseHeaderPath(Err(rejected())))
+            }
+            _ => unreachable!("only path handles have an adapter-side input check"),
+        }
+    }
+
     /// The reply the production adapter gives for `fault`, or
-    /// [`IllegalOutcome`] if the contract doesn't allow `fault` at
-    /// `since_submit`.
+    /// [`IllegalOutcome`] if [`Self::check`] refuses it.
     pub fn fault_reply(
         &self,
+        key: &AdapterKey,
         fault: Fault,
         since_submit: Duration,
     ) -> Result<HeaderReply, IllegalOutcome> {
-        let op = self.op();
-        op.check(Outcome::Fault(fault), since_submit)?;
+        self.check(key, Outcome::Fault(fault), since_submit)?;
         let port_error = || match fault {
             Fault::Timeout => PortError::Timeout,
             Fault::Unavailable => PortError::Unavailable { source: None },

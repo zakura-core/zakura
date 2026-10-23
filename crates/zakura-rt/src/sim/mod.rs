@@ -322,6 +322,66 @@ pub enum Op {
     Watch,
 }
 
+impl Op {
+    /// Every operation, in declaration order. Executors test their mapping
+    /// over it, so a new variant must be added here too.
+    pub const ALL: [Op; 18] = [
+        Op::Lock,
+        Op::Release,
+        Op::Send,
+        Op::Recv,
+        Op::Notify,
+        Op::Notified,
+        Op::Acquire,
+        Op::Cancel,
+        Op::Cancelled,
+        Op::AtomicLoad,
+        Op::AtomicStore,
+        Op::AtomicRmw,
+        Op::Spawn,
+        Op::Join,
+        Op::Abort,
+        Op::Sleep,
+        Op::Select,
+        Op::Watch,
+    ];
+
+    /// The short name traces use, such as `lock` in `lock#2`. An executor's
+    /// own operation names must agree with these.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Op::Lock => "lock",
+            Op::Release => "release",
+            Op::Send => "send",
+            Op::Recv => "recv",
+            Op::Notify => "notify",
+            Op::Notified => "notified",
+            Op::Acquire => "acquire",
+            Op::Cancel => "cancel",
+            Op::Cancelled => "cancelled",
+            Op::AtomicLoad => "load",
+            Op::AtomicStore => "store",
+            Op::AtomicRmw => "rmw",
+            Op::Spawn => "spawn",
+            Op::Join => "join",
+            Op::Abort => "abort",
+            Op::Sleep => "sleep",
+            Op::Select => "select",
+            Op::Watch => "watch",
+        }
+    }
+}
+
+// `ALL` lists each variant once, in declaration order.
+const _: () = {
+    let mut i = 0;
+    while i < Op::ALL.len() {
+        // A fieldless enum's discriminant is its declaration index.
+        assert!(Op::ALL[i] as usize == i);
+        i += 1;
+    }
+};
+
 /// Where a random choice comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -336,6 +396,27 @@ pub enum DrawKind {
     /// The first stream a `StreamMap` polls.
     StreamMap,
 }
+
+impl DrawKind {
+    /// Every draw kind, in declaration order. Executors test their mapping
+    /// over it, so a new variant must be added here too.
+    pub const ALL: [DrawKind; 4] = [
+        DrawKind::Rng,
+        DrawKind::Select,
+        DrawKind::HashSeed,
+        DrawKind::StreamMap,
+    ];
+}
+
+// `ALL` lists each variant once, in declaration order.
+const _: () = {
+    let mut i = 0;
+    while i < DrawKind::ALL.len() {
+        // A fieldless enum's discriminant is its declaration index.
+        assert!(DrawKind::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// A random choice's kind and the source location that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

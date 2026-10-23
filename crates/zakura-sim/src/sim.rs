@@ -147,7 +147,8 @@ impl Sim {
                 phase = Phase::Drain;
             }
             if phase == Phase::Drain && drained >= self.config.drain_bound {
-                return st.end_budget(drained, true);
+                // Exhausted only if the bound cut off work still waiting.
+                return st.end_budget(drained, !ready.is_empty());
             }
             let now = self.sched.now();
             let offers: Vec<Offer> = match phase {

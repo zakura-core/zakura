@@ -180,3 +180,23 @@ fn livelock_limit_violates() {
     assert_eq!(violation.property, NO_LIVELOCK);
     assert_eq!(violation.step, 51);
 }
+
+#[test]
+fn drain_that_finishes_on_its_bound_is_not_exhausted() {
+    let config = RunConfig {
+        drain_bound: 1,
+        ..config(2, 0)
+    };
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("done", async {});
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Budget);
+    let drain = report.end.drain.unwrap();
+    assert_eq!(drain.steps, 1);
+    assert!(!drain.exhausted, "no task was ready when the drain stopped");
+}

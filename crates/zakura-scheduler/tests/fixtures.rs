@@ -377,9 +377,17 @@ impl Drop for SpinsOnDrop {
 fn shutdown_report(
     setup: impl FnOnce(&mut Scheduler) + Send + 'static,
 ) -> zakura_scheduler::CleanupReport {
+    shutdown_report_with(SchedulerConfig::default(), setup)
+}
+
+/// [`shutdown_report`] with `config`.
+fn shutdown_report_with(
+    config: SchedulerConfig,
+    setup: impl FnOnce(&mut Scheduler) + Send + 'static,
+) -> zakura_scheduler::CleanupReport {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let mut s = Scheduler::new(config, SimInstant::ZERO);
         setup(&mut s);
         let _ = done.send(s.shutdown());
     });
@@ -601,7 +609,104 @@ fn a_spawn_from_a_leftover_drop_is_leaked() {
             &waker,
         );
     });
-    assert_eq!((report.leaked, report.cancelled), (2, 0), "A and B");
+    // The run is abandoned with the timer still registered, so its waker
+    // never drops and B is never spawned. Only A is leaked.
+    assert_eq!((report.leaked, report.cancelled), (1, 0));
+}
+
+#[test]
+fn a_rejected_spawn_from_a_leftover_drop_runs_nothing() {
+    if leaks_in_a_child("a_rejected_spawn_from_a_leftover_drop_runs_nothing") {
+        return;
+    }
+    // With room for one task, B's spawn would be rejected, and a rejected
+    // spawn drops its future at once, guard and all.
+    let config = SchedulerConfig {
+        max_tasks: 1,
+        ..SchedulerConfig::default()
+    };
+    let report = shutdown_report_with(config, |s| {
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        LEFTOVER_FLAG.with(|f| *f.borrow_mut() = Some(flag.clone()));
+        let a = s.spawn_root("a", async move {
+            let _signal = SetsOnDrop(flag);
+            while never.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(a.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        let waker = Waker::from(std::sync::Arc::new(SpawnsOnDrop));
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &waker,
+        );
+    });
+    assert_eq!((report.leaked, report.cancelled), (1, 0));
+}
+
+/// Sets its flag when woken or dropped.
+struct SetsFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl std::task::Wake for SetsFlag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for SetsFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn no_code_runs_after_a_task_is_stuck() {
+    use std::{
+        future::Future,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    if leaks_in_a_child("no_code_runs_after_a_task_is_stuck") {
+        return;
+    }
+    let (join, timer, spawned) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let flags = (join.clone(), timer.clone(), spawned.clone());
+    let report = shutdown_report(move |s| {
+        let never = shared(Atomic::default());
+        let mut spinner = s.spawn_root("spinner", async move { while never.load() == 0 {} });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // A joiner's waker, a timer's waker, and a queued spawn's future.
+        // Waking or dropping any of them sets its flag.
+        let joiner = Waker::from(Arc::new(SetsFlag(join)));
+        let polled =
+            std::pin::Pin::new(&mut spinner).poll(&mut std::task::Context::from_waker(&joiner));
+        assert!(polled.is_pending());
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &Waker::from(Arc::new(SetsFlag(timer))),
+        );
+        let guard = SetsFlag(spawned);
+        hooks::spawn("queued", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+    });
+    let (join, timer, spawned) = flags;
+    let set = |flag: &AtomicBool| flag.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        (set(&join), set(&timer), set(&spawned)),
+        (false, false, false),
+        "no waker woke or dropped, and no future dropped"
+    );
+    assert_eq!(report.leaked, 2, "the spinner and the queued spawn");
 }
 
 #[test]

@@ -357,9 +357,9 @@ pub struct CleanupReport {
     /// Tasks still parked after the drain, such as a lock cycle, whose
     /// coroutines were force-unwound.
     pub unwound: usize,
-    /// Tasks stopped at the cleanup point limit, and every task left after
-    /// one, whose coroutines and stacks were leaked without running their
-    /// destructors.
+    /// Tasks leaked when a task got stuck at the cleanup point limit and
+    /// shutdown abandoned the run: every task still live, plus any spawn
+    /// still queued. None of their code ran.
     pub leaked: usize,
     /// Forced unwinds that a task's own code caught and didn't rethrow. The
     /// stack of such a task is leaked rather than reused.
@@ -371,8 +371,9 @@ pub struct CleanupReport {
 /// This thread's coroutine stacks, as [`stack_pool`] reports them.
 ///
 /// Every stack the thread allocated is idle in the pool, in use by a run,
-/// freed by the pool, or leaked by an unwind failure (see
-/// [`CleanupReport::unwind_failures`]). So between runs,
+/// freed by the pool, or leaked by an unwind failure or an abandoned run
+/// (see [`CleanupReport::unwind_failures`] and [`CleanupReport::leaked`]).
+/// So between runs,
 /// `allocated - freed - idle` counts leaked stacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackPool {

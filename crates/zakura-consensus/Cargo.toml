@@ -62,7 +62,7 @@ zcash_primitives = { workspace = true }
 
 zakura-script = { path = "../zakura-script", version = "5.0.0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
 zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 

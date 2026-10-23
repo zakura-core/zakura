@@ -439,6 +439,96 @@ fn a_leak_leaks_the_waiters_that_depend_on_it() {
     assert_eq!((report.leaked, report.unwound), (2, 0));
 }
 
+/// Counts its drops, as a guard with a visible destructor would.
+struct CountsDrops(Rc<Cell<u32>>);
+
+impl Drop for CountsDrops {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+#[test]
+fn a_stuck_task_stops_the_drain() {
+    let report = shutdown_report(|s| {
+        let never = shared(Atomic::default());
+        let spinner = s.spawn_root("spinner", async move { while never.load() == 0 {} });
+        assert!(matches!(
+            s.run(spinner.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // Ready tasks the drain would cancel after the spinner, running
+        // their guards' destructors.
+        let drops = shared(Cell::new(0));
+        for _ in 0..3 {
+            let guard = CountsDrops(drops.clone());
+            s.spawn_root("ready", async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            });
+        }
+    });
+    assert_eq!(
+        (report.leaked, report.cancelled),
+        (4, 0),
+        "once the spinner was stuck, nothing was cancelled"
+    );
+}
+
+/// A waker whose wake panics, as a buggy joiner's might.
+struct PanicsOnWake;
+
+impl std::task::Wake for PanicsOnWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        panic!("this waker panics");
+    }
+}
+
+#[test]
+fn a_panicking_join_waker_unwinds_nothing_after_a_leak() {
+    use std::future::Future;
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Signals when the thread ends, even by a panic.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _done = Done(done);
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let lock = shared(Mutex::new(()));
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_lock, a_flag) = (lock.clone(), flag.clone());
+        let mut a = s.spawn_root("a", async move {
+            let _held = a_lock.lock();
+            let _signal = SetsOnDrop(a_flag);
+            while never.load() == 0 {}
+        });
+        let b = s.spawn_root("b", async move {
+            let _waits = SpinsOnDrop(flag);
+            drop(lock.lock());
+        });
+        for _ in 0..4 {
+            assert!(matches!(s.run(a.task()), Reached(_)));
+        }
+        while !matches!(s.run(b.task()), Parked(_)) {}
+        // A joiner of A whose waker panics when A is finished.
+        let waker = Waker::from(std::sync::Arc::new(PanicsOnWake));
+        let polled = std::pin::Pin::new(&mut a).poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The waker's panic ends this thread. It must not force-unwind B on
+        // the way out.
+        let _ = s.shutdown();
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the shutdown thread ended");
+}
+
 #[test]
 fn long_but_finite_cleanup_finishes() {
     let report = shutdown_report(|s| {

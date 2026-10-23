@@ -2,7 +2,8 @@
 
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zakura_scheduler::SchedulerConfig;
 
@@ -31,8 +32,10 @@ pub struct MetaRecord {
     pub build: BuildInfo,
     /// The harness's name, such as `header-sync`.
     pub sim: String,
-    /// The harness's scenario, in full.
-    pub scenario: serde_json::Value,
+    /// The harness's scenario, in full. Written with sorted keys (see
+    /// [`sorted`]).
+    #[serde(serialize_with = "sorted")]
+    pub scenario: Value,
     /// Each assumption the scenario declares, with its parameters.
     pub assumptions: Vec<AssumeRecord>,
     /// The scheduler's limits.
@@ -149,8 +152,10 @@ impl BuildInfo {
 pub struct AssumeRecord {
     /// The assumption, such as `bounded-delivery`.
     pub assume: String,
-    /// Its parameters, such as the link's maximum delay.
-    pub params: serde_json::Value,
+    /// Its parameters, such as the link's maximum delay. Written with sorted
+    /// keys (see [`sorted`]).
+    #[serde(serialize_with = "sorted")]
+    pub params: Value,
 }
 
 /// The scheduler limits a run used.
@@ -272,6 +277,37 @@ pub enum DerivationTool {
     Search,
     /// A format migration.
     Migrate,
+}
+
+/// Serializes `value` with every object's keys in sorted order, at any depth.
+///
+/// Equal records must write equal bytes. serde_json keeps an object's
+/// insertion order when its `preserve_order` feature is on, which another
+/// workspace crate turns on, so `{"a":1,"z":2}` and `{"z":2,"a":1}` would
+/// compare equal but write different bytes and trace IDs.
+fn sorted<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
+    Sorted(value).serialize(serializer)
+}
+
+/// A JSON value that serializes with sorted object keys (see [`sorted`]).
+struct Sorted<'a>(&'a Value);
+
+impl Serialize for Sorted<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    out.serialize_entry(key, &Sorted(value))?;
+                }
+                out.end()
+            }
+            Value::Array(items) => serializer.collect_seq(items.iter().map(Sorted)),
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 /// Splits a list `build.rs` joined with its separator.

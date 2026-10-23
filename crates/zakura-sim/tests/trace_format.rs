@@ -796,6 +796,46 @@ fn current_build_is_recorded() {
 }
 
 #[test]
+fn meta_bytes_ignore_key_order() {
+    let mut forward = serde_json::Map::new();
+    forward.insert("a".into(), json!(1));
+    forward.insert("z".into(), json!({ "b": 2, "y": [{ "c": 3, "x": 4 }] }));
+    let mut reverse = serde_json::Map::new();
+    let mut inner = serde_json::Map::new();
+    inner.insert("y".into(), json!([{ "x": 4, "c": 3 }]));
+    inner.insert("b".into(), json!(2));
+    reverse.insert("z".into(), Value::Object(inner));
+    reverse.insert("a".into(), json!(1));
+    let (forward, reverse) = (Value::Object(forward), Value::Object(reverse));
+    assert_eq!(forward, reverse);
+    assert_ne!(
+        forward.to_string(),
+        reverse.to_string(),
+        "preserve_order is on, so a plain write shows insertion order"
+    );
+
+    let with = |value: &Value| MetaRecord {
+        scenario: value.clone(),
+        assumptions: vec![AssumeRecord {
+            assume: "bounded-delivery".into(),
+            params: value.clone(),
+        }],
+        ..meta()
+    };
+    let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    record_to(a.path(), &with(&forward), plan(), &mut NoChecks);
+    record_to(b.path(), &with(&reverse), plan(), &mut NoChecks);
+    let (a, b) = (
+        TraceReader::open(a.path()).unwrap(),
+        TraceReader::open(b.path()).unwrap(),
+    );
+    assert_eq!(a.id, b.id, "equal meta writes equal bytes");
+    assert_eq!(a.meta, b.meta);
+    let line = Record::Meta(Box::new(a.meta)).to_line();
+    assert!(line.contains(r#""scenario":{"a":1,"z":{"b":2,"y":[{"c":3,"x":4}]}}"#));
+}
+
+#[test]
 fn meta_has_no_debug_output() {
     let line = Record::Meta(Box::new(meta())).to_line();
     let value: Value = serde_json::from_str(&line).unwrap();

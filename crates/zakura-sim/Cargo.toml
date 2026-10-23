@@ -24,6 +24,9 @@ libc = { workspace = true }
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
 rand_10 = { workspace = true }
+# zakura-rpc turns this on in workspace builds, so the trace tests run with it
+# to check that equal records still write equal bytes.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }

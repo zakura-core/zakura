@@ -315,7 +315,9 @@ fn obligations_match_by_key() {
 }
 
 /// Review P-03: one observation discharges only the oldest obligation it
-/// matches, even when two share a key.
+/// matches, even when two share a key. The two open at 0 s and 1 s, and one
+/// serve at 1.5 s discharges the older one. The newer one is left, so it
+/// expires when time jumps to 10 s, and the violation names its trigger.
 #[test]
 fn one_observation_discharges_oldest_only() {
     let (report, _, recorder) = run_with(
@@ -325,12 +327,21 @@ fn one_observation_discharges_oldest_only() {
         Recorder::default(),
         |sim| {
             exit_after(sim, "request-p1", Duration::ZERO);
-            exit_after(sim, "request-p1", Duration::ZERO);
-            exit_after(sim, "serve-p1", Duration::from_secs(1));
+            exit_after(sim, "request-p1", Duration::from_secs(1));
+            exit_after(sim, "serve-p1", Duration::from_millis(1_500));
+            exit_after(sim, "tail", Duration::from_secs(10));
         },
     );
-    // The second obligation is still open, within its deadline, at run end.
-    assert_eq!(outcome(&report, &SERVED), inconclusive("obligation-open"));
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("one obligation expired");
+    assert_eq!(
+        violation.witness,
+        vec![exit_step(&report.log, "request-p1.2"), violation.step],
+        "the newer obligation is the one left open"
+    );
     let discharges = recorder
         .points()
         .into_iter()

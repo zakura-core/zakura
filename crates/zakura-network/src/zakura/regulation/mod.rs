@@ -68,7 +68,10 @@ pub(crate) use writer_fence::{
     Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 pub(crate) mod test_family;
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use cadence::{replay_cadence_bytes, CadenceReplaySummary};

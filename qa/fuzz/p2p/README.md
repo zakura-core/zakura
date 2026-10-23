@@ -13,7 +13,7 @@ workspace root:
 cargo +nightly-2026-07-15 fuzz run --fuzz-dir . service_session
 ```
 
-The available target is `service_session`. It replays one connection's inputs
+The `service_session` target replays one connection's inputs
 to the service-session state in
 `crates/zakura-network/src/zakura/handler/service_session/state.rs` and checks
 `session/offer-assembly`, `session/one-active-generation`, and
@@ -36,6 +36,30 @@ cargo +nightly-2026-07-15 fuzz tmin --fuzz-dir . service_session path/to/crash-a
 
 Turn every confirmed bug into a normal deterministic test in the owning crate.
 Do not commit raw or minimized corpus files.
+
+## Cadence target
+
+`cadence` calls the production sender's hold decision and synchronous send path
+for two rows sharing one queue. Its independent ledger checks `cadence/hold`
+and `cadence/settlement`. A receive settles the real frame guard. This boundary
+does not exercise scheduled transport writes.
+
+Decoder version 1 reads at most 512 bytes. Each byte chooses update, elapsed
+seconds, send or settlement. The fixed witness exercises pacing, an unwritten
+frame, a full queue and settlement. Planted failures break pacing and ownership.
+Proptest and cargo-fuzz call `replay_cadence_bytes`.
+
+Run the applicability witnesses with `cargo test -p zakura-network --lib
+cadence_witness -- --nocapture` from the repository root. Their printed counters
+are witness evidence; they do not claim applicability for every fuzz input.
+An empty input has zero applicability.
+
+Each nightly target keeps its own 900-second daily and 3,600-second weekly
+budget. CI restores corpora by target and decoder version. CI uploads the corpus,
+crash artifacts, witness counters, compiler version, source revision and fuzz log.
+Machine bytes are compatible with their target and decoder version. They are
+not portable simulator traces. The planned P1 registry will index these local
+property IDs and their witness paths.
 
 ## Block query and fill targets
 

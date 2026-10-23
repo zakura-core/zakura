@@ -494,3 +494,24 @@ fn a_sim_whose_shutdown_panics_forgets_its_sources() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the sim was dropped without waiting on its source");
 }
+
+#[test]
+fn a_deadlock_at_the_last_live_step_is_idle() {
+    let report = run(
+        config(1, 1),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler()
+                .spawn_root("stuck", std::future::pending::<()>());
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.steps, 1);
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Idle {
+            status: zakura_sim::IdleStatus::Deadlock
+        }
+    );
+    assert_eq!(report.end.drain, None);
+}

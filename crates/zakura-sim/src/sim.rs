@@ -221,7 +221,12 @@ impl Sim {
         let mut drained = 0;
         let mut at_instant = 0;
         loop {
-            if phase == Phase::Live && st.step >= self.config.budget {
+            // A run whose last live step left nothing enabled stays live, so
+            // it ends idle below rather than at its budget.
+            if phase == Phase::Live
+                && st.step >= self.config.budget
+                && !self.nothing_enabled(&ready)
+            {
                 phase = Phase::Drain;
             }
             if phase == Phase::Drain && drained >= self.config.drain_bound {

@@ -1644,7 +1644,9 @@ impl HeaderSyncReactor {
             row.insert("event".into(), "header_body_size_hints_received".into());
             row.insert("peer".into(), trace_peer_label(&peer).into());
             row.insert("session_id".into(), session_id.into());
-            row.insert("request_id".into(), response.request_id.into());
+            // Keep the trace correlation key shared with header_response_received:
+            // v9 pages belong to a subscription, not a separate per-page request.
+            row.insert(hs_trace::REQUEST_ID.into(), response.subscription_id.into());
             row.insert(
                 "common_ancestor_height".into(),
                 response.common_ancestor_height.0.into(),

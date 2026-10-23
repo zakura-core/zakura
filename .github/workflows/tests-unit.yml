@@ -475,7 +475,8 @@ jobs:
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
 
   # `zakura-rt`, `zakura-scheduler`, `zakura-sim` and `zakura-quic` have a
-  # simulator build behind `--cfg zakura_sim` that no other job compiles. Changing RUSTFLAGS
+  # simulator build behind `--cfg zakura_sim` that no other job compiles.
+  # `zakura-storage` serves the simulator, so it runs here too. Changing RUSTFLAGS
   # rebuilds every crate, so this job uses its own target directory and cache
   # key. `zakura-network`'s library and its scheduler tests build under the
   # flag too. Its unit tests still name tokio's types, so they don't.
@@ -502,13 +503,13 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint the simulator build
         run: |
-          cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-quic --all-targets -- -D warnings
+          cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets -- -D warnings
           cargo clippy --locked -p zakura-network --lib --test sim_header_sync -- -D warnings
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build
         run: |
-          cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-quic
+          cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic
           cargo test --locked -p zakura-network --test sim_header_sync
           # Rustdoc needs the flag too, or the crate has no doc tests to run.
           RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc

@@ -31,6 +31,10 @@
 //!
 //! # Outcomes
 //!
+//! An [`Outcome`] or [`HeaderReply`] can be built freely, so the contract only
+//! holds if ST3 calls [`HeaderOp::check`] at its completion boundary, before
+//! it runs or replies.
+//!
 //! [`Outcome::Engine`] runs the operation against the engine and returns what
 //! it computes. Every engine result in the table comes only from the engine.
 //! For example, the run can't make a still-current target `stale_target`.

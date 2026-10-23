@@ -12,19 +12,19 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, PoisonError, Weak,
-    },
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::Duration,
 };
 
-use crate::{EndpointInputs, NodeSecretKey, KEY_LENGTH};
+use crate::{inputs::ProviderWatch, EndpointInputs, NodeSecretKey, KEY_LENGTH};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use quinn_proto::{ConnectionId, ConnectionIdGenerator, InvalidCid};
 use ring::{digest, hkdf, hmac};
 use rustls::{
-    crypto::{ActiveKeyExchange, GetRandomFailed, SecureRandom, SharedSecret, SupportedKxGroup},
+    crypto::{
+        ActiveKeyExchange, CryptoProvider, GetRandomFailed, SecureRandom, SharedSecret,
+        SupportedKxGroup,
+    },
     NamedGroup, PeerMisbehaved,
 };
 
@@ -135,8 +135,8 @@ struct Cursor {
     draws: u64,
 }
 
-/// One node's streams. The endpoint inputs and [`SeededInputs`] share it,
-/// and dropping the last of them frees its TLS slot.
+/// One node's streams, shared by its [`SeededInputs`], their endpoint
+/// inputs and its TLS slot.
 struct Streams {
     seed: [u8; 32],
     node: u32,
@@ -172,13 +172,6 @@ impl Streams {
     }
 }
 
-impl Drop for Streams {
-    /// Frees the TLS slot for the next node that starts.
-    fn drop(&mut self) {
-        self.slot.release();
-    }
-}
-
 /// Seeded inputs for one node of a scenario.
 ///
 /// [`SeededInputs::endpoint_inputs`] sets every input `bind_with` takes, and
@@ -188,6 +181,7 @@ impl Drop for Streams {
 #[derive(Clone)]
 pub struct SeededInputs {
     streams: Arc<Streams>,
+    lease: Arc<Lease>,
     rng_seed: [u8; 32],
     reset_key: hmac::Key,
     token_key: hkdf::Prk,
@@ -207,21 +201,24 @@ impl SeededInputs {
     /// Starts node `node`'s streams under `seed`, every one at block 0.
     ///
     /// rustls takes the TLS random source and key-exchange group as
-    /// `&'static`, so the node leases a leaked slot for them, reusing a free
-    /// one when it can. A process leaks at most as many slots as it ever has
-    /// nodes alive at once.
+    /// `&'static`, so the node takes a leaked slot for them, reusing a free
+    /// one when it can. A slot stays the node's while these inputs, their
+    /// endpoint inputs or any TLS config built from them lives, so a process
+    /// leaks at most one slot per node alive at once.
     pub fn new(seed: [u8; 32], node: u32) -> Self {
         Self::with_pool(seed, node, &TLS_SLOTS)
     }
 
     /// [`SeededInputs::new`], taking its TLS slot from `pool`.
-    fn with_pool(seed: [u8; 32], node: u32, pool: &'static SlotPool) -> Self {
-        let streams = Arc::new_cyclic(|streams| Streams {
+    fn with_pool(seed: [u8; 32], node: u32, pool: &SlotPool) -> Self {
+        let lease = pool.lease();
+        let streams = Arc::new(Streams {
             seed,
             node,
             cursors: Mutex::default(),
-            slot: pool.lease(streams.clone()),
+            slot: lease.slot,
         });
+        lease.slot.state().streams = Some(streams.clone());
         let rng_seed = streams.draw_array(Source::RngSeed);
         let reset_key = hmac::Key::new(
             hmac::HMAC_SHA256,
@@ -232,6 +229,7 @@ impl SeededInputs {
             .extract(&streams.draw_array::<64>(Source::TokenKey));
         Self {
             streams,
+            lease: Arc::new(lease),
             rng_seed,
             reset_key,
             token_key,
@@ -246,7 +244,8 @@ impl SeededInputs {
     }
 
     /// Endpoint inputs with every source set from this node's streams.
-    /// Each call shares the same streams and keys.
+    /// Each call shares the same streams and keys. They hold the node's TLS
+    /// slot even if a caller replaces every other input.
     pub fn endpoint_inputs(&self) -> EndpointInputs {
         let cids = self.streams.clone();
         let initial = self.streams.clone();
@@ -262,6 +261,7 @@ impl SeededInputs {
             .token_key(Arc::new(self.token_key.clone()))
             .tls_random(self.streams.slot)
             .kx_groups(vec![self.streams.slot as &'static dyn SupportedKxGroup])
+            .provider_watch(self.lease.clone())
     }
 
     /// The seed, node and draw counts so far.
@@ -338,32 +338,46 @@ impl ConnectionIdGenerator for SeededCidGenerator {
     }
 }
 
-/// The TLS random source and X25519 group of one live node.
+/// The TLS random source and X25519 group of one node.
 ///
 /// rustls holds both as `&'static`, so each slot is leaked once and reused.
-/// A node leases a slot for as long as its streams live, and a draw reads
-/// the leaseholder's streams. A draw from a slot with no leaseholder fails,
-/// so a stale TLS config errors instead of reading another node's stream.
+/// A node takes a slot when it starts and keeps it while its
+/// [`SeededInputs`], any [`EndpointInputs`] made from them, or any TLS
+/// provider built on the slot is alive. Every rustls config and session
+/// holds its provider, so a live provider stands for every TLS user. Until
+/// then no other node gets the slot, and a draw always reads the node's own
+/// stream.
 struct TlsSlot {
-    pool: &'static SlotPool,
-    holder: Mutex<Weak<Streams>>,
+    state: Mutex<SlotState>,
+}
+
+/// Who holds a slot.
+struct SlotState {
+    /// The node's streams. They stay until another node takes the slot, so
+    /// a late draw still reads them.
+    streams: Option<Arc<Streams>>,
+    /// Whether a [`Lease`] is alive.
+    leased: bool,
+    /// The TLS providers built on the slot.
+    users: Vec<Weak<CryptoProvider>>,
+}
+
+impl SlotState {
+    /// Whether another node may take the slot.
+    fn is_free(&self) -> bool {
+        !self.leased && self.users.iter().all(|user| user.strong_count() == 0)
+    }
 }
 
 impl TlsSlot {
-    /// Locks the leaseholder.
-    fn holder(&self) -> MutexGuard<'_, Weak<Streams>> {
-        self.holder.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Locks the slot's state.
+    fn state(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The current leaseholder's streams, if it's still alive.
+    /// The streams the slot draws from, once a node has taken it.
     fn streams(&self) -> Option<Arc<Streams>> {
-        self.holder().upgrade()
-    }
-
-    /// Ends the lease and returns the slot to its pool.
-    fn release(&'static self) {
-        *self.holder() = Weak::new();
-        self.pool.free().push(self);
+        self.state().streams.clone()
     }
 }
 
@@ -390,7 +404,7 @@ impl SupportedKxGroup for TlsSlot {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
         let streams = self
             .streams()
-            .ok_or_else(|| rustls::Error::General("the seeded node has ended".into()))?;
+            .ok_or_else(|| rustls::Error::General("the TLS slot has no node yet".into()))?;
         let secret = streams.draw_array(Source::KeyExchange);
         let public = MontgomeryPoint::mul_base_clamped(secret).to_bytes();
         Ok(Box::new(X25519Exchange { secret, public }))
@@ -434,10 +448,32 @@ impl ActiveKeyExchange for X25519Exchange {
     }
 }
 
-/// Free TLS slots, and how many were ever leaked.
+/// A node's hold on its slot, kept by its [`SeededInputs`] and the
+/// [`EndpointInputs`] made from them. It also records the TLS providers
+/// built on the slot.
+struct Lease {
+    slot: &'static TlsSlot,
+}
+
+impl Drop for Lease {
+    /// Lets the slot go once its TLS providers are gone too.
+    fn drop(&mut self) {
+        self.slot.state().leased = false;
+    }
+}
+
+impl ProviderWatch for Lease {
+    /// Keeps the slot from another node while `provider` lives.
+    fn built(&self, provider: &Arc<CryptoProvider>) {
+        let mut state = self.slot.state();
+        state.users.retain(|user| user.strong_count() > 0);
+        state.users.push(Arc::downgrade(provider));
+    }
+}
+
+/// Every TLS slot leaked so far.
 struct SlotPool {
-    free: Mutex<Vec<&'static TlsSlot>>,
-    leaked: AtomicUsize,
+    slots: Mutex<Vec<&'static TlsSlot>>,
 }
 
 /// The process's TLS slots.
@@ -447,33 +483,48 @@ impl SlotPool {
     /// An empty pool.
     const fn new() -> Self {
         Self {
-            free: Mutex::new(Vec::new()),
-            leaked: AtomicUsize::new(0),
+            slots: Mutex::new(Vec::new()),
         }
     }
 
-    /// Locks the free list.
-    fn free(&self) -> MutexGuard<'_, Vec<&'static TlsSlot>> {
-        self.free.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Locks the slot list.
+    fn slots(&self) -> MutexGuard<'_, Vec<&'static TlsSlot>> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A slot leased to `holder`: a free one, or a newly leaked one.
-    fn lease(&'static self, holder: Weak<Streams>) -> &'static TlsSlot {
-        let free = self.free().pop();
-        let slot = free.unwrap_or_else(|| {
-            self.leaked.fetch_add(1, Ordering::Relaxed);
-            Box::leak(Box::new(TlsSlot {
-                pool: self,
-                holder: Mutex::new(Weak::new()),
-            }))
+    /// Takes a free slot, or leaks a new one if none is free. The caller
+    /// gives it streams.
+    fn lease(&self) -> Lease {
+        let mut slots = self.slots();
+        let free = slots.iter().copied().find(|slot| {
+            let mut state = slot.state();
+            if !state.is_free() {
+                return false;
+            }
+            *state = SlotState {
+                streams: None,
+                leased: true,
+                users: Vec::new(),
+            };
+            true
         });
-        *slot.holder() = holder;
-        slot
+        let slot = free.unwrap_or_else(|| {
+            let slot: &'static TlsSlot = Box::leak(Box::new(TlsSlot {
+                state: Mutex::new(SlotState {
+                    streams: None,
+                    leased: true,
+                    users: Vec::new(),
+                }),
+            }));
+            slots.push(slot);
+            slot
+        });
+        Lease { slot }
     }
 
     /// Slots leaked so far.
     #[cfg(test)]
     fn leaked(&self) -> usize {
-        self.leaked.load(Ordering::Relaxed)
+        self.slots().len()
     }
 }

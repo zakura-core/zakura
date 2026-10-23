@@ -92,6 +92,8 @@ impl TlsConfig {
             }
         }
         let tls = Self::with_provider(secret_key, provider);
+        #[cfg(any(test, zakura_sim))]
+        inputs.provider_built(&tls.provider);
         tls.client_config(secret_key.public(), &[b"zakura-quic/check"])?;
         Ok(tls)
     }

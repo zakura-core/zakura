@@ -171,20 +171,20 @@ fn seeded_cids_have_the_hashed_generator_shape() {
 }
 
 #[test]
-fn tls_slots_are_reused_and_stale_ones_fail() {
+fn tls_slots_are_reused_once_free() {
     static POOL: SlotPool = SlotPool::new();
 
     let first = SeededInputs::with_pool(SEED, 0, &POOL);
     let slot = first.streams.slot;
-    let tls = first.endpoint_inputs();
+    let inputs = first.endpoint_inputs();
     drop(first);
-    // The endpoint inputs still hold the streams, so the lease lives.
-    assert!(slot.fill(&mut [0; 8]).is_ok());
-    drop(tls);
-    assert!(slot.fill(&mut [0; 8]).is_err());
-    assert!(slot.start().is_err());
+    // The endpoint inputs still hold the slot.
+    let second = SeededInputs::with_pool(SEED, 1, &POOL);
+    assert!(!std::ptr::eq(second.streams.slot, slot));
+    drop((inputs, second));
 
-    // Sequential runs reuse one slot, and the new holder starts at block 0.
+    // Sequential runs reuse the free slots, and each new holder starts at
+    // block 0.
     for node in 0..50 {
         let inputs = SeededInputs::with_pool(SEED, node, &POOL);
         assert_eq!(
@@ -192,7 +192,7 @@ fn tls_slots_are_reused_and_stale_ones_fail() {
             sample(&SeededInputs::new(SEED, node), Source::TlsRandom)
         );
     }
-    assert_eq!(POOL.leaked(), 1);
+    assert_eq!(POOL.leaked(), 2);
 
     // Nodes alive at once each hold their own.
     let nodes: Vec<_> = (0..3)
@@ -212,4 +212,66 @@ fn the_endpoint_inputs_set_every_source() {
         "EndpointInputs { rng_seed: true, reset_key: true, cid_generator: true, \
          initial_dst_cid: true, token_key: true, tls_random: true, kx_groups: Some(1) }"
     );
+}
+
+/// Endpoint inputs from `node` with both CID callbacks replaced, so only
+/// the TLS inputs still come from the seed.
+fn tls_only_inputs(node: &SeededInputs) -> EndpointInputs {
+    node.endpoint_inputs()
+        .cid_generator(Arc::new(|| {
+            Box::new(quinn_proto::HashedConnectionIdGenerator::from_key(1))
+                as Box<dyn ConnectionIdGenerator>
+        }))
+        .initial_dst_cid(Arc::new(|| ConnectionId::new(&[1; 8])))
+}
+
+/// node 0's first TLS random draw under `SEED`.
+fn first_tls_random() -> Vec<u8> {
+    sample(&SeededInputs::new(SEED, 0), Source::TlsRandom)
+}
+
+#[test]
+fn a_live_tls_config_keeps_its_slot_after_the_inputs_drop() {
+    static POOL: SlotPool = SlotPool::new();
+
+    let node = SeededInputs::with_pool(SEED, 0, &POOL);
+    let slot = node.streams.slot;
+    let inputs = tls_only_inputs(&node);
+    let tls =
+        crate::tls::TlsConfig::with_inputs(&SeededInputs::node_key(SEED, 0), &inputs).unwrap();
+    drop((node, inputs));
+
+    // The TLS config still draws through the slot, from node 0's stream.
+    let mut random = vec![0; 48];
+    slot.fill(&mut random)
+        .expect("a live TLS user keeps the lease");
+    assert_eq!(random, first_tls_random());
+    assert!(slot.start().is_ok());
+    drop(tls);
+}
+
+#[test]
+fn a_slot_with_a_live_tls_config_isnt_reused() {
+    static POOL: SlotPool = SlotPool::new();
+
+    let node = SeededInputs::with_pool(SEED, 0, &POOL);
+    let slot = node.streams.slot;
+    let inputs = tls_only_inputs(&node);
+    let tls =
+        crate::tls::TlsConfig::with_inputs(&SeededInputs::node_key(SEED, 0), &inputs).unwrap();
+    drop((node, inputs));
+
+    let other = SeededInputs::with_pool(SEED, 1, &POOL);
+    assert!(
+        !std::ptr::eq(other.streams.slot, slot),
+        "node 1 took a used slot"
+    );
+    let mut random = vec![0; 48];
+    slot.fill(&mut random).unwrap();
+    assert_eq!(random, first_tls_random(), "node 0 read another stream");
+
+    // Once the last TLS user is gone, the slot is free again.
+    drop(tls);
+    let _third = SeededInputs::with_pool(SEED, 2, &POOL);
+    assert_eq!(POOL.leaked(), 2);
 }

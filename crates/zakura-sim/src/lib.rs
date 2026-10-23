@@ -9,3 +9,7 @@
 //! `RUSTFLAGS="--cfg zakura_sim"`. The design is in the `sim.md` plan and its
 //! M1 implementation plan.
 #![cfg(zakura_sim)]
+
+pub mod identity;
+
+pub use identity::{Category, Identity};

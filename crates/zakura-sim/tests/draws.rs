@@ -192,3 +192,35 @@ fn a_checker_draw_is_a_harness_failure() {
         "the checker's draw took no plan input"
     );
 }
+
+#[test]
+fn cleanup_draws_rotate_so_a_select_loop_exits() {
+    // Runs on its own thread, so a hang fails the test instead of the suite.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let config = zakura_sim::RunConfig {
+            drain_bound: 0,
+            ..config(2, 1)
+        };
+        let (report, _) = recorded(
+            config,
+            Plan::from_fuzz(&[]),
+            |sim| {
+                sim.scheduler().spawn_root("looper", async {
+                    loop {
+                        zakura_rt::select! {
+                            () = std::future::ready(()) => continue,
+                            () = std::future::ready(()) => break,
+                        }
+                    }
+                });
+            },
+            &mut NoChecks,
+        );
+        let _ = done.send(report.end.outcome);
+    });
+    let outcome = finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("shutdown finished the select loop");
+    assert_eq!(outcome, Outcome::Budget);
+}

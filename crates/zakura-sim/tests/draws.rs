@@ -202,27 +202,33 @@ fn cleanup_draws_rotate_so_a_select_loop_exits() {
             drain_bound: 0,
             ..config(2, 1)
         };
+        let exited = Rc::new(std::cell::Cell::new(false));
+        let exited_in_task = exited.clone();
         let (report, _) = recorded(
             config,
             Plan::from_fuzz(&[]),
             |sim| {
-                sim.scheduler().spawn_root("looper", async {
+                sim.scheduler().spawn_root("looper", async move {
                     loop {
                         zakura_rt::select! {
                             () = std::future::ready(()) => continue,
                             () = std::future::ready(()) => break,
                         }
                     }
+                    exited_in_task.set(true);
                 });
             },
             &mut NoChecks,
         );
-        let _ = done.send(report.end.outcome);
+        let _ = done.send((report.end.outcome, exited.get(), report.cleanup.unwound));
     });
-    let outcome = finished
+    let (outcome, exited, unwound) = finished
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("shutdown finished the select loop");
     assert_eq!(outcome, Outcome::Budget);
+    // The cleanup point bound would also end a stuck loop, by unwinding it.
+    assert!(exited, "the loop took its exit branch during cleanup");
+    assert_eq!(unwound, 0, "nothing had to be force-unwound");
 }
 
 /// A sink that builds the run's first hashed map when it gets `init`.

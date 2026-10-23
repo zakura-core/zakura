@@ -38,9 +38,11 @@ const MAX_INPUTS_PER_WAKEUP: usize = 64;
 /// The shortest gap between two warnings about failed sends.
 const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The current time on tokio's clock, so paused-time tests drive quinn-proto.
+/// The driver's clock: `zakura-rt`'s monotonic clock, which is tokio's in
+/// production, so paused-time tests drive quinn-proto, and virtual inside a
+/// simulated run.
 pub(crate) fn now() -> Instant {
-    tokio::time::Instant::now().into_std()
+    zakura_rt::time::Instant::now().into_std()
 }
 
 /// Everything a connection task starts with.
@@ -236,12 +238,12 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     };
 
     let mut cmds_open = true;
-    let mut timer = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut timer = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut timer_deadline: Option<Instant> = None;
-    let mut sampler = tokio::time::interval(SAMPLE_INTERVAL);
-    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampler = zakura_rt::time::interval(SAMPLE_INTERVAL);
+    sampler.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     sampler.tick().await;
-    let mut publish = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut publish = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut publish_deadline: Option<Instant> = None;
     let mut closing_seen = false;
     if *closing.borrow() {
@@ -269,7 +271,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             Some(deadline) if publish_deadline != Some(deadline) => {
                 publish
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 publish_deadline = Some(deadline);
             }
             Some(_) => {}
@@ -279,7 +281,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             Some(deadline) if timer_deadline != Some(deadline) => {
                 timer
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 timer_deadline = Some(deadline);
             }
             Some(_) => {}

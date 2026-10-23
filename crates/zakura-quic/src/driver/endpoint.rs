@@ -162,9 +162,9 @@ impl<F: SocketFactory> EndpointTask<F> {
     }
 
     pub(crate) async fn run(mut self) {
-        let mut flush = tokio::time::interval(FLUSH_INTERVAL);
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        let mut flush = zakura_rt::time::interval(FLUSH_INTERVAL);
+        flush.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
+        let mut deadline = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
         loop {
             if self.close_deadline.is_some() && self.conns.is_empty() {
                 break;
@@ -176,7 +176,9 @@ impl<F: SocketFactory> EndpointTask<F> {
             };
             let more_to_recv = self.more_to_recv;
             if let Some(at) = self.close_deadline {
-                deadline.as_mut().reset(tokio::time::Instant::from_std(at));
+                deadline
+                    .as_mut()
+                    .reset(zakura_rt::time::Instant::from_std(at));
             }
             tokio::select! {
                 biased;

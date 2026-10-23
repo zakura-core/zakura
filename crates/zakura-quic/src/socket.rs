@@ -481,7 +481,7 @@ impl<S: UdpIo> SocketCell<S> {
                 if weak.strong_count() == 0 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                zakura_rt::time::sleep(Duration::from_millis(1)).await;
             }
         }
         let io = rebind()?;

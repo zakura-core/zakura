@@ -3384,6 +3384,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zakura-rt",
  "zeroize",
 ]
 

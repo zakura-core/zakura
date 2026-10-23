@@ -8,12 +8,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
 use quinn_proto::{ClientConfig, TransportConfig, VarInt};
 use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::time::Instant;
 
 use crate::{
     config::{QuicBindConfig, QuicConfig},
@@ -521,7 +522,7 @@ impl QuicEndpoint {
             let delay = stagger * index as u32;
             attempts.push(async move {
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    zakura_rt::time::sleep(delay).await;
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
@@ -604,7 +605,7 @@ impl QuicEndpoint {
         // The endpoint tasks enforce the 3 s drain; the extra second covers
         // their exit.
         let all = futures::future::join_all(done);
-        if tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
+        if zakura_rt::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
             .await
             .is_ok()
         {
@@ -621,7 +622,7 @@ impl QuicEndpoint {
                 .take();
             if let Some(task) = task {
                 task.abort();
-                let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+                let _ = zakura_rt::time::timeout(Duration::from_secs(1), task).await;
             }
         }
     }
@@ -706,7 +707,7 @@ async fn establish(
     let established = connecting.established();
     match deadline {
         // Dropping the attempt at the deadline closes the connection.
-        Some(deadline) => match tokio::time::timeout(deadline, established).await {
+        Some(deadline) => match zakura_rt::time::timeout(deadline, established).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
             Err(_) => Err(ConnectError::HandshakeTimeout),
         },
@@ -753,7 +754,7 @@ pub(crate) async fn inbound_handshake(
 /// shutdown drain bound in case the task is gone.
 async fn wait_closed(shared: &crate::driver::ConnShared) {
     let mut closed = shared.closed.subscribe();
-    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
+    let _ = zakura_rt::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
 }
 
 /// Applies the acceptor's rules, then this crate's optional limits (ADM-3).
@@ -819,8 +820,8 @@ pub(crate) async fn watch_interfaces(
     interval: Duration,
 ) {
     let mut known = list_ips();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticker = zakura_rt::time::interval(interval);
+    ticker.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
@@ -845,7 +846,7 @@ pub(crate) async fn watch_interfaces(
 /// Exports the socket's `/proc/net/udp` drop count as a counter (SOCK-7).
 #[cfg(target_os = "linux")]
 async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = zakura_rt::time::interval(interval);
     let mut baseline: Option<(u64, u64)> = None;
     loop {
         ticker.tick().await;

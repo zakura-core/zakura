@@ -242,7 +242,7 @@ pub(crate) fn digest<'a>(observations: impl Iterator<Item = &'a Observation>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::PropertyOutcome;
+    use crate::{check::PropertyOutcome, observe::Exit};
 
     /// One record of each kind, with every optional field set.
     fn samples() -> Vec<Record> {
@@ -295,8 +295,49 @@ mod tests {
                 r#"{"init":{"draws":[{"draw":"setup:hash-seed#1","bound":"0x0","value":"0x9f2c4e1a77d0b351","by":"bytes"}]}}"#,
                 r#"{"step":41,"pick":"task:root.1:select#3","options":3,"by":"bytes","offset":17,"draws":[{"draw":"root.1:select#5","bound":"0x4","value":"0x2","by":"default"}],"obs":"5d1e09aa3c4f7b21"}"#,
                 r#"{"end":{"outcome":"idle","status":"deadlock","steps":42,"drain":null,"cleanup":{"cancelled":0,"panicked":0,"unwound":0,"unwind_failures":0,"leaked":0,"timers_left":0},"properties":[{"property":"sim/no-livelock","outcome":{"held":{"applicable":3}}}]}}"#,
-            ]
+            ],
+            "a record's encoding changed, so bump FORMAT_VERSION and update these lines"
         );
+    }
+
+    #[test]
+    fn observation_digests_are_pinned() {
+        let obs = [
+            Observation::TaskSpawned {
+                task: "root.1".into(),
+            },
+            Observation::TaskReached {
+                task: "root.1".into(),
+                at: "lock#2".into(),
+                site: Some("src/lib.rs:7".into()),
+            },
+            Observation::TaskWaiting {
+                task: "root.1".into(),
+            },
+            Observation::TaskParked {
+                task: "root.1".into(),
+            },
+            Observation::TaskExited {
+                task: "root.1".into(),
+                exit: Exit::Completed,
+            },
+            Observation::TimeAdvanced {
+                to_ns: 1_000,
+                fired: 2,
+            },
+            Observation::Fake {
+                source: "net".into(),
+                event: "deliver".into(),
+            },
+        ];
+        let bump = "an observation's encoding changed, which changes every `obs` digest, \
+            so bump FORMAT_VERSION and update this test";
+        assert_eq!(
+            serde_json::to_string(&obs).unwrap(),
+            r#"[{"obs":"task-spawned","task":"root.1"},{"obs":"task-reached","task":"root.1","at":"lock#2","site":"src/lib.rs:7"},{"obs":"task-waiting","task":"root.1"},{"obs":"task-parked","task":"root.1"},{"obs":"task-exited","task":"root.1","exit":"completed"},{"obs":"time-advanced","to_ns":1000,"fired":2},{"obs":"fake","source":"net","event":"deliver"}]"#,
+            "{bump}"
+        );
+        assert_eq!(digest(obs.iter()), "917a4440abdd4f53", "{bump}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! `zakura-rt`.
 //!
 //! The check parses every production module under `zakura-network`'s
-//! `zakura` module and flags paths to tokio, the std mutex and atomics, std's
+//! `zakura` module and in `zakura-quic`, and flags paths to tokio, the std mutex and atomics, std's
 //! hashed collections, and the thread RNG. It also flags the std blocking
 //! primitives and channels, `futures::select!` and `tokio_util::time`, which
 //! `zakura-rt` has no names for: under the simulator a blocking wait hangs the
@@ -31,12 +31,17 @@ use syn::{
 
 use crate::BoxError;
 
-const ROOT_MODULE: &str = "crates/zakura-network/src/zakura.rs";
+/// The root modules the check walks, each with the child modules under it
+/// that are not v2 production code.
+const ROOTS: [(&str, &[&str]); 2] = [
+    (
+        "crates/zakura-network/src/zakura.rs",
+        &["legacy_gossip", "testkit"],
+    ),
+    ("crates/zakura-quic/src/lib.rs", &[]),
+];
 
 const RT_LIB: &str = "crates/zakura-rt/src/lib.rs";
-
-/// Modules under `zakura` that are not v2 production code.
-const EXCLUDED_MODULES: [&str; 2] = ["legacy_gossip", "testkit"];
 
 /// Other spellings of the paths `zakura-rt` re-exports, rewritten in order.
 const ALIASES: [(&str, &str); 3] = [
@@ -60,7 +65,13 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 ];
 
 /// Direct runtime paths the v2 code may keep, with the reason for each.
-const ALLOWED: [(&str, &str, &str); 2] = [
+///
+/// For `zakura-quic` this is the bypass inventory M3.7 asks for. Two more
+/// pieces of state outlive a simulated run without a runtime path to flag:
+/// the Linux GSO probe's `OnceLock`, which only the production socket
+/// reaches, and `ConnShared`'s connection counter, a trace ID that numbers
+/// connections process-wide and never reaches the wire or a decision.
+const ALLOWED: [(&str, &str, &str); 4] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -71,6 +82,17 @@ const ALLOWED: [(&str, &str, &str); 2] = [
         "tokio::sync::mpsc::Sender",
         "the legacy address book's updater, and legacy code stays on tokio",
     ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::net::UdpSocket",
+        "the production socket and its Linux fast path, which a simulated run \
+         replaces with an injected socket through the socket factory",
+    ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::io::Interest",
+        "readiness for the production socket, which a simulated run never binds",
+    ),
 ];
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
@@ -80,13 +102,15 @@ const MODULE_IMPORT: &str = "zakura_rt names, imported by item";
 pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     let rules = Rules::load(repo_root)?;
     let mut findings = Findings::default();
-    check_file(
-        repo_root,
-        &rules,
-        &repo_root.join(ROOT_MODULE),
-        true,
-        &mut findings,
-    )?;
+    for (root, excluded) in ROOTS {
+        check_file(
+            repo_root,
+            &rules,
+            &repo_root.join(root),
+            excluded,
+            &mut findings,
+        )?;
+    }
 
     for (used, (file, prefix, _)) in findings.allowances_used.iter().zip(ALLOWED) {
         if !used {
@@ -140,11 +164,13 @@ fn relative_path(repo_root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
+/// Checks the module in `path` and its child modules, skipping the children
+/// named in `excluded`.
 fn check_file(
     repo_root: &Path,
     rules: &Rules,
     path: &Path,
-    is_root: bool,
+    excluded: &[&str],
     findings: &mut Findings,
 ) -> Result<(), BoxError> {
     let file = parse_file(repo_root, path)?;
@@ -163,29 +189,42 @@ fn check_file(
         visitor.visit_item(item);
     }
 
-    // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`.
-    let child_dir = if path.file_name().is_some_and(|name| name == "mod.rs") {
+    // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`, and
+    // a crate's `lib.rs` keeps them beside it.
+    let child_dir = if path
+        .file_name()
+        .is_some_and(|name| name == "mod.rs" || name == "lib.rs")
+    {
         path.parent()
             .ok_or_else(|| format!("{relative} has no parent directory"))?
             .to_path_buf()
     } else {
         path.with_extension("")
     };
-    check_child_modules(repo_root, rules, &child_dir, &file.items, is_root, findings)
+    check_child_modules(
+        repo_root,
+        rules,
+        &child_dir,
+        &file.items,
+        excluded,
+        findings,
+    )
 }
 
+/// Checks the child modules declared in `items`, whose files are in `dir`,
+/// skipping the ones named in `excluded`.
 fn check_child_modules(
     repo_root: &Path,
     rules: &Rules,
     dir: &Path,
     items: &[Item],
-    is_root: bool,
+    excluded: &[&str],
     findings: &mut Findings,
 ) -> Result<(), BoxError> {
     for item in items {
         let Item::Mod(module) = item else { continue };
         let name = module.ident.to_string();
-        if is_test_only(&module.attrs) || (is_root && EXCLUDED_MODULES.contains(&name.as_str())) {
+        if is_test_only(&module.attrs) || excluded.contains(&name.as_str()) {
             continue;
         }
         if module.attrs.iter().any(|attr| attr.path().is_ident("path")) {
@@ -198,11 +237,11 @@ fn check_child_modules(
         match &module.content {
             // The visitor already walked the inline module's items.
             Some((_, items)) => {
-                check_child_modules(repo_root, rules, &dir.join(&name), items, false, findings)?
+                check_child_modules(repo_root, rules, &dir.join(&name), items, &[], findings)?
             }
             None => {
                 let path = module_file(repo_root, dir, &name)?;
-                check_file(repo_root, rules, &path, false, findings)?;
+                check_file(repo_root, rules, &path, &[], findings)?;
             }
         }
     }

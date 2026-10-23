@@ -2488,11 +2488,12 @@ fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
         addrs: vec![addr],
         ..loopback()
     };
-    QuicEndpoint::bind_with_factory(
+    QuicEndpoint::bind_with(
         NodeSecretKey::generate(),
         &bind,
         &test_config(),
         net.clone(),
+        crate::EndpointInputs::default(),
     )
     .unwrap()
 }
@@ -2643,4 +2644,264 @@ async fn simnet_rebinds_use_the_factory_and_virtual_time() {
     })
     .await
     .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// Counts the calls into one injected input.
+#[derive(Debug, Default)]
+struct Calls(AtomicUsize);
+
+impl Calls {
+    /// Records one call.
+    fn hit(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The calls so far.
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// ring's HMAC reset key, counting signatures.
+struct SpyResetKey(ring::hmac::Key, Arc<Calls>);
+
+impl crate::HmacKey for SpyResetKey {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        self.1.hit();
+        self.0.sign(data, signature_out);
+    }
+
+    fn signature_len(&self) -> usize {
+        self.0.signature_len()
+    }
+
+    fn verify(
+        &self,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<(), quinn_proto::crypto::CryptoError> {
+        self.0.verify(data, signature)
+    }
+}
+
+/// ring's HKDF token key, counting the AEAD keys it derives.
+struct SpyTokenKey(ring::hkdf::Prk, Arc<Calls>);
+
+impl crate::HandshakeTokenKey for SpyTokenKey {
+    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn quinn_proto::crypto::AeadKey> {
+        self.1.hit();
+        self.0.aead_from_hkdf(random_bytes)
+    }
+}
+
+/// quinn-proto's hashed CID generator, counting the IDs it makes.
+struct SpyCids(quinn_proto::HashedConnectionIdGenerator, Arc<Calls>);
+
+impl crate::ConnectionIdGenerator for SpyCids {
+    fn generate_cid(&mut self) -> crate::ConnectionId {
+        self.1.hit();
+        self.0.generate_cid()
+    }
+
+    fn validate(&self, cid: &crate::ConnectionId) -> Result<(), quinn_proto::InvalidCid> {
+        self.0.validate(cid)
+    }
+
+    fn cid_len(&self) -> usize {
+        self.0.cid_len()
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        self.0.cid_lifetime()
+    }
+}
+
+/// ring's TLS random source, counting fills. `&'static`, as rustls needs.
+#[derive(Debug)]
+struct SpyRandom(Calls);
+
+impl crate::SecureRandom for SpyRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        self.0.hit();
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(buf)
+    }
+}
+
+/// ring's X25519 group, counting key exchanges. `&'static`, as rustls needs.
+#[derive(Debug)]
+struct SpyKx(Calls);
+
+impl crate::SupportedKxGroup for SpyKx {
+    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        self.0.hit();
+        rustls::crypto::ring::kx_group::X25519.start()
+    }
+
+    fn name(&self) -> rustls::NamedGroup {
+        rustls::crypto::ring::kx_group::X25519.name()
+    }
+}
+
+static SPY_RANDOM: SpyRandom = SpyRandom(Calls(AtomicUsize::new(0)));
+static SPY_KX: SpyKx = SpyKx(Calls(AtomicUsize::new(0)));
+
+/// Spies on every input `bind_with` takes, so a test can check each one is
+/// used.
+#[derive(Default)]
+struct Spies {
+    reset_key: Arc<Calls>,
+    cid_factory: Arc<Calls>,
+    cids: Arc<Calls>,
+    initial_cid: Arc<Calls>,
+    token_key: Arc<Calls>,
+}
+
+impl Spies {
+    /// Inputs that route every source through a spy. Each spy delegates to
+    /// the production source, so the handshake itself is unchanged.
+    fn inputs(&self) -> crate::EndpointInputs {
+        let rng = ring::rand::SystemRandom::new();
+        let reset_key = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+        let token_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&[7; 64]);
+        let (cid_factory, cids) = (self.cid_factory.clone(), self.cids.clone());
+        let initial_cid = self.initial_cid.clone();
+        crate::EndpointInputs::default()
+            .rng_seed([3; 32])
+            .reset_key(Arc::new(SpyResetKey(reset_key, self.reset_key.clone())))
+            .cid_generator(Arc::new(move || {
+                cid_factory.hit();
+                Box::new(SpyCids(
+                    quinn_proto::HashedConnectionIdGenerator::from_key(7),
+                    cids.clone(),
+                ))
+            }))
+            .initial_dst_cid(Arc::new(move || {
+                let n = initial_cid.0.fetch_add(1, Ordering::Relaxed) as u8;
+                crate::ConnectionId::new(&[n; 16])
+            }))
+            .token_key(Arc::new(SpyTokenKey(token_key, self.token_key.clone())))
+            .tls_random(&SPY_RANDOM)
+            .kx_groups(vec![&SPY_KX])
+    }
+}
+
+/// An endpoint on one simulated socket at `addr`, with `inputs`.
+fn sim_endpoint_with(
+    net: &SimNet,
+    addr: SocketAddr,
+    inputs: crate::EndpointInputs,
+) -> Result<QuicEndpoint, crate::BindError> {
+    let bind = QuicBindConfig {
+        addrs: vec![addr],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        net.clone(),
+        inputs,
+    )
+}
+
+/// M3.3, API-2: a Retry handshake and a stream exchange between two
+/// `bind_with` endpoints use every injected input, and the seed reaches each
+/// socket's endpoint config.
+#[tokio::test(start_paused = true)]
+async fn bind_with_uses_every_injected_input() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let server_spies = Spies::default();
+        let client_spies = Spies::default();
+        let server_endpoint = sim_endpoint_with(&net, sim_addr(1), server_spies.inputs()).unwrap();
+        let mut server = serve_test_acceptor(server_endpoint, &[ALPN], |incoming| {
+            if incoming.validated {
+                Admit::Accept
+            } else {
+                Admit::Retry
+            }
+        });
+        let client = sim_endpoint_with(&net, sim_addr(2), client_spies.inputs()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(echo(&conn, b"injected").await, b"injected");
+        let _inbound = server.handled.recv().await.unwrap();
+        assert!(server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| !seen.validated));
+
+        for endpoint in [&client, &server.endpoint] {
+            let config = format!("{:?}", endpoint.shared().endpoint_config());
+            assert!(config.contains("rng_seed: Some("), "{config}");
+        }
+        for (side, spies) in [("server", &server_spies), ("client", &client_spies)] {
+            assert_eq!(
+                spies.cid_factory.get(),
+                1,
+                "{side}: one generator per socket"
+            );
+            assert!(spies.cids.get() > 0, "{side}: connection IDs");
+            assert!(spies.reset_key.get() > 0, "{side}: reset tokens");
+        }
+        assert!(
+            client_spies.initial_cid.get() > 0,
+            "initial destination CID"
+        );
+        assert_eq!(server_spies.initial_cid.get(), 0, "the server never dials");
+        assert!(
+            server_spies.token_key.get() > 0,
+            "Retry token sealed and opened"
+        );
+        assert!(SPY_RANDOM.0.get() > 0, "TLS random");
+        // One key share per side.
+        assert!(SPY_KX.0.get() >= 2, "TLS key exchange");
+
+        drop(conn);
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// TLS-9: key-exchange groups that can't carry TLS 1.3 fail at bind, before
+/// any dial.
+#[tokio::test(start_paused = true)]
+async fn unusable_kx_groups_fail_at_bind() {
+    let net = sim_net();
+    let inputs = crate::EndpointInputs::default().kx_groups(Vec::new());
+    assert!(matches!(
+        sim_endpoint_with(&net, sim_addr(1), inputs),
+        Err(crate::BindError::Tls(_))
+    ));
+}
+
+/// M3.6: `bind` injects nothing. Each socket's endpoint config is the
+/// production one, with no seed, and the TLS provider is rustls' ring
+/// default.
+#[tokio::test]
+async fn bind_keeps_the_production_inputs() {
+    let endpoint =
+        QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+    let shared = endpoint.shared();
+    assert_eq!(
+        format!("{:?}", shared.inputs),
+        "EndpointInputs { rng_seed: false, reset_key: false, cid_generator: false, \
+         initial_dst_cid: false, token_key: false, tls_random: false, kx_groups: None }"
+    );
+    let socket_config = format!("{:?}", shared.endpoint_config());
+    assert_eq!(
+        socket_config,
+        format!("{:?}", shared.config.endpoint_config())
+    );
+    assert!(socket_config.contains("rng_seed: None"), "{socket_config}");
+    assert!(shared.tls.uses_default_provider());
+    endpoint.shutdown().await;
 }

@@ -39,8 +39,12 @@ use crate::zakura::{
     Cadence, Clock, FrameGuard, FramedSend, MessageRole, MessageRule, RealClock,
 };
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fuzz::{replay_cadence_bytes, CadenceReplaySummary};
 
 /// The result of charging one frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

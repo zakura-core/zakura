@@ -364,9 +364,8 @@ fn is_finished_is_a_point() {
 }
 
 #[test]
-#[should_panic(expected = "spawn_blocking isn't simulated")]
-fn spawn_blocking_is_refused_inside_a_run() {
-    run(async {
-        drop(task::spawn_blocking(|| ()));
-    });
+fn spawn_blocking_runs_as_a_task_inside_a_run() {
+    let (value, report) = run(async { task::spawn_blocking(|| 6 * 7).await.unwrap() });
+    assert_eq!(value, 42);
+    assert_eq!(report.count(Op::Spawn), 1);
 }

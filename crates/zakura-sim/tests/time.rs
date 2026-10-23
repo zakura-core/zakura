@@ -322,3 +322,33 @@ fn same_instant_datagrams_keep_choices() {
     }
     assert_eq!(first.len(), 2, "the plan delivers either datagram first");
 }
+
+#[test]
+fn peer_waits_for_its_opening_across_an_unrelated_advance() {
+    let report = run(
+        config(2, 10_000),
+        zakura_sim::Plan::from_fuzz(&[]),
+        |sim| {
+            // One action per instant, so the second waits for 1 s.
+            sim.add_source(Box::new(zakura_sim::fake::FakePeer::new(
+                "p1",
+                &["first", "second"],
+                1,
+            )));
+            sim.scheduler().spawn_root("timer", async {
+                time::sleep(Duration::from_millis(5)).await;
+                time::sleep(Duration::from_secs(2)).await;
+            });
+        },
+        &mut NoChecks,
+    );
+    let times = pick_times(&report);
+    let (at, _) = times
+        .iter()
+        .find(|(_, p)| p == "peer:p1:second")
+        .expect("the peer takes its second action");
+    assert!(
+        *at >= 1_000 * MS,
+        "the second action ran at {at} ns: {times:?}"
+    );
+}

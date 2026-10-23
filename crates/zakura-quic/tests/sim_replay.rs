@@ -114,7 +114,7 @@ impl Scenario {
 /// What a run lets a test compare.
 #[derive(Debug, PartialEq, Eq)]
 struct Observations {
-    /// SHA-256 over the delivered datagrams and losses, as hex.
+    /// The transcript digest (see [`transcript_digest`]), as hex.
     digest: String,
     /// Each step: `task:point`, `deliver`, `drop` or `advance`, in order.
     steps: Vec<String>,
@@ -340,8 +340,11 @@ fn sim_of(instant: std::time::Instant, now_std: std::time::Instant, now: SimInst
     SimInstant::from_start(now.since_start() + instant.saturating_duration_since(now_std))
 }
 
-/// Runs `scenario` to the end and returns what it observed.
-fn run(scenario: &Scenario) -> Observations {
+/// Runs `scenario` to the end and returns what it observed, with the
+/// network's events and every datagram's bytes.
+fn run_with_transcript(
+    scenario: &Scenario,
+) -> (Observations, Vec<NetEvent>, BTreeMap<DatagramId, Vec<u8>>) {
     let plan = Rc::new(RefCell::new(Plan(scenario.plan)));
     let draws = Rc::new(RefCell::new(Vec::new()));
     let config = SchedulerConfig {
@@ -436,37 +439,51 @@ fn run(scenario: &Scenario) -> Observations {
     let cleanup = format!("{:?}", sched.shutdown());
 
     let recording = recording.lock().unwrap_or_else(PoisonError::into_inner);
+    let events = net.events();
+    let outcome = outcome
+        .borrow_mut()
+        .take()
+        .expect("the scenario task finished");
+    let observations = Observations {
+        digest: transcript_digest(&events, &recording.bytes),
+        steps,
+        draws: draws.take(),
+        outcome,
+        cleanup,
+    };
+    (observations, events, recording.bytes.clone())
+}
+
+/// Runs `scenario` to the end and returns what it observed.
+fn run(scenario: &Scenario) -> Observations {
+    run_with_transcript(scenario).0
+}
+
+/// SHA-256 over the network's events in order, as hex: each send with its
+/// identity, length and bytes, then each delivery and each loss. Every
+/// byte a socket sent counts, delivered, lost or still in flight.
+fn transcript_digest(events: &[NetEvent], bytes: &BTreeMap<DatagramId, Vec<u8>>) -> String {
     let mut digest = Sha256::new();
-    for event in net.events() {
+    for event in events {
         match event {
             NetEvent::Sent { id, len } => {
+                let sent = &bytes[id];
                 assert_eq!(
-                    recording.bytes.get(&id).map(Vec::len),
-                    Some(len),
+                    sent.len(),
+                    *len,
                     "the recorder keys datagrams as SimNet does"
                 );
+                digest.update(format!("send {id:?} {len}").as_bytes());
+                digest.update(sent);
             }
-            NetEvent::Delivered { id } => {
-                digest.update(format!("deliver {id:?}").as_bytes());
-                digest.update(&recording.bytes[&id]);
-            }
+            NetEvent::Delivered { id } => digest.update(format!("deliver {id:?}").as_bytes()),
             NetEvent::Dropped { id, reason } => {
                 digest.update(format!("drop {id:?} {reason:?}").as_bytes());
             }
             NetEvent::Bound { .. } | NetEvent::Unbound { .. } => {}
         }
     }
-    let outcome = outcome
-        .borrow_mut()
-        .take()
-        .expect("the scenario task finished");
-    Observations {
-        digest: hex::encode(digest.finalize()),
-        steps,
-        draws: draws.take(),
-        outcome,
-        cleanup,
-    }
+    hex::encode(digest.finalize())
 }
 
 /// M3.1 helper: run as a child process, print the base scenario's digest.
@@ -571,12 +588,10 @@ fn every_seeded_source_reaches_the_transcript() {
     }
 }
 
-/// M3.4: with reordering and losses, the handshake and echo still complete,
-/// and the same plan repeats the same bytes and task events. Plans differ
-/// in what they deliver or lose.
-#[test]
-fn loss_and_reordering_replay_with_the_same_plan() {
-    let lossy = |plan| Scenario {
+/// The base scenario on reordering 1 to 50 ms links that may lose up to
+/// three datagrams each, under `plan`.
+fn lossy(plan: u64) -> Scenario {
+    Scenario {
         plan,
         links: LinkModel {
             min_delay: Duration::from_millis(1),
@@ -585,7 +600,37 @@ fn loss_and_reordering_replay_with_the_same_plan() {
             loss_budget: 3,
         },
         ..Scenario::base()
-    };
+    }
+}
+
+/// The digest covers the bytes of datagrams that were lost, not only the
+/// ones delivered: changing one byte of a dropped datagram changes it.
+#[test]
+fn the_digest_covers_lost_datagrams_bytes() {
+    let (observed, events, mut bytes) = (1..=4)
+        .map(|plan| run_with_transcript(&lossy(plan)))
+        .find(|(_, events, _)| {
+            events
+                .iter()
+                .any(|event| matches!(event, NetEvent::Dropped { .. }))
+        })
+        .expect("some plan loses a datagram");
+    let dropped = events
+        .iter()
+        .find_map(|event| match event {
+            NetEvent::Dropped { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("the run lost a datagram");
+    bytes.get_mut(&dropped).expect("the lost datagram was sent")[0] ^= 1;
+    assert_ne!(transcript_digest(&events, &bytes), observed.digest);
+}
+
+/// M3.4: with reordering and losses, the handshake and echo still complete,
+/// and the same plan repeats the same bytes and task events. Plans differ
+/// in what they deliver or lose.
+#[test]
+fn loss_and_reordering_replay_with_the_same_plan() {
     let mut digests = Vec::new();
     let mut lost = false;
     for plan in 1..=4 {

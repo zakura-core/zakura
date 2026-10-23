@@ -90,15 +90,11 @@ impl rt::Executor for SchedulerExecutor {
         // instant, fires at the next advance. Left as is, `advance_to` could
         // never reach it.
         let deadline = SimInstant::from_start(deadline).max(now);
-        let timer = hooks::register_timer(deadline, waker);
-        rt::TimerId::new(timer.deadline.since_start(), timer.seq)
+        timer_to_rt(hooks::register_timer(deadline, waker))
     }
 
     fn cancel_timer(&self, timer: rt::TimerId) {
-        hooks::cancel_timer(TimerId {
-            deadline: SimInstant::from_start(timer.deadline()),
-            seq: timer.seq(),
-        });
+        hooks::cancel_timer(timer_from_rt(timer));
     }
 
     fn new_object(&self) -> rt::ObjectId {
@@ -117,14 +113,18 @@ impl rt::Executor for SchedulerExecutor {
     }
 
     fn draw(&self, site: rt::DrawSite, bound: u64) -> u64 {
-        let kind = match site.kind {
-            rt::DrawKind::Rng => DrawKind::Rng,
-            rt::DrawKind::Select => DrawKind::Select,
-            rt::DrawKind::HashSeed => DrawKind::HashSeed,
-            rt::DrawKind::StreamMap => DrawKind::StreamMap,
-            other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
-        };
-        hooks::draw(kind, site.site, bound)
+        hooks::draw(draw_kind_from_rt(site.kind), site.site, bound)
+    }
+}
+
+/// The scheduler's draw kind for a `zakura-rt` one.
+fn draw_kind_from_rt(kind: rt::DrawKind) -> DrawKind {
+    match kind {
+        rt::DrawKind::Rng => DrawKind::Rng,
+        rt::DrawKind::Select => DrawKind::Select,
+        rt::DrawKind::HashSeed => DrawKind::HashSeed,
+        rt::DrawKind::StreamMap => DrawKind::StreamMap,
+        other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
     }
 }
 
@@ -176,5 +176,86 @@ fn object_from_rt(object: rt::ObjectId) -> ObjectId {
     ObjectId {
         creator: object.creator.map(task_from_rt),
         ordinal: object.ordinal,
+    }
+}
+
+/// A scheduler timer id as `zakura-rt` sees it.
+fn timer_to_rt(timer: TimerId) -> rt::TimerId {
+    rt::TimerId::new(timer.deadline.since_start(), timer.seq)
+}
+
+/// The scheduler timer id behind a `zakura-rt` one.
+fn timer_from_rt(timer: rt::TimerId) -> TimerId {
+    TimerId {
+        deadline: SimInstant::from_start(timer.deadline()),
+        seq: timer.seq(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn every_rt_op_maps_by_name() {
+        let mapped: BTreeSet<Op> = rt::Op::ALL
+            .into_iter()
+            .map(|op| {
+                let ours = op_from_rt(op);
+                assert_eq!(ours.name(), op.name(), "{op:?} maps to {ours:?}");
+                ours
+            })
+            .collect();
+        assert_eq!(mapped.len(), rt::Op::ALL.len(), "no two rt ops alias");
+    }
+
+    #[test]
+    fn every_rt_draw_kind_maps() {
+        let mapped: BTreeSet<DrawKind> = rt::DrawKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let ours = draw_kind_from_rt(kind);
+                // The two enums name their variants alike.
+                assert_eq!(format!("{ours:?}"), format!("{kind:?}"));
+                ours
+            })
+            .collect();
+        assert_eq!(mapped.len(), rt::DrawKind::ALL.len(), "no two kinds alias");
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        for raw in [0, 1, u32::MAX] {
+            let task = TaskId(raw);
+            assert_eq!(task_from_rt(task_to_rt(task)), task);
+            assert_eq!(task_to_rt(task).get(), u64::from(raw));
+
+            let object = ObjectId {
+                creator: Some(task),
+                ordinal: raw,
+            };
+            assert_eq!(object_from_rt(object_to_rt(object)), object);
+        }
+        let setup = ObjectId {
+            creator: None,
+            ordinal: u32::MAX,
+        };
+        assert_eq!(object_from_rt(object_to_rt(setup)), setup);
+
+        for (deadline, seq) in [(Duration::ZERO, 0), (Duration::MAX, u64::MAX)] {
+            let timer = TimerId {
+                deadline: SimInstant::from_start(deadline),
+                seq,
+            };
+            assert_eq!(timer_from_rt(timer_to_rt(timer)), timer);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zakura-rt only holds ids this scheduler handed out")]
+    fn oversized_rt_task_id_panics() {
+        task_from_rt(rt::TaskId::new(u64::from(u32::MAX) + 1));
     }
 }

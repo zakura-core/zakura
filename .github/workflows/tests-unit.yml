@@ -80,6 +80,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       publish_graph: ${{ steps.filter.outputs.publish_graph }}
       cluster: ${{ steps.filter.outputs.cluster }}
+      scheduler: ${{ steps.filter.outputs.scheduler }}
     steps:
       - id: filter
         env:
@@ -105,6 +106,7 @@ jobs:
                 echo "rust=true" >> "$GITHUB_OUTPUT"
                 echo "cluster=true" >> "$GITHUB_OUTPUT"
                 echo "publish_graph=true" >> "$GITHUB_OUTPUT"
+                echo "scheduler=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
 
@@ -137,6 +139,7 @@ jobs:
               echo "rust=true" >> "$GITHUB_OUTPUT"
               echo "cluster=true" >> "$GITHUB_OUTPUT"
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
+              echo "scheduler=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
@@ -146,6 +149,7 @@ jobs:
               # Nightly re-checks the live index so main cannot silently
               # accumulate a skipped-dependent pin after a crates.io publish.
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
+              echo "scheduler=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -202,9 +206,18 @@ jobs:
             publish_graph=false
           fi
 
+          # The scheduler's release and ASan runs, for its code, the runtime
+          # it drives, and anything that changes how they build.
+          if grep -qE '^crates/zakura-(scheduler|rt)/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^\.github/(workflows/tests-unit\.yml|lsan/)' <<< "$changed"; then
+            scheduler=true
+          else
+            scheduler=false
+          fi
+
           echo "config=$config" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "publish_graph=$publish_graph" >> "$GITHUB_OUTPUT"
+          echo "scheduler=$scheduler" >> "$GITHUB_OUTPUT"
 
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
@@ -500,6 +513,72 @@ jobs:
         env:
           RUSTFLAGS: --cfg zakura_sim
 
+  # The scheduler switches coroutine stacks in unsafe code, so its tests also
+  # run in release mode and under AddressSanitizer on Linux x86_64. Each mode
+  # has its own target directory and cache key. The ASan build turns on
+  # corosensei's sanitizer support, and `--target` keeps the sanitizer flag off
+  # build scripts and proc macros. LeakSanitizer stays on, with the tests that
+  # leak on purpose listed in `.github/lsan/zakura-sim.supp`. Fixture stacks
+  # are 64 KiB, and the default task stack is 2 MiB.
+  sim-sanitizers:
+    name: zakura_sim ${{ matrix.mode }}
+    needs: changes
+    if: >-
+      needs.changes.outputs.scheduler == 'true'
+      || github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: release
+            toolchain: stable
+            rustflags: --cfg zakura_sim
+            args: --release
+          - mode: asan
+            # The nightly `header-fuzz.yml` pins for its ASan builds.
+            toolchain: nightly-2026-07-15
+            rustflags: --cfg zakura_sim -Zsanitizer=address
+            args: --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests
+    env:
+      CARGO_TARGET_DIR: target/sim-${{ matrix.mode }}
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan/zakura-sim.supp
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          cache-shared-key: zakura-sim-${{ matrix.mode }}
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Record the compiler
+        run: rustc +${{ matrix.toolchain }} -Vv
+      # Leak suppressions match function names, so ASan needs a symbolizer.
+      # It fails to start on the scheduler's `fixtures` binary, so that
+      # binary's one deliberate leak runs in a child with leak checks off.
+      # It must be named `llvm-symbolizer`, and the runner's versioned
+      # `/usr/bin/llvm-symbolizer-NN` failed to start, so check that it runs.
+      - name: Find a symbolizer
+        if: matrix.mode == 'asan'
+        run: |
+          symbolizer="$(command -v llvm-symbolizer || find /usr/lib -path '/usr/lib/llvm-*/bin/llvm-symbolizer' | sort -V | tail -n1)"
+          if [ -z "$symbolizer" ] || ! "$symbolizer" --version > /dev/null; then
+            sudo apt-get install -y llvm
+            symbolizer="$(command -v llvm-symbolizer)"
+          fi
+          "$symbolizer" --version | head -n2
+          echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
+      - name: Test the scheduler and runtime
+        run: cargo +${{ matrix.toolchain }} test --locked -p zakura-rt -p zakura-scheduler ${{ matrix.args }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:
   # it dry-run-publishes the real publish set against the live crates.io
@@ -573,6 +652,7 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
+      - sim-sanitizers
       - zakura-testkit
     timeout-minutes: 30
     steps:
@@ -586,9 +666,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build skips with the same test-relevant filter as build-tests.
+          # sim-build skips with the same test-relevant filter as build-tests,
+          # and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
+          # their build inputs change.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

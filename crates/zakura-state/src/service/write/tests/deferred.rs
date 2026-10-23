@@ -289,6 +289,17 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
 
 #[test]
 fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
+    assert_header_change_wakes_vct_retry(VctWriteRetryCause::MissingRoot {
+        trigger: VctRepairTrigger::MissingRootObserved,
+    });
+}
+
+#[test]
+fn missing_successor_wait_processes_control_messages_and_channel_closure() {
+    assert_header_change_wakes_vct_retry(VctWriteRetryCause::MissingSuccessor);
+}
+
+fn assert_header_change_wakes_vct_retry(retry_cause: VctWriteRetryCause) {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());
     let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
@@ -346,7 +357,7 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
             write_slot: test_write_slot(),
         })
         .expect("the unrelated write message queues");
-    let (insert_tx, insert_rx) = oneshot::channel();
+    let (insert_tx, mut insert_rx) = oneshot::channel();
     sender
         .send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
             prepared,
@@ -362,7 +373,8 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
 
     let mut resource_stall_recovery = None;
 
-    assert!(wait_for_vct_root_insert(
+    assert!(wait_for_vct_retry(
+        retry_cause,
         &mut receiver,
         Some(&writer),
         &mut deferred,
@@ -370,9 +382,9 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
         &mut retry_manager,
         &mut resource_stall_recovery,
     )
-    .expect("the VCT repair wait processes the insertion"));
+    .is_none());
     assert!(insert_rx
-        .blocking_recv()
+        .try_recv()
         .expect("the insertion response is sent")
         .is_ok());
     let deferred_message = deferred
@@ -391,7 +403,7 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
     // The same insertion commits nothing the second time. A parked checkpoint's VCT prerequisite
     // is therefore unchanged, so the wait must keep waiting instead of retrying the block.
     let repeat = authority.from_registered_header_attempt(insert);
-    let (repeat_tx, repeat_rx) = oneshot::channel();
+    let (repeat_tx, mut repeat_rx) = oneshot::channel();
     sender
         .send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
             prepared: repeat,
@@ -410,20 +422,23 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
     drop(sender);
 
     assert!(
-        !wait_for_vct_root_insert(
-            &mut receiver,
-            Some(&writer),
-            &mut deferred,
-            &runtime,
-            &mut retry_manager,
-            &mut resource_stall_recovery,
-        )
-        .expect("the VCT repair wait drains the closed channel"),
+        matches!(
+            wait_for_vct_retry(
+                retry_cause,
+                &mut receiver,
+                Some(&writer),
+                &mut deferred,
+                &runtime,
+                &mut retry_manager,
+                &mut resource_stall_recovery,
+            ),
+            Some(BlockWriteTaskExit::Completed)
+        ),
         "a no-change insertion must not retry the parked checkpoint"
     );
     assert!(!matches!(
         repeat_rx
-            .blocking_recv()
+            .try_recv()
             .expect("the repeated insertion response is sent")
             .expect("the repeated insertion is coherent"),
         ApplyResult::Committed

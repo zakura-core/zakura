@@ -169,3 +169,28 @@ matches a replacement request, and resets the remaining window.
 These ledgers prove logical state transitions. Scheduled IO still needs separate
 proof that the actual guard or permit settles with its owner. P1 will register
 these local property IDs when its shared schema exists.
+
+## Sequencer targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `block_sequencer_order` | `block/contiguous-submission` | `sequencer_order_witness_retries_a_refused_contiguous_prefix` |
+| `block_sequencer_reset` | `block/retired-apply-isolation` | `sequencer_reset_witness_isolates_a_retired_completion` |
+| `block_sequencer_evidence` | `block/required-evidence` | `sequencer_evidence_witness_retains_evidence_while_full` |
+
+Each decoder-v1 target reads at most 512 bytes and uses the existing sequencer
+model for proptest and cargo-fuzz. The ordering witness delivers bodies out of
+order and retries a refused submission. The reset witness completes a retired
+apply while current work remains. The evidence witness holds required evidence
+while the action channel is full, then delivers it. Each witness has a planted
+failure that must report the intended property ID.
+
+Ordering and evidence use three-byte operations. Reset uses one header byte for
+the retired-apply count, then three-byte operations. Empty inputs report zero
+applicability. Setup creates valid fixture state; setup transitions do not count
+as generated coverage. The package-local block fixture copies public mainnet
+block 1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.
+
+Each target has its own 900-second daily and 3,600-second weekly budget. These
+tests prove logical submission and evidence ownership. They do not prove
+decoded-memory retention or asynchronous channel delivery.

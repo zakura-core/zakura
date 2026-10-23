@@ -96,3 +96,24 @@ path = "fuzz_targets/block_request_lifecycle.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_sequencer_order"
+path = "fuzz_targets/block_sequencer_order.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_sequencer_reset"
+path = "fuzz_targets/block_sequencer_reset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_sequencer_evidence"
+path = "fuzz_targets/block_sequencer_evidence.rs"
+test = false
+doc = false
+bench = false

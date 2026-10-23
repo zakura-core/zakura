@@ -129,6 +129,30 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: block_sequencer_order
+            decoder: 1
+            witness: sequencer_order_witness_retries_a_refused_contiguous_prefix
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_sequencer_reset
+            decoder: 1
+            witness: sequencer_reset_witness_isolates_a_retired_completion
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: block_sequencer_evidence
+            decoder: 1
+            witness: sequencer_evidence_witness_retains_evidence_while_full
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

@@ -638,7 +638,7 @@ mod tests {
     use super::*;
     use crate::{
         endpoint::{ConnectionSlots, PendingTable},
-        sim_net::{LinkModel, SimNet},
+        sim::{LinkModel, SimNet},
         socket::SocketBuffers,
         tls::TlsConfig,
         NodeSecretKey, QuicConfig,

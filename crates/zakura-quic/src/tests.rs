@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     endpoint::watch_interfaces,
-    sim_net::{LinkModel, NetEvent, SimNet},
+    sim::{LinkModel, NetEvent, SimNet},
     Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };

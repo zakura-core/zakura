@@ -43,9 +43,9 @@ fn owner() -> HeaderSyncWorkOwner {
     .into()
 }
 
-/// Mainnet block 1 prepared on genesis and sealed for `owner`, so an apply
-/// request holds a real sealed target.
-fn prepared_target(owner: HeaderSyncWorkOwner) -> PreparedHeaderTarget {
+/// Mainnet block 1 prepared on genesis, sealed with `key` for `owner`, so an
+/// apply request holds a real sealed target.
+fn prepared_target(key: &AdapterKey, owner: HeaderSyncWorkOwner) -> PreparedHeaderTarget {
     let genesis: Arc<block::Block> = BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("the genesis vector deserializes");
@@ -71,7 +71,7 @@ fn prepared_target(owner: HeaderSyncWorkOwner) -> PreparedHeaderTarget {
     )
     .expect("Mainnet block 1 prepares on genesis");
     PreparedHeaderTarget::from_insert(
-        &AdapterKey::new(),
+        key,
         Box::new(InsertHeaders {
             owner,
             source: SourceId::from_digest([5; 32]),
@@ -137,7 +137,7 @@ fn requests(key: &AdapterKey) -> Vec<HeaderRequest> {
             },
         }),
         HeaderRequest::ApplyHeaderTarget {
-            target: prepared_target(owner()),
+            target: prepared_target(key, owner()),
         },
         HeaderRequest::SelectedChainContains { hash: target.hash },
     ]
@@ -484,6 +484,7 @@ fn a_failed_input_check_skips_the_sweep() {
             AcquireHeaderPath => &[InputCheck::LocatorCount],
             ReadHeaderPath => &[InputCheck::AdapterHandle, InputCheck::PageCount],
             ReleaseHeaderPath => &[InputCheck::AdapterHandle],
+            ApplyHeaderTarget => &[InputCheck::PreparedTargetSeal],
             _ => &[],
         };
         assert_eq!(contract.input_checks, expected, "{}", op.name());
@@ -497,22 +498,28 @@ fn a_failed_input_check_skips_the_sweep() {
     assert!(b_acquire.sweeps(None));
 }
 
-/// Rule A: a read or release with another adapter's handle gets the
-/// adapter's rejection before any deadline starts, so at 30 s it still has
-/// no `timeout`, no `unavailable` fault and no engine result.
+/// Rule A: a read or release with another adapter's handle, or an apply of a
+/// target another adapter sealed, gets the adapter's rejection before any
+/// deadline starts. So at 30 s it still has no `timeout`, no fault and no
+/// engine result. With the issuing adapter's key, nothing is rejected.
 #[test]
-fn a_foreign_handle_has_only_the_rejection() {
+fn foreign_adapter_inputs_have_only_the_rejection() {
+    use HeaderOp::*;
     let ours = AdapterKey::new();
     let theirs = AdapterKey::new();
     for request in requests(&theirs) {
         let op = request.op();
         assert_eq!(request.rejected_by(&theirs), None, "{}", op.name());
         assert!(request.rejection_reply(&theirs).is_none());
-        if !matches!(op, HeaderOp::ReadHeaderPath | HeaderOp::ReleaseHeaderPath) {
-            assert_eq!(request.rejected_by(&ours), None, "{}", op.name());
-            continue;
-        }
-        assert_eq!(request.rejected_by(&ours), Some(InputCheck::AdapterHandle));
+        let expected = match op {
+            ReadHeaderPath | ReleaseHeaderPath => InputCheck::AdapterHandle,
+            ApplyHeaderTarget => InputCheck::PreparedTargetSeal,
+            _ => {
+                assert_eq!(request.rejected_by(&ours), None, "{}", op.name());
+                continue;
+            }
+        };
+        assert_eq!(request.rejected_by(&ours), Some(expected), "{}", op.name());
         assert!(!op.contract().sweeps(request.rejected_by(&ours)));
         for t in TIMES {
             assert_eq!(
@@ -527,12 +534,23 @@ fn a_foreign_handle_has_only_the_rejection() {
                 assert!(request.fault_reply(&ours, fault, t).is_err(), "{fault:?}");
             }
         }
-        match request.rejection_reply(&ours) {
-            Some(HeaderReply::ReadHeaderPath(Err(PortError::Unavailable { source: None })))
-                if op == HeaderOp::ReadHeaderPath => {}
-            Some(HeaderReply::ReleaseHeaderPath(Err(PortError::Unavailable { source: None })))
-                if op == HeaderOp::ReleaseHeaderPath => {}
-            other => panic!("{} rejected with {other:?}", op.name()),
+        match (op, request.rejection_reply(&ours)) {
+            (
+                ReadHeaderPath,
+                Some(HeaderReply::ReadHeaderPath(Err(PortError::Unavailable { source: None }))),
+            )
+            | (
+                ReleaseHeaderPath,
+                Some(HeaderReply::ReleaseHeaderPath(Err(PortError::Unavailable { source: None }))),
+            ) => {}
+            (ApplyHeaderTarget, Some(HeaderReply::ApplyHeaderTarget(Err(error)))) => {
+                assert_eq!(error.category, ErrorCategory::StaleTargetOrGeneration);
+                assert_eq!(
+                    error.subject,
+                    ErrorSubject::Branch(owner().header_authority().branch)
+                );
+            }
+            (_, other) => panic!("{} rejected with {other:?}", op.name()),
         }
     }
     for check in [InputCheck::LocatorCount, InputCheck::PageCount] {
@@ -542,4 +560,26 @@ fn a_foreign_handle_has_only_the_rejection() {
         );
     }
     assert!(InputCheck::AdapterHandle.in_adapter());
+    assert!(InputCheck::PreparedTargetSeal.in_adapter());
+}
+
+/// An apply of a target this adapter sealed passes the seal check, so it
+/// keeps its engine result and its `local-resource` fault.
+#[test]
+fn an_own_target_seal_keeps_engine_and_fault() {
+    let key = AdapterKey::new();
+    let apply = HeaderRequest::ApplyHeaderTarget {
+        target: prepared_target(&key, owner()),
+    };
+    assert_eq!(apply.rejected_by(&key), None);
+    assert!(apply.rejection_reply(&key).is_none());
+    for t in TIMES {
+        assert_eq!(
+            apply.enabled(&key, t),
+            [Outcome::Engine, Outcome::Fault(Fault::LocalResource)]
+        );
+    }
+    assert!(apply
+        .fault_reply(&key, Fault::LocalResource, Duration::ZERO)
+        .is_ok());
 }

@@ -26,7 +26,7 @@
 //! | `read_header_path` | v9 publisher page job | `Page`, `Unavailable`. A foreign path or an out-of-bounds page count gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `release_header_path` | v9 publisher page job | `Ok(())`, also on repeats. A foreign path gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `prepare_header_target` | reactor, `PrepareHeaderTarget` | a sealed target, `stale_target`, `unknown_anchor`, validation and body-size errors | `local-resource` |
-//! | `apply_header_target` | reactor, `ApplyHeaderTarget` | `Applied`, `ResourceStalled`, `stale_target`, `invalid_header`, `auxiliary_capacity`, `local_resource` | `local-resource` |
+//! | `apply_header_target` | reactor, `ApplyHeaderTarget` | `Applied`, `ResourceStalled`, `stale_target`, `invalid_header`, `auxiliary_capacity`, `local_resource`. A target another adapter sealed gets only `stale_target` | `local-resource` |
 //! | `selected_chain_contains` | v9 publisher | `Selected`, `NotSelected`, `NotRetained` | `unavailable`, `timeout` after 30 s |
 //!
 //! # Outcomes
@@ -36,8 +36,9 @@
 //! before it runs or replies.
 //!
 //! Input checks the adapter runs itself come first. A request that fails one,
-//! such as a read with another adapter's path handle, gets the adapter's
-//! rejection before any state read or deadline starts. So its only legal
+//! such as a read with another adapter's path handle or an apply of a target
+//! another adapter sealed, gets the adapter's rejection before any state call
+//! or deadline starts. So its only legal
 //! outcome is [`Outcome::Rejected`], and [`HeaderRequest::enabled`] offers no
 //! engine result or fault for it. Checks that state runs, like the locator and
 //! page counts, run under the adapter's deadline, so they are engine results.
@@ -87,6 +88,11 @@
 //! * Work that ran anyway after a fault. A state read keeps running after its
 //!   adapter times out, so a read can time out at 30 s and still consume its
 //!   lease a moment later, and a release can time out after releasing.
+//! * A commit visible before its apply replies. The writer commits and
+//!   publishes the snapshot, then sends the reply, so production readers can
+//!   see the commit in between. Here both happen in one completion. Readers
+//!   still see the commit before the caller handles its reply, but no other
+//!   storage operation completes between the publish and the reply.
 //!
 //! ST3's single-completion model covers none of these. ST3 treats any new
 //! history of this shape as covered by this rule. It needs no contract
@@ -405,8 +411,9 @@ pub struct OpContract {
     pub sweeps_idle_leases: bool,
 }
 
-/// A request check that runs before the lease registry, so a request that
-/// fails it changes no lease and fires no capacity signal.
+/// A request check that runs before the operation touches the state it
+/// changes, so a request that fails it changes no state or lease and fires no
+/// capacity signal.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum InputCheck {
     /// An acquire's locator has between 1 and `MAX_HEADER_LOCATOR_HASHES`
@@ -417,6 +424,10 @@ pub enum InputCheck {
     /// A read asks for between 1 and `MAX_HEADER_SYNC_HEIGHT_RANGE` headers
     /// (`read_retained_path`).
     PageCount,
+    /// The adapter sealed the target it's asked to apply
+    /// (`PreparedHeaderTarget::into_insert`). A foreign seal gives
+    /// `stale_target` for the owner's branch.
+    PreparedTargetSeal,
 }
 
 impl InputCheck {
@@ -424,7 +435,10 @@ impl InputCheck {
     /// so before any deadline. Only these checks decide a request's outcome
     /// on their own. State runs the others under the adapter's deadline.
     pub const fn in_adapter(self) -> bool {
-        matches!(self, InputCheck::AdapterHandle)
+        matches!(
+            self,
+            InputCheck::AdapterHandle | InputCheck::PreparedTargetSeal
+        )
     }
 }
 
@@ -554,7 +568,7 @@ static CONTRACTS: [OpContract; 8] = [
             after: VCT_REPAIR_WATCHDOG,
         }],
         releases: &[],
-        input_checks: &[],
+        input_checks: &[InputCheck::PreparedTargetSeal],
         sweeps_idle_leases: false,
     },
     OpContract {
@@ -779,6 +793,14 @@ impl HeaderRequest {
                     }
                     _ => false,
                 },
+                InputCheck::PreparedTargetSeal => match self {
+                    // `into_insert` consumes the target, so this checks a
+                    // clone and keeps the request's own.
+                    HeaderRequest::ApplyHeaderTarget { target } => {
+                        target.clone().into_insert(key).is_err()
+                    }
+                    _ => false,
+                },
                 InputCheck::LocatorCount | InputCheck::PageCount => false,
             })
     }
@@ -813,20 +835,26 @@ impl HeaderRequest {
     }
 
     /// The adapter's rejection, if this request fails an adapter-side input
-    /// check. It's `PortError::Unavailable` with no source, as the
-    /// production adapter returns.
+    /// check, as the production adapter returns it. A foreign path handle
+    /// gives `PortError::Unavailable` with no source. A foreign target seal
+    /// gives `stale_target` for the owner's branch.
     pub fn rejection_reply(&self, key: &AdapterKey) -> Option<HeaderReply> {
-        self.rejected_by(key)?;
-        let rejected = || PortError::Unavailable { source: None };
-        match self {
-            HeaderRequest::ReadHeaderPath { .. } => {
-                Some(HeaderReply::ReadHeaderPath(Err(rejected())))
+        let check = self.rejected_by(key)?;
+        let foreign_handle = || PortError::Unavailable { source: None };
+        Some(match (check, self) {
+            (InputCheck::AdapterHandle, HeaderRequest::ReadHeaderPath { .. }) => {
+                HeaderReply::ReadHeaderPath(Err(foreign_handle()))
             }
-            HeaderRequest::ReleaseHeaderPath { .. } => {
-                Some(HeaderReply::ReleaseHeaderPath(Err(rejected())))
+            (InputCheck::AdapterHandle, HeaderRequest::ReleaseHeaderPath { .. }) => {
+                HeaderReply::ReleaseHeaderPath(Err(foreign_handle()))
             }
-            _ => unreachable!("only path handles have an adapter-side input check"),
-        }
+            (InputCheck::PreparedTargetSeal, HeaderRequest::ApplyHeaderTarget { target }) => {
+                HeaderReply::ApplyHeaderTarget(Err(Arc::new(HeaderChainError::stale_target(
+                    ErrorSubject::Branch(target.owner().header_authority().branch),
+                ))))
+            }
+            _ => unreachable!("rejected_by fails each adapter-side check only on its own request"),
+        })
     }
 
     /// The reply the production adapter gives for `fault`, or

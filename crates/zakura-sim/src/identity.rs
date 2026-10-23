@@ -6,12 +6,10 @@
 
 use std::{cmp::Ordering, fmt};
 
-use serde::Serialize;
 use zakura_scheduler::{At, SimInstant};
 
 /// An action's kind. Enabled sets list categories in this order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Category {
     /// Run a ready task to its next point.
     Task,

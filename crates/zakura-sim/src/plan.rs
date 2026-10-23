@@ -357,6 +357,11 @@ impl Decider {
 
     /// The round-robin default: the first option whose key sorts after the
     /// previous pick, wrapping to the start.
+    ///
+    /// It's fair only while the enabled set stays fixed: each of `k` options
+    /// is then picked within `k` steps. A changing set can keep putting one
+    /// off. With `{a, z}`, then `{b, z}`, then `{c, z}`, each pick lands on
+    /// the new key after the previous one, and `z` waits.
     fn round_robin(&self, options: &[Identity]) -> usize {
         let Some((category, key)) = &self.cursor else {
             return 0;
@@ -382,6 +387,7 @@ enum Next {
     expect(dead_code, reason = "the draw callback lands in the next PR")
 )]
 pub(crate) fn default_draw(bound: u64, ordinal: u32) -> u64 {
+    debug_assert!(ordinal >= 1, "draw ordinals count from 1");
     match bound {
         0 => 0,
         bound => u64::from(ordinal.saturating_sub(1)) % bound,
@@ -481,6 +487,31 @@ mod tests {
     }
 
     #[test]
+    fn wide_bounds_take_four_and_eight_bytes() {
+        let mut d = bytes(&[
+            0x34, 0x12, // bound 0x1_0000: two bytes
+            0x78, 0x56, 0x34, 0x12, // bound 0x1_0001: four bytes
+            0xff, 0xff, 0xff, 0xff, // bound 2^32: four bytes
+            1, 2, 3, 4, 5, 6, 7, 8, // bound 2^32 + 1: eight bytes
+        ]);
+        let cases = [
+            (0x1_0000, 0x1234, 0),
+            (0x1_0001, 0x1234_5678 % 0x1_0001, 2),
+            (1 << 32, 0xffff_ffff, 6),
+            ((1 << 32) + 1, 0x0807_0605_0403_0201 % ((1 << 32) + 1), 10),
+        ];
+        for (bound, value, offset) in cases {
+            let answer = d.draw(bound, 1).unwrap();
+            assert_eq!(
+                (answer.value, answer.by, answer.offset),
+                (value, By::Bytes, Some(offset)),
+                "bound {bound:#x}"
+            );
+        }
+        assert_eq!(d.draw(2, 1).unwrap().by, By::Default, "all 18 bytes used");
+    }
+
+    #[test]
     fn truncated_input_pads_then_runs_out() {
         // Two bytes wanted, one left: the value is 0x0001, still from bytes.
         let mut d = bytes(&[9, 1]);
@@ -500,6 +531,13 @@ mod tests {
         let values: Vec<_> = (1..=7).map(|n| default_draw(3, n)).collect();
         assert_eq!(values, [0, 1, 2, 0, 1, 2, 0]);
         assert_eq!(default_draw(0, 5), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "draw ordinals count from 1")]
+    fn default_draw_rejects_ordinal_zero() {
+        default_draw(3, 0);
     }
 
     #[test]

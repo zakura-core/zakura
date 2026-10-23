@@ -259,3 +259,23 @@ floor; both must report the intended property ID.
 The target has its own 900-second daily and 3,600-second weekly budget. Clock
 values use offsets from one origin per history. The model checks synchronous
 policy; actual storage waits and action-channel ownership need simulator tests.
+
+## Header reactor policy target
+
+`header_reactor` shares the existing reactor model between proptest and
+cargo-fuzz. Its local property ID is `header/reactor-policy`. The model checks
+locator ownership and dispositions, session replacement, close deadlines,
+cached-offer scheduling and repair stalls. The existing header-pursuit target
+keeps its separate domain and budget.
+
+Decoder version 1 reads at most 512 bytes in four-byte operations. The witness
+`header_reactor_witness_exercises_locator_deadlines_and_repair` refuses a locator
+dispatch, starts a read, replaces the session, rejects stale completions, drains
+close retries and timeouts, grants a cached pass and reports a sustained repair
+stall once. Empty inputs report zero applicability. Three planted failures lose
+a locator, corrupt the scheduling revision or drain a close retry prematurely.
+Each planted failure must report the intended property ID.
+
+The target has its own 900-second daily and 3,600-second weekly budget. Clock
+values use offsets from one origin per history. Storage-operation cancellation
+and actual session writes remain simulator adapter obligations.

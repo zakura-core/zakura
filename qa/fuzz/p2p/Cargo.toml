@@ -145,3 +145,10 @@ path = "fuzz_targets/block_reactor.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "header_reactor"
+path = "fuzz_targets/header_reactor.rs"
+test = false
+doc = false
+bench = false

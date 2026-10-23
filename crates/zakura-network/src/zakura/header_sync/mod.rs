@@ -14,6 +14,9 @@ mod peer;
 mod reactor;
 mod scheduler;
 mod service;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
 #[cfg(test)]
 mod tests;
 pub(crate) mod v9;

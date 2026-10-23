@@ -556,6 +556,9 @@ pub use discovery::{
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use block_sync::{replay_block_reactor_bytes, BlockReactorReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use header_sync::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
 #[cfg(test)]
 mod tests {
     use super::*;

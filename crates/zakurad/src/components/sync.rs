@@ -2321,10 +2321,10 @@ where
                         )
                         .await?
                         else {
-                            if raw_len != 1 {
-                                if let Some(feedback) = feedback {
-                                    feedback.no_progress();
-                                }
+                            // Validation proved this response cannot extend the requested tip.
+                            // Singleton compatibility applies only to accepted responses.
+                            if let Some(feedback) = feedback {
+                                feedback.no_progress();
                             }
                             continue;
                         };
@@ -2665,6 +2665,13 @@ where
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
+        // A valid side-chain duplicate resolves discovery evidence but does not advance
+        // the selected chain. Preserve that distinction before normalizing duplicates.
+        let side_chain_duplicate = matches!(
+            &response,
+            Err(BlockDownloadVerifyError::Invalid { error, .. })
+                if matches!(error.duplicate_location(), Some(zs::KnownBlock::SideChain))
+        );
         let response = match response {
             Err(BlockDownloadVerifyError::Invalid {
                 ref error,
@@ -2686,7 +2693,9 @@ where
         };
         if let Ok((_height, hash)) = response.as_ref() {
             self.discovery.committed(*hash);
-            self.last_verified_progress = tokio::time::Instant::now();
+            if !side_chain_duplicate {
+                self.last_verified_progress = tokio::time::Instant::now();
+            }
             self.missing_block_retry_counts.remove(hash);
             self.transient_block_retry_counts.remove(hash);
             self.poisoned_block_retry_counts.remove(hash);

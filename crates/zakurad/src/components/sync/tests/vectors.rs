@@ -4290,7 +4290,7 @@ async fn active_registry_retries_do_not_postpone_verified_progress_deadline() {
 }
 
 /// A completed duplicate commit restores the same retry budgets as a direct success.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn committed_duplicate_clears_verification_retry_budgets() {
     for location in [
         zs::KnownBlock::BestChain,
@@ -4301,11 +4301,16 @@ async fn committed_duplicate_clears_verification_retry_budgets() {
         let hash = block::Hash([0xCD; 32]);
         chain_sync.verify_timeout_retry_counts.insert(hash, 2);
         chain_sync.utxo_race_drops = 1;
+        let original_progress = chain_sync.last_verified_progress;
+        tokio::time::advance(Duration::from_secs(7 * 60)).await;
         chain_sync
             .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
                 error: RouterError::Block {
                     source: Box::new(VerifyBlockError::Block {
-                        source: zakura_consensus::error::BlockError::AlreadyInChain(hash, location),
+                        source: zakura_consensus::error::BlockError::AlreadyInChain(
+                            hash,
+                            location.clone(),
+                        ),
                     }),
                 },
                 height: Height(1),
@@ -4316,6 +4321,16 @@ async fn committed_duplicate_clears_verification_retry_budgets() {
             .unwrap();
         assert!(chain_sync.verify_timeout_retry_counts.is_empty());
         assert_eq!(chain_sync.utxo_race_drops, 0);
+        if location == zs::KnownBlock::SideChain {
+            assert_eq!(chain_sync.last_verified_progress, original_progress);
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert!(chain_sync.last_verified_progress.elapsed() >= sync::BLOCK_VERIFY_TIMEOUT);
+        } else {
+            assert_eq!(
+                chain_sync.last_verified_progress,
+                tokio::time::Instant::now()
+            );
+        }
         peers.expect_no_requests().await;
     }
 }

@@ -293,7 +293,9 @@ fn harness_text_in_records_has_no_debug_output() {
         end.harness.as_deref(),
         Some("the run asked for a pick, but the script has draw 0x2a")
     );
+}
 
+#[test]
 fn livelock_on_a_sync_spin_still_shuts_down() {
     // Runs on its own thread, so a hang fails the test instead of the suite.
     let (done, finished) = std::sync::mpsc::channel();

@@ -69,6 +69,7 @@ impl TraceReader {
     /// in the record order, and the step numbers it names, then every blob
     /// `meta` names.
     pub fn open_prefix(dir: &Path) -> Result<Trace, ReadError> {
+        refuse_symlinked_dir(dir)?;
         let path = dir.join(TRACE_FILE);
         let bytes = read_bounded(&path, MAX_TRACE_BYTES)?.ok_or_else(|| {
             ReadError::Io(io::Error::new(
@@ -304,6 +305,20 @@ fn check_artifacts(dir: &Path, meta: &MetaRecord) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Refuses a directory that is itself a symlink. A missing one passes, since
+/// its files then read as missing.
+pub(crate) fn refuse_symlinked_dir(dir: &Path) -> Result<(), ReadError> {
+    match dir.symlink_metadata() {
+        Ok(meta) if meta.is_symlink() => Err(ReadError::Refused {
+            path: dir.to_owned(),
+            reason: Refusal::SymlinkedDirectory,
+        }),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ReadError::Io(error)),
+    }
+}
+
 /// Reads the regular file at `path`, or `None` if nothing is there. Refuses
 /// a symlink, anything else that isn't a regular file, such as a FIFO or a
 /// device, and a file over `limit` bytes, and never allocates past `limit`.
@@ -383,6 +398,8 @@ pub enum ReadError {
 pub enum Refusal {
     /// It's a symlink, a FIFO, a device or a directory.
     NotRegularFile,
+    /// It's a trace or blob directory that is itself a symlink.
+    SymlinkedDirectory,
     /// It's over its size limit (see [`super::MAX_TRACE_BYTES`]).
     TooLarge {
         /// The limit, in bytes.
@@ -493,6 +510,10 @@ impl fmt::Display for ReadError {
                 path,
                 reason: Refusal::TooLarge { limit },
             } => write!(f, "{} is over {limit} bytes", path.display()),
+            ReadError::Refused {
+                path,
+                reason: Refusal::SymlinkedDirectory,
+            } => write!(f, "{} is a symlinked directory", path.display()),
             ReadError::Io(error) => write!(f, "couldn't read the trace: {error}"),
         }
     }

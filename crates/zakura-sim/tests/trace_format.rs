@@ -482,6 +482,46 @@ fn symlinks_are_refused() {
 
 #[cfg(unix)]
 #[test]
+fn symlinked_directories_are_refused() {
+    // A blobs/ that links to another store is refused for reads and writes,
+    // even when that store holds the right blob.
+    let (dir, outside) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let digest = BlobStore::new(vec![outside.path().into()])
+        .put(b"elsewhere")
+        .unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("blobs")).unwrap();
+    let store = BlobStore::for_trace(dir.path());
+    assert_eq!(refusal(store.get(&digest)), Refusal::SymlinkedDirectory);
+    assert!(store.put(b"new blob").is_err());
+    assert_eq!(listing(outside.path()), std::slice::from_ref(&digest));
+
+    // So is a trace that names a blob through it.
+    let meta = MetaRecord {
+        fixtures: vec![BlobRef {
+            name: "chain".into(),
+            sha256: digest,
+        }],
+        ..meta()
+    };
+    record_to(dir.path(), &meta, plan(), &mut NoChecks);
+    assert_eq!(
+        refusal(TraceReader::open(dir.path())),
+        Refusal::SymlinkedDirectory
+    );
+
+    // And a trace directory that is itself a symlink.
+    let real = recorded(plan());
+    let links = TempDir::new().unwrap();
+    let linked = links.path().join("trace");
+    std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+    assert_eq!(
+        refusal(TraceReader::open(&linked)),
+        Refusal::SymlinkedDirectory
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fifo_blob_is_refused_without_blocking() {
     let dir = TempDir::new().unwrap();
     let blobs = dir.path().join("blobs");

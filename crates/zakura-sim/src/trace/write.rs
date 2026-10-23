@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     meta::{hex, MetaRecord},
-    read::{read_bounded, Missing, ReadError},
+    read::{read_bounded, refuse_symlinked_dir, Missing, ReadError},
     BLOBS_DIR, MAX_BLOB_BYTES, MAX_LINE_BYTES, MAX_TRACE_BYTES, TRACE_FILE,
 };
 use crate::{Record, RecordSink};
@@ -160,7 +160,7 @@ impl BlobStore {
     /// corrupt copy or a symlink, is replaced by renaming a complete temporary
     /// file over it, which never follows a symlink and never leaves a partial
     /// blob. Fails for more than [`MAX_BLOB_BYTES`], which the reader would
-    /// refuse.
+    /// refuse, or if the directory is itself a symlink.
     pub fn put(&self, bytes: &[u8]) -> io::Result<String> {
         // A usize always fits in a u64 on supported targets.
         if bytes.len() as u64 > MAX_BLOB_BYTES {
@@ -175,6 +175,7 @@ impl BlobStore {
             .first()
             .ok_or_else(|| io::Error::other("a blob store needs a directory"))?;
         fs::create_dir_all(dir)?;
+        refuse_symlinked_dir(dir).map_err(|error| io::Error::other(error.to_string()))?;
         let path = dir.join(&sha256);
         if let Ok(Some(existing)) = read_bounded(&path, MAX_BLOB_BYTES) {
             if hex(&Sha256::digest(&existing)) == sha256 {
@@ -195,7 +196,8 @@ impl BlobStore {
     /// The blob named `sha256`, from the first directory that has it. A copy
     /// whose contents don't hash to its name is a [`Missing::DigestMismatch`],
     /// even when a later directory has a good one. A copy that isn't a
-    /// regular file, or is over [`MAX_BLOB_BYTES`], is refused.
+    /// regular file, or is over [`MAX_BLOB_BYTES`], is refused, and so is a
+    /// directory that is itself a symlink.
     pub fn get(&self, sha256: &str) -> Result<Vec<u8>, ReadError> {
         let missing = || {
             ReadError::Missing(Missing::MissingBlob {
@@ -207,6 +209,7 @@ impl BlobStore {
             return Err(missing());
         }
         for dir in &self.dirs {
+            refuse_symlinked_dir(dir)?;
             match read_bounded(&dir.join(sha256), MAX_BLOB_BYTES)? {
                 Some(bytes) if hex(&Sha256::digest(&bytes)) == sha256 => return Ok(bytes),
                 Some(_) => {

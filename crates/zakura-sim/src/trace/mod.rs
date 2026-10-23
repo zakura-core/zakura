@@ -4,6 +4,15 @@
 //! `init`, then one line per step and `end` last. Beside it, `input.bin`
 //! holds the fuzz input that produced the run, if bytes did, and `blobs/`
 //! holds fixtures by SHA-256.
+//!
+//! A trace directory isn't a security boundary. The reader bounds what it
+//! allocates (see [`MAX_TRACE_BYTES`] and the limits beside it), and refuses
+//! symlinks, special files such as FIFOs, and a trace or `blobs/` directory
+//! that is itself a symlink, so a bad trace can't exhaust memory, block a
+//! read, or point the store elsewhere. It doesn't defend against a hostile
+//! process changing the filesystem while it reads: links in a directory's
+//! own ancestors are followed, and on Windows a path can change between the
+//! check and the open.
 
 pub mod meta;
 pub mod read;

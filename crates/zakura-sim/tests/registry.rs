@@ -912,3 +912,67 @@ fn first_violation_emits_applicable() {
     ));
     assert_eq!(recorder.points(), [Lifecycle::Applicable]);
 }
+
+/// Opens an obligation, discharged by the next timer to fire, for each
+/// `request-<owner>` task that exits.
+fn requests_until_timer(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    let triggers: Vec<usize> = cx
+        .observations()
+        .enumerate()
+        .filter(|(_, obs)| exited(obs, "request-").is_some())
+        .map(|(at, _)| at)
+        .collect();
+    for at in &triggers {
+        let obligation = cx.obligation(Some(*at), Subject::Owner("p1".to_owned()), timer_fired);
+        cx.oblige(obligation);
+    }
+    if triggers.is_empty() {
+        Verdict::NotApplicable
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// True if `obs` is a time advance that fired a timer.
+fn timer_fired(_: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::TimeAdvanced { fired, .. } if *fired > 0)
+}
+
+/// A request at 0 s, discharged by the first timer, which fires at `timer`,
+/// under a 2 s bound.
+fn timer_within_two_seconds(timer: Duration) -> RunReport {
+    let property = Property {
+        check: requests_until_timer,
+        ..request_served(TWO_SECONDS, Status::Active, &[])
+    };
+    report(honest(), vec![property], Assumptions::none(), |sim| {
+        exit_after(sim, "request-p1", Duration::ZERO);
+        exit_after(sim, "tail", timer);
+    })
+}
+
+/// Review: the advance to 5 s matches `discharged_by`, but it comes after the
+/// 2 s deadline, so the obligation expires before that advance can
+/// discharge it.
+#[test]
+fn virtual_time_deadline_checked_before_discharge() {
+    let late = timer_within_two_seconds(Duration::from_secs(5));
+    assert_eq!(
+        late.end.outcome,
+        Outcome::Violation,
+        "{:?}",
+        late.properties
+    );
+    let violation = late.end.violation.expect("the deadline passed");
+    assert_eq!(violation.actual, "still open at 5000000000 ns");
+}
+
+/// A discharge at exactly the deadline is in time.
+#[test]
+fn virtual_time_discharge_at_deadline_holds() {
+    let on_time = timer_within_two_seconds(Duration::from_secs(2));
+    assert_eq!(
+        outcome(&on_time, &SERVED),
+        PropertyOutcome::Held { applicable: 1 }
+    );
+}

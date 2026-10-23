@@ -166,13 +166,14 @@ impl std::error::Error for RegistryError {}
 /// 2. While the assumptions hold, it runs the check and keeps the
 ///    obligations the check opens. Each `Holds` counts as applicable, and
 ///    the first `Holds` or `Violated` emits `Lifecycle::Applicable`.
-/// 3. It walks the step's observations in order. A point first counts
+/// 3. It expires each `VirtualTime` obligation whose deadline is behind the
+///    clock. A discharge at exactly the deadline is in time.
+/// 4. It walks the step's observations in order. A point first counts
 ///    toward each `Ops` bound it reaches, and expires that obligation once
 ///    past `max`. Then the observation discharges the oldest open obligation
 ///    whose trigger it follows and that it matches.
-/// 4. It expires the other obligations whose bound has passed: every
-///    `BeforeQuiescence` one when no task can run after the step, and a
-///    `VirtualTime` one once the clock passes its deadline.
+/// 5. When no task can run after the step, it expires every
+///    `BeforeQuiescence` obligation still open.
 ///
 /// It returns the step's first new violation of an `Active` property, which
 /// ends the run. A `Known` or `Draft` violation is only recorded, so the run
@@ -365,6 +366,20 @@ fn step_property<S: HasView>(
 
     let floor = state.holds_since.map(|(_, at)| at);
     let mut expired = Vec::new();
+    // Every observation of the step happened at `cx.now`, so none can
+    // discharge an obligation whose deadline is already behind it.
+    state.open.retain(|open| {
+        let LivenessBound::VirtualTime(within) = open.obligation.bound else {
+            return true;
+        };
+        let overdue =
+            deadline(&open.obligation, floor, within).is_some_and(|deadline| cx.now > deadline);
+        if overdue {
+            events.push(event(Lifecycle::Expired));
+            expired.push(expiry(property, open, floor, cx));
+        }
+        !overdue
+    });
     for (at, obs) in cx.observations().enumerate() {
         // A point counts toward its `Ops` bound, and can expire it, before it
         // can discharge it.
@@ -394,13 +409,8 @@ fn step_property<S: HasView>(
     }
 
     state.open.retain(|open| {
-        let gone = match open.obligation.bound {
-            LivenessBound::BeforeQuiescence => cx.status != zakura_scheduler::Status::Running,
-            LivenessBound::VirtualTime(within) => {
-                deadline(&open.obligation, floor, within).is_some_and(|deadline| cx.now > deadline)
-            }
-            LivenessBound::Ops { .. } => false,
-        };
+        let gone = open.obligation.bound == LivenessBound::BeforeQuiescence
+            && cx.status != zakura_scheduler::Status::Running;
         if gone {
             events.push(event(Lifecycle::Expired));
             expired.push(expiry(property, open, floor, cx));

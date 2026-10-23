@@ -86,3 +86,28 @@ pure decisions. They do not prove asynchronous reservation cleanup.
 Each target receives its own 900-second daily and 3,600-second weekly budget.
 Keep the existing session budget intact. The planned P1 registry will index the
 local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+
+## Discovery session and redial targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_session` | `discovery/session-policy` | `discovery_session_witness_reaches_close_after_recheck` |
+| `discovery_redial` | `discovery/redial-policy` | `redial_witness_exercises_limits_resets_and_lagging_registration` |
+
+Both decoder-v1 targets read at most 512 bytes and reuse their existing
+independent models for proptest and cargo-fuzz. Empty inputs report zero
+applicability. Each target retains its own daily and weekly budget.
+
+`discovery_session` decodes hello, admitted answers and operation outcomes.
+It checks exchange completion, single settlement, and ownership checks before
+close. Its witness reaches a close after the answer wait and ownership recheck.
+Two planted failures skip the recheck or discard the success charge.
+
+`discovery_redial` uses three header bytes for policy and backoff bounds.
+Each remaining triple selects an attempt and registration lifetime. Its witness
+checks local limits, backoff growth, registration upgrades, resets and stopping.
+Two planted failures reset a failed attempt or charge a local limit.
+
+These targets check pure policies. They do not prove worker cancellation or
+connection ownership across scheduled IO. The planned P1 registry will index
+the local IDs and witnesses.

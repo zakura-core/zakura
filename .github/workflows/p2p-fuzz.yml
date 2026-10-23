@@ -65,6 +65,22 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: discovery_redial
+            decoder: 1
+            witness: redial_witness_exercises_limits_resets_and_lagging_registration
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: discovery_session
+            decoder: 1
+            witness: discovery_session_witness_reaches_close_after_recheck
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

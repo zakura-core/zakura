@@ -6,7 +6,7 @@ use thiserror::Error;
 use zakura_rt::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        counter::{AtomicU64, AtomicUsize, Ordering},
         Mutex, PoisonError,
     },
 };
@@ -57,6 +57,9 @@ pub(crate) enum ServeConfigError {
 }
 
 /// Metric labels and test counters for one request row.
+///
+/// The counters only feed gauges and tests, so they're `sync::counter`
+/// atomics, which cost no preemption points in the simulator.
 #[derive(Debug)]
 pub(super) struct ServeMetrics {
     service: &'static str,

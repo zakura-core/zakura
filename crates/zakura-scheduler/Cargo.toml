@@ -12,6 +12,11 @@ categories = ["development-tools::testing"]
 # Only the simulator depends on it, and no published crate does.
 publish = false
 
+[features]
+# Tells AddressSanitizer about each coroutine stack switch. Only for
+# `-Zsanitizer=address` builds, since it links against the ASan runtime.
+sanitizer = ["corosensei/sanitizer"]
+
 [dependencies]
 corosensei = { workspace = true }
 
@@ -24,7 +29,11 @@ zakura-rt = { path = "../zakura-rt" }
 tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
+# The real `FuturesUnordered`, for the child-waker tests.
+futures = { workspace = true }
 rand_10 = { workspace = true }
+# Paused-clock tokio, the reference the sim `interval` is compared against.
+tokio = { workspace = true, features = ["rt", "sync", "test-util", "time"] }
 
 [lints]
 workspace = true

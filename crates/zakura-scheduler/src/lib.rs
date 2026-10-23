@@ -28,7 +28,7 @@ pub mod hooks;
 mod scheduler;
 
 pub use hooks::JoinHandle;
-pub use scheduler::Scheduler;
+pub use scheduler::{stack_pool, Scheduler};
 
 /// A task's identity within one run, assigned in spawn order.
 ///
@@ -203,6 +203,19 @@ impl Op {
     }
 }
 
+impl DrawKind {
+    /// The short name used in draw identities, such as `select` in
+    /// `select#2`.
+    pub fn name(self) -> &'static str {
+        match self {
+            DrawKind::Rng => "rng",
+            DrawKind::Select => "select",
+            DrawKind::HashSeed => "hash-seed",
+            DrawKind::StreamMap => "stream-map",
+        }
+    }
+}
+
 /// A preemption point, as a runtime primitive reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
@@ -353,4 +366,22 @@ pub struct CleanupReport {
     pub unwind_failures: usize,
     /// Timers still registered at shutdown.
     pub timers_left: usize,
+}
+
+/// This thread's coroutine stacks, as [`stack_pool`] reports them.
+///
+/// Every stack the thread allocated is idle in the pool, in use by a run,
+/// freed by the pool, or leaked by an unwind failure (see
+/// [`CleanupReport::unwind_failures`]). So between runs,
+/// `allocated - freed - idle` counts leaked stacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StackPool {
+    /// Idle stacks kept for later runs. Kept on purpose, not leaked.
+    pub idle: usize,
+    /// Stacks this thread has allocated in all, because its pool had none
+    /// idle. Repeating a run of the same shape allocates none.
+    pub allocated: u64,
+    /// Stacks the pool has freed in all: the whole pool when the stack size
+    /// changes, and each stack returned past the pool's limit.
+    pub freed: u64,
 }

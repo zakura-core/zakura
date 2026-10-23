@@ -220,15 +220,24 @@ fn cleanup_draws_rotate_so_a_select_loop_exits() {
             },
             &mut NoChecks,
         );
-        let _ = done.send((report.end.outcome, exited.get(), report.cleanup.unwound));
+        let _ = done.send((
+            report.end.outcome,
+            exited.get(),
+            report.cleanup.unwound,
+            report.cleanup.leaked,
+        ));
     });
-    let (outcome, exited, unwound) = finished
+    let (outcome, exited, unwound, leaked) = finished
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("shutdown finished the select loop");
     assert_eq!(outcome, Outcome::Budget);
     // The cleanup point bound would also end a stuck loop, by unwinding it.
     assert!(exited, "the loop took its exit branch during cleanup");
-    assert_eq!(unwound, 0, "nothing had to be force-unwound");
+    assert_eq!(
+        (unwound, leaked),
+        (0, 0),
+        "nothing was force-unwound or leaked"
+    );
 }
 
 /// A sink that builds the run's first hashed map when it gets `init`.

@@ -60,12 +60,24 @@
 //! moment later, and a release can time out after releasing. Histories where
 //! the work ran anyway after a fault are excluded for now, as is the API
 //! draft's Ambiguous outcome. Both would need an operation split into
-//! separate execute and reply stages. A page read whose tree-root reads fail
-//! after its path read consumed the lease is one of these histories.
+//! separate execute and reply stages. These histories are excluded:
+//!
+//! * A fault reply after the work ran, as above.
+//! * A page read whose tree-root reads fail after its path read consumed the
+//!   lease.
+//! * A successful page read whose path read ran long before its reply. For
+//!   example, the lease is acquired at 0 s, the path read consumes it at 1 s
+//!   and frees its slot, and the body-size read times out at 31 s. Production
+//!   still replies `Page` at 31 s. ST3's single completion would run the read
+//!   at 31 s instead, find the lease expired and reply `Unavailable`, and
+//!   would never free the slot at 1 s.
+//!
+//! ST3's single-completion model covers none of these.
 //!
 //! The body-size fallback needs no outcome of its own. Header fixtures commit
 //! no block bodies, so the engine adapter serves every size as unknown, which
-//! is the same page the fallback gives.
+//! is the same page the fallback gives. Only its timing is lost, as the last
+//! exclusion shows.
 //!
 //! # Execution
 //!

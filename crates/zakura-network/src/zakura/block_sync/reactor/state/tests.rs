@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use proptest::prelude::*;
 use zakura_header_chain::{BodyWorkAuthority, HeaderGeneration, HeaderWorkAuthority};
 
@@ -110,6 +111,7 @@ fn refill(
     }
 }
 
+#[cfg(test)]
 fn expect_accepted(refill: Refill) -> PendingNeededQuery {
     match refill {
         Refill::Accepted(query) => query,
@@ -117,6 +119,7 @@ fn expect_accepted(refill: Refill) -> PendingNeededQuery {
     }
 }
 
+#[cfg(test)]
 fn anchor(height: u32) -> Frontier {
     Frontier {
         height: block::Height(height),
@@ -526,6 +529,7 @@ enum Input {
     Wait(u64),
 }
 
+#[cfg(test)]
 fn target() -> impl Strategy<Value = Target> {
     prop_oneof![
         3 => Just(Target::Pending),
@@ -534,6 +538,7 @@ fn target() -> impl Strategy<Value = Target> {
     ]
 }
 
+#[cfg(test)]
 fn anchor_kind() -> impl Strategy<Value = AnchorKind> {
     prop_oneof![
         4 => Just(AnchorKind::Current),
@@ -543,6 +548,7 @@ fn anchor_kind() -> impl Strategy<Value = AnchorKind> {
     ]
 }
 
+#[cfg(test)]
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         6 => (
@@ -815,134 +821,371 @@ fn model_reply(reply: NeededReply) -> ModelReply {
     }
 }
 
-fn check(state: &ReactorState, model: &Model, base: Instant) -> Result<(), TestCaseError> {
-    prop_assert_eq!(state.queries.pending().map(model_query), model.pending);
-    prop_assert_eq!(
-        state.queries.next_id().map(NonZeroU64::get),
-        Some(model.next_id)
+fn check(state: &ReactorState, model: &Model, base: Instant) {
+    assert_eq!(
+        state.queries.pending().map(model_query),
+        model.pending,
+        "{PROPERTY}"
     );
-    prop_assert_eq!(
+    assert_eq!(
+        state.queries.next_id().map(NonZeroU64::get),
+        Some(model.next_id),
+        "{PROPERTY}"
+    );
+    assert_eq!(
         state.queries.retry_at(),
         model
             .retry_until_ms
-            .map(|ms| base + Duration::from_millis(ms))
+            .map(|ms| base + Duration::from_millis(ms)),
+        "{PROPERTY}"
     );
-    prop_assert_eq!(state.progress.verified_block_tip.0, model.verified_tip);
-    prop_assert_eq!(state.progress.request_floor.0, model.floor);
-    prop_assert_eq!(state.progress.best_header_tip.0, model.header_tip);
-    Ok(())
+    assert_eq!(
+        state.progress.verified_block_tip.0, model.verified_tip,
+        "{PROPERTY}"
+    );
+    assert_eq!(state.progress.request_floor.0, model.floor, "{PROPERTY}");
+    assert_eq!(
+        state.progress.best_header_tip.0, model.header_tip,
+        "{PROPERTY}"
+    );
 }
 
+const PROPERTY: &str = "block/reactor-policy";
+
+/// Applicable transitions in a decoder-v1 reactor history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct BlockReactorReplaySummary {
+    /// Inputs decoded.
+    pub transitions: usize,
+    /// Query dispatches accepted by the action channel.
+    pub accepted: usize,
+    /// Query dispatches refused by the action channel.
+    pub refused: usize,
+    /// Named query replies checked.
+    pub replies: usize,
+    /// Replies rejected for query or authority identity.
+    pub stale_replies: usize,
+    /// Retry deadlines elapsed.
+    pub retry_expiries: usize,
+    /// Sequencer views observed.
+    pub views: usize,
+    /// Views that required a reaction.
+    pub reactions: usize,
+    /// Reactions that reset pending work.
+    pub resets: usize,
+}
+
+fn run(
+    inputs: impl IntoIterator<Item = Input>,
+    mut after_step: impl FnMut(&mut ReactorState),
+) -> BlockReactorReplaySummary {
+    let mut summary = BlockReactorReplaySummary::default();
+    let base = Instant::now();
+    let mut state = reactor_state(0, 20);
+    let mut model = Model::new(20);
+    // The finalized height stays at zero: no generated view raises it.
+    for input in inputs {
+        summary.transitions += 1;
+        let now = base + Duration::from_millis(model.now_ms);
+        match input {
+            Input::Refill {
+                force,
+                first_unclaimed,
+                backlog,
+                low_water,
+                has_authority,
+                accept,
+            } => {
+                let scope = has_authority.then(|| authority(model.authority));
+                let actual = refill(
+                    &mut state,
+                    force,
+                    work(first_unclaimed, backlog, low_water),
+                    scope,
+                    accept,
+                    now,
+                );
+                let expected = model.refill(
+                    force,
+                    first_unclaimed,
+                    backlog,
+                    low_water,
+                    has_authority,
+                    accept,
+                );
+                let actual = match actual {
+                    Refill::Held => None,
+                    Refill::Accepted(query) => {
+                        summary.accepted += 1;
+                        Some((model_query(query), true))
+                    }
+                    Refill::Refused(query) => {
+                        summary.refused += 1;
+                        Some((model_query(query), false))
+                    }
+                };
+                assert_eq!(actual, expected, "{PROPERTY}");
+            }
+            Input::Reply {
+                target,
+                scope,
+                anchor,
+            } => {
+                let Some(id) = model.named(target) else {
+                    continue;
+                };
+                let body_anchor = match anchor {
+                    AnchorKind::Current => (model.verified_tip, verified_hash(model.verified_tip)),
+                    AnchorKind::Ahead => (
+                        model.verified_tip + 1,
+                        verified_hash(model.verified_tip + 1),
+                    ),
+                    AnchorKind::Behind => {
+                        let height = model.verified_tip.saturating_sub(1);
+                        (height, verified_hash(height))
+                    }
+                    AnchorKind::OtherHash => (model.verified_tip, hash(0xCC, model.verified_tip)),
+                };
+                let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
+                let actual = state.complete_needed_query(
+                    query_id,
+                    authority(scope),
+                    Frontier {
+                        height: block::Height(body_anchor.0),
+                        hash: body_anchor.1,
+                    },
+                    Some(authority(model.authority)),
+                );
+                let expected = model.reply(id, scope, body_anchor);
+                summary.replies += 1;
+                summary.stale_replies += usize::from(matches!(
+                    expected,
+                    ModelReply::Stale | ModelReply::StaleAuthority
+                ));
+                assert_eq!(model_reply(actual), expected, "{PROPERTY}");
+            }
+            Input::Fail { target, scope } => {
+                let Some(id) = model.named(target) else {
+                    continue;
+                };
+                let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
+                let actual = state.queries.fail(query_id, authority(scope), now);
+                assert_eq!(actual, model.fail(id, scope), "{PROPERTY}");
+            }
+            Input::RetryElapsed => {
+                if model
+                    .retry_until_ms
+                    .is_some_and(|until| until <= model.now_ms)
+                {
+                    summary.retry_expiries += 1;
+                    state.queries.retry_elapsed();
+                    model.retry_until_ms = None;
+                }
+            }
+            Input::HeaderTip(tip) => {
+                state
+                    .progress
+                    .observe_header_tip(block::Height(tip), header_hash(tip));
+                model.header_tip = tip;
+            }
+            Input::Authority(generation) => model.authority = generation,
+            Input::View {
+                tip,
+                floor_lag,
+                reset,
+                react,
+                refill_accept,
+                refill_backlog,
+            } => {
+                let floor = tip.saturating_sub(floor_lag);
+                let expected = model.view(tip, floor, reset, react);
+                let mut next = view(tip, model.reset_epoch, model.reaction_epoch);
+                next.download_floor = block::Height(floor);
+                let actual = state.observe_view(next);
+                summary.views += 1;
+                summary.reactions += usize::from(expected.is_some());
+                summary.resets += usize::from(expected.is_some_and(|(reset, _)| reset));
+                match expected {
+                    None => assert_eq!(actual, ViewReaction::ObserveOnly, "{PROPERTY}"),
+                    Some((reset, tip_advanced)) => {
+                        assert_eq!(
+                            actual,
+                            ViewReaction::React {
+                                reset,
+                                tip_advanced
+                            },
+                            "{PROPERTY}"
+                        );
+                        // The reaction refills, forced after a reset, with
+                        // outstanding work over the low-water target.
+                        check(&state, &model, base);
+                        let scope = Some(authority(model.authority));
+                        let actual = refill(
+                            &mut state,
+                            reset,
+                            work(Some(floor + 1), refill_backlog, 10),
+                            scope,
+                            refill_accept,
+                            now,
+                        );
+                        let expected = model.refill(
+                            reset,
+                            Some(floor + 1),
+                            refill_backlog,
+                            10,
+                            true,
+                            refill_accept,
+                        );
+                        if reset && floor < model.header_tip {
+                            assert!(
+                                expected.is_some(),
+                                "{PROPERTY}: a reset refill always dispatches"
+                            );
+                        }
+                        let actual = match actual {
+                            Refill::Held => None,
+                            Refill::Accepted(query) => {
+                                summary.accepted += 1;
+                                Some((model_query(query), true))
+                            }
+                            Refill::Refused(query) => {
+                                summary.refused += 1;
+                                Some((model_query(query), false))
+                            }
+                        };
+                        assert_eq!(actual, expected, "{PROPERTY}");
+                    }
+                }
+            }
+            Input::Wait(ms) => model.now_ms += ms,
+        }
+        after_step(&mut state);
+        check(&state, &model, base);
+    }
+
+    summary
+}
+
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
-
-    /// Queries, replies, failures, and views keep the pending query, query ID,
-    /// retry gate, and mirrors equal to the model's after every step.
     #[test]
     fn reactor_state_matches_model(inputs in prop::collection::vec(input(), 1..60)) {
-        let base = Instant::now();
-        let mut state = reactor_state(0, 20);
-        let mut model = Model::new(20);
-        // The finalized height stays at zero: no generated view raises it.
-        for input in inputs {
-            let now = base + Duration::from_millis(model.now_ms);
-            match input {
-                Input::Refill { force, first_unclaimed, backlog, low_water, has_authority, accept } => {
-                    let scope = has_authority.then(|| authority(model.authority));
-                    let actual = refill(
-                        &mut state,
-                        force,
-                        work(first_unclaimed, backlog, low_water),
-                        scope,
-                        accept,
-                        now,
-                    );
-                    let expected = model.refill(force, first_unclaimed, backlog, low_water, has_authority, accept);
-                    let actual = match actual {
-                        Refill::Held => None,
-                        Refill::Accepted(query) => Some((model_query(query), true)),
-                        Refill::Refused(query) => Some((model_query(query), false)),
-                    };
-                    prop_assert_eq!(actual, expected);
-                }
-                Input::Reply { target, scope, anchor } => {
-                    let Some(id) = model.named(target) else { continue };
-                    let body_anchor = match anchor {
-                        AnchorKind::Current => (model.verified_tip, verified_hash(model.verified_tip)),
-                        AnchorKind::Ahead => (model.verified_tip + 1, verified_hash(model.verified_tip + 1)),
-                        AnchorKind::Behind => {
-                            let height = model.verified_tip.saturating_sub(1);
-                            (height, verified_hash(height))
-                        }
-                        AnchorKind::OtherHash => (model.verified_tip, hash(0xCC, model.verified_tip)),
-                    };
-                    let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                    let actual = state.complete_needed_query(
-                        query_id,
-                        authority(scope),
-                        Frontier { height: block::Height(body_anchor.0), hash: body_anchor.1 },
-                        Some(authority(model.authority)),
-                    );
-                    prop_assert_eq!(model_reply(actual), model.reply(id, scope, body_anchor));
-                }
-                Input::Fail { target, scope } => {
-                    let Some(id) = model.named(target) else { continue };
-                    let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                    let actual = state.queries.fail(query_id, authority(scope), now);
-                    prop_assert_eq!(actual, model.fail(id, scope));
-                }
-                Input::RetryElapsed => {
-                    if model.retry_until_ms.is_some_and(|until| until <= model.now_ms) {
-                        state.queries.retry_elapsed();
-                        model.retry_until_ms = None;
-                    }
-                }
-                Input::HeaderTip(tip) => {
-                    state.progress.observe_header_tip(block::Height(tip), header_hash(tip));
-                    model.header_tip = tip;
-                }
-                Input::Authority(generation) => model.authority = generation,
-                Input::View { tip, floor_lag, reset, react, refill_accept, refill_backlog } => {
-                    let floor = tip.saturating_sub(floor_lag);
-                    let expected = model.view(tip, floor, reset, react);
-                    let mut next = view(tip, model.reset_epoch, model.reaction_epoch);
-                    next.download_floor = block::Height(floor);
-                    let actual = state.observe_view(next);
-                    match expected {
-                        None => prop_assert_eq!(actual, ViewReaction::ObserveOnly),
-                        Some((reset, tip_advanced)) => {
-                            prop_assert_eq!(actual, ViewReaction::React { reset, tip_advanced });
-                            // The reaction refills, forced after a reset, with
-                            // outstanding work over the low-water target.
-                            check(&state, &model, base)?;
-                            let scope = Some(authority(model.authority));
-                            let actual = refill(
-                                &mut state,
-                                reset,
-                                work(Some(floor + 1), refill_backlog, 10),
-                                scope,
-                                refill_accept,
-                                now,
-                            );
-                            let expected = model.refill(reset, Some(floor + 1), refill_backlog, 10, true, refill_accept);
-                            if reset && floor < model.header_tip {
-                                prop_assert!(expected.is_some(), "a reset refill always dispatches");
-                            }
-                            let actual = match actual {
-                                Refill::Held => None,
-                                Refill::Accepted(query) => Some((model_query(query), true)),
-                                Refill::Refused(query) => Some((model_query(query), false)),
-                            };
-                            prop_assert_eq!(actual, expected);
-                        }
-                    }
-                }
-                Input::Wait(ms) => model.now_ms += ms,
-            }
-            check(&state, &model, base)?;
-        }
+        run(inputs, |_| {});
+    }
+    #[test]
+    fn reactor_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_block_reactor_bytes(&bytes);
     }
 }
 
+#[cfg(test)]
 mod committed;
+#[cfg(test)]
 mod status;
+
+/// Replay decoder-v1 quadruples against the existing reactor policy model.
+/// Read at most 512 bytes and express deadlines relative to one clock origin.
+pub fn replay_block_reactor_bytes(data: &[u8]) -> BlockReactorReplaySummary {
+    run(decode(data), |_| {})
+}
+
+fn decode(data: &[u8]) -> impl Iterator<Item = Input> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let target = match b % 6 {
+            0..=2 => Target::Pending,
+            3..=4 => Target::Earlier(usize::from(b % 6 - 2)),
+            _ => Target::Unknown,
+        };
+        match a % 8 {
+            0 => Input::Refill {
+                force: b & 1 != 0,
+                first_unclaimed: (b & 2 == 0).then_some(u32::from(c % 40)),
+                backlog: usize::from(d % 20),
+                low_water: usize::from(d / 20) + 1,
+                has_authority: b & 4 == 0,
+                accept: b & 8 == 0,
+            },
+            1 => Input::Reply {
+                target,
+                scope: c % 2,
+                anchor: match d % 4 {
+                    0 => AnchorKind::Current,
+                    1 => AnchorKind::Ahead,
+                    2 => AnchorKind::Behind,
+                    _ => AnchorKind::OtherHash,
+                },
+            },
+            2 => Input::Fail {
+                target,
+                scope: c % 2,
+            },
+            3 => Input::RetryElapsed,
+            4 => Input::HeaderTip(u32::from(c % 40)),
+            5 => Input::Authority(c % 2),
+            6 => Input::View {
+                tip: u32::from(c % 30),
+                floor_lag: u32::from(d % 3),
+                reset: b & 1 != 0,
+                react: b & 2 != 0,
+                refill_accept: b & 4 == 0,
+                refill_backlog: usize::from(d / 3 % 20),
+            },
+            _ => Input::Wait(u64::from(c) * 2),
+        }
+    })
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[
+    0, 0, 1, 200, 0, 8, 2, 200, 7, 0, 200, 0, 3, 0, 0, 0, 1, 0, 0, 1, 6, 2, 1, 0, 6, 3, 0, 0, 5, 0,
+    1, 0, 1, 0, 0, 0, 0, 0, 1, 200, 2, 0, 1, 0, 7, 0, 200, 0, 3, 0, 0, 0, 4, 0, 30, 0, 6, 0, 3, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
+    let summary = replay_block_reactor_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        BlockReactorReplaySummary {
+            transitions: 15,
+            accepted: 4,
+            refused: 1,
+            replies: 2,
+            stale_replies: 1,
+            retry_expiries: 2,
+            views: 3,
+            reactions: 2,
+            resets: 1,
+        }
+    );
+    assert_eq!(
+        replay_block_reactor_bytes(&[]),
+        BlockReactorReplaySummary::default()
+    );
+    println!("tier=Machine target=block_reactor decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "block/reactor-policy")]
+fn reactor_witness_rejects_lost_pending_query() {
+    run(decode(WITNESS), |state| {
+        state.queries.pending = None;
+    });
+}
+
+#[test]
+#[should_panic(expected = "block/reactor-policy")]
+fn reactor_witness_rejects_wrong_request_floor() {
+    run(decode(WITNESS), |state| {
+        state.progress.request_floor = block::Height(99);
+    });
+}

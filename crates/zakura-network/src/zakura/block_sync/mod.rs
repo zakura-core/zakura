@@ -52,6 +52,9 @@ mod service;
 mod source;
 mod state;
 mod status;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{replay_block_reactor_bytes, BlockReactorReplaySummary};
 #[cfg(test)]
 mod tests;
 mod trace;

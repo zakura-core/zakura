@@ -6,12 +6,14 @@ mod support;
 
 use std::{cell::Cell, collections::BTreeSet, future::Future, rc::Rc, time::Duration};
 
+use zakura_sim::Sim;
+
 use support::{advances, config, inputs, picks, run};
 use zakura_rt::{task, time};
 use zakura_scheduler::{SimInstant, Status};
 use zakura_sim::{
-    check, ActionSource, Boundary, Identity, NoChecks, Observation, ObservationLog, Outcome,
-    Violation,
+    check, fake::FakeNet, ActionSource, Boundary, Identity, NoChecks, Observation, ObservationLog,
+    Outcome, Violation,
 };
 
 const MS: u128 = 1_000_000;
@@ -226,4 +228,97 @@ fn no_repeated_zero_progress_advance() {
             .collect();
         assert!(zero_progress.is_empty(), "{zero_progress:?}");
     }
+}
+
+/// A network that delivers 5 to 10 ms after sending and never drops, with
+/// one task that sends `sends` datagrams and then sleeps `sleep_ms`.
+fn sender(sim: &mut Sim, sends: usize, sleep_ms: u64) {
+    let net = FakeNet::new(Duration::from_millis(5), Duration::from_millis(10), 0);
+    sim.add_source(Box::new(net.clone()));
+    sim.scheduler().spawn_root("sender", async move {
+        for _ in 0..sends {
+            net.send("node->p1");
+        }
+        time::sleep(Duration::from_millis(sleep_ms)).await;
+    });
+}
+
+/// The virtual time, in nanoseconds, when each pick ran.
+fn pick_times(report: &zakura_sim::RunReport) -> Vec<(u128, String)> {
+    let mut now = 0;
+    picks(report)
+        .into_iter()
+        .map(|p| {
+            if let Some(ns) = p.strip_prefix("advance-time:") {
+                now = ns.parse().unwrap();
+            }
+            (now, p.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn datagram_window_opens_at_boundary() {
+    for plan in inputs(200, 32) {
+        let report = run(
+            config(2, 10_000),
+            plan,
+            |sim| sender(sim, 1, 7),
+            &mut NoChecks,
+        );
+        assert_eq!(
+            advances(&report)[0],
+            5 * MS,
+            "time stops where the window opens"
+        );
+        for (at, pick) in pick_times(&report) {
+            if pick.starts_with("deliver:") {
+                assert!((5 * MS..=10 * MS).contains(&at), "{pick} at {at}");
+            }
+        }
+    }
+}
+
+#[test]
+fn delivery_deadline_blocks_time() {
+    for plan in inputs(200, 32) {
+        let report = run(
+            config(2, 10_000),
+            plan,
+            |sim| sender(sim, 1, 20),
+            &mut NoChecks,
+        );
+        let times = pick_times(&report);
+        let delivered = times
+            .iter()
+            .position(|(_, p)| p.starts_with("deliver:"))
+            .expect("the datagram is delivered");
+        assert!(times[delivered].0 <= 10 * MS);
+        assert!(
+            times[..delivered].iter().all(|(at, _)| *at <= 10 * MS),
+            "time passed the deadline with the datagram in flight: {times:?}"
+        );
+        assert_eq!(advances(&report).last(), Some(&(20 * MS)));
+    }
+}
+
+#[test]
+fn same_instant_datagrams_keep_choices() {
+    let mut first = BTreeSet::new();
+    for plan in inputs(200, 32) {
+        let report = run(
+            config(2, 10_000),
+            plan,
+            |sim| sender(sim, 2, 1),
+            &mut NoChecks,
+        );
+        let deliveries: Vec<String> = picks(&report)
+            .into_iter()
+            .filter(|p| p.starts_with("deliver:"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(deliveries.len(), 2);
+        first.insert(deliveries[0].clone());
+    }
+    assert_eq!(first.len(), 2, "the plan delivers either datagram first");
 }

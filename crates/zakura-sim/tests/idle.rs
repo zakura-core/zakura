@@ -4,12 +4,13 @@
 
 mod support;
 
-use std::{future::pending, sync::Arc};
+use std::{cell::Cell, future::pending, sync::Arc, time::Duration};
 
 use support::{config, inputs, run};
 use zakura_rt::{sync::Mutex, task};
 use zakura_scheduler::hooks;
-use zakura_sim::{IdleStatus, NoChecks, Outcome, Plan, PlanInput, Sim};
+use zakura_scheduler::Status;
+use zakura_sim::{check, fake::FakeStorage, IdleStatus, NoChecks, Outcome, Plan, PlanInput, Sim};
 
 /// The idle status a run under `plan` with `workers` ends with.
 fn idle(workers: u16, plan: PlanInput, setup: impl FnOnce(&mut Sim)) -> IdleStatus {
@@ -70,4 +71,46 @@ fn idle_outcomes_distinct() {
         "{statuses:?}"
     );
     assert!(statuses.contains(&IdleStatus::Quiescent), "{statuses:?}");
+}
+
+#[test]
+fn storage_completion_releases_apparent_deadlock() {
+    for plan in inputs(100, 16) {
+        // Set when the scheduler alone looks deadlocked while a storage
+        // completion is enabled.
+        let apparent = Cell::new(false);
+        let mut checker = check::after_step(|cx| {
+            if cx.status == Status::Deadlock {
+                apparent.set(true);
+            }
+            None
+        });
+        let report = run(
+            config(2, 1_000),
+            plan,
+            |sim| {
+                let storage = FakeStorage::new("store", Duration::from_secs(1));
+                sim.add_source(Box::new(storage.clone()));
+                sim.scheduler().spawn_root("waiter", async move {
+                    let _ = storage.submit().await;
+                });
+            },
+            &mut checker,
+        );
+        assert!(
+            apparent.get(),
+            "the waiter's poll left the scheduler deadlocked"
+        );
+        assert_eq!(
+            report.end.outcome,
+            Outcome::Idle {
+                status: IdleStatus::Quiescent
+            },
+            "the completion ran and the waiter finished"
+        );
+        assert!(report
+            .picks
+            .iter()
+            .any(|p| p.identity.starts_with("storage:store:1:")));
+    }
 }

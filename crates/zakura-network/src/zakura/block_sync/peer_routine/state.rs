@@ -17,8 +17,10 @@ use super::{
 mod liveness;
 mod requests;
 mod status;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
 
 #[cfg(test)]
 pub(super) use liveness::{liveness_grace_allowed, no_progress_response};

@@ -68,3 +68,31 @@ path = "fuzz_targets/discovery_candidate.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_work_ownership"
+path = "fuzz_targets/block_work_ownership.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_retry_authority"
+path = "fuzz_targets/block_retry_authority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_peer_registry"
+path = "fuzz_targets/block_peer_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_request_lifecycle"
+path = "fuzz_targets/block_request_lifecycle.rs"
+test = false
+doc = false
+bench = false

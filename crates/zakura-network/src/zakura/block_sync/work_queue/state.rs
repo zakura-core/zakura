@@ -22,8 +22,10 @@ use super::{
     WorkItem, WorkReturnOutcome, DEFAULT_BS_SIZE_FLOOR_BYTES,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{replay_work_ownership_bytes, WorkOwnershipReplaySummary};
 
 /// Wakeups that a logical work transition requires.
 #[must_use]
@@ -133,7 +135,7 @@ impl WorkQueueState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn set_estimate_floor(&mut self, floor: u64) {
         self.floor_estimate_bytes = floor.max(1);
     }
@@ -921,7 +923,7 @@ impl WorkQueueState {
     }
 
     /// Ground-truth O(pending + in_flight) recomputation of [`Self::reserved_bytes`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(in crate::zakura::block_sync) fn reserved_bytes_scanned(&self) -> u64 {
         self.pending
             .values()

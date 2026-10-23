@@ -1506,3 +1506,49 @@ fn consecutive_runs_reset_rt_per_run_state() {
     assert_eq!(sim::suppressed_points(), 0, "a new run starts from zero");
     drop(s);
 }
+
+/// `SchedulerConfig::utc_origin` sets the run's UTC at virtual time zero,
+/// and UTC then moves with virtual time. Unset, the run uses `zakura-rt`'s
+/// default origin.
+#[test]
+fn rt_utc_now_starts_at_the_configured_origin() {
+    let read = |utc_origin, start| {
+        let config = SchedulerConfig {
+            utc_origin,
+            ..SchedulerConfig::default()
+        };
+        let mut s = Scheduler::new(config, start);
+        let seen = shared(Cell::new(None));
+        let out = seen.clone();
+        let root = s.spawn_root("root", async move {
+            let first = time::utc_now();
+            time::sleep(Duration::from_secs(5)).await;
+            out.set(Some((first, time::utc_now())));
+        });
+        while !root.is_finished() {
+            if s.ready().is_empty() {
+                let next = s.next_deadline().expect("the root task waits on its timer");
+                s.advance_to(next);
+            } else {
+                s.run(root.task());
+            }
+        }
+        seen.get().expect("the root task finished")
+    };
+    let origin = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let five = Duration::from_secs(5);
+    assert_eq!(
+        read(Some(origin), SimInstant::ZERO),
+        (origin, origin + five)
+    );
+    let start = SimInstant::from_start(Duration::from_secs(60));
+    assert_eq!(
+        read(Some(origin), start),
+        (
+            origin + Duration::from_secs(60),
+            origin + Duration::from_secs(65)
+        )
+    );
+    let default = std::time::UNIX_EPOCH + sim::DEFAULT_UTC_ORIGIN_SINCE_EPOCH;
+    assert_eq!(read(None, SimInstant::ZERO), (default, default + five));
+}

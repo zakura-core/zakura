@@ -331,6 +331,9 @@ pub struct SchedulerConfig {
     pub max_tasks: u32,
     /// Stack size for each task, in bytes. Untouched pages cost no memory.
     pub stack_size: usize,
+    /// UTC at virtual time zero, which `zakura_rt::time::utc_now` reads
+    /// from. `None` keeps `zakura-rt`'s default origin.
+    pub utc_origin: Option<std::time::SystemTime>,
 }
 
 impl Default for SchedulerConfig {
@@ -341,6 +344,7 @@ impl Default for SchedulerConfig {
             // Tokio's default worker stack, so any poll that fits on a
             // production worker fits here.
             stack_size: 2 * 1024 * 1024,
+            utc_origin: None,
         }
     }
 }

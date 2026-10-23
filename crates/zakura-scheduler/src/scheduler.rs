@@ -74,6 +74,9 @@ pub(crate) struct RunState {
     pub(crate) done: BTreeMap<TaskId, TaskExit>,
     pub(crate) join_wakers: BTreeMap<TaskId, Vec<Waker>>,
     pub(crate) now: SimInstant,
+    /// UTC at virtual time zero, or `None` for `zakura-rt`'s default.
+    #[cfg(zakura_sim)]
+    pub(crate) utc_origin: Option<std::time::SystemTime>,
     pub(crate) timers: BTreeMap<TimerId, Waker>,
     next_timer: u64,
     spawn_queue: Vec<(TaskId, BoxTask)>,
@@ -420,6 +423,8 @@ impl Scheduler {
                 done: BTreeMap::new(),
                 join_wakers: BTreeMap::new(),
                 now: start,
+                #[cfg(zakura_sim)]
+                utc_origin: config.utc_origin,
                 timers: BTreeMap::new(),
                 next_timer: 0,
                 spawn_queue: Vec::new(),

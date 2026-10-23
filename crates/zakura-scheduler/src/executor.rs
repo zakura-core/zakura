@@ -115,6 +115,13 @@ impl rt::Executor for SchedulerExecutor {
     fn draw(&self, site: rt::DrawSite, bound: u64) -> u64 {
         hooks::draw(draw_kind_from_rt(site.kind), site.site, bound)
     }
+
+    /// The run's configured origin, or `zakura-rt`'s default.
+    fn utc_origin(&self) -> std::time::SystemTime {
+        with_run(|s| s.utc_origin)
+            .expect("zakura-rt calls the executor only while it's installed for a run")
+            .unwrap_or_else(|| std::time::UNIX_EPOCH + rt::DEFAULT_UTC_ORIGIN_SINCE_EPOCH)
+    }
 }
 
 /// The scheduler's draw kind for a `zakura-rt` one.

@@ -54,6 +54,8 @@ pub(super) struct WorkItem {
     pub(super) hash: block::Hash,
     /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
     pub(super) estimated_bytes: u64,
+    /// Supplier hint, independent of the scheduling reservation.
+    pub(super) size_hint: BlockSizeEstimate,
     /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
     observed_bytes: u64,
     /// Refreshed hint for a future retry while an issued reservation stays fixed.
@@ -267,6 +269,7 @@ impl WorkQueue {
                         let estimated_bytes = estimated_bytes.max(item.observed_bytes);
                         estimate_changed |= item.estimated_bytes != estimated_bytes;
                         item.estimated_bytes = estimated_bytes;
+                        item.size_hint = size;
                     }
                     continue;
                 }
@@ -281,6 +284,7 @@ impl WorkQueue {
                         provisional: false,
                         hash,
                         estimated_bytes,
+                        size_hint: size,
                         observed_bytes: 0,
                         retry_estimated_bytes: None,
                         retry_after_tip: None,
@@ -315,10 +319,12 @@ impl WorkQueue {
                     let estimated = estimated.max(item.observed_bytes);
                     changed |= item.estimated_bytes != estimated;
                     item.estimated_bytes = estimated;
+                    item.size_hint = size;
                 }
             } else if let Some(item) = inner.in_flight.get_mut(&height) {
                 if item.scope.body_work_epoch == scope.body_work_epoch && item.hash == hash {
                     item.retry_estimated_bytes = Some(estimated.max(item.observed_bytes));
+                    item.size_hint = size;
                 }
             }
         }
@@ -1183,6 +1189,10 @@ impl WorkQueue {
 
     pub(super) fn min_pending(&self) -> Option<block::Height> {
         self.lock().pending.keys().next().copied()
+    }
+
+    pub(super) fn in_flight_item(&self, height: block::Height) -> Option<WorkItem> {
+        self.lock().in_flight.get(&height).copied()
     }
 
     pub(super) fn pending_item(&self, height: block::Height) -> Option<WorkItem> {

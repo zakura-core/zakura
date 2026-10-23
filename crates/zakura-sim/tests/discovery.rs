@@ -354,9 +354,12 @@ impl Checker for WaitCompleteWakes {
     }
 }
 
-/// The run config: 2 workers, and a budget well past the exchange.
+/// The run config: 2 workers, a budget well past the exchange, and tokio's
+/// worker stack, since record verification runs deep in a debug build.
 fn run_config() -> zakura_sim::RunConfig {
-    config(2, 3_000)
+    let mut config = config(2, 3_000);
+    config.scheduler.stack_size = zakura_scheduler::SchedulerConfig::default().stack_size;
+    config
 }
 
 /// Runs the scenario under `plan` with the check. Returns the report, the

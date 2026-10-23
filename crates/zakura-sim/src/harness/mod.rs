@@ -6,6 +6,7 @@
 //! scenario, so [`find`] and [`HarnessEntry::run`] can rerun any trace
 //! without knowing its type.
 
+pub mod discovery;
 pub mod header_sync;
 
 use std::{fmt, rc::Rc};
@@ -195,7 +196,10 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 }
 
 /// Every harness, by name.
-pub static HARNESSES: &[HarnessEntry] = &[entry::<header_sync::Smoke>()];
+pub static HARNESSES: &[HarnessEntry] = &[
+    entry::<discovery::WaitComplete>(),
+    entry::<header_sync::Smoke>(),
+];
 
 /// The harness named `name`.
 pub fn find(name: &str) -> Result<&'static HarnessEntry, HarnessError> {

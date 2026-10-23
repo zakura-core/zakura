@@ -354,8 +354,9 @@ pub struct CleanupReport {
 /// This thread's coroutine stacks, as [`stack_pool`] reports them.
 ///
 /// Every stack the thread allocated is idle in the pool, in use by a run,
-/// or leaked by an unwind failure (see [`CleanupReport::unwind_failures`]).
-/// So between runs, `allocated - idle` counts leaked stacks.
+/// freed by the pool, or leaked by an unwind failure (see
+/// [`CleanupReport::unwind_failures`]). So between runs,
+/// `allocated - freed - idle` counts leaked stacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackPool {
     /// Idle stacks kept for later runs. Kept on purpose, not leaked.
@@ -363,4 +364,7 @@ pub struct StackPool {
     /// Stacks this thread has allocated in all, because its pool had none
     /// idle. Repeating a run of the same shape allocates none.
     pub allocated: u64,
+    /// Stacks the pool has freed in all: the whole pool when the stack size
+    /// changes, and each stack returned past the pool's limit.
+    pub freed: u64,
 }

@@ -263,5 +263,9 @@ fn consecutive_runs_share_nothing_and_reuse_stacks() {
     );
     let pool = pool.expect("later rounds ran");
     assert!(pool.idle > 0);
-    assert_eq!(pool.allocated, pool.idle as u64, "no stack leaked"); // idle fits u64
+    assert_eq!(
+        pool.allocated - pool.freed,
+        pool.idle as u64,
+        "no stack leaked"
+    ); // idle fits u64
 }

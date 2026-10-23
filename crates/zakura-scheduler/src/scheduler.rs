@@ -254,6 +254,7 @@ thread_local! {
     static STACK_POOL: RefCell<Vec<DefaultStack>> = const { RefCell::new(Vec::new()) };
     static POOLED_SIZE: Cell<usize> = const { Cell::new(0) };
     static STACKS_ALLOCATED: Cell<u64> = const { Cell::new(0) };
+    static STACKS_FREED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The most idle stacks one thread keeps. Pooled stacks keep the pages a run
@@ -288,7 +289,8 @@ pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
 /// Takes a stack of `size` bytes from this thread's pool, or allocates one.
 fn take_stack(size: usize) -> DefaultStack {
     if POOLED_SIZE.get() != size {
-        STACK_POOL.with(|p| p.borrow_mut().clear());
+        let dropped = STACK_POOL.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        count_freed(dropped.len());
         POOLED_SIZE.set(size);
     }
     STACK_POOL
@@ -300,22 +302,37 @@ fn take_stack(size: usize) -> DefaultStack {
         })
 }
 
-/// This thread's stack pool: idle stacks, and how many it ever allocated.
+/// This thread's stack pool: idle stacks, and how many it ever allocated
+/// and freed.
 pub fn stack_pool() -> StackPool {
     StackPool {
         idle: STACK_POOL.with(|p| p.borrow().len()),
         allocated: STACKS_ALLOCATED.get(),
+        freed: STACKS_FREED.get(),
     }
 }
 
-/// Returns a stack to this thread's pool.
+/// Returns a stack to this thread's pool, or frees it once the pool is full.
 fn return_stack(stack: DefaultStack) {
-    STACK_POOL.with(|p| {
+    let full = STACK_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if p.len() < STACK_POOL_LIMIT {
             p.push(stack);
+            None
+        } else {
+            Some(stack)
         }
     });
+    if let Some(stack) = full {
+        drop(stack);
+        count_freed(1);
+    }
+}
+
+/// Adds `n` stacks to this thread's freed count.
+fn count_freed(n: usize) {
+    let n = u64::try_from(n).expect("a stack count fits in u64");
+    STACKS_FREED.set(STACKS_FREED.get().saturating_add(n));
 }
 
 /// Wakes a task. Wakers from an earlier run carry an old generation and do

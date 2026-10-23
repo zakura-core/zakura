@@ -1548,3 +1548,59 @@ fn cleanup_that_never_reaches_a_point_trips_the_watchdog() {
     child.kill().expect("the child is still running");
     child.wait().expect("the killed child can be reaped");
 }
+
+/// Stacks the pool can't account for: allocated, but neither freed nor idle.
+/// Between runs that's only stacks an unwind failure leaked.
+fn unaccounted_stacks() -> u64 {
+    let pool = zakura_scheduler::stack_pool();
+    pool.allocated - pool.freed - pool.idle as u64 // idle is at most STACK_POOL_LIMIT
+}
+
+/// Runs one task that finishes, with stacks of `stack_size` bytes.
+fn one_clean_run(stack_size: usize) {
+    let config = SchedulerConfig {
+        stack_size,
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    let task = s.spawn_root("task", async {});
+    assert_eq!(s.run(task.task()), zakura_scheduler::RunOutcome::Completed);
+    assert_eq!(s.shutdown().unwind_failures, 0);
+}
+
+#[test]
+fn changing_the_stack_size_frees_the_pool_without_a_false_leak() {
+    let before = unaccounted_stacks();
+    one_clean_run(64 * 1024);
+    // A new size empties the pool, which frees its 64 KiB stack.
+    one_clean_run(128 * 1024);
+    assert_eq!(
+        unaccounted_stacks(),
+        before,
+        "{:?}",
+        zakura_scheduler::stack_pool()
+    );
+}
+
+#[test]
+fn stacks_past_the_pool_limit_are_freed_without_a_false_leak() {
+    let before = unaccounted_stacks();
+    let config = SchedulerConfig {
+        stack_size: 64 * 1024,
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    // More live tasks than the pool keeps. Shutdown cancels them all, and the
+    // pool frees the stacks past its limit.
+    for _ in 0..1_030 {
+        s.spawn_root("idle", std::future::pending::<()>());
+    }
+    assert_eq!(s.shutdown().cancelled, 1_030);
+    assert_eq!(zakura_scheduler::stack_pool().idle, 1_024);
+    assert_eq!(
+        unaccounted_stacks(),
+        before,
+        "{:?}",
+        zakura_scheduler::stack_pool()
+    );
+}

@@ -1,6 +1,8 @@
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
-use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths, P2P_V2_ALPN};
+use crate::zakura::{
+    MessageRole, PayloadLen, SessionOpening, SessionPolicy, StreamQueueDepths, P2P_V2_ALPN,
+};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {

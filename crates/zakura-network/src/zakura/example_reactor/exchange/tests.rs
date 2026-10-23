@@ -54,7 +54,7 @@ async fn exchange(layout: &'static [Stream]) {
             high: Height(high),
         })
     };
-    let mut a = ExampleNode::new(
+    let mut a = ExchangeIO::new(
         layout,
         &capacity,
         store(0, 95),
@@ -62,7 +62,7 @@ async fn exchange(layout: &'static [Stream]) {
         a_link.sends,
         cancel.clone(),
     );
-    let mut b = ExampleNode::new(
+    let mut b = ExchangeIO::new(
         layout,
         &capacity,
         store(96, 191),
@@ -141,10 +141,10 @@ async fn nodes_exchange_items_over_a_stream_pair() {
     exchange(&PAIRED).await;
 }
 
-fn node(layout: &'static [Stream]) -> (ExampleNode, Link, ServeCapacity) {
+fn node(layout: &'static [Stream]) -> (ExchangeIO, Link, ServeCapacity) {
     let capacity = capacity();
     let (link, peer_link) = connect(layout);
-    let node = ExampleNode::new(
+    let node = ExchangeIO::new(
         layout,
         &capacity,
         Arc::new(Store {
@@ -253,8 +253,8 @@ fn capacity_over_limit(capacity: &ServeCapacity) -> u64 {
 
 /// Two nodes, A watching B, driven until `done` holds for A.
 struct Pair {
-    a: ExampleNode,
-    b: ExampleNode,
+    a: ExchangeIO,
+    b: ExchangeIO,
     a_in: SelectAll<futures::stream::BoxStream<'static, Frame>>,
     b_in: SelectAll<futures::stream::BoxStream<'static, Frame>>,
     cancel: CancellationToken,
@@ -265,7 +265,7 @@ impl Pair {
         let capacity = capacity();
         let (a_link, b_link) = connect(layout);
         let cancel = CancellationToken::new();
-        let a = ExampleNode::new(
+        let a = ExchangeIO::new(
             layout,
             &capacity,
             Arc::new(Store {
@@ -276,7 +276,7 @@ impl Pair {
             a_link.sends,
             cancel.clone(),
         );
-        let b = ExampleNode::new(
+        let b = ExchangeIO::new(
             layout,
             &capacity,
             Arc::new(Store {
@@ -297,7 +297,7 @@ impl Pair {
         (pair, capacity)
     }
 
-    async fn run_until(&mut self, done: impl Fn(&ExampleNode) -> bool) {
+    async fn run_until(&mut self, done: impl Fn(&ExchangeIO) -> bool) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !done(&self.a) {
                 tokio::select! {

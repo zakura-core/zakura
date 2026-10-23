@@ -364,6 +364,29 @@ mod tests {
         );
     }
 
+    /// M3.5: inside a simulated run, the Retry token time and the
+    /// certificate-check time are the scenario's UTC: its origin plus
+    /// virtual time, however much host time passes.
+    #[cfg(zakura_sim)]
+    #[test]
+    fn runtime_utc_reads_scenario_time_in_a_simulated_run() {
+        use zakura_scheduler::{Scheduler, SchedulerConfig, SimInstant};
+
+        let origin = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let config = SchedulerConfig {
+            utc_origin: Some(origin),
+            ..SchedulerConfig::default()
+        };
+        let mut run = Scheduler::new(config, SimInstant::ZERO);
+        run.advance_to(SimInstant::from_start(std::time::Duration::from_secs(5)));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let scenario = origin + std::time::Duration::from_secs(5);
+        assert_eq!(quinn_proto::TimeSource::now(&RuntimeUtc), scenario);
+        let tls_now = rustls::time_provider::TimeProvider::current_time(&RuntimeUtc).unwrap();
+        assert_eq!(tls_now.as_secs(), 1_700_000_005);
+        drop(run);
+    }
+
     /// M3.5: both TLS configs check certificates against the runtime's UTC
     /// clock, which is the host clock outside a simulated run.
     #[test]

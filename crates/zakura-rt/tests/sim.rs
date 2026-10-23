@@ -370,3 +370,35 @@ fn spawn_blocking_is_refused_inside_a_run() {
         drop(task::spawn_blocking(|| ()));
     });
 }
+
+/// UTC inside a run starts at the executor's origin and moves only with
+/// virtual time. The test executor keeps the provided default origin.
+#[test]
+fn utc_now_follows_virtual_time_from_the_origin() {
+    let origin = std::time::UNIX_EPOCH + sim::DEFAULT_UTC_ORIGIN_SINCE_EPOCH;
+    let ((start, later), _) = run(async {
+        let start = time::utc_now();
+        time::sleep(Duration::from_secs(90)).await;
+        (start, time::utc_now())
+    });
+    assert_eq!(start, origin);
+    assert_eq!(later, origin + Duration::from_secs(90));
+}
+
+/// The host clock doesn't reach a run: two runs with real time between them
+/// read the same UTC values.
+#[test]
+fn utc_now_is_the_same_in_every_run() {
+    let read = || run(async { time::utc_now() }).0;
+    let first = read();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(read(), first);
+}
+
+/// Outside a run, UTC is the host clock, as in production.
+#[test]
+fn utc_now_outside_a_run_reads_the_host_clock() {
+    let before = std::time::SystemTime::now();
+    let now = time::utc_now();
+    assert!(before <= now && now <= std::time::SystemTime::now());
+}

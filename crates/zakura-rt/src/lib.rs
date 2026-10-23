@@ -122,6 +122,12 @@ pub mod time {
     pub use tokio::time::{
         error, interval, sleep, sleep_until, timeout, Instant, MissedTickBehavior, Sleep, Timeout,
     };
+
+    /// The current UTC time: the host clock, `SystemTime::now()`. The
+    /// simulator build reads the run's scenario clock instead.
+    pub fn utc_now() -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
 }
 
 /// Synchronization.

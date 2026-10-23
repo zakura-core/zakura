@@ -51,7 +51,6 @@ getset = { workspace = true }
 bitvec = { workspace = true }
 bitflags = { workspace = true }
 blake2b_simd = { workspace = true }
-blake2s_simd = { workspace = true }
 bs58 = { workspace = true, features = ["check"] }
 byteorder = { workspace = true }
 

@@ -3,44 +3,20 @@
 use crate::serialization::ZcashReader;
 use std::{fmt, io, sync::LazyLock};
 
-use group::{
-    ff::{FromUniformBytes, PrimeField},
-    CurveAffine as _, GroupEncoding,
-};
+use group::{ff::PrimeField, CurveAffine as _, GroupEncoding};
 use halo2::{
     arithmetic::{Coordinates, CurveAffine},
     pasta::pallas,
 };
-use rand_core::{CryptoRng, RngCore};
 
 use crate::{
     amount::Amount,
-    error::RandError,
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
 };
 
 use super::sinsemilla::*;
-
-/// Generates a random scalar from the scalar field 𝔽_{q_P}.
-///
-/// <https://zips.z.cash/protocol/nu5.pdf#pallasandvesta>
-pub fn generate_trapdoor<T>(csprng: &mut T) -> Result<pallas::Scalar, RandError>
-where
-    T: RngCore + CryptoRng,
-{
-    let mut bytes = [0u8; 64];
-    csprng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| RandError::FillBytes)?;
-    // pallas::Scalar::from_uniform_bytes() reduces the input modulo q_P under the hood.
-    Ok(pallas::Scalar::from_uniform_bytes(&bytes))
-}
-
-/// The randomness used in the Simsemilla hash for note commitment.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CommitmentRandomness(pallas::Scalar);
 
 /// Note commitments for the output notes.
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -228,18 +204,6 @@ impl ZcashDeserialize for ValueCommitment {
 }
 
 impl ValueCommitment {
-    /// Generate a new _ValueCommitment_.
-    ///
-    /// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
-    pub fn randomized<T>(csprng: &mut T, value: Amount) -> Result<Self, RandError>
-    where
-        T: RngCore + CryptoRng,
-    {
-        let rcv = generate_trapdoor(csprng)?;
-
-        Ok(Self::new(rcv, value))
-    }
-
     /// Generate a new `ValueCommitment` from an existing `rcv on a `value`.
     ///
     /// ValueCommit^Orchard(v) :=

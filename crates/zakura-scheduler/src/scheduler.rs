@@ -392,9 +392,13 @@ impl Scheduler {
     ///
     /// # Panics
     ///
-    /// If this thread already has a run, or `config.workers` is 0.
+    /// If this thread already has a run, or `config.workers` is 0. In the
+    /// simulator build, also if UTC at `start` doesn't fit in a `SystemTime`
+    /// (see `zakura_rt::sim::Executor::utc_origin`).
     pub fn new(config: SchedulerConfig, start: SimInstant) -> Self {
         assert!(config.workers > 0, "a run needs at least one worker");
+        #[cfg(zakura_sim)]
+        crate::executor::assert_utc_in_range(config.utc_origin, start);
         let gen = NEXT_GEN.get() + 1;
         NEXT_GEN.set(gen);
         RUN.with(|r| {
@@ -627,10 +631,14 @@ impl Scheduler {
     ///
     /// # Panics
     ///
-    /// If `t` is earlier than the current time.
+    /// If `t` is earlier than the current time. In the simulator build, also
+    /// if UTC at `t` doesn't fit in a `SystemTime`, so a task's `utc_now`
+    /// can't overflow.
     pub fn advance_to(&mut self, t: SimInstant) -> Vec<TimerId> {
         let fired = self.state(|s| {
             assert!(t >= s.now, "virtual time can't move backwards");
+            #[cfg(zakura_sim)]
+            crate::executor::assert_utc_in_range(s.utc_origin, t);
             s.now = t;
             let later = s.timers.split_off(&TimerId {
                 deadline: t.checked_add(Duration::from_nanos(1)).unwrap_or(t),

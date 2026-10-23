@@ -70,7 +70,10 @@ fn far_future(now: Instant) -> Instant {
 /// it's `SystemTime::now()`, as in production.
 pub fn utc_now() -> std::time::SystemTime {
     match sim::executor() {
-        Some(executor) => executor.utc_origin() + executor.now(),
+        Some(executor) => executor
+            .utc_origin()
+            .checked_add(executor.now())
+            .expect("the executor keeps its UTC origin plus virtual time representable"),
         None => std::time::SystemTime::now(),
     }
 }

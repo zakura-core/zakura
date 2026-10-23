@@ -1751,13 +1751,15 @@ fn watchdog_child_spins_in_cleanup() {
     if !in_child("watchdog_child_spins_in_cleanup") {
         return;
     }
-    // A destructor that waits for a flag only another task sets. Points do
-    // nothing during shutdown, so it never lets that task run.
+    // A destructor that waits for a flag only another task sets. It takes
+    // no preemption points, so nothing in the scheduler can stop it. One
+    // that spins through points is leaked at the cleanup point bound, as
+    // `cleanup_that_spins_through_points_is_leaked` checks.
     struct SpinOnDrop(Rc<Cell<bool>>);
     impl Drop for SpinOnDrop {
         fn drop(&mut self) {
             while !self.0.get() {
-                point();
+                std::hint::spin_loop();
             }
         }
     }
@@ -1771,6 +1773,37 @@ fn watchdog_child_spins_in_cleanup() {
     s.spawn_root("setter", async move { flag.set(true) });
     assert_eq!(s.run(spinner.task()), zakura_scheduler::RunOutcome::Waiting);
     s.shutdown();
+}
+
+#[test]
+fn cleanup_that_spins_through_points_is_leaked() {
+    if leaks_in_a_child("cleanup_that_spins_through_points_is_leaked") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        // A destructor that waits, through points, for a flag only another
+        // task sets. Points don't switch during shutdown, so the setter never
+        // runs, and the cleanup point bound stops the destructor instead.
+        struct SpinOnDrop(Rc<Cell<bool>>);
+        impl Drop for SpinOnDrop {
+            fn drop(&mut self) {
+                while !self.0.get() {
+                    point();
+                }
+            }
+        }
+        let flag = shared(Cell::new(false));
+        let guard = SpinOnDrop(flag.clone());
+        let spinner = s.spawn_root("spinner", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+        s.spawn_root("setter", async move { flag.set(true) });
+        assert_eq!(s.run(spinner.task()), zakura_scheduler::RunOutcome::Waiting);
+    });
+    // The spinner stuck inside its cancellation, so it and the setter are
+    // both leaked.
+    assert_eq!((report.leaked, report.cancelled), (2, 0));
 }
 
 #[test]

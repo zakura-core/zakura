@@ -83,6 +83,11 @@ pub(crate) struct RunState {
     object_counts: BTreeMap<Option<TaskId>, u32>,
     root_counts: BTreeMap<&'static str, u32>,
     pub(crate) shutting_down: bool,
+    /// Points each task passed during shutdown, where points don't switch.
+    pub(crate) cleanup_points: BTreeMap<TaskId, u32>,
+    /// Tasks that passed [`CLEANUP_POINT_LIMIT`] points during shutdown. The
+    /// drain skips them, and shutdown force-unwinds them.
+    pub(crate) stuck: BTreeSet<TaskId>,
     /// Answers random draws. Taken out while it runs.
     pub(crate) draws: Option<DrawSource>,
     /// Panic payloads of tasks that panicked, until a joiner takes them.
@@ -263,6 +268,11 @@ const STACK_POOL_LIMIT: usize = 1024;
 /// past it are force-unwound instead, so cleanup always ends.
 const DRAIN_STEP_LIMIT: usize = 100_000;
 
+/// The most preemption points one task passes during shutdown. Points don't
+/// switch then, so a task spinning on a value no one will set never reaches
+/// a poll boundary. Past this it stops, and shutdown force-unwinds it.
+pub(crate) const CLEANUP_POINT_LIMIT: u32 = 100_000;
+
 /// Takes this thread's run state when dropped, even if shutdown panics, so
 /// later runs on the thread can still start. During a panic it leaks what the
 /// state still holds, since dropping that could panic again and abort.
@@ -401,6 +411,8 @@ impl Scheduler {
                 object_counts: BTreeMap::new(),
                 root_counts: BTreeMap::new(),
                 shutting_down: false,
+                cleanup_points: BTreeMap::new(),
+                stuck: BTreeSet::new(),
                 draws: None,
                 #[cfg(zakura_sim)]
                 panics: BTreeMap::new(),
@@ -637,8 +649,10 @@ impl Scheduler {
     ///    can take a contended lock.
     /// 2. Every task at a poll boundary is cancelled, as an abort would. Its
     ///    future is dropped on its own stack, outside any unwind.
-    /// 3. Only a task that is still parked, as in a lock cycle, is
-    ///    force-unwound. Whatever that unwind releases drains as in stage 1.
+    /// 3. Only a task that is still parked, as in a lock cycle, or that
+    ///    passed [`CLEANUP_POINT_LIMIT`] points in stage 1, as a spin on a
+    ///    value no one will set does, is force-unwound. Whatever that unwind
+    ///    releases drains as in stage 1.
     ///
     /// Check properties before calling this. A force-unwound task inside a
     /// production `catch_unwind` sees the unwind as a panic.
@@ -724,10 +738,10 @@ impl Scheduler {
             // Setup code may have spawned since the last step.
             self.admit();
             let next = self.state(|s| {
-                s.ready
-                    .iter()
+                let mut live = s.ready.iter().filter(|t| !s.stuck.contains(t));
+                live.clone()
                     .find(|t| s.mid_poll.contains(t))
-                    .or_else(|| s.ready.first())
+                    .or_else(|| live.next())
                     .copied()
             });
             let Some(task) = next else { return };

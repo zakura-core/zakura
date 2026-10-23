@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    scheduler::{with_run, BoxTask, RunState, TaskYielder, Yield},
+    scheduler::{with_run, BoxTask, RunState, TaskYielder, Yield, CLEANUP_POINT_LIMIT},
     Draw, DrawKind, ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
@@ -34,8 +34,19 @@ pub fn preempt(point: Point) {
         return;
     }
     let yielder = with_run(|s| {
-        let task = s.current.filter(|_| !s.shutting_down)?;
-        s.advance_point(task, point.op, Some(point.site));
+        let task = s.current?;
+        if s.shutting_down {
+            // Points don't switch during cleanup, until a task passes the
+            // limit. Then it stops here, and shutdown force-unwinds it.
+            let n = s.cleanup_points.entry(task).or_insert(0);
+            *n = n.saturating_add(1);
+            if *n <= CLEANUP_POINT_LIMIT {
+                return None;
+            }
+            s.stuck.insert(task);
+        } else {
+            s.advance_point(task, point.op, Some(point.site));
+        }
         Some(s.tasks[task.index()].yielder)
     })
     .flatten();

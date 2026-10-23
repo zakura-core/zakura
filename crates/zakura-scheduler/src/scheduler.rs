@@ -652,10 +652,11 @@ impl Scheduler {
     /// 2. Every task at a poll boundary is cancelled, as an abort would. Its
     ///    future is dropped on its own stack, outside any unwind.
     /// 3. Only a task that is still parked, as in a lock cycle, is
-    ///    force-unwound. A task that passed [`CLEANUP_POINT_LIMIT`] points in
-    ///    stage 1, as a spin on a value no one will set does, is leaked
-    ///    without running its destructors. Whatever either releases drains
-    ///    as in stage 1.
+    ///    force-unwound, and whatever that releases drains as in stage 1. If
+    ///    a task passed [`CLEANUP_POINT_LIMIT`] points in stage 1, as a spin
+    ///    on a value no one will set does, every task left is leaked
+    ///    instead, without running its destructors, since any of them may
+    ///    wait on what the stuck task's destructors would have done.
     ///
     /// Check properties before calling this. A force-unwound task inside a
     /// production `catch_unwind` sees the unwind as a panic.
@@ -698,10 +699,13 @@ impl Scheduler {
             let mut co = self.coroutines[task.index()]
                 .take()
                 .expect("position found a live coroutine");
-            if self.state(|s| s.stuck.contains(&task)) {
-                // Unwinding runs the task's destructors, which can't be
-                // preempted while unwinding, so one that spins would hang
-                // cleanup. The run is over, so leak the task instead.
+            // Unwinding runs a task's destructors, which can't be preempted
+            // while unwinding, so one that spins would hang cleanup. Once a
+            // task is stuck, its own destructors won't run either, and any
+            // other task's destructor may wait on what they would have done,
+            // such as a flag or an unlock. So after that, leak every task
+            // left instead of unwinding it. The run is over.
+            if self.state(|s| !s.stuck.is_empty()) {
                 report.leaked += 1;
                 std::mem::forget(co);
                 self.finish(task, TaskExit::Cancelled);

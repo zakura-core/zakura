@@ -402,6 +402,43 @@ fn shutdown_leaks_a_stuck_task_whose_drop_spins() {
     assert_eq!((report.leaked, report.unwound), (1, 0));
 }
 
+/// Sets `flag` when dropped, as a guard that signals another task would.
+struct SetsOnDrop(Rc<Atomic>);
+
+impl Drop for SetsOnDrop {
+    fn drop(&mut self) {
+        self.0.store(1);
+    }
+}
+
+#[test]
+fn a_leak_leaks_the_waiters_that_depend_on_it() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+    let report = shutdown_report(|s| {
+        let lock = shared(Mutex::new(()));
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        let (a_lock, a_flag) = (lock.clone(), flag.clone());
+        // A holds the lock and spins. Unwinding A would set the flag and
+        // release the lock, but leaking A does neither.
+        let a = s.spawn_root("a", async move {
+            let _held = a_lock.lock();
+            let _signal = SetsOnDrop(a_flag);
+            while never.load() == 0 {}
+        });
+        // B parks on A's lock, holding a guard that waits for the flag.
+        let b = s.spawn_root("b", async move {
+            let _waits = SpinsOnDrop(flag);
+            drop(lock.lock());
+        });
+        for _ in 0..4 {
+            assert!(matches!(s.run(a.task()), Reached(_)));
+        }
+        while !matches!(s.run(b.task()), Parked(_)) {}
+    });
+    assert_eq!((report.leaked, report.unwound), (2, 0));
+}
+
 #[test]
 fn long_but_finite_cleanup_finishes() {
     let report = shutdown_report(|s| {

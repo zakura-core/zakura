@@ -1,20 +1,23 @@
 //! The endpoint: bind, serve, dial and shut down (API-2, SPEC §6 to §8).
 
 use std::{
-    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError, Weak,
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
 use quinn_proto::{ClientConfig, TransportConfig, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
-use zakura_rt::time::Instant;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        counter, downgrade, mpsc, oneshot, watch, Mutex, PoisonError, Weak,
+    },
+    task::{spawn_named, JoinHandle},
+    time::Instant,
+};
 
 use crate::{
     config::{QuicBindConfig, QuicConfig},
@@ -114,13 +117,13 @@ pub(crate) struct SocketSlot {
     pub(crate) local_addr: SocketAddr,
     pub(crate) buffers: SocketBuffers,
     pub(crate) gso: bool,
-    pub(crate) rebinds: AtomicU64,
+    pub(crate) rebinds: counter::AtomicU64,
     pub(crate) inode: AtomicU64,
-    pub(crate) recv_calls: AtomicU64,
-    pub(crate) datagrams_received: AtomicU64,
-    pub(crate) queue_drops: AtomicU64,
-    pub(crate) oversize_drops: AtomicU64,
-    pub(crate) stopped: std::sync::atomic::AtomicBool,
+    pub(crate) recv_calls: counter::AtomicU64,
+    pub(crate) datagrams_received: counter::AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
+    pub(crate) oversize_drops: counter::AtomicU64,
+    pub(crate) stopped: AtomicBool,
 }
 
 /// State the handles and every endpoint task share. It holds no command
@@ -135,7 +138,7 @@ pub(crate) struct Shared {
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
-    pub(crate) network_changes: AtomicU64,
+    pub(crate) network_changes: counter::AtomicU64,
     /// The injected randomness. Applied where each config is built: socket
     /// endpoint configs, `serve` and every dial.
     pub(crate) inputs: EndpointInputs,
@@ -184,7 +187,7 @@ struct SocketHandle {
     cmds: mpsc::UnboundedSender<EndpointCmd>,
     slot: Arc<SocketSlot>,
     /// The endpoint task, so `shutdown` can abort one that doesn't stop.
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for QuicEndpoint {
@@ -249,7 +252,7 @@ impl QuicEndpoint {
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
-            network_changes: AtomicU64::new(0),
+            network_changes: counter::AtomicU64::new(0),
             inputs,
         });
         let factory = Arc::new(factory);
@@ -274,16 +277,17 @@ impl QuicEndpoint {
                 local_addr: socket.local_addr,
                 buffers: socket.buffers.unwrap_or_default(),
                 gso: socket.io.gso(),
-                rebinds: AtomicU64::new(0),
+                rebinds: counter::AtomicU64::new(0),
                 inode: AtomicU64::new(socket.inode.unwrap_or(0)),
-                recv_calls: AtomicU64::new(0),
-                datagrams_received: AtomicU64::new(0),
-                queue_drops: AtomicU64::new(0),
-                oversize_drops: AtomicU64::new(0),
-                stopped: std::sync::atomic::AtomicBool::new(false),
+                recv_calls: counter::AtomicU64::new(0),
+                datagrams_received: counter::AtomicU64::new(0),
+                queue_drops: counter::AtomicU64::new(0),
+                oversize_drops: counter::AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
-            let task = tokio::spawn(
+            let task = spawn_named(
+                "quic.endpoint",
                 EndpointTask::new(
                     shared.clone(),
                     slot.clone(),
@@ -296,15 +300,15 @@ impl QuicEndpoint {
             // SOCK-7: an injected socket has no inode to poll.
             #[cfg(target_os = "linux")]
             if socket.inode.is_some() {
-                tokio::spawn(kernel_drop_poller(
-                    Arc::downgrade(&slot),
-                    config.kernel_drop_poll_interval(),
-                ));
+                spawn_named(
+                    "quic.kernel_drop_poller",
+                    kernel_drop_poller(downgrade(&slot), config.kernel_drop_poll_interval()),
+                );
             }
             sockets.push(SocketHandle {
                 cmds,
                 slot,
-                task: std::sync::Mutex::new(Some(task)),
+                task: Mutex::new(Some(task)),
             });
         }
         // SOCK-12: a socket bound to a specific address keeps sending from it,
@@ -313,11 +317,10 @@ impl QuicEndpoint {
             .iter()
             .any(|socket| socket.slot.local_addr.ip().is_unspecified())
         {
-            tokio::spawn(watch_interfaces(
-                Arc::downgrade(&shared),
-                local_interface_ips,
-                INTERFACE_POLL,
-            ));
+            spawn_named(
+                "quic.interface_watcher",
+                watch_interfaces(downgrade(&shared), local_interface_ips, INTERFACE_POLL),
+            );
         }
         Ok(Self {
             inner: Arc::new(Inner { shared, sockets }),

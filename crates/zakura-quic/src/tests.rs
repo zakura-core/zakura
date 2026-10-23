@@ -376,7 +376,7 @@ async fn interface_change_notifies_connections_and_keeps_them() {
             move || ips.lock().unwrap().clone()
         };
         let watcher = tokio::spawn(watch_interfaces(
-            Arc::downgrade(client.shared()),
+            zakura_rt::sync::downgrade(client.shared()),
             list_ips,
             Duration::from_millis(20),
         ));

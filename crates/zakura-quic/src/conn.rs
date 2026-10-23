@@ -4,13 +4,13 @@
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, ConnectionStats, StreamId, VarInt};
-use tokio::sync::oneshot;
+use zakura_rt::sync::{oneshot, Mutex, PoisonError};
 
 use crate::{
     driver::{ConnCmd, ConnRef},

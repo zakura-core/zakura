@@ -1,10 +1,10 @@
 //! The connection task: the peer routine that owns one QUIC connection.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     mem,
     net::{IpAddr, SocketAddr},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,10 @@ use quinn_proto::{
     ConnectionError, ConnectionEvent, ConnectionHandle, Dir, EndpointEvent, Event, StreamEvent,
     StreamId, Transmit, TransportError, TransportErrorCode, VarInt,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::Ordering, mpsc, oneshot, watch},
+};
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
 use crate::{
@@ -295,7 +298,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         // network progress themselves, while a peer can keep the queue full.
         // Datagrams first would let a flood starve close, limits, shutdown
         // and the PATH-3 check.
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             event = control.recv() => match event {
                 Some(event) => task.conn.handle_event(event),
@@ -355,7 +358,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
             // Yield between transmit batches, so a busy connection can't hold
             // the worker thread.
-            () = tokio::task::yield_now(), if more_to_send => {}
+            () = zakura_rt::task::yield_now(), if more_to_send => {}
         }
     }
     task.drain_datagrams(&mut datagrams).await;
@@ -1160,7 +1163,7 @@ fn export_delta(previous: &Exported, next: &Exported) {
 mod tests {
     use super::*;
     use crate::{socket::TokioUdpIo, NodeSecretKey};
-    use std::sync::atomic::AtomicUsize;
+    use zakura_rt::sync::atomic::AtomicUsize;
 
     fn task() -> ConnTask<TokioUdpIo> {
         client_task().1

@@ -19,16 +19,16 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, PoisonError, RwLock,
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use quinn_proto::Transmit;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::watch;
+use zakura_rt::sync::{
+    atomic::{AtomicBool, Ordering},
+    watch, Mutex, PoisonError,
+};
 
 /// Receive buffer size: the largest UDP payload, and the largest batch GRO
 /// coalesces (SOCK-13).
@@ -430,7 +430,7 @@ struct Caps {
 /// before it binds the same address again.
 #[derive(Debug)]
 pub(crate) struct SocketCell<S> {
-    current: RwLock<Option<Arc<S>>>,
+    current: Mutex<Option<Arc<S>>>,
     generation: watch::Sender<u64>,
 }
 
@@ -438,7 +438,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// A cell that holds `io`.
     pub(crate) fn new(io: S) -> Self {
         Self {
-            current: RwLock::new(Some(Arc::new(io))),
+            current: Mutex::new(Some(Arc::new(io))),
             generation: watch::Sender::new(0),
         }
     }
@@ -446,7 +446,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// The current socket, or `None` while a rebind runs.
     pub(crate) fn get(&self) -> Option<Arc<S>> {
         self.current
-            .read()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
@@ -454,7 +454,7 @@ impl<S: UdpIo> SocketCell<S> {
     /// Closes the socket for good once its last in-flight user lets go.
     pub(crate) fn close(&self) {
         self.current
-            .write()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         self.generation.send_modify(|generation| *generation += 1);
@@ -470,7 +470,7 @@ impl<S: UdpIo> SocketCell<S> {
     pub(crate) async fn replace(&self, rebind: impl FnOnce() -> io::Result<S>) -> io::Result<()> {
         let old = self
             .current
-            .write()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         self.generation.send_modify(|generation| *generation += 1);
@@ -485,7 +485,7 @@ impl<S: UdpIo> SocketCell<S> {
             }
         }
         let io = rebind()?;
-        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(io));
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(io));
         self.generation.send_modify(|generation| *generation += 1);
         Ok(())
     }

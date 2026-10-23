@@ -4,15 +4,20 @@
 
 mod support;
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use rand_10::Rng;
 use support::{config, inputs, recorded};
 use tokio_stream::StreamExt;
 use zakura_rt::{collections::HashMap, stream::StreamMap};
+use zakura_scheduler::SimInstant;
 use zakura_sim::{
     record::{DrawRecord, Record, StepRecord},
-    HexU64, NoChecks, Outcome, Plan, PlanInput, Sim,
+    ActionSource, Boundary, HarnessFailure, HexU64, Identity, NoChecks, ObservationLog, Outcome,
+    Plan, PlanInput, Sim,
 };
 
 /// The draws in `lines`: the `init` record's, then each step's, in order.
@@ -296,4 +301,84 @@ fn an_at_end_draw_is_a_harness_failure() {
         report.end
     );
     assert!(draws(&lines).is_empty(), "the draw took no plan input");
+}
+
+/// A source whose one action is always enabled. Its `enabled` draws on call
+/// `at`, which is harness code drawing between steps.
+struct DrawsOnOffer {
+    calls: Cell<u64>,
+    at: u64,
+    runs: Rc<Cell<u64>>,
+}
+
+impl ActionSource for DrawsOnOffer {
+    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() == self.at {
+            let _ = zakura_rt::rand::rng().next_u64();
+        }
+        out.push((Identity::peer("p1", "ping"), 0));
+    }
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        self.runs.set(self.runs.get() + 1);
+    }
+}
+
+/// Runs `budget` live steps with a [`DrawsOnOffer`] that draws on call `at`
+/// and a task that yields forever. Checks that the run ends at the draw
+/// after `steps` steps, with no action run or recorded after it.
+fn ends_at_offer_draw(budget: u64, at: u64, steps_before: u64) {
+    let runs = Rc::new(Cell::new(0));
+    let polls = Rc::new(Cell::new(0));
+    let (report, lines) = recorded(
+        config(2, budget),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.add_source(Box::new(DrawsOnOffer {
+                calls: Cell::new(0),
+                at,
+                runs: runs.clone(),
+            }));
+            let polls = polls.clone();
+            sim.scheduler().spawn_root("spinner", async move {
+                loop {
+                    polls.set(polls.get() + 1);
+                    zakura_rt::task::yield_now().await;
+                }
+            });
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(
+        report.end.harness,
+        Some(HarnessFailure::DrawOutsideStep),
+        "{:?}",
+        report.end
+    );
+    assert_eq!(report.end.steps, steps_before);
+    assert_eq!(
+        steps(&lines).len() as u64,
+        steps_before,
+        "no later step was recorded"
+    );
+    // Each step either ran the source or polled the task once.
+    assert!(
+        runs.get() + polls.get() <= steps_before,
+        "no later action ran"
+    );
+}
+
+#[test]
+fn an_offer_draw_ends_the_run_before_its_pick() {
+    ends_at_offer_draw(100, 1, 0);
+}
+
+#[test]
+fn an_offer_draw_at_the_budget_ends_the_run_before_the_drain() {
+    // After the one live step, the loop offers again to see whether the run
+    // is idle before it drains, and the source draws there.
+    ends_at_offer_draw(1, 2, 1);
 }

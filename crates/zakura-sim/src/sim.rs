@@ -238,6 +238,11 @@ impl Sim {
                 Phase::Live => self.sources.iter().map(|s| offer(&**s, now)).collect(),
                 Phase::Drain => Vec::new(),
             };
+            // A source that drew while offering, here or in the idle check
+            // above, ends the run before anything else runs.
+            if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
             let enabled = match enabled_set(&EnabledInputs {
                 phase,
                 now,

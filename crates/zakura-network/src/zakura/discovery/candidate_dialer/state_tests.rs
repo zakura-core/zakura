@@ -10,14 +10,18 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
 use proptest::prelude::*;
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::time::Instant;
 
 use super::state::{CandidateAddress, CandidateDialerState, DialAttemptKey};
 use super::DiscoveryDialResult;
-use crate::zakura::{canonical_ip, discovery::ZakuraDiscoveryDialCandidate};
+#[cfg(test)]
+use crate::zakura::canonical_ip;
+use crate::zakura::discovery::ZakuraDiscoveryDialCandidate;
 
+#[cfg(test)]
 const DIAL_BACKOFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3_600));
 
 fn node_id(byte: u8) -> NodeId {
@@ -33,6 +37,7 @@ fn candidate(node_id: NodeId, direct_addrs: Vec<SocketAddr>) -> ZakuraDiscoveryD
 }
 
 /// Records an attempt to `node` that reserves `ips`, then completes it.
+#[cfg(test)]
 fn settle(
     state: &mut CandidateDialerState,
     node: NodeId,
@@ -376,6 +381,7 @@ enum DialerOp {
     },
 }
 
+#[cfg(test)]
 fn dial_result() -> impl Strategy<Value = DiscoveryDialResult> {
     prop_oneof![
         Just(DiscoveryDialResult::Registered),
@@ -387,6 +393,7 @@ fn dial_result() -> impl Strategy<Value = DiscoveryDialResult> {
     ]
 }
 
+#[cfg(test)]
 fn dialer_op() -> impl Strategy<Value = DialerOp> {
     prop_oneof![
         2 => (0u64..25_000).prop_map(DialerOp::Advance),
@@ -509,15 +516,14 @@ impl DialerModel {
     }
 }
 
-fn check_dialer(
-    state: &CandidateDialerState,
-    model: &DialerModel,
-    nodes: &[NodeId],
-    now: Instant,
-) -> Result<(), TestCaseError> {
+fn check_dialer(state: &CandidateDialerState, model: &DialerModel, nodes: &[NodeId], now: Instant) {
     let mut in_flight = state.in_flight_node_ids();
     let unique: HashSet<_> = in_flight.iter().copied().collect();
-    prop_assert_eq!(unique.len(), in_flight.len(), "one attempt per node");
+    assert_eq!(
+        unique.len(),
+        in_flight.len(),
+        "{PROPERTY}: one attempt per node"
+    );
     let mut expected: Vec<_> = model
         .in_flight
         .iter()
@@ -525,120 +531,284 @@ fn check_dialer(
         .collect();
     in_flight.sort();
     expected.sort();
-    prop_assert_eq!(in_flight, expected);
+    assert_eq!(in_flight, expected, "{PROPERTY}");
 
     for ip in 0..MODEL_IPS.len() {
         let reserved = state.in_flight_dials_to(model_ip(ip));
-        prop_assert_eq!(reserved, model.reserved(ip), "reservations of IP {}", ip);
-        prop_assert!(reserved <= MODEL_PER_IP_CAP);
+        assert_eq!(
+            reserved,
+            model.reserved(ip),
+            "{PROPERTY}: reservations of IP {}",
+            ip
+        );
+        assert!(reserved <= MODEL_PER_IP_CAP, "{PROPERTY}");
         for (node, &node_id) in nodes.iter().enumerate() {
-            prop_assert_eq!(
+            assert_eq!(
                 state.is_backed_off(node_id, model_ip(ip), now),
                 model.backed_off(node, ip),
-                "backoff of node {} for IP {}",
+                "{PROPERTY}: backoff of node {} for IP {}",
                 node,
                 ip
             );
         }
     }
-    Ok(())
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+const PROPERTY: &str = "discovery/dial-attempts";
 
-    // In-flight nodes stay unique, every reservation is released exactly
-    // once, and backoff and the local-limit pause follow the documented
-    // rules, under address rotation, supervisor refusals, local limits, and
-    // duplicate completions.
-    #[test]
-    fn candidate_dialer_matches_independent_model(
-        ops in prop::collection::vec(dialer_op(), 1..80),
-    ) {
-        let nodes = model_nodes();
-        let start = Instant::now();
-        let mut state = CandidateDialerState::new((
-            Duration::from_millis(MODEL_BACKOFF_BASE_MS),
-            Duration::from_millis(MODEL_BACKOFF_MAX_MS),
-        ));
-        let mut model = DialerModel::default();
+/// Applicable transitions in a decoder-v1 candidate dial history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct CandidateDialReplaySummary {
+    /// Attempts accepted with at least one IP reservation.
+    pub attempts: usize,
+    /// Explicit completions of live attempts.
+    pub completions: usize,
+    /// Duplicate completions rejected by identity.
+    pub duplicates: usize,
+    /// Local resource limits that pause dialing.
+    pub local_limits: usize,
+    /// Failed attempts that establish backoff.
+    pub failures: usize,
+    /// Round decisions checked at logical time.
+    pub rounds: usize,
+}
 
-        for op in ops {
-            let now = start + Duration::from_millis(model.now_ms);
-            match op {
-                DialerOp::Advance(ms) => model.now_ms += ms,
-                DialerOp::Round => prop_assert_eq!(state.begin_round(now), model.round()),
-                DialerOp::Dial { node, addresses, refused } => {
-                    let dialed = candidate(
-                        nodes[node],
-                        addresses.iter().map(|&address| model_address(address)).collect(),
-                    );
-                    let expected = model.candidate_addresses(node, &addresses);
-                    let planned = state.candidate_addresses(&dialed, now);
-                    prop_assert_eq!(
-                        &planned,
-                        &expected
-                            .iter()
-                            .map(|&(address, ip)| CandidateAddress {
-                                addr: model_address(address),
-                                ip: model_ip(ip),
-                            })
-                            .collect::<Vec<_>>()
-                    );
+/// Replay decoder-v1 triples against the existing candidate dialer model.
+/// Read at most 512 bytes. Logical time advances only through decoded events.
+pub fn replay_candidate_dial_bytes(data: &[u8]) -> CandidateDialReplaySummary {
+    run(decode(data), |_, _, _| {})
+}
 
-                    // The simulated supervisor refuses an IP the run marks
-                    // refused or one at its cap, counting this dialer's
-                    // in-flight attempts as the real check does.
-                    let accepted: Vec<_> = expected
+fn decode(data: &[u8]) -> impl Iterator<Item = DialerOp> + '_ {
+    data[..data.len().min(512)].chunks(3).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let result = match c % 6 {
+            0 => DiscoveryDialResult::Registered,
+            1 => DiscoveryDialResult::ConnectedElsewhere,
+            2 => DiscoveryDialResult::ShortLivedRegistered,
+            3 => DiscoveryDialResult::Failed,
+            4 => DiscoveryDialResult::AlpnMismatch,
+            _ => DiscoveryDialResult::LocalResourceLimit,
+        };
+        match a % 5 {
+            0 => DialerOp::Advance(u64::from(b) * 100),
+            1 => DialerOp::Round,
+            2 => DialerOp::Dial {
+                node: usize::from(a / 5) % MODEL_NODES,
+                addresses: (0..MODEL_ADDRESSES.len())
+                    .filter(|bit| b & (1 << bit) != 0)
+                    .collect(),
+                refused: [c & 1 != 0, c & 2 != 0, c & 4 != 0],
+            },
+            3 => DialerOp::Complete {
+                pick: usize::from(b),
+                result,
+                admitted: (c & 8 != 0).then_some(usize::from(c / 16) % MODEL_ADDRESSES.len()),
+            },
+            _ => DialerOp::Duplicate {
+                pick: usize::from(b),
+                result,
+            },
+        }
+    })
+}
+
+fn run(
+    ops: impl IntoIterator<Item = DialerOp>,
+    mut after_step: impl FnMut(&mut CandidateDialerState, &DialerModel, Instant),
+) -> CandidateDialReplaySummary {
+    let nodes = model_nodes();
+    let start = Instant::now();
+    let mut state = CandidateDialerState::new((
+        Duration::from_millis(MODEL_BACKOFF_BASE_MS),
+        Duration::from_millis(MODEL_BACKOFF_MAX_MS),
+    ));
+    let mut model = DialerModel::default();
+
+    let mut summary = CandidateDialReplaySummary::default();
+    for op in ops {
+        let now = start + Duration::from_millis(model.now_ms);
+        match op {
+            DialerOp::Advance(ms) => model.now_ms += ms,
+            DialerOp::Round => {
+                summary.rounds += 1;
+                assert_eq!(state.begin_round(now), model.round(), "{PROPERTY}");
+            }
+            DialerOp::Dial {
+                node,
+                addresses,
+                refused,
+            } => {
+                let dialed = candidate(
+                    nodes[node],
+                    addresses
                         .iter()
-                        .map(|&(_, ip)| ip)
-                        .filter(|&ip| !refused[ip] && model.reserved(ip) < MODEL_PER_IP_CAP)
-                        .collect();
-                    let recorded = state.record_attempt(
-                        nodes[node],
-                        accepted.iter().map(|&ip| model_ip(ip)).collect(),
-                    );
-                    let busy = model.in_flight.iter().any(|attempt| attempt.node == node);
-                    match recorded {
-                        Some(key) => {
-                            prop_assert!(!accepted.is_empty() && !busy);
-                            prop_assert_eq!(key.node_id, nodes[node]);
-                            prop_assert!(!model.settled.contains(&key), "keys are never reused");
-                            model.in_flight.push(ModelAttempt { key, node, ips: accepted });
-                        }
-                        None => prop_assert!(accepted.is_empty() || busy),
+                        .map(|&address| model_address(address))
+                        .collect(),
+                );
+                let expected = model.candidate_addresses(node, &addresses);
+                let planned = state.candidate_addresses(&dialed, now);
+                assert_eq!(
+                    &planned,
+                    &expected
+                        .iter()
+                        .map(|&(address, ip)| CandidateAddress {
+                            addr: model_address(address),
+                            ip: model_ip(ip),
+                        })
+                        .collect::<Vec<_>>(),
+                    "{PROPERTY}"
+                );
+
+                // The simulated supervisor refuses an IP the run marks
+                // refused or one at its cap, counting this dialer's
+                // in-flight attempts as the real check does.
+                let accepted: Vec<_> = expected
+                    .iter()
+                    .map(|&(_, ip)| ip)
+                    .filter(|&ip| !refused[ip] && model.reserved(ip) < MODEL_PER_IP_CAP)
+                    .collect();
+                let recorded = state.record_attempt(
+                    nodes[node],
+                    accepted.iter().map(|&ip| model_ip(ip)).collect(),
+                );
+                let busy = model.in_flight.iter().any(|attempt| attempt.node == node);
+                match recorded {
+                    Some(key) => {
+                        summary.attempts += 1;
+                        assert!(!accepted.is_empty() && !busy, "{PROPERTY}");
+                        assert_eq!(key.node_id, nodes[node], "{PROPERTY}");
+                        assert!(
+                            !model.settled.contains(&key),
+                            "{PROPERTY}: keys are never reused"
+                        );
+                        model.in_flight.push(ModelAttempt {
+                            key,
+                            node,
+                            ips: accepted,
+                        });
                     }
-                }
-                DialerOp::Complete { pick, result, admitted } => {
-                    if model.in_flight.is_empty() {
-                        continue;
-                    }
-                    let index = pick % model.in_flight.len();
-                    let key = model.in_flight[index].key;
-                    prop_assert!(state.complete(key, result, admitted.map(model_address).map(|addr| addr.ip()), now));
-                    model.complete(index, result, admitted);
-                }
-                DialerOp::Duplicate { pick, result } => {
-                    if model.settled.is_empty() {
-                        continue;
-                    }
-                    let key = model.settled[pick % model.settled.len()];
-                    prop_assert!(!state.complete(key, result, None, now));
+                    None => assert!(accepted.is_empty() || busy, "{PROPERTY}"),
                 }
             }
-            let now = start + Duration::from_millis(model.now_ms);
-            check_dialer(&state, &model, &nodes, now)?;
+            DialerOp::Complete {
+                pick,
+                result,
+                admitted,
+            } => {
+                if model.in_flight.is_empty() {
+                    continue;
+                }
+                let index = pick % model.in_flight.len();
+                let key = model.in_flight[index].key;
+                assert!(
+                    state.complete(
+                        key,
+                        result,
+                        admitted.map(model_address).map(|addr| addr.ip()),
+                        now
+                    ),
+                    "{PROPERTY}"
+                );
+                model.complete(index, result, admitted);
+                summary.completions += 1;
+                summary.local_limits +=
+                    usize::from(result == DiscoveryDialResult::LocalResourceLimit);
+                summary.failures += usize::from(matches!(
+                    result,
+                    DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch
+                ));
+            }
+            DialerOp::Duplicate { pick, result } => {
+                if model.settled.is_empty() {
+                    continue;
+                }
+                summary.duplicates += 1;
+                let key = model.settled[pick % model.settled.len()];
+                assert!(!state.complete(key, result, None, now), "{PROPERTY}");
+            }
         }
-
-        // Settling every remaining attempt releases every reservation.
         let now = start + Duration::from_millis(model.now_ms);
-        while let Some(attempt) = model.in_flight.first() {
-            prop_assert!(state.complete(attempt.key, DiscoveryDialResult::Failed, None, now));
-            model.complete(0, DiscoveryDialResult::Failed, None);
-        }
-        check_dialer(&state, &model, &nodes, now)?;
-        for ip in 0..MODEL_IPS.len() {
-            prop_assert_eq!(state.in_flight_dials_to(model_ip(ip)), 0);
-        }
+        after_step(&mut state, &model, now);
+        check_dialer(&state, &model, &nodes, now);
     }
+
+    // Settling every remaining attempt releases every reservation.
+    let now = start + Duration::from_millis(model.now_ms);
+    while let Some(attempt) = model.in_flight.first() {
+        assert!(
+            state.complete(attempt.key, DiscoveryDialResult::Failed, None, now),
+            "{PROPERTY}"
+        );
+        model.complete(0, DiscoveryDialResult::Failed, None);
+    }
+    check_dialer(&state, &model, &nodes, now);
+    for ip in 0..MODEL_IPS.len() {
+        assert_eq!(state.in_flight_dials_to(model_ip(ip)), 0, "{PROPERTY}");
+    }
+    summary
+}
+
+#[cfg(test)]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn candidate_dialer_matches_independent_model(ops in prop::collection::vec(dialer_op(), 1..80)) {
+        run(ops, |_, _, _| {});
+    }
+
+    #[test]
+    fn candidate_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_candidate_dial_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[
+    2, 7, 0, 3, 0, 3, 4, 0, 3, 0, 30, 0, 1, 0, 0, 2, 7, 0, 3, 0, 5, 1, 0, 0, 0, 10, 0, 1, 0, 0,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn candidate_witness_exercises_identity_backoff_and_local_limits() {
+    let summary = replay_candidate_dial_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        CandidateDialReplaySummary {
+            attempts: 2,
+            completions: 2,
+            duplicates: 1,
+            local_limits: 1,
+            failures: 1,
+            rounds: 3,
+        }
+    );
+    assert_eq!(
+        replay_candidate_dial_bytes(&[]),
+        CandidateDialReplaySummary::default()
+    );
+    println!("tier=Machine target=discovery_candidate decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "discovery/dial-attempts")]
+fn candidate_witness_rejects_premature_reservation_release() {
+    run(decode(WITNESS), |state, model, now| {
+        if let Some(attempt) = model.in_flight.first() {
+            state.complete(attempt.key, DiscoveryDialResult::Registered, None, now);
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "discovery/dial-attempts")]
+fn candidate_witness_rejects_lost_backoff() {
+    run(decode(WITNESS), |state, _, now| {
+        state.begin_round(now + Duration::from_secs(120));
+    });
 }

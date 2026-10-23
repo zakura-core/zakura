@@ -111,3 +111,27 @@ Two planted failures reset a failed attempt or charge a local limit.
 These targets check pure policies. They do not prove worker cancellation or
 connection ownership across scheduled IO. The planned P1 registry will index
 the local IDs and witnesses.
+
+## Discovery query and candidate targets
+
+| Target | Local property ID | Applicability witness |
+| --- | --- | --- |
+| `discovery_query` | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
+| `discovery_candidate` | `discovery/dial-attempts` | `candidate_witness_exercises_identity_backoff_and_local_limits` |
+
+Both decoder-v1 targets share their existing proptest models with cargo-fuzz.
+They read at most 512 bytes and report zero applicability for empty histories.
+Each target has its own 900-second daily and 3,600-second weekly budget.
+
+`discovery_query` decodes reservation, queue, release and claim operations.
+Its model calculates wire caps independently and checks that an answer claims
+its own reservation once. Its witness exercises refusal, unsent release, an
+exact-cap answer, an oversized answer and a stale claim. Planted failures lose
+a reservation or release a queued query.
+
+`discovery_candidate` decodes triples into dial, completion, duplicate, round
+and logical-time operations. Its model tracks canonical IP reservations and
+per-node backoff. Its witness exercises a duplicate completion, failure backoff
+and a local-limit pause. Planted failures release reservations early or discard
+backoff. Final cleanup settles every remaining logical reservation. This does
+not prove that an asynchronous worker releases its admission permit.

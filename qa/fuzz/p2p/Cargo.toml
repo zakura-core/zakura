@@ -54,3 +54,17 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "discovery_query"
+path = "fuzz_targets/discovery_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_candidate"
+path = "fuzz_targets/discovery_candidate.rs"
+test = false
+doc = false
+bench = false

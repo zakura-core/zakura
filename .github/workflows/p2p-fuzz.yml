@@ -81,6 +81,22 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: discovery_query
+            decoder: 1
+            witness: query_witness_exercises_ownership_and_caps
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: discovery_candidate
+            decoder: 1
+            witness: candidate_witness_exercises_identity_backoff_and_local_limits
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

@@ -194,3 +194,22 @@ block 1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.
 Each target has its own 900-second daily and 3,600-second weekly budget. These
 tests prove logical submission and evidence ownership. They do not prove
 decoded-memory retention or asynchronous channel delivery.
+
+## Header publisher target
+
+`header_publisher` shares the existing publisher model between proptest and
+cargo-fuzz. Its local property ID is `header/publisher-policy`. The model checks
+credit, contiguous pages, legal terminal outcomes, stale jobs and shutdown.
+It calculates schema-0 Regtest entry size as 181 bytes and the page prefix as
+82 bytes from the wire fields, independently of production size helpers.
+
+Decoder version 1 reads at most 512 bytes in four-byte operations. Empty inputs
+report zero applicability. `publisher_witness_exercises_credit_terminal_and_stale_page`
+spends credit on one page, writes the terminal outcome, then rejects a stale page.
+Three planted failures lose credit, a job, or a terminal outcome. They must
+report the intended property ID. Each operation compares the complete credit
+ledger with the independent model.
+
+The target has its own 900-second daily and 3,600-second weekly budget. It checks
+the publisher state. Scheduled storage waits and transport writes remain
+separate simulator adapter obligations.

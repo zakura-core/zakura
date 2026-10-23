@@ -25,6 +25,36 @@ use std::{
 };
 
 use super::*;
+#[cfg(test)]
+use crate::zakura::header_sync::v9::test_support::OUTCOME_CODES;
+use crate::zakura::header_sync::v9::{Cursor, Operation, RegtestMessage};
+use crate::zakura::{wire_codec::decode_frame, Credit, Frame};
+#[cfg(test)]
+use proptest::prelude::*;
+use zakura_chain::work::difficulty::U256;
+use zakura_header_chain::{
+    AlarmSet, ChainScore, EngineMode, FrontierSet, StateVersion, SuffixWork, VerifiedGeneration,
+};
+
+const HB: usize = crate::zakura::header_sync::config::REGTEST_HEADER_BYTES;
+/// A selected chain ending at `tip`.
+pub(super) fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot {
+    EngineSnapshot {
+        mode: EngineMode::Integrated,
+        state_version: StateVersion::new(generation),
+        header_generation: HeaderGeneration::new(generation),
+        verified_generation: VerifiedGeneration::new(1),
+        frontiers: FrontierSet {
+            finalized: genesis,
+            header_best: tip,
+            verified_best: genesis,
+        },
+        header_best_score: ChainScore::new(SuffixWork::new(U256::from(tip.height.0)), tip.hash),
+        oldest_retained_height: block::Height(0),
+        alarms: AlarmSet::default(),
+    }
+}
+
 use crate::zakura::{
     header_sync::v9::{message_type, MAX_HS_SUBSCRIPTIONS},
     regulation::Totals,
@@ -41,12 +71,12 @@ const MAX_LIVE: usize = MAX_HS_SUBSCRIPTIONS as usize;
 
 /// One schema-0 entry's bytes on Regtest.
 fn entry() -> u64 {
-    entry_bytes(HB, AuxSchema::None) as u64
+    181
 }
 
 /// A page's fixed bytes.
 fn fixed() -> u64 {
-    HEADERS_RESPONSE_FIXED_BYTES as u64
+    82
 }
 
 /// Three headers per page, and bytes for exactly three entries.
@@ -299,11 +329,11 @@ enum Step {
     Page {
         headers: u32,
         shave: u64,
-        stale: Option<prop::sample::Index>,
+        stale: Option<usize>,
     },
     Finish {
         answer: Answer,
-        stale: Option<prop::sample::Index>,
+        stale: Option<usize>,
     },
     EndDue,
     NextTerminal,
@@ -313,17 +343,20 @@ enum Step {
     /// The stream or the runtime closed under the job in progress.
     Closed,
     Select(Option<Tip>),
-    Release(prop::sample::Index),
+    Release(usize),
 }
 
+#[cfg(test)]
 fn sequence() -> impl Strategy<Value = Sequence> {
     prop_oneof![4 => Just(Sequence::Next), 1 => Just(Sequence::Repeat)]
 }
 
-fn stale() -> impl Strategy<Value = Option<prop::sample::Index>> {
-    prop::option::weighted(0.2, any::<prop::sample::Index>())
+#[cfg(test)]
+fn stale() -> impl Strategy<Value = Option<usize>> {
+    prop::option::weighted(0.2, any::<usize>())
 }
 
+#[cfg(test)]
 fn answer() -> impl Strategy<Value = Answer> {
     let own = OUTCOME_CODES
         .into_iter()
@@ -340,6 +373,7 @@ fn answer() -> impl Strategy<Value = Answer> {
 }
 
 /// Steps that stop the publisher are rare, so most histories run long.
+#[cfg(test)]
 fn step() -> impl Strategy<Value = Step> {
     let id = 1..=IDS;
     prop_oneof![
@@ -374,7 +408,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Closed),
         10 => prop::option::weighted(0.9, (0..=2u8, 0..=8u32))
             .prop_map(|tip| Step::Select(tip.map(|(branch, height)| Tip { branch, height }))),
-        4 => any::<prop::sample::Index>().prop_map(Step::Release),
+        4 => any::<usize>().prop_map(Step::Release),
     ]
 }
 
@@ -460,7 +494,7 @@ impl Machine {
                 if self.signals.is_empty() {
                     return;
                 }
-                let index = which.index(self.signals.len());
+                let index = which % self.signals.len();
                 self.state
                     .capacity_released(std::slice::from_ref(&self.signals[index]));
                 for sub in self.model.subs.values_mut() {
@@ -505,7 +539,11 @@ impl Machine {
             } else {
                 Ok(Applied::Live)
             };
-        assert_eq!(self.state.apply(&update, page_limits()), expected);
+        assert_eq!(
+            self.state.apply(&update, page_limits()),
+            expected,
+            "{PROPERTY}"
+        );
         if expected.is_err() {
             return;
         }
@@ -638,7 +676,11 @@ impl Machine {
         } else {
             Err(SubscriptionFault::Unknown.into())
         };
-        assert_eq!(self.state.apply(&update, page_limits()), expected);
+        assert_eq!(
+            self.state.apply(&update, page_limits()),
+            expected,
+            "{PROPERTY}"
+        );
     }
 
     /// The job the model expects next, superseding followers on the way.
@@ -707,9 +749,8 @@ impl Machine {
         if busy {
             assert!(
                 job.is_none(),
-                "no job starts beside another, a waiting terminal outcome, or after exit: {:?}",
-                self.model
-            );
+                "{PROPERTY}: no job starts beside another, a waiting terminal outcome, or after exit: {:?}",
+                self.model);
             return;
         }
         let found = job.as_ref().map(|job| {
@@ -721,7 +762,7 @@ impl Machine {
                 job.lease_target,
             )
         });
-        assert_eq!(found, expected, "the next job");
+        assert_eq!(found, expected, "{PROPERTY}: the next job");
         let Some(job) = job else {
             return;
         };
@@ -736,14 +777,14 @@ impl Machine {
     }
 
     /// The job a result answers: a stale one, or the one in progress.
-    fn answering(&self, stale: Option<prop::sample::Index>) -> Option<(JobRecord, bool)> {
+    fn answering(&self, stale: Option<usize>) -> Option<(JobRecord, bool)> {
         match (stale, self.stale.is_empty()) {
-            (Some(index), false) => Some((self.stale[index.index(self.stale.len())].clone(), true)),
+            (Some(index), false) => Some((self.stale[index % self.stale.len()].clone(), true)),
             _ => self.model.in_progress.clone().map(|record| (record, false)),
         }
     }
 
-    fn page(&mut self, headers: u32, shave: u64, stale: Option<prop::sample::Index>) {
+    fn page(&mut self, headers: u32, shave: u64, stale: Option<usize>) {
         let Some((record, is_stale)) = self.answering(stale) else {
             return;
         };
@@ -782,8 +823,12 @@ impl Machine {
         let before = observe(&self.state);
         let committed = self.state.commit(job.key, &page);
         if is_stale {
-            assert!(!committed, "a stale page is never sent");
-            assert_eq!(observe(&self.state), before, "a stale page spends nothing");
+            assert!(!committed, "{PROPERTY}: a stale page is never sent");
+            assert_eq!(
+                observe(&self.state),
+                before,
+                "{PROPERTY}: a stale page spends nothing"
+            );
             return;
         }
         self.settle(record.clone());
@@ -794,10 +839,10 @@ impl Machine {
             .expect("a running job's subscription is live");
         assert_eq!(
             sub.last, job.parent,
-            "the page extends the last header sent"
+            "{PROPERTY}: the page extends the last header sent"
         );
         let expected = !sub.closing;
-        assert_eq!(committed, expected, "the commit verdict");
+        assert_eq!(committed, expected, "{PROPERTY}: the commit verdict");
         if !committed {
             return;
         }
@@ -807,7 +852,7 @@ impl Machine {
         };
         assert!(
             u64::from(count) <= unspent.objects && bytes <= unspent.bytes,
-            "the page spends only granted credit"
+            "{PROPERTY}: the page spends only granted credit"
         );
         sub.consumed = sub.consumed.add(u64::from(count), bytes);
         sub.sent.push_back(Cursor {
@@ -829,11 +874,11 @@ impl Machine {
                 objects: sub.consumed.objects,
                 bytes: sub.consumed.bytes,
             }),
-            "state's consumed credit matches the model's"
+            "{PROPERTY}: state's consumed credit matches the model's"
         );
     }
 
-    fn finish(&mut self, answer: Answer, stale: Option<prop::sample::Index>) {
+    fn finish(&mut self, answer: Answer, stale: Option<usize>) {
         let Some((record, is_stale)) = self.answering(stale) else {
             return;
         };
@@ -868,7 +913,7 @@ impl Machine {
             assert_eq!(
                 observe(&self.state),
                 before,
-                "a stale result changes nothing"
+                "{PROPERTY}: a stale result changes nothing"
             );
             return;
         }
@@ -918,7 +963,10 @@ impl Machine {
             })
             .collect();
         let codes: Vec<HeadersOutcomeCode> = expected.iter().map(|(_, code)| *code).collect();
-        assert_eq!(ended, codes, "the terminal outcomes and their order");
+        assert_eq!(
+            ended, codes,
+            "{PROPERTY}: the terminal outcomes and their order"
+        );
         for (id, outcome) in expected {
             let sub = model
                 .subs
@@ -926,7 +974,7 @@ impl Machine {
                 .expect("an ended subscription was live");
             assert!(
                 model_legal(outcome, sub.pages > 0, sub.reached(), sub.closing),
-                "{outcome:?} is legal for {sub:?}"
+                "{PROPERTY}: {outcome:?} is legal for {sub:?}"
             );
             let abandoned = model.in_progress.take_if(|record| record.job.id == id);
             model.queued.push_back(ModelTerminal {
@@ -969,7 +1017,7 @@ impl Machine {
             expected
                 .as_ref()
                 .map(|terminal| (terminal.id, terminal.outcome, terminal.abandons)),
-            "the next terminal outcome, one at a time and in order"
+            "{PROPERTY}: the next terminal outcome, one at a time and in order"
         );
         if terminal.is_some() {
             model.writing = expected;
@@ -995,7 +1043,7 @@ impl Machine {
         assert_eq!(
             self.state.terminal_written(written),
             expected,
-            "a refused terminal outcome stops the publisher"
+            "{PROPERTY}: a refused terminal outcome stops the publisher"
         );
         self.check_stopped();
     }
@@ -1006,7 +1054,11 @@ impl Machine {
             Exit::Cancelled => state.cancelled(),
             Exit::Closed => state.closed(),
         };
-        assert_eq!(stopped(&mut self.state, exit), exit, "the reason to stop");
+        assert_eq!(
+            stopped(&mut self.state, exit),
+            exit,
+            "{PROPERTY}: the reason to stop"
+        );
         self.model.exit = Some(exit);
         let other = match exit {
             Exit::Cancelled => Exit::Closed,
@@ -1015,7 +1067,7 @@ impl Machine {
         assert_eq!(
             stopped(&mut self.state, other),
             exit,
-            "the first reason to stop wins"
+            "{PROPERTY}: the first reason to stop wins"
         );
         self.check_stopped();
     }
@@ -1030,15 +1082,16 @@ impl Machine {
             self.state
                 .next_job::<HB>(selected.as_ref(), page_limits())
                 .is_none(),
-            "no job starts after the publisher stops"
+            "{PROPERTY}: no job starts after the publisher stops"
         );
         assert!(
             self.state.next_terminal().is_none(),
-            "no terminal outcome is written after the publisher stops"
+            "{PROPERTY}: no terminal outcome is written after the publisher stops"
         );
     }
 }
 
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256)))]
 
@@ -1047,10 +1100,7 @@ proptest! {
     /// let no stale job result change anything.
     #[test]
     fn publisher_state_matches_the_model(steps in prop::collection::vec(step(), 1..64)) {
-        let mut machine = Machine::new();
-        for step in &steps {
-            machine.run(step);
-        }
+        run(steps, |_, _| {});
     }
 }
 
@@ -1233,6 +1283,7 @@ fn another_subscriptions_page_commits_while_a_terminal_waits() {
 }
 
 /// Two subscriptions that close together, with the first outcome taken.
+#[cfg(test)]
 fn two_closed_one_writing() -> Machine {
     let mut machine = Machine::new();
     for id in [1, 2] {
@@ -1274,4 +1325,249 @@ fn a_refused_terminal_write_stops_the_publisher() {
     let mut machine = two_closed_one_writing();
     machine.run(&Step::TerminalWritten(false));
     assert_eq!(machine.model.exit, Some(Exit::Closed));
+}
+
+const PROPERTY: &str = "header/publisher-policy";
+
+/// Applicable operations in a decoder-v1 publisher history.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct HeaderPublisherReplaySummary {
+    /// Operations executed before publisher shutdown.
+    pub transitions: usize,
+    /// New jobs issued.
+    pub jobs: usize,
+    /// Pages that consumed credit.
+    pub pages: usize,
+    /// Header credit consumed by those pages.
+    pub headers: u64,
+    /// Byte credit consumed by those pages.
+    pub bytes: u64,
+    /// Results delivered for an abandoned or settled job.
+    pub stale_results: usize,
+    /// Successful writes of a pending terminal outcome.
+    pub terminals: usize,
+}
+
+/// Replay decoder-v1 quadruples against the existing publisher model.
+/// Read at most 512 bytes. The model derives page sizes from the wire layout.
+pub fn replay_header_publisher_bytes(data: &[u8]) -> HeaderPublisherReplaySummary {
+    run(decode(data), |_, _| {})
+}
+
+fn decode(data: &[u8]) -> impl Iterator<Item = Step> + '_ {
+    data[..data.len().min(512)].chunks(4).map(|chunk| {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        let d = chunk.get(3).copied().unwrap_or(0);
+        let id = u64::from(b) % IDS + 1;
+        let sequence = if c & 128 == 0 {
+            Sequence::Next
+        } else {
+            Sequence::Repeat
+        };
+        let stale = (d & 128 != 0).then_some(usize::from(d % 128));
+        match a % 32 {
+            0..=3 => Step::Open {
+                id,
+                at_target: a & 32 != 0,
+                target: u32::from(c % 5) + 1,
+                objects: u32::from(d % 6) + 1,
+                units: u32::from(d / 6 % 6) + 1,
+            },
+            4..=7 => Step::Grant {
+                id,
+                sequence,
+                ack: usize::from(c % 8),
+                objects: u32::from(d % 5),
+                units: u32::from(d / 5 % 5),
+            },
+            8..=9 => Step::Close {
+                id,
+                sequence,
+                ack: usize::from(c % 8),
+            },
+            10..=14 => Step::NextJob,
+            15..=19 => Step::Page {
+                headers: u32::from(b % 3) + 1,
+                shave: u64::from(c % 3),
+                stale,
+            },
+            20..=22 => Step::Finish {
+                answer: match b % 10 {
+                    0 => Answer::End(HeadersOutcomeCode::TargetNotRetained),
+                    1 => Answer::End(HeadersOutcomeCode::NoLocatorIntersection),
+                    2 => Answer::End(HeadersOutcomeCode::HistoryPruned),
+                    3 => Answer::End(HeadersOutcomeCode::TargetNotSelected),
+                    4 => Answer::End(HeadersOutcomeCode::SubscriptionSuperseded),
+                    5 => Answer::Local,
+                    6 => Answer::Capacity,
+                    7 => Answer::Retry,
+                    8 => Answer::Extends,
+                    _ => Answer::ReachedAtOpen,
+                },
+                stale,
+            },
+            23 => Step::EndDue,
+            24 => Step::NextTerminal,
+            25 => Step::TerminalWritten(b % 10 != 9),
+            26..=27 => Step::Select((d & 1 == 0).then_some(Tip {
+                branch: b % 3,
+                height: u32::from(c % 9),
+            })),
+            28..=29 => Step::Release(usize::from(b)),
+            30 => Step::Cancel,
+            _ => Step::Closed,
+        }
+    })
+}
+
+fn run(
+    steps: impl IntoIterator<Item = Step>,
+    mut after_step: impl FnMut(&mut Machine, &Step),
+) -> HeaderPublisherReplaySummary {
+    let mut machine = Machine::new();
+    let mut summary = HeaderPublisherReplaySummary::default();
+    for step in steps {
+        if machine.model.exit.is_some() {
+            break;
+        }
+        summary.transitions += 1;
+        let was_idle = machine.model.in_progress.is_none();
+        let consumed = || {
+            machine
+                .model
+                .subs
+                .values()
+                .fold((0u64, 0u64), |(objects, bytes), sub| {
+                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
+                })
+        };
+        let before = consumed();
+        match &step {
+            Step::Page { stale, .. } | Step::Finish { stale, .. } => {
+                summary.stale_results +=
+                    usize::from(machine.answering(*stale).is_some_and(|(_, stale)| stale));
+            }
+            Step::TerminalWritten(true) => {
+                summary.terminals += usize::from(machine.writing.is_some())
+            }
+            _ => {}
+        }
+        machine.run(&step);
+        if matches!(step, Step::NextJob) && was_idle && machine.model.in_progress.is_some() {
+            summary.jobs += 1;
+        }
+        if matches!(step, Step::Page { .. }) {
+            let after = machine
+                .model
+                .subs
+                .values()
+                .fold((0u64, 0u64), |(objects, bytes), sub| {
+                    (objects + sub.consumed.objects, bytes + sub.consumed.bytes)
+                });
+            summary.pages += usize::from(after.0 > before.0);
+            summary.headers += after.0.saturating_sub(before.0);
+            summary.bytes += after.1.saturating_sub(before.1);
+        }
+        after_step(&mut machine, &step);
+        if machine.model.exit.is_none() {
+            let expected: Vec<_> = machine
+                .model
+                .subs
+                .iter()
+                .map(|(id, sub)| {
+                    (
+                        *id,
+                        Totals {
+                            objects: sub.granted.objects,
+                            bytes: sub.granted.bytes,
+                        },
+                        Totals {
+                            objects: sub.consumed.objects,
+                            bytes: sub.consumed.bytes,
+                        },
+                        Some(sub.sent.len()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                observe(&machine.state),
+                expected,
+                "{PROPERTY}: credit ledger"
+            );
+        }
+    }
+    summary
+}
+
+#[cfg(test)]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn publisher_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) {
+        replay_header_publisher_bytes(&bytes);
+    }
+}
+
+#[cfg(test)]
+const WITNESS: &[u8] = &[
+    0, 0, 4, 35, 10, 0, 0, 0, 15, 0, 0, 0, 8, 0, 0, 0, 23, 0, 0, 0, 24, 0, 0, 0, 25, 0, 0, 0, 15,
+    0, 0, 128,
+];
+
+#[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
+fn publisher_witness_exercises_credit_terminal_and_stale_page() {
+    let summary = replay_header_publisher_bytes(WITNESS);
+    assert_eq!(
+        summary,
+        HeaderPublisherReplaySummary {
+            transitions: 8,
+            jobs: 1,
+            pages: 1,
+            headers: 1,
+            bytes: 263,
+            stale_results: 1,
+            terminals: 1
+        }
+    );
+    assert_eq!(
+        replay_header_publisher_bytes(&[]),
+        HeaderPublisherReplaySummary::default()
+    );
+    println!("tier=Machine target=header_publisher decoder=1 {summary:?}");
+}
+
+#[test]
+#[should_panic(expected = "header/publisher-policy")]
+fn publisher_witness_rejects_lost_credit() {
+    run(decode(WITNESS), |machine, step| {
+        if matches!(step, Step::Open { .. }) {
+            machine.state.publications.end(&1);
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "header/publisher-policy")]
+fn publisher_witness_rejects_lost_job() {
+    run(decode(WITNESS), |machine, step| {
+        if matches!(step, Step::Open { .. }) {
+            machine.state.next_job::<HB>(None, page_limits());
+        }
+    });
+}
+
+#[test]
+#[should_panic(expected = "header/publisher-policy")]
+fn publisher_witness_rejects_lost_terminal() {
+    run(decode(WITNESS), |machine, step| {
+        if matches!(step, Step::EndDue) {
+            machine.state.next_terminal();
+        }
+    });
 }

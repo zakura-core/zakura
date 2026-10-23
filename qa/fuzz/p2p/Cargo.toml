@@ -25,4 +25,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "block_query"
+path = "fuzz_targets/block_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_fill"
+path = "fuzz_targets/block_fill.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

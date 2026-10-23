@@ -20,6 +20,8 @@ use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{replay_block_query_bytes, BlockQueryReplaySummary};
 #[cfg(test)]
 mod tests;
 mod trace;

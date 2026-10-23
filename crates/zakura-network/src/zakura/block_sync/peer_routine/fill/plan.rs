@@ -16,8 +16,12 @@ use crate::zakura::block_sync::{
 
 use super::{FillLimits, FillStop};
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fuzz::{replay_block_fill_bytes, BlockFillReplaySummary};
 
 /// One bounded take from the work queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

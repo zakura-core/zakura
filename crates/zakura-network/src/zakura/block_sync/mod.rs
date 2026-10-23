@@ -39,6 +39,8 @@ mod error;
 mod events;
 mod peer_registry;
 mod peer_routine;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_routine::{replay_block_fill_bytes, BlockFillReplaySummary};
 mod pipe;
 mod reactor;
 mod regulated;
@@ -74,6 +76,8 @@ pub use events::{
     BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{replay_block_query_bytes, BlockQueryReplaySummary};
 pub use request::BlockSizeEstimate;
 #[cfg(test)]
 pub(crate) use service::block_sync_streams;

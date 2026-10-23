@@ -1898,6 +1898,7 @@ dependencies = [
  "tower",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-rt",
 ]
 
 [[package]]
@@ -2077,6 +2078,7 @@ dependencies = [
 name = "zakura-rt"
 version = "0.1.0-rc0"
 dependencies = [
+ "pin-project-lite",
  "rand 0.10.2",
  "tokio",
  "tokio-stream",

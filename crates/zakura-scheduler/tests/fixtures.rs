@@ -1141,7 +1141,10 @@ const STARVATION_SCHEDULE: &[&str] = &["holder.1", "holder.1", "holder.1", "wait
 #[test]
 fn saved_schedules_for_lock_cycle_and_starvation() {
     // `noise` waits on its timer while the pair parks. Once time moves, it's
-    // ready but has no worker, and the cycle still reports `Deadlock`.
+    // ready but has no worker, and the cycle still reports `Deadlock`. That's
+    // the one shape `status()` already handles. With a spare worker, or with
+    // the timer still pending, the cycle shows as `Running` or
+    // `WaitingOnTime` instead (#1635).
     let (r, _) = replay(2, AB_BA_WITH_NOISE_SCHEDULE, ab_ba(true)).expect("replays");
     assert_eq!(r.status, Status::Deadlock);
     assert!(

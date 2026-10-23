@@ -215,18 +215,17 @@ struct Sites {
     marks: Vec<u32>,
 }
 
+/// The discovery service's source, as the binary was built from it. The
+/// observations carry the line numbers compiled into the binary, so the
+/// sites must come from the same text, never from the checkout at run time.
+const SERVICE_RS: &str = include_str!("../../../zakura-network/src/zakura/discovery/service.rs");
+
 impl Sites {
     /// Finds the sites in the discovery service's source, so the check
     /// follows the code as it moves.
     fn find() -> Sites {
         let file = "crates/zakura-network/src/zakura/discovery/service.rs";
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../zakura-network/src/zakura/discovery/service.rs"
-        );
-        let source =
-            std::fs::read_to_string(path).expect("the discovery source is in the workspace");
-        let lines: Vec<&str> = source.lines().collect();
+        let lines: Vec<&str> = SERVICE_RS.lines().collect();
         let find = |from: usize, needle: &str| {
             from + lines[from..]
                 .iter()

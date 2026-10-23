@@ -3556,6 +3556,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "zakura-rt",
  "zakura-scheduler",
 ]
 

@@ -100,6 +100,10 @@ pub trait Executor {
     /// UTC at virtual time zero. [`crate::time::utc_now`] adds virtual time
     /// to it. The default, [`DEFAULT_UTC_ORIGIN_SINCE_EPOCH`] after the Unix
     /// epoch, keeps a run that sets no origin deterministic.
+    ///
+    /// The executor must keep the origin plus [`Executor::now`] within what
+    /// `SystemTime` can hold, refusing to move time past it, so a task's
+    /// `utc_now` never overflows.
     fn utc_origin(&self) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + DEFAULT_UTC_ORIGIN_SINCE_EPOCH
     }

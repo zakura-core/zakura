@@ -25,6 +25,8 @@ use zakura_rt::{
     sync::{watch, AsyncMutex},
 };
 
+use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
+use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
     canonical_ip, regulation::SlotBudget, BlockSyncStatus, ServiceAdmissionDecision,
@@ -771,7 +773,7 @@ impl Default for ZakuraDiscoveryBookLimits {
 /// A stored Zakura discovery record with local dial metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryEntry {
-    record: ZakuraNodeRecord,
+    record: VerifiedRecord,
     source: Option<NodeId>,
     is_static: bool,
     last_seen: u64,
@@ -787,6 +789,11 @@ pub struct ZakuraDiscoveryEntry {
 impl ZakuraDiscoveryEntry {
     /// Returns the latest valid signed record for this node.
     pub fn record(&self) -> &ZakuraNodeRecord {
+        &self.record
+    }
+
+    /// Returns the stored record's verification evidence.
+    pub(super) fn verified_record(&self) -> &VerifiedRecord {
         &self.record
     }
 
@@ -946,7 +953,7 @@ pub struct ImportBatchOutcome {
 }
 
 impl ImportBatchOutcome {
-    fn record_success(&mut self, outcome: ImportOutcome) {
+    pub(super) fn record_success(&mut self, outcome: ImportOutcome) {
         match outcome {
             ImportOutcome::Added => self.added += 1,
             ImportOutcome::Updated => self.updated += 1,
@@ -1058,12 +1065,12 @@ fn relay_verdict(error: &DiscoveryRecordError) -> RecordVerdict {
 fn verify_relayed(
     records: Vec<ZakuraNodeRecord>,
     context: &DiscoveryRecordValidationContext,
-) -> Result<(Vec<ZakuraNodeRecord>, usize), DiscoveryRecordError> {
+) -> Result<(Vec<VerifiedRecord>, usize), DiscoveryRecordError> {
     let mut authentic = Vec::with_capacity(records.len());
     let mut dropped = 0;
     for record in records {
-        match record.verify_authentic(context) {
-            Ok(()) => authentic.push(record),
+        match VerifiedRecord::verify(record, context) {
+            Ok(verified) => authentic.push(verified),
             Err(error) => match relay_verdict(&error) {
                 RecordVerdict::Drop => dropped += 1,
                 RecordVerdict::Disconnect => return Err(error),
@@ -1203,15 +1210,25 @@ impl fmt::Debug for ZakuraDiscoveryLocalConfig {
 }
 
 /// Cloneable passive runtime handle for native Zakura discovery state.
+///
+/// The handle is discovery's IO. It holds the logical [`DiscoveryState`] under
+/// one mutex and owns the runtime resources around it: the clocks, the random
+/// source, the signing key, the verification slots, and the watches it
+/// publishes.
 #[derive(Clone)]
 pub struct ZakuraDiscoveryHandle {
-    inner: Arc<AsyncMutex<ZakuraDiscoveryInner>>,
+    inner: Arc<AsyncMutex<DiscoveryState>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
     self_record_tx: watch::Sender<Arc<ZakuraNodeRecord>>,
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     peer_snapshot_tx: watch::Sender<ServicePeerSnapshot>,
-    import_validation: DiscoveryImportValidation,
+    /// Signs each self-record body the state proposes.
+    signing_key: Arc<NodeSecretKey>,
+    /// The state's validation context, copied at construction so record
+    /// verification runs outside the lock. Every field except the time is fixed
+    /// for the handle's lifetime.
+    verification_context: DiscoveryRecordValidationContext,
     /// Node-wide slots for record signature verification. Each session's
     /// reader verifies one message at a time, so a peer holds at most one slot.
     verify_slots: SlotBudget,
@@ -1226,38 +1243,6 @@ fn record_verify_slots() -> SlotBudget {
         .expect("the slot count is at least one and far below the semaphore maximum")
 }
 
-/// Immutable inputs needed to validate and bound a peer record batch without holding the
-/// global discovery mutex.
-///
-/// These mirror the fields [`ZakuraDiscoveryInner::validation_context`] reads, all of which
-/// are fixed at construction (local identity/network parameters and import limits never
-/// change at runtime). Snapshotting them on the handle lets record imports run CPU-heavy
-/// Ed25519 verification outside the lock.
-#[derive(Clone, Debug)]
-struct DiscoveryImportValidation {
-    expected_network_id: ZakuraNetworkId,
-    expected_chain_id: [u8; 32],
-    supported_protocol_min: u16,
-    supported_protocol_max: u16,
-    max_record_ttl: Duration,
-    clock_skew_tolerance: Duration,
-    max_imported_records_per_response: usize,
-}
-
-impl DiscoveryImportValidation {
-    fn context(&self, now: u64) -> DiscoveryRecordValidationContext {
-        DiscoveryRecordValidationContext {
-            expected_network_id: self.expected_network_id,
-            expected_chain_id: self.expected_chain_id,
-            current_unix_secs: now,
-            supported_protocol_min: self.supported_protocol_min,
-            supported_protocol_max: self.supported_protocol_max,
-            max_record_ttl: self.max_record_ttl,
-            clock_skew_tolerance: self.clock_skew_tolerance,
-        }
-    }
-}
-
 impl fmt::Debug for ZakuraDiscoveryHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1269,92 +1254,6 @@ impl fmt::Debug for ZakuraDiscoveryHandle {
             .finish_non_exhaustive()
     }
 }
-
-#[derive(Debug)]
-struct ZakuraDiscoveryInner {
-    book: ZakuraDiscoveryBook,
-    active_services: HashMap<NodeId, ZakuraActiveServiceEntry>,
-    admitted_peers: HashMap<ZakuraPeerId, ZakuraDiscoveryAdmittedPeer>,
-    last_connected_node_ids: HashSet<NodeId>,
-    local: ZakuraLocalDiscoveryState,
-    config: ZakuraDiscoveryConfig,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct ZakuraDiscoveryAdmittedPeer {
-    conn_id: ZakuraConnId,
-    session_id: u64,
-    direction: ServicePeerDirection,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ZakuraActiveServiceEntry {
-    record: Option<ZakuraNodeRecord>,
-    services: Vec<ZakuraServiceId>,
-    live_summaries: Vec<ZakuraCachedLiveServiceSummary>,
-}
-
-impl ZakuraActiveServiceEntry {
-    fn from_record(record: ZakuraNodeRecord, services: Vec<ZakuraServiceId>) -> Self {
-        Self {
-            record: Some(record),
-            services,
-            live_summaries: Vec::new(),
-        }
-    }
-
-    fn from_live_summaries(summaries: Vec<ZakuraCachedLiveServiceSummary>) -> Self {
-        let mut services = Vec::new();
-        for summary in &summaries {
-            push_unique_service(&mut services, summary.service_id.clone());
-        }
-        Self {
-            record: None,
-            services,
-            live_summaries: summaries,
-        }
-    }
-
-    fn update_record(&mut self, record: ZakuraNodeRecord, services: Vec<ZakuraServiceId>) {
-        self.record = Some(record);
-        self.services = services;
-    }
-
-    fn update_live_summaries(&mut self, summaries: Vec<ZakuraCachedLiveServiceSummary>) {
-        self.live_summaries.retain(|cached| {
-            !summaries.iter().any(|summary| {
-                summary.service_id == cached.service_id && summary.summary_tag == cached.summary_tag
-            })
-        });
-        for summary in summaries {
-            self.live_summaries.push(summary);
-        }
-        if self.record.is_none() {
-            self.refresh_live_derived_services();
-        }
-    }
-
-    fn prune_expired_live_summaries(&mut self, now_unix_secs: u64) {
-        self.live_summaries
-            .retain(|summary| summary.expires_at_unix_secs > now_unix_secs);
-        if self.record.is_none() {
-            self.refresh_live_derived_services();
-        }
-    }
-
-    fn refresh_live_derived_services(&mut self) {
-        let mut services = Vec::new();
-        for summary in &self.live_summaries {
-            push_unique_service(&mut services, summary.service_id.clone());
-        }
-        self.services = services;
-    }
-
-    fn is_empty_live_only(&self) -> bool {
-        self.record.is_none() && self.live_summaries.is_empty()
-    }
-}
-
 /// A decoded first-party live service summary cached while its peer remains connected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraCachedLiveServiceSummary {
@@ -1371,7 +1270,7 @@ pub struct ZakuraCachedLiveServiceSummary {
 }
 
 impl ZakuraCachedLiveServiceSummary {
-    fn from_envelope(
+    pub(super) fn from_envelope(
         envelope: &ServiceSummaryEnvelope,
         observed_at_unix_secs: u64,
         expires_at_unix_secs: u64,
@@ -1408,35 +1307,6 @@ pub enum ZakuraLiveServiceSummary {
     Unknown,
 }
 
-#[derive(Clone)]
-struct ZakuraLocalDiscoveryState {
-    secret_key: NodeSecretKey,
-    node_id: NodeId,
-    direct_addrs: Vec<SocketAddr>,
-    services: Vec<ZakuraServiceId>,
-    zakura_protocol_min: u16,
-    zakura_protocol_max: u16,
-    network_id: ZakuraNetworkId,
-    chain_id: [u8; 32],
-    next_sequence: u64,
-}
-
-impl fmt::Debug for ZakuraLocalDiscoveryState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ZakuraLocalDiscoveryState")
-            .field("node_id", &self.node_id)
-            .field("direct_addrs", &self.direct_addrs)
-            .field("services", &self.services)
-            .field("zakura_protocol_min", &self.zakura_protocol_min)
-            .field("zakura_protocol_max", &self.zakura_protocol_max)
-            .field("network_id", &self.network_id)
-            .field("chain_id", &self.chain_id)
-            .field("next_sequence", &self.next_sequence)
-            .finish()
-    }
-}
-
 #[allow(dead_code)]
 impl ZakuraDiscoveryHandle {
     /// Creates passive discovery state using the current wall-clock sequence.
@@ -1461,40 +1331,26 @@ impl ZakuraDiscoveryHandle {
         now_unix_secs: u64,
         wall_clock_sequence: u64,
     ) -> Result<Self, DiscoveryWireError> {
-        let mut local = ZakuraLocalDiscoveryState::new(local_config, wall_clock_sequence)?;
-        let self_record = Arc::new(local.build_self_record(
-            now_unix_secs,
-            wall_clock_sequence,
-            config.record_ttl,
+        let mut local = LocalRecordState::new(&local_config, wall_clock_sequence)?;
+        let signing_key = Arc::new(local_config.secret_key);
+        let self_record = Arc::new(ZakuraNodeRecord::sign(
+            local.next_body(now_unix_secs, wall_clock_sequence, config.record_ttl),
+            &signing_key,
         )?);
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
-        let book = ZakuraDiscoveryBook::with_local_node_id(config.book_limits, local.node_id);
-        let import_validation = DiscoveryImportValidation {
-            expected_network_id: local.network_id,
-            expected_chain_id: local.chain_id,
-            supported_protocol_min: local.zakura_protocol_min,
-            supported_protocol_max: local.zakura_protocol_max,
-            max_record_ttl: config.max_record_ttl,
-            clock_skew_tolerance: config.clock_skew_tolerance,
-            max_imported_records_per_response: config.book_limits.max_imported_records_per_response,
-        };
+        let state = DiscoveryState::new(local, config, RandomState::new());
+        let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
-            inner: Arc::new(AsyncMutex::new(ZakuraDiscoveryInner {
-                book,
-                active_services: HashMap::new(),
-                admitted_peers: HashMap::new(),
-                last_connected_node_ids: HashSet::new(),
-                local,
-                config,
-            })),
+            inner: Arc::new(AsyncMutex::new(state)),
             connected,
             self_record: self_record_rx,
             self_record_tx,
             peer_snapshot: peer_snapshot_rx,
             peer_snapshot_tx,
-            import_validation,
+            signing_key,
+            verification_context,
             verify_slots: record_verify_slots(),
         })
     }
@@ -1521,19 +1377,13 @@ impl ZakuraDiscoveryHandle {
         now_unix_secs: u64,
         wall_clock_sequence: u64,
     ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
-        let mut inner = self.inner.lock().await;
+        let mut state = self.inner.lock().await;
         let current = self.current_self_record();
-        if current.body.expires_at_unix_secs
-            > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
-        {
+        if state.self_record_is_fresh(&current, now_unix_secs) {
             return Ok(current);
         }
-        let record_ttl = inner.config.record_ttl;
-        let record = Arc::new(inner.local.build_self_record(
-            now_unix_secs,
-            wall_clock_sequence,
-            record_ttl,
-        )?);
+        let body = state.next_self_record_body(now_unix_secs, wall_clock_sequence);
+        let record = Arc::new(ZakuraNodeRecord::sign(body, &self.signing_key)?);
         // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
         // sequence after a newer record.
         self.self_record_tx.send_replace(record.clone());
@@ -1547,8 +1397,8 @@ impl ZakuraDiscoveryHandle {
 
     /// Returns the configured peer sample limit for active exchanges.
     pub async fn peer_sample_limit(&self) -> usize {
-        let inner = self.inner.lock().await;
-        inner.config.peer_sample_limit
+        let state = self.inner.lock().await;
+        state.config().peer_sample_limit
     }
 
     /// Holds the discovery state lock until the returned guard drops.
@@ -1586,115 +1436,42 @@ impl ZakuraDiscoveryHandle {
         }
     }
 
-    pub(crate) async fn admit_peer_session(
+    /// Admits `session`, replacing an older session of the same peer, and
+    /// publishes the new slot snapshot when it is admitted.
+    pub(super) async fn admit_peer_session(
         &self,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-        peer_id: ZakuraPeerId,
+        session: DiscoverySessionKey,
         direction: ServicePeerDirection,
     ) -> ServiceAdmissionDecision {
-        let mut inner = self.inner.lock().await;
-        if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
-            if (conn_id, session_id) <= (peer.conn_id, peer.session_id) {
-                return ServiceAdmissionDecision::RejectNotUseful;
-            }
-
-            *peer = ZakuraDiscoveryAdmittedPeer {
-                conn_id,
-                session_id,
-                direction,
-            };
-            self.publish_peer_snapshot_locked(&inner);
-            return ServiceAdmissionDecision::Admit;
+        let mut state = self.inner.lock().await;
+        let decision = state.admit_session(session, direction);
+        if decision == ServiceAdmissionDecision::Admit {
+            self.publish_peer_snapshot_locked(&state);
         }
-
-        let admitted = inner
-            .admitted_peers
-            .values()
-            .filter(|peer| peer.direction == direction)
-            .count();
-        let cap = match direction {
-            ServicePeerDirection::Inbound => inner.config.peer_limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => inner.config.peer_limits.max_outbound_peers,
-        };
-
-        if admitted >= cap {
-            ServiceAdmissionDecision::RejectFull
-        } else {
-            inner.admitted_peers.insert(
-                peer_id,
-                ZakuraDiscoveryAdmittedPeer {
-                    conn_id,
-                    session_id,
-                    direction,
-                },
-            );
-            self.publish_peer_snapshot_locked(&inner);
-            ServiceAdmissionDecision::Admit
-        }
+        decision
     }
 
     /// Remove a locally closed or disconnected discovery service session.
     pub async fn remove_peer(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
-        let mut inner = self.inner.lock().await;
-        if inner
-            .admitted_peers
-            .get(peer_id)
-            .is_some_and(|peer| peer.conn_id == conn_id)
-        {
-            inner.admitted_peers.remove(peer_id);
-        }
-        self.publish_peer_snapshot_locked(&inner);
+        let mut state = self.inner.lock().await;
+        state.remove_connection(peer_id, conn_id);
+        self.publish_peer_snapshot_locked(&state);
     }
 
     /// Remove one exact ordered discovery stream generation.
-    pub(crate) async fn remove_session(
-        &self,
-        peer_id: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-    ) {
-        let mut inner = self.inner.lock().await;
-        if inner
-            .admitted_peers
-            .get(peer_id)
-            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
-        {
-            inner.admitted_peers.remove(peer_id);
-        }
-        self.publish_peer_snapshot_locked(&inner);
+    pub(super) async fn remove_session(&self, session: &DiscoverySessionKey) {
+        let mut state = self.inner.lock().await;
+        state.remove_session(session);
+        self.publish_peer_snapshot_locked(&state);
     }
 
     /// Returns whether an ordered discovery stream is the currently admitted generation.
-    pub(crate) async fn is_current_session(
-        &self,
-        peer_id: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-    ) -> bool {
-        let inner = self.inner.lock().await;
-        inner
-            .admitted_peers
-            .get(peer_id)
-            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
+    pub(super) async fn is_current_session(&self, session: &DiscoverySessionKey) -> bool {
+        self.inner.lock().await.is_current_session(session)
     }
 
-    fn publish_peer_snapshot_locked(&self, inner: &ZakuraDiscoveryInner) {
-        let inbound = inner
-            .admitted_peers
-            .values()
-            .filter(|peer| peer.direction == ServicePeerDirection::Inbound)
-            .count();
-        let outbound = inner
-            .admitted_peers
-            .values()
-            .filter(|peer| peer.direction == ServicePeerDirection::Outbound)
-            .count();
-        let _ = self.peer_snapshot_tx.send(ServicePeerSnapshot::new(
-            inbound,
-            outbound,
-            inner.config.peer_limits,
-        ));
+    fn publish_peer_snapshot_locked(&self, state: &DiscoveryState) {
+        let _ = self.peer_snapshot_tx.send(state.peer_snapshot());
     }
 
     /// Returns bounded node ids to exclude from a peer-sample request.
@@ -1703,24 +1480,7 @@ impl ZakuraDiscoveryHandle {
     /// The list holds raw node ids in byte order, as the wire requires.
     pub async fn peer_sample_exclusions(&self) -> Vec<[u8; 32]> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
-        let inner = self.inner.lock().await;
-        let max = inner
-            .config
-            .max_excluded_node_ids
-            .min(MAX_DISCOVERY_EXCLUDED_NODE_IDS);
-        let mut excluded = Vec::with_capacity(max);
-        push_excluded_node_id(&mut excluded, inner.local.node_id, max);
-        for node_id in connected {
-            push_excluded_node_id(&mut excluded, node_id, max);
-        }
-        for node_id in inner
-            .book
-            .recent_node_ids(max.saturating_sub(excluded.len()))
-        {
-            push_excluded_node_id(&mut excluded, node_id, max);
-        }
-        excluded.sort_unstable();
-        excluded
+        self.inner.lock().await.peer_sample_exclusions(&connected)
     }
 
     /// Imports a relayed batch of peer-supplied signed records from `source`.
@@ -1747,19 +1507,23 @@ impl ZakuraDiscoveryHandle {
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
         source: Option<NodeId>,
     ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
-        let max_records = self.import_validation.max_imported_records_per_response;
         let mut outcome = ImportBatchOutcome::default();
         let batch: Vec<_> = records.into_iter().collect();
         if batch.is_empty() {
             return Ok(outcome);
         }
 
-        let (mut authentic, unverified): (Vec<_>, Vec<_>) = {
-            let inner = self.inner.lock().await;
-            batch
-                .into_iter()
-                .partition(|record| inner.holds_record(record))
-        };
+        let mut authentic = Vec::with_capacity(batch.len());
+        let mut unverified = Vec::new();
+        {
+            let state = self.inner.lock().await;
+            for record in batch {
+                match state.stored_evidence(&record) {
+                    Some(stored) => authentic.push(stored),
+                    None => unverified.push(record),
+                }
+            }
+        }
         if !unverified.is_empty() {
             let unverified_len = unverified.len();
             let Some(verified) = self
@@ -1776,22 +1540,10 @@ impl ZakuraDiscoveryHandle {
         }
 
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        for record in authentic {
-            if outcome.attempted >= max_records {
-                outcome.dropped_for_limit += 1;
-                continue;
-            }
-            outcome.attempted += 1;
-            match inner
-                .book
-                .import_verified_record(record, source, now, &context)
-            {
-                Ok(import_outcome) => outcome.record_success(import_outcome),
-                Err(_) => outcome.rejected += 1,
-            }
-        }
+        self.inner
+            .lock()
+            .await
+            .install_relayed(authentic, source, now, &mut outcome);
         Ok(outcome)
     }
 
@@ -1814,51 +1566,32 @@ impl ZakuraDiscoveryHandle {
         peer_node_id: NodeId,
         now: u64,
     ) -> Result<(), DiscoveryWireError> {
-        if services.node_id != peer_node_id {
-            return Err(DiscoveryWireError::MismatchedNodeId {
-                field: "services node id",
-            });
-        }
-
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected_node_ids, now);
-        if !connected_node_ids.contains(&peer_node_id) {
-            return Ok(());
-        }
-
-        let Some(expires_at_unix_secs) = effective_live_summary_expiry(
-            services.expires_at_unix_secs,
+        self.inner.lock().await.receive_live_summaries(
+            peer_node_id,
+            services,
+            &connected_node_ids,
             now,
-            inner.config.clock_skew_tolerance,
-        ) else {
-            if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
-                entry.live_summaries.clear();
-                if entry.record.is_none() {
-                    entry.refresh_live_derived_services();
-                }
-            }
-            inner
-                .active_services
-                .retain(|_, entry| !entry.is_empty_live_only());
-            return Ok(());
-        };
+        )
+    }
 
-        let mut live_summaries = Vec::with_capacity(services.summaries.len());
-        for envelope in &services.summaries {
-            live_summaries.push(ZakuraCachedLiveServiceSummary::from_envelope(
-                envelope,
-                now,
-                expires_at_unix_secs,
-            )?);
-        }
-
-        inner
-            .active_services
-            .entry(peer_node_id)
-            .and_modify(|entry| entry.update_live_summaries(live_summaries.clone()))
-            .or_insert_with(|| ZakuraActiveServiceEntry::from_live_summaries(live_summaries));
-        Ok(())
+    /// Imports a connected peer's first-party live service summaries, received on `session`, as
+    /// [`Self::import_connected_peer_services`] does. A replaced `session` caches nothing.
+    pub(super) async fn import_session_services(
+        &self,
+        session: &DiscoverySessionKey,
+        services: Services,
+        peer_node_id: NodeId,
+    ) -> Result<(), DiscoveryWireError> {
+        let now = current_unix_secs();
+        let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
+        self.inner.lock().await.receive_session_live_summaries(
+            session,
+            peer_node_id,
+            services,
+            &connected_node_ids,
+            now,
+        )
     }
 
     /// Imports one trusted static signed record through the static validation path.
@@ -1867,9 +1600,7 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        inner.book.import_static_record(record, now, &context)
+        self.inner.lock().await.import_static_record(record, now)
     }
 
     /// Imports a connected peer's latest self-record and updates active service hints.
@@ -1885,39 +1616,45 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
+        let record = self
+            .verify_connected_peer_record(record, peer_node_id)
+            .await?;
+        let now = current_unix_secs();
+        self.inner
+            .lock()
+            .await
+            .install_connected_peer_record(record, now)
+    }
+
+    /// Imports a connected peer's latest self-record, received on `session`, as
+    /// [`Self::import_connected_peer_record`] does. The lock hold installs nothing once
+    /// `session` is replaced.
+    pub(super) async fn import_session_record(
+        &self,
+        session: &DiscoverySessionKey,
+        record: ZakuraNodeRecord,
+        peer_node_id: NodeId,
+    ) -> Result<ImportOutcome, SessionRecordError> {
+        let record = self
+            .verify_connected_peer_record(record, peer_node_id)
+            .await?;
+        let now = current_unix_secs();
+        self.inner
+            .lock()
+            .await
+            .install_session_record(session, record, now)
+    }
+
+    /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
+    async fn verify_connected_peer_record(
+        &self,
+        record: ZakuraNodeRecord,
+        peer_node_id: NodeId,
+    ) -> Result<VerifiedRecord, DiscoveryBookError> {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
-        let record = self.verify_unless_stored(record).await?;
-
-        let now = current_unix_secs();
-        let services = normalize_services(record.body.services.clone());
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        if record.body.services.len() > inner.config.book_limits.max_services_per_record {
-            return Err(DiscoveryBookError::Limit {
-                field: "service",
-                actual: record.body.services.len(),
-                max: inner.config.book_limits.max_services_per_record,
-            });
-        }
-
-        let import_result =
-            inner
-                .book
-                .import_verified_record(record.clone(), Some(peer_node_id), now, &context);
-        if import_result.is_ok()
-            || matches!(import_result, Err(ref error) if is_direct_address_import_error(error))
-        {
-            inner.update_active_services_from_connected_record(
-                peer_node_id,
-                record,
-                services,
-                &import_result,
-                now,
-            );
-        }
-        import_result
+        self.verify_unless_stored(record).await
     }
 
     /// Verifies `record`'s author checks off the lock, unless the record is
@@ -1928,11 +1665,11 @@ impl ZakuraDiscoveryHandle {
     async fn verify_unless_stored(
         &self,
         record: ZakuraNodeRecord,
-    ) -> Result<ZakuraNodeRecord, DiscoveryBookError> {
-        if self.inner.lock().await.holds_record(&record) {
-            return Ok(record);
+    ) -> Result<VerifiedRecord, DiscoveryBookError> {
+        if let Some(stored) = self.inner.lock().await.stored_evidence(&record) {
+            return Ok(stored);
         }
-        self.verify_off_lock(move |context| record.verify_authentic(context).map(|()| record))
+        self.verify_off_lock(move |context| VerifiedRecord::verify(record, context))
             .await
             .ok_or(DiscoveryBookError::VerificationCancelled)?
             .map_err(DiscoveryBookError::Record)
@@ -1946,7 +1683,10 @@ impl ZakuraDiscoveryHandle {
         verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
     ) -> Option<T> {
         let slot = self.verify_slots.reserve().await;
-        let context = self.import_validation.context(current_unix_secs());
+        let context = DiscoveryRecordValidationContext {
+            current_unix_secs: current_unix_secs(),
+            ..self.verification_context.clone()
+        };
         crate::zakura::resume_task_panic(
             zakura_rt::task::spawn_blocking(move || {
                 let _slot = slot;
@@ -1963,9 +1703,10 @@ impl ZakuraDiscoveryHandle {
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
     ) -> ImportBatchOutcome {
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        inner.book.import_persisted_entries(entries, now, &context)
+        self.inner
+            .lock()
+            .await
+            .import_persisted_entries(entries, now)
     }
 
     /// Inserts a trusted static/bootstrap dial candidate.
@@ -1973,9 +1714,9 @@ impl ZakuraDiscoveryHandle {
         &self,
         node_addr: NodeAddr,
     ) -> Result<(), DiscoveryBookError> {
-        let mut inner = self.inner.lock().await;
-        inner
-            .book
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
             .insert_static_candidate(node_addr, current_unix_secs())
     }
 
@@ -1993,11 +1734,15 @@ impl ZakuraDiscoveryHandle {
         exclude_node_ids: &[[u8; 32]],
     ) -> Vec<ZakuraNodeRecord> {
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let limit = limit.min(inner.config.peer_sample_limit);
-        inner
-            .book
-            .sample_peers(limit, wanted_services, exclude_node_ids, now, requester)
+        let mut state = self.inner.lock().await;
+        state.sample_peers(
+            requester,
+            limit,
+            wanted_services,
+            exclude_node_ids,
+            now,
+            &mut zakura_rt::rand::rng(),
+        )
     }
 
     /// Returns owned dial candidates, excluding peers currently registered with the supervisor.
@@ -2006,43 +1751,8 @@ impl ZakuraDiscoveryHandle {
         wanted_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
-        let connected = self.connected.borrow().clone();
-        let (limit, dial_backoff_base, dial_backoff_max, book_limits) = {
-            let inner = self.inner.lock().await;
-            (
-                discovery_dial_slot_limit(
-                    connected.len(),
-                    in_flight_node_ids.len(),
-                    inner.config.max_zakura_connections,
-                    inner.config.discovery_connection_headroom,
-                    inner.config.max_concurrent_discovery_dials,
-                ),
-                inner.config.dial_backoff_base,
-                inner.config.dial_backoff_max,
-                inner.config.book_limits,
-            )
-        };
-        if limit == 0 {
-            return Vec::new();
-        }
-
-        let connected_node_ids = connected_peer_node_ids(&connected);
-        let now = current_unix_secs();
-        let inner = self.inner.lock().await;
-        let wanted_services = bounded_services(wanted_services, book_limits);
-        let mut rng = zakura_rt::rand::rng();
-        inner.book.dial_candidates(
-            limit,
-            &wanted_services,
-            &[],
-            DialCandidateExclusions {
-                connected_node_ids: &connected_node_ids,
-                in_flight_node_ids,
-            },
-            now,
-            (dial_backoff_base, dial_backoff_max),
-            &mut rng,
-        )
+        self.dial_candidates_with(wanted_services, &[], in_flight_node_ids)
+            .await
     }
 
     /// Returns service-matching candidates first, followed by general candidates.
@@ -2051,80 +1761,89 @@ impl ZakuraDiscoveryHandle {
         preferred_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        self.dial_candidates_with(&[], preferred_services, in_flight_node_ids)
+            .await
+    }
+
+    /// Returns dial candidates that advertise every `required_services` entry,
+    /// those advertising any `preferred_services` entry first.
+    async fn dial_candidates_with(
+        &self,
+        required_services: &[ZakuraServiceId],
+        preferred_services: &[ZakuraServiceId],
+        in_flight_node_ids: &[NodeId],
+    ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let connected = self.connected.borrow().clone();
-        let (limit, dial_backoff_base, dial_backoff_max) = {
-            let inner = self.inner.lock().await;
-            (
-                discovery_dial_slot_limit(
-                    connected.len(),
-                    in_flight_node_ids.len(),
-                    inner.config.max_zakura_connections,
-                    inner.config.discovery_connection_headroom,
-                    inner.config.max_concurrent_discovery_dials,
-                ),
-                inner.config.dial_backoff_base,
-                inner.config.dial_backoff_max,
-            )
-        };
+        let limit = self
+            .inner
+            .lock()
+            .await
+            .dial_slot_limit(connected.len(), in_flight_node_ids.len());
         if limit == 0 {
             return Vec::new();
         }
 
         let connected_node_ids = connected_peer_node_ids(&connected);
         let now = current_unix_secs();
-        let inner = self.inner.lock().await;
-        let mut rng = zakura_rt::rand::rng();
-        inner.book.dial_candidates(
+        let state = self.inner.lock().await;
+        state.dial_candidates(
             limit,
-            &[],
+            required_services,
             preferred_services,
             DialCandidateExclusions {
                 connected_node_ids: &connected_node_ids,
                 in_flight_node_ids,
             },
             now,
-            (dial_backoff_base, dial_backoff_max),
-            &mut rng,
+            &mut zakura_rt::rand::rng(),
         )
     }
 
     pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
-        let inner = self.inner.lock().await;
+        let state = self.inner.lock().await;
         (
-            inner.config.dial_backoff_base,
-            inner.config.dial_backoff_max,
+            state.config().dial_backoff_base,
+            state.config().dial_backoff_max,
         )
     }
 
     /// Marks a discovery dial attempt for `node_id`.
     pub async fn mark_dial_attempt(&self, node_id: &NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner.book.mark_dial_attempt(node_id, current_unix_secs());
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
+            .mark_dial_attempt(node_id, current_unix_secs());
     }
 
     /// Marks a successful discovery dial for `node_id`.
     pub async fn mark_dial_success(&self, node_id: &NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner.book.mark_dial_success(node_id, current_unix_secs());
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
+            .mark_dial_success(node_id, current_unix_secs());
     }
 
     /// Marks a failed discovery dial for `node_id`.
     pub async fn mark_dial_failure(&self, node_id: &NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner.book.mark_dial_failure(node_id, current_unix_secs());
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
+            .mark_dial_failure(node_id, current_unix_secs());
     }
 
     /// Marks a dial that failed on an ALPN mismatch (zakura-quic DIAL-5).
     pub async fn mark_alpn_mismatch(&self, node_id: &NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner.book.mark_alpn_mismatch(node_id, current_unix_secs());
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
+            .mark_alpn_mismatch(node_id, current_unix_secs());
     }
 
     /// Marks a completed short-lived discovery exchange for local redial backoff.
     pub async fn mark_short_lived_exchange(&self, node_id: &NodeId) {
-        let mut inner = self.inner.lock().await;
-        inner
-            .book
+        let mut state = self.inner.lock().await;
+        state
+            .book_mut()
             .mark_short_lived_exchange(node_id, current_unix_secs());
     }
 
@@ -2132,16 +1851,10 @@ impl ZakuraDiscoveryHandle {
     pub async fn active_services(&self, node_id: NodeId) -> Option<Vec<ZakuraServiceId>> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected, now);
-        if !connected.contains(&node_id) {
-            return None;
-        }
-
-        inner
-            .active_services
-            .get(&node_id)
-            .map(|entry| entry.services.clone())
+        self.inner
+            .lock()
+            .await
+            .active_services(node_id, &connected, now)
     }
 
     /// Returns fresh first-party live summaries cached for a connected peer.
@@ -2159,16 +1872,10 @@ impl ZakuraDiscoveryHandle {
         now: u64,
     ) -> Option<Vec<ZakuraCachedLiveServiceSummary>> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected, now);
-        if !connected.contains(&node_id) {
-            return None;
-        }
-
-        inner
-            .active_services
-            .get(&node_id)
-            .map(|entry| entry.live_summaries.clone())
+        self.inner
+            .lock()
+            .await
+            .live_service_summaries(node_id, &connected, now)
     }
 
     /// Holds every free verification slot until the returned permits drop.
@@ -2179,154 +1886,19 @@ impl ZakuraDiscoveryHandle {
 
     /// Returns a stored discovery record for `node_id`, if present.
     pub async fn record_for(&self, node_id: NodeId) -> Option<ZakuraNodeRecord> {
-        let inner = self.inner.lock().await;
-        inner.book.get(&node_id).map(|entry| entry.record().clone())
+        let state = self.inner.lock().await;
+        state
+            .book()
+            .get(&node_id)
+            .map(|entry| entry.record().clone())
     }
 
     /// Returns owned entries suitable for a future Zakura-specific persistent cache writer.
     pub async fn persisted_entries(&self) -> Vec<ZakuraDiscoveryPersistedEntry> {
-        let inner = self.inner.lock().await;
-        inner.book.persisted_entries()
+        let state = self.inner.lock().await;
+        state.book().persisted_entries()
     }
 }
-
-impl ZakuraDiscoveryInner {
-    fn validation_context(&self, now: u64) -> DiscoveryRecordValidationContext {
-        DiscoveryRecordValidationContext {
-            expected_network_id: self.local.network_id,
-            expected_chain_id: self.local.chain_id,
-            current_unix_secs: now,
-            supported_protocol_min: self.local.zakura_protocol_min,
-            supported_protocol_max: self.local.zakura_protocol_max,
-            max_record_ttl: self.config.max_record_ttl,
-            clock_skew_tolerance: self.config.clock_skew_tolerance,
-        }
-    }
-
-    fn sync_active_services(&mut self, connected_node_ids: &[NodeId], now_unix_secs: u64) {
-        let connected_node_ids: HashSet<_> = connected_node_ids.iter().copied().collect();
-        self.active_services
-            .retain(|node_id, _| connected_node_ids.contains(node_id));
-        for entry in self.active_services.values_mut() {
-            entry.prune_expired_live_summaries(now_unix_secs);
-            if entry
-                .record
-                .as_ref()
-                .is_some_and(|record| record.body.expires_at_unix_secs < now_unix_secs)
-            {
-                entry.record = None;
-                entry.refresh_live_derived_services();
-            }
-        }
-        self.active_services
-            .retain(|_, entry| !entry.is_empty_live_only());
-        self.last_connected_node_ids = connected_node_ids;
-    }
-
-    /// Whether the book or the live service hints hold exactly `record`.
-    fn holds_record(&self, record: &ZakuraNodeRecord) -> bool {
-        let node_id = &record.body.node_id;
-        self.book
-            .get(node_id)
-            .is_some_and(|entry| entry.record() == record)
-            || self
-                .active_services
-                .get(node_id)
-                .and_then(|active| active.record.as_ref())
-                .is_some_and(|active| active == record)
-    }
-
-    fn update_active_services_from_connected_record(
-        &mut self,
-        node_id: NodeId,
-        record: ZakuraNodeRecord,
-        services: Vec<ZakuraServiceId>,
-        import_result: &Result<ImportOutcome, DiscoveryBookError>,
-        now: u64,
-    ) {
-        // An expired hint no longer orders the peer's records.
-        if self.active_services.get(&node_id).is_some_and(|active| {
-            active.record.as_ref().is_some_and(|active_record| {
-                active_record.body.expires_at_unix_secs >= now
-                    && record.body.sequence <= active_record.body.sequence
-            })
-        }) {
-            return;
-        }
-
-        let should_update = match import_result {
-            Ok(ImportOutcome::Added | ImportOutcome::Updated) => true,
-            Ok(ImportOutcome::MetadataUpdated) => self
-                .book
-                .get(&node_id)
-                .is_some_and(|entry| entry.record() == &record),
-            Ok(ImportOutcome::IgnoredOlder) => false,
-            Err(error) if is_direct_address_import_error(error) => {
-                self.book.get(&node_id).is_none_or(|entry| {
-                    connected_record_is_fresh_for_stored_record(&record, entry, now)
-                })
-            }
-            Err(_) => false,
-        };
-
-        if should_update {
-            self.active_services
-                .entry(node_id)
-                .and_modify(|entry| entry.update_record(record.clone(), services.clone()))
-                .or_insert_with(|| ZakuraActiveServiceEntry::from_record(record, services));
-        }
-    }
-}
-
-impl ZakuraLocalDiscoveryState {
-    fn new(
-        config: ZakuraDiscoveryLocalConfig,
-        wall_clock_sequence: u64,
-    ) -> Result<Self, DiscoveryWireError> {
-        let node_id = config.secret_key.public();
-        let persisted_next_sequence = config
-            .last_authored_sequence
-            .map(|sequence| sequence.saturating_add(1))
-            .unwrap_or(0);
-        Ok(Self {
-            secret_key: config.secret_key,
-            node_id,
-            direct_addrs: normalize_direct_addrs(config.direct_addrs),
-            services: advertised_services(config.services)?,
-            zakura_protocol_min: config.zakura_protocol_min,
-            zakura_protocol_max: config.zakura_protocol_max,
-            network_id: config.network_id,
-            chain_id: config.chain_id,
-            next_sequence: persisted_next_sequence.max(wall_clock_sequence),
-        })
-    }
-
-    fn build_self_record(
-        &mut self,
-        now_unix_secs: u64,
-        wall_clock_sequence: u64,
-        record_ttl: Duration,
-    ) -> Result<ZakuraNodeRecord, DiscoveryWireError> {
-        let sequence = self.next_sequence.max(wall_clock_sequence);
-        self.next_sequence = sequence.saturating_add(1);
-        ZakuraNodeRecord::sign(
-            ZakuraNodeRecordBody {
-                node_id: self.node_id,
-                direct_addrs: self.direct_addrs.clone(),
-                services: self.services.clone(),
-                zakura_protocol_min: self.zakura_protocol_min,
-                zakura_protocol_max: self.zakura_protocol_max,
-                network_id: self.network_id,
-                chain_id: self.chain_id,
-                sequence,
-                expires_at_unix_secs: now_unix_secs.saturating_add(record_ttl.as_secs()),
-                extensions: Vec::new(),
-            },
-            &self.secret_key,
-        )
-    }
-}
-
 impl Default for ZakuraDiscoveryBook {
     fn default() -> Self {
         Self::new(ZakuraDiscoveryBookLimits::default())
@@ -2334,25 +1906,33 @@ impl Default for ZakuraDiscoveryBook {
 }
 
 impl ZakuraDiscoveryBook {
-    /// Creates an empty discovery book with `limits`.
+    /// Creates an empty discovery book with `limits` and a fresh random disclosure key.
     pub fn new(limits: ZakuraDiscoveryBookLimits) -> Self {
-        Self {
-            entries: HashMap::new(),
-            static_candidates: HashMap::new(),
-            limits,
-            local_node_id: None,
-            disclosure_key: RandomState::new(),
-            sample_snapshot: None,
-            generation: 0,
-            relayed: HashMap::new(),
-        }
+        Self::with_disclosure_key(limits, None, RandomState::new())
     }
 
     /// Creates an empty discovery book that rejects the local node's record.
     pub fn with_local_node_id(limits: ZakuraDiscoveryBookLimits, local_node_id: NodeId) -> Self {
+        Self::with_disclosure_key(limits, Some(local_node_id), RandomState::new())
+    }
+
+    /// Creates an empty discovery book that places sample windows with `disclosure_key`.
+    ///
+    /// The book rejects `local_node_id`'s record when one is given.
+    pub(super) fn with_disclosure_key(
+        limits: ZakuraDiscoveryBookLimits,
+        local_node_id: Option<NodeId>,
+        disclosure_key: RandomState,
+    ) -> Self {
         Self {
-            local_node_id: Some(local_node_id),
-            ..Self::new(limits)
+            entries: HashMap::new(),
+            static_candidates: HashMap::new(),
+            limits,
+            local_node_id,
+            disclosure_key,
+            sample_snapshot: None,
+            generation: 0,
+            relayed: HashMap::new(),
         }
     }
 
@@ -2442,21 +2022,22 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, source, false, false, now, context)
+        self.import_record_inner(record, source, false, now, context)
     }
 
     /// Imports one peer record whose author checks already passed.
     ///
     /// Expiry, storage limits, address policy, and sequence order still run
     /// here.
-    fn import_verified_record(
+    pub(super) fn import_verified_record(
         &mut self,
-        record: ZakuraNodeRecord,
+        record: VerifiedRecord,
         source: Option<NodeId>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, source, false, true, now, context)
+        let metadata = import_metadata(&record, source, false, now);
+        self.install_record(record, metadata, now, context)
     }
 
     /// Imports one signed static/bootstrap record.
@@ -2471,7 +2052,7 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, None, true, false, now, context)
+        self.import_record_inner(record, None, true, now, context)
     }
 
     /// Returns a bounded peer sample from the requester's disclosure window.
@@ -2510,13 +2091,34 @@ impl ZakuraDiscoveryBook {
         now: u64,
         requester: NodeId,
     ) -> Vec<ZakuraNodeRecord> {
+        self.sample_peers_with_rng(
+            limit,
+            wanted_services,
+            exclude_node_ids,
+            now,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        )
+    }
+
+    /// Returns the same sample as [`Self::sample_peers`], with `rng` shuffling a
+    /// new snapshot and the returned sample.
+    pub(super) fn sample_peers_with_rng<R: rand_10::Rng + ?Sized>(
+        &mut self,
+        limit: usize,
+        wanted_services: &[ZakuraServiceId],
+        exclude_node_ids: &[[u8; 32]],
+        now: u64,
+        requester: NodeId,
+        rng: &mut R,
+    ) -> Vec<ZakuraNodeRecord> {
         debug_assert!(
             exclude_node_ids.is_sorted(),
             "the decoder admits only sorted exclusions"
         );
         let window = self.sample_window();
         let limit = limit.min(window);
-        self.refresh_sample_snapshot(now);
+        self.refresh_sample_snapshot(now, rng);
         let snapshot = self
             .sample_snapshot
             .as_ref()
@@ -2541,10 +2143,10 @@ impl ZakuraDiscoveryBook {
                     && advertises_all_services(&entry.record, wanted_services)
             })
             .take(limit)
-            .map(|entry| entry.record.clone())
+            .map(|entry| entry.record().clone())
             .collect();
         // The order would reveal each record's place in the snapshot.
-        records.shuffle(&mut zakura_rt::rand::rng());
+        records.shuffle(rng);
         records
     }
 
@@ -2569,14 +2171,14 @@ impl ZakuraDiscoveryBook {
     /// candidates to a snapshot shorter than one window.
     ///
     /// See [`Self::sample_peers`] for why.
-    fn refresh_sample_snapshot(&mut self, now: u64) {
+    fn refresh_sample_snapshot<R: rand_10::Rng + ?Sized>(&mut self, now: u64, rng: &mut R) {
         let epoch = now / DISCOVERY_DISCLOSURE_EPOCH.as_secs();
         let window = self.sample_window();
         let snapshot = match self.sample_snapshot.take() {
             Some(mut snapshot) if snapshot.epoch == epoch => {
                 let room = window.saturating_sub(snapshot.node_ids.len());
                 if room > 0 && snapshot.generation != self.generation {
-                    let added = self.sample_candidates(now, &snapshot.node_ids);
+                    let added = self.sample_candidates(now, &snapshot.node_ids, rng);
                     snapshot.node_ids.extend(added.into_iter().take(room));
                     snapshot.generation = self.generation;
                 }
@@ -2584,7 +2186,7 @@ impl ZakuraDiscoveryBook {
             }
             _ => SampleSnapshot {
                 epoch,
-                node_ids: self.sample_candidates(now, &[]),
+                node_ids: self.sample_candidates(now, &[], rng),
                 generation: self.generation,
             },
         };
@@ -2592,7 +2194,12 @@ impl ZakuraDiscoveryBook {
     }
 
     /// The sample-eligible ids not in `known`, in random order.
-    fn sample_candidates(&self, now: u64, known: &[NodeId]) -> Vec<NodeId> {
+    fn sample_candidates<R: rand_10::Rng + ?Sized>(
+        &self,
+        now: u64,
+        known: &[NodeId],
+        rng: &mut R,
+    ) -> Vec<NodeId> {
         let mut node_ids: Vec<NodeId> = self
             .entries
             .iter()
@@ -2601,7 +2208,7 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
-        node_ids.shuffle(&mut zakura_rt::rand::rng());
+        node_ids.shuffle(rng);
         node_ids
     }
 
@@ -2778,7 +2385,7 @@ impl ZakuraDiscoveryBook {
         }
     }
 
-    fn recent_node_ids(&self, limit: usize) -> Vec<NodeId> {
+    pub(super) fn recent_node_ids(&self, limit: usize) -> Vec<NodeId> {
         let mut entries: Vec<_> = self.entries.values().collect();
         entries.sort_unstable_by_key(|entry| {
             (
@@ -2799,7 +2406,7 @@ impl ZakuraDiscoveryBook {
             .entries
             .values()
             .map(|entry| ZakuraDiscoveryPersistedEntry {
-                record: entry.record.clone(),
+                record: entry.record().clone(),
                 source: entry.source,
                 is_static: entry.is_static,
                 last_seen: entry.last_seen,
@@ -2846,7 +2453,8 @@ impl ZakuraDiscoveryBook {
             last_confirmed: entry.last_confirmed,
             failure_count: entry.failure_count,
         };
-        self.import_validated_record(entry.record, metadata, false, now, context)
+        let record = self.verify_foreign(entry.record, context)?;
+        self.install_record(record, metadata, now, context)
     }
 
     fn import_record_inner(
@@ -2854,36 +2462,37 @@ impl ZakuraDiscoveryBook {
         record: ZakuraNodeRecord,
         source: Option<NodeId>,
         is_static: bool,
-        pre_verified: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        // First-party imports arrive from the authenticated record owner itself (its `Hello`,
-        // or its own self-record inside its `Peers` response). Those and trusted static
-        // configuration confirm the identity; a third-party gossiped record does not.
-        let is_first_party = source == Some(record.body.node_id);
-        let metadata = DiscoveryEntryMetadata {
-            source,
-            is_static,
-            last_seen: now,
-            last_dial_attempt: None,
-            last_success: None,
-            last_confirmed: (is_static || is_first_party).then_some(now),
-            failure_count: 0,
-        };
-        self.import_validated_record(record, metadata, pre_verified, now, context)
+        let record = self.verify_foreign(record, context)?;
+        let metadata = import_metadata(&record, source, is_static, now);
+        self.install_record(record, metadata, now, context)
     }
 
-    /// Validates and stores one record.
+    /// Runs the author checks of a record about another node.
     ///
-    /// When `pre_verified` is set, the caller already ran the author checks outside the
-    /// global discovery mutex, so only expiry runs here. The storage-limit,
-    /// address-policy, insertion, and eviction steps always run under the caller's lock.
-    fn import_validated_record(
-        &mut self,
+    /// The local node's own record fails as [`DiscoveryBookError::SelfRecord`]
+    /// before any check runs.
+    fn verify_foreign(
+        &self,
         record: ZakuraNodeRecord,
+        context: &DiscoveryRecordValidationContext,
+    ) -> Result<VerifiedRecord, DiscoveryBookError> {
+        if self.local_node_id == Some(record.body.node_id) {
+            return Err(DiscoveryBookError::SelfRecord);
+        }
+        Ok(VerifiedRecord::verify(record, context)?)
+    }
+
+    /// Validates and stores one record whose author checks passed.
+    ///
+    /// Expiry, storage-limit, address-policy, insertion, and eviction steps run
+    /// here, under the caller's lock.
+    fn install_record(
+        &mut self,
+        record: VerifiedRecord,
         metadata: DiscoveryEntryMetadata,
-        pre_verified: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
@@ -2891,11 +2500,7 @@ impl ZakuraDiscoveryBook {
             return Err(DiscoveryBookError::SelfRecord);
         }
 
-        if pre_verified {
-            validate_record_expiry(&record.body, context)?;
-        } else {
-            record.verify(context)?;
-        }
+        validate_record_expiry(&record.body, context)?;
         self.validate_record_storage_limits(&record)?;
         let direct_addr_policy = if metadata.is_static {
             DiscoveryDirectAddrPolicy::StaticConfigured
@@ -3247,9 +2852,33 @@ fn relay_of(source: Option<NodeId>, node_id: NodeId) -> Option<NodeId> {
     source.filter(|source| *source != node_id)
 }
 
+/// The metadata of a freshly imported record from `source`.
+///
+/// First-party imports arrive from the authenticated record owner itself (its
+/// `Hello`, or its own self-record inside its `Peers` response). Those and
+/// trusted static configuration confirm the identity; a third-party gossiped
+/// record does not.
+fn import_metadata(
+    record: &ZakuraNodeRecord,
+    source: Option<NodeId>,
+    is_static: bool,
+    now: u64,
+) -> DiscoveryEntryMetadata {
+    let is_first_party = source == Some(record.body.node_id);
+    DiscoveryEntryMetadata {
+        source,
+        is_static,
+        last_seen: now,
+        last_dial_attempt: None,
+        last_success: None,
+        last_confirmed: (is_static || is_first_party).then_some(now),
+        failure_count: 0,
+    }
+}
+
 fn update_existing_entry(
     entry: &mut ZakuraDiscoveryEntry,
-    record: ZakuraNodeRecord,
+    record: VerifiedRecord,
     metadata: DiscoveryEntryMetadata,
     now: u64,
 ) -> ImportOutcome {
@@ -3286,30 +2915,6 @@ fn update_existing_entry(
     ImportOutcome::Updated
 }
 
-fn connected_record_is_fresh_for_stored_record(
-    record: &ZakuraNodeRecord,
-    entry: &ZakuraDiscoveryEntry,
-    now: u64,
-) -> bool {
-    // An expired record no longer orders the peer's records.
-    if entry_is_expired(entry, now) {
-        return true;
-    }
-    match record.body.sequence.cmp(&entry.record.body.sequence) {
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => entry.record() == record,
-        std::cmp::Ordering::Greater => true,
-    }
-}
-
-fn is_direct_address_import_error(error: &DiscoveryBookError) -> bool {
-    matches!(
-        error,
-        DiscoveryBookError::NoUsableDirectAddress
-            | DiscoveryBookError::NonDialableDirectAddress { .. }
-    )
-}
-
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3329,7 +2934,7 @@ fn current_sequence_tick() -> u64 {
         .unwrap_or(0)
 }
 
-fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+pub(super) fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let mut addrs: Vec<_> = addrs
         .into_iter()
         .filter(is_discovery_dialable_addr)
@@ -3340,7 +2945,7 @@ fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     addrs
 }
 
-fn normalize_services(mut services: Vec<ZakuraServiceId>) -> Vec<ZakuraServiceId> {
+pub(super) fn normalize_services(mut services: Vec<ZakuraServiceId>) -> Vec<ZakuraServiceId> {
     services.sort_unstable();
     services.dedup();
     services
@@ -3350,7 +2955,7 @@ fn normalize_services(mut services: Vec<ZakuraServiceId>) -> Vec<ZakuraServiceId
 ///
 /// It rejects a list the self-record cannot carry. Truncating the sorted list
 /// would silently drop built-in `zakura.*` services behind custom ids.
-fn advertised_services(
+pub(super) fn advertised_services(
     services: Vec<ZakuraServiceId>,
 ) -> Result<Vec<ZakuraServiceId>, DiscoveryWireError> {
     let services = normalize_services(services);
@@ -3363,49 +2968,13 @@ fn advertised_services(
     Ok(services)
 }
 
-fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServiceId) {
+pub(super) fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServiceId) {
     if services.iter().any(|existing| existing == &service) {
         return;
     }
     if services.len() < MAX_SERVICES_PER_RECORD {
         services.push(service);
         services.sort_unstable();
-    }
-}
-
-fn effective_live_summary_expiry(
-    declared_expires_at: u64,
-    now_unix_secs: u64,
-    clock_skew_tolerance: Duration,
-) -> Option<u64> {
-    let local_expiry = now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs());
-    if declared_expires_at > now_unix_secs {
-        return Some(declared_expires_at.min(local_expiry));
-    }
-    if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
-        return None;
-    }
-    // This response arrived on the authenticated live stream but is already expired locally. Use
-    // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
-    // peer's intentionally shorter lifetime.
-    Some(local_expiry)
-}
-
-fn bounded_services(
-    services: &[ZakuraServiceId],
-    limits: ZakuraDiscoveryBookLimits,
-) -> Vec<ZakuraServiceId> {
-    services
-        .iter()
-        .take(limits.max_services_per_record)
-        .cloned()
-        .collect()
-}
-
-fn push_excluded_node_id(excluded: &mut Vec<[u8; 32]>, node_id: NodeId, max_node_ids: usize) {
-    let node_id = *node_id.as_bytes();
-    if excluded.len() < max_node_ids && !excluded.contains(&node_id) {
-        excluded.push(node_id);
     }
 }
 
@@ -3611,7 +3180,7 @@ fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
-fn entry_is_expired(entry: &ZakuraDiscoveryEntry, now: u64) -> bool {
+pub(super) fn entry_is_expired(entry: &ZakuraDiscoveryEntry, now: u64) -> bool {
     entry.record.body.expires_at_unix_secs < now
 }
 
@@ -6888,7 +6457,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_services_drop_connected_hello_absent_from_supervisor_watch() {
-        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(9), test_addr(9));
         let node_id = record.body.node_id;
@@ -6897,7 +6466,9 @@ mod tests {
             .await
             .expect("connected self-record imports");
         assert_eq!(handle.active_services(node_id).await, None);
-        assert!(handle.inner.lock().await.active_services.is_empty());
+        // The hint was pruned, not hidden: connecting the peer later does not reveal it.
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+        assert_eq!(handle.active_services(node_id).await, None);
     }
 
     #[tokio::test]
@@ -7526,9 +7097,11 @@ mod tests {
             Some(vec![service(43)])
         );
 
-        let mut inner = handle.inner.lock().await;
-        inner.sync_active_services(&[node_id], expires_at.saturating_add(1));
-        assert!(!inner.active_services.contains_key(&node_id));
+        let mut state = handle.inner.lock().await;
+        assert_eq!(
+            state.active_services(node_id, &[node_id], expires_at.saturating_add(1)),
+            None
+        );
     }
 
     #[tokio::test]
@@ -7623,7 +7196,7 @@ mod tests {
                 Err(DiscoveryRecordError::InvalidSignature)
             ));
             assert_eq!(
-                handle.inner.lock().await.book.len(),
+                handle.inner.lock().await.book().len(),
                 0,
                 "position {position}"
             );
@@ -7654,7 +7227,7 @@ mod tests {
                 .await,
             Err(DiscoveryRecordError::InvalidSignature)
         ));
-        assert_eq!(handle.inner.lock().await.book.len(), 0);
+        assert_eq!(handle.inner.lock().await.book().len(), 0);
 
         let handle = discovery_handle_with_connected(connected_rx.clone());
         let now = current_unix_secs();
@@ -8232,7 +7805,10 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer_session(2, 0, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer.clone(), 2, 0),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -8240,7 +7816,10 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer_session(1, 0, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer.clone(), 1, 0),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::RejectNotUseful
         );
@@ -8265,27 +7844,40 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer_session(2, 1, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer.clone(), 2, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
         assert_eq!(
             handle
-                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer.clone(), 2, 2),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
         assert_eq!(
             handle
-                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer.clone(), 2, 2),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::RejectNotUseful
         );
 
-        handle.remove_session(&peer, 2, 1).await;
+        handle
+            .remove_session(&DiscoverySessionKey::new(peer.clone(), 2, 1))
+            .await;
         assert_eq!(handle.peer_snapshot().inbound_peers, 1);
 
-        handle.remove_session(&peer, 2, 2).await;
+        handle
+            .remove_session(&DiscoverySessionKey::new(peer.clone(), 2, 2))
+            .await;
         assert_eq!(handle.peer_snapshot().inbound_peers, 0);
     }
 

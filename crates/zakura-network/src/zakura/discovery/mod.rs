@@ -4,6 +4,7 @@ mod candidate_dialer;
 #[cfg(test)]
 mod conformance_tests;
 mod dialer;
+mod peer;
 mod pipe;
 mod protocol;
 mod redial;
@@ -11,7 +12,11 @@ mod requester;
 mod runtime;
 mod service;
 mod serving;
+mod state;
+#[cfg(test)]
+mod state_tests;
 mod trace;
+mod verified;
 pub(crate) mod wire;
 #[cfg(test)]
 mod wire_tests;

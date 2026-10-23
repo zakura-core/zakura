@@ -73,27 +73,32 @@ fn exit_after(sim: &mut Sim, label: &'static str, after: Duration) {
     });
 }
 
-/// The owner in a completed task's name: `p1` for `request-p1.1` and the
-/// prefix `request-`.
+/// The owner in a completed task's name: `p1` for `request-p1.1`, or for
+/// a child such as `serve-p1.1/request-p1.1`, and the prefix `request-`.
 fn exited<'o>(obs: &'o Observation, prefix: &str) -> Option<&'o str> {
     match obs {
         Observation::TaskExited {
             task,
             exit: Exit::Completed,
-        } => task.strip_prefix(prefix)?.split('.').next(),
+        } => task
+            .rsplit('/')
+            .next()?
+            .strip_prefix(prefix)?
+            .split('.')
+            .next(),
         _ => None,
     }
 }
 
 /// Opens an obligation for each `request-<owner>` task that exits.
 fn requests(cx: &mut CheckCtx<'_, World>) -> Verdict {
-    let owners: Vec<String> = cx
+    let owners: Vec<(usize, String)> = cx
         .observations()
-        .filter_map(|obs| exited(obs, "request-"))
-        .map(str::to_owned)
+        .enumerate()
+        .filter_map(|(at, obs)| Some((at, exited(obs, "request-")?.to_owned())))
         .collect();
-    for owner in &owners {
-        let obligation = cx.obligation(Subject::Owner(owner.clone()), served);
+    for (at, owner) in &owners {
+        let obligation = cx.obligation(Some(*at), Subject::Owner(owner.clone()), served);
         cx.oblige(obligation);
     }
     if owners.is_empty() {
@@ -337,14 +342,18 @@ fn one_observation_discharges_oldest_only() {
 /// Opens a `BeforeQuiescence` obligation on the handler when the first
 /// storage operation completes.
 fn completions(cx: &mut CheckCtx<'_, World>) -> Verdict {
-    let completed = cx.observations().any(|obs| {
+    let completed = cx.observations().position(|obs| {
         matches!(obs, Observation::Fake { source, event }
             if source == "storage" && event.starts_with("store:1:"))
     });
-    if !completed {
+    if completed.is_none() {
         return Verdict::NotApplicable;
     }
-    let obligation = cx.obligation(Subject::Owner("handler".to_owned()), handler_exits);
+    let obligation = cx.obligation(
+        completed,
+        Subject::Owner("handler".to_owned()),
+        handler_exits,
+    );
     cx.oblige(obligation);
     Verdict::Holds
 }
@@ -694,5 +703,77 @@ fn ops_bound_with_object_rejected() {
     assert_eq!(
         Registry::new(vec![property]).err(),
         Some(RegistryError::OpsObject { id: SERVED })
+    );
+}
+
+/// Opens a `BeforeQuiescence` obligation for each `request-<owner>` task
+/// that a step spawns.
+fn spawned_requests(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    let owners: Vec<(usize, String)> = cx
+        .observations()
+        .enumerate()
+        .filter_map(|(at, obs)| match obs {
+            Observation::TaskSpawned { task } => {
+                let name = task.rsplit('/').next()?.strip_prefix("request-")?;
+                Some((at, name.split('.').next()?.to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (at, owner) in &owners {
+        let obligation = cx.obligation(Some(*at), Subject::Owner(owner.clone()), served);
+        cx.oblige(obligation);
+    }
+    if owners.is_empty() {
+        Verdict::NotApplicable
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// Review: a step that logs `serve-p1`'s exit and then the spawn of
+/// `request-p1` mustn't let the earlier exit discharge the later request.
+/// The request is never served, so the property fails at quiescence.
+#[test]
+fn earlier_observation_does_not_discharge_later_trigger() {
+    let property = Property {
+        id: SERVED,
+        claim: "every spawned request is served before quiescence",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::Schedule],
+        status: Status::Active,
+        check: spawned_requests,
+        witness: None,
+    };
+    let report = report(honest(), vec![property], Assumptions::none(), |sim| {
+        sim.scheduler().spawn_root("serve-p1", async {
+            task::spawn_named("request-p1", async {});
+        });
+    });
+    let trigger = report
+        .log
+        .entries()
+        .iter()
+        .position(|e| matches!(&e.obs, Observation::TaskSpawned { task } if task.ends_with("/request-p1.1")))
+        .expect("the request was spawned");
+    let entries = report.log.entries();
+    assert_eq!(
+        entries[trigger - 1],
+        zakura_sim::observe::Entry {
+            step: entries[trigger].step,
+            obs: Observation::TaskExited {
+                task: "serve-p1.1".to_owned(),
+                exit: Exit::Completed
+            }
+        },
+        "the serve's exit comes first in the request's step"
+    );
+    assert!(
+        matches!(outcome(&report, &SERVED), PropertyOutcome::Violated { .. }),
+        "{:?}",
+        report.properties
     );
 }

@@ -28,6 +28,11 @@ pub struct Obligation {
     pub opened_at: u64,
     /// The trigger time.
     pub opened_time: SimInstant,
+    /// The trigger's position among its step's observations, or `None` for
+    /// a trigger that isn't one, such as a change in the view. Only later
+    /// observations discharge the obligation: in the trigger step, those
+    /// after this position, and with `None`, none.
+    pub trigger: Option<usize>,
     /// How long the node has.
     pub bound: LivenessBound,
     /// True if an observation discharges the obligation with `key`.

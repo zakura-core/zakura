@@ -53,13 +53,16 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     }
 
     /// An obligation on `subject`, opened at this step under the property's
-    /// liveness bound. Its witness is this step.
+    /// liveness bound. `trigger` is the trigger's position in
+    /// [`StepCtx::observations`], as [`Obligation::trigger`] describes. Its
+    /// witness is this step.
     ///
     /// # Panics
     ///
     /// If the property isn't a liveness property.
     pub fn obligation(
         &self,
+        trigger: Option<usize>,
         subject: Subject,
         discharged_by: fn(&ObligationKey, &Observation) -> bool,
     ) -> Obligation {
@@ -76,6 +79,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             },
             opened_at: self.step.step,
             opened_time: self.step.now,
+            trigger,
             bound,
             discharged_by,
             witness: vec![self.step.step],

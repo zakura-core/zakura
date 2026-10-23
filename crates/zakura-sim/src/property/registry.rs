@@ -200,6 +200,14 @@ struct Open {
     ops: u32,
 }
 
+impl Open {
+    /// True if observation `at` of `step` came after the trigger, so it may
+    /// discharge the obligation.
+    fn follows(&self, step: u64, at: usize) -> bool {
+        step > self.registered || self.obligation.trigger.is_some_and(|trigger| at > trigger)
+    }
+}
+
 impl<S: HasView> RegistryChecker<S> {
     /// A checker for `registry`'s properties. Checks read the harness's view
     /// through `handle`, and `assumptions` says what the scenario declares.
@@ -338,10 +346,10 @@ fn step_property<S: HasView>(
         });
     }
 
-    for obs in cx.observations() {
+    for (at, obs) in cx.observations().enumerate() {
         let matched = state.open.iter().position(|open| {
             let obligation = &open.obligation;
-            (obligation.discharged_by)(&obligation.key, obs)
+            open.follows(cx.step, at) && (obligation.discharged_by)(&obligation.key, obs)
         });
         if let Some(i) = matched {
             state.open.remove(i);

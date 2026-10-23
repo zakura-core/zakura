@@ -352,8 +352,16 @@ fn owned_capacity_has_release_events() {
                 Release::LeaseIdleExpired,
                 Release::Shutdown,
             ],
-            ReadHeaderPath => &[Release::LeaseConsumedByRead, Release::Shutdown],
-            ReleaseHeaderPath => &[Release::LeaseReleased, Release::Shutdown],
+            ReadHeaderPath => &[
+                Release::LeaseConsumedByRead,
+                Release::LeaseIdleExpired,
+                Release::Shutdown,
+            ],
+            ReleaseHeaderPath => &[
+                Release::LeaseReleased,
+                Release::LeaseIdleExpired,
+                Release::Shutdown,
+            ],
             _ => &[],
         };
         assert_eq!(releases, expected, "{}", op.name());
@@ -393,4 +401,33 @@ fn a_held_lease_refuses_with_capacity_busy() {
         busy,
         [AcquireRefusal::IdsExhausted, AcquireRefusal::ScopeAhead]
     );
+}
+
+/// Idle expiry isn't per peer. Peer A's idle lease ends when peer B acquires
+/// or reads, so B can take the slot, as the "expired slots are reclaimed"
+/// step of `retained_path_leases_are_exact_bounded_session_scoped_and_expiring`
+/// in zakura-state shows. Every operation that holds a lease can lose it this
+/// way, and only acquire and read sweep.
+#[test]
+fn any_peers_acquire_or_read_sweeps_idle_leases() {
+    use HeaderOp::*;
+    for op in HeaderOp::ALL {
+        let contract = op.contract();
+        assert_eq!(
+            contract.sweeps_idle_leases,
+            matches!(op, AcquireHeaderPath | ReadHeaderPath),
+            "{}",
+            op.name()
+        );
+        assert_eq!(
+            contract.releases.contains(&Release::LeaseIdleExpired),
+            matches!(op, AcquireHeaderPath | ReadHeaderPath | ReleaseHeaderPath),
+            "{}",
+            op.name()
+        );
+    }
+    // A's lease, held by its pending read, ends when B's acquire runs first.
+    let a_holds = ReadHeaderPath.contract();
+    let b_runs = AcquireHeaderPath.contract();
+    assert!(b_runs.sweeps_idle_leases && a_holds.releases.contains(&Release::LeaseIdleExpired));
 }

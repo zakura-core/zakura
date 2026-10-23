@@ -102,9 +102,13 @@
 //! * a successful read consumes it
 //! * an explicit release drops it
 //! * an `Acquired` reply nobody receives drops it
-//! * its 30 s idle deadline passes, checked on the peer's next acquire or read
+//! * its 30 s idle deadline passes, and some later acquire or read sweeps it
 //!
-//! Shutdown ends everything.
+//! The sweep isn't per peer. Each acquire, and each read that passes its
+//! bounds check, first ends every lease past its idle deadline, whoever holds
+//! it, and fires the waiting capacity signals. So if peer A leaves a lease
+//! idle for 30 s, peer B's next acquire ends it and can take the freed slot.
+//! A then sees `Unavailable` on its next read. Shutdown ends everything.
 //!
 //! A peer holds at most one lease. An acquire while that peer's lease or
 //! earlier acquire is still live gets `CapacityBusy`, whose signal fires when
@@ -252,8 +256,9 @@ pub enum Release {
     LeaseReleased,
     /// An `Acquired` reply with no receiver drops its lease.
     LeaseAbandonedAcquire,
-    /// The lease's 30 s idle deadline passes. State checks it on the peer's
-    /// next acquire or read.
+    /// The lease's 30 s idle deadline has passed, and a later operation that
+    /// sweeps idle leases ends it. That operation can belong to any peer. See
+    /// [`OpContract::sweeps_idle_leases`].
     LeaseIdleExpired,
     /// Service shutdown drops everything still owned.
     Shutdown,
@@ -314,6 +319,10 @@ pub struct OpContract {
     /// The events that end capacity the operation creates or holds. Empty if
     /// it owns none.
     pub releases: &'static [Release],
+    /// Whether the operation first ends every peer's lease that's past its
+    /// idle deadline, as `RetainedPathLeaseRegistry::expire` does. For a read,
+    /// only once the page count passes its bounds check.
+    pub sweeps_idle_leases: bool,
 }
 
 /// The faults of the operations that return `PortError`.
@@ -346,12 +355,14 @@ static CONTRACTS: [OpContract; 8] = [
         faults: PORT_FAULTS,
         deadlines: REACTOR_READ_DEADLINES,
         releases: &[Release::LocatorPermitOnFinish, Release::Shutdown],
+        sweeps_idle_leases: false,
     },
     OpContract {
         op: HeaderOp::VctRepairContext,
         faults: PORT_FAULTS,
         deadlines: REACTOR_READ_DEADLINES,
         releases: &[],
+        sweeps_idle_leases: false,
     },
     OpContract {
         op: HeaderOp::AcquireHeaderPath,
@@ -362,6 +373,7 @@ static CONTRACTS: [OpContract; 8] = [
             Release::LeaseIdleExpired,
             Release::Shutdown,
         ],
+        sweeps_idle_leases: true,
     },
     OpContract {
         op: HeaderOp::ReadHeaderPath,
@@ -373,13 +385,23 @@ static CONTRACTS: [OpContract; 8] = [
                 after: ADAPTER_DEADLINE,
             },
         ],
-        releases: &[Release::LeaseConsumedByRead, Release::Shutdown],
+        releases: &[
+            Release::LeaseConsumedByRead,
+            Release::LeaseIdleExpired,
+            Release::Shutdown,
+        ],
+        sweeps_idle_leases: true,
     },
     OpContract {
         op: HeaderOp::ReleaseHeaderPath,
         faults: PORT_FAULTS,
         deadlines: &[STATE_READ_DEADLINE],
-        releases: &[Release::LeaseReleased, Release::Shutdown],
+        releases: &[
+            Release::LeaseReleased,
+            Release::LeaseIdleExpired,
+            Release::Shutdown,
+        ],
+        sweeps_idle_leases: false,
     },
     OpContract {
         op: HeaderOp::PrepareHeaderTarget,
@@ -394,6 +416,7 @@ static CONTRACTS: [OpContract; 8] = [
             },
         ],
         releases: &[],
+        sweeps_idle_leases: false,
     },
     OpContract {
         op: HeaderOp::ApplyHeaderTarget,
@@ -402,12 +425,14 @@ static CONTRACTS: [OpContract; 8] = [
             after: VCT_REPAIR_WATCHDOG,
         }],
         releases: &[],
+        sweeps_idle_leases: false,
     },
     OpContract {
         op: HeaderOp::SelectedChainContains,
         faults: PORT_FAULTS,
         deadlines: &[STATE_READ_DEADLINE],
         releases: &[],
+        sweeps_idle_leases: false,
     },
 ];
 

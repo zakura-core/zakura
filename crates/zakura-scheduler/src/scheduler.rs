@@ -86,7 +86,7 @@ pub(crate) struct RunState {
     /// Points each task passed during shutdown, where points don't switch.
     pub(crate) cleanup_points: BTreeMap<TaskId, u32>,
     /// Tasks that passed [`CLEANUP_POINT_LIMIT`] points during shutdown. The
-    /// drain skips them, and shutdown leaks them.
+    /// drain stops at the first, and shutdown abandons the run.
     pub(crate) stuck: BTreeSet<TaskId>,
     /// Answers random draws. Taken out while it runs.
     pub(crate) draws: Option<DrawSource>,
@@ -272,7 +272,7 @@ const DRAIN_STEP_LIMIT: usize = 100_000;
 
 /// The most preemption points one task passes during shutdown. Points don't
 /// switch then, so a task spinning on a value no one will set never reaches
-/// a poll boundary. Past this it stops, and shutdown leaks it. The limit is
+/// a poll boundary. Past this it stops, and shutdown abandons the run. The limit is
 /// high so long but finite cleanup still finishes, and a cleanup point costs
 /// only a counter, so a stuck task costs well under a second.
 pub(crate) const CLEANUP_POINT_LIMIT: u32 = 10_000_000;
@@ -686,10 +686,9 @@ impl Scheduler {
     ///    future is dropped on its own stack, outside any unwind.
     /// 3. Only a task that is still parked, as in a lock cycle, is
     ///    force-unwound, and whatever that releases drains as in stage 1. If
-    ///    a task passed [`CLEANUP_POINT_LIMIT`] points in stage 1, as a spin
-    ///    on a value no one will set does, every task left is leaked
-    ///    instead, without running its destructors, since any of them may
-    ///    wait on what the stuck task's destructors would have done.
+    ///    a task passed [`CLEANUP_POINT_LIMIT`] points in stage 1, shutdown
+    ///    instead abandons the run without running any more code (see
+    ///    `abandon`).
     ///
     /// Check properties before calling this. A force-unwound task inside a
     /// production `catch_unwind` sees the unwind as a panic.
@@ -718,16 +717,12 @@ impl Scheduler {
             timers_left,
             ..CleanupReport::default()
         };
+        let mut abandoned = false;
         loop {
             self.drain(&mut report);
-            // Unwinding runs a task's destructors, which can't be preempted
-            // while unwinding, so one that spins would hang cleanup. Once a
-            // task is stuck, its own destructors won't run either, and any
-            // other task's destructor may wait on what they would have done,
-            // such as a flag or an unlock. So leak every task left instead.
-            // The run is over.
             if self.state(|s| !s.stuck.is_empty()) {
-                self.leak_all(&mut report);
+                report.leaked = self.abandon();
+                abandoned = true;
                 break;
             }
             // Every task left is parked, or the drain hit its step limit.
@@ -762,23 +757,14 @@ impl Scheduler {
         // Drop what's left outside the borrow, while the run and the
         // `zakura-rt` executor are both still installed, since destructors
         // may call hooks or queue more. Then nothing in the state runs code.
-        loop {
-            // A leftover's drop may spawn, and the new task's future may wait
-            // on what a leaked task skipped, as in `leak_all`. So once a task
-            // is stuck, queued futures are leaked too, before anything drops.
-            let leaked = self.state(|s| {
-                if s.stuck.is_empty() {
-                    return Vec::new();
+        if !abandoned {
+            loop {
+                let left = self.state(RunState::take_leftovers);
+                if left.is_empty() {
+                    break;
                 }
-                std::mem::take(&mut s.spawn_queue)
-            });
-            report.leaked += leaked.len();
-            leaked.into_iter().for_each(std::mem::forget);
-            let left = self.state(RunState::take_leftovers);
-            if left.is_empty() {
-                break;
+                drop(left);
             }
-            drop(left);
         }
         drop(clear_run);
         // After the state, so destructors above still found `zakura-rt`'s
@@ -788,36 +774,30 @@ impl Scheduler {
         report
     }
 
-    /// Leaks every live task without running its destructors, and counts it
-    /// in `leaked`. Every coroutine is forgotten before any task finishes,
-    /// because finishing wakes joiners, and a waker that panics would
-    /// otherwise drop, and so force-unwind, the coroutines still held.
-    fn leak_all(&mut self, report: &mut CleanupReport) {
-        loop {
-            let leaked: Vec<TaskId> = (0..self.coroutines.len())
-                .filter_map(|i| {
-                    std::mem::forget(self.coroutines[i].take()?);
-                    Some(TaskId(
-                        u32::try_from(i).expect("queue_spawn caps tasks at u32"),
-                    ))
-                })
-                .collect();
-            if leaked.is_empty() {
-                return;
-            }
-            report.leaked += leaked.len();
-            for task in leaked {
-                self.finish(task, TaskExit::Cancelled);
-            }
-            // A wake may have spawned. Leak those tasks too.
-            self.admit();
-        }
+    /// Abandons the run once a task is stuck in cleanup, and returns how many
+    /// tasks it leaked: every task still live, plus any spawn still queued.
+    ///
+    /// A stuck task's own destructors never run, and any other code may wait
+    /// on what they would have done, such as a flag or an unlock. So from
+    /// here no more user code runs at all: no unwind, drop, wake, or spawn.
+    /// Every coroutine and the whole run state, with its queued spawns,
+    /// timers, join wakers and panic payloads, are forgotten as they are,
+    /// as [`ClearRun`] does during a panic. Their stacks count as leaked in
+    /// [`StackPool`](crate::StackPool).
+    fn abandon(&mut self) -> usize {
+        let coroutines = std::mem::take(&mut self.coroutines);
+        let live = coroutines.iter().filter(|co| co.is_some()).count();
+        std::mem::forget(coroutines);
+        let state = RUN.with(|r| r.borrow_mut().take());
+        let queued = state.as_ref().map_or(0, |s| s.spawn_queue.len());
+        std::mem::forget(state);
+        live + queued
     }
 
     /// Runs ready tasks during shutdown until none is left: first any task
     /// stopped mid-poll, then each task at a poll boundary, which `step`
     /// cancels. Picks the lowest `TaskId`, so cleanup replays too. Stops as
-    /// soon as a task is stuck, since every task left is then leaked.
+    /// soon as a task is stuck, since shutdown then abandons the run.
     fn drain(&mut self, report: &mut CleanupReport) {
         for _ in 0..DRAIN_STEP_LIMIT {
             if self.state(|s| !s.stuck.is_empty()) {
@@ -826,10 +806,10 @@ impl Scheduler {
             // Setup code may have spawned since the last step.
             self.admit();
             let next = self.state(|s| {
-                let mut live = s.ready.iter().filter(|t| !s.stuck.contains(t));
-                live.clone()
+                s.ready
+                    .iter()
                     .find(|t| s.mid_poll.contains(t))
-                    .or_else(|| live.next())
+                    .or_else(|| s.ready.first())
                     .copied()
             });
             let Some(task) = next else { return };

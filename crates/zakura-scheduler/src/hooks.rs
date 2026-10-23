@@ -37,7 +37,7 @@ pub fn preempt(point: Point) {
         let task = s.current?;
         if s.shutting_down {
             // Points don't switch during cleanup, until a task passes the
-            // limit. Then it stops here, and shutdown leaks it.
+            // limit. Then it stops here, and shutdown abandons the run.
             let n = s.cleanup_points.entry(task).or_insert(0);
             *n = n.saturating_add(1);
             if *n <= CLEANUP_POINT_LIMIT {

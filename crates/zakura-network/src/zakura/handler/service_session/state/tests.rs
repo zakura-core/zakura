@@ -632,6 +632,10 @@ proptest! {
 /// Fixed seeds run the fuzz entry in every test run, and together exercise
 /// every rule the replay counts.
 #[test]
+#[allow(
+    clippy::print_stdout,
+    reason = "CI retains these applicability counters"
+)]
 fn fixed_seeds_exercise_every_session_rule() {
     let mut total = ServiceSessionReplaySummary::default();
     for seed in 1..=32u64 {

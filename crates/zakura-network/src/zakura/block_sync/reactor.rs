@@ -8,7 +8,7 @@ use crate::zakura::{
 };
 use rand_10::Rng;
 use std::num::NonZeroU64;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
@@ -250,7 +250,7 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
-    spawn_erased(sequencer_task.run());
+    spawn_erased_named("block_sync_sequencer", sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
@@ -336,7 +336,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
-    let task = spawn_erased(reactor.run());
+    let task = spawn_erased_named("block_sync_reactor", reactor.run());
 
     Ok((handle, actions_rx, task))
 }

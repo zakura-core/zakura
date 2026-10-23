@@ -151,18 +151,23 @@ jobs:
       # node with "librocksdb.so.8.9: cannot open shared object file". Unset it so
       # RocksDB is vendored and statically linked. Both steps must keep it unset:
       # if the run step re-set it, cargo would relink the bin and re-break it.
+      #
+      # `-mpclmul`: the runner's amd64v3 GCC defaults to `-march=x86-64-v3`,
+      # which enables AVX but not PCLMUL. RocksDB's `port/lang.h` assumes AVX
+      # implies PCLMUL and compiles its pclmul CRC32C code, which then fails.
+      # Both steps need identical CXXFLAGS or cargo rebuilds librocksdb-sys.
       - name: Build Zakura e2e (debug)
         run: |
           unset ROCKSDB_LIB_DIR
           cargo test -p zakura --test zakura_regtest_e2e --no-run
         env:
-          CXXFLAGS: "-include cstdint"
+          CXXFLAGS: "-include cstdint -mpclmul"
       - name: Run Zakura regtest PR gate
         run: |
           unset ROCKSDB_LIB_DIR
           cargo test -p zakura --test zakura_regtest_e2e -- --ignored --nocapture
         env:
-          CXXFLAGS: "-include cstdint"
+          CXXFLAGS: "-include cstdint -mpclmul"
           ZAKURA_REGTEST_E2E: "1"
           ZAKURA_E2E_MODE: pr-gate
           ZAKURA_E2E_TRACE_DIR: ${{ runner.temp }}/zakura-regtest-e2e-traces-pr-gate
@@ -260,20 +265,20 @@ jobs:
           cache-on-failure: true
           cache-save-if: false
       - uses: ./.github/actions/setup-zakura-build
-      # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR / static-link
+      # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR and CXXFLAGS
       # rationale); the run step reuses the compiled artifacts.
       - name: Build Zakura e2e (debug)
         run: |
           unset ROCKSDB_LIB_DIR
           cargo test -p zakura --test zakura_regtest_e2e --no-run
         env:
-          CXXFLAGS: "-include cstdint"
+          CXXFLAGS: "-include cstdint -mpclmul"
       - name: Run Zakura regtest dual-stack e2e
         run: |
           unset ROCKSDB_LIB_DIR
           cargo test -p zakura --test zakura_regtest_e2e -- --ignored --nocapture
         env:
-          CXXFLAGS: "-include cstdint"
+          CXXFLAGS: "-include cstdint -mpclmul"
           ZAKURA_REGTEST_E2E: "1"
           ZAKURA_E2E_MODE: ${{ matrix.zakura-mode }}
           ZAKURA_E2E_TRACE_DIR: ${{ runner.temp }}/zakura-regtest-e2e-traces-${{ matrix.zakura-mode }}

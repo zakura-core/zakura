@@ -238,7 +238,21 @@ fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, 
 /// 5. Reconstruct a new frontier from the merged roots and the new tip leaf.
 pub(crate) fn parallel_append<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
+    new_leaves: Vec<H>,
+) -> Result<Frontier<H, DEPTH>, FrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    parallel_append_using(frontier, new_leaves, |leaves, _| {
+        perfect_subtree_root(leaves)
+    })
+}
+
+/// Appends leaves using a caller-supplied perfect-subtree reduction.
+fn parallel_append_using<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
     mut new_leaves: Vec<H>,
+    subtree_root: fn(&[H], usize) -> H,
 ) -> Result<Frontier<H, DEPTH>, FrontierError>
 where
     H: Hashable + Clone + Send + Sync,
@@ -266,7 +280,7 @@ where
     // Hash each new subtree chunk in parallel.
     let new_subtree_roots: Vec<(usize, H)> = chunks
         .into_par_iter()
-        .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
+        .map(|(level, leaves)| (level, subtree_root(leaves, leaves_to_merge.len())))
         .collect();
 
     // Merge the new roots in leaf order. The roots can be computed in parallel,
@@ -313,6 +327,37 @@ pub fn append_batch_with_subtree<H, const DEPTH: u8>(
 where
     H: Hashable + Clone + Send + Sync,
 {
+    append_batch_with_subtree_impl(frontier, nodes, parallel_append)
+}
+
+/// Like [`append_batch_with_subtree`], with a specialized subtree hasher.
+///
+/// `subtree_root` must return the same root as [`Hashable::combine`] for a
+/// nonempty, power-of-two slice of leaves, starting at [`Level`] zero. Its
+/// second argument is the total number of leaves being merged in this append
+/// segment (excluding the frontier tip). This lets it retain scalar parallelism
+/// when too little work is available for efficient batches.
+pub(crate) fn append_batch_with_subtree_using<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    nodes: Vec<H>,
+    subtree_root: fn(&[H], usize) -> H,
+) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), BatchFrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    append_batch_with_subtree_impl(frontier, nodes, |frontier, nodes| {
+        parallel_append_using(frontier, nodes, subtree_root)
+    })
+}
+
+fn append_batch_with_subtree_impl<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    nodes: Vec<H>,
+    append: impl Fn(Frontier<H, DEPTH>, Vec<H>) -> Result<Frontier<H, DEPTH>, FrontierError>,
+) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), BatchFrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
     use crate::subtree::TRACKED_SUBTREE_HEIGHT;
 
     if nodes.is_empty() {
@@ -349,7 +394,7 @@ where
         let mut head = nodes;
         let tail = head.split_off(head_len);
 
-        let f1 = parallel_append(frontier, head)?;
+        let f1 = append(frontier, head)?;
 
         // index = (boundary / subtree_size) - 1; fits in u16 by tree depth.
         let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
@@ -358,10 +403,10 @@ where
             .expect("just appended at least one leaf")
             .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
 
-        let f2 = parallel_append(f1, tail)?;
+        let f2 = append(f1, tail)?;
         Ok((f2, Some((index_value, root))))
     } else {
-        let f = parallel_append(frontier, nodes)?;
+        let f = append(frontier, nodes)?;
         Ok((f, None))
     }
 }

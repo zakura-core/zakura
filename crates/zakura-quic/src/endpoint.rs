@@ -25,7 +25,7 @@ use crate::{
     },
     error::{BindError, ConnectError},
     key::{NodeAddr, NodeId, NodeSecretKey},
-    socket::{bind_udp, SocketBuffers, UdpIo},
+    socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
     tls::TlsConfig,
 };
@@ -190,6 +190,24 @@ impl QuicEndpoint {
         bind: &QuicBindConfig,
         config: &QuicConfig,
     ) -> Result<Self, BindError> {
+        // A `u32` fits in `usize` on every supported target.
+        let factory = UdpFactory {
+            recv_buffer_bytes: config.recv_buffer_bytes as usize,
+            send_buffer_bytes: config.send_buffer_bytes as usize,
+            offload: config.gso,
+        };
+        Self::bind_with_factory(secret, bind, config, factory)
+    }
+
+    /// Binds one socket per address in `bind` through `factory`, which also
+    /// builds every SOCK-9 replacement. Only a socket with an inode gets the
+    /// SOCK-7 poller, and only one with buffer sizes gets the SOCK-5 gauges.
+    pub(crate) fn bind_with_factory<F: SocketFactory>(
+        secret: NodeSecretKey,
+        bind: &QuicBindConfig,
+        config: &QuicConfig,
+        factory: F,
+    ) -> Result<Self, BindError> {
         config.validate()?;
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
@@ -215,34 +233,30 @@ impl QuicEndpoint {
             network: watch::Sender::new(0),
             network_changes: AtomicU64::new(0),
         });
+        let factory = Arc::new(factory);
         let mut bound = Vec::with_capacity(bind.addrs.len());
         for addr in &bind.addrs {
-            let socket_error = |source| BindError::Socket {
+            let socket = factory.bind(*addr).map_err(|source| BindError::Socket {
                 addr: *addr,
                 source,
-            };
-            let socket = bind_udp(
-                *addr,
-                config.recv_buffer_bytes as usize,
-                config.send_buffer_bytes as usize,
-            )
-            .map_err(socket_error)?;
-            let io = UdpIo::new(socket.socket, config.gso).map_err(socket_error)?;
-            bound.push((socket.local_addr, socket.buffers, socket.inode, io));
+            })?;
+            bound.push(socket);
         }
         let mut sockets = Vec::with_capacity(bound.len());
-        for (local_addr, buffers, inode, io) in bound {
+        for socket in bound {
             // SOCK-5.
-            metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
-                .set(buffers.recv_effective as f64);
-            metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
-                .set(buffers.send_effective as f64);
+            if let Some(buffers) = socket.buffers {
+                metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
+                    .set(buffers.recv_effective as f64);
+                metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
+                    .set(buffers.send_effective as f64);
+            }
             let slot = Arc::new(SocketSlot {
-                local_addr,
-                buffers,
-                gso: io.gso(),
+                local_addr: socket.local_addr,
+                buffers: socket.buffers.unwrap_or_default(),
+                gso: socket.io.gso(),
                 rebinds: AtomicU64::new(0),
-                inode: AtomicU64::new(inode.unwrap_or(0)),
+                inode: AtomicU64::new(socket.inode.unwrap_or(0)),
                 recv_calls: AtomicU64::new(0),
                 datagrams_received: AtomicU64::new(0),
                 queue_drops: AtomicU64::new(0),
@@ -250,13 +264,24 @@ impl QuicEndpoint {
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
-            let task =
-                tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
+            let task = tokio::spawn(
+                EndpointTask::new(
+                    shared.clone(),
+                    slot.clone(),
+                    factory.clone(),
+                    socket.io,
+                    cmds_rx,
+                )
+                .run(),
+            );
+            // SOCK-7: an injected socket has no inode to poll.
             #[cfg(target_os = "linux")]
-            tokio::spawn(kernel_drop_poller(
-                Arc::downgrade(&slot),
-                config.kernel_drop_poll_interval(),
-            ));
+            if socket.inode.is_some() {
+                tokio::spawn(kernel_drop_poller(
+                    Arc::downgrade(&slot),
+                    config.kernel_drop_poll_interval(),
+                ));
+            }
             sockets.push(SocketHandle {
                 cmds,
                 slot,

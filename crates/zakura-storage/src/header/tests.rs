@@ -378,3 +378,19 @@ fn outcome_names_are_distinct_identity_parts() {
         assert!(!name.contains(':'), "{name} would split a storage identity");
     }
 }
+
+/// A second acquire by a peer that holds a lease waits on capacity, as
+/// `capacity_signals_follow_reservations_and_capacity_classes` in
+/// zakura-state shows. Only a stale scope or exhausted IDs give `Busy`.
+#[test]
+fn a_held_lease_refuses_with_capacity_busy() {
+    let busy: Vec<_> = AcquireRefusal::ALL
+        .into_iter()
+        .filter(|refusal| !refusal.waits_for_capacity())
+        .collect();
+    assert!(AcquireRefusal::PeerHoldsLease.waits_for_capacity());
+    assert_eq!(
+        busy,
+        [AcquireRefusal::IdsExhausted, AcquireRefusal::ScopeAhead]
+    );
+}

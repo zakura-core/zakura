@@ -22,7 +22,7 @@
 //! |:--|:--|:--|:--|
 //! | `continuation_locator` | reactor, `QueryHeaderLocator` | `Some(locator)`, or `None` before handoff | `unavailable`, `timeout` after 30 s |
 //! | `vct_repair_context` | reactor, `QueryVctRepairContext` | `Resolved`, `Stale` | `unavailable`, `timeout` after 30 s |
-//! | `acquire_header_path` | v9 publisher page job | `Acquired`, `TargetNotRetained`, `NoLocatorIntersection`, `HistoryPruned`, `Busy`, `CapacityBusy` | `unavailable`, `timeout` after 30 s |
+//! | `acquire_header_path` | v9 publisher page job | `Acquired`, `TargetNotRetained`, `NoLocatorIntersection`, `HistoryPruned`, `CapacityBusy` or `Busy` per [`AcquireRefusal`]. An empty or oversized locator gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `read_header_path` | v9 publisher page job | `Page`, `Unavailable`. A foreign path gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `release_header_path` | v9 publisher page job | `Ok(())`, also on repeats. A foreign path gives `Err(Unavailable)` | `unavailable`, `timeout` after 30 s |
 //! | `prepare_header_target` | reactor, `PrepareHeaderTarget` | a sealed target, `stale_target`, `unknown_anchor`, validation and body-size errors | `local-resource` |
@@ -104,8 +104,13 @@
 //! * an `Acquired` reply nobody receives drops it
 //! * its 30 s idle deadline passes, checked on the peer's next acquire or read
 //!
-//! Shutdown ends everything. A peer holds at most one lease, so an acquire
-//! while one is held gets `Busy`.
+//! Shutdown ends everything.
+//!
+//! A peer holds at most one lease. An acquire while that peer's lease or
+//! earlier acquire is still live gets `CapacityBusy`, whose signal fires when
+//! that lease ends, so the publisher waits and retries. `Busy` is a different
+//! refusal that sends the publisher to a local stall. [`AcquireRefusal`] maps
+//! each refusal to its reply.
 //!
 //! # Source references
 //!
@@ -252,6 +257,48 @@ pub enum Release {
     LeaseIdleExpired,
     /// Service shutdown drops everything still owned.
     Shutdown,
+}
+
+/// Why state refuses an acquire before leasing a path, following
+/// `RetainedPathLeaseRegistry::reserve` and `acquire_retained_path`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AcquireRefusal {
+    /// The peer already holds a lease, or has an acquire in flight. The
+    /// signal fires when that ends.
+    PeerHoldsLease,
+    /// Every slot the request's capacity class may use is taken. The signal
+    /// fires when one frees.
+    CapacityFull,
+    /// The path needs an ordinary slot, but only the reserve slot was free.
+    /// The signal fires when an ordinary slot frees.
+    BeyondReserve,
+    /// The scope names another target, or a newer header generation than
+    /// state has.
+    ScopeAhead,
+    /// The reservation or lease ID counter ran out.
+    IdsExhausted,
+}
+
+impl AcquireRefusal {
+    /// Every refusal, in the order state checks them.
+    pub const ALL: [AcquireRefusal; 5] = [
+        AcquireRefusal::PeerHoldsLease,
+        AcquireRefusal::CapacityFull,
+        AcquireRefusal::IdsExhausted,
+        AcquireRefusal::ScopeAhead,
+        AcquireRefusal::BeyondReserve,
+    ];
+
+    /// Whether the refusal is `CapacityBusy`, with a signal the caller waits
+    /// on. Otherwise it's `Busy`.
+    pub const fn waits_for_capacity(self) -> bool {
+        match self {
+            AcquireRefusal::PeerHoldsLease
+            | AcquireRefusal::CapacityFull
+            | AcquireRefusal::BeyondReserve => true,
+            AcquireRefusal::ScopeAhead | AcquireRefusal::IdsExhausted => false,
+        }
+    }
 }
 
 /// The contract for one [`HeaderOp`].

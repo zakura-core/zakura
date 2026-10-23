@@ -344,8 +344,9 @@ pub struct CleanupReport {
     /// Tasks still parked after the drain, such as a lock cycle, whose
     /// coroutines were force-unwound.
     pub unwound: usize,
-    /// Tasks stopped at the cleanup point limit, whose coroutines and stacks
-    /// were leaked without running their destructors.
+    /// Tasks stopped at the cleanup point limit, and every task left after
+    /// one, whose coroutines and stacks were leaked without running their
+    /// destructors.
     pub leaked: usize,
     /// Forced unwinds that a task's own code caught and didn't rethrow. The
     /// stack of such a task is leaked rather than reused.

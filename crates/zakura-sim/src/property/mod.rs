@@ -78,8 +78,9 @@ pub enum Unit {
     Headers,
 }
 
-/// An observation source a check reads (properties.md, Tiers). A log that
-/// lacks a source a property needs makes that property `NotApplicable`.
+/// An observation source a check reads (properties.md, Tiers). A harness
+/// names the sources it observes, and a property that needs one it lacks is
+/// `NotApplicable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Source {

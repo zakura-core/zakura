@@ -6,7 +6,7 @@ use zakura_scheduler::{Op, SimInstant};
 
 use super::{
     Assume, Assumptions, CheckCtx, HasView, Inconclusive, Kind, LivenessBound, Obligation,
-    Property, PropertyId, Status, Verdict,
+    Property, PropertyId, Source, Status, Verdict,
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
@@ -158,7 +158,7 @@ impl std::error::Error for RegistryError {}
 /// Evaluates a [`Registry`] as a run's checker.
 ///
 /// After each step, for each property whose assumptions the scenario
-/// declares, in registry order:
+/// declares and whose sources the harness observes, in registry order:
 ///
 /// 1. It updates `holds_since` from the property's assumptions. When one
 ///    stops holding, the property's open obligations end, and the property
@@ -191,6 +191,8 @@ pub struct RegistryChecker<S: HasView> {
 struct PropertyState {
     /// True if the scenario declares every assumption the property needs.
     declared: bool,
+    /// The sources the property needs that the harness doesn't observe.
+    missing: Vec<Source>,
     /// Evaluations that returned `Holds`.
     applicable: u32,
     /// True once an evaluation returned `Holds` or `Violated`, and the
@@ -228,13 +230,26 @@ impl Open {
 
 impl<S: HasView> RegistryChecker<S> {
     /// A checker for `registry`'s properties. Checks read the harness's view
-    /// through `handle`, and `assumptions` says what the scenario declares.
-    pub fn new(registry: Registry<S>, handle: Rc<S>, assumptions: Assumptions<S>) -> Self {
+    /// through `handle`, `assumptions` says what the scenario declares, and
+    /// `sources` names what the harness observes. A property that needs a
+    /// source outside `sources` never runs and is `NotApplicable`.
+    pub fn new(
+        registry: Registry<S>,
+        handle: Rc<S>,
+        assumptions: Assumptions<S>,
+        sources: &[Source],
+    ) -> Self {
         let state = registry
             .properties
             .iter()
             .map(|property| PropertyState {
                 declared: property.assumes.iter().all(|a| assumptions.declares(*a)),
+                missing: property
+                    .needs
+                    .iter()
+                    .copied()
+                    .filter(|need| !sources.contains(need))
+                    .collect(),
                 ..PropertyState::default()
             })
             .collect();
@@ -245,6 +260,17 @@ impl<S: HasView> RegistryChecker<S> {
             holds: assumptions.holds,
             events: Vec::new(),
         }
+    }
+
+    /// The sources property `id` needs that the harness doesn't observe, in
+    /// `needs` order, for the evidence report to name. Empty for a property
+    /// that runs, or isn't registered.
+    pub fn missing_sources(&self, id: &PropertyId) -> &[Source] {
+        self.properties
+            .iter()
+            .zip(&self.state)
+            .find(|(property, _)| &property.id == id)
+            .map_or(&[], |(_, state)| &state.missing)
     }
 
     /// The step after which all of property `id`'s assumptions have held so
@@ -265,7 +291,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         let mut first = None;
         for (property, state) in self.properties.iter().zip(&mut self.state) {
-            if !state.declared {
+            if !state.declared || !state.missing.is_empty() {
                 continue;
             }
             let Some(violation) = step_property(
@@ -497,7 +523,7 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
             witness: violation.witness.clone(),
         };
     }
-    if !state.declared {
+    if !state.declared || !state.missing.is_empty() {
         return PropertyOutcome::NotApplicable;
     }
     let reason = if !property.assumes.is_empty() && !state.ever_held {

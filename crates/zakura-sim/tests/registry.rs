@@ -131,6 +131,9 @@ fn request_served(
     }
 }
 
+/// What these runs observe: tasks, fake storage, and the world.
+const OBSERVED: &[Source] = &[Source::Schedule, Source::Storage, Source::View];
+
 /// Runs `properties` under `assumptions` over the tasks `setup` spawns,
 /// with `extra` after the registry in a [`Tee`]. Returns the report and the
 /// registry checker.
@@ -141,8 +144,21 @@ fn run_with<C: Checker>(
     extra: C,
     setup: impl FnOnce(&mut Sim),
 ) -> (RunReport, RegistryChecker<World>, C) {
+    run_observing(world, properties, assumptions, OBSERVED, extra, setup)
+}
+
+/// [`run_with`], observing `sources`.
+fn run_observing<C: Checker>(
+    world: Rc<World>,
+    properties: Vec<Property<World>>,
+    assumptions: Assumptions<World>,
+    sources: &[Source],
+    extra: C,
+    setup: impl FnOnce(&mut Sim),
+) -> (RunReport, RegistryChecker<World>, C) {
     let registry = Registry::new(properties).expect("the test's IDs are unique");
-    let mut tee = Tee(RegistryChecker::new(registry, world, assumptions), extra);
+    let checker = RegistryChecker::new(registry, world, assumptions, sources);
+    let mut tee = Tee(checker, extra);
     let report = run(config(2, 1_000), Plan::from_fuzz(&[]), setup, &mut tee);
     (report, tee.0, tee.1)
 }
@@ -975,4 +991,61 @@ fn virtual_time_discharge_at_deadline_holds() {
         outcome(&on_time, &SERVED),
         PropertyOutcome::Held { applicable: 1 }
     );
+}
+
+const NO_BAD_FRAMES: PropertyId = PropertyId::new("test/no-bad-frames");
+
+/// Finds no offending frame, since it looks for frames among observations
+/// that never include any.
+fn no_bad_frames(_: &mut CheckCtx<'_, World>) -> Verdict {
+    Verdict::Holds
+}
+
+/// A safety property that reads frames.
+fn frames_property() -> Property<World> {
+    Property {
+        id: NO_BAD_FRAMES,
+        claim: "no peer sends an offending frame",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Frames],
+        status: Status::Active,
+        check: no_bad_frames,
+        witness: None,
+    }
+}
+
+/// Review: a run that observes only scheduling never saw a frame, so a
+/// property that needs frames is `NotApplicable`, not `Held` for finding no
+/// bad ones. It never runs, so it never emits `Applicable`.
+#[test]
+fn missing_source_not_applicable() {
+    let (report, checker, recorder) = run_with(
+        honest(),
+        vec![frames_property()],
+        Assumptions::none(),
+        Recorder::default(),
+        |sim| exit_after(sim, "request-p1", Duration::ZERO),
+    );
+    assert_eq!(
+        outcome(&report, &NO_BAD_FRAMES),
+        PropertyOutcome::NotApplicable
+    );
+    assert_eq!(recorder.points(), []);
+    assert_eq!(checker.missing_sources(&NO_BAD_FRAMES), [Source::Frames]);
+
+    // A harness that observes frames runs it.
+    let (report, checker, _) = run_observing(
+        honest(),
+        vec![frames_property()],
+        Assumptions::none(),
+        &[Source::Frames, Source::Schedule],
+        Recorder::default(),
+        |sim| exit_after(sim, "request-p1", Duration::ZERO),
+    );
+    assert_eq!(
+        outcome(&report, &NO_BAD_FRAMES),
+        PropertyOutcome::Held { applicable: 1 }
+    );
+    assert_eq!(checker.missing_sources(&NO_BAD_FRAMES), []);
 }

@@ -220,15 +220,24 @@ fn cleanup_draws_rotate_so_a_select_loop_exits() {
             },
             &mut NoChecks,
         );
-        let _ = done.send((report.end.outcome, exited.get(), report.cleanup.unwound));
+        let _ = done.send((
+            report.end.outcome,
+            exited.get(),
+            report.cleanup.unwound,
+            report.cleanup.leaked,
+        ));
     });
-    let (outcome, exited, unwound) = finished
+    let (outcome, exited, unwound, leaked) = finished
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("shutdown finished the select loop");
     assert_eq!(outcome, Outcome::Budget);
     // The cleanup point bound would also end a stuck loop, by unwinding it.
     assert!(exited, "the loop took its exit branch during cleanup");
-    assert_eq!(unwound, 0, "nothing had to be force-unwound");
+    assert_eq!(
+        (unwound, leaked),
+        (0, 0),
+        "nothing was force-unwound or leaked"
+    );
 }
 
 /// A sink that builds the run's first hashed map when it gets `init`.
@@ -262,4 +271,29 @@ fn a_sink_draw_is_a_harness_failure() {
             "the sink's draw took no plan input"
         );
     }
+}
+
+#[test]
+fn an_at_end_draw_is_a_harness_failure() {
+    let mut checker = zakura_sim::check::FnChecker::new(
+        |_: &zakura_sim::StepCtx<'_>| None,
+        |_: &zakura_sim::RunEnd, _: &zakura_sim::ObservationLog| {
+            // The run's first hashed map draws its hash seed.
+            let _: HashMap<u8, u8> = HashMap::default();
+            Vec::new()
+        },
+    );
+    let (report, lines) = recorded(
+        config(2, 100),
+        Plan::from_fuzz(&[7; 16]),
+        |_| {},
+        &mut checker,
+    );
+    assert_eq!(
+        report.end.harness,
+        Some(zakura_sim::HarnessFailure::DrawOutsideStep),
+        "{:?}",
+        report.end
+    );
+    assert!(draws(&lines).is_empty(), "the draw took no plan input");
 }

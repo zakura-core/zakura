@@ -57,9 +57,10 @@ impl TlsConfig {
     /// TLS state whose provider takes its random source and key-exchange
     /// groups from `inputs`, when they're set (TLS-9).
     ///
-    /// Injected groups must include one that TLS 1.3 can use (TLS-1), and
-    /// with either input injected this builds a client config once. So
-    /// unusable groups fail at bind rather than at the first handshake.
+    /// Injected groups that TLS 1.3 can't use are dropped, and at least one
+    /// must remain (TLS-1). With either input injected this also builds a
+    /// client config once, so unusable groups fail at bind rather than at
+    /// the first handshake.
     pub(crate) fn with_inputs(
         secret_key: &NodeSecretKey,
         inputs: &EndpointInputs,
@@ -75,17 +76,20 @@ impl TlsConfig {
             provider.secure_random = random;
         }
         if let Some(groups) = groups {
-            // rustls' builder doesn't check `usable_for_version`. It only
-            // filters on it while negotiating.
-            if !groups
+            // TLS-1: drop groups TLS 1.3 can't use. rustls' builder doesn't
+            // check `usable_for_version`, and its client starts the first
+            // configured group for the key share while advertising only the
+            // usable ones.
+            provider.kx_groups = groups
                 .iter()
-                .any(|group| group.usable_for_version(rustls::ProtocolVersion::TLSv1_3))
-            {
+                .copied()
+                .filter(|group| group.usable_for_version(rustls::ProtocolVersion::TLSv1_3))
+                .collect();
+            if provider.kx_groups.is_empty() {
                 return Err(TlsConfigError::Rustls(rustls::Error::General(
                     "no key-exchange group is usable with TLS 1.3".into(),
                 )));
             }
-            provider.kx_groups = groups.to_vec();
         }
         let tls = Self::with_provider(secret_key, provider);
         tls.client_config(secret_key.public(), &[b"zakura-quic/check"])?;
@@ -274,17 +278,18 @@ mod tests {
         assert!(tls.uses_default_provider());
     }
 
-    /// ring's X25519, limited to TLS 1.2.
+    /// ring's P-256, limited to TLS 1.2, counting the key exchanges it starts.
     #[derive(Debug)]
-    struct Tls12OnlyX25519;
+    struct Tls12OnlyP256(std::sync::atomic::AtomicUsize);
 
-    impl rustls::crypto::SupportedKxGroup for Tls12OnlyX25519 {
+    impl rustls::crypto::SupportedKxGroup for Tls12OnlyP256 {
         fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-            rustls::crypto::ring::kx_group::X25519.start()
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rustls::crypto::ring::kx_group::SECP256R1.start()
         }
 
         fn name(&self) -> rustls::NamedGroup {
-            rustls::crypto::ring::kx_group::X25519.name()
+            rustls::crypto::ring::kx_group::SECP256R1.name()
         }
 
         fn usable_for_version(&self, version: rustls::ProtocolVersion) -> bool {
@@ -292,22 +297,42 @@ mod tests {
         }
     }
 
-    static TLS12_ONLY_X25519: Tls12OnlyX25519 = Tls12OnlyX25519;
+    static TLS12_ONLY_P256: Tls12OnlyP256 = Tls12OnlyP256(std::sync::atomic::AtomicUsize::new(0));
 
     /// TLS-1, TLS-9: rustls' builder accepts groups that only TLS 1.2 can
-    /// use, then finds no group while negotiating. Such a list fails here
-    /// instead, and one usable group is enough.
+    /// use. A list with none for TLS 1.3 fails here. In a mixed list the
+    /// TLS 1.2-only group is dropped, because rustls would otherwise start
+    /// the first configured group for its key share while advertising only
+    /// the usable ones.
     #[test]
-    fn kx_groups_without_tls13_fail() {
+    fn kx_groups_unusable_with_tls13_are_refused_or_dropped() {
         let secret = NodeSecretKey::generate();
-        let inputs = EndpointInputs::default().kx_groups(vec![&TLS12_ONLY_X25519]);
+        let inputs = EndpointInputs::default().kx_groups(vec![&TLS12_ONLY_P256]);
         assert!(TlsConfig::with_inputs(&secret, &inputs).is_err());
 
-        let inputs = EndpointInputs::default().kx_groups(vec![
-            &TLS12_ONLY_X25519,
-            rustls::crypto::ring::kx_group::X25519,
-        ]);
-        assert!(TlsConfig::with_inputs(&secret, &inputs).is_ok());
+        let x25519 = rustls::crypto::ring::kx_group::X25519;
+        let inputs = EndpointInputs::default().kx_groups(vec![&TLS12_ONLY_P256, x25519]);
+        let tls = TlsConfig::with_inputs(&secret, &inputs).unwrap();
+        assert_eq!(
+            tls.provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>(),
+            [x25519.name()]
+        );
+
+        // Writing a ClientHello starts the key share.
+        let starts = TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed);
+        let client = tls
+            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
+            .unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        assert_eq!(
+            TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed),
+            starts
+        );
     }
 
     /// TLS-10, TLS-11, WIRE-2: no 0-RTT, no tickets, no SNI, and the ALPNs in

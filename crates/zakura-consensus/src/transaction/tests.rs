@@ -4485,10 +4485,11 @@ fn v4_deprecation_boundary() {
     for network in [
         configured_network_with_nu7(Some(Height(2_000_000))),
         Network::new_default_testnet(),
+        Network::Mainnet,
     ] {
         let nu7 = NetworkUpgrade::Nu7
             .activation_height(&network)
-            .expect("NU7 is scheduled on configured and default Testnet");
+            .expect("NU7 is scheduled on configured and default networks");
         assert!(
             verify_v4_at(
                 &network,
@@ -4519,14 +4520,13 @@ fn v4_deprecation_boundary() {
         );
     }
 
-    for network in [Network::Mainnet, configured_network_with_nu7(None)] {
-        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
-        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
-        assert!(
-            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
-            "a network without an exact NU7 activation must keep accepting V4",
-        );
-    }
+    let network = configured_network_with_nu7(None);
+    assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+    assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+    assert!(
+        verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+        "a network without an exact NU7 activation must keep accepting V4",
+    );
 }
 
 /// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`

@@ -19,7 +19,7 @@ use zakura_chain::{
     parameters::{
         testnet::{self, Parameters},
         Network::*,
-        NetworkKind, POST_BLOSSOM_POW_TARGET_SPACING,
+        NetworkKind,
     },
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{zip317, VerifiedUnminedTx},
@@ -314,9 +314,11 @@ async fn rpc_getdeprecationinfo_uses_latest_checkpoint_without_tip() {
             .expect("test checkpoint height is far below the maximum height"),
     );
     let rpc = rpc.with_end_of_support_height(Some(end_of_support_height));
-    let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(checkpoint_height.0);
-    let expected_offset = remaining_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING)
-        - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
+    // The estimated span crosses the NU7 spacing change, so each block counts
+    // with the target spacing at its height.
+    let expected_offset =
+        target_seconds_between_heights(&Mainnet, checkpoint_height, end_of_support_height)
+            - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
 
     let before = Utc::now().timestamp();
     let end_of_service = rpc
@@ -356,9 +358,11 @@ async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
 
     let end_of_support_height = Height(3_546_440);
     let rpc = rpc.with_end_of_support_height(Some(end_of_support_height));
-    let remaining_blocks = i64::from(end_of_support_height.0 - tip_height.0);
-    let expected_offset = remaining_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING)
-        - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
+    // The estimated span crosses the NU7 spacing change, so each block counts
+    // with the target spacing at its height.
+    let expected_offset =
+        target_seconds_between_heights(&Mainnet, tip_height, end_of_support_height)
+            - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
 
     let before = Utc::now().timestamp();
     let end_of_service = rpc

@@ -13,10 +13,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -40,10 +39,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -113,6 +111,9 @@ jobs:
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts
+      - name: Check v2 P2P runtime imports
+        if: ${{ !cancelled() }}
+        run: cargo xtask check-rt-imports
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with
@@ -200,7 +201,13 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck .github/actions/setup-zakura-build/*.sh scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: Ubuntu package retry tests
+        if: ${{ !cancelled() }}
+        run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
+      - name: Real apt mirror failover test
+        if: ${{ !cancelled() }}
+        run: python3 .github/actions/setup-zakura-build/test_apt_failover.py
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
@@ -237,7 +244,9 @@ jobs:
 
       - name: CI alert tests
         if: ${{ !cancelled() }}
-        run: python3 .github/workflows/scripts/test_ci_alert.py
+        run: |
+          python3 -m pip install --disable-pip-version-check -r .github/workflows/scripts/requirements-ci-alerts.txt
+          python3 .github/workflows/scripts/test_ci_alert.py
 
       - name: Deployer tests
         if: ${{ !cancelled() }}
@@ -373,6 +382,19 @@ jobs:
           hits=$(cargo tree --locked -p zakura -e normal --prefix none | grep -E "$denied" | sort -u || true)
           if [ -n "$hits" ]; then
             echo "zakurad's dependency graph contains packages that docs/specs/zakura-quic.md DEP-1 forbids:"
+            echo "$hits"
+            exit 1
+          fi
+
+      # The simulator crates and their coroutine library are test-only and
+      # must never reach the zakurad binary.
+      - name: Check zakurad has no simulator packages
+        if: ${{ !cancelled() }}
+        run: |
+          denied='^(zakura-scheduler|zakura-sim|corosensei) '
+          hits=$(cargo tree --locked -p zakura -e normal,build --target all --prefix none | grep -E "$denied" | sort -u || true)
+          if [ -n "$hits" ]; then
+            echo "zakurad's dependency graph contains test-only simulator packages:"
             echo "$hits"
             exit 1
           fi

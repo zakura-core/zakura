@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::zakura::FramedRecv;
+use tokio::time;
 
 /// A reactor at the Regtest genesis.
 pub(super) fn fallback_reactor() -> (

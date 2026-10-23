@@ -2,8 +2,8 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-use tokio::time::Instant;
 use zakura_quic::NodeAddr;
+use zakura_rt::{sync::watch, time::Instant};
 
 use crate::zakura::{
     ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
@@ -161,7 +161,7 @@ pub(crate) async fn native_dial_supervised(
     // never exits on its own (no max attempts), and the supervisor registration
     // watch stays open while this task holds an endpoint clone, so this is the
     // only signal that reliably ends the loop at teardown.
-    tokio::select! {
+    zakura_rt::select! {
         biased;
         _ = shutdown.cancelled() => {}
         _ = supervised => {}
@@ -178,7 +178,7 @@ pub(crate) async fn native_dial_supervised(
 /// unit-testable without real network I/O.
 async fn run_dial_supervisor<F>(
     peer_id: ZakuraPeerId,
-    mut registered: tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
     policy: RedialPolicy,
     mut dial: F,
 ) where
@@ -197,7 +197,7 @@ async fn run_dial_supervisor<F>(
         let mut attempt = if already_registered {
             if !policy.redial_after_drop {
                 // Wait for it to deregister, then re-dial promptly.
-                tokio::select! {
+                zakura_rt::select! {
                     changed = registered.changed() => {
                         if changed.is_err() {
                             return;
@@ -206,7 +206,7 @@ async fn run_dial_supervisor<F>(
                         failures = 0;
                         continue;
                     }
-                    _ = tokio::time::sleep(policy.registered_settle_timeout) => {
+                    _ = zakura_rt::time::sleep(policy.registered_settle_timeout) => {
                         return;
                     }
                 }
@@ -305,14 +305,14 @@ async fn run_dial_supervisor<F>(
 /// connection. Ignores unrelated peer-set changes. Returns `false` when the
 /// registration watch closes (node shutdown).
 async fn sleep_unless_registered(
-    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
     wait: Duration,
 ) -> bool {
-    let sleep = tokio::time::sleep(wait);
-    tokio::pin!(sleep);
+    let sleep = zakura_rt::time::sleep(wait);
+    zakura_rt::pin!(sleep);
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             changed = registered.changed() => {
                 if changed.is_err() {
                     return false;
@@ -331,7 +331,7 @@ async fn sleep_unless_registered(
 /// Returns how long the peer remained registered after this observer first saw
 /// it, or `None` when the sender closes while the peer remains registered.
 async fn wait_for_peer_deregistration(
-    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
 ) -> Option<Duration> {
     let registered_at = Instant::now();

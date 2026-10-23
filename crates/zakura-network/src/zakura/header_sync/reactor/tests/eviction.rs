@@ -1,5 +1,6 @@
 use super::*;
 use crate::zakura::transport::FramedRecv;
+use tokio::time;
 
 /// One admitted header-sync session with the state needed to drive it unproductive.
 struct EvictionFixture {

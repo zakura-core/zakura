@@ -191,20 +191,63 @@ fn nu7_branch_id_matches_zip_259_and_librustzcash() {
     );
 }
 
-/// Mainnet and default Regtest keep NU7 unscheduled.
+/// Mainnet selects NU7 and its timing rules at Common's ZIP 259 activation height.
 #[test]
-fn nu7_remains_unscheduled_on_mainnet_and_regtest() {
+fn nu7_mainnet_activation_matches_common() {
+    let activation_height = zp_consensus::MAIN_NETWORK
+        .activation_height(zp_consensus::NetworkUpgrade::Nu7)
+        .expect("Common schedules NU7 on Mainnet");
+    let activation_height = Height(u32::from(activation_height));
+    assert_eq!(activation_height, Height(3_543_405));
+
+    let network = Network::Mainnet;
     assert_eq!(
-        zp_consensus::MAIN_NETWORK.activation_height(zp_consensus::NetworkUpgrade::Nu7),
-        None,
+        NetworkUpgrade::Nu7.activation_height(&network),
+        Some(activation_height),
     );
-    for network in [
-        Network::Mainnet,
-        Network::new_regtest(RegtestParameters::default()),
+    assert!(NetworkUpgrade::is_activation_height(
+        &network,
+        activation_height
+    ));
+    for (height, upgrade) in [
+        (
+            activation_height.previous().expect("NU7 is not genesis"),
+            NetworkUpgrade::Nu6_3,
+        ),
+        (activation_height, NetworkUpgrade::Nu7),
+        (
+            activation_height
+                .next()
+                .expect("NU7 is below the maximum height"),
+            NetworkUpgrade::Nu7,
+        ),
     ] {
-        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
-        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+        assert_eq!(NetworkUpgrade::current(&network, height), upgrade);
+        assert_eq!(
+            ConsensusBranchId::current(&network, height),
+            upgrade.branch_id()
+        );
+        assert_eq!(
+            NetworkUpgrade::is_nu7_active(&network, height),
+            upgrade == NetworkUpgrade::Nu7,
+        );
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&network, height),
+            upgrade.target_spacing()
+        );
+        assert_eq!(
+            zp_consensus::BranchId::for_height(&network, height.0.into()),
+            zp_consensus::BranchId::for_height(&zp_consensus::MAIN_NETWORK, height.0.into()),
+        );
     }
+}
+
+/// Default Regtest keeps NU7 unscheduled.
+#[test]
+fn nu7_remains_unscheduled_on_regtest() {
+    let network = Network::new_regtest(RegtestParameters::default());
+    assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+    assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
 }
 
 /// Default Testnet selects NU7 and its timing rules at Common's activation height.

@@ -10,6 +10,7 @@ use std::{
 mod header_conformance;
 mod header_fuzz;
 mod rpc_artifacts;
+mod rt_imports;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -80,6 +81,15 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             rpc_artifacts::check(&repo_root()?)
+        }
+        Some("check-rt-imports") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask check-rt-imports` does not accept arguments",
+                )));
+            }
+
+            rt_imports::check(&repo_root()?)
         }
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -284,6 +294,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask minimize-header-fuzz <artifact>")?;
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;
+    writeln!(output, "  cargo xtask check-rt-imports")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -313,5 +324,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "Regenerates deterministic protobuf and OpenRPC source artifacts, or checks that"
     )?;
-    writeln!(output, "the checked-in artifacts are current.")
+    writeln!(output, "the checked-in artifacts are current.")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Checks that the v2 P2P code in zakura-network takes runtime names from zakura-rt."
+    )
 }

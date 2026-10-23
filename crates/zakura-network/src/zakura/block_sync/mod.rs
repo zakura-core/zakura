@@ -5,24 +5,24 @@
 //! commit pipeline, the registry, and the reactor.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::BTreeMap,
     io,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-    time,
-};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
+    task::JoinHandle,
+    time,
 };
 
 use super::{

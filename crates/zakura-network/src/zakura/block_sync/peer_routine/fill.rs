@@ -195,7 +195,7 @@ impl PeerRoutine {
     /// per-peer slots, never floor-distance / near-tip lag. The pass never
     /// awaits. Other tasks change shared state between its synchronous operations.
     pub(super) fn try_fill(&mut self) -> FillReport {
-        self.request_pool_waiting = false;
+        self.state.request_pool_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
@@ -212,12 +212,12 @@ impl PeerRoutine {
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
         let now = time::Instant::now().into_std();
-        self.retry_avoid.retain(|_, until| *until > now);
+        self.state.prune_retry_avoid(now);
         let mut pass = FillPass {
             now,
             retry_at: None,
         };
-        let request_sender = self.session.request_sender();
+        let request_sender = self.io.session.request_sender();
         let mut sent = 0u32;
         let stop = loop {
             match self.try_issue_one(&request_sender, &mut pass) {
@@ -242,9 +242,7 @@ impl PeerRoutine {
         pass: &mut FillPass,
     ) -> Result<(), FillStop> {
         // Local eligibility: status, the no-progress cap, and the congestion window.
-        let limits = self
-            .state
-            .fill_limits(&self.config, &self.window, pass.now)?;
+        let limits = self.state.fill_limits(&self.config, pass.now)?;
         // Capacity: a requester pool entry, an exchange, and a transport slot.
         let capacity = self.acquire_request_capacity(request_sender)?;
         // A later failure of this attempt still consumes its request ID.
@@ -269,7 +267,7 @@ impl PeerRoutine {
             first_height,
             items.iter().map(|(_, item)| item.estimated_bytes),
         );
-        let owner = first_item.scope.bind(self.generation, request_id);
+        let owner = first_item.scope.bind(self.io.generation, request_id);
         let claim = self.fund(owner, &items, funding)?;
 
         // Preparation: the request, its response authorization, and its frame.
@@ -300,19 +298,19 @@ impl PeerRoutine {
                 Ok(())
             }
             PublishOutcome::FenceRefused | PublishOutcome::ClaimRefused => {
-                self.requester.retire(first_height, true);
+                self.io.requester.retire(first_height, true);
                 Err(FillStop::Internal)
             }
             PublishOutcome::TransportClosed => {
                 tracing::debug!(
-                    peer = ?self.peer,
-                    generation = self.generation,
+                    peer = ?self.io.peer,
+                    generation = self.io.generation,
                     start_height = ?issued.start_height,
                     count = issued.count,
                     "block request transport closed during publication"
                 );
                 claim.delivery_failed();
-                self.requester.retire(first_height, true);
+                self.io.requester.retire(first_height, true);
                 Err(FillStop::SendError)
             }
         }
@@ -335,8 +333,9 @@ impl PeerRoutine {
 
         // If pending work is running low, ping the reactor to re-query (the
         // producer self-gates on low-water, so this is idempotent/cheap).
-        if self.work.pending_len() < self.refill_low_water_blocks() {
+        if self.io.work.pending_len() < self.refill_low_water_blocks() {
             let _ = self
+                .io
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);
         }
@@ -348,15 +347,15 @@ impl PeerRoutine {
         &mut self,
         request_sender: &'a FramedSend,
     ) -> Result<RequestCapacity<'a>, FillStop> {
-        self.request_pool_waiting = false;
+        self.state.request_pool_waiting = false;
         if let Some(stop) = self.requester_stop() {
             return Err(stop);
         }
-        let Some(entry) = self.requester.pool.try_entry() else {
-            self.request_pool_waiting = true;
+        let Some(entry) = self.io.requester.pool.try_entry() else {
+            self.state.request_pool_waiting = true;
             return Err(FillStop::Budget);
         };
-        let Some(exchange) = self.requester.open() else {
+        let Some(exchange) = self.io.requester.open() else {
             return Err(FillStop::SendError);
         };
         let slot = match request_sender.try_reserve_guarded() {
@@ -364,12 +363,12 @@ impl PeerRoutine {
             Err(GuardedReserveError::Full) => return Err(FillStop::OutboundFull),
             Err(error) => {
                 tracing::debug!(
-                    peer = ?self.peer,
-                    generation = self.generation,
+                    peer = ?self.io.peer,
+                    generation = self.io.generation,
                     ?error,
                     "could not reserve guarded block request transport capacity"
                 );
-                self.session.cancel_token().cancel();
+                self.io.session.cancel_token().cancel();
                 return Err(FillStop::SendError);
             }
         };
@@ -392,7 +391,7 @@ impl PeerRoutine {
         request_id: NonZeroU64,
         now: Instant,
     ) -> Result<TakenWork, FillStop> {
-        let view = *self.sequencer_view.borrow();
+        let view = *self.io.sequencer_view.borrow();
         let snapshot = self.admission_snapshot(&view);
         let floor_start = self.probe_floor(limits, view.download_floor, now);
         if let Some(take) = plan::plan_floor(&self.config, limits, snapshot, floor_start)? {
@@ -407,6 +406,7 @@ impl PeerRoutine {
 
         limits.above_floor_slot()?;
         let start = self
+            .io
             .work
             .first_pending_in_range(limits.servable_low, limits.servable_high);
         let take = plan::plan_above_floor(&self.config, limits, snapshot, start);
@@ -437,12 +437,13 @@ impl PeerRoutine {
     ) -> Option<block::Height> {
         let floor_high = floor_rescue_high(download_floor);
         let start = self
+            .io
             .work
             .first_pending_in_range(limits.servable_low, limits.servable_high.min(floor_high))?;
-        let deferred = self.registry.floor_has_preferred_unsaturated_server(
+        let deferred = self.io.registry.floor_has_preferred_unsaturated_server(
             start,
-            &self.peer,
-            self.window.bbr_rtprop_ms(now),
+            &self.io.peer,
+            self.state.window.bbr_rtprop_ms(now),
             limits.floor_bypass_only,
         );
         (!deferred).then_some(start)
@@ -450,12 +451,12 @@ impl PeerRoutine {
 
     /// Take `take` from the work queue for this attempt's exact owner.
     fn take_work(&self, take: TakePlan, request_id: NonZeroU64) -> Vec<(block::Height, WorkItem)> {
-        self.work.take_for_request(
+        self.io.work.take_for_request(
             take.low,
             take.high,
             take.max_count,
             take.max_bytes,
-            self.generation,
+            self.io.generation,
             request_id,
         )
     }
@@ -479,7 +480,7 @@ impl PeerRoutine {
         let run =
             plan::select_retry_run(&items, |(height, item)| self.retry_fact(*height, item, now));
         let Some(keep) = run.keep else {
-            self.work.return_unpublished(&items);
+            self.io.work.return_unpublished(&items);
             // The pass stops here, and this wake replaces any earlier attempt's.
             pass.retry_at = self.retry_filter_wake_deadline(now, run.timed_rejection);
             return Err(FillStop::RetryAvoid);
@@ -488,12 +489,12 @@ impl PeerRoutine {
         let mut returned_avoided = false;
         if keep.start > 0 {
             let avoided: Vec<_> = items.drain(..keep.start).collect();
-            self.work.return_unpublished(&avoided);
+            self.io.work.return_unpublished(&avoided);
             returned_avoided = true;
         }
         if keep_len < items.len() {
             let avoided = items.split_off(keep_len);
-            self.work.return_unpublished(&avoided);
+            self.io.work.return_unpublished(&avoided);
             returned_avoided = true;
         }
         if returned_avoided {
@@ -510,16 +511,18 @@ impl PeerRoutine {
 
     /// Read one taken item's retry facts from their owners.
     fn retry_fact(&self, height: block::Height, item: &WorkItem, now: Instant) -> RetryFact {
-        if self.requester.blocks_retry(height) {
+        if self.io.requester.blocks_retry(height) {
             return RetryFact::ProtocolBlocked;
         }
-        let avoided = self.retry_avoid.contains_key(&height)
+        let avoided = self.state.is_retry_avoided(height)
             || self
+                .io
                 .registry
-                .is_floor_height_avoided(&self.peer, height, now)
+                .is_floor_height_avoided(&self.io.peer, height, now)
             || self
+                .io
                 .registry
-                .is_body_retry_avoided(&self.peer, item.scope, item.hash, now);
+                .is_body_retry_avoided(&self.io.peer, item.scope, item.hash, now);
         if avoided {
             RetryFact::Avoided
         } else {
@@ -537,10 +540,17 @@ impl PeerRoutine {
             now,
             timed_rejection,
             RetryDeadlines {
-                local: self.retry_avoid.values().min().copied(),
-                floor_watchdog: self.registry.next_floor_avoid_deadline(&self.peer, now),
-                body_retry: self.registry.next_body_retry_deadline(&self.peer, now),
+                local: self.state.retry_avoid_expiry(),
+                floor_watchdog: self
+                    .io
+                    .registry
+                    .next_floor_avoid_deadline(&self.io.peer, now),
+                body_retry: self
+                    .io
+                    .registry
+                    .next_body_retry_deadline(&self.io.peer, now),
                 retirement: self
+                    .io
                     .requester
                     .retirement_deadline(self.config.effective_liveness_timeout()),
             },
@@ -559,24 +569,24 @@ impl PeerRoutine {
             // Quiet (no notify): the returning routine must not re-wake its own
             // want-work arm into a take/return spin, and any other peer waiting
             // on budget capacity is woken by the matching `budget.release`.
-            self.work.return_unpublished(items);
+            self.io.work.return_unpublished(items);
             return Err(FillStop::Budget);
         }
         Ok(RequestWrite::new(
             owner,
             items.to_vec(),
-            self.work.clone(),
-            self.budget.clone(),
-            self.session.cancel_token(),
+            self.io.work.clone(),
+            self.io.budget.clone(),
+            self.io.session.cancel_token(),
         ))
     }
 
     fn reserve_request_budget(&mut self, funding: Funding) -> bool {
-        if self.budget.try_reserve(funding.reserved_bytes) {
+        if self.io.budget.try_reserve(funding.reserved_bytes) {
             return true;
         }
         if funding.allows_overdraft() {
-            self.budget.charge(funding.reserved_bytes);
+            self.io.budget.charge(funding.reserved_bytes);
             metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
             return true;
         }
@@ -596,7 +606,8 @@ impl PeerRoutine {
             .iter()
             .map(|block| block.hash)
             .collect();
-        self.requester
+        self.io
+            .requester
             .reserve(
                 request.start_height,
                 &expected,
@@ -609,7 +620,7 @@ impl PeerRoutine {
                     ?error,
                     "valid scheduler request could not reserve its response"
                 );
-                self.cancel.cancel();
+                self.io.cancel.cancel();
                 FillStop::Internal
             })
     }
@@ -622,7 +633,7 @@ impl PeerRoutine {
         }
         .encode_frame()
         .map_err(|_| {
-            self.session.cancel_token().cancel();
+            self.io.session.cancel_token().cancel();
             FillStop::SendError
         })
     }
@@ -631,9 +642,9 @@ impl PeerRoutine {
     fn request_deadline(&self, funding: Funding, queued_at: Instant) -> Instant {
         // A block-count delivery sample proves progress even though it cannot
         // supply a byte rate for estimating transfer time.
-        let byte_rate = self.window.bbr_btlbw_bytes_per_sec(queued_at);
+        let byte_rate = self.state.window.bbr_btlbw_bytes_per_sec(queued_at);
         let has_delivery_measurement =
-            byte_rate.is_some() || self.window.bbr_btlbw_milliblocks(queued_at).is_some();
+            byte_rate.is_some() || self.state.window.bbr_btlbw_milliblocks(queued_at).is_some();
         request_deadline(
             funding.priority,
             queued_at,
@@ -641,7 +652,8 @@ impl PeerRoutine {
             self.config.effective_floor_rescue_timeout(),
             // Responses share an ordered stream. Include earlier unreceived
             // work so this request cannot expire while those bodies arrive.
-            self.window
+            self.state
+                .window
                 .outstanding_reserved_bytes()
                 .saturating_add(funding.reserved_bytes),
             // Filter BtlBw by the request's send time so a stale-high rate from a
@@ -674,15 +686,16 @@ impl PeerRoutine {
         let mut delivered = false;
         let fenced = writer.publish(|| {
             claim.publish(|| {
-                issued = Some(self.window.outstanding.push(OutstandingBlockRange {
+                let key = self.state.window.outstanding.push(OutstandingBlockRange {
                     request,
-                    write_status: claim.status(),
                     queued_at,
                     deadline,
-                    delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                    delivery_snapshot: self.state.window.delivery_snapshot(queued_at),
                     delivered_bytes: 0,
                     received: ReceivedBlockTracker::default(),
-                }));
+                });
+                self.io.writes.insert(key, claim.status());
+                issued = Some(key);
                 delivered = slot.send_request(frame, write_claim);
             });
         });
@@ -710,7 +723,8 @@ impl PeerRoutine {
             // A floor request borrowed a bypass slot while the cwnd was saturated.
             metrics::counter!("sync.block.request.floor_bypass").increment(1);
         }
-        self.window
+        self.state
+            .window
             .arm_liveness(queued_at, self.config.effective_liveness_timeout());
         self.publish_request_claims(key);
         self.publish_slot_diagnostics();
@@ -726,7 +740,7 @@ impl PeerRoutine {
     fn refill_low_water_blocks(&self) -> usize {
         let max_blocks_per_response =
             usize::try_from(self.config.advertised_max_blocks_per_response()).unwrap_or(usize::MAX);
-        let max_inflight_per_peer = hard_outbound_capacity(self.window.max_inflight_requests);
+        let max_inflight_per_peer = hard_outbound_capacity(self.state.window.max_inflight_requests);
         max_inflight_per_peer
             .saturating_mul(max_blocks_per_response)
             .max(max_blocks_per_response)

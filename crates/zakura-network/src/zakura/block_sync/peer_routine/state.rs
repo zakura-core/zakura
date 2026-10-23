@@ -1,21 +1,77 @@
 //! Peer-local request policy for one block-sync session.
 
-use std::{num::NonZeroU64, time::Instant};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroU64,
+    time::{Duration, Instant},
+};
 
 use zakura_chain::block;
 
 use super::{
+    super::state::RateMeter,
     fill::{FillLimits, FillStop},
-    DownloadWindow, ZakuraBlockSyncConfig,
+    BlockSyncStatus, DownloadWindow, ZakuraBlockSyncConfig,
 };
 
-/// What this session may request, learned from its peer's `Status`, and the
-/// session's request identities.
+mod liveness;
+mod requests;
+mod status;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(super) use liveness::{liveness_grace_allowed, no_progress_response};
+pub(super) use liveness::{LivenessDecision, NoProgressResponse};
+pub(super) use requests::{unreceived_heights, BodyMatch, Disposition, SharedDeadlines};
+pub(super) use status::StatusUpdate;
+
+/// One block-sync session's download, status, and liveness facts.
 ///
-/// `PeerState` holds no runtime handles. The routine passes in time and window
-/// observations, and it executes the decisions that `PeerState` returns.
+/// `PeerState` holds no runtime handles. The routine passes in time and
+/// observations from shared owners, and it executes the decisions that
+/// `PeerState` returns. One `PeerState` belongs to one session generation, so
+/// a [`RequestKey`](super::RequestKey) identifies one request of that session.
 #[derive(Clone, Debug)]
 pub(super) struct PeerState {
+    /// This session's outstanding requests and congestion window.
+    pub(super) window: DownloadWindow,
+    /// Heights this routine recently returned on a failure, mapped to the instant
+    /// after which it may re-take them. While avoided, the routine leaves the
+    /// height `pending` (contestable by any other peer) but does not re-grab it
+    /// itself — the peer-local retry bias. Pruned on expiry each fill pass.
+    pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Whether the last fill stopped because the node-wide request pool was
+    /// empty, so the routine waits for a pool entry.
+    pub(super) request_pool_waiting: bool,
+    /// A connection gets one local no-progress park/re-admission cycle. A
+    /// repeated stall is connection-fatal so it cannot reclaim download slots
+    /// indefinitely without paying the redial cost.
+    pub(super) allow_no_progress_park: bool,
+    /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
+    /// The reply decision is routine-local; the actual send stays reactor-side via
+    /// `RoutineToReactor::StatusReceived`.
+    pub(super) status_reply_meter: RateMeter,
+    /// Rate meter for status application, with one extra range change per window.
+    pub(super) inbound_status_meter: RateMeter,
+    /// Allows one immediate range change without permitting an unbounded bypass.
+    pub(super) status_range_bypass_available: bool,
+    /// Clamped limits last published to the registry. Request issuance uses the
+    /// latest limits immediately; only publication waits for the meter.
+    pub(super) published_limits: (u32, u32, u32),
+    /// Whether the last slot publication showed a requester that refuses work.
+    pub(super) published_requester_stopped: bool,
+    /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
+    pub(super) pending_status: Option<BlockSyncStatus>,
+    /// Last `reset_epoch` that this routine processed.
+    /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
+    pub(super) last_reset_epoch: u64,
+    /// Work-queue revocation count when this routine last checked its requests
+    /// for lost ownership.
+    pub(super) checked_revocations: u64,
+    /// Start of the current interval in which this peer's outbound queue stayed full.
+    /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
+    pub(super) outbound_full_since: Option<Instant>,
     /// Whether this peer has sent a `Status` yet (gates want-work; mirrored into
     /// the registry for the reactor's candidate reads).
     pub(super) received_status: bool,
@@ -34,13 +90,40 @@ pub(super) struct PeerState {
 }
 
 impl PeerState {
-    pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn new(
+        config: &ZakuraBlockSyncConfig,
+        allow_no_progress_park: bool,
+        reset_epoch: u64,
+        revocations: u64,
+    ) -> Self {
+        let window = DownloadWindow::new(config);
+        let max_blocks_per_response = config.advertised_max_blocks_per_response();
+        let max_response_bytes = config.advertised_max_response_bytes();
         Self {
+            published_limits: (
+                max_blocks_per_response,
+                max_response_bytes,
+                window.max_inflight_requests,
+            ),
+            window,
+            retry_avoid: BTreeMap::new(),
+            request_pool_waiting: false,
+            allow_no_progress_park,
+            status_reply_meter: RateMeter::new(config.status_refresh_interval),
+            inbound_status_meter: RateMeter::new(
+                config.status_refresh_interval.min(Duration::from_secs(1)),
+            ),
+            status_range_bypass_available: false,
+            published_requester_stopped: false,
+            pending_status: None,
+            last_reset_epoch: reset_epoch,
+            checked_revocations: revocations,
+            outbound_full_since: None,
             received_status: false,
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
-            max_blocks_per_response: config.advertised_max_blocks_per_response(),
-            max_response_bytes: config.advertised_max_response_bytes(),
+            max_blocks_per_response,
+            max_response_bytes,
             next_request_id: NonZeroU64::new(1),
         }
     }
@@ -56,9 +139,9 @@ impl PeerState {
     pub(super) fn fill_limits(
         &self,
         config: &ZakuraBlockSyncConfig,
-        window: &DownloadWindow,
         now: Instant,
     ) -> Result<FillLimits, FillStop> {
+        let window = &self.window;
         if !self.received_status {
             return Err(FillStop::NoStatus);
         }

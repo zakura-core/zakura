@@ -29,7 +29,7 @@ use crate::{
     key::{NodeAddr, NodeId, NodeSecretKey},
     socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
-    tls::TlsConfig,
+    tls::{RuntimeUtc, TlsConfig},
 };
 
 /// How often a wildcard-bound endpoint lists the host's interface addresses to
@@ -410,6 +410,8 @@ impl QuicEndpoint {
         let crypto = self.inner.shared.tls.server_config(alpns.clone())?;
         let mut server = self.inner.shared.inputs.server_config(Arc::new(crypto));
         self.inner.shared.config.apply_server_limits(&mut server);
+        // Retry tokens carry their issue time, so they read the runtime's UTC.
+        server.time_source(Arc::new(RuntimeUtc));
         let server = Arc::new(server);
 
         let ban = acceptor.clone();

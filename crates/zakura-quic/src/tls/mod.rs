@@ -10,10 +10,13 @@
 //! sees on a full handshake: the server refuses 0-RTT and issues no session
 //! tickets, and the client never resumes (TLS-10).
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer};
+use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer, UnixTime};
 
 use crate::{
     inputs::EndpointInputs,
@@ -28,6 +31,28 @@ pub(crate) mod verifier;
 /// SNI is off (TLS-6), so this name never leaves the process. The verifier
 /// checks the dialed node ID instead.
 pub(crate) const UNSENT_SERVER_NAME: &str = "zakura.invalid";
+
+/// The runtime's UTC clock, `zakura_rt::time::utc_now`, for the Retry token
+/// time and the TLS certificate-check time. It's the host clock in
+/// production and the scenario clock in a simulated run.
+#[derive(Debug)]
+pub(crate) struct RuntimeUtc;
+
+impl quinn_proto::TimeSource for RuntimeUtc {
+    /// The runtime's UTC time.
+    fn now(&self) -> SystemTime {
+        zakura_rt::time::utc_now()
+    }
+}
+
+impl rustls::time_provider::TimeProvider for RuntimeUtc {
+    /// The runtime's UTC time, or `None` before the Unix epoch, which rustls
+    /// treats as a failed clock read.
+    fn current_time(&self) -> Option<UnixTime> {
+        let since_epoch = zakura_rt::time::utc_now().duration_since(UNIX_EPOCH).ok()?;
+        Some(UnixTime::since_unix_epoch(since_epoch))
+    }
+}
 
 /// An error building a rustls or QUIC crypto config.
 #[derive(Debug, thiserror::Error)]
@@ -120,10 +145,11 @@ impl TlsConfig {
     }
 
     fn rustls_server(&self, alpns: Vec<Vec<u8>>) -> Result<rustls::ServerConfig, TlsConfigError> {
-        let mut crypto = rustls::ServerConfig::builder_with_provider(self.provider.clone())
-            .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
-            .with_client_cert_verifier(self.client_verifier.clone())
-            .with_cert_resolver(self.cert_resolver.clone());
+        let mut crypto =
+            rustls::ServerConfig::builder_with_details(self.provider.clone(), Arc::new(RuntimeUtc))
+                .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
+                .with_client_cert_verifier(self.client_verifier.clone())
+                .with_cert_resolver(self.cert_resolver.clone());
         crypto.alpn_protocols = alpns;
         // TLS-10: refuse 0-RTT. Without tickets, no client can resume either.
         crypto.max_early_data_size = 0;
@@ -148,13 +174,14 @@ impl TlsConfig {
         expected: NodeId,
         alpns: &[&[u8]],
     ) -> Result<rustls::ClientConfig, TlsConfigError> {
-        let mut crypto = rustls::ClientConfig::builder_with_provider(self.provider.clone())
-            .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier::ServerCertificateVerifier::new(
-                expected,
-            )))
-            .with_client_cert_resolver(self.cert_resolver.clone());
+        let mut crypto =
+            rustls::ClientConfig::builder_with_details(self.provider.clone(), Arc::new(RuntimeUtc))
+                .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(
+                    verifier::ServerCertificateVerifier::new(expected),
+                ))
+                .with_client_cert_resolver(self.cert_resolver.clone());
         crypto.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
         crypto.enable_sni = false;
         crypto.enable_early_data = false;
@@ -333,6 +360,29 @@ mod tests {
             TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed),
             starts
         );
+    }
+
+    /// M3.5: both TLS configs check certificates against the runtime's UTC
+    /// clock, which is the host clock outside a simulated run.
+    #[test]
+    fn tls_configs_read_the_runtime_utc_clock() {
+        let tls = TlsConfig::new(&NodeSecretKey::generate());
+        let server = tls.rustls_server(vec![b"a".to_vec()]).unwrap();
+        let client = tls
+            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
+            .unwrap();
+        assert_eq!(format!("{:?}", server.time_provider), "RuntimeUtc");
+        assert_eq!(format!("{:?}", client.time_provider), "RuntimeUtc");
+
+        let secs = |time: SystemTime| time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let before = secs(SystemTime::now());
+        let tls_now = rustls::time_provider::TimeProvider::current_time(&RuntimeUtc)
+            .unwrap()
+            .as_secs();
+        let retry_now = secs(quinn_proto::TimeSource::now(&RuntimeUtc));
+        let after = secs(SystemTime::now());
+        assert!((before..=after).contains(&tls_now));
+        assert!((before..=after).contains(&retry_now));
     }
 
     /// TLS-10, TLS-11, WIRE-2: no 0-RTT, no tickets, no SNI, and the ALPNs in

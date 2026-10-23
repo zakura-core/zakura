@@ -65,7 +65,14 @@ struct Datagram {
 impl FakeNet {
     /// A network whose delivery window is `min..=max` after sending, and
     /// that may drop `drops` datagrams.
+    ///
+    /// # Panics
+    ///
+    /// If `min` is after `max`. Time would stop at the deadline before
+    /// delivery opened, and the run would look idle with a datagram in
+    /// flight.
     pub fn new(min: Duration, max: Duration, drops: u32) -> Self {
+        assert!(min <= max, "a FakeNet's min delay must not exceed its max");
         FakeNet(Rc::new(RefCell::new(Net {
             min,
             max,

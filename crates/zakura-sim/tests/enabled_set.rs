@@ -84,3 +84,9 @@ fn duplicate_identity_is_harness() {
 fn a_peer_with_no_budget_is_rejected() {
     let _ = FakePeer::new("p1", &["hello"], 0);
 }
+
+#[test]
+#[should_panic(expected = "min")]
+fn a_net_whose_window_closes_before_it_opens_is_rejected() {
+    let _ = FakeNet::new(Duration::from_millis(10), Duration::from_millis(5), 0);
+}

@@ -12,6 +12,11 @@ categories = ["development-tools::testing"]
 # Only the simulator depends on it, and no published crate does.
 publish = false
 
+[features]
+# Tells AddressSanitizer about each coroutine stack switch. Only for
+# `-Zsanitizer=address` builds, since it links against the ASan runtime.
+sanitizer = ["corosensei/sanitizer"]
+
 [dependencies]
 corosensei = { workspace = true }
 

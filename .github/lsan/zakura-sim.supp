@@ -1,0 +1,10 @@
+# LeakSanitizer suppressions for the `zakura_sim asan` job in tests-unit.yml.
+# Each entry is a test that leaks on purpose. Matching needs a symbolizer.
+
+# Forgets channel halves so their closing release points don't count.
+leak:sim_sync::owned_permit_send_is_not_a_release
+leak:sim_sync::gating_reads_are_points
+
+# Shutdown panics, so the scheduler leaks the run state rather than drop it
+# while panicking.
+leak:fixtures::panic_in_a_leftover_drop_leaves_no_run_behind

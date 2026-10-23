@@ -65,7 +65,7 @@ impl TxFactory {
                 .collect(),
             sapling_shielded_data: None,
             orchard_shielded_data: None,
-            ironwood_shielded_data: Some(ironwood::ShieldedData {
+            ironwood_shielded_data: Some(Box::new(ironwood::ShieldedData {
                 flags: orchard::Flags::ENABLE_SPENDS,
                 value_balance: Amount::zero(),
                 shared_anchor: tree::Root::default(),
@@ -75,7 +75,7 @@ impl TxFactory {
                     spend_auth_sig: [0u8; 64].into(),
                 }],
                 binding_sig: [0u8; 64].into(),
-            }),
+            })),
         };
 
         // Construct with a fee that passes the ZIP-317 mempool checks, then set the test fee.

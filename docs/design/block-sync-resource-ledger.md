@@ -70,7 +70,7 @@ Execution slots are 24 per node and 12 per peer. A slot is held until the blocki
 encode actually return, including after the session is cancelled, so connection churn cannot
 multiply running reads. Each job retains the blocks it read. These are decoded blocks from
 the node's own consensus-valid state. One job holds `blocks_per_response` blocks (always 1):
-at most about 53 MB decoded for the worst consensus-valid block, about 7 MB for real Mainnet
+at most about 7.1 MB decoded for the worst consensus-valid block, about 7 MB for real Mainnet
 blocks (≤ 3.45× wire). The encoder serializes one block at a time and the handler drops each
 frame right after encoding, so the transient copy is one block.
 
@@ -139,11 +139,16 @@ A decoded block's heap is not a fixed multiple of its wire size:
 | Body | Wire | Decoded | Ratio |
 | --- | --- | --- | --- |
 | Real Mainnet blocks | — | — | ≤ 3.45×, about 2× in aggregate |
-| Worst consensus-valid block (smallest valid transactions) | 2 MB | about 53 MB | about 26× |
-| Junk body: 37,037 empty V1 transactions | 372 KB | 74.9 MB | about 200× |
+| Worst consensus-valid block (one transaction of empty-script outputs) | 2 MB | about 7.1 MB | about 3.6× |
+| Smallest valid transactions (26,666 × 75 B) | 2 MB | about 5.3 MB | about 2.7× |
+| Junk body: 37,037 empty V1 transactions | 372 KB | about 3.9 MB | about 10× |
 
-`size_of::<Transaction>()` is 2,008 B, so per-transaction overhead dominates small
-transactions. `DESERIALIZED_MEM_FACTOR` = 4 is an average, not a bound.
+`Transaction` boxes its Sprout, Sapling, Orchard and Ironwood bundles, so
+`size_of::<Transaction>()` is 96 B. Before the bundles were boxed it was 2,008 B, the inline
+size of a V4 Sprout bundle, and the smallest valid transactions decoded at about 28×. A
+9-byte transparent output decodes to 32 B, so consensus-valid blocks stay under
+`DESERIALIZED_MEM_FACTOR` = 4. Junk bodies can still exceed it until the Merkle check
+rejects them.
 
 Two changes tie decoded memory to the blocks the node asked for:
 
@@ -167,11 +172,11 @@ B + R + L × W × (1 + r) + min(P, L) × J
 - `B` = look-ahead budget (1.5 GiB)
 - `R` = one in-window response beyond the gate (≤ 32 MiB)
 - `L` = submission window (401), `W` = 2 MB maximum block, `r` = the chain's decoded ratio
-- `J` = one transient junk decode per connection before its rejection (≤ about 80 MB)
+- `J` = one transient junk decode per connection before its rejection (≤ about 4 MB)
 
-At `r` ≈ 4 this is about 5.6 GB, of which about 3.2 GB is the decoded window. A deliberately
-built, proof-of-work-paid chain at `r` ≈ 26 raises the window term to about 21 GB; admission
-then charges the measured size and stops requesting ahead. The check costs one txid pass per
+At `r` ≈ 4 this is about 5.6 GB, of which about 3.2 GB is the decoded window. A consensus-valid
+chain stays below `r` = 4, so this is the bound for a deliberately built, proof-of-work-paid
+chain too. The check costs one txid pass per
 body, about 11% of decode time on real blocks, on the per-peer routine tasks.
 
 Above the last checkpoint the sequencer also gates new decoded submissions on

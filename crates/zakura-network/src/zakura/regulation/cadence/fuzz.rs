@@ -135,6 +135,10 @@ mod tests {
     const WITNESS: &[u8] = &[0, 2, 8, 2, 121, 2, 3, 4, 6, 2, 3, 2, 3];
 
     #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "CI retains these applicability counters"
+    )]
     fn cadence_witness_exercises_every_hold_and_settlement() {
         let summary = replay_cadence_bytes(WITNESS);
         println!("tier=Machine target=cadence decoder=1 {summary:?}");

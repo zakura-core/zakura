@@ -18,7 +18,7 @@ use zakura_rt::{
         atomic::{AtomicUsize, Ordering},
         mpsc, oneshot, watch,
     },
-    task::JoinSet,
+    task::{JoinSet, JoinSetExt},
 };
 
 use super::{
@@ -507,12 +507,15 @@ impl<F: SocketFactory> EndpointTask<F> {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
-                        self.tasks.spawn(inbound_handshake(
-                            connecting,
-                            self.shared.config.handshake_timeout(),
-                            pending,
-                            acceptor,
-                        ));
+                        self.tasks.spawn_named(
+                            "quic.inbound_handshake",
+                            inbound_handshake(
+                                connecting,
+                                self.shared.config.handshake_timeout(),
+                                pending,
+                                acceptor,
+                            ),
+                        );
                     }
                     Err(error) => {
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);

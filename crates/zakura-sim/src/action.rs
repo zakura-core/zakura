@@ -131,7 +131,9 @@ pub(crate) fn enabled_set(i: &EnabledInputs<'_>) -> Result<Vec<Enabled>, Identit
 /// The instant `AdvanceTime` goes to, or `None` when time can't move.
 fn next_time(i: &EnabledInputs<'_>) -> Option<SimInstant> {
     let boundaries = i.offers.iter().flat_map(|o| o.boundaries.iter().copied());
-    let mut earliest = i.next_deadline;
+    // A raw timer can have a deadline behind the clock. It's due now, and
+    // `advance_to` can't go back to it.
+    let mut earliest = i.next_deadline.map(|t| t.max(i.now));
     for boundary in boundaries {
         match boundary {
             Boundary::Deadline(t) if t <= i.now => return None,

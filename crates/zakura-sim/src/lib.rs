@@ -18,6 +18,7 @@ pub mod fake;
 pub mod identity;
 pub mod observe;
 pub mod plan;
+pub mod property;
 pub mod record;
 pub mod sim;
 pub mod trace;

@@ -1,12 +1,14 @@
 //! Property checks a run calls after each step and at its end.
 //!
-//! properties.md's registry (P1) builds on these hooks. M1 ships
-//! [`NoChecks`] and [`FnChecker`] for tests.
+//! The property registry, [`crate::property::RegistryChecker`], builds on
+//! these hooks. M1 ships [`NoChecks`] and [`FnChecker`] for tests.
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
-use crate::{end::RunEnd, observe::Observation, Enabled, Identity, ObservationLog};
+use crate::{
+    end::RunEnd, observe::Observation, property::CheckEvent, Enabled, Identity, ObservationLog,
+};
 
 /// A property that failed, and the steps its failure depends on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +110,16 @@ pub trait Checker {
     /// Called once the run has ended, before cleanup, with the complete live
     /// log. Returns each property's outcome.
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport>;
+
+    /// Drains the events this checker emitted since the last call, for a
+    /// checker that runs after it in a [`crate::property::Tee`].
+    fn events(&mut self) -> Vec<CheckEvent> {
+        Vec::new()
+    }
+
+    /// Receives the events of a checker that runs before this one in a
+    /// [`crate::property::Tee`].
+    fn observe_events(&mut self, _events: &[CheckEvent]) {}
 }
 
 /// A checker that checks nothing.

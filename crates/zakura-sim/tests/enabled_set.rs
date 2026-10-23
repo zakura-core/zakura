@@ -4,14 +4,14 @@
 
 mod support;
 
-use std::{cell::RefCell, time::Duration};
+use std::{cell::RefCell, collections::BTreeSet, time::Duration};
 
 use support::{config, inputs, run};
 use zakura_rt::{task, time};
 use zakura_sim::{
     check,
     fake::{FakeNet, FakePeer, FakeStorage},
-    HarnessFailure, NoChecks, Outcome, Plan, Sim,
+    HarnessFailure, NoChecks, Observation, Outcome, Plan, Sim,
 };
 
 /// Tasks that send datagrams, submit storage, and sleep, with a peer
@@ -35,16 +35,58 @@ fn busy(sim: &mut Sim) {
     }
 }
 
+/// The fake event a pick of a fake action must log, as `(source, event)`,
+/// or `None` for a task or a time advance.
+fn expected_event(pick: &str) -> Option<(&'static str, String)> {
+    let (category, key) = pick.split_once(':')?;
+    match category {
+        "deliver" | "drop" => Some(("net", format!("{category} {key}"))),
+        "storage" => Some(("storage", key.to_owned())),
+        "peer" => Some(("peer", key.to_owned())),
+        _ => None,
+    }
+}
+
 #[test]
-fn every_pick_was_enabled() {
+fn every_pick_runs_its_own_action() {
+    // Seen across all plans: a datagram picked past the first one enabled,
+    // a drop, and each storage outcome.
+    let mut later_datagram = false;
+    let mut seen = BTreeSet::new();
     for plan in inputs(2_000, 48) {
         let problem = RefCell::new(None);
         let mut checker = check::after_step(|cx| {
             let shown: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
+            let pick = cx.pick.to_string();
+            let events: Vec<(&str, &str)> = cx
+                .log
+                .of_step(cx.step)
+                .filter_map(|obs| match obs {
+                    Observation::Fake { source, event } => Some((source.as_str(), event.as_str())),
+                    _ => None,
+                })
+                .collect();
+            let expected = expected_event(&pick);
+            let wanted: Vec<(&str, &str)> = expected
+                .iter()
+                .map(|(source, event)| (*source, event.as_str()))
+                .collect();
             if !cx.enabled.windows(2).all(|w| w[0].identity < w[1].identity) {
                 *problem.borrow_mut() = Some(format!("unsorted or duplicated: {shown:?}"));
-            } else if !shown.contains(&cx.pick.to_string()) {
-                *problem.borrow_mut() = Some(format!("{} not in {shown:?}", cx.pick));
+            } else if events != wanted {
+                *problem.borrow_mut() = Some(format!("{pick} logged {events:?}"));
+            }
+            let datagrams: Vec<&String> =
+                shown.iter().filter(|s| s.starts_with("deliver:")).collect();
+            if datagrams.len() > 1 && pick.starts_with("deliver:") && *datagrams[0] != pick {
+                later_datagram = true;
+            }
+            if let Some(kind) = ["drop:", "storage:store:"]
+                .iter()
+                .find(|kind| pick.starts_with(*kind))
+            {
+                let outcome = pick.rsplit(':').next().unwrap_or_default();
+                seen.insert(if *kind == "drop:" { "drop" } else { outcome }.to_owned());
             }
             None
         });
@@ -56,6 +98,11 @@ fn every_pick_was_enabled() {
             report.end
         );
     }
+    assert!(later_datagram, "a pick decoded a datagram past the first");
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["drop", "failure", "success"]
+    );
 }
 
 #[test]

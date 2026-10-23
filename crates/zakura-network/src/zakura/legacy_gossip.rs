@@ -31,7 +31,7 @@ use zakura_chain::{
     },
     transaction::{Transaction, UnminedTx, UnminedTxId},
 };
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::erased;
 
 use crate::{
     constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
@@ -2568,12 +2568,12 @@ impl LegacyGossipSink {
         Inbound::Future: Send + 'static,
     {
         let (inbound_tx, inbound_rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
-        spawn_erased(legacy_gossip_worker(
+        tokio::spawn(erased(legacy_gossip_worker(
             inbound,
             inbound_rx,
             LegacyGossipForwarder::new(supervisor.clone()),
             trace.clone(),
-        ));
+        )));
         let outbound = outbound_for_supervisor(&supervisor);
         Self {
             inbound_tx,
@@ -2737,6 +2737,7 @@ impl ZakuraService for LegacyGossipSink {
         let replay_panic_outbound = outbound.clone();
         let replay_panic_cancel = cancel_token.clone();
         spawn_supervised_peer_task(
+            "legacy_gossip_replay",
             replay_task_peer_id,
             || {},
             move || {
@@ -2764,6 +2765,7 @@ impl ZakuraService for LegacyGossipSink {
         let recv_teardown_outbound = outbound.clone();
         let recv_panic_cancel = cancel_token.clone();
         spawn_supervised_peer_task(
+            "legacy_gossip_recv",
             recv_task_peer_id,
             move || {
                 recv_teardown_outbound.finish_session(

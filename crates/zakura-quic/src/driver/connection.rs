@@ -25,7 +25,7 @@ use crate::{
     endpoint::ConnectionSlot,
     error::{ReadError, WriteError},
     key::NodeId,
-    socket::SocketCell,
+    socket::{SocketCell, UdpIo},
     sys::canonical_ip,
     tls,
 };
@@ -44,7 +44,7 @@ pub(crate) fn now() -> Instant {
 }
 
 /// Everything a connection task starts with.
-pub(crate) struct ConnTaskParams {
+pub(crate) struct ConnTaskParams<S> {
     pub(crate) handle: ConnectionHandle,
     pub(crate) conn: quinn_proto::Connection,
     pub(crate) shared: Arc<ConnShared>,
@@ -54,7 +54,7 @@ pub(crate) struct ConnTaskParams {
     pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    pub(crate) socket: Arc<SocketCell>,
+    pub(crate) socket: Arc<SocketCell<S>>,
     pub(crate) closing: watch::Receiver<bool>,
     pub(crate) network: watch::Receiver<u64>,
     pub(crate) probe: Arc<CongestionProbe>,
@@ -116,12 +116,12 @@ struct Exported {
     datagrams_sent: u64,
 }
 
-struct ConnTask {
+struct ConnTask<S: UdpIo> {
     handle: ConnectionHandle,
     conn: quinn_proto::Connection,
     shared: Arc<ConnShared>,
     to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    socket: Arc<SocketCell>,
+    socket: Arc<SocketCell<S>>,
     probe: Arc<CongestionProbe>,
     hooks: Arc<Hooks>,
     admitted: SocketAddr,
@@ -176,7 +176,7 @@ struct ConnTask {
 }
 
 /// Runs one connection until quinn-proto drains it.
-pub(crate) async fn run(params: ConnTaskParams) {
+pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     let ConnTaskParams {
         handle,
         conn,
@@ -359,7 +359,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
     task.drain_datagrams(&mut datagrams).await;
 }
 
-impl ConnTask {
+impl<S: UdpIo> ConnTask<S> {
     async fn drain_datagrams(
         &self,
         datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
@@ -1092,7 +1092,7 @@ impl ConnTask {
     }
 }
 
-impl Drop for ConnTask {
+impl<S: UdpIo> Drop for ConnTask<S> {
     fn drop(&mut self) {
         self.terminate(ConnectionError::LocallyClosed);
         if !self.drained_sent {
@@ -1157,16 +1157,16 @@ fn export_delta(previous: &Exported, next: &Exported) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{socket::UdpIo, NodeSecretKey};
+    use crate::{socket::TokioUdpIo, NodeSecretKey};
     use std::sync::atomic::AtomicUsize;
 
-    fn task() -> ConnTask {
+    fn task() -> ConnTask<TokioUdpIo> {
         client_task().1
     }
 
     /// A task for a client connection that hasn't sent anything yet, and the
     /// client endpoint that routes its datagrams.
-    fn client_task() -> (quinn_proto::Endpoint, ConnTask) {
+    fn client_task() -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
             .client_config(key.public(), &[b"test"])
@@ -1185,7 +1185,7 @@ mod tests {
         let to_endpoint = mpsc::unbounded_channel().0;
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         udp.set_nonblocking(true).unwrap();
-        let socket = Arc::new(SocketCell::new(UdpIo::new(udp, false).unwrap()));
+        let socket = Arc::new(SocketCell::new(TokioUdpIo::new(udp, false).unwrap()));
         let probe = Arc::default();
         let hooks = Arc::default();
         let handshake = oneshot::channel().0;
@@ -1252,7 +1252,7 @@ mod tests {
     /// the client's first Initial.
     fn pump(
         client: &mut quinn_proto::Endpoint,
-        task: &mut ConnTask,
+        task: &mut ConnTask<TokioUdpIo>,
         server: &mut quinn_proto::Endpoint,
         accepted: &mut Option<(ConnectionHandle, quinn_proto::Connection)>,
     ) {

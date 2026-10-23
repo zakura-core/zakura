@@ -62,7 +62,8 @@ In descending order:
    components.
 
 Less important or out of scope: `crates/xtask`, `crates/zakura-test`,
-`crates/zakura-utils`, `crates/zakura-jsonl-trace`, `crates/zakura-assets`
+`crates/zakura-utils`, `crates/zakura-jsonl-trace`, `crates/zakura-scheduler`
+(test-only), `crates/zakura-assets`
 (a publish-only packaging crate), `deploy/`, `docker/`, `qa/`, `scripts/`,
 and the CI under `.github/`. The `zcashd` compatibility mode drives an
 external `zcashd` binary that is not in this repository and not in the image;

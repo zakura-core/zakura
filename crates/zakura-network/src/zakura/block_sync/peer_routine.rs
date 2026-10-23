@@ -342,6 +342,8 @@ pub(super) struct PeerRoutine {
     /// Last sampled fill-stop time for each bounded reason label.
     fill_stop_trace_at: BTreeMap<&'static str, Instant>,
     fill_again: bool,
+    /// A guarded reservation failed; retain the wait even if capacity returns immediately.
+    transport_waiting: bool,
 
     // ---- shared primitives (clones) ----
     /// Generation this routine was spawned with; gates its registry writes (and
@@ -453,6 +455,7 @@ impl PeerRoutine {
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
             fill_again: false,
+            transport_waiting: false,
             generation,
             next_request_id: NonZeroU64::new(1),
             budget,
@@ -570,6 +573,7 @@ impl PeerRoutine {
                     self.try_fill_with_slot(transport_slot.take()).await
                 } else {
                     self.fill_again = false;
+                    self.transport_waiting = true;
                     self.gc_skipped_outstanding();
                     self.publish_slot_diagnostics();
                     None
@@ -638,7 +642,7 @@ impl PeerRoutine {
                         self.trace_bbr_sample();
                         continue;
                     },
-                    slot = &mut transport_capacity, if !outbound_queue_has_capacity => {
+                    slot = &mut transport_capacity, if self.transport_waiting || !outbound_queue_has_capacity => {
                         transport_slot = Some(slot.map_err(|error| SinkReject::local(format!("block request transport closed: {error:?}")))?);
                         transport_capacity = Box::pin(request_sender.reserve_guarded());
                         self.trace_wake("transport_capacity");
@@ -1016,6 +1020,7 @@ impl PeerRoutine {
         mut transport_slot: Option<crate::zakura::transport::GuardedFrameSlot<'_>>,
     ) -> Option<Instant> {
         self.fill_again = false;
+        self.transport_waiting = false;
         self.request_pool_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
@@ -1034,6 +1039,8 @@ impl PeerRoutine {
         // routine again.
         let now = time::Instant::now().into_std();
         self.retry_avoid.retain(|_, until| *until > now);
+        // Ranking must see current model freshness and wire authorization before taking work.
+        self.publish_slot_diagnostics();
         let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
         // trace can attribute carrier idle ("bubble") time to a cause. The loop yields a
@@ -1129,6 +1136,19 @@ impl PeerRoutine {
                 .work
                 .first_pending_in_range(servable_low, servable_high.min(floor_high));
             let floor_item = floor_start.and_then(|height| self.work.pending_item(height));
+            if let Some((height, item)) = floor_start.zip(floor_item.as_ref()) {
+                let timed_rejection = self.retry_avoid.contains_key(&height)
+                    || self
+                        .registry
+                        .is_floor_height_avoided(&self.peer, height, now)
+                    || self
+                        .registry
+                        .is_body_retry_avoided(&self.peer, item.scope, item.hash, now);
+                if self.requester.blocks_retry(height) || timed_rejection {
+                    retry_filter_deadline = self.retry_filter_wake_deadline(now, timed_rejection);
+                    break FillStop::RetryAvoid;
+                }
+            }
             let floor_arm_allowed = floor_start.is_some_and(|height| {
                 !self.registry.floor_has_preferred_eligible_server(
                     height,
@@ -1486,6 +1506,7 @@ impl PeerRoutine {
                 break FillStop::Yield;
             }
         };
+        self.transport_waiting = fill_stop == FillStop::OutboundFull;
         self.publish_slot_diagnostics();
         // Attribute this pass's stop. A pass that issued nothing is a candidate bubble;
         // the reason + the live slot/budget/work snapshot let a trace tell a legitimate
@@ -2541,8 +2562,12 @@ impl PeerRoutine {
     /// requester refuses new requests publishes no free slots, so no other
     /// routine defers the floor to it.
     fn publish_slot_diagnostics(&mut self) {
-        self.registry
-            .publish_retry_avoid(&self.peer, self.generation, &self.retry_avoid);
+        self.registry.publish_retry_avoid(
+            &self.peer,
+            self.generation,
+            &self.retry_avoid,
+            self.requester.retry_blocked_ranges(),
+        );
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.published_requester_stopped = self.requester_stop().is_some();
         let available_slots = if self.published_requester_stopped

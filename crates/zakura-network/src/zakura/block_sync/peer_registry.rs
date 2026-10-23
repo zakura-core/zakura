@@ -33,6 +33,7 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
+    time,
 };
 
 use super::{
@@ -67,6 +68,8 @@ pub(super) struct Entry {
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
     request_retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Inclusive ranges still authorized on the wire, including abandoned requests.
+    request_retry_blocked: BTreeMap<block::Height, block::Height>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -100,6 +103,7 @@ impl Entry {
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
             request_retry_avoid: BTreeMap::new(),
+            request_retry_blocked: BTreeMap::new(),
             generation,
             conn_id: None,
             session_closed: false,
@@ -1209,15 +1213,19 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         generation: u64,
         avoid: &BTreeMap<block::Height, Instant>,
+        blocked: BTreeMap<block::Height, block::Height>,
     ) {
         let mut peers = self.lock();
         let Some(entry) = peers.get_mut(peer) else {
             return;
         };
-        if entry.generation != generation || entry.request_retry_avoid == *avoid {
+        if entry.generation != generation
+            || (entry.request_retry_avoid == *avoid && entry.request_retry_blocked == blocked)
+        {
             return;
         }
         entry.request_retry_avoid.clone_from(avoid);
+        entry.request_retry_blocked = blocked;
         drop(peers);
         self.floor_ranking_changed.notify_waiters();
     }
@@ -1276,6 +1284,11 @@ impl Entry {
             && self.servable_low <= height
             && height <= self.servable_high
             && self.slots.available_slots > 0
+            && !self
+                .request_retry_blocked
+                .range(..=height)
+                .next_back()
+                .is_some_and(|(_, last)| height <= *last)
             && !self
                 .request_retry_avoid
                 .get(&height)

@@ -187,6 +187,12 @@ impl LiveRequester {
         Ok(())
     }
 
+    pub(crate) fn retry_blocked_ranges(
+        &self,
+    ) -> std::collections::BTreeMap<block::Height, block::Height> {
+        self.shared.lock().retry_blocked_ranges()
+    }
+
     pub(crate) fn blocks_retry(&self, height: block::Height) -> bool {
         self.shared.lock().blocks_retry(height)
     }

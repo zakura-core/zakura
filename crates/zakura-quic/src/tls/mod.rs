@@ -57,8 +57,9 @@ impl TlsConfig {
     /// TLS state whose provider takes its random source and key-exchange
     /// groups from `inputs`, when they're set (TLS-9).
     ///
-    /// With either one injected, this builds a client config once, so groups
-    /// that can't carry TLS 1.3 fail at bind rather than at the first dial.
+    /// Injected groups must include one that TLS 1.3 can use (TLS-1), and
+    /// with either input injected this builds a client config once. So
+    /// unusable groups fail at bind rather than at the first handshake.
     pub(crate) fn with_inputs(
         secret_key: &NodeSecretKey,
         inputs: &EndpointInputs,
@@ -74,6 +75,16 @@ impl TlsConfig {
             provider.secure_random = random;
         }
         if let Some(groups) = groups {
+            // rustls' builder doesn't check `usable_for_version`. It only
+            // filters on it while negotiating.
+            if !groups
+                .iter()
+                .any(|group| group.usable_for_version(rustls::ProtocolVersion::TLSv1_3))
+            {
+                return Err(TlsConfigError::Rustls(rustls::Error::General(
+                    "no key-exchange group is usable with TLS 1.3".into(),
+                )));
+            }
             provider.kx_groups = groups.to_vec();
         }
         let tls = Self::with_provider(secret_key, provider);
@@ -261,6 +272,42 @@ mod tests {
         let tls =
             TlsConfig::with_inputs(&NodeSecretKey::generate(), &EndpointInputs::default()).unwrap();
         assert!(tls.uses_default_provider());
+    }
+
+    /// ring's X25519, limited to TLS 1.2.
+    #[derive(Debug)]
+    struct Tls12OnlyX25519;
+
+    impl rustls::crypto::SupportedKxGroup for Tls12OnlyX25519 {
+        fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+            rustls::crypto::ring::kx_group::X25519.start()
+        }
+
+        fn name(&self) -> rustls::NamedGroup {
+            rustls::crypto::ring::kx_group::X25519.name()
+        }
+
+        fn usable_for_version(&self, version: rustls::ProtocolVersion) -> bool {
+            version == rustls::ProtocolVersion::TLSv1_2
+        }
+    }
+
+    static TLS12_ONLY_X25519: Tls12OnlyX25519 = Tls12OnlyX25519;
+
+    /// TLS-1, TLS-9: rustls' builder accepts groups that only TLS 1.2 can
+    /// use, then finds no group while negotiating. Such a list fails here
+    /// instead, and one usable group is enough.
+    #[test]
+    fn kx_groups_without_tls13_fail() {
+        let secret = NodeSecretKey::generate();
+        let inputs = EndpointInputs::default().kx_groups(vec![&TLS12_ONLY_X25519]);
+        assert!(TlsConfig::with_inputs(&secret, &inputs).is_err());
+
+        let inputs = EndpointInputs::default().kx_groups(vec![
+            &TLS12_ONLY_X25519,
+            rustls::crypto::ring::kx_group::X25519,
+        ]);
+        assert!(TlsConfig::with_inputs(&secret, &inputs).is_ok());
     }
 
     /// TLS-10, TLS-11, WIRE-2: no 0-RTT, no tickets, no SNI, and the ALPNs in

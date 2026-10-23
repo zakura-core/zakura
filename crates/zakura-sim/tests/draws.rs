@@ -263,3 +263,28 @@ fn a_sink_draw_is_a_harness_failure() {
         );
     }
 }
+
+#[test]
+fn an_at_end_draw_is_a_harness_failure() {
+    let mut checker = zakura_sim::check::FnChecker::new(
+        |_: &zakura_sim::StepCtx<'_>| None,
+        |_: &zakura_sim::RunEnd, _: &zakura_sim::ObservationLog| {
+            // The run's first hashed map draws its hash seed.
+            let _: HashMap<u8, u8> = HashMap::default();
+            Vec::new()
+        },
+    );
+    let (report, lines) = recorded(
+        config(2, 100),
+        Plan::from_fuzz(&[7; 16]),
+        |_| {},
+        &mut checker,
+    );
+    assert_eq!(
+        report.end.harness,
+        Some(zakura_sim::HarnessFailure::DrawOutsideStep),
+        "{:?}",
+        report.end
+    );
+    assert!(draws(&lines).is_empty(), "the draw took no plan input");
+}

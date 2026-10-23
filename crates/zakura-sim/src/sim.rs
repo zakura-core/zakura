@@ -151,8 +151,13 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
-        self.choices.borrow_mut().set_owner(Owner::Done);
+        // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
+        let end = match self.failure.take() {
+            Some(failure) => state.end_harness(failure),
+            None => end,
+        };
+        self.choices.borrow_mut().set_owner(Owner::Done);
         state.log.freeze();
         let cleanup = self.sched.shutdown();
         sink.record(Record::End(end_record(&end, &properties, cleanup)));

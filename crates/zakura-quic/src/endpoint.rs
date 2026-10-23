@@ -35,6 +35,15 @@ use crate::{
     tls::{RuntimeUtc, TlsConfig},
 };
 
+/// Whether a `zakura_sim` run is active on this thread. Always false in a
+/// production build.
+fn in_simulated_run() -> bool {
+    #[cfg(zakura_sim)]
+    return zakura_rt::sim::executor().is_some();
+    #[cfg(not(zakura_sim))]
+    false
+}
+
 /// How often a wildcard-bound endpoint lists the host's interface addresses to
 /// notice a network change (SOCK-12).
 const INTERFACE_POLL: Duration = Duration::from_secs(5);
@@ -262,6 +271,19 @@ impl QuicEndpoint {
                 addr: *addr,
                 source,
             })?;
+            // SOCK-12: a wildcard socket starts the interface watcher, which
+            // reads the host's interfaces. Inside a simulated run that would
+            // let the host change the run.
+            if in_simulated_run() && socket.local_addr.ip().is_unspecified() {
+                return Err(BindError::Socket {
+                    addr: *addr,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a simulated run can't bind a wildcard address, whose interface \
+                         watcher would read the host's interfaces",
+                    ),
+                });
+            }
             bound.push(socket);
         }
         let mut sockets = Vec::with_capacity(bound.len());

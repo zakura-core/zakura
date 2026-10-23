@@ -2905,3 +2905,74 @@ async fn bind_keeps_the_production_inputs() {
     assert!(shared.tls.uses_default_provider());
     endpoint.shutdown().await;
 }
+
+/// Binds on `SimNet` but reports a wildcard local address, as an injected
+/// factory that forwards the requested address might.
+struct WildcardFactory(SimNet);
+
+impl crate::SocketFactory for WildcardFactory {
+    type Socket = <SimNet as crate::SocketFactory>::Socket;
+
+    /// Binds `addr` on the network and reports `0.0.0.0` with its port.
+    fn bind(&self, addr: SocketAddr) -> std::io::Result<crate::BoundSocket<Self::Socket>> {
+        let mut bound = <SimNet as crate::SocketFactory>::bind(&self.0, addr)?;
+        bound.local_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port()));
+        Ok(bound)
+    }
+}
+
+/// Binds one socket at `sim_addr(1)` through a [`WildcardFactory`].
+fn bind_wildcard(net: &SimNet) -> Result<QuicEndpoint, crate::BindError> {
+    let bind = QuicBindConfig {
+        addrs: vec![sim_addr(1)],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        WildcardFactory(net.clone()),
+        crate::EndpointInputs::default(),
+    )
+}
+
+/// SOCK-12: outside a simulated run, an injected socket with a wildcard
+/// local address binds as before and gets the interface watcher.
+#[tokio::test(start_paused = true)]
+async fn a_wildcard_injected_socket_binds_outside_a_simulated_run() {
+    let before = alive_tasks();
+    let endpoint = bind_wildcard(&sim_net()).unwrap();
+    assert_eq!(
+        alive_tasks(),
+        before + 2,
+        "the endpoint task and the watcher"
+    );
+    endpoint.shutdown().await;
+}
+
+/// SOCK-12: inside a simulated run, a wildcard socket would start the
+/// interface watcher on the host's interfaces, so `bind_with` refuses it
+/// and releases the socket it bound.
+#[cfg(zakura_sim)]
+#[test]
+fn a_simulated_run_refuses_a_wildcard_socket() {
+    let net = sim_net();
+    let run = zakura_scheduler::Scheduler::new(
+        zakura_scheduler::SchedulerConfig::default(),
+        zakura_scheduler::SimInstant::ZERO,
+    );
+    let error = bind_wildcard(&net).unwrap_err();
+    drop(run);
+    let crate::BindError::Socket { addr, source } = error else {
+        panic!("expected a socket error, got {error:?}");
+    };
+    assert_eq!(addr, sim_addr(1));
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        net.events().last(),
+        Some(&NetEvent::Unbound {
+            addr: sim_addr(1),
+            unread: 0
+        })
+    );
+}

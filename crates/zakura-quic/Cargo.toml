@@ -39,5 +39,10 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "ne
 sha2 = { workspace = true }
 toml = { workspace = true }
 
+# The deterministic scheduler, for tests that run under
+# `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no version.
+[target.'cfg(zakura_sim)'.dev-dependencies]
+zakura-scheduler = { path = "../zakura-scheduler" }
+
 [lints]
 workspace = true

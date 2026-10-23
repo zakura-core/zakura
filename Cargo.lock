@@ -3385,6 +3385,7 @@ dependencies = [
  "toml",
  "tracing",
  "zakura-rt",
+ "zakura-scheduler",
  "zeroize",
 ]
 

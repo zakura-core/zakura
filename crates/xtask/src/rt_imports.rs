@@ -70,7 +70,10 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 /// pieces of state outlive a simulated run without a runtime path to flag:
 /// the Linux GSO probe's `OnceLock`, which only the production socket
 /// reaches, and `ConnShared`'s connection counter, a trace ID that numbers
-/// connections process-wide and never reaches the wire or a decision.
+/// connections process-wide and never reaches the wire or a decision. The
+/// interface watcher reads the host's interfaces through `getifaddrs`, but it
+/// starts only for a wildcard socket, and `bind_with` refuses one inside a
+/// simulated run.
 const ALLOWED: [(&str, &str, &str); 4] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",

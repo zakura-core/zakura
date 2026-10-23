@@ -16,6 +16,7 @@ pub mod end;
 pub mod identity;
 pub mod observe;
 pub mod plan;
+pub mod record;
 pub mod sim;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
@@ -23,5 +24,6 @@ pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Vio
 pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};
-pub use plan::{HexU64, Plan, PlanChoice, PlanError, PlanInput};
+pub use plan::{By, HexU64, Plan, PlanChoice, PlanError, PlanInput};
+pub use record::{MemorySink, Record, RecordSink};
 pub use sim::{RunConfig, RunReport, Sim};

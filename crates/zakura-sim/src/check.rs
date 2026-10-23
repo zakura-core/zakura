@@ -3,13 +3,14 @@
 //! properties.md's registry (P1) builds on these hooks. M1 ships
 //! [`NoChecks`] and [`FnChecker`] for tests.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
 use crate::{end::RunEnd, observe::Observation, Identity, ObservationLog};
 
 /// A property that failed, and the steps its failure depends on.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Violation {
     /// The property's ID, such as `sim/no-livelock`.
     pub property: String,
@@ -25,8 +26,8 @@ pub struct Violation {
 
 /// One property's outcome over a whole run (properties.md, Verdicts and
 /// obligations).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PropertyOutcome {
     /// `applicable` evaluations applied, none failed, and no obligation is
     /// open.
@@ -50,12 +51,12 @@ pub enum PropertyOutcome {
 }
 
 /// A property's ID and its run outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PropertyReport {
     /// The property's ID.
     pub property: String,
     /// Its outcome.
-    #[serde(flatten)]
     pub outcome: PropertyOutcome,
 }
 

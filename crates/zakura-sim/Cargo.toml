@@ -16,10 +16,15 @@ publish = false
 zakura-scheduler = { path = "../zakura-scheduler" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
+# For the header-sync smoke test.
+zakura-chain = { path = "../zakura-chain" }
+zakura-network = { path = "../zakura-network" }
+zakura-node-services = { path = "../zakura-node-services" }
 
 [lints]
 workspace = true

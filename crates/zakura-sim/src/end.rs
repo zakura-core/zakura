@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::{check::Violation, PlanError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A failure of the simulation itself, not of the code under test.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl fmt::Display for HarnessFailure {
 }
 
 /// Why nothing was enabled at the end of a live run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IdleStatus {
     /// Every task finished.
@@ -77,7 +77,8 @@ pub enum Outcome {
 }
 
 /// What the drain after a budget did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Drain {
     /// Steps the drain took.
     pub steps: u64,

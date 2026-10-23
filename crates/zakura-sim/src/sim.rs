@@ -17,6 +17,9 @@ use crate::{
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     observe::{Exit, Observation},
     plan::Decider,
+    record::{
+        digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
+    },
     Identity, ObservationLog, Plan, PlanInput,
 };
 
@@ -116,13 +119,16 @@ impl Sim {
     }
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
-    /// and shuts the scheduler down.
-    pub fn run(mut self, checker: &mut dyn Checker) -> RunReport {
+    /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
+    /// each step, then `end`.
+    pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
-        let end = self.drive(checker, &mut state);
+        sink.record(Record::Init(InitRecord::default()));
+        let end = self.drive(checker, &mut state, sink);
         let properties = checker.at_end(&end, &state.log);
         state.log.freeze();
         let cleanup = self.sched.shutdown();
+        sink.record(Record::End(end_record(&end, &properties, cleanup)));
         RunReport {
             end,
             properties,
@@ -134,7 +140,12 @@ impl Sim {
     }
 
     /// Steps until the run ends.
-    fn drive(&mut self, checker: &mut dyn Checker, st: &mut State) -> RunEnd {
+    fn drive(
+        &mut self,
+        checker: &mut dyn Checker,
+        st: &mut State,
+        sink: &mut dyn RecordSink,
+    ) -> RunEnd {
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -201,7 +212,18 @@ impl Sim {
             });
             self.execute(chosen.action, st);
 
-            ready = match self.ready(st) {
+            let next = self.ready(st);
+            sink.record(Record::Step(StepRecord {
+                step: st.step,
+                pick: chosen.identity.to_string(),
+                key: None,
+                options: enabled.len(),
+                by: decision.by,
+                offset: decision.offset,
+                draws: Vec::new(),
+                obs: Some(digest(st.log.of_step(st.step))),
+            }));
+            ready = match next {
                 Ok(ready) => ready,
                 Err(failure) => return st.end_harness(failure),
             };
@@ -365,5 +387,25 @@ fn idle_status(status: Status) -> Result<IdleStatus, HarnessFailure> {
         Status::WaitingOnTime => Err(HarnessFailure::StuckWithoutAction {
             status: "waiting-on-time",
         }),
+    }
+}
+
+/// The `end` record for a run that ended with `end`.
+fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupReport) -> EndRecord {
+    let (outcome, status) = match end.outcome {
+        Outcome::Violation => (OutcomeKind::Violation, None),
+        Outcome::Budget => (OutcomeKind::Budget, None),
+        Outcome::Idle { status } => (OutcomeKind::Idle, Some(status)),
+        Outcome::Harness => (OutcomeKind::Harness, None),
+    };
+    EndRecord {
+        outcome,
+        status,
+        steps: end.steps,
+        violation: end.violation.clone(),
+        drain: end.drain,
+        harness: end.harness.as_ref().map(ToString::to_string),
+        cleanup: CleanupRecord::from(cleanup),
+        properties: properties.to_vec(),
     }
 }

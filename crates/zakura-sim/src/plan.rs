@@ -81,10 +81,10 @@ pub enum PlanInput {
     Script(Plan),
 }
 
-/// What made a choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// What made a choice, as records show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum By {
+pub enum By {
     /// Input bytes, or a [`PlanInput::Script`] entry, which has no offset.
     Bytes,
     /// The fallback, once the input ran out.

@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use zakura_scheduler::SchedulerConfig;
-use zakura_sim::{Checker, Plan, PlanInput, RunConfig, RunReport, Sim};
+use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};
 
 /// A run config with `workers` workers, small stacks, and `budget` steps.
 pub fn config(workers: u16, budget: u64) -> RunConfig {
@@ -28,9 +28,22 @@ pub fn run(
     setup: impl FnOnce(&mut Sim),
     checker: &mut dyn Checker,
 ) -> RunReport {
+    recorded(config, plan, setup, checker).0
+}
+
+/// Runs one simulation as [`run`] does, and also returns its records as
+/// JSON lines.
+pub fn recorded(
+    config: RunConfig,
+    plan: PlanInput,
+    setup: impl FnOnce(&mut Sim),
+    checker: &mut dyn Checker,
+) -> (RunReport, Vec<String>) {
     let mut sim = Sim::new(config, plan);
     setup(&mut sim);
-    sim.run(checker)
+    let mut sink = MemorySink::default();
+    let report = sim.run(checker, &mut sink);
+    (report, sink.lines())
 }
 
 /// `count` byte inputs of up to `max_len` bytes, the same on every call.

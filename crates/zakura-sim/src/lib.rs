@@ -10,15 +10,23 @@
 //! M1 implementation plan.
 #![cfg(zakura_sim)]
 
+pub mod action;
+pub mod check;
+pub mod end;
 pub mod identity;
+pub mod observe;
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the step loop, the decider's only user, lands in the next PR"
+        reason = "the step loop, the decider's only user, lands in a later PR"
     )
 )]
 pub mod plan;
 
+pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
+pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};
+pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
+pub use observe::{Observation, ObservationLog};
 pub use plan::{HexU64, Plan, PlanChoice, PlanError, PlanInput};

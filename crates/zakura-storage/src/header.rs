@@ -62,29 +62,40 @@
 //!   nothing was committed.
 //!
 //! A fault means the backing work never ran, so it has no effect on state.
-//! Production can do more. A state read keeps running after its adapter
-//! times out, so a read can time out at 30 s and still consume its lease a
-//! moment later, and a release can time out after releasing. Histories where
-//! the work ran anyway after a fault are excluded for now, as is the API
-//! draft's Ambiguous outcome. Both would need an operation split into
-//! separate execute and reply stages. These histories are excluded:
 //!
-//! * A fault reply after the work ran, as above.
-//! * A page read whose tree-root reads fail after its path read consumed the
-//!   lease.
-//! * A successful page read whose path read ran long before its reply. For
-//!   example, the lease is acquired at 0 s, the path read consumes it at 1 s
-//!   and frees its slot, and the body-size read times out at 31 s. Production
-//!   still replies `Page` at 31 s. ST3's single completion would run the read
-//!   at 31 s instead, find the lease expired and reply `Unavailable`, and
-//!   would never free the slot at 1 s.
+//! # Excluded histories
 //!
-//! ST3's single-completion model covers none of these.
+//! Each operation's production stages run atomically at its completion.
+//! Production runs some stages earlier, and other operations can see their
+//! effects before the reply. Any production history that depends on another
+//! operation seeing such an intermediate stage is excluded, as is the API
+//! draft's Ambiguous outcome. Covering them would need an operation split
+//! into separate execute and reply stages. The known instances:
+//!
+//! * A reservation held while an acquire resolves its path. Say acquire A
+//!   reserves its peer's slot at 1 s. Acquire B, from the same peer, gets
+//!   `CapacityBusy` at 2 s. Then A replies `NoLocatorIntersection` at 3 s and
+//!   fires B's signal. Under atomic completion A holds no reservation before
+//!   it completes, so B can't be refused this way.
+//! * A lease consumed long before a late successful reply. Say the lease is
+//!   acquired at 0 s, the path read consumes it at 1 s and frees its slot,
+//!   and the body-size read times out at 31 s. Production still replies
+//!   `Page` at 31 s. A single completion at 31 s would find the lease expired
+//!   and reply `Unavailable`, and would never free the slot at 1 s.
+//! * A lease consumed before a tree-root read fails, so the read replies
+//!   `timeout` or `unavailable` with its lease already gone.
+//! * Work that ran anyway after a fault. A state read keeps running after its
+//!   adapter times out, so a read can time out at 30 s and still consume its
+//!   lease a moment later, and a release can time out after releasing.
+//!
+//! ST3's single-completion model covers none of these. ST3 treats any new
+//! history of this shape as covered by this rule. It needs no contract
+//! change.
 //!
 //! The body-size fallback needs no outcome of its own. Header fixtures commit
 //! no block bodies, so the engine adapter serves every size as unknown, which
-//! is the same page the fallback gives. Only its timing is lost, as the last
-//! exclusion shows.
+//! is the same page the fallback gives. Only its timing is lost, as the
+//! second instance shows.
 //!
 //! # Execution
 //!

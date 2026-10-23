@@ -14,6 +14,7 @@ use super::{HarnessEntry, HarnessError};
 use crate::{
     trace::{
         meta::{hex, InputRef},
+        read::refuse_symlinked_dir,
         FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES,
     },
     Plan,
@@ -45,6 +46,9 @@ pub enum RecordError {
         /// Its length.
         len: usize,
     },
+    /// `out` is a symlink, which the reader would refuse. Nothing was
+    /// written.
+    Refused(ReadError),
     /// Writing the trace failed, as when `out` already holds one.
     Io(io::Error),
     /// The written trace didn't read back.
@@ -60,6 +64,7 @@ impl fmt::Display for RecordError {
                 f,
                 "the input is {len} bytes, and input.bin holds at most {MAX_INPUT_BYTES}"
             ),
+            RecordError::Refused(error) => write!(f, "the trace can't go there: {error}"),
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
         }
@@ -70,6 +75,9 @@ impl std::error::Error for RecordError {}
 
 /// Runs `what` on `harness` and writes the trace to `out`, which must not
 /// already hold one. Returns the trace as the reader reads it back.
+///
+/// `out` gets the reader's directory check before anything is written, so a
+/// symlinked `out` is refused with nothing written through it.
 ///
 /// For a full input, the first [`HarnessEntry::scenario_bytes`] bytes
 /// decode the scenario. An input shorter than that reads the missing
@@ -93,6 +101,7 @@ pub fn record(
         RecordInput::Plan { scenario, plan } => (scenario.clone(), plan, None),
     };
     let mut meta = (harness.meta)(&scenario).map_err(RecordError::Harness)?;
+    refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
     if let Some(input) = input {
         // A usize always fits in a u64 on supported targets.
         let len = input.len() as u64;

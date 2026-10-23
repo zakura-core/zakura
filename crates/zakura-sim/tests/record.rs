@@ -199,3 +199,25 @@ fn bytes_per_step() {
         );
     }
 }
+
+/// A symlinked `out` is refused before anything is written, so the link's
+/// target stays empty and a retry with a real directory works.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_out_is_refused_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    for out in [link.clone(), link.join(""), link.join(".")] {
+        let error = record(&YIELDERS, RecordInput::Input(BYTES), &out).unwrap_err();
+        assert!(
+            matches!(error, RecordError::Refused(_)),
+            "{}: {error}",
+            out.display()
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    record(&YIELDERS, RecordInput::Input(BYTES), &target).unwrap();
+}

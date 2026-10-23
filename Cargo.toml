@@ -8,6 +8,7 @@ members = [
         "crates/zakura-quic",
         "crates/zakura-rt",
         "crates/zakura-scheduler",
+        "crates/zakura-sim",
         "crates/zakura-state",
         "crates/zakura-script",
         "crates/zakura-consensus",

@@ -83,6 +83,11 @@ pub(crate) struct RunState {
     object_counts: BTreeMap<Option<TaskId>, u32>,
     root_counts: BTreeMap<&'static str, u32>,
     pub(crate) shutting_down: bool,
+    /// Points each task passed during shutdown, where points don't switch.
+    pub(crate) cleanup_points: BTreeMap<TaskId, u32>,
+    /// Tasks that passed [`CLEANUP_POINT_LIMIT`] points during shutdown. The
+    /// drain skips them, and shutdown leaks them.
+    pub(crate) stuck: BTreeSet<TaskId>,
     /// Answers random draws. Taken out while it runs.
     pub(crate) draws: Option<DrawSource>,
     /// Panic payloads of tasks that panicked, until a joiner takes them.
@@ -265,6 +270,13 @@ const STACK_POOL_LIMIT: usize = 1024;
 /// past it are force-unwound instead, so cleanup always ends.
 const DRAIN_STEP_LIMIT: usize = 100_000;
 
+/// The most preemption points one task passes during shutdown. Points don't
+/// switch then, so a task spinning on a value no one will set never reaches
+/// a poll boundary. Past this it stops, and shutdown leaks it. The limit is
+/// high so long but finite cleanup still finishes, and a cleanup point costs
+/// only a counter, so a stuck task costs well under a second.
+pub(crate) const CLEANUP_POINT_LIMIT: u32 = 10_000_000;
+
 /// Takes this thread's run state when dropped, even if shutdown panics, so
 /// later runs on the thread can still start. During a panic it leaks what the
 /// state still holds, since dropping that could panic again and abort.
@@ -428,6 +440,8 @@ impl Scheduler {
                 object_counts: BTreeMap::new(),
                 root_counts: BTreeMap::new(),
                 shutting_down: false,
+                cleanup_points: BTreeMap::new(),
+                stuck: BTreeSet::new(),
                 draws: None,
                 #[cfg(zakura_sim)]
                 panics: BTreeMap::new(),
@@ -463,8 +477,9 @@ impl Scheduler {
 
     /// Sets what answers the run's random draws: the `rng()` stream seed, unbiased
     /// `select!` starts, and the hash seed. `zakura-sim` passes its `Plan`.
-    /// Without a source every draw is 0, the same default the `Plan` uses
-    /// once its bytes run out.
+    /// Without a source every draw is 0. The `Plan` answers exhausted
+    /// `select!` and `StreamMap` draws with a rotating default instead, so
+    /// they don't all start at branch 0.
     pub fn set_draws(&mut self, draws: impl FnMut(&Draw) -> u64 + 'static) {
         let old = self.state(|s| s.draws.replace(Box::new(draws)));
         // Dropped outside the borrow, since a closure's drop can run any code.
@@ -670,7 +685,11 @@ impl Scheduler {
     /// 2. Every task at a poll boundary is cancelled, as an abort would. Its
     ///    future is dropped on its own stack, outside any unwind.
     /// 3. Only a task that is still parked, as in a lock cycle, is
-    ///    force-unwound. Whatever that unwind releases drains as in stage 1.
+    ///    force-unwound, and whatever that releases drains as in stage 1. If
+    ///    a task passed [`CLEANUP_POINT_LIMIT`] points in stage 1, as a spin
+    ///    on a value no one will set does, every task left is leaked
+    ///    instead, without running its destructors, since any of them may
+    ///    wait on what the stuck task's destructors would have done.
     ///
     /// Check properties before calling this. A force-unwound task inside a
     /// production `catch_unwind` sees the unwind as a panic.
@@ -701,6 +720,16 @@ impl Scheduler {
         };
         loop {
             self.drain(&mut report);
+            // Unwinding runs a task's destructors, which can't be preempted
+            // while unwinding, so one that spins would hang cleanup. Once a
+            // task is stuck, its own destructors won't run either, and any
+            // other task's destructor may wait on what they would have done,
+            // such as a flag or an unlock. So leak every task left instead.
+            // The run is over.
+            if self.state(|s| !s.stuck.is_empty()) {
+                self.leak_all(&mut report);
+                break;
+            }
             // Every task left is parked, or the drain hit its step limit.
             let Some(task) = self
                 .coroutines
@@ -748,18 +777,48 @@ impl Scheduler {
         report
     }
 
+    /// Leaks every live task without running its destructors, and counts it
+    /// in `leaked`. Every coroutine is forgotten before any task finishes,
+    /// because finishing wakes joiners, and a waker that panics would
+    /// otherwise drop, and so force-unwind, the coroutines still held.
+    fn leak_all(&mut self, report: &mut CleanupReport) {
+        loop {
+            let leaked: Vec<TaskId> = (0..self.coroutines.len())
+                .filter_map(|i| {
+                    std::mem::forget(self.coroutines[i].take()?);
+                    Some(TaskId(
+                        u32::try_from(i).expect("queue_spawn caps tasks at u32"),
+                    ))
+                })
+                .collect();
+            if leaked.is_empty() {
+                return;
+            }
+            report.leaked += leaked.len();
+            for task in leaked {
+                self.finish(task, TaskExit::Cancelled);
+            }
+            // A wake may have spawned. Leak those tasks too.
+            self.admit();
+        }
+    }
+
     /// Runs ready tasks during shutdown until none is left: first any task
     /// stopped mid-poll, then each task at a poll boundary, which `step`
-    /// cancels. Picks the lowest `TaskId`, so cleanup replays too.
+    /// cancels. Picks the lowest `TaskId`, so cleanup replays too. Stops as
+    /// soon as a task is stuck, since every task left is then leaked.
     fn drain(&mut self, report: &mut CleanupReport) {
         for _ in 0..DRAIN_STEP_LIMIT {
+            if self.state(|s| !s.stuck.is_empty()) {
+                return;
+            }
             // Setup code may have spawned since the last step.
             self.admit();
             let next = self.state(|s| {
-                s.ready
-                    .iter()
+                let mut live = s.ready.iter().filter(|t| !s.stuck.contains(t));
+                live.clone()
                     .find(|t| s.mid_poll.contains(t))
-                    .or_else(|| s.ready.first())
+                    .or_else(|| live.next())
                     .copied()
             });
             let Some(task) = next else { return };

@@ -474,11 +474,11 @@ jobs:
       - name: Check no git dependencies
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
 
-  # `zakura-rt` and `zakura-scheduler` have a simulator build behind
-  # `--cfg zakura_sim` that no other job compiles. Changing RUSTFLAGS rebuilds
-  # every crate, so this job uses its own target directory and cache key.
-  # `zakura-network`'s library and its scheduler tests build under the flag
-  # too. Its unit tests still name tokio's types, so they don't.
+  # `zakura-rt`, `zakura-scheduler` and `zakura-sim` have a simulator build
+  # behind `--cfg zakura_sim` that no other job compiles. Changing RUSTFLAGS
+  # rebuilds every crate, so this job uses its own target directory and cache
+  # key. `zakura-network`'s library and its scheduler tests build under the
+  # flag too. Its unit tests still name tokio's types, so they don't.
   sim-build:
     name: zakura_sim build
     needs: changes
@@ -502,14 +502,23 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint the simulator build
         run: |
-          cargo clippy --locked -p zakura-rt -p zakura-scheduler --all-targets -- -D warnings
+          cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim --all-targets -- -D warnings
           cargo clippy --locked -p zakura-network --lib --test sim_header_sync -- -D warnings
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build
         run: |
-          cargo test --locked -p zakura-rt -p zakura-scheduler
+          cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim
           cargo test --locked -p zakura-network --test sim_header_sync
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+      # S4.7: the discovery regression must still find the bug it guards.
+      # The patch reverts the wait_complete fix in this disposable checkout,
+      # so this step runs last. A patch that no longer applies fails here.
+      - name: Check the discovery regression against the reverted fix
+        run: |
+          git apply crates/zakura-sim/tests/fixtures/discovery-wait-complete-revert.patch
+          cargo test --locked -p zakura-sim --test discovery -- --ignored --exact reverted_fix_misses_the_wakeup
         env:
           RUSTFLAGS: --cfg zakura_sim
 

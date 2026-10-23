@@ -114,20 +114,19 @@ where
 
 /// Runs `f` on tokio's blocking pool, as `tokio::task::spawn_blocking` does.
 ///
-/// # Panics
-///
-/// Inside a run. Blocking work isn't simulated yet.
+/// Inside a run, `f` runs as an ordinary task labeled `blocking`, in one
+/// poll, on the run's one thread. Unlike tokio's blocking pool, it holds a
+/// simulated worker while it runs.
 #[track_caller]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    assert!(
-        sim::executor().is_none(),
-        "spawn_blocking isn't simulated yet, so it can't run inside a zakura-rt sim run"
-    );
-    JoinHandle::tokio(tokio::task::spawn_blocking(f))
+    if sim::executor().is_none() {
+        return JoinHandle::tokio(tokio::task::spawn_blocking(f));
+    }
+    spawn_named("blocking", async move { f() })
 }
 
 /// Lets other tasks run, as `tokio::task::yield_now` does.

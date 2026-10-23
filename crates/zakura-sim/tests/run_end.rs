@@ -379,3 +379,70 @@ fn the_end_record_counts_a_leaked_task() {
     };
     assert_eq!(end.cleanup.leaked, 1);
 }
+
+/// Sets its flag when dropped, as a leaked task's guard would have.
+struct SetsOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetsOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A source with no actions whose drop waits for its flag.
+struct WaitsOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ActionSource for WaitsOnDrop {
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {}
+}
+
+impl Drop for WaitsOnDrop {
+    fn drop(&mut self) {
+        while !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Builds a sim whose only task spins forever holding a guard that would
+/// set the flag a source's drop waits for, and runs `end` on it on its own
+/// thread. Returns what `end` returns, or panics after a minute.
+fn abandoned_sim_with_a_waiting_source<T: Send + 'static>(
+    end: impl FnOnce(zakura_sim::Sim) -> T + Send + 'static,
+) -> T {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sim = zakura_sim::Sim::new(livelock_config(), Plan::from_fuzz(&[]));
+        sim.add_source(Box::new(WaitsOnDrop(flag.clone())));
+        let spinner = zakura_rt::sync::atomic::AtomicBool::new(false);
+        let guard = SetsOnDrop(flag);
+        let task = sim.scheduler().spawn_root("spinner", async move {
+            let _guard = guard;
+            while !spinner.load(zakura_rt::sync::atomic::Ordering::Acquire) {}
+        });
+        // Mid-poll, so shutdown's drain runs it until the cleanup bound.
+        sim.scheduler().run(task.task());
+        let _ = done.send(end(sim));
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the sim ended")
+}
+
+#[test]
+fn an_abandoned_run_forgets_its_sources() {
+    let leaked = abandoned_sim_with_a_waiting_source(|sim| {
+        sim.run(&mut NoChecks, &mut zakura_sim::MemorySink::default())
+            .cleanup
+            .leaked
+    });
+    assert_eq!(leaked, 1);
+}
+
+#[test]
+fn dropping_a_sim_that_abandons_forgets_its_sources() {
+    abandoned_sim_with_a_waiting_source(drop);
+}

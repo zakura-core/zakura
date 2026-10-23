@@ -6,12 +6,6 @@ use crate::zakura::{
 };
 use std::{num::NonZeroU64, time::Duration};
 
-impl RequestWriteStatus {
-    pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
-    }
-}
-
 thread_local! {
     static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);

@@ -5,7 +5,7 @@
 //! every window size. A per-request cost that grows with the window means that
 //! some event still scans or rebuilds the whole window.
 
-use super::super::request::BlockSizeEstimate;
+use super::super::{request::BlockSizeEstimate, BlockSyncMessage};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
 use zakura_chain::serialization::ZcashDeserializeInto;
@@ -152,17 +152,17 @@ async fn request_bookkeeping_scaling() {
         } = probe(window);
 
         let started = Instant::now();
-        while routine.window.outstanding.len() < blocks.len() {
-            let before = routine.window.outstanding.len();
-            routine.try_fill().await;
+        while routine.state.window.outstanding.len() < blocks.len() {
+            let before = routine.state.window.outstanding.len();
+            routine.try_fill();
             assert!(
-                routine.window.outstanding.len() > before,
+                routine.state.window.outstanding.len() > before,
                 "fill stalled at {before} of {window} requests: {:?}",
-                routine.fill_stop_trace_at.keys().collect::<Vec<_>>()
+                routine.io.fill_stop_trace_at.keys().collect::<Vec<_>>()
             );
         }
         let fill = started.elapsed();
-        routine.window.outstanding.assert_consistent();
+        routine.state.window.outstanding.assert_consistent();
         while outbound.try_recv().is_ok() {}
 
         let started = Instant::now();
@@ -178,11 +178,11 @@ async fn request_bookkeeping_scaling() {
             )
             .await;
             // The run loop refills after every frame.
-            routine.try_fill().await;
+            routine.try_fill();
         }
         let settle = started.elapsed();
-        assert!(routine.window.outstanding.is_empty());
-        assert_eq!(routine.registry.total_unreceived(), 0);
+        assert!(routine.state.window.outstanding.is_empty());
+        assert_eq!(routine.io.registry.total_unreceived(), 0);
 
         eprintln!(
             "window={window:>6} fill={:>9.1?} ({:>7.2?}/request) settle={:>9.1?} ({:>7.2?}/response)",

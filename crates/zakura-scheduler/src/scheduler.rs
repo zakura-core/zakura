@@ -686,6 +686,16 @@ impl Scheduler {
         };
         loop {
             self.drain(&mut report);
+            // Unwinding runs a task's destructors, which can't be preempted
+            // while unwinding, so one that spins would hang cleanup. Once a
+            // task is stuck, its own destructors won't run either, and any
+            // other task's destructor may wait on what they would have done,
+            // such as a flag or an unlock. So leak every task left instead.
+            // The run is over.
+            if self.state(|s| !s.stuck.is_empty()) {
+                self.leak_all(&mut report);
+                break;
+            }
             // Every task left is parked, or the drain hit its step limit.
             let Some(task) = self
                 .coroutines
@@ -698,19 +708,6 @@ impl Scheduler {
             let mut co = self.coroutines[task.index()]
                 .take()
                 .expect("position found a live coroutine");
-            // Unwinding runs a task's destructors, which can't be preempted
-            // while unwinding, so one that spins would hang cleanup. Once a
-            // task is stuck, its own destructors won't run either, and any
-            // other task's destructor may wait on what they would have done,
-            // such as a flag or an unlock. So after that, leak every task
-            // left instead of unwinding it. The run is over.
-            if self.state(|s| !s.stuck.is_empty()) {
-                report.leaked += 1;
-                std::mem::forget(co);
-                self.finish(task, TaskExit::Cancelled);
-                self.admit();
-                continue;
-            }
             if co.started() && !co.done() {
                 report.unwound += 1;
             }
@@ -746,11 +743,41 @@ impl Scheduler {
         report
     }
 
+    /// Leaks every live task without running its destructors, and counts it
+    /// in `leaked`. Every coroutine is forgotten before any task finishes,
+    /// because finishing wakes joiners, and a waker that panics would
+    /// otherwise drop, and so force-unwind, the coroutines still held.
+    fn leak_all(&mut self, report: &mut CleanupReport) {
+        loop {
+            let leaked: Vec<TaskId> = (0..self.coroutines.len())
+                .filter_map(|i| {
+                    std::mem::forget(self.coroutines[i].take()?);
+                    Some(TaskId(
+                        u32::try_from(i).expect("queue_spawn caps tasks at u32"),
+                    ))
+                })
+                .collect();
+            if leaked.is_empty() {
+                return;
+            }
+            report.leaked += leaked.len();
+            for task in leaked {
+                self.finish(task, TaskExit::Cancelled);
+            }
+            // A wake may have spawned. Leak those tasks too.
+            self.admit();
+        }
+    }
+
     /// Runs ready tasks during shutdown until none is left: first any task
     /// stopped mid-poll, then each task at a poll boundary, which `step`
-    /// cancels. Picks the lowest `TaskId`, so cleanup replays too.
+    /// cancels. Picks the lowest `TaskId`, so cleanup replays too. Stops as
+    /// soon as a task is stuck, since every task left is then leaked.
     fn drain(&mut self, report: &mut CleanupReport) {
         for _ in 0..DRAIN_STEP_LIMIT {
+            if self.state(|s| !s.stuck.is_empty()) {
+                return;
+            }
             // Setup code may have spawned since the last step.
             self.admit();
             let next = self.state(|s| {

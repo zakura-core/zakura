@@ -35,6 +35,62 @@ fn trace_active_request(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> Act
     active
 }
 
+#[tokio::test]
+async fn body_size_hints_correlate_with_the_admitted_subscription() {
+    let mut capture =
+        TraceCapture::for_test("body_size_hints_subscription").expect("trace capture starts");
+    let (mut reactor, _actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+    reactor.startup.trace = crate::zakura::ZakuraTrace::new(capture.tracer(), "hints-test");
+    let active = trace_active_request(&reactor, &peer);
+    let mut entries = active.entries;
+    entries[0].body_size = 123_456;
+    let active = reactor.peer_work_queue.active_mut(&peer).unwrap();
+    active.phase = HeaderTargetPhase::Receiving;
+    active.entries.clear();
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
+    let mut page = Headers {
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        common_ancestor_height: snapshot.frontiers.finalized.height,
+        common_ancestor_hash: snapshot.frontiers.finalized.hash,
+        reaches_initial_target: true,
+        tree_aux_schema: AuxSchema::None,
+        entries,
+    };
+    let admitted_id = page.subscription_id;
+    page.subscription_id += 1;
+    reactor.deliver_page(peer.clone(), owner.session_id(), page.clone());
+    page.subscription_id = admitted_id;
+    reactor.deliver_page(peer.clone(), owner.session_id(), page);
+
+    capture.flush().await;
+    let reader = capture.reader().expect("the trace reloads");
+    let table = reader.table(HEADER_SYNC_TABLE.table());
+    let correlation = [
+        (hs_trace::REQUEST_ID, TraceValue::U64(admitted_id)),
+        (hs_trace::SESSION_ID, TraceValue::U64(owner.session_id())),
+    ];
+    table.assert_row(hs_trace::HEADER_REQUEST_SENT, &correlation);
+    table.assert_row(hs_trace::HEADER_RESPONSE_RECEIVED, &correlation);
+    table.assert_row("header_body_size_hints_received", &correlation);
+    let hints: Vec<_> = table
+        .rows()
+        .into_iter()
+        .filter(|row| {
+            row.get("event").and_then(serde_json::Value::as_str)
+                == Some("header_body_size_hints_received")
+        })
+        .collect();
+    assert_eq!(
+        hints.len(),
+        1,
+        "stale subscriptions do not emit body-size evidence"
+    );
+    assert_eq!(hints[0]["body_sizes"], serde_json::json!([123_456]));
+    assert_eq!(hints[0]["peer"], trace_peer_label(&peer));
+    let _ = capture.finish().await.expect("trace capture finishes");
+}
+
 /// A `SubscriptionSuperseded` outcome emits one request terminal row that
 /// names the exact session, request, and branch.
 #[tokio::test]

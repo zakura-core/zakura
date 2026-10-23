@@ -589,11 +589,14 @@ impl SequencerTask {
         let _ = self.sequencer.drain_ready_into_applying();
     }
 
-    /// Reset the body pipeline and queued work above `tip` under one reset epoch.
+    /// Reset the body pipeline to `tip` and clear obsolete work under one reset epoch.
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
         let released = self.work.reset_above(tip);
-        self.budget.release(released);
+        // The retained prefix is committed at the new tip, so it must not count
+        // toward refill limits or be returned to pending by an old request.
+        let committed = self.work.advance_floor(tip);
+        self.budget.release(released.saturating_add(committed));
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -1220,6 +1223,7 @@ impl SequencerTask {
         // core (and starves progress under CI load) on a real clock and fully wedges
         // a `start_paused` test clock, which auto-advances only once every task
         // parks. Keep the stored rates fresh, but notify only on a schedulable change.
+        self.trace_apply_occupancy(&next);
         publish_sequencer_view(&self.view_tx, next);
     }
 
@@ -1490,6 +1494,75 @@ mod tests {
             ZakuraTrace::noop(),
         )
         .with_retained_body_limit(limit)
+    }
+
+    /// Reset cleanup releases both sides of the tip once and rejects late returns.
+    #[test]
+    fn destructive_reset_clears_obsolete_work_and_releases_reservations_once() {
+        let mut task = retention_test_task(u64::MAX);
+        task.work.set_estimate_floor_for_tests(1);
+        task.work.extend(
+            super::test_work_scope(),
+            (1..=5).map(|height| {
+                (
+                    block::Height(height),
+                    block::Hash([u8::try_from(height).unwrap(); 32]),
+                    super::super::request::BlockSizeEstimate::Advertised(1_000),
+                )
+            }),
+        );
+        let provisional = task.work.take_for_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            1_000,
+            1,
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        for height in [block::Height(2), block::Height(4)] {
+            let taken = task.work.take_for_request(
+                height,
+                height,
+                1,
+                1_000,
+                u64::from(height.0),
+                std::num::NonZeroU64::new(1).unwrap(),
+            );
+            let reserved = task
+                .work
+                .mark_reserved_for_owner(taken[0].1.owner.unwrap(), [height]);
+            task.budget.charge(reserved);
+        }
+        assert_eq!(task.budget.reserved(), 2_000);
+
+        task.destructive_reset_to(block::Height(3), false);
+
+        assert_eq!(task.work.pending_len(), 0);
+        assert_eq!(task.work.in_flight_len(), 0);
+        assert_eq!(task.work.reserved_bytes(), 0);
+        assert_eq!(task.budget.reserved(), 0);
+        task.work.return_unpublished(&provisional);
+        assert_eq!(task.work.pending_len(), 0);
+        assert_eq!(
+            task.work
+                .release_reserved_and_return_items([block::Height(2), block::Height(4)]),
+            0,
+            "late request cleanup must not release the same reservations twice",
+        );
+
+        task.destructive_reset_to(block::Height(1), false);
+        assert_eq!(
+            task.work.extend(
+                super::test_work_scope(),
+                [(
+                    block::Height(2),
+                    block::Hash([2; 32]),
+                    super::super::request::BlockSizeEstimate::Advertised(1_000),
+                )],
+            ),
+            1,
+            "a backward reset must allow the replacement suffix to be downloaded",
+        );
     }
 
     // Use a real serialized block. Only the scheduling height is synthetic.

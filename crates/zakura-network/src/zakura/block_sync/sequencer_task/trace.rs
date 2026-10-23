@@ -3,6 +3,19 @@ use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
 
 impl SequencerTask {
+    pub(super) fn trace_apply_occupancy(&self, next: &SequencerView) {
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build("block_apply_occupancy", |row| {
+                row.verified_block_tip = Some(u64::from(next.verified_tip.0));
+                row.body_download_floor = Some(u64::from(next.download_floor.0));
+                row.in_flight_submission_count = Some(next.in_flight_submission_count);
+                row.unsubmitted_applying_count = Some(next.unsubmitted_applying_count);
+                row.reorder_len = Some(next.reorder_len);
+                row.pending_work = Some(saturating_usize(self.work.pending_len()));
+            })
+        });
+    }
+
     pub(super) fn trace_body_submitted(&self, height: block::Height, token: BlockApplyToken) {
         self.trace.emit_event(|| {
             BlockTraceEvent::build(bs_trace::BLOCK_BODY_SUBMITTED, |row| {

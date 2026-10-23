@@ -554,6 +554,8 @@ thread_local! {
 /// [`LEFTOVER_FLAG`].
 struct SpawnsOnDrop;
 
+// `Waker::noop()` has no drop to spawn from, so this needs its own waker.
+#[allow(clippy::manual_noop_waker)]
 impl std::task::Wake for SpawnsOnDrop {
     fn wake(self: std::sync::Arc<Self>) {}
 }

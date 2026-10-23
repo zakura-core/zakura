@@ -544,6 +544,64 @@ fn a_panicking_join_waker_unwinds_nothing_after_a_leak() {
         .expect("the shutdown thread ended");
 }
 
+thread_local! {
+    /// The flag a timer waker's `Drop` hands to the task it spawns. See
+    /// `a_spawn_from_a_leftover_drop_is_leaked`.
+    static LEFTOVER_FLAG: RefCell<Option<Rc<Atomic>>> = const { RefCell::new(None) };
+}
+
+/// A waker whose last drop spawns a task holding a guard that spins on
+/// [`LEFTOVER_FLAG`].
+struct SpawnsOnDrop;
+
+impl std::task::Wake for SpawnsOnDrop {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+impl Drop for SpawnsOnDrop {
+    fn drop(&mut self) {
+        let flag = LEFTOVER_FLAG
+            .with(|f| f.borrow().clone())
+            .expect("the test sets the flag first");
+        // Built outside the future, so dropping it unpolled runs the guard.
+        let waits = SpinsOnDrop(flag);
+        hooks::spawn("b", async move {
+            let _waits = waits;
+            std::future::pending::<()>().await
+        });
+    }
+}
+
+#[test]
+fn a_spawn_from_a_leftover_drop_is_leaked() {
+    if leaks_in_a_child("a_spawn_from_a_leftover_drop_is_leaked") {
+        return;
+    }
+    let report = shutdown_report(|s| {
+        let flag = shared(Atomic::default());
+        let never = shared(Atomic::default());
+        LEFTOVER_FLAG.with(|f| *f.borrow_mut() = Some(flag.clone()));
+        // A spins until the cleanup bound stops it, so its guard, which
+        // would set the flag, never runs.
+        let a = s.spawn_root("a", async move {
+            let _signal = SetsOnDrop(flag);
+            while never.load() == 0 {}
+        });
+        assert!(matches!(
+            s.run(a.task()),
+            zakura_scheduler::RunOutcome::Reached(_)
+        ));
+        // A leftover timer whose waker spawns B when shutdown drops it. B's
+        // guard waits on A's flag.
+        let waker = Waker::from(std::sync::Arc::new(SpawnsOnDrop));
+        hooks::register_timer(
+            SimInstant::from_start(std::time::Duration::from_secs(3600)),
+            &waker,
+        );
+    });
+    assert_eq!((report.leaked, report.cancelled), (2, 0), "A and B");
+}
+
 #[test]
 fn long_but_finite_cleanup_finishes() {
     let report = shutdown_report(|s| {
@@ -1720,15 +1778,31 @@ fn task_panic_reaches_the_harness_with_a_replaced_panic_hook() {
 /// tasks on purpose, and checks it passed. Returns true in the parent, which
 /// should then return. In the child, returns false so the body runs.
 fn leaks_in_a_child(test: &str) -> bool {
+    use std::process::{Command, Stdio};
     if in_child(test) {
         return false;
     }
-    // The child's stdout is piped, so read it to the end while waiting.
-    let status = rerun_in_child(test, &[("ASAN_OPTIONS", "detect_leaks=0")])
-        .wait_with_output()
-        .expect("the child is ours to wait on")
-        .status;
-    assert!(status.success(), "the child failed: {status}");
+    // Added to any ASan options already set, rather than replacing them.
+    let asan = match std::env::var("ASAN_OPTIONS") {
+        Ok(options) if !options.is_empty() => format!("{options}:detect_leaks=0"),
+        _ => "detect_leaks=0".to_owned(),
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = Command::new(exe)
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env(CHILD_TEST, test)
+        .env("ASAN_OPTIONS", asan)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("the test binary can rerun itself");
+    assert!(
+        output.status.success(),
+        "the child failed: {}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     true
 }
 

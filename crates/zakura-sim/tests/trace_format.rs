@@ -523,6 +523,46 @@ fn symlinked_directories_are_refused() {
 
 #[cfg(unix)]
 #[test]
+fn trailing_separators_dont_hide_a_symlinked_directory() {
+    let real = recorded(plan());
+    let links = TempDir::new().unwrap();
+    let linked = links.path().join("trace");
+    std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+    let spellings = [
+        PathBuf::from(format!("{}/", linked.display())),
+        PathBuf::from(format!("{}//", linked.display())),
+        linked.join("."),
+        PathBuf::from(format!("{}/./", linked.display())),
+    ];
+    for dir in &spellings {
+        assert_eq!(
+            refusal(TraceReader::open(dir)),
+            Refusal::SymlinkedDirectory,
+            "{}",
+            dir.display()
+        );
+    }
+
+    // A store whose directory is spelled the same ways refuses both ways.
+    let outside = TempDir::new().unwrap();
+    let digest = BlobStore::new(vec![outside.path().into()])
+        .put(b"elsewhere")
+        .unwrap();
+    let blobs = links.path().join("blobs");
+    std::os::unix::fs::symlink(outside.path(), &blobs).unwrap();
+    for dir in [
+        PathBuf::from(format!("{}/", blobs.display())),
+        blobs.join("."),
+    ] {
+        let store = BlobStore::new(vec![dir.clone()]);
+        assert_eq!(refusal(store.get(&digest)), Refusal::SymlinkedDirectory);
+        assert!(store.put(b"new blob").is_err(), "{}", dir.display());
+    }
+    assert_eq!(listing(outside.path()), std::slice::from_ref(&digest));
+}
+
+#[cfg(unix)]
+#[test]
 fn fifo_blob_is_refused_without_blocking() {
     let dir = TempDir::new().unwrap();
     let blobs = dir.path().join("blobs");

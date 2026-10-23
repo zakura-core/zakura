@@ -311,7 +311,11 @@ fn check_artifacts(dir: &Path, meta: &MetaRecord) -> Result<(), ReadError> {
 /// Refuses a directory that is itself a symlink. A missing one passes, since
 /// its files then read as missing.
 pub(crate) fn refuse_symlinked_dir(dir: &Path) -> Result<(), ReadError> {
-    match dir.symlink_metadata() {
+    // On Unix, `lstat("link/")` and `lstat("link/.")` follow the link. Path
+    // components drop a trailing separator and every `.` but a leading one,
+    // so the check sees the link itself.
+    let link: PathBuf = dir.components().collect();
+    match link.symlink_metadata() {
         Ok(meta) if meta.is_symlink() => Err(ReadError::Refused {
             path: dir.to_owned(),
             reason: Refusal::SymlinkedDirectory,

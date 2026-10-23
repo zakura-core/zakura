@@ -39,10 +39,12 @@ use crate::zakura::block_sync::status::StatusDelivery;
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
-#[cfg(test)]
+#[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{replay_block_query_bytes, BlockQueryReplaySummary};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use tests::{replay_block_reactor_bytes, BlockReactorReplaySummary};
 
 /// The block-sync reactor's logical state.
 #[derive(Debug)]
@@ -304,7 +306,7 @@ pub(super) struct QueryProposal {
 }
 
 impl QueryProposal {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn query(&self) -> PendingNeededQuery {
         self.query
     }
@@ -362,7 +364,7 @@ impl QueryState {
         self.pending
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn next_id(&self) -> Option<NonZeroU64> {
         self.next_id
     }

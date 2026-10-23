@@ -138,3 +138,10 @@ path = "fuzz_targets/discovery_state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "block_reactor"
+path = "fuzz_targets/block_reactor.rs"
+test = false
+doc = false
+bench = false

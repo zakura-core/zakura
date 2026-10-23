@@ -177,6 +177,14 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: block_reactor
+            decoder: 1
+            witness: reactor_witness_exercises_refusal_retry_reset_and_authority
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

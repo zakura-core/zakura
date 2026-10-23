@@ -240,3 +240,22 @@ controlled hash-key boundary. Record metadata and session checks compare
 normalized state and do not depend on hash iteration order. These targets check
 synchronous installation rules; simulator adapters must check actual task
 cancellation and verification waits.
+
+## Block reactor policy target
+
+`block_reactor` shares the existing reactor policy model between proptest and
+cargo-fuzz. It covers view mirrors and reaction epochs, reset refills, query
+refusal, retry expiry and authority changes. Its local property ID is
+`block/reactor-policy`. The narrower `block_query` target retains its independent
+query identity and refusal checks.
+
+Decoder version 1 reads at most 512 bytes in four-byte operations. The witness
+`reactor_witness_exercises_refusal_retry_reset_and_authority` checks accepted and
+refused dispatches, a retry deadline, an anchor reply, reactive and passive views,
+a reset and a reply under retired authority. Empty inputs report zero
+applicability. Two planted failures lose the pending query or corrupt the request
+floor; both must report the intended property ID.
+
+The target has its own 900-second daily and 3,600-second weekly budget. Clock
+values use offsets from one origin per history. The model checks synchronous
+policy; actual storage waits and action-channel ownership need simulator tests.

@@ -2109,6 +2109,48 @@ class ReleaseStateAlertTests(unittest.TestCase):
                 self.assertEqual(len(self.posted), 1)
                 self.assertIn(f"release state* {condition}", self.posted[0])
 
+    def test_active_bundle_alert_survives_transient_errors_until_recovery(self):
+        """Transient reads cannot erase an alert or duplicate it when the bad bundle returns."""
+        cases = [
+            ([self.pointer, {}], "unreadable"),
+            ([self.pointer, {"files": {}}], "incomplete"),
+            ([{**self.pointer, "generated_at": "2000-01-01T00:00:00Z"}, {"files": ALL_FILES}], "stale"),
+        ]
+        for invalid, condition in cases:
+            with self.subTest(condition=condition):
+                self.state = {"version": watchdog.STATE_VERSION}
+                self.posted.clear()
+                self.poll(0, invalid)
+                self.assertEqual(len(self.posted), 1)
+                for elapsed, responses in (
+                    (60, TimeoutError()),
+                    (120, invalid),
+                    (180, [self.pointer, self.http_error(503)]),
+                    (360, TimeoutError()),
+                ):
+                    self.poll(elapsed, responses)
+                    self.assertEqual(len(self.posted), 1)
+                    entry = self.state["release_state"]["mainnet"]
+                    self.assertTrue(entry["alerting"])
+                    self.assertEqual(entry["condition"], condition)
+
+                # Persist the incident as the main loop does, then restart the lane.
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "state.json"
+                    watchdog.save_state(path, self.state)
+                    self.state = watchdog.load_state(path)
+                self.lane = watchdog.Watchdog([], make_args())
+                self.lane.notify = lambda text, args: (self.posted.append(text), True)[1]
+                with patch.object(self.lane, "notify", return_value=False):
+                    self.poll(420, self.healthy)
+                self.assertTrue(self.state["release_state"]["mainnet"]["alerting"])
+                self.poll(480, self.healthy)
+                self.assertEqual(len(self.posted), 2)
+                self.assertIn(f"recovered from {condition}", self.posted[1])
+                self.assertFalse(self.state["release_state"]["mainnet"]["alerting"])
+                self.poll(540, self.healthy)
+                self.assertEqual(len(self.posted), 2)
+
 
 class ReleaseStateConfigTests(unittest.TestCase):
     def load(self, body):

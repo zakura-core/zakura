@@ -1760,6 +1760,11 @@ class Watchdog:
                     and isinstance(error.reason, TimeoutError)
                 )
             ):
+                # A transient fetch failure cannot clear the last notified incident.
+                # Keep it until a readable bundle can establish its next condition.
+                if entry.get("alerting"):
+                    entry["last_seen"] = now
+                    return
                 threshold = RELEASE_STATE_TRANSIENT_GRACE_SECONDS
 
         previous_bad_since = coerce_float(entry.get("bad_since"))

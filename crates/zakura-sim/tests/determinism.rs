@@ -108,6 +108,10 @@ fn fingerprint() -> String {
         .collect()
 }
 
+/// Marks the fingerprint in the child's output. libtest may print its own
+/// `test ... ` prefix on the same line, as it does with one test thread.
+const MARKER: &str = "zakura-sim-fingerprint=";
+
 /// Prints the fingerprint when run as the child, and does nothing otherwise.
 #[test]
 fn fresh_process_child() {
@@ -117,23 +121,44 @@ fn fresh_process_child() {
             reason = "the parent test reads the child's stdout"
         )]
         {
-            println!("fingerprint {}", fingerprint());
+            println!("\n{MARKER}{}", fingerprint());
         }
     }
 }
 
-#[test]
-fn same_records_in_a_fresh_process() {
-    let output = Command::new(std::env::current_exe().unwrap())
+/// The fingerprint a fresh run of this test binary prints, with
+/// `RUST_TEST_THREADS` set to `threads`, or unset.
+fn child_fingerprint(threads: Option<&str>) -> String {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
         .args(["--exact", "fresh_process_child", "--nocapture"])
-        .env(CHILD, "1")
-        .output()
-        .expect("the test binary reruns itself");
+        .env(CHILD, "1");
+    match threads {
+        Some(threads) => child.env("RUST_TEST_THREADS", threads),
+        None => child.env_remove("RUST_TEST_THREADS"),
+    };
+    let output = child.output().expect("the test binary reruns itself");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let child = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("fingerprint "))
-        .unwrap_or_else(|| panic!("the child printed no fingerprint: {stdout}"));
-    assert_eq!(child, fingerprint());
+    let at = stdout
+        .find(MARKER)
+        .unwrap_or_else(|| panic!("the child printed no fingerprint: {stdout}"))
+        + MARKER.len();
+    stdout[at..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect()
+}
+
+#[test]
+fn same_records_in_a_fresh_process() {
+    let expected = fingerprint();
+    assert_eq!(expected.len(), 64);
+    for threads in [None, Some("1"), Some("4")] {
+        assert_eq!(
+            child_fingerprint(threads),
+            expected,
+            "RUST_TEST_THREADS={threads:?}"
+        );
+    }
 }

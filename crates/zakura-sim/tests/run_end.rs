@@ -180,3 +180,117 @@ fn livelock_limit_violates() {
     assert_eq!(violation.property, NO_LIVELOCK);
     assert_eq!(violation.step, 51);
 }
+
+#[test]
+fn drain_that_finishes_on_its_bound_is_not_exhausted() {
+    let config = RunConfig {
+        drain_bound: 1,
+        ..config(2, 0)
+    };
+    let report = run(
+        config,
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("done", async {});
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Budget);
+    let drain = report.end.drain.unwrap();
+    assert_eq!(drain.steps, 1);
+    assert!(!drain.exhausted, "no task was ready when the drain stopped");
+}
+
+/// A config that enforces the livelock limit at 50 steps per instant.
+fn livelock_config() -> RunConfig {
+    RunConfig {
+        max_steps_per_instant: 50,
+        enforce_no_livelock: true,
+        ..config(2, 1_000)
+    }
+}
+
+#[test]
+fn livelock_counts_a_source_acting_while_tasks_wait() {
+    let report = run(
+        livelock_config(),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.add_source(Box::new(Always(Rc::default())));
+            sim.scheduler()
+                .spawn_root("waiter", std::future::pending::<()>());
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    assert_eq!(report.end.violation.unwrap().property, NO_LIVELOCK);
+}
+
+#[test]
+fn livelock_counts_advances_that_leave_the_clock_still() {
+    let report = run(
+        livelock_config(),
+        Plan::from_fuzz(&[]),
+        |sim| {
+            sim.scheduler().spawn_root("clamped", async {
+                use std::future::Future;
+                loop {
+                    let mut timer =
+                        std::pin::pin!(zakura_rt::time::sleep(std::time::Duration::from_secs(1)));
+                    std::future::poll_fn(|cx| {
+                        let _ = timer.as_mut().poll(cx);
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    // Behind the clock, so only an advance to now fires it.
+                    let past = zakura_rt::time::Instant::now() - std::time::Duration::from_secs(1);
+                    timer.as_mut().reset(past);
+                    let mut woken = false;
+                    std::future::poll_fn(|_| {
+                        if woken {
+                            std::task::Poll::Ready(())
+                        } else {
+                            woken = true;
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            });
+        },
+        &mut NoChecks,
+    );
+    let advances = picks(&report)
+        .iter()
+        .filter(|p| p.starts_with("advance-time:"))
+        .count();
+    assert!(
+        advances > 1,
+        "the clock stayed at 0 across {advances} advances"
+    );
+    assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+    assert_eq!(report.end.violation.unwrap().property, NO_LIVELOCK);
+}
+
+#[test]
+fn harness_text_in_records_has_no_debug_output() {
+    let script = zakura_sim::PlanInput::Script(Plan {
+        choices: vec![zakura_sim::PlanChoice::Draw(zakura_sim::HexU64(42))],
+    });
+    let (_, lines) = support::recorded(
+        config(2, 100),
+        script,
+        |sim| {
+            sim.scheduler().spawn_root("a", async {});
+            sim.scheduler().spawn_root("b", async {});
+        },
+        &mut NoChecks,
+    );
+    let Ok(zakura_sim::Record::End(end)) = serde_json::from_str(lines.last().unwrap()) else {
+        panic!("the last record is end");
+    };
+    assert_eq!(
+        end.harness.as_deref(),
+        Some("the run asked for a pick, but the script has draw 0x2a")
+    );
+}

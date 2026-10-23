@@ -36,7 +36,8 @@ pub struct RunConfig {
     /// The most steps the drain takes.
     pub drain_bound: u64,
     /// The most steps at one instant before a run counts as a livelock. The
-    /// count resets when time advances and when no task is ready.
+    /// count resets only when the clock moves forward. A run with nothing
+    /// enabled ends, so it can't sit at one instant idle.
     pub max_steps_per_instant: u64,
     /// Whether passing `max_steps_per_instant` violates [`NO_LIVELOCK`].
     pub enforce_no_livelock: bool,
@@ -174,7 +175,8 @@ impl Sim {
                 phase = Phase::Drain;
             }
             if phase == Phase::Drain && drained >= self.config.drain_bound {
-                return st.end_budget(drained, true);
+                // Exhausted only if the bound cut off work still waiting.
+                return st.end_budget(drained, !ready.is_empty());
             }
             let now = self.sched.now();
             let offers: Vec<Offer> = match phase {
@@ -263,7 +265,9 @@ impl Sim {
                 Ok(ready) => ready,
                 Err(failure) => return st.end_harness(failure),
             };
-            if matches!(chosen.action, Action::AdvanceTime(_)) || ready.is_empty() {
+            // Only a clock that moved ends the instant. An advance to now, or
+            // a step where tasks wait while a source acts, doesn't.
+            if self.sched.now() > now {
                 at_instant = 0;
             } else {
                 at_instant += 1;
@@ -285,7 +289,7 @@ impl Sim {
                     step: st.step,
                     witness: vec![st.step],
                     expected: format!(
-                        "at most {} steps without advancing time or going idle",
+                        "at most {} steps before the clock moves",
                         self.config.max_steps_per_instant
                     ),
                     actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),

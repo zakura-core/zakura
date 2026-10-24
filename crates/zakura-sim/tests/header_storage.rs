@@ -8,8 +8,10 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use support::{config, inputs, run};
-use zakura_header_chain::{EngineSnapshot, Frontier};
-use zakura_node_services::header_chain::{Port, SelectedChainMembership};
+use zakura_header_chain::{EngineSnapshot, ErrorCategory, Frontier};
+use zakura_node_services::header_chain::{
+    ApplyHeaderTargetOutcome, ApplyHeaderTargetReply, Port, SelectedChainMembership,
+};
 use zakura_sim::{observe::Exit, NoChecks, Observation, PlanInput, RunReport};
 use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
 
@@ -118,8 +120,9 @@ fn shared_port_commits_the_same_chain_under_every_plan() {
         for (snapshot, membership) in &seen {
             assert!(snapshot.state_version <= last.state_version);
             match membership {
+                // Membership answers for the exact tip the watch showed.
                 SelectedChainMembership::Selected(frontier) => {
-                    assert!(frontier.height <= last.frontiers.header_best.height);
+                    assert_eq!(*frontier, snapshot.frontiers.header_best);
                 }
                 // A later commit can reorganize past a tip the publisher saw.
                 SelectedChainMembership::NotSelected => {
@@ -243,22 +246,31 @@ fn ready<F: std::future::Future>(future: F) -> F::Output {
 /// Two applies race while a reader follows the watch and membership. Apply
 /// A only adds body-size hints to the committed H1..H2, which moves the
 /// state version but not the header generation. Apply B, prepared on that
-/// same generation, extends to H3. Under every plan, the watch must end at
-/// the engine's final snapshot, and a header the reader finds selected must
-/// never be above the watch's tip. Both hold only if install and
-/// publication form one step.
+/// same generation, extends to H3.
+///
+/// Under every plan, B applies, and A either applies or, if B committed
+/// first, fails as stale. The engine ends at H3, the watch ends at the
+/// engine's final snapshot, and a header the reader finds selected is never
+/// above the watch's tip. Both watch checks hold only if install and
+/// publication form one step. Some plan must commit both, so the race is
+/// actually exercised.
 #[test]
 fn concurrent_applies_publish_in_commit_order() {
+    type Outcome = Arc<Mutex<Option<ApplyHeaderTargetReply>>>;
+    let mut both_committed = 0;
     for plan in inputs(64, 64) {
         let fixture = HeaderFixture::regtest();
         let port = Arc::new(EnginePort::new(&fixture));
         let anchor = fixture.anchor();
         let main = fixture.extend(anchor, 3, 0);
         let h2 = Frontier::new(zakura_chain::block::Height(2), main[1].hash());
+        let h3 = Frontier::new(zakura_chain::block::Height(3), main[2].hash());
         let request = fixture.target_request(&port.snapshot(), anchor, &main[..2], 1);
         let prepared = ready(port.prepare_header_target(request)).expect("H1..H2 prepare");
         ready(port.apply_header_target(prepared)).expect("H1..H2 apply");
+        let hints_version = port.snapshot().state_version;
         let violations = Arc::new(Mutex::new(Vec::new()));
+        let (a_outcome, b_outcome): (Outcome, Outcome) = Default::default();
         let mut config = config(2, 4_000);
         config.scheduler.stack_size = zakura_scheduler::SchedulerConfig::default().stack_size;
         let report = run(
@@ -266,18 +278,19 @@ fn concurrent_applies_publish_in_commit_order() {
             plan,
             |sim| {
                 let (a_port, a_fixture, a_headers) = (port.clone(), fixture.clone(), main.clone());
+                let a_outcome = a_outcome.clone();
                 sim.scheduler().spawn_root("apply-hints", async move {
                     let target =
                         prepare(&a_fixture, &a_port, anchor, &a_headers[..2], 2, 1_000).await;
-                    // A loses to B's new tip if B commits first.
-                    let _ = a_port.apply_header_target(target).await;
+                    let reply = a_port.apply_header_target(target).await;
+                    *a_outcome.lock().unwrap() = Some(reply);
                 });
                 let (b_port, b_fixture, b_headers) = (port.clone(), fixture.clone(), main.clone());
+                let b_outcome = b_outcome.clone();
                 sim.scheduler().spawn_root("apply-h3", async move {
                     let target = prepare(&b_fixture, &b_port, h2, &b_headers[2..], 3, 0).await;
-                    // Either apply may fail as stale. Only what gets
-                    // published matters.
-                    let _ = b_port.apply_header_target(target).await;
+                    let reply = b_port.apply_header_target(target).await;
+                    *b_outcome.lock().unwrap() = Some(reply);
                 });
                 let (r_port, violations) = (port.clone(), violations.clone());
                 let hashes: Vec<_> = main.iter().map(|header| header.hash()).collect();
@@ -307,7 +320,35 @@ fn concurrent_applies_publish_in_commit_order() {
             },
             &mut NoChecks,
         );
+        let panicked = report.log.entries().iter().any(|e| {
+            matches!(
+                e.obs,
+                Observation::TaskExited {
+                    exit: Exit::Panicked,
+                    ..
+                }
+            )
+        });
+        assert!(!panicked, "a task panicked: {:?}", report.end);
         assert_eq!(report.cleanup.panicked, 0, "{:?}", report.end);
+        let b = b_outcome.lock().unwrap().take().expect("apply B finished");
+        assert_eq!(
+            b.expect("apply B commits"),
+            ApplyHeaderTargetOutcome::Applied
+        );
+        match a_outcome.lock().unwrap().take().expect("apply A finished") {
+            Ok(outcome) => {
+                assert_eq!(outcome, ApplyHeaderTargetOutcome::Applied);
+                // Two commits after H1..H2: the hints and H3.
+                assert_eq!(port.snapshot().state_version.get(), hints_version.get() + 2);
+                both_committed += 1;
+            }
+            Err(error) => {
+                assert_eq!(error.category, ErrorCategory::StaleTargetOrGeneration);
+                assert_eq!(port.snapshot().state_version.get(), hints_version.get() + 1);
+            }
+        }
+        assert_eq!(port.snapshot().frontiers.header_best, h3);
         assert_eq!(
             port.selected_chain().borrow().as_ref(),
             Some(&port.snapshot()),
@@ -319,4 +360,5 @@ fn concurrent_applies_publish_in_commit_order() {
             violations.lock().unwrap()
         );
     }
+    assert!(both_committed > 0, "no plan committed both applies");
 }

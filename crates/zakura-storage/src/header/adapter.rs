@@ -54,6 +54,9 @@ pub struct EnginePort {
     config: EngineConfig,
     engine: Mutex<HeaderChainEngine>,
     leases: Mutex<Registry>,
+    /// The committed snapshot. Apply sends on it while it holds the
+    /// engine lock, so no consumer may hold a borrow of this watch while it
+    /// takes the engine lock, or the two would deadlock.
     selected: watch::Sender<Option<EngineSnapshot>>,
 }
 

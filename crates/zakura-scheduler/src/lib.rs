@@ -331,6 +331,9 @@ pub struct SchedulerConfig {
     pub max_tasks: u32,
     /// Stack size for each task, in bytes. Untouched pages cost no memory.
     pub stack_size: usize,
+    /// UTC at virtual time zero, which `zakura_rt::time::utc_now` reads
+    /// from. `None` keeps `zakura-rt`'s default origin.
+    pub utc_origin: Option<std::time::SystemTime>,
 }
 
 impl Default for SchedulerConfig {
@@ -341,6 +344,7 @@ impl Default for SchedulerConfig {
             // Tokio's default worker stack, so any poll that fits on a
             // production worker fits here.
             stack_size: 2 * 1024 * 1024,
+            utc_origin: None,
         }
     }
 }
@@ -357,8 +361,13 @@ pub struct CleanupReport {
     /// Tasks still parked after the drain, such as a lock cycle, whose
     /// coroutines were force-unwound.
     pub unwound: usize,
-    /// Forced unwinds that a task's own code caught and didn't rethrow. The
-    /// stack of such a task is leaked rather than reused.
+    /// Tasks leaked when a task got stuck at the cleanup point limit and
+    /// shutdown abandoned the run: every task still live, plus any spawn
+    /// still queued. None of their code ran. Nonzero exactly when the run
+    /// was abandoned.
+    pub leaked: usize,
+    /// Forced unwinds that a task's own code caught before it suspended
+    /// again. Such a task stays live, and shutdown runs it on like any other.
     pub unwind_failures: usize,
     /// Timers still registered at shutdown.
     pub timers_left: usize,
@@ -367,8 +376,8 @@ pub struct CleanupReport {
 /// This thread's coroutine stacks, as [`stack_pool`] reports them.
 ///
 /// Every stack the thread allocated is idle in the pool, in use by a run,
-/// freed by the pool, or leaked by an unwind failure (see
-/// [`CleanupReport::unwind_failures`]). So between runs,
+/// freed by the pool, or leaked by an abandoned run (see
+/// [`CleanupReport::leaked`]) or a shutdown that panicked. So between runs,
 /// `allocated - freed - idle` counts leaked stacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackPool {

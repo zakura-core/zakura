@@ -1506,3 +1506,123 @@ fn consecutive_runs_reset_rt_per_run_state() {
     assert_eq!(sim::suppressed_points(), 0, "a new run starts from zero");
     drop(s);
 }
+
+/// `SchedulerConfig::utc_origin` sets the run's UTC at virtual time zero,
+/// and UTC then moves with virtual time. Unset, the run uses `zakura-rt`'s
+/// default origin.
+#[test]
+fn rt_utc_now_starts_at_the_configured_origin() {
+    let read = |utc_origin, start| {
+        let config = SchedulerConfig {
+            utc_origin,
+            ..SchedulerConfig::default()
+        };
+        let mut s = Scheduler::new(config, start);
+        let seen = shared(Cell::new(None));
+        let out = seen.clone();
+        let root = s.spawn_root("root", async move {
+            let first = time::utc_now();
+            time::sleep(Duration::from_secs(5)).await;
+            out.set(Some((first, time::utc_now())));
+        });
+        while !root.is_finished() {
+            if s.ready().is_empty() {
+                let next = s.next_deadline().expect("the root task waits on its timer");
+                s.advance_to(next);
+            } else {
+                s.run(root.task());
+            }
+        }
+        seen.get().expect("the root task finished")
+    };
+    let origin = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let five = Duration::from_secs(5);
+    assert_eq!(
+        read(Some(origin), SimInstant::ZERO),
+        (origin, origin + five)
+    );
+    let start = SimInstant::from_start(Duration::from_secs(60));
+    assert_eq!(
+        read(Some(origin), start),
+        (
+            origin + Duration::from_secs(60),
+            origin + Duration::from_secs(65)
+        )
+    );
+    let default = std::time::UNIX_EPOCH + sim::DEFAULT_UTC_ORIGIN_SINCE_EPOCH;
+    assert_eq!(read(None, SimInstant::ZERO), (default, default + five));
+}
+
+/// The latest whole second `SystemTime` can hold on this platform.
+fn latest_system_time() -> std::time::SystemTime {
+    let (mut low, mut high) = (0u64, u64::MAX);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        match std::time::UNIX_EPOCH.checked_add(Duration::from_secs(mid)) {
+            Some(_) => low = mid,
+            None => high = mid - 1,
+        }
+    }
+    std::time::UNIX_EPOCH + Duration::from_secs(low)
+}
+
+/// Runs `f` and returns its panic message, or `None` if it didn't panic.
+fn panic_message(f: impl FnOnce()) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+}
+
+/// Moving virtual time past what `SystemTime` can hold above the UTC origin
+/// panics in the harness, at `advance_to`, rather than in the task that
+/// next reads `utc_now`. Up to that point the run is fine.
+#[test]
+fn rt_advancing_past_the_utc_range_panics_in_the_harness() {
+    let config = SchedulerConfig {
+        utc_origin: Some(latest_system_time() - Duration::from_secs(1)),
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    let read = shared(Cell::new(false));
+    let out = read.clone();
+    let root = s.spawn_root("root", async move {
+        time::sleep(Duration::from_secs(2)).await;
+        time::utc_now();
+        out.set(true);
+    });
+    s.run(root.task());
+    s.advance_to(SimInstant::from_start(Duration::from_secs(1)));
+    let message = panic_message(|| {
+        s.advance_to(SimInstant::from_start(Duration::from_secs(2)));
+    });
+    assert!(
+        message.as_deref().is_some_and(|m| m.contains("utc_origin")),
+        "{message:?}"
+    );
+    assert!(
+        !read.get(),
+        "the task never read an unrepresentable UTC time"
+    );
+}
+
+/// A start instant past what `SystemTime` can hold above the UTC origin
+/// panics in `Scheduler::new`.
+#[test]
+fn rt_a_start_past_the_utc_range_panics_at_construction() {
+    let config = SchedulerConfig {
+        utc_origin: Some(latest_system_time()),
+        ..SchedulerConfig::default()
+    };
+    let message = panic_message(|| {
+        drop(Scheduler::new(
+            config,
+            SimInstant::from_start(Duration::from_secs(2)),
+        ));
+    });
+    assert!(
+        message.as_deref().is_some_and(|m| m.contains("utc_origin")),
+        "{message:?}"
+    );
+}

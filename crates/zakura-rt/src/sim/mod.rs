@@ -96,7 +96,22 @@ pub trait Executor {
     /// A random choice for `site`, taken from the run's `Plan`. Returns a
     /// value below `bound`, or any `u64` when `bound` is 0.
     fn draw(&self, site: DrawSite, bound: u64) -> u64;
+
+    /// UTC at virtual time zero. [`crate::time::utc_now`] adds virtual time
+    /// to it. The default, [`DEFAULT_UTC_ORIGIN_SINCE_EPOCH`] after the Unix
+    /// epoch, keeps a run that sets no origin deterministic.
+    ///
+    /// The executor must keep the origin plus [`Executor::now`] within what
+    /// `SystemTime` can hold, refusing to move time past it, so a task's
+    /// `utc_now` never overflows.
+    fn utc_origin(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + DEFAULT_UTC_ORIGIN_SINCE_EPOCH
+    }
 }
+
+/// [`Executor::utc_origin`]'s default, as time since the Unix epoch:
+/// 2026-01-01T00:00:00Z.
+pub const DEFAULT_UTC_ORIGIN_SINCE_EPOCH: Duration = Duration::from_secs(1_767_225_600);
 
 /// The run installed on a thread.
 #[derive(Clone, Copy)]

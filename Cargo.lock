@@ -2485,18 +2485,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
 ]
 
 [[package]]
@@ -2514,7 +2502,6 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -2574,12 +2561,6 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -2871,9 +2852,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
- "log",
  "metrics",
  "pin-project",
  "proptest",
@@ -2962,13 +2941,12 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "bech32",
  "bitflags",
  "bitvec",
  "blake2b_simd",
- "blake2s_simd",
  "bounded-vec",
  "bs58",
  "byteorder",
@@ -2982,7 +2960,6 @@ dependencies = [
  "hex",
  "incrementalmerkletree",
  "itertools 0.14.0",
- "lazy_static",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3021,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3033,9 +3010,7 @@ dependencies = [
  "futures-util",
  "getset",
  "hex",
- "lazy_static",
  "metrics",
- "once_cell",
  "pin-project",
  "proptest",
  "proptest-derive",
@@ -3122,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3200,7 +3175,6 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.14.0",
- "lazy_static",
  "metrics",
  "pin-project",
  "proptest",
@@ -3231,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3384,6 +3358,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zakura-rt",
+ "zakura-scheduler",
  "zeroize",
 ]
 
@@ -3426,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.0"
+version = "13.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3444,7 +3420,6 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
  "metrics",
  "proptest",
@@ -3536,10 +3511,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "hex",
- "lazy_static",
  "ripemd",
  "secp256k1",
  "sha2",
@@ -3548,6 +3522,26 @@ dependencies = [
  "zakura-primitives",
  "zakura-test",
  "zcash_script",
+]
+
+[[package]]
+name = "zakura-sim"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio-stream",
+ "zakura-chain",
+ "zakura-network",
+ "zakura-node-services",
+ "zakura-quic",
+ "zakura-rt",
+ "zakura-scheduler",
 ]
 
 [[package]]
@@ -3564,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3577,7 +3571,6 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "metrics",
- "once_cell",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3605,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "eyre",
  "futures",
@@ -3613,8 +3606,6 @@ dependencies = [
  "indexmap",
  "insta",
  "itertools 0.14.0",
- "lazy_static",
- "once_cell",
  "proptest",
  "rand 0.10.2",
  "regex",
@@ -3648,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "clap",
  "eyre",

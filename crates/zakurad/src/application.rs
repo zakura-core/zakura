@@ -7,7 +7,7 @@ use std::{
     env,
     fmt::Write as _,
     process,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use clap::Parser;
@@ -23,10 +23,10 @@ use crate::{
     config::ZakuradConfig,
 };
 
-lazy_static::lazy_static! {
-    /// The last log event that occurred in the application.
-    pub static ref LAST_WARN_ERROR_LOG_SENDER: watch::Sender<Option<(String, tracing::Level, chrono::DateTime<chrono::Utc>)>> = watch::Sender::new(None);
-}
+/// The last log event that occurred in the application.
+pub static LAST_WARN_ERROR_LOG_SENDER: LazyLock<
+    watch::Sender<Option<(String, tracing::Level, chrono::DateTime<chrono::Utc>)>>,
+> = LazyLock::new(|| watch::Sender::new(None));
 
 /// Returns the `zakurad` version for this build, in SemVer 2.0 format.
 ///

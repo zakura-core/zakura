@@ -16,17 +16,14 @@
 //!
 //! Nothing shares a `quinn-proto` object, so no lock guards one.
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, StreamId, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::sync::{
+    atomic::{AtomicUsize, Ordering},
+    counter, mpsc, oneshot, watch,
+};
 
 use crate::{
     error::{ReadError, WriteError},
@@ -129,20 +126,22 @@ pub(crate) struct ConnShared {
     /// Datagram bytes the endpoint queued that the task hasn't handled yet.
     pub(crate) queued_datagram_bytes: AtomicUsize,
     /// Datagrams the endpoint dropped because the queue was full.
-    pub(crate) queue_drops: AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
     /// The queued datagram bytes of every connection on this socket.
     pub(crate) socket_queued_bytes: Arc<AtomicUsize>,
 }
 
 impl ConnShared {
     fn new(remote: SocketAddr, socket_queued_bytes: Arc<AtomicUsize>) -> Arc<Self> {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        // A trace ID, so a metrics atomic. It's process-wide, so two runs in
+        // one process number their connections differently.
+        static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
-            queue_drops: AtomicU64::new(0),
+            queue_drops: counter::AtomicU64::new(0),
             socket_queued_bytes,
         })
     }

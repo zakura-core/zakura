@@ -4,13 +4,11 @@
 //! bytes. The driver installs this wrapper around the configured controller
 //! for each connection, so the connection task can read them without a fork.
 
-use std::{
-    any::Any,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::Instant,
+use std::{any::Any, sync::Arc, time::Instant};
+
+use zakura_rt::sync::{
+    atomic::AtomicBool,
+    counter::{AtomicU64, Ordering},
 };
 
 use quinn_proto::{

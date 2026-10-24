@@ -15,7 +15,7 @@ use crate::{
     trace::{
         meta::{hex, InputRef},
         read::refuse_symlinked_dir,
-        FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES,
+        FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, TRACE_FILE,
     },
     Plan,
 };
@@ -77,7 +77,9 @@ impl std::error::Error for RecordError {}
 /// already hold one. Returns the trace as the reader reads it back.
 ///
 /// `out` gets the reader's directory check before anything is written, so a
-/// symlinked `out` is refused with nothing written through it.
+/// symlinked `out` is refused with nothing written through it. So is an `out`
+/// that already holds a `trace.jsonl`, which keeps an old trace's files as its
+/// meta names them.
 ///
 /// For a full input, the first [`HarnessEntry::scenario_bytes`] bytes
 /// decode the scenario. An input shorter than that reads the missing
@@ -102,6 +104,12 @@ pub fn record(
     };
     let mut meta = (harness.meta)(&scenario).map_err(RecordError::Harness)?;
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
+    if fs::symlink_metadata(out.join(TRACE_FILE)).is_ok() {
+        return Err(RecordError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "out already holds a trace",
+        )));
+    }
     if let Some(input) = input {
         // A usize always fits in a u64 on supported targets.
         let len = input.len() as u64;

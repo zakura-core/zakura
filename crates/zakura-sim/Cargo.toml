@@ -35,6 +35,9 @@ zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-quic = { path = "../zakura-quic" }
+# For the engine-backed header storage scenario.
+zakura-header-chain = { path = "../zakura-header-chain" }
+zakura-storage = { path = "../zakura-storage" }
 
 # build.rs hashes the source for trace `meta` records.
 [build-dependencies]

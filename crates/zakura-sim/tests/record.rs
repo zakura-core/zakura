@@ -169,6 +169,23 @@ fn record_refuses_to_overwrite() {
     assert_eq!(std::fs::read(dir.path().join(INPUT_FILE)).unwrap(), BYTES);
 }
 
+/// An input recorded into a directory that holds a Plan trace is refused
+/// before `input.bin` is written, so the old trace gains no file its meta
+/// doesn't name.
+#[test]
+fn record_into_a_plan_trace_writes_no_input() {
+    let scenario = serde_json::json!({ "tasks": 2 });
+    let dir = TempDir::new().unwrap();
+    let plan = RecordInput::Plan {
+        scenario: &scenario,
+        plan: &BYTES[1..],
+    };
+    record(&YIELDERS, plan, dir.path()).unwrap();
+    let again = record(&YIELDERS, RecordInput::Input(BYTES), dir.path());
+    assert!(matches!(again, Err(RecordError::Io(_))));
+    assert!(!dir.path().join(INPUT_FILE).exists());
+}
+
 #[test]
 fn a_short_input_reads_missing_scenario_bytes_as_zero() {
     let dir = TempDir::new().unwrap();

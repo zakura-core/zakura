@@ -631,10 +631,13 @@ impl EnginePort {
         engine
             .install_committed_transition(transition)
             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
-        drop(engine);
         // Published after the install, so a receiver never sees an
-        // uncommitted snapshot.
+        // uncommitted snapshot, and still under the engine lock, as
+        // production publishes under its writer lock. Dropping the lock first
+        // would let a later commit publish before this one, leaving the watch
+        // behind the engine for good.
         self.selected.send_replace(Some(after));
+        drop(engine);
         Ok(match stalled {
             Some(receipt) => ApplyHeaderTargetOutcome::ResourceStalled(receipt),
             None => ApplyHeaderTargetOutcome::Applied,

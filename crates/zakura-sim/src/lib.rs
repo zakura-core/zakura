@@ -15,6 +15,7 @@ pub mod check;
 mod draws;
 pub mod end;
 pub mod fake;
+pub mod harness;
 pub mod identity;
 pub mod observe;
 pub mod plan;

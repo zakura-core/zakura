@@ -175,7 +175,8 @@ fn answer_unretained(
     reactor.schedule_cached_statuses();
 }
 
-/// Completes `peer`'s locator read through the port-completion path and ends the event.
+/// Completes `peer`'s locator read as the external driver reports it, then
+/// refreshes the committed snapshot and ends the event as a port completion does.
 fn complete_locator(
     reactor: &mut HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
@@ -184,13 +185,11 @@ fn complete_locator(
     target: block::Hash,
     available: bool,
 ) {
-    let peer = peer.clone();
     let locator = available.then(|| {
         zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.header_best)
     });
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.handle_header_locator_ready(peer, 0, target, scope, locator);
-    })));
+    reactor.handle_header_locator_ready(peer.clone(), 0, target, scope, locator);
+    reactor.refresh_committed_snapshot();
     reactor.schedule_cached_statuses();
 }
 
@@ -427,9 +426,9 @@ fn completion_release_stages_a_cached_alternate() {
     reactor.handle_status(alternate.clone(), 0, status);
     assert!(actions.try_recv().is_err());
 
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.retire_peer_work(&owner, HeaderRequestTerminal::LocalError);
-    })));
+    // A completion retires the owner's work, then refreshes the committed snapshot.
+    reactor.retire_peer_work(&owner, HeaderRequestTerminal::LocalError);
+    reactor.refresh_committed_snapshot();
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &alternate, target);
 }
@@ -604,7 +603,7 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
         actions.try_recv().is_err(),
         "two pending one-header reads use all remaining headroom"
     );
-    assert!(!reactor.peer_state[&third].status_spent);
+    assert!(!reactor.state.peers[&third].status_spent);
 }
 
 #[test]
@@ -632,7 +631,7 @@ fn locator_losing_headroom_keeps_offer_for_body_progress() {
     complete_locator(&mut reactor, &snapshot, &waiting, scope, target, true);
     assert!(outbound.try_recv().is_err());
     assert_quiescent(&mut reactor, &mut actions);
-    assert!(!reactor.peer_state[&waiting].status_spent);
+    assert!(!reactor.state.peers[&waiting].status_spent);
 
     // Only verified bodies advance: neither header authority nor the peer status changes.
     snapshot.state_version = snapshot.state_version.checked_next().unwrap();
@@ -679,7 +678,7 @@ fn in_flight_locator_waits_for_committed_resource_stall_to_clear() {
     );
     assert_eq!(reactor.peer_work_queue.reserved_header_count(&waiting), 0);
     assert_quiescent(&mut reactor, &mut actions);
-    assert!(!reactor.peer_state[&waiting].status_spent);
+    assert!(!reactor.state.peers[&waiting].status_spent);
     let mut newer = snapshot;
     newer.state_version = newer.state_version.checked_next().unwrap();
     reactor.observe_latest_committed_snapshot(newer.clone());
@@ -763,7 +762,7 @@ fn assert_failed_repair_preserves_offer(full_budget: bool) {
     ready_repair(&mut reactor, &mut actions, &snapshot);
     assert!(reactor.peer_work_queue.active(&supplier).is_none());
     assert!(
-        !reactor.peer_state[&supplier].status_spent,
+        !reactor.state.peers[&supplier].status_spent,
         "failed repair must preserve the ordinary offer (full_budget={full_budget})"
     );
     if full_budget {
@@ -802,12 +801,12 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
     ));
     let repair = update(outbound.try_recv().expect("repair Open sent"));
     assert!(
-        !reactor.peer_state[&supplier].status_spent,
+        !reactor.state.peers[&supplier].status_spent,
         "the status that assigns repair still offers ordinary work"
     );
     reactor.handle_status(supplier.clone(), 0, status);
     assert!(
-        !reactor.peer_state[&supplier].status_spent,
+        !reactor.state.peers[&supplier].status_spent,
         "a fresh status during repair is not an ordinary attempt"
     );
     reactor.retire_vct_repair();
@@ -979,7 +978,7 @@ fn locator_evictions_bound_retained_operations() {
         outbounds.push(outbound);
         reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([byte; 32])));
     }
-    assert!(reactor.pending_locator_queries.len() <= MAX_STAGED_TARGETS_V1);
+    assert!(reactor.state.locators.len() <= MAX_STAGED_TARGETS_V1);
     assert!(reactor.pending_port_operations.len() <= MAX_STAGED_TARGETS_V1);
 }
 
@@ -1079,19 +1078,19 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
         0,
         status_for(&snapshot, block::Hash([17; 32])),
     );
-    assert!(!reactor.peer_state[&peer].status_spent);
+    assert!(!reactor.state.peers[&peer].status_spent);
     time::advance(reactor.startup.request_timeout).await;
     while let Some(Some(completion)) = reactor.pending_port_operations.next().now_or_never() {
         reactor.handle_port_completion(completion);
     }
-    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.state.locators.len(), 0);
     assert_eq!(reactor.locator_capacity.available_permits(), 0);
     // A cached offer can become idle without a fresh refusal arming the waiter.
     reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
     assert!(reactor.locator_capacity_waiting);
-    assert!(reactor.pending_locator_queries.is_empty());
-    assert!(!reactor.peer_state[&peer].status_spent);
+    assert_eq!(reactor.state.locators.len(), 0);
+    assert!(!reactor.state.peers[&peer].status_spent);
     // The real service finishes one orphaned read. Its last permit drop wakes
     // the reactor's capacity branch, with no timer or new wire Status needed.
     port.accepted.lock().unwrap().pop();
@@ -1104,7 +1103,7 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     drop(permit);
     reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
-    assert_eq!(reactor.pending_locator_queries.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
     assert!(reactor
         .pending_port_operations
         .next()
@@ -1147,7 +1146,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
             session_id,
             status_for(&snapshot, block::Hash([2; 32])),
         );
-        assert_eq!(reactor.pending_locator_queries.len(), 1);
+        assert_eq!(reactor.state.locators.len(), 1);
         assert_eq!(
             reactor.locator_capacity.available_permits(),
             MAX_STAGED_TARGETS_V1 - 1
@@ -1156,7 +1155,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
     reactor.handle_peer_disconnected(&peer, 32, "test final disconnect");
     let completion = reactor.pending_port_operations.next().await.unwrap();
     reactor.handle_port_completion(completion);
-    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.state.locators.len(), 0);
     assert_eq!(
         reactor.locator_capacity.available_permits(),
         MAX_STAGED_TARGETS_V1
@@ -1215,21 +1214,24 @@ async fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
                     for iteration in 0..100 {
                         // The end-of-event pass also runs on events with no scheduling effect.
                         if unconditional {
-                            reactor.last_scheduling_opportunity = None;
-                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
+                            reactor.state.last_scheduling_opportunity = None;
+                            reactor.state.cached_pass_budget =
+                                CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                         let (peer, status) = &offers[iteration % offers.len()];
                         reactor.handle_status(peer.clone(), 0, status.clone());
                         if unconditional {
-                            reactor.last_scheduling_opportunity = None;
-                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
+                            reactor.state.last_scheduling_opportunity = None;
+                            reactor.state.cached_pass_budget =
+                                CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                         reactor.handle_status(owner.clone(), 0, owner_status.clone());
                         if unconditional {
-                            reactor.last_scheduling_opportunity = None;
-                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
+                            reactor.state.last_scheduling_opportunity = None;
+                            reactor.state.cached_pass_budget =
+                                CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                     }
@@ -1342,7 +1344,7 @@ async fn assert_status_metadata_churn_is_local(no_headroom: bool, awaiting_owner
     .await;
     assert_eq!(visits, 0);
     assert_eq!(
-        reactor.peer_state[&peer].last_status.as_ref(),
+        reactor.state.peers[&peer].last_status.as_ref(),
         Some(&status)
     );
     if awaiting_owner {
@@ -1400,7 +1402,7 @@ fn pending_locator_claim_shrink_wakes_cached_offer_without_changing_target() {
         .peer_work_queue
         .awaiting_target(&alternate)
         .is_some());
-    assert_eq!(reactor.pending_locator_queries.len(), 2);
+    assert_eq!(reactor.state.locators.len(), 2);
 }
 
 #[test]
@@ -1420,7 +1422,7 @@ fn awaiting_owner_retarget_wakes_old_target_alternate() {
         .peer_work_queue
         .awaiting_target(&alternate)
         .is_some());
-    assert_eq!(reactor.pending_locator_queries.len(), 2);
+    assert_eq!(reactor.state.locators.len(), 2);
 }
 
 #[test]
@@ -1472,7 +1474,7 @@ async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
         reactor.schedule_cached_statuses();
     }
     let (attacker, _attacker_outbound) = connect(&mut reactor, 0xfe);
-    let peers = reactor.peer_state.len();
+    let peers = reactor.sessions.len();
     // Connecting and the first statuses spent part of the burst.
     time::advance(CACHED_PASS_REFILL * CACHED_PASS_BURST).await;
     let flips = [block::Hash([0x51; 32]), block::Hash([0x52; 32])];
@@ -1488,11 +1490,11 @@ async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
         u64::from(CACHED_PASS_BURST) * u64::try_from(peers).expect("the peer count fits u64"),
         "1000 retargets buy one burst of passes"
     );
-    assert!(reactor.cached_pass_deferred);
+    assert!(reactor.state.cached_pass_deferred);
 
     // The owner leaves while the budget is empty. Flushing the trace may have
     // let paused time advance, so empty the budget again at this instant.
-    reactor.cached_pass_budget = CachedPassBudget {
+    reactor.state.cached_pass_budget = CachedPassBudget {
         passes: 0,
         refilled_at: Instant::now(),
     };
@@ -1519,21 +1521,21 @@ async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
 #[tokio::test(start_paused = true)]
 async fn a_deferred_pass_drops_its_refill_deadline_when_discovery_pauses() {
     let (mut reactor, _actions, snapshot) = offers_reactor();
-    reactor.cached_pass_budget = CachedPassBudget {
+    reactor.state.cached_pass_budget = CachedPassBudget {
         passes: 0,
         refilled_at: Instant::now(),
     };
     let (peer, _outbound) = connect(&mut reactor, 1);
     reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
-    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.state.scheduling_revision = reactor.state.scheduling_revision.wrapping_add(1);
     reactor.schedule_cached_statuses();
-    assert!(reactor.cached_pass_deferred);
+    assert!(reactor.state.cached_pass_deferred);
 
     // A resource stall pauses discovery before the refill.
-    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    reactor.state.ordinary_resource_stall = Some(snapshot.state_version);
     time::advance(CACHED_PASS_REFILL * 2).await;
     reactor.schedule_cached_statuses();
-    assert!(!reactor.cached_pass_deferred);
+    assert!(!reactor.state.cached_pass_deferred);
     assert!(reactor.next_maintenance_deadline() > Instant::now());
 }
 
@@ -1552,14 +1554,14 @@ async fn a_deferred_pass_does_not_starve_the_snapshot_that_ends_a_stall() {
         build_header_sync_reactor(startup).expect("the reactor builds");
     let (peer, _outbound) = connect(&mut reactor, 1);
     reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
-    reactor.cached_pass_budget = CachedPassBudget {
+    reactor.state.cached_pass_budget = CachedPassBudget {
         passes: 0,
         refilled_at: Instant::now(),
     };
-    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.state.scheduling_revision = reactor.state.scheduling_revision.wrapping_add(1);
     reactor.schedule_cached_statuses();
-    assert!(reactor.cached_pass_deferred);
-    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    assert!(reactor.state.cached_pass_deferred);
+    reactor.state.ordinary_resource_stall = Some(snapshot.state_version);
     time::advance(CACHED_PASS_REFILL * 2).await;
 
     let task = tokio::spawn(reactor.run());
@@ -1850,7 +1852,7 @@ async fn status_flood_during_context_backoff_keeps_supplier_history() {
         panic!("context read")
     };
     reactor.handle_vct_repair_context_ready(owner, VctRepairContextResult::Unavailable);
-    let before = reactor.vct_repair.current().unwrap().state.clone();
+    let before = reactor.state.vct_repair.current().unwrap().state.clone();
     for _ in 0..602 {
         for (peer, _) in &outputs {
             reactor.handle_status(
@@ -1860,7 +1862,7 @@ async fn status_flood_during_context_backoff_keeps_supplier_history() {
             );
         }
     }
-    assert_eq!(reactor.vct_repair.current().unwrap().state, before);
+    assert_eq!(reactor.state.vct_repair.current().unwrap().state, before);
     assert!(actions.try_recv().is_err());
 }
 
@@ -1892,7 +1894,7 @@ async fn active_repair_status_flood_cost() {
             .collect();
         ready_repair(&mut reactor, &mut actions, &snapshot);
         let RepairPolicyState::Ready { context } =
-            reactor.vct_repair.current().unwrap().state.clone()
+            reactor.state.vct_repair.current().unwrap().state.clone()
         else {
             panic!("ready repair")
         };
@@ -1913,7 +1915,7 @@ async fn active_repair_status_flood_cost() {
             RepairPolicyState::Completed,
         ];
         for (phase, state) in phases.into_iter().enumerate() {
-            reactor.vct_repair.current_mut().unwrap().state = state.clone();
+            reactor.state.vct_repair.current_mut().unwrap().state = state.clone();
             let start = std::time::Instant::now();
             for _ in 0..602 {
                 for (peer, _) in &outputs {
@@ -1928,7 +1930,7 @@ async fn active_repair_status_flood_cost() {
                 "active_repair_status_flood peers={peers} phase={phase} ns_per_status={}",
                 start.elapsed().as_nanos() / (u128::from(peers) * 602)
             );
-            assert_eq!(reactor.vct_repair.current().unwrap().state, state);
+            assert_eq!(reactor.state.vct_repair.current().unwrap().state, state);
             assert!(actions.try_recv().is_err());
         }
     }

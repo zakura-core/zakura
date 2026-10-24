@@ -5,6 +5,7 @@ mod completion;
 mod eviction;
 mod peer_faults;
 mod port_panics;
+mod state_machine;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
 
-use super::*;
+use super::{state::*, *};
 use crate::zakura::{
     framed_channel,
     wire_codec::{decode_frame, encode_frame},
@@ -77,8 +78,8 @@ fn invalid_header_failure(
 /// subscriber when it holds the page's subscription, as the session reader
 /// does, or as admitted when a test seeded the work without one.
 fn admit_page(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId, page: &Headers) -> v9::Admitted {
-    if let Some(state) = reactor.peer_state.get(peer) {
-        let mut subscriber = state.session.subscriber();
+    if let Some(handles) = reactor.sessions.get(peer) {
+        let mut subscriber = handles.session.subscriber();
         if subscriber.live() == Some(page.subscription_id) {
             let frame = encode_frame(&v9::RegtestMessage::Headers(page.clone()))
                 .expect("the test page encodes");
@@ -117,8 +118,8 @@ impl HeaderSyncReactor {
     /// Deliver `outcome` from `peer`'s session `session_id` as its subscriber
     /// admits it, or as admitted when a test seeded the work without one.
     fn deliver_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, outcome: HeadersOutcome) {
-        let live = self.peer_state.get(&peer).and_then(|state| {
-            let mut subscriber = state.session.subscriber();
+        let live = self.sessions.get(&peer).and_then(|handles| {
+            let mut subscriber = handles.session.subscriber();
             (subscriber.live() == Some(outcome.subscription_id)).then(|| {
                 subscriber
                     .receive_outcome(&outcome)

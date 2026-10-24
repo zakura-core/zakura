@@ -1278,6 +1278,15 @@ impl WorkQueue {
             .copied()
     }
 
+    /// Body-work authority of a pending height.
+    #[cfg(test)]
+    pub(super) fn pending_scope(
+        &self,
+        height: block::Height,
+    ) -> Option<zakura_header_chain::BodyWorkAuthority> {
+        self.lock().pending.get(&height).map(|item| item.scope)
+    }
+
     /// Active request owner for a height, if it is currently reserved.
     pub(super) fn owner_for_height(
         &self,

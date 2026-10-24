@@ -523,6 +523,65 @@ async fn capacity_and_release_match() {
     assert_eq!(seen[0][7], "capacity-busy");
 }
 
+/// The ordinary slots and the reserve slot. With every ordinary slot taken,
+/// a path longer than one page is refused onto the ordinary signal
+/// (`beyond_reserve`), while a short path still takes the reserve slot. Each
+/// signal fires only when its own class has room.
+#[tokio::test]
+async fn reserve_slot_and_beyond_reserve_match() {
+    let fixture = HeaderFixture::regtest();
+    let mut seen = Vec::new();
+    for port in both().await {
+        let port = &*port;
+        let anchor = fixture.anchor();
+        let low = admit(
+            port,
+            anchor,
+            &fixture.extend(anchor, MAX_HEADER_SYNC_HEIGHT_RANGE, 0),
+            1,
+        )
+        .await;
+        let near = *low.last().expect("the batch has headers");
+        let tip = admit(port, near, &fixture.extend(near, 2, 0), 2).await[1].hash;
+        // A short path covers the tip's two headers above `near`. A long one
+        // starts at the anchor, one page plus two below the tip.
+        let short = |n: u8| acquire_request(port, peer(n), tip, vec![near.hash]);
+        let long = |n: u8| acquire_request(port, peer(n), tip, vec![anchor.hash]);
+        let mut events = Vec::new();
+        let mut ordinary = Vec::new();
+        for n in 1..MAX_RETAINED_PATH_LEASES {
+            let n = u8::try_from(n).expect("16 peers fit u8");
+            ordinary.push(leased(port.acquire_header_path(short(n)).await));
+        }
+        let general = refused(port, long(100)).await;
+        let reserve = leased(port.acquire_header_path(short(101)).await);
+        let fallback = refused(port, short(102)).await;
+        let signals = || format!("{} {}", general.is_released(), fallback.is_released());
+        events.push(signals());
+        // Freeing the reserve slot wakes only the fallback waiter, and the
+        // long path still can't use it.
+        port.release_header_path(reserve)
+            .await
+            .expect("a release succeeds");
+        events.push(signals());
+        events.push(acquire_shape(&port.acquire_header_path(long(100)).await));
+        // Freeing an ordinary slot wakes the ordinary waiter, and the long
+        // path takes that slot.
+        port.release_header_path(ordinary[0].clone())
+            .await
+            .expect("a release succeeds");
+        events.push(signals());
+        events.push(acquire_shape(&port.acquire_header_path(long(100)).await));
+        seen.push(events);
+    }
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(
+        seen[0][..4],
+        ["false false", "false true", "capacity-busy", "true true"]
+    );
+    assert!(seen[0][4].starts_with("acquired "), "{}", seen[0][4]);
+}
+
 /// Eviction on the idle deadline: A's lease survives a sweep one tick before
 /// it, then is swept by peer C's acquire, not by B's empty-locator acquire,
 /// and A's waiting signal fires then.

@@ -4830,10 +4830,11 @@ async fn persistent_stream_worker_with_policy(
             };
             // Any error is terminal. `Closed` is a clean peer-initiated close;
             // every other error must disconnect the peer, under the cause
-            // `read_close_cause` gives it. Forward the error first so the main loop can
-            // map it to a reset code, then cancel the connection ourselves so
-            // the disconnect is guaranteed even if the main loop tore the worker
-            // down for a stopped outbound write before processing it.
+            // `read_close_cause` gives it. Forward the error first so the main
+            // loop can map it to a reset code, then cancel the connection
+            // ourselves so the disconnect is guaranteed even if the main loop
+            // tore the worker down for a stopped outbound write before
+            // processing it.
             let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
             if !must_disconnect && !reader_context.stream_token.is_cancelled() {
                 if let Some(cause) = &reader_failure_cause {
@@ -5054,7 +5055,9 @@ async fn request_stream_worker(
                 "closing Zakura request stream with invalid request frame"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.close_cause.record(read_close_cause(ReadPath::Request, &error));
+            context
+                .close_cause
+                .record(read_close_cause(ReadPath::Request, &error));
             context.connection_token.cancel();
             return;
         }
@@ -6498,6 +6501,7 @@ mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
+    mod read_close_cause;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;
     use crate::{

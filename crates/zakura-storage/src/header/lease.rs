@@ -305,4 +305,9 @@ impl Registry {
     pub(super) fn live(&self) -> usize {
         self.by_peer.len()
     }
+
+    /// The peers with a cached continuation, in peer order.
+    pub(super) fn continued(&self) -> Vec<SourceId> {
+        self.continuations.keys().copied().collect()
+    }
 }

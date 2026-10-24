@@ -215,7 +215,7 @@ pub enum NoteCommitmentTreeError {
 /// [nullifier set]: https://zips.z.cash/protocol/protocol.pdf#nullifierset
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(into = "LegacyNoteCommitmentTree")]
-#[serde(from = "LegacyNoteCommitmentTree")]
+#[serde(try_from = "LegacyNoteCommitmentTree")]
 pub struct NoteCommitmentTree {
     /// The tree represented as a [`incrementalmerkletree::frontier::Frontier`].
     ///

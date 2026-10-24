@@ -415,15 +415,18 @@ fn reader_and_worker_record_one_cause() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Read errors reset and cancel as on `main`. This pins the current-thread
+/// ordering of the ordered path: the reader cancels the connection before the
+/// worker resumes, so the worker's biased select takes that cancellation and
+/// the peer reads the neutral reset. On a multi-thread runtime the worker can
+/// receive the error first and send its own reset code, and that first reset
+/// stands.
 #[tokio::test]
 async fn read_errors_keep_reset_codes() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     for case in Case::ORDERED {
         let outcome = run_ordered(case).await?;
-        // The reader cancels the connection right after it forwards the
-        // error, and the worker's biased select takes that cancellation
-        // first. So the peer reads the neutral reset, as on `main`. A lost
-        // connection carries no stream reset to observe.
+        // A lost connection carries no stream reset to observe.
         let expected = (case != Case::Transport).then_some(ZAKURA_CLOSE_NEUTRAL);
         assert_eq!(outcome.reset, expected, "{case:?}");
         assert!(outcome.cancelled, "{case:?}");

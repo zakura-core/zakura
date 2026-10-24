@@ -11,7 +11,11 @@ mod requester;
 mod runtime;
 mod service;
 mod serving;
+mod state;
+#[cfg(test)]
+mod state_tests;
 mod trace;
+mod verified;
 pub(crate) mod wire;
 #[cfg(test)]
 mod wire_tests;

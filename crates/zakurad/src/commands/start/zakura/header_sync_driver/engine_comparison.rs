@@ -76,10 +76,25 @@ async fn production() -> Arc<dyn Port> {
     ))
 }
 
-/// Both ports, each holding only the genesis anchor.
+/// How long `both` waits, in wall-clock time, for `production` to start.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Both ports, each holding only the genesis anchor. Fails the test if
+/// `production` doesn't start within `SETUP_TIMEOUT`. A tokio timeout can't
+/// bound it, because tests with a paused clock auto-advance past the timeout
+/// while zakura-state's writer thread commits genesis.
 async fn both() -> [Arc<dyn Port>; 2] {
+    let (expire, expired) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(SETUP_TIMEOUT);
+        let _ = expire.send(());
+    });
     [
-        production().await,
+        tokio::select! {
+            biased;
+            port = production() => port,
+            _ = expired => panic!("the production state didn't start within {SETUP_TIMEOUT:?}"),
+        },
         Arc::new(EnginePort::new(&HeaderFixture::regtest())),
     ]
 }

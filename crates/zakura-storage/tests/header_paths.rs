@@ -344,3 +344,179 @@ fn a_foreign_handle_gets_the_contract_rejection() {
     assert_eq!(ours.live_leases(), 1);
     page(read(&ours, &ours_path, main[0].hash, 1));
 }
+
+/// A port with a chain of `length` headers on the anchor, admitted in
+/// batches no longer than the transition cap. Returns the port and the
+/// headers' frontiers.
+fn long_chain(length: u32) -> (EnginePort, Vec<Frontier>) {
+    let fixture = HeaderFixture::regtest();
+    let port = EnginePort::new(&fixture);
+    let mut frontiers = Vec::new();
+    let mut parent = fixture.anchor();
+    let cap = u32::try_from(zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1)
+        .expect("the cap fits u32");
+    let mut request_id = 1;
+    while frontiers.len() < length as usize {
+        // Widening a header count to usize is lossless on supported targets.
+        let remaining = length - frontiers.len() as u32;
+        let batch = admit(
+            &fixture,
+            &port,
+            parent,
+            &fixture.extend(parent, remaining.min(cap), 0),
+            request_id,
+        );
+        parent = *batch.last().expect("a batch has headers");
+        frontiers.extend(batch);
+        request_id += 1;
+    }
+    (port, frontiers)
+}
+
+/// The reserve slot serves a path of exactly 4,000 headers and refuses
+/// 4,001 as beyond reserve. The two refusals wait on different signals:
+/// beyond reserve waits for an ordinary slot, and a full registry waits for
+/// any slot.
+#[test]
+fn the_reserve_slot_boundary_is_4000_headers() {
+    let (port, chain) = long_chain(4_001);
+    let anchor = HeaderFixture::regtest().anchor();
+    // Fill the 15 ordinary slots with short paths.
+    let ordinary: Vec<_> = (1..MAX_RETAINED_PATH_LEASES)
+        .map(|n| {
+            let n = u8::try_from(n).expect("16 peers fit u8");
+            acquired(acquire(&port, peer(n), chain[1].hash, vec![chain[0].hash]))
+        })
+        .collect();
+    let beyond = busy(acquire(
+        &port,
+        peer(100),
+        chain[4_000].hash,
+        vec![anchor.hash],
+    ));
+    let reserve = acquired(acquire(
+        &port,
+        peer(101),
+        chain[3_999].hash,
+        vec![anchor.hash],
+    ));
+    assert_eq!(
+        (reserve.common_ancestor, reserve.target),
+        (anchor, chain[3_999])
+    );
+    let full = busy(acquire(
+        &port,
+        peer(102),
+        chain[1].hash,
+        vec![chain[0].hash],
+    ));
+    assert_ne!(beyond, full, "the two refusals wait on different signals");
+
+    // Freeing the reserve slot wakes the full-registry waiter only.
+    ready(port.release_header_path(reserve)).expect("a release succeeds");
+    assert!(full.is_released());
+    assert!(!beyond.is_released());
+    // Freeing an ordinary slot wakes the beyond-reserve waiter.
+    ready(port.release_header_path(ordinary[0].clone())).expect("a release succeeds");
+    assert!(beyond.is_released());
+    acquired(acquire(
+        &port,
+        peer(100),
+        chain[4_000].hash,
+        vec![anchor.hash],
+    ));
+}
+
+/// The continuation cache: a matching acquire continues from the cached
+/// cursor, any mismatch drops it, a full cache evicts its lowest lease ID,
+/// and a late release of a consumed handle can't end its replacement.
+#[test]
+fn the_continuation_cache_matches_production() {
+    let (port, main, _) = chain();
+    let anchor = HeaderFixture::regtest().anchor();
+    let consume = |n: u8| {
+        let path = acquired(acquire(&port, peer(n), main[4].hash, vec![anchor.hash]));
+        page(read(&port, &path, anchor.hash, 1));
+        path
+    };
+
+    // Session, target and locator mismatches each drop the continuation.
+    consume(1);
+    let wrong_session = AcquirePath {
+        source: peer(1),
+        session_id: 2,
+        scope: HeaderWorkAuthority::for_target(&port.snapshot(), main[4].hash),
+        target_tip_hash: main[4].hash,
+        locator_hashes: vec![main[0].hash],
+    };
+    let fresh = acquired(ready(port.acquire_header_path(wrong_session)));
+    assert!(!port.continued_peers().contains(&peer(1)));
+    ready(port.release_header_path(fresh)).expect("a release succeeds");
+    consume(1);
+    let wrong_target = acquired(acquire(&port, peer(1), main[3].hash, vec![main[0].hash]));
+    assert!(!port.continued_peers().contains(&peer(1)));
+    ready(port.release_header_path(wrong_target)).expect("a release succeeds");
+    consume(1);
+    let wrong_locator = acquired(acquire(&port, peer(1), main[4].hash, vec![anchor.hash]));
+    assert!(!port.continued_peers().contains(&peer(1)));
+    ready(port.release_header_path(wrong_locator)).expect("a release succeeds");
+
+    // A matching acquire continues, and the late release of the consumed
+    // handle doesn't end the new lease.
+    let old = consume(1);
+    assert!(port.continued_peers().contains(&peer(1)));
+    let next = acquired(acquire(&port, peer(1), main[4].hash, vec![main[0].hash]));
+    assert_eq!(next.common_ancestor, main[0]);
+    assert!(!port.continued_peers().contains(&peer(1)));
+    ready(port.release_header_path(old)).expect("a stale release succeeds");
+    assert_eq!(
+        port.live_leases(),
+        1,
+        "the stale release left the new lease"
+    );
+    page(read(&port, &next, main[0].hash, 10));
+
+    // Seventeen continuations: the cache keeps 16 and evicts the lowest ID.
+    for n in 1..=17 {
+        consume(n);
+    }
+    let cached = port.continued_peers();
+    assert_eq!(cached.len(), MAX_RETAINED_PATH_LEASES);
+    assert!(
+        !cached.contains(&peer(1)),
+        "peer 1 held the lowest lease ID"
+    );
+    assert!(cached.contains(&peer(17)));
+}
+
+/// A read sweeps every expired lease and fires their signals, and a page
+/// that's served consumes its lease and fires the signal its peer waits on.
+#[tokio::test(start_paused = true)]
+async fn a_read_sweeps_and_a_served_page_frees_its_slot() {
+    let (port, main, _) = chain();
+    let a = acquired(acquire(&port, peer(1), main[4].hash, vec![main[0].hash]));
+    let b = acquired(acquire(&port, peer(2), main[4].hash, vec![main[0].hash]));
+    let b_waiting = busy(acquire(&port, peer(2), main[3].hash, vec![main[0].hash]));
+    tokio::time::advance(RETAINED_PATH_LEASE_IDLE - Duration::from_millis(1)).await;
+    let c = acquired(acquire(&port, peer(3), main[4].hash, vec![main[0].hash]));
+    let c_waiting = busy(acquire(&port, peer(3), main[3].hash, vec![main[0].hash]));
+    tokio::time::advance(Duration::from_millis(1)).await;
+
+    // A's read sweeps A's and B's expired leases, but not C's.
+    assert_eq!(
+        read(&port, &a, main[0].hash, 1).expect("runs"),
+        ReadPathReply::Unavailable
+    );
+    assert!(b_waiting.is_released());
+    assert_eq!(port.live_leases(), 1);
+    assert_eq!(
+        read(&port, &b, main[0].hash, 1).expect("runs"),
+        ReadPathReply::Unavailable
+    );
+
+    // C's page consumes its lease and wakes C's waiting acquire.
+    assert!(!c_waiting.is_released());
+    page(read(&port, &c, main[0].hash, 1));
+    assert!(c_waiting.is_released());
+    assert_eq!(port.live_leases(), 0);
+}

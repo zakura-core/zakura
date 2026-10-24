@@ -151,6 +151,13 @@ impl EnginePort {
         self.leases().live()
     }
 
+    /// The peers whose consumed lease is cached for continuation, in peer
+    /// order. The cache holds no capacity and keeps at most
+    /// [`MAX_RETAINED_PATH_LEASES`](super::lease::MAX_RETAINED_PATH_LEASES).
+    pub fn continued_peers(&self) -> Vec<SourceId> {
+        self.leases().continued()
+    }
+
     /// Leases the path toward `request`'s target, as
     /// `HeaderChainReader::acquire_retained_path` does above finality.
     fn acquire(&self, request: AcquirePath) -> Result<AcquirePathReply, PortError> {

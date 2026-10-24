@@ -19,3 +19,9 @@ internal-bench = []
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[[bin]]
+name = "zakura-bbtree-experiment"
+path = "src/main.rs"
+test = false
+bench = false

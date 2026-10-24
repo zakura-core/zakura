@@ -1,0 +1,24 @@
+{
+  "date_utc": "2026-10-24T20:56:45.915643+00:00",
+  "zakura_base": "2b2b9bec56240f407b665b865a60121e847d27f9",
+  "bbtree_rev": "8adae97a0ed97e5c98fa2790312eb0aec9719846",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+  "build": "cargo +1.97.1 build --release --locked; opt-level=3, lto=thin, codegen-units=1",
+  "RUSTFLAGS": "",
+  "target": "x86_64-unknown-linux-gnu (generic baseline CPU)",
+  "run": "taskset -c 0 target/release/zakura-bbtree-experiment",
+  "repetitions": 9,
+  "height_inner_samples": 21,
+  "seed": "0x5eed_cafe_1234_abcd",
+  "isolation": "KVM shared environment; CPU 0 affinity; no frequency lock; host contention unknown",
+  "cgroup_cpu_max": "400000 100000",
+  "cgroup_memory_max": "17179869184",
+  "lscpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  5\nOn-line CPU(s) list:                     0-4\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC 9V45 96-Core Processor\nCPU family:                              26\nModel:                                   2\nThread(s) per core:                      1\nCore(s) per socket:                      5\nSocket(s):                               1\nStepping:                                1\nBogoMIPS:                                5192.24\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr arat npt nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm avx512_vp2intersect arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               144 KiB (3 instances)\nL1i cache:                               96 KiB (3 instances)\nL2 cache:                                3 MiB (3 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-4\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Vulnerable\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "uname": "Linux 8d667966000e 6.18.55 #1 SMP Wed Oct 14 19:45:18 UTC 2026 x86_64 GNU/Linux\n",
+  "sha256": {
+    "Cargo.toml": "c7463741348a84225f65629cd3ec5b74b9300ced3b4a2dfb62dd0cfd6c94f9d6",
+    "Cargo.lock": "748f7b6b4a9ccf85f681e6cbc3fe03510e0ef400ff9c429c1483b739b25b8aee",
+    "build.rs": "c3d7cf43e79bc16dbcb6124c007f3310a60599030d08a42ffb2270dbb9e7fdbb",
+    "src/main.rs": "d8d33e98835680eaeb31ff5694d620bf72c7f8b6c09d3bf800bdeb9a2953b48f"
+  }
+}

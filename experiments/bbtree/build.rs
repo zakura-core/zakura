@@ -6,10 +6,15 @@ fn main() {
     println!("cargo:rerun-if-changed={source}");
     let original = fs::read_to_string(source).expect("height_map source exists in this checkout");
     // include! does not accept the source's inner module documentation.
-    let original = original.replacen("//!", "//", 1)
+    let original = original
+        .replacen("//!", "//", 1)
         .replace("zakura_chain::block::Height", "crate::block::Height");
     let marker = "    collections::BTreeMap,\n";
-    assert_eq!(original.matches(marker).count(), 1, "review changed map imports");
+    assert_eq!(
+        original.matches(marker).count(),
+        1,
+        "review changed map imports"
+    );
     let candidate = original.replace(marker, "");
     let candidate = format!("use bbtree::unsync::BBTreeMap as BTreeMap;\n{candidate}");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"));

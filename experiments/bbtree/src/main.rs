@@ -1,15 +1,24 @@
 //! Isolated comparison; see README.md for the limits of the Height stand-in.
 #![allow(dead_code)]
-use std::{alloc::{GlobalAlloc, Layout, System}, collections::BTreeMap, hint::black_box,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}, time::Instant};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    collections::BTreeMap,
+    hint::black_box,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+    time::Instant,
+};
 
 /// Same representation and ordering as zakura_chain::block::Height. No chain dependencies.
 mod block {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Height(pub u32);
 }
-mod std_height { include!(concat!(env!("OUT_DIR"), "/std_height.rs")); }
-mod bb_height { include!(concat!(env!("OUT_DIR"), "/bb_height.rs")); }
+mod std_height {
+    include!(concat!(env!("OUT_DIR"), "/std_height.rs"));
+}
+mod bb_height {
+    include!(concat!(env!("OUT_DIR"), "/bb_height.rs"));
+}
 
 struct CountingAllocator;
 static COUNT: AtomicBool = AtomicBool::new(false);
@@ -43,7 +52,11 @@ fn measure(n: u32, backend: &str, operation: &str, repetition: usize, mut body: 
     COUNT.store(true, Relaxed);
     body(); // separate, untimed allocation pass
     COUNT.store(false, Relaxed);
-    println!("map,{backend},{n},{operation},{repetition},{ns},{},{}", ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+    println!(
+        "map,{backend},{n},{operation},{repetition},{ns},{},{}",
+        ALLOCS.load(Relaxed),
+        BYTES.load(Relaxed)
+    );
 }
 
 fn keys(n: u32) -> Vec<u64> {
@@ -68,7 +81,9 @@ macro_rules! map_workloads {
         let full: $map = shuffled.iter().map(|&k| (k, [7u8; 32])).collect();
         measure(n, $backend, "insert_drop", $rep, || {
             let mut map = <$map>::new();
-            for &k in &shuffled { black_box(map.insert(black_box(k), [7; 32])); }
+            for &k in &shuffled {
+                black_box(map.insert(black_box(k), [7; 32]));
+            }
             black_box(map);
         });
         measure(n, $backend, "lookup_hit_miss", $rep, || {
@@ -78,27 +93,43 @@ macro_rules! map_workloads {
             }
         });
         measure(n, $backend, "ordered_forward_reverse", $rep, || {
-            for pair in full.iter() { black_box(pair); }
-            for pair in full.iter().rev() { black_box(pair); }
+            for pair in full.iter() {
+                black_box(pair);
+            }
+            for pair in full.iter().rev() {
+                black_box(pair);
+            }
         });
         measure(n, $backend, "range_32", $rep, || {
             for &k in &shuffled {
-                for pair in full.range(k..k.saturating_add(32)) { black_box(pair); }
+                for pair in full.range(k..k.saturating_add(32)) {
+                    black_box(pair);
+                }
             }
         });
         measure(n, $backend, "clone_remove_drop", $rep, || {
             let mut map = full.clone();
-            for k in &shuffled { black_box(map.remove(k)); }
+            for k in &shuffled {
+                black_box(map.remove(k));
+            }
             black_box(map);
         });
         measure(n, $backend, "clone_mixed_drop", $rep, || {
             let mut map = full.clone();
             for (i, &k) in shuffled.iter().enumerate() {
                 match i % 5 {
-                    0 => { black_box(map.remove(&k)); }
-                    1 => { black_box(map.insert(k, [8; 32])); }
-                    2 => { black_box(map.range(k..).next()); }
-                    _ => { black_box(map.get(&k)); }
+                    0 => {
+                        black_box(map.remove(&k));
+                    }
+                    1 => {
+                        black_box(map.insert(k, [8; 32]));
+                    }
+                    2 => {
+                        black_box(map.range(k..).next());
+                    }
+                    _ => {
+                        black_box(map.get(&k));
+                    }
                 }
             }
             black_box(map);
@@ -107,6 +138,7 @@ macro_rules! map_workloads {
 }
 
 fn correctness() {
+    range_edges();
     use block::Height;
     let mut std = BTreeMap::new();
     let mut bb = bbtree::unsync::BBTreeMap::new();
@@ -123,7 +155,8 @@ fn correctness() {
                 assert_eq!(real_bb.remove(&height), expected);
             }
             1 => {
-                real_std.remove_through(height); real_bb.remove_through(height);
+                real_std.remove_through(height);
+                real_bb.remove_through(height);
                 oracle.retain(|k, _| *k > height);
             }
             _ => {
@@ -139,11 +172,17 @@ fn correctness() {
         assert_eq!(real_std.get(&height), oracle.get(&height));
         assert_eq!(real_bb.get(&height), oracle.get(&height));
         if i % 101 == 0 {
-            assert_eq!(std.iter().collect::<Vec<_>>(), bb.iter().collect::<Vec<_>>());
+            assert_eq!(
+                std.iter().collect::<Vec<_>>(),
+                bb.iter().collect::<Vec<_>>()
+            );
             let expected: Vec<_> = oracle.iter().collect();
             assert_eq!(real_std.range(..).collect::<Vec<_>>(), expected);
             assert_eq!(real_bb.range(..).collect::<Vec<_>>(), expected);
-            assert_eq!(real_std.range(..).rev().collect::<Vec<_>>(), real_bb.range(..).rev().collect::<Vec<_>>());
+            assert_eq!(
+                real_std.range(..).rev().collect::<Vec<_>>(),
+                real_bb.range(..).rev().collect::<Vec<_>>()
+            );
             let mut fork = real_bb.clone();
             fork.insert(height, usize::MAX);
             assert_eq!(real_bb.get(&height), oracle.get(&height));
@@ -160,9 +199,65 @@ fn correctness() {
     eprintln!("correctness: 20000 deterministic differential operations passed");
 }
 
+/// Exercise dense chunks, all bound kinds, invalid ranges, and snapshot isolation.
+fn range_edges() {
+    use block::Height;
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<bb_height::HeightMap<std::sync::Arc<u64>>>();
+    let mut std = std_height::HeightMap::default();
+    let mut bb = bb_height::HeightMap::default();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    for populated in [false, true] {
+        if populated {
+            for height in 0..192 {
+                std.insert(Height(height), height);
+                bb.insert(Height(height), height);
+            }
+        }
+        for lower in [0, 1, 63, 64, 65, 127, 128, 191, 192] {
+            for upper in [0, 1, 63, 64, 65, 127, 128, 191, 192] {
+                for start in [Unbounded, Included(Height(lower)), Excluded(Height(lower))] {
+                    for end in [Unbounded, Included(Height(upper)), Excluded(Height(upper))] {
+                        let a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            std.range((start, end))
+                                .map(|(k, v)| (*k, *v))
+                                .collect::<Vec<_>>()
+                        }));
+                        let b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            bb.range((start, end))
+                                .map(|(k, v)| (*k, *v))
+                                .collect::<Vec<_>>()
+                        }));
+                        assert_eq!(a.is_err(), b.is_err());
+                        if let (Ok(a), Ok(b)) = (a, b) {
+                            assert_eq!(a, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::panic::set_hook(hook);
+    for boundary in [0, 63, 64, 127, 128, 191, 192] {
+        let mut a = std.clone();
+        let mut b = bb.clone();
+        a.remove_through(Height(boundary));
+        b.remove_through(Height(boundary));
+        assert_eq!(
+            a.range(..).collect::<Vec<_>>(),
+            b.range(..).collect::<Vec<_>>()
+        );
+        assert_eq!(bb.get(&Height(0)), Some(&0));
+    }
+}
+
 fn main() {
     correctness();
-    if std::env::args().any(|arg| arg == "--check") { return; }
+    if std::env::args().any(|arg| arg == "--check") {
+        return;
+    }
     println!("suite,backend,size,operation,repetition,ns,allocations,requested_bytes");
     for rep in 0..9 {
         for n in [16, 256, 4096, 65536] {
@@ -178,16 +273,26 @@ fn main() {
             let run = |backend| {
                 let rows = if backend == "std" {
                     std_height::benchmark::benchmark_height_map(n, 21)
-                        .into_iter().map(|s| (s.name, s.nanos_per_op)).collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|s| (s.name, s.nanos_per_op))
+                        .collect::<Vec<_>>()
                 } else {
                     bb_height::benchmark::benchmark_height_map(n, 21)
-                        .into_iter().map(|s| (s.name, s.nanos_per_op)).collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|s| (s.name, s.nanos_per_op))
+                        .collect::<Vec<_>>()
                 };
                 for (name, ns) in rows {
                     println!("height,{backend},{n},{name},{rep},{ns},,");
                 }
             };
-            if rep % 2 == 0 { run("std"); run("bb"); } else { run("bb"); run("std"); }
+            if rep % 2 == 0 {
+                run("std");
+                run("bb");
+            } else {
+                run("bb");
+                run("std");
+            }
         }
     }
 }

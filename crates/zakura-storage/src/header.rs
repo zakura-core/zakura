@@ -368,7 +368,9 @@ pub enum AcquireRefusal {
 }
 
 impl AcquireRefusal {
-    /// Every refusal, in the order state checks them.
+    /// Every refusal, in the order state checks them. `IdsExhausted` sits
+    /// where state checks the reservation ID. State checks the lease ID last,
+    /// after `BeyondReserve`.
     pub const ALL: [AcquireRefusal; 5] = [
         AcquireRefusal::PeerHoldsLease,
         AcquireRefusal::CapacityFull,

@@ -88,3 +88,38 @@ async fn oversized_request_body_is_rejected() {
 
     assert!(result.is_err(), "oversized request body should be rejected");
 }
+
+/// A body that never produces any data, like a client that stops sending.
+struct PendingBody;
+
+impl http_body::Body for PendingBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Pending
+    }
+}
+
+/// A request whose body stops arriving is abandoned after the body timeout.
+#[tokio::test(start_paused = true)]
+async fn stalled_request_body_times_out() {
+    let request = HttpRequest::builder()
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(PendingBody)
+        .expect("valid request");
+
+    let start = tokio::time::Instant::now();
+    let mut middleware = HttpRequestMiddleware::new(MockRpcService, None, 2_097_152);
+    let result = middleware.call(request).await;
+
+    assert!(result.is_err(), "a stalled body should be rejected");
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(30),
+        "the body timeout is 30 seconds"
+    );
+}

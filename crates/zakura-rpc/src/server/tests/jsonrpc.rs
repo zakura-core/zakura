@@ -1,6 +1,6 @@
 //! Tests for JSON-RPC parameter decoding.
 
-use super::super::jsonrpc::param_name_matches;
+use super::super::jsonrpc::{param_name_matches, Body};
 
 /// Every RPC parameter name, with the snake case and lower camel case aliases that `jsonrpsee`
 /// accepted for it, as `heck` 0.5 computes them.
@@ -65,5 +65,32 @@ fn param_names_do_not_match_other_keys() {
             !param_name_matches(key, name),
             "{key:?} should not name {name:?}"
         );
+    }
+}
+
+/// Returns the JSON response to a batch body, with a limit of 3 entries.
+fn batch_response(body: &str) -> String {
+    match Body::parse(body.as_bytes(), false, 3) {
+        Body::Error(response) => response.as_json().get().to_string(),
+        Body::Batch(entries) => format!("batch of {}", entries.len()),
+        _ => unreachable!("batch bodies parse as batches or errors"),
+    }
+}
+
+/// Batches over the limit are rejected as soon as the parser reaches the extra entry, so the
+/// rest of the body doesn't matter.
+#[test]
+fn batches_over_the_limit_are_rejected_without_parsing_the_rest() {
+    assert_eq!(batch_response("[1, 2, 3]"), "batch of 3");
+
+    for body in ["[1, 2, 3, 4]", "[1, 2, 3, 4, not json", "[1, 2, 3, 4,"] {
+        let response = batch_response(body);
+        assert!(response.contains("-32010"), "{body}: {response}");
+    }
+
+    // Malformed batches at or under the limit are still parse errors.
+    for body in ["[1, 2, 3, not json", "[1, 2, 3", "[1, 2, 3] trailing"] {
+        let response = batch_response(body);
+        assert!(response.contains("-32700"), "{body}: {response}");
     }
 }

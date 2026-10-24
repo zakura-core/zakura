@@ -229,7 +229,8 @@ fn funding_streams_round_once_over_the_reissuance_bonus() {
 
     for balance in [0, 1, 10_000_000_000, MAX_MONEY] {
         let balance = Amount::<NonNegative>::try_from(balance).expect("the balances are money");
-        let bonus = i64::from(reissuance_bonus(balance).expect("the bonus is below the balance"));
+        let bonus =
+            i64::from(reissuance_bonus(balance, &network).expect("the bonus is below the balance"));
         let subsidy = block_subsidy(reissuance, &network, Some(balance))
             .expect("the network supplies a reissuance height and the balance");
         assert_eq!(i64::from(subsidy), scheduled + bonus);

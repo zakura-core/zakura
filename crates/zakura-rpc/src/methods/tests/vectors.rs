@@ -3058,9 +3058,9 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
 
     const BALANCE: i64 = 400_000_000;
 
-    // Compute the fixed NU7 ceiling payout independently of the production helper.
+    // Compute the Regtest NU7 ceiling payout independently of the production helper.
     let bonus = |balance: i64| {
-        i64::try_from((i128::from(balance.max(0)) * 1_375 + 9_999_999_999) / 10_000_000_000)
+        i64::try_from((i128::from(balance.max(0)) * 8_022_777 + 9_999_999_999) / 10_000_000_000)
             .expect("the bonus fits in i64")
     };
 

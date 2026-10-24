@@ -4,10 +4,10 @@
 //! through its existing interface, and lets the run choose when and how each
 //! one completes. The plan is `storage.md`.
 //!
-//! So far the crate holds only the header contract in [`header`]: the
-//! operations a header-chain [`Port`](zakura_node_services::header_chain::Port)
-//! serves, the outcomes each one may complete with, and the deadlines and
-//! releases around them. The engine-backed adapter and the controllable
-//! operation lifecycle build on it.
+//! So far the crate holds the header side in [`header`]: the contract for
+//! the operations a header-chain
+//! [`Port`](zakura_node_services::header_chain::Port) serves, a port over the
+//! real header-chain engine, and the fixture chains it loads. The
+//! controllable operation lifecycle builds on both.
 
 pub mod header;

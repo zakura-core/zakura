@@ -512,9 +512,9 @@ async fn capacity_and_release_match() {
     assert_eq!(seen[0], [(false, false), (false, true), (true, true)]);
 }
 
-/// Eviction on the idle deadline: peer A's idle lease is swept by peer C's
-/// acquire, not by B's empty-locator acquire, and A's waiting signal fires
-/// then.
+/// Eviction on the idle deadline: A's lease survives a sweep one tick before
+/// it, then is swept by peer C's acquire, not by B's empty-locator acquire,
+/// and A's waiting signal fires then.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn idle_eviction_matches() {
     let mut seen = Vec::new();
@@ -542,7 +542,23 @@ async fn idle_eviction_matches() {
         else {
             panic!("a held lease refuses its peer");
         };
-        tokio::time::advance(RETAINED_PATH_LEASE_IDLE).await;
+        // A's own acquire sweeps without taking a slot, so one tick before
+        // the deadline it must still find A's lease.
+        tokio::time::advance(RETAINED_PATH_LEASE_IDLE - Duration::from_nanos(1)).await;
+        let early = port
+            .acquire_header_path(acquire_request(
+                port,
+                peer(1),
+                main[3].hash,
+                vec![main[0].hash],
+            ))
+            .await;
+        events.push(format!(
+            "{} {}",
+            acquire_shape(&early),
+            waiting.is_released()
+        ));
+        tokio::time::advance(Duration::from_nanos(1)).await;
         let empty = port
             .acquire_header_path(acquire_request(port, peer(2), main[3].hash, Vec::new()))
             .await;
@@ -568,15 +584,17 @@ async fn idle_eviction_matches() {
         seen.push(events);
     }
     assert_eq!(seen[0], seen[1]);
-    // The empty locator sweeps nothing, C's acquire sweeps A's lease and
-    // wakes A's waiter, and A's handle then reads nothing.
-    assert_eq!(seen[0][0], "unavailable(source=true) false");
+    // One tick early, A's lease is still live. At the deadline, the empty
+    // locator sweeps nothing, C's acquire sweeps A's lease and wakes A's
+    // waiter, and A's handle then reads nothing.
+    assert_eq!(seen[0][0], "capacity-busy false");
+    assert_eq!(seen[0][1], "unavailable(source=true) false");
     assert!(
-        seen[0][1].starts_with("acquired ") && seen[0][1].ends_with(" true"),
+        seen[0][2].starts_with("acquired ") && seen[0][2].ends_with(" true"),
         "{}",
-        seen[0][1]
+        seen[0][2]
     );
-    assert_eq!(seen[0][2], "unavailable");
+    assert_eq!(seen[0][3], "unavailable");
 }
 
 /// Timeouts: production fails a wedged state read at exactly the contract's

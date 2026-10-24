@@ -18,7 +18,8 @@ use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::{
     header_chain::{
         AcquirePath, AcquirePathReply, ApplyHeaderTargetOutcome, LocatorReadPermit, Port, ReadPath,
-        ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
+        ReadPathReply, RetainedHeaderPath, SelectedChainMembership, ServingCapacitySignal,
+        VctRepairContextReply,
     },
     sync_lifecycle::HeaderRuntimeStatus,
 };
@@ -204,6 +205,15 @@ fn leased(reply: Result<AcquirePathReply, PortError>) -> RetainedHeaderPath {
     match reply {
         Ok(AcquirePathReply::Acquired(path)) => *path,
         other => panic!("expected a lease, got {other:?}"),
+    }
+}
+
+/// The signal in `port`'s refusal of `request`, which must be
+/// `CapacityBusy`.
+async fn refused(port: &dyn Port, request: AcquirePath) -> ServingCapacitySignal {
+    match port.acquire_header_path(request).await {
+        Ok(AcquirePathReply::CapacityBusy(signal)) => signal,
+        other => panic!("expected a capacity refusal, got {other:?}"),
     }
 }
 
@@ -439,77 +449,78 @@ async fn path_serving_matches() {
     assert_eq!(seen[0], seen[1]);
 }
 
-/// A held lease refuses its own peer, full capacity refuses new peers with
-/// one shared signal, and each signal fires at the same release.
+/// A held lease refuses its own peer, and full capacity refuses every new
+/// peer with one shared signal. A served read and a release each free a slot
+/// that the next peer then takes, and wake the waiters at that moment.
 #[tokio::test]
 async fn capacity_and_release_match() {
     let mut seen = Vec::new();
     for port in both().await {
         let port = &*port;
         let (main, _) = chain(port).await;
+        let wide = |n: u8| acquire_request(port, peer(n), main[4].hash, vec![main[0].hash]);
         let mut events = Vec::new();
-        let first = leased(
-            port.acquire_header_path(acquire_request(
-                port,
-                peer(0),
-                main[4].hash,
-                vec![main[0].hash],
-            ))
-            .await,
-        );
-        let Ok(AcquirePathReply::CapacityBusy(own)) = port
-            .acquire_header_path(acquire_request(
-                port,
-                peer(0),
-                main[3].hash,
-                vec![main[0].hash],
-            ))
-            .await
-        else {
-            panic!("a held lease refuses its peer");
-        };
-        let mut paths = vec![first];
+        let mut paths = vec![leased(port.acquire_header_path(wide(0)).await)];
+        let own = refused(
+            port,
+            acquire_request(port, peer(0), main[3].hash, vec![main[0].hash]),
+        )
+        .await;
         for n in 1..MAX_RETAINED_PATH_LEASES {
             let n = u8::try_from(n).expect("16 peers fit u8");
-            paths.push(leased(
-                port.acquire_header_path(acquire_request(
-                    port,
-                    peer(n),
-                    main[4].hash,
-                    vec![main[0].hash],
-                ))
-                .await,
-            ));
+            paths.push(leased(port.acquire_header_path(wide(n)).await));
         }
-        let Ok(AcquirePathReply::CapacityBusy(full)) = port
-            .acquire_header_path(acquire_request(
-                port,
-                peer(100),
-                main[4].hash,
-                vec![main[0].hash],
-            ))
-            .await
-        else {
-            panic!("full capacity refuses a new peer");
+        let full = [
+            refused(port, wide(100)).await,
+            refused(port, wide(101)).await,
+        ];
+        let waiting = |full: &[ServingCapacitySignal; 2]| {
+            format!(
+                "{} {:?}",
+                own.is_released(),
+                full.each_ref().map(ServingCapacitySignal::is_released)
+            )
         };
-        events.push((own.is_released(), full.is_released()));
-        // Releasing another peer's lease frees a slot but not peer 0's.
-        port.release_header_path(paths[3].clone())
-            .await
-            .expect("a release succeeds");
-        events.push((own.is_released(), full.is_released()));
-        // Repeats are safe.
+        events.push(waiting(&full));
+        // A read that serves another peer's whole path consumes its lease.
+        let served = port
+            .read_header_path(paths[3].clone(), page_request(main[0].hash, 4))
+            .await;
+        events.push(match &served {
+            Ok(ReadPathReply::Page(page)) => format!("served complete={}", page.complete),
+            other => read_shape(other),
+        });
+        events.push(waiting(&full));
+        // The freed slot takes one peer, and the next waits on a new signal.
+        events.push(acquire_shape(&port.acquire_header_path(wide(102)).await));
+        let again = refused(port, wide(103)).await;
+        events.push(format!("{} {}", own.is_released(), again.is_released()));
+        // Releasing peer 0's lease wakes peer 0 and the new waiter. Repeats
+        // are safe.
         port.release_header_path(paths[0].clone())
             .await
             .expect("a release succeeds");
         port.release_header_path(paths[0].clone())
             .await
             .expect("a repeated release succeeds");
-        events.push((own.is_released(), full.is_released()));
+        events.push(format!("{} {}", own.is_released(), again.is_released()));
+        events.push(acquire_shape(&port.acquire_header_path(wide(104)).await));
+        events.push(acquire_shape(&port.acquire_header_path(wide(105)).await));
         seen.push(events);
     }
     assert_eq!(seen[0], seen[1]);
-    assert_eq!(seen[0], [(false, false), (false, true), (true, true)]);
+    assert_eq!(
+        seen[0][..3],
+        [
+            "false [false, false]",
+            "served complete=true",
+            "false [true, true]"
+        ]
+    );
+    assert!(seen[0][3].starts_with("acquired "), "{}", seen[0][3]);
+    assert_eq!(seen[0][4..6], ["false false", "true true"]);
+    assert!(seen[0][6].starts_with("acquired "), "{}", seen[0][6]);
+    assert_eq!(seen[0][7], "capacity-busy");
 }
 
 /// Eviction on the idle deadline: A's lease survives a sweep one tick before

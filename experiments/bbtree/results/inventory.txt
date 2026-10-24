@@ -1,0 +1,595 @@
+crates/zakura-sim/tests/time.rs:7:use std::{cell::Cell, collections::BTreeSet, future::Future, rc::Rc, time::Duration};
+crates/zakura-sim/tests/time.rs:98:    let mut first_after_advance = BTreeSet::new();
+crates/zakura-sim/tests/time.rs:123:        BTreeSet::from(["a.1".to_owned(), "b.1".to_owned()]),
+crates/zakura-sim/tests/time.rs:307:    let mut first = BTreeSet::new();
+crates/zakura-sim/tests/header_sync.rs:59:    let mut runs = std::collections::BTreeSet::new();
+crates/zakura-sim/tests/enabled_set.rs:7:use std::{cell::RefCell, collections::BTreeSet, time::Duration};
+crates/zakura-sim/tests/enabled_set.rs:55:    let mut seen = BTreeSet::new();
+crates/zakura-sim/tests/draws.rs:110:    let mut values = std::collections::BTreeSet::new();
+crates/zakura-sim/tests/discovery.rs:9:    collections::BTreeMap,
+crates/zakura-sim/tests/discovery.rs:231:    next: BTreeMap<String, (String, Option<u32>)>,
+crates/zakura-scheduler/tests/support/mod.rs:169:    let mut finished = std::collections::BTreeSet::new();
+crates/zakura-scheduler/tests/rt.rs:798:        let digits: std::collections::BTreeSet<u32> =
+crates/zakura-scheduler/tests/rt.rs:800:        let shuffles: std::collections::BTreeSet<Vec<u8>> = (0..1_000)
+crates/zakura-scheduler/tests/rt.rs:1266:    let mut unbiased_firsts = std::collections::BTreeSet::new();
+crates/zakurad/src/config/loader.rs:4:    collections::{btree_map, BTreeMap},
+crates/zakurad/src/config/loader.rs:24:    Table(BTreeMap<String, Value>),
+crates/zakurad/src/config/loader.rs:69:    let mut values = Value::Table(BTreeMap::new());
+crates/zakurad/src/config/loader.rs:99:        let mut overrides = BTreeMap::new();
+crates/zakurad/src/config/loader.rs:155:            *current = Value::Table(BTreeMap::new());
+crates/zakurad/src/config/loader.rs:206:            *current = Value::Table(BTreeMap::new());
+crates/zakurad/src/config/loader.rs:504:    fn new(values: BTreeMap<String, Value>) -> Self {
+crates/zakura-scheduler/tests/model.rs:440:    let mut model: std::collections::BTreeMap<(SimInstant, usize), TimerId> = Default::default();
+crates/zakura-scheduler/src/scheduler.rs:6:    collections::{BTreeMap, BTreeSet},
+crates/zakura-scheduler/src/scheduler.rs:65:    point_counts: BTreeMap<Op, u32>,
+crates/zakura-scheduler/src/scheduler.rs:66:    child_counts: BTreeMap<&'static str, u32>,
+crates/zakura-scheduler/src/scheduler.rs:78:    woken: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:79:    pub(crate) ready: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:80:    pub(crate) waiting: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:81:    pub(crate) external: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:82:    mid_poll: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:83:    pub(crate) cancel_requested: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:84:    pub(crate) done: BTreeMap<TaskId, TaskExit>,
+crates/zakura-scheduler/src/scheduler.rs:85:    pub(crate) join_wakers: BTreeMap<TaskId, Vec<Waker>>,
+crates/zakura-scheduler/src/scheduler.rs:90:    pub(crate) timers: BTreeMap<TimerId, Waker>,
+crates/zakura-scheduler/src/scheduler.rs:94:    pub(crate) parked: BTreeMap<ObjectId, Vec<TaskId>>,
+crates/zakura-scheduler/src/scheduler.rs:95:    pub(crate) holders: BTreeMap<ObjectId, TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:96:    object_counts: BTreeMap<Option<TaskId>, u32>,
+crates/zakura-scheduler/src/scheduler.rs:97:    root_counts: BTreeMap<&'static str, u32>,
+crates/zakura-scheduler/src/scheduler.rs:100:    pub(crate) cleanup_points: BTreeMap<TaskId, u32>,
+crates/zakura-scheduler/src/scheduler.rs:103:    pub(crate) stuck: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:109:    unwind_tried: BTreeSet<TaskId>,
+crates/zakura-scheduler/src/scheduler.rs:114:    pub(crate) panics: BTreeMap<TaskId, Box<dyn std::any::Any + Send>>,
+crates/zakura-scheduler/src/scheduler.rs:172:            point_counts: BTreeMap::from([(Op::Poll, 1)]),
+crates/zakura-scheduler/src/scheduler.rs:173:            child_counts: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:255:        let waits_on: BTreeMap<TaskId, TaskId> = self
+crates/zakura-scheduler/src/scheduler.rs:262:            let mut seen = BTreeSet::new();
+crates/zakura-scheduler/src/scheduler.rs:449:                woken: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:450:                ready: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:451:                waiting: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:452:                external: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:453:                mid_poll: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:454:                cancel_requested: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:455:                done: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:456:                join_wakers: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:460:                timers: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:463:                parked: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:464:                holders: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:465:                object_counts: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:466:                root_counts: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:468:                cleanup_points: BTreeMap::new(),
+crates/zakura-scheduler/src/scheduler.rs:469:                stuck: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:471:                unwind_tried: BTreeSet::new(),
+crates/zakura-scheduler/src/scheduler.rs:474:                panics: BTreeMap::new(),
+crates/zakura-scheduler/src/executor.rs:221:    use std::{collections::BTreeSet, time::Duration};
+crates/zakura-scheduler/src/executor.rs:227:        let mapped: BTreeSet<Op> = rt::Op::ALL
+crates/zakura-scheduler/src/executor.rs:240:        let mapped: BTreeSet<DrawKind> = rt::DrawKind::ALL
+crates/zakura-rt/tests/support/mod.rs:13:    collections::{BTreeMap, BTreeSet},
+crates/zakura-rt/tests/support/mod.rs:109:    ready: Arc<Mutex<BTreeSet<u64>>>,
+crates/zakura-rt/tests/support/mod.rs:110:    timers: BTreeMap<TimerId, Waker>,
+crates/zakura-rt/tests/support/mod.rs:146:    ready: Arc<Mutex<BTreeSet<u64>>>,
+crates/zakurad/src/components/zcashd_compat/preflight.rs:5:    collections::{BTreeMap, HashMap},
+crates/zakurad/src/components/zcashd_compat/preflight.rs:403:    let mut grouped = BTreeMap::<PathBuf, PermissionRequirements>::new();
+crates/zakura-rpc/src/server.rs:11:    collections::BTreeSet, fmt, fs::File, future::Future, io::Read, net::SocketAddr, panic,
+crates/zakura-rpc/src/server.rs:653:    let registered: BTreeSet<_> = registered.iter().copied().collect();
+crates/zakura-rpc/src/server.rs:654:    let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
+crates/zakura-test/src/vectors/block.rs:7:use std::collections::BTreeMap;
+crates/zakura-test/src/vectors/block.rs:35:pub static CONTINUOUS_MAINNET_BLOCKS: LazyLock<BTreeMap<u32, &'static [u8]>> =
+crates/zakura-test/src/vectors/block.rs:49:pub static CONTINUOUS_TESTNET_BLOCKS: LazyLock<BTreeMap<u32, &'static [u8]>> =
+crates/zakura-test/src/vectors/block.rs:67:pub static MAINNET_BLOCKS: LazyLock<BTreeMap<u32, &'static [u8]>> = LazyLock::new(|| {
+crates/zakura-test/src/vectors/block.rs:144:pub static MAINNET_FINAL_SPROUT_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-test/src/vectors/block.rs:195:pub static MAINNET_FINAL_SAPLING_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-test/src/vectors/block.rs:377:pub static MAINNET_FINAL_ORCHARD_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-test/src/vectors/block.rs:432:pub static TESTNET_BLOCKS: LazyLock<BTreeMap<u32, &'static [u8]>> = LazyLock::new(|| {
+crates/zakura-test/src/vectors/block.rs:528:pub static TESTNET_FINAL_SPROUT_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-test/src/vectors/block.rs:557:pub static TESTNET_FINAL_SAPLING_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-test/src/vectors/block.rs:785:pub static TESTNET_FINAL_ORCHARD_ROOTS: LazyLock<BTreeMap<u32, &'static [u8; 32]>> =
+crates/zakura-rpc/src/server/tests/surface.rs:5:    collections::BTreeSet,
+crates/zakura-rpc/src/server/tests/surface.rs:36:    let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
+crates/zakura-rpc/src/server/tests/surface.rs:37:    let documented: BTreeSet<_> = METHODS.iter().map(|(name, _)| *name).collect();
+crates/zakura-rpc/src/server/tests/surface.rs:52:    let actual: BTreeSet<_> = enabled_rpc_methods(&classified_methods(), RpcSurface::Restricted)
+crates/zakura-rpc/src/server/tests/surface.rs:56:    let expected: BTreeSet<_> = RPC_METHOD_ACCESS
+crates/zakura-rpc/src/server/tests/surface.rs:72:    let actual: BTreeSet<_> = enabled_rpc_methods(&classified_methods(), RpcSurface::Full)
+crates/zakura-rpc/src/server/tests/surface.rs:314:    let mut ports = BTreeSet::new();
+crates/zakura-rpc/src/server/tests/surface.rs:462:fn discovered_methods(response: &serde_json::Value) -> BTreeSet<&str> {
+crates/zakura-rpc/src/server/tests/rpc_metrics.rs:4:    collections::BTreeSet,
+crates/zakura-rpc/src/server/tests/rpc_metrics.rs:32:    fn method_labels(&self) -> BTreeSet<String> {
+crates/zakura-rpc/src/server/tests/rpc_metrics.rs:100:        BTreeSet::from(["getblockcount".to_owned(), "unknown".to_owned()]),
+crates/zakurad/src/components/metrics/prometheus/text.rs:6:use std::{collections::BTreeMap, fmt::Display, sync::atomic::Ordering, time::Instant};
+crates/zakurad/src/components/metrics/prometheus/text.rs:74:) -> BTreeMap<String, BTreeMap<String, T>> {
+crates/zakurad/src/components/metrics/prometheus/text.rs:75:    let mut by_name: BTreeMap<String, BTreeMap<String, T>> = BTreeMap::new();
+crates/zakurad/src/components/metrics/prometheus/summary.rs:8:    collections::{BTreeMap, VecDeque},
+crates/zakurad/src/components/metrics/prometheus/summary.rs:58:    positive: BTreeMap<i32, u64>,
+crates/zakurad/src/components/metrics/prometheus/summary.rs:60:    negative: BTreeMap<i32, u64>,
+crates/zakurad/src/components/metrics/prometheus/summary.rs:170:fn add_to(buckets: &mut BTreeMap<i32, u64>, bucket: i32, count: u64) {
+crates/zakurad/src/components/mempool/storage/verified_set.rs:6:    collections::{BTreeSet, HashMap, HashSet},
+crates/zakurad/src/components/mempool/storage/verified_set.rs:64:    eviction_order: BTreeSet<EvictionCandidate>,
+crates/zakurad/src/components/mempool/storage/verified_set.rs:313:        let mut updated = BTreeSet::new();
+crates/zakurad/src/components/mempool/storage/verified_set.rs:617:        let expected: BTreeSet<_> = self
+crates/zakura-sim/src/sim.rs:8:use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+crates/zakura-sim/src/sim.rs:462:    names: BTreeMap<TaskId, String>,
+crates/zakura-test/src/allocations.rs:35:    collections::BTreeMap,
+crates/zakura-test/src/allocations.rs:55:    allocations: BTreeMap<usize, usize>,
+crates/zakura-sim/src/property/registry.rs:3:use std::{collections::BTreeSet, fmt, rc::Rc};
+crates/zakura-sim/src/property/registry.rs:88:        let mut ids = BTreeSet::new();
+crates/zakura-sim/src/fake.rs:10:    collections::{BTreeMap, VecDeque},
+crates/zakura-sim/src/fake.rs:53:    sent: BTreeMap<String, u64>,
+crates/zakura-sim/src/fake.rs:80:            sent: BTreeMap::new(),
+crates/zakura-sim/src/fake.rs:158:    ops: BTreeMap<u64, Op>,
+crates/zakura-sim/src/fake.rs:179:            ops: BTreeMap::new(),
+crates/zakura-sim/src/fake.rs:444:        let mut sent = BTreeMap::new();
+crates/zakura-sim/src/fake.rs:503:        let mut seqs = BTreeMap::new();
+crates/zakura-sim/src/draws.rs:7:use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+crates/zakura-sim/src/draws.rs:42:    ordinals: BTreeMap<(String, &'static str), u32>,
+crates/zakura-sim/src/draws.rs:52:            ordinals: BTreeMap::new(),
+crates/zakura-state/src/service.rs:18:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service.rs:2438:    stored: Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error>,
+crates/zakura-state/src/service.rs:2442:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service.rs:2445:        &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service.rs:2447:) -> Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error> {
+crates/zakura-state/src/service.rs:2466:                Ok(BTreeMap::new())
+crates/zakura-rpc/src/methods/tests/snapshot.rs:10:    collections::BTreeMap,
+crates/zakura-rpc/src/methods/tests/snapshot.rs:666:    let mut subtrees = BTreeMap::new();
+crates/zakura-rpc/src/methods/tests/snapshot.rs:694:    let mut subtrees = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:16:    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:283:    ) -> Result<BTreeMap<OutputLocation, transparent::Output>, TransparentIndexesUnavailable> {
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:288:            None => return Ok(BTreeMap::new()),
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:314:    ) -> BTreeSet<AddressUnspentOutput> {
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:321:        let mut addr_unspent_outputs = BTreeSet::new();
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:373:    ) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, TransparentIndexesUnavailable>
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:379:            None => return Ok(BTreeMap::new()),
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:387:            return Ok(BTreeMap::new());
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:413:    ) -> BTreeSet<AddressTransaction> {
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:490:    ) -> Result<BTreeMap<OutputLocation, transparent::Output>, TransparentIndexesUnavailable> {
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:493:        let mut utxos = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:531:    ) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, TransparentIndexesUnavailable>
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:535:        let mut tx_ids = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:561:        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:563:        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:635:        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:636:        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:770:        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/transparent.rs:842:        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/shielded.rs:16:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/finalized_state/zakura_db/shielded.rs:378:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>> {
+crates/zakura-state/src/service/finalized_state/zakura_db/shielded.rs:521:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>> {
+crates/zakura-state/src/service/finalized_state/zakura_db/shielded.rs:641:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
+crates/zakura-state/src/service/finalized_state/zakura_db/rollback.rs:4:    collections::{BTreeMap, HashMap, HashSet},
+crates/zakura-state/src/service/finalized_state/zakura_db/rollback.rs:1059:    let sapling_trees: BTreeMap<_, _> = db
+crates/zakura-state/src/service/finalized_state/zakura_db/rollback.rs:1073:    let orchard_trees: BTreeMap<_, _> = db
+crates/zakura-state/src/service/finalized_state/zakura_db/rollback.rs:1087:    let ironwood_trees: BTreeMap<_, _> = db
+crates/zakura-quic/tests/sim_replay.rs:15:    collections::BTreeMap,
+crates/zakura-quic/tests/sim_replay.rs:135:    sent: BTreeMap<Link, u64>,
+crates/zakura-quic/tests/sim_replay.rs:137:    bytes: BTreeMap<DatagramId, Vec<u8>>,
+crates/zakura-quic/tests/sim_replay.rs:349:) -> (Observations, Vec<NetEvent>, BTreeMap<DatagramId, Vec<u8>>) {
+crates/zakura-quic/tests/sim_replay.rs:470:fn transcript_digest(events: &[NetEvent], bytes: &BTreeMap<DatagramId, Vec<u8>>) -> String {
+crates/zakura-quic/src/sim/seeded.rs:13:    collections::BTreeMap,
+crates/zakura-quic/src/sim/seeded.rs:113:    pub draws: BTreeMap<Source, u64>,
+crates/zakura-state/src/service/finalized_state/zakura_db/highest_completed_checkpoint.rs:3:use std::{collections::BTreeMap, sync::Arc};
+crates/zakura-state/src/service/finalized_state/zakura_db/highest_completed_checkpoint.rs:357:        let pending: BTreeMap<_, _> = pending
+crates/zakura-quic/src/sim/net.rs:16:    collections::{BTreeMap, VecDeque},
+crates/zakura-quic/src/sim/net.rs:183:    links: BTreeMap<Link, LinkState>,
+crates/zakura-quic/src/sim/net.rs:184:    in_flight: BTreeMap<DatagramId, InFlight>,
+crates/zakura-quic/src/sim/net.rs:185:    sockets: BTreeMap<SocketAddr, Binding>,
+crates/zakura-quic/src/sim/net/tests.rs:5:    collections::{BTreeMap, BTreeSet, VecDeque},
+crates/zakura-quic/src/sim/net/tests.rs:621:    models: BTreeMap<Link, LinkModel>,
+crates/zakura-quic/src/sim/net/tests.rs:622:    next_seq: BTreeMap<Link, u64>,
+crates/zakura-quic/src/sim/net/tests.rs:623:    drops: BTreeMap<Link, u64>,
+crates/zakura-quic/src/sim/net/tests.rs:625:    queues: BTreeMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>,
+crates/zakura-quic/src/sim/net/tests.rs:626:    resolved: BTreeSet<DatagramId>,
+crates/zakura-quic/src/sim/net/tests.rs:627:    last_delivered: BTreeMap<Link, u64>,
+crates/zakura-quic/src/sim/net/tests.rs:898:    let mut outcomes: BTreeMap<DatagramId, usize> = BTreeMap::new();
+crates/zakura-quic/src/sim/net/tests.rs:899:    let mut losses: BTreeMap<Link, u64> = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/zakura_db/chain.rs:15:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/finalized_state/zakura_db/chain.rs:192:    ) -> Result<BTreeMap<RawBytes, Arc<HistoryTree>>, HistoryTreeDecodeError> {
+crates/zakura-state/src/service/finalized_state/zakura_db/block.rs:13:    collections::{BTreeMap, HashMap, HashSet},
+crates/zakura-state/src/service/finalized_state/zakura_db/block.rs:870:        let new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = finalized
+crates/zakura-state/src/service/finalized_state/zakura_db/block.rs:960:        let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = spent_utxos
+crates/zakura-state/src/service/finalized_state/zakura_db/block.rs:1353:        new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-state/src/service/finalized_state/zakura_db/block.rs:1355:        spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
+crates/zakura-network/src/zakura/wire_codec/message_suite.rs:26:use std::{collections::BTreeSet, fmt::Debug};
+crates/zakura-network/src/zakura/wire_codec/message_suite.rs:104:    let declared: BTreeSet<u16> = M::RULES.iter().map(|rule| rule.message_type).collect();
+crates/zakura-network/src/zakura/wire_codec/message_suite.rs:105:    let sampled: BTreeSet<u16> = samples.iter().map(WireMessage::message_type).collect();
+crates/zakura-network/src/zakura/transport/message_rule/frame_suite.rs:18:use std::collections::BTreeSet;
+crates/zakura-network/src/zakura/transport/message_rule/frame_suite.rs:80:            let own: BTreeSet<u16> = rows.iter().map(|rule| rule.message_type).collect();
+crates/zakura-state/src/service/finalized_state/vct_treestate_audit.rs:14:    collections::{BTreeMap, BTreeSet},
+crates/zakura-state/src/service/finalized_state/vct_treestate_audit.rs:329:    stored: BTreeMap<(&'static str, NoteCommitmentSubtreeIndex), ([u8; 32], Height)>,
+crates/zakura-state/src/service/finalized_state/vct_treestate_audit.rs:334:    let mut replayed = BTreeSet::new();
+crates/zakura-state/src/service/read/tree.rs:14:use std::{collections::BTreeMap, sync::Arc};
+crates/zakura-state/src/service/read/tree.rs:87:    mut subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:89:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>> {
+crates/zakura-state/src/service/read/tree.rs:91:        return BTreeMap::new();
+crates/zakura-state/src/service/read/tree.rs:97:    let mut contiguous = BTreeMap::new();
+crates/zakura-state/src/service/read/tree.rs:127:    stored: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:145:    subtrees: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:279:    subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:310:    subtrees: &BTreeMap<
+crates/zakura-state/src/service/read/tree.rs:339:    subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+crates/zakura-state/src/service/read/tree.rs:365:    subtrees: &BTreeMap<
+crates/zakura-state/src/service/read/tree.rs:420:    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
+crates/zakura-state/src/service/read/tree.rs:442:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>
+crates/zakura-state/src/service/read/tree.rs:488:    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+crates/zakura-state/src/service/read/tree.rs:510:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>
+crates/zakura-state/src/service/read/tree.rs:552:    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
+crates/zakura-state/src/service/read/tree.rs:574:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>
+crates/zakura-state/src/service/read/tree.rs:611:    subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:613:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>> {
+crates/zakura-state/src/service/read/tree.rs:617:        BTreeMap::new()
+crates/zakura-state/src/service/read/tree.rs:630:) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>
+crates/zakura-state/src/service/read/tree.rs:639:        -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:641:        FnOnce(Range) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/read/tree.rs:650:        return BTreeMap::new();
+crates/zakura-network/src/zakura/testkit/cluster.rs:155:        collections::{BTreeMap, HashMap},
+crates/zakura-network/src/zakura/testkit/cluster.rs:1006:        let by_height: BTreeMap<_, _> = blocks
+crates/zakura-state/src/service/read/tests/vectors.rs:1198:            .collect::<std::collections::BTreeMap<_, _>>()
+crates/zakura-state/src/service/read/tests/vectors.rs:1268:    let merged: std::collections::BTreeMap<_, _> = [0u16, 1, 2, 3]
+crates/zakura-state/src/service/read/tests/vectors.rs:1356:    let mut stored = std::collections::BTreeMap::new();
+crates/zakura-state/src/service/read/tests/vectors.rs:1396:    let mut stored = std::collections::BTreeMap::new();
+crates/zakura-state/src/service/read/tests/vectors.rs:1432:    let mut stored = std::collections::BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/treestate_export.rs:9:    collections::BTreeMap,
+crates/zakura-state/src/service/finalized_state/treestate_export.rs:277:    stored: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+crates/zakura-state/src/service/finalized_state/treestate_export.rs:504:        let mut stored = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/treestate_export.rs:557:                BTreeMap::<
+crates/zakura-state/src/service/read/historical_tree.rs:20:    collections::BTreeMap,
+crates/zakura-state/src/service/read/historical_tree.rs:195:    frontiers: BTreeMap<Height, Arc<DerivedFrontiers>>,
+crates/zakura-state/src/service/read/historical_tree.rs:209:            frontiers: BTreeMap::new(),
+crates/zakura-state/src/service/finalized_state/tests/transparent_indexes.rs:7:    collections::{BTreeMap, HashSet},
+crates/zakura-state/src/service/finalized_state/tests/transparent_indexes.rs:737:            Ok(BTreeMap::new())
+crates/zakura-state/src/service/finalized_state/tests/transparent_indexes.rs:743:            Ok(BTreeMap::new())
+crates/zakura-state/src/service/finalized_state/tests/transparent.rs:14:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/finalized_state/tests/transparent.rs:151:    let new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = BTreeMap::from([
+crates/zakura-state/src/service/finalized_state/tests/transparent.rs:159:    let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = BTreeMap::from([
+crates/zakura-network/src/zakura/regulation/reservations.rs:56:    collections::BTreeMap,
+crates/zakura-network/src/zakura/regulation/reservations.rs:296:    remaining: BTreeMap<u64, usize>,
+crates/zakura-state/src/service/read/address/utxo.rs:15:    collections::{BTreeMap, BTreeSet, HashSet},
+crates/zakura-state/src/service/read/address/utxo.rs:44:    utxos: BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:47:    tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
+crates/zakura-state/src/service/read/address/utxo.rs:62:        utxos: BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:63:        tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
+crates/zakura-state/src/service/read/address/utxo.rs:216:        BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:259:        BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:260:        BTreeSet<OutputLocation>,
+crates/zakura-state/src/service/read/address/utxo.rs:413:    finalized_utxos: BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:414:    created_chain_utxos: BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:415:    spent_chain_utxos: BTreeSet<OutputLocation>,
+crates/zakura-state/src/service/read/address/utxo.rs:416:) -> BTreeMap<OutputLocation, transparent::Output> {
+crates/zakura-state/src/service/read/address/utxo.rs:436:    utxos: &BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/read/address/utxo.rs:437:) -> BTreeMap<TransactionLocation, transaction::Hash>
+crates/zakura-state/src/service/read/address/utxo.rs:442:    let transaction_locations: BTreeSet<TransactionLocation> = utxos
+crates/zakura-state/src/service/read/address/tx_id.rs:15:    collections::{BTreeMap, HashSet},
+crates/zakura-state/src/service/read/address/tx_id.rs:44:) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, BoxError>
+crates/zakura-state/src/service/read/address/tx_id.rs:95:        BTreeMap<TransactionLocation, transaction::Hash>,
+crates/zakura-state/src/service/read/address/tx_id.rs:135:) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, BoxError>
+crates/zakura-state/src/service/read/address/tx_id.rs:285:    finalized_tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
+crates/zakura-state/src/service/read/address/tx_id.rs:286:    chain_tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
+crates/zakura-state/src/service/read/address/tx_id.rs:287:) -> BTreeMap<TransactionLocation, transaction::Hash> {
+crates/zakura-state/src/service/queued_blocks.rs:4:    collections::{hash_map::Drain, BTreeMap, HashMap, HashSet, VecDeque},
+crates/zakura-state/src/service/queued_blocks.rs:54:    by_height: BTreeMap<block::Height, HashSet<block::Hash>>,
+crates/zakura-state/src/service/non_finalized_state.rs:6:    collections::{BTreeSet, HashMap},
+crates/zakura-state/src/service/non_finalized_state.rs:101:    chain_set: BTreeSet<Arc<Chain>>,
+crates/zakura-state/src/service/non_finalized_state.rs:304:        F: FnOnce(&mut BTreeSet<Arc<Chain>>),
+crates/zakura-state/src/service/finalized_state/header_chain.rs:7:    collections::{BTreeSet, HashMap, HashSet},
+crates/zakura-state/src/service/finalized_state/header_chain.rs:509:    let indexed: BTreeSet<_> = indexed_ids.iter().copied().collect();
+crates/zakura-state/src/service/finalized_state/header_chain.rs:510:    let stored: BTreeSet<_> = deliveries
+crates/zakura-state/src/service/finalized_state/header_chain.rs:514:    let durable: BTreeSet<_> = durable_rows
+crates/zakura-state/src/service/finalized_state/header_chain.rs:624:    pub repairs: BTreeSet<RecoveryRepair>,
+crates/zakura-state/src/service/finalized_state/header_chain.rs:4106:    let indexed: BTreeSet<_> = node.aux_delivery_ids.iter().copied().collect();
+crates/zakura-state/src/service/finalized_state/header_chain.rs:4107:    let stored: BTreeSet<_> = deliveries
+crates/zakura-state/src/service/non_finalized_state/tests/vectors.rs:362:/// `BTreeSet::remove(&chain)`, which compared the stored chain against
+crates/zakura-state/src/service/non_finalized_state/tests/vectors.rs:434:/// parent chain whose tip hash matched an existing entry, and `BTreeSet::insert`
+crates/zakura-network/src/zakura/header_sync/v9/publisher.rs:31:    any::Any, collections::BTreeMap, future::Future, num::NonZeroU32, ops::Bound,
+crates/zakura-network/src/zakura/header_sync/v9/publisher.rs:188:    subscriptions: BTreeMap<u64, Subscription>,
+crates/zakura-network/src/zakura/header_sync/v9/publisher.rs:224:            subscriptions: BTreeMap::new(),
+crates/zakura-state/src/service/non_finalized_state/tests/prop.rs:4:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/non_finalized_state/tests/prop.rs:76:        let mut chain_values = BTreeMap::new();
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:3:use std::collections::BTreeSet;
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:88:    pub tried_suppliers: BTreeSet<SourceId>,
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:93:    eligible_suppliers: BTreeSet<SourceId>,
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:102:        eligible_suppliers: BTreeSet<SourceId>,
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:112:            tried_suppliers: BTreeSet::new(),
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:124:        eligible_suppliers: BTreeSet<SourceId>,
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:130:            BTreeSet::new()
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:152:    pub fn refresh_suppliers(&mut self, eligible_suppliers: BTreeSet<SourceId>) -> bool {
+crates/zakura-network/src/zakura/header_sync/scheduler/retry.rs:517:        let mut suppliers: BTreeSet<_> = [first].into_iter().collect();
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:1437:        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:1562:            BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:1773:        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:1809:        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:1866:        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+crates/zakura-state/src/service/finalized_state/header_chain/tests/startup.rs:2339:        BTreeSet::from([
+crates/zakura-state/src/service/non_finalized_state/chain.rs:6:    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+crates/zakura-state/src/service/non_finalized_state/chain.rs:93:    pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:186:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:200:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:204:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:773:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>> {
+crates/zakura-state/src/service/non_finalized_state/chain.rs:972:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>> {
+crates/zakura-state/src/service/non_finalized_state/chain.rs:1043:    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
+crates/zakura-state/src/service/non_finalized_state/chain.rs:1568:        BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:1569:        BTreeSet<OutputLocation>,
+crates/zakura-state/src/service/non_finalized_state/chain.rs:1609:    ) -> BTreeMap<TransactionLocation, transaction::Hash> {
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:4:    collections::{BTreeMap, BTreeSet},
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:42:    created_utxos: BTreeMap<OutputLocation, transparent::Output>,
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:52:    spent_utxos: BTreeSet<OutputLocation>,
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:256:    ) -> BTreeMap<TransactionLocation, transaction::Hash> {
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:279:    pub fn created_utxos(&self) -> &BTreeMap<OutputLocation, transparent::Output> {
+crates/zakura-state/src/service/non_finalized_state/chain/index.rs:286:    pub fn spent_utxos(&self) -> &BTreeSet<OutputLocation> {
+crates/zakura-state/src/service/finalized_state/header_chain/tests/crash/writes.rs:94:                BTreeSet::new()
+crates/zakura-state/src/service/finalized_state/header_chain/tests/crash/writes.rs:96:                BTreeSet::from([RecoveryRepair::SelectedProjection])
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:4:    collections::BTreeMap,
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:21:    chunks: BTreeMap<u32, Arc<Chunk<V>>>,
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:27:/// type than a nested `BTreeMap`.
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:144:            chunks: BTreeMap::new(),
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:453:    fn assert_equal(actual: &HeightMap<u64>, expected: &BTreeMap<Height, u64>) {
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:488:            let mut expected = BTreeMap::new();
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:522:            let mut expected = BTreeMap::new();
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:562:        let mut expected = BTreeMap::new();
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:661:        let mut flat = BTreeMap::new();
+crates/zakura-state/src/service/non_finalized_state/chain/height_map.rs:744:            let expected: BTreeMap<_, _> =
+crates/zakura-state/src/service/non_finalized_state/chain/chunked_height_map_tests.rs:16:        let ordered: BTreeMap<_, _> = heights.iter().map(|height| (Height(*height), ())).collect();
+crates/zakura-state/src/service/non_finalized_state/chain/chunked_height_map_tests.rs:55:                let mut expected_heights: BTreeMap<_, _> = chain
+crates/zakura-state/src/service/non_finalized_state/chain/chunked_height_map_tests.rs:71:                        .collect::<BTreeMap<_, _>>(),
+crates/zakura-state/src/service/non_finalized_state/backup.rs:2:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/non_finalized_state/backup.rs:39:    let mut store: BTreeMap<Height, Vec<SemanticallyVerifiedBlock>> = BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/header_chain/tests/crash/mod.rs:118:        &BTreeSet::new(),
+crates/zakura-state/src/service/finalized_state/header_chain/tests/crash/mod.rs:133:    allowed_startup_repairs: &BTreeSet<RecoveryRepair>,
+crates/zakura-state/src/service/finalized_state/header_chain/tests/crash/deferred.rs:165:        let allowed_startup_repairs = BTreeSet::from([
+crates/zakura-state/src/service/finalized_state/header_chain/fuzz.rs:3:use std::collections::BTreeMap;
+crates/zakura-state/src/service/finalized_state/header_chain/fuzz.rs:359:    let mut unique = BTreeMap::new();
+crates/zakurad/src/components/mempool/peer_cooldown.rs:21:    collections::{BTreeSet, HashMap},
+crates/zakurad/src/components/mempool/peer_cooldown.rs:57:    expirations: BTreeSet<(Instant, IpAddr)>,
+crates/zakurad/src/commands/start/zakura/coordinator.rs:2:    collections::BTreeMap,
+crates/zakurad/src/commands/start/zakura/coordinator.rs:41:    operations: Mutex<BTreeMap<BlockApplyOperationId, BlockApplyOperationRecord>>,
+crates/zakurad/src/commands/start/zakura/coordinator.rs:140:            operations: Mutex::new(BTreeMap::new()),
+crates/zakurad/src/commands/start/zakura/block_sync_driver.rs:2:    collections::{BTreeMap, VecDeque},
+crates/zakurad/src/commands/start/zakura/block_sync_driver.rs:106:    let mut pending_probe_applies = BTreeMap::new();
+crates/zakurad/src/commands/start/zakura/block_sync_driver.rs:1134:    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+crates/zakurad/src/commands/start/zakura/block_sync_driver.rs:1167:    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+crates/zakura-network/src/address_book.rs:5:    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+crates/zakura-network/src/address_book.rs:97:    by_priority: BTreeSet<MetaAddr>,
+crates/zakura-network/src/address_book.rs:261:    // TODO: Replace with `by_ip: HashMap<IpAddr, BTreeMap<DateTime32, MetaAddr>>` to support configured `max_connections_per_ip` greater than 1
+crates/zakura-consensus/tests/nu7_diff_dump.rs:12:    collections::{BTreeMap, BTreeSet},
+crates/zakura-consensus/tests/nu7_diff_dump.rs:449:    let mut cheap_changes = BTreeSet::new();
+crates/zakura-consensus/tests/nu7_diff_dump.rs:464:        let mut v = BTreeSet::new();
+crates/zakura-consensus/tests/nu7_diff_dump.rs:487:    let mut exp_heights = BTreeSet::new();
+crates/zakura-consensus/tests/nu7_diff_dump.rs:764:        let mut times: BTreeMap<u32, i64> = BTreeMap::new();
+crates/zakura-consensus/tests/nu7_diff_dump.rs:765:        let mut bits: BTreeMap<u32, CompactDifficulty> = BTreeMap::new();
+crates/zakura-network/src/zakura/example_reactor/exchange.rs:15:    collections::{BTreeMap, VecDeque},
+crates/zakura-network/src/zakura/example_reactor/exchange.rs:227:    downloads: BTreeMap<Height, Download>,
+crates/zakura-network/src/zakura/example_reactor/exchange.rs:294:            downloads: BTreeMap::new(),
+crates/zakura-consensus/src/checkpoint.rs:17:    collections::BTreeMap,
+crates/zakura-consensus/src/checkpoint.rs:193:    queued: BTreeMap<block::Height, QueuedBlockList>,
+crates/zakura-consensus/src/checkpoint.rs:335:            queued: BTreeMap::new(),
+crates/zakura-consensus/src/checkpoint/tests.rs:72:        let checkpoints = BTreeMap::from([
+crates/zakura-consensus/src/checkpoint/tests.rs:223:        BTreeMap::from([(block::Height(0), hash)]),
+crates/zakura-consensus/src/checkpoint/tests.rs:289:            BTreeMap::from([(block::Height(0), hash)]),
+crates/zakura-consensus/src/checkpoint/tests.rs:321:    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-consensus/src/checkpoint/tests.rs:419:    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
+crates/zakura-consensus/src/checkpoint/tests.rs:821:    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_list
+crates/zakura-consensus/src/checkpoint/tests.rs:993:    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-consensus/src/checkpoint/tests.rs:1085:    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-consensus/src/checkpoint/tests.rs:1307:    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
+crates/zakura-consensus/src/checkpoint/tests.rs:1514:    let checkpoint_list: BTreeMap<block::Height, block::Hash> = [0usize, 3, 6, 10]
+crates/zakura-consensus/src/checkpoint/tests.rs:1647:    let checkpoints: BTreeMap<_, _> = [0usize, 3, 6, 10]
+crates/zakura-consensus/src/checkpoint/tests.rs:1740:    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+crates/zakura-consensus/src/checkpoint/tests.rs:1813:    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+crates/zakura-consensus/src/checkpoint/tests.rs:1931:    let checkpoints = BTreeMap::from([initial_tip, (block::Height(1), block.hash())]);
+crates/zakura-header-chain/src/transition/recovery/tests/repair.rs:3:use std::collections::BTreeSet;
+crates/zakura-header-chain/src/transition/recovery/tests/repair.rs:49:        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+crates/zakura-header-chain/src/transition/recovery/tests/repair.rs:113:        BTreeSet::from([RecoveryRepair::BodyAvailabilityAlarm])
+crates/zakura-header-chain/src/transition/recovery/tests/repair.rs:134:        BTreeSet::from([RecoveryRepair::RetentionMetadata])
+crates/zakura-header-chain/src/transition/recovery/tests/repair.rs:201:        BTreeSet::from([
+crates/zakura-consensus/benches/halo2.rs:32:use std::{collections::BTreeMap, hint::black_box, sync::Arc};
+crates/zakura-consensus/benches/halo2.rs:144:    let mut items_by_action_count = BTreeMap::new();
+crates/zakura-consensus/benches/halo2.rs:167:    let mut inputs_by_action_count = BTreeMap::new();
+crates/zakura-header-chain/src/transition/recovery/repair.rs:3:use std::collections::BTreeSet;
+crates/zakura-header-chain/src/transition/recovery/repair.rs:37:    let mut repairs = BTreeSet::new();
+crates/zakura-header-chain/src/transition/recovery/repair.rs:133:    repairs: &mut BTreeSet<RecoveryRepair>,
+crates/zakura-header-chain/src/transition/recovery/contracts.rs:3:use std::{collections::BTreeSet, sync::Arc};
+crates/zakura-header-chain/src/transition/recovery/contracts.rs:283:    pub repairs: BTreeSet<RecoveryRepair>,
+crates/zakura-header-chain/src/transition/planner/retention.rs:3:use std::collections::{BTreeSet, HashSet};
+crates/zakura-header-chain/src/transition/planner/retention.rs:147:    permanently_ineligible_roots: BTreeSet<(block::Height, [u8; 32])>,
+crates/zakura-header-chain/src/transition/planner/retention.rs:148:    eligible_header_tips: BTreeSet<crate::ChainScore>,
+crates/zakura-header-chain/src/transition/planner/retention.rs:149:    header_leaves: BTreeSet<crate::ChainScore>,
+crates/zakura-header-chain/src/transition/planner/retention.rs:155:        let mut permanently_ineligible_roots = BTreeSet::new();
+crates/zakura-header-chain/src/transition/planner/retention.rs:156:        let mut eligible_header_tips = BTreeSet::new();
+crates/zakura-header-chain/src/transition/planner/retention.rs:157:        let mut header_leaves = BTreeSet::new();
+crates/zakura-header-chain/src/transition/planner/projected_state.rs:9:    collections::{BTreeSet, HashMap, HashSet},
+crates/zakura-header-chain/src/transition/planner/projected_state.rs:389:        let mut queue = BTreeSet::new();
+crates/zakura-header-chain/src/graph/overlay.rs:1:use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+crates/zakura-header-chain/src/graph/overlay.rs:843:        let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
+crates/zakura-header-chain/src/graph/mod.rs:4:    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+crates/zakura-header-chain/src/graph/mod.rs:551:        let direct_reasons: BTreeSet<EligibilityReason> = direct_reasons.into_iter().collect();
+crates/zakura-header-chain/src/graph/mod.rs:1512:    use std::collections::BTreeSet;
+crates/zakura-header-chain/src/graph/mod.rs:1760:        direct_reasons: BTreeSet<EligibilityReason>,
+crates/zakura-header-chain/src/graph/mod.rs:1777:                direct_reasons: BTreeSet::new(),
+crates/zakura-header-chain/src/graph/mod.rs:1799:                    direct_reasons: BTreeSet::new(),
+crates/zakura-chain/src/tests/vectors.rs:4:use std::{collections::BTreeMap, ops::RangeBounds};
+crates/zakura-chain/src/tests/vectors.rs:84:    /// Returns blocks indexed by height in a [`BTreeMap`].
+crates/zakura-chain/src/tests/vectors.rs:87:    pub fn block_map(&self) -> BTreeMap<u32, &'static [u8]> {
+crates/zakura-chain/src/tests/vectors.rs:125:    pub fn blockchain_map(&self) -> &BTreeMap<u32, &'static [u8]> {
+crates/zakura-chain/src/tests/vectors.rs:133:    /// Returns a [`BTreeMap`] of heights and Sapling anchors for this network.
+crates/zakura-chain/src/tests/vectors.rs:134:    pub fn sapling_anchors(&self) -> std::collections::BTreeMap<u32, &[u8; 32]> {
+crates/zakura-chain/src/tests/vectors.rs:142:    /// Returns a [`BTreeMap`] of heights and Orchard anchors for this network.
+crates/zakura-chain/src/tests/vectors.rs:143:    pub fn orchard_anchors(&self) -> std::collections::BTreeMap<u32, &[u8; 32]> {
+crates/zakura-chain/src/tests/vectors.rs:155:        &std::collections::BTreeMap<u32, &'static [u8]>,
+crates/zakura-chain/src/tests/vectors.rs:156:        &std::collections::BTreeMap<u32, &'static [u8; 32]>,
+crates/zakura-chain/src/tests/vectors.rs:188:        &std::collections::BTreeMap<u32, &'static [u8]>,
+crates/zakura-chain/src/tests/vectors.rs:189:        &std::collections::BTreeMap<u32, &'static [u8; 32]>,
+crates/zakura-header-chain/src/graph/header_node.rs:3:use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
+crates/zakura-header-chain/src/graph/header_node.rs:192:    pub direct_reasons: BTreeSet<EligibilityReason>,
+crates/zakura-header-chain/src/graph/header_node.rs:276:    pub fn supplier_set_digest(suppliers: &BTreeSet<SourceId>) -> [u8; 32] {
+crates/zakura-header-chain/src/config.rs:4:    collections::BTreeMap,
+crates/zakura-header-chain/src/config.rs:82:pub struct CheckpointSet(BTreeMap<block::Height, block::Hash>);
+crates/zakura-header-chain/src/config.rs:87:        let mut result = BTreeMap::new();
+crates/zakura-header-chain/src/config.rs:362:    let mut pins: BTreeMap<_, _> = local_checkpoints
+crates/zakura-header-chain/src/config.rs:390:    let mut pins_by_height: BTreeMap<block::Height, (block::Hash, &'static str)> = BTreeMap::new();
+crates/zakura-network/src/zakura/block_sync/work_queue.rs:95:    pending: std::collections::BTreeMap<block::Height, WorkItem>,
+crates/zakura-network/src/zakura/block_sync/work_queue.rs:96:    in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
+crates/zakura-network/src/zakura/block_sync/work_queue.rs:191:                pending: std::collections::BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/work_queue.rs:192:                in_flight: std::collections::BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/work_queue.rs:904:        let mut heights: std::collections::BTreeSet<_> = heights.into_iter().collect();
+crates/zakura-chain/src/serialization/bincode_format/tests.rs:5:use std::collections::BTreeMap;
+crates/zakura-chain/src/serialization/bincode_format/tests.rs:45:    map: BTreeMap<u32, String>,
+crates/zakura-chain/src/serialization/bincode_format/tests.rs:121:    assert_eq!(encoded(&BTreeMap::from([(1_u32, true)])), [1, 1, 1]);
+crates/zakura-chain/src/serialization/bincode_format/tests.rs:200:        deserialize::<BTreeMap<u32, u32>>(&huge_length),
+crates/zakura-network/src/zakura/block_sync/tests.rs:4:    collections::{BTreeSet, HashMap},
+crates/zakura-network/src/zakura/block_sync/tests.rs:4620:// reactor's `fill_peer`, and a `BTreeMap` keeps ascending order by construction.
+crates/zakura-network/src/zakura/block_sync/tests.rs:4721:    // A BTreeMap keeps the lowest needed height first regardless of extend order,
+crates/zakura-network/src/zakura/block_sync/tests.rs:5344:            eligible_sources: BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/tests.rs:5375:                eligible_sources: BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/tests.rs:5565:                eligible_sources: BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/tests.rs:5859:                eligible_sources: BTreeSet::new(),
+crates/zakura-chain/src/primitives/zcash_history.rs:8:use std::{collections::BTreeMap, io, sync::Arc};
+crates/zakura-chain/src/primitives/zcash_history.rs:200:        peaks: &BTreeMap<u32, Entry>,
+crates/zakura-chain/src/primitives/zcash_history.rs:201:        extra: &BTreeMap<u32, Entry>,
+crates/zakura-chain/src/primitives/zcash_history.rs:251:        let mut peaks = BTreeMap::new();
+crates/zakura-chain/src/primitives/zcash_history.rs:254:            Tree::new_from_cache(network, network_upgrade, 1, &peaks, &BTreeMap::new())?,
+crates/zakura-chain/src/primitives/zcash_history.rs:275:        let mut peaks = BTreeMap::new();
+crates/zakura-chain/src/primitives/zcash_history.rs:278:            Tree::new_from_cache(network, network_upgrade, 1, &peaks, &BTreeMap::new())?,
+crates/zakura-chain/src/primitives/zcash_history/tests/vectors.rs:264:        &BTreeMap::new(),
+crates/zakura-chain/src/primitives/zcash_history/tests/vectors.rs:265:        &BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:8:    collections::{BTreeMap, BTreeSet},
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:28:    requests: BTreeMap<RequestKey, OutstandingBlockRange>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:29:    by_start: BTreeSet<(block::Height, RequestKey)>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:30:    by_end: BTreeSet<(block::Height, RequestKey)>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:31:    by_deadline: BTreeSet<(Instant, RequestKey)>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:34:    unstarted: BTreeSet<RequestKey>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:36:    charged_for_liveness: BTreeSet<RequestKey>,
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:290:        let starts: BTreeSet<_> = self
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:296:        let ends: BTreeSet<_> = self
+crates/zakura-network/src/zakura/block_sync/state/outstanding.rs:302:        let deadlines: BTreeSet<_> = self
+crates/zakura-chain/src/parameters/network_upgrade.rs:9:use std::collections::{BTreeMap, HashMap};
+crates/zakura-chain/src/parameters/network_upgrade.rs:388:    pub fn activation_list(&self) -> BTreeMap<block::Height, NetworkUpgrade> {
+crates/zakura-chain/src/parameters/network/testnet.rs:4:    collections::{BTreeMap, HashSet},
+crates/zakura-chain/src/parameters/network/testnet.rs:178:impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
+crates/zakura-chain/src/parameters/network/testnet.rs:179:    fn from(activation_heights: &BTreeMap<Height, NetworkUpgrade>) -> Self {
+crates/zakura-chain/src/parameters/network/testnet.rs:210:impl From<BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
+crates/zakura-chain/src/parameters/network/testnet.rs:211:    fn from(value: BTreeMap<Height, NetworkUpgrade>) -> Self {
+crates/zakura-chain/src/parameters/network/testnet.rs:749:    activation_heights: BTreeMap<Height, NetworkUpgrade>,
+crates/zakura-chain/src/parameters/network/testnet.rs:928:        let activation_heights: BTreeMap<_, _> = {
+crates/zakura-chain/src/parameters/network/testnet.rs:955:                .collect::<Result<BTreeMap<_, _>, _>>()?
+crates/zakura-chain/src/parameters/network/testnet.rs:1424:    activation_heights: BTreeMap<Height, NetworkUpgrade>,
+crates/zakura-chain/src/parameters/network/testnet.rs:1642:    pub fn activation_heights(&self) -> &BTreeMap<Height, NetworkUpgrade> {
+crates/zakura-chain/src/parameters/checkpoint/list.rs:9:    collections::{BTreeMap, HashSet},
+crates/zakura-chain/src/parameters/checkpoint/list.rs:101:/// BTreeMap, and do the value uniqueness check on initialisation.
+crates/zakura-chain/src/parameters/checkpoint/list.rs:103:pub struct CheckpointList(BTreeMap<block::Height, block::Hash>);
+crates/zakura-chain/src/parameters/checkpoint/list.rs:136:        // BTreeMap silently ignores duplicates, so we count the checkpoints
+crates/zakura-chain/src/parameters/checkpoint/list.rs:141:        let checkpoints: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list.rs:178:    /// See `BTreeMap::contains_key()` for details.
+crates/zakura-chain/src/parameters/checkpoint/list.rs:186:    /// See `BTreeMap::get()` for details.
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:34:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:63:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:137:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:153:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:172:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-chain/src/parameters/checkpoint/list/tests.rs:181:    let checkpoint_list: BTreeMap<block::Height, block::Hash> =
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:29:use std::collections::BTreeSet;
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:193:        eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:732:        mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:908:        eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:1826:                BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:1933:                    BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:2045:                    BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:2225:                        BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:2325:                BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task.rs:2440:                    BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task/tests/commit_metrics.rs:176:                            BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer_task/tests/commit_metrics.rs:196:                            BTreeSet::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:105:    applying: BTreeMap<block::Height, ApplyingBlock>,
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:106:    submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:107:    in_flight_submissions: BTreeMap<BlockApplyToken, InFlightSubmission>,
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:145:            applying: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:146:            submitted_applies: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/sequencer.rs:147:            in_flight_submissions: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/reorder.rs:5:    blocks: BTreeMap<block::Height, BufferedBlock>,
+crates/zakura-network/src/zakura/block_sync/reorder.rs:13:            blocks: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:22:use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:339:    retry_avoid: BTreeMap<block::Height, Instant>,
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:341:    fill_stop_trace_at: BTreeMap<&'static str, Instant>,
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:450:            retry_avoid: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:451:            fill_stop_trace_at: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/peer_routine.rs:1777:        let mut lost: BTreeMap<RequestKey, Vec<block::Height>> = BTreeMap::new();
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:25:    collections::{BTreeMap, BTreeSet},
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:61:    pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:68:    pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:98:            outstanding: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:100:            floor_watchdog_avoid: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:271:    ) -> BTreeSet<zakura_header_chain::SourceId> {
+crates/zakura-network/src/zakura/block_sync/peer_registry.rs:295:        let sources: std::collections::BTreeSet<_> = sources.into_iter().collect();
+crates/zakura-network/src/zakura/block_sync/regulated/session.rs:3:use std::{collections::BTreeMap, sync::Arc};
+crates/zakura-network/src/zakura/block_sync/regulated/session.rs:147:            ranges: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/regulated/session.rs:155:    ranges: BTreeMap<Height, (Height, CompletionId)>,
+crates/zakura-network/src/zakura/block_sync/mod.rs:8:    collections::BTreeMap,
+crates/zakura-network/src/zakura/block_sync/bench.rs:313:            eligible_sources: std::collections::BTreeSet::new(),
+crates/zakura-chain/src/history_tree.rs:7:    collections::{BTreeMap, HashSet},
+crates/zakura-chain/src/history_tree.rs:104:    peaks: SummaryDebug<BTreeMap<u32, Entry>>,
+crates/zakura-chain/src/history_tree.rs:117:        peaks: BTreeMap<u32, Entry>,
+crates/zakura-chain/src/history_tree.rs:274:        let mut peaks = BTreeMap::new();
+crates/zakura-chain/src/history_tree.rs:511:    pub fn peaks(&self) -> &BTreeMap<u32, Entry> {
+crates/zakura-network/src/zakura/block_sync/regulated/session/tests.rs:8:    collections::BTreeMap,
+crates/zakura-network/src/zakura/block_sync/regulated/session/tests.rs:21:    gates: Mutex<BTreeMap<Height, Arc<Semaphore>>>,
+crates/zakura-network/src/zakura/block_sync/regulated/session/tests.rs:25:    blocks: BTreeMap<Height, Vec<u8>>,
+crates/zakura-network/src/zakura/block_sync/regulated/session/tests.rs:59:fn mainnet_blocks(heights: std::ops::RangeInclusive<u32>) -> BTreeMap<Height, Vec<u8>> {
+crates/zakura-network/src/zakura/block_sync/regulated/requester.rs:4:    collections::{BTreeMap, BTreeSet},
+crates/zakura-network/src/zakura/block_sync/regulated/requester.rs:74:    ranges: BTreeMap<Height, Pending>,
+crates/zakura-network/src/zakura/block_sync/regulated/requester.rs:77:    retiring: BTreeSet<(Instant, Height)>,
+crates/zakura-network/src/zakura/block_sync/regulated/requester.rs:92:            ranges: BTreeMap::new(),
+crates/zakura-network/src/zakura/block_sync/regulated/requester.rs:94:            retiring: BTreeSet::new(),
+crates/zakura-network/src/peer_set/initialize.rs:8:    collections::{BTreeMap, HashMap, HashSet},
+crates/zakura-network/src/peer_set/initialize.rs:718:    let mut preferred_peers: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
+crates/zakura-state/src/response.rs:4:    collections::{BTreeMap, HashSet},
+crates/zakura-state/src/response.rs:605:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
+crates/zakura-state/src/response.rs:611:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+crates/zakura-state/src/response.rs:617:        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
+crates/zakura-state/src/response.rs:631:    AddressesTransactionIds(BTreeMap<TransactionLocation, transaction::Hash>),
+crates/xtask/src/rt_imports.rs:790:            use std::{collections::BTreeMap, sync::Arc};
+crates/zakura-state/src/request.rs:1987:    /// * [`ReadResponse::SaplingSubtree(BTreeMap<_, NoteCommitmentSubtreeData<_>>))`](crate::ReadResponse::SaplingSubtrees)
+crates/zakura-state/src/request.rs:2001:    /// * [`ReadResponse::OrchardSubtree(BTreeMap<_, NoteCommitmentSubtreeData<_>>))`](crate::ReadResponse::OrchardSubtrees)
+crates/zakura-state/src/request.rs:2015:    /// * [`ReadResponse::IronwoodSubtrees(BTreeMap<_, NoteCommitmentSubtreeData<_>>))`](crate::ReadResponse::IronwoodSubtrees)
+crates/xtask/src/header_fuzz.rs:4:    collections::BTreeSet,
+crates/xtask/src/header_fuzz.rs:74:fn artifact_files(directory: &Path) -> Result<BTreeSet<PathBuf>, BoxError> {
+crates/xtask/src/header_fuzz.rs:76:        return Ok(BTreeSet::new());
+crates/xtask/src/header_fuzz.rs:78:    let mut files = BTreeSet::new();
+crates/xtask/src/header_fuzz.rs:88:fn find_minimized(directory: &Path, before: &BTreeSet<PathBuf>) -> Result<PathBuf, BoxError> {
+crates/xtask/src/header_conformance.rs:2:    collections::{BTreeMap, BTreeSet},
+crates/xtask/src/header_conformance.rs:98:    rules: BTreeMap<String, RuleReport>,
+crates/xtask/src/header_conformance.rs:99:    audit_ids: BTreeSet<String>,
+crates/xtask/src/header_conformance.rs:180:        .collect::<BTreeSet<_>>();
+crates/xtask/src/header_conformance.rs:192:    let mut manifest_rules = BTreeMap::new();
+crates/xtask/src/header_conformance.rs:203:    let spec_ids = spec_rules.keys().cloned().collect::<BTreeSet<_>>();
+crates/xtask/src/header_conformance.rs:206:    let manifest_ids = manifest_rules.keys().cloned().collect::<BTreeSet<_>>();
+crates/xtask/src/header_conformance.rs:209:    let mut rules = BTreeMap::new();
+crates/xtask/src/header_conformance.rs:248:fn parse_spec_rules(spec: &str) -> Result<BTreeMap<String, SpecRule>, ValidationError> {
+crates/xtask/src/header_conformance.rs:249:    let mut rules = BTreeMap::new();
+crates/xtask/src/header_conformance.rs:290:fn parse_audit_ids(spec: &str) -> Result<BTreeSet<String>, ValidationError> {
+crates/xtask/src/header_conformance.rs:291:    let mut audit_ids = BTreeSet::new();
+crates/xtask/src/header_conformance.rs:315:fn parse_rule_matrix_ids(spec: &str) -> Result<BTreeSet<String>, ValidationError> {
+crates/xtask/src/header_conformance.rs:328:    let mut ids = BTreeSet::new();
+crates/xtask/src/header_conformance.rs:423:    let mut unique = BTreeSet::new();
+crates/xtask/src/header_conformance.rs:462:        let mut unique = BTreeSet::new();
+crates/xtask/src/header_conformance.rs:558:        .collect::<BTreeSet<_>>();
+crates/xtask/src/header_conformance.rs:563:        .collect::<BTreeSet<_>>();
+crates/xtask/src/header_conformance.rs:670:) -> Result<BTreeMap<String, Vec<PathBuf>>, ValidationError> {
+crates/xtask/src/header_conformance.rs:677:) -> Result<BTreeMap<String, Vec<PathBuf>>, ValidationError> {
+crates/xtask/src/header_conformance.rs:678:    let mut tests: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+crates/xtask/src/header_conformance.rs:856:    expected: &BTreeSet<String>,
+crates/xtask/src/header_conformance.rs:857:    actual: &BTreeSet<String>,
+crates/zakura-state/src/service/finalized_state/column_family.rs:8:    collections::{BTreeMap, HashMap},
+crates/zakura-state/src/service/finalized_state/column_family.rs:237:    /// Returns the keys and values in this column family in `range`, in an ordered `BTreeMap`.
+crates/zakura-state/src/service/finalized_state/column_family.rs:240:    pub fn zs_items_in_range_ordered<Range>(&self, range: Range) -> BTreeMap<Key, Value>
+crates/zakura-state/src/service/finalized_state/commitment_aux_verify.rs:1075:        let mut epoch_ends = std::collections::BTreeMap::new();
+crates/zakura-state/src/service/finalized_state/disk_db.rs:14:    collections::{BTreeMap, HashMap, HashSet},
+crates/zakura-state/src/service/finalized_state/disk_db.rs:412:    /// Returns the keys and values in `cf` in `range`, in an ordered `BTreeMap`.
+crates/zakura-state/src/service/finalized_state/disk_db.rs:415:    fn zs_items_in_range_ordered<C, K, V, R>(&self, cf: &C, range: R) -> BTreeMap<K, V>
+crates/zakura-state/src/service/finalized_state/disk_db.rs:602:    fn zs_items_in_range_ordered<C, K, V, R>(&self, cf: &C, range: R) -> BTreeMap<K, V>
+crates/zakura-state/src/service/finalized_state/disk_format/chain/tests.rs:105:        peaks: BTreeMap::from([
+crates/zakura-state/src/service/finalized_state/disk_format/chain/tests.rs:142:        peaks: BTreeMap::from([
+crates/zakura-state/src/service/finalized_state/disk_format/chain/tests.rs:192:        peaks: BTreeMap::from([(
+crates/zakura-state/src/service/finalized_state/disk_format/chain/tests.rs:249:        peaks: BTreeMap::new(),
+crates/zakura-state/src/service/finalized_state/disk_format/chain/tests.rs:265:        peaks: BTreeMap::from([(
+crates/zakura-state/src/service/finalized_state/disk_format/chain.rs:8:use std::collections::BTreeMap;
+crates/zakura-state/src/service/finalized_state/disk_format/chain.rs:81:    peaks: BTreeMap<u32, zcash_history::Entry>,
+crates/zakura-state/src/service/finalized_state/disk_format/chain.rs:154:    peaks: BTreeMap<u32, LegacyEntry>,
+crates/zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs:30:use std::{collections::BTreeMap, sync::Arc};
+crates/zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs:125:        let cf_items: BTreeMap<RawBytes, RawBytes> = db.zs_items_in_range_ordered(&cf_handle, ..);

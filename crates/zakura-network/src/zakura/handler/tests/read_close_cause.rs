@@ -393,9 +393,9 @@ async fn request_reader_records_each_cause() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The reader records after forwarding, and the worker records on receipt. A
-/// current-thread runtime lets the reader record first. A multi-thread runtime
-/// lets either one win. Both must give the same cause.
+/// The reader records right after forwarding, so it records first on either
+/// runtime, and the worker's record is a no-op here.
+/// `ordered_worker_closes_each_forwarded_error` pins the worker's cause.
 #[test]
 fn reader_and_worker_record_one_cause() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
@@ -413,6 +413,45 @@ fn reader_and_worker_record_one_cause() -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+/// The worker's close for each error its reader forwards: the reset code and
+/// the cause it records. The reader wins the race to record in the tests
+/// above, so only this test pins the worker's side.
+#[test]
+fn ordered_worker_closes_each_forwarded_error() {
+    use zakura_quic::{ConnectionError, ReadError, ReadExactError};
+
+    let lost = || ReadExactError::ReadError(ReadError::ConnectionLost(ConnectionError::TimedOut));
+    let cases = [
+        (
+            ZakuraHandlerError::Oversize,
+            Some((ZAKURA_CLOSE_OVERSIZE, "ordered_oversize")),
+        ),
+        (
+            ZakuraHandlerError::RateLimited,
+            Some((ZAKURA_CLOSE_RATE_LIMIT, "ordered_rate_limited")),
+        ),
+        (
+            ZakuraHandlerError::RejectedFrame {
+                message_type: UNKNOWN_TYPE,
+                rejection: FrameRejection::UnknownMessageType,
+            },
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_rejected")),
+        ),
+        (
+            ZakuraHandlerError::Timeout("frame header"),
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_timeout")),
+        ),
+        (
+            ZakuraHandlerError::QuicRead(lost()),
+            Some((ZAKURA_CLOSE_BAD_PRELUDE, "ordered_read_transport")),
+        ),
+        (ZakuraHandlerError::Closed, None),
+    ];
+    for (error, close) in &cases {
+        assert_eq!(ordered_read_close(error), *close, "{error:?}");
+    }
 }
 
 /// Read errors reset and cancel as on `main`. This pins the current-thread

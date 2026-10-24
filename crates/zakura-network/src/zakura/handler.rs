@@ -4929,31 +4929,18 @@ async fn persistent_stream_worker_with_policy(
                 }
             }
             error = error_rx.recv() => {
-                match error {
-                    Some(error @ ZakuraHandlerError::Oversize) => {
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
+                if let Some(error) = error {
+                    if let Some((code, cause)) = ordered_read_close(&error) {
+                        // The reader already emitted any oversize-desync diagnostic.
+                        if code == ZAKURA_CLOSE_BAD_PRELUDE {
+                            debug!(?error, "closing Zakura stream worker");
+                        }
+                        let _ = send.reset(VarInt::from_u32(code));
+                        context.close_cause.record(cause);
                         context.connection_token.cancel();
-                        break;
-                    }
-                    Some(error @ ZakuraHandlerError::RateLimited) => {
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
-                        context.connection_token.cancel();
-                        break;
-                    }
-                    Some(ZakuraHandlerError::Closed) | None => {
-                        break;
-                    }
-                    // The reader already emitted any oversize-desync diagnostic.
-                    Some(error) => {
-                        debug!(?error, "closing Zakura stream worker");
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
-                        context.connection_token.cancel();
-                        break;
                     }
                 }
+                break;
             }
         }
     }
@@ -4969,6 +4956,19 @@ async fn persistent_stream_worker_with_policy(
     reader.abort();
     // Keep the stream permit until the reader has actually dropped its buffers.
     let _ = reader.await;
+}
+
+/// How the ordered worker closes on an error its reader forwarded: the
+/// stream's reset code and the close cause to record. `None` is a clean
+/// close, which resets and records nothing.
+fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)> {
+    let code = match error {
+        ZakuraHandlerError::Closed => return None,
+        ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
+        ZakuraHandlerError::RateLimited => ZAKURA_CLOSE_RATE_LIMIT,
+        _ => ZAKURA_CLOSE_BAD_PRELUDE,
+    };
+    Some((code, read_close_cause(ReadPath::Ordered, error)))
 }
 
 /// The frame reader that hit a read error.

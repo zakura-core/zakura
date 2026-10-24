@@ -427,66 +427,121 @@ fn the_reserve_slot_boundary_is_4000_headers() {
     ));
 }
 
-/// The continuation cache: a matching acquire continues from the cached
-/// cursor, any mismatch drops it, a full cache evicts its lowest lease ID,
-/// and a late release of a consumed handle can't end its replacement.
+/// The headers of `reply`'s page, by hash.
+fn page_hashes(reply: Result<ReadPathReply, PortError>) -> (Vec<block::Hash>, bool) {
+    let page = page(reply);
+    (
+        page.headers.iter().map(|h| h.hash()).collect(),
+        page.complete,
+    )
+}
+
+/// The continuation cache. A matching acquire continues from the cached
+/// cursor. A session, target or locator mismatch drops the cursor and walks
+/// the graph instead, which shows in the lease each one gets. A full cache
+/// evicts its lowest lease ID, and a late release of a consumed handle can't
+/// end its replacement.
 #[test]
 fn the_continuation_cache_matches_production() {
     let (port, main, _) = chain();
     let anchor = HeaderFixture::regtest().anchor();
+    // Peer `n` leases toward the main tip from the anchor and reads one
+    // header, so its cached cursor stops at main[0] toward main[4].
     let consume = |n: u8| {
         let path = acquired(acquire(&port, peer(n), main[4].hash, vec![anchor.hash]));
         page(read(&port, &path, anchor.hash, 1));
         path
     };
 
-    // Session, target and locator mismatches each drop the continuation.
+    // A session mismatch walks the graph. A walk from main[0] builds the
+    // same lease a continuation would, so the hit count is the witness.
     consume(1);
-    let wrong_session = AcquirePath {
+    let hits = port.continuation_hits();
+    let wrong_session = acquired(ready(port.acquire_header_path(AcquirePath {
         source: peer(1),
         session_id: 2,
         scope: HeaderWorkAuthority::for_target(&port.snapshot(), main[4].hash),
         target_tip_hash: main[4].hash,
         locator_hashes: vec![main[0].hash],
-    };
-    let fresh = acquired(ready(port.acquire_header_path(wrong_session)));
+    })));
+    assert_eq!(
+        port.continuation_hits(),
+        hits,
+        "the session mismatch walked"
+    );
+    assert_eq!(
+        (wrong_session.common_ancestor, wrong_session.target),
+        (main[0], main[4])
+    );
     assert!(!port.continued_peers().contains(&peer(1)));
-    ready(port.release_header_path(fresh)).expect("a release succeeds");
+    ready(port.release_header_path(wrong_session)).expect("a release succeeds");
+
+    // A target mismatch gets the requested target. Reusing the cursor
+    // would give main[4].
     consume(1);
     let wrong_target = acquired(acquire(&port, peer(1), main[3].hash, vec![main[0].hash]));
+    assert_eq!(port.continuation_hits(), hits);
+    assert_eq!(
+        (wrong_target.common_ancestor, wrong_target.target),
+        (main[0], main[3])
+    );
+    assert_eq!(
+        page_hashes(read(&port, &wrong_target, main[0].hash, 10)),
+        (vec![main[1].hash, main[2].hash, main[3].hash], true)
+    );
     assert!(!port.continued_peers().contains(&peer(1)));
-    ready(port.release_header_path(wrong_target)).expect("a release succeeds");
+
+    // A locator that isn't the cursor's last header starts from that
+    // locator. Reusing the cursor would start after main[0].
     consume(1);
     let wrong_locator = acquired(acquire(&port, peer(1), main[4].hash, vec![anchor.hash]));
-    assert!(!port.continued_peers().contains(&peer(1)));
-    ready(port.release_header_path(wrong_locator)).expect("a release succeeds");
+    assert_eq!(port.continuation_hits(), hits);
+    assert_eq!(
+        (wrong_locator.common_ancestor, wrong_locator.target),
+        (anchor, main[4])
+    );
+    assert_eq!(
+        page_hashes(read(&port, &wrong_locator, anchor.hash, 1)),
+        (vec![main[0].hash], false)
+    );
+    assert!(
+        port.continued_peers().contains(&peer(1)),
+        "the read cached a new cursor"
+    );
 
-    // A matching acquire continues, and the late release of the consumed
-    // handle doesn't end the new lease.
-    let old = consume(1);
-    assert!(port.continued_peers().contains(&peer(1)));
-    let next = acquired(acquire(&port, peer(1), main[4].hash, vec![main[0].hash]));
-    assert_eq!(next.common_ancestor, main[0]);
-    assert!(!port.continued_peers().contains(&peer(1)));
+    // A matching acquire continues: it's a hit, and it serves the rest of
+    // the cached path. The late release of the consumed handle doesn't end
+    // the new lease.
+    let old = acquired(acquire(&port, peer(1), main[4].hash, vec![main[0].hash]));
+    assert_eq!(port.continuation_hits(), hits + 1, "the match continued");
+    assert_eq!((old.common_ancestor, old.target), (main[0], main[4]));
+    page(read(&port, &old, main[0].hash, 1));
+    let next = acquired(acquire(&port, peer(1), main[4].hash, vec![main[1].hash]));
+    assert_eq!(port.continuation_hits(), hits + 2);
     ready(port.release_header_path(old)).expect("a stale release succeeds");
     assert_eq!(
         port.live_leases(),
         1,
         "the stale release left the new lease"
     );
-    page(read(&port, &next, main[0].hash, 10));
+    assert_eq!(
+        page_hashes(read(&port, &next, main[1].hash, 10)),
+        (vec![main[2].hash, main[3].hash, main[4].hash], true)
+    );
 
-    // Seventeen continuations: the cache keeps 16 and evicts the lowest ID.
-    for n in 1..=17 {
+    // Seventeen continuations, made in descending peer order, so lease IDs
+    // rise as peer IDs fall. The cache keeps 16 and evicts the lowest lease
+    // ID, which is peer 17's, not the lowest peer.
+    for n in (1..=17).rev() {
         consume(n);
     }
     let cached = port.continued_peers();
     assert_eq!(cached.len(), MAX_RETAINED_PATH_LEASES);
     assert!(
-        !cached.contains(&peer(1)),
-        "peer 1 held the lowest lease ID"
+        !cached.contains(&peer(17)),
+        "peer 17 held the lowest lease ID"
     );
-    assert!(cached.contains(&peer(17)));
+    assert!(cached.contains(&peer(1)), "the lowest peer stays");
 }
 
 /// A read sweeps every expired lease and fires their signals, and a page

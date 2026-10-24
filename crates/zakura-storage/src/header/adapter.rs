@@ -161,6 +161,14 @@ impl EnginePort {
         self.leases().continued()
     }
 
+    /// How many acquires continued from a cached cursor instead of walking
+    /// the graph. A continuation's lease is the one a walk would build, so
+    /// this count is the only place the difference shows. Production keeps
+    /// no such count.
+    pub fn continuation_hits(&self) -> u64 {
+        self.leases().continuation_hits()
+    }
+
     /// Leases the path toward `request`'s target, as
     /// `HeaderChainReader::acquire_retained_path` does above finality.
     fn acquire(&self, request: AcquirePath) -> Result<AcquirePathReply, PortError> {
@@ -202,6 +210,7 @@ impl EnginePort {
                         == Capacity::Bounded)
         });
         if let Some(cursor) = continuation {
+            leases.record_continuation();
             return Ok(self.commit_lease(
                 &engine,
                 &mut leases,

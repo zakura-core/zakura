@@ -4829,11 +4829,12 @@ async fn persistent_stream_worker_with_policy(
                 }
             };
             // Any error is terminal. `Closed` is a clean peer-initiated close;
-            // every other error is a protocol/limit violation that must
-            // disconnect the peer. Forward the error first so the main loop can
-            // map it to a reset code, then cancel the connection ourselves so
-            // the disconnect is guaranteed even if the main loop tore the worker
-            // down for a stopped outbound write before processing it.
+            // every other error must disconnect the peer, under the cause
+            // `read_close_cause` gives it. Forward the error first so the main
+            // loop can map it to a reset code, then cancel the connection
+            // ourselves so the disconnect is guaranteed even if the main loop
+            // tore the worker down for a stopped outbound write before
+            // processing it.
             let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
             if !must_disconnect && !reader_context.stream_token.is_cancelled() {
                 if let Some(cause) = &reader_failure_cause {
@@ -4842,9 +4843,10 @@ async fn persistent_stream_worker_with_policy(
                     cause.record(OrderedStreamFailure::RemoteClose);
                 }
             }
+            let cause = read_close_cause(ReadPath::Ordered, &error);
             let _ = error_tx.send(error).await;
             if must_disconnect {
-                reader_context.close_cause.record("ordered_read_error");
+                reader_context.close_cause.record(cause);
                 reader_context.connection_token.cancel();
             }
             break;
@@ -4928,15 +4930,15 @@ async fn persistent_stream_worker_with_policy(
             }
             error = error_rx.recv() => {
                 match error {
-                    Some(ZakuraHandlerError::Oversize) => {
+                    Some(error @ ZakuraHandlerError::Oversize) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-                        context.close_cause.record("ordered_oversize");
+                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
                         context.connection_token.cancel();
                         break;
                     }
-                    Some(ZakuraHandlerError::RateLimited) => {
+                    Some(error @ ZakuraHandlerError::RateLimited) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-                        context.close_cause.record("ordered_rate_limited");
+                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
                         context.connection_token.cancel();
                         break;
                     }
@@ -4947,7 +4949,7 @@ async fn persistent_stream_worker_with_policy(
                     Some(error) => {
                         debug!(?error, "closing Zakura stream worker");
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                        context.close_cause.record("ordered_read_error");
+                        context.close_cause.record(read_close_cause(ReadPath::Ordered, &error));
                         context.connection_token.cancel();
                         break;
                     }
@@ -4967,6 +4969,46 @@ async fn persistent_stream_worker_with_policy(
     reader.abort();
     // Keep the stream permit until the reader has actually dropped its buffers.
     let _ = reader.await;
+}
+
+/// The frame reader that hit a read error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadPath {
+    /// The reader of a persistent ordered stream.
+    Ordered,
+    /// The responder reading a request stream's one request frame.
+    Request,
+}
+
+/// The close cause for a frame-read error on `path`.
+///
+/// Only the `*_read_rejected` causes are peer faults: the frame broke its
+/// stream's table or frame cap, or ended before its declared length. Timeout
+/// and transport causes are neutral, and every unlisted error (such as `Io`)
+/// is transport. A request stream that closes before its request frame ends is
+/// transport too. The ordered path never records `Closed`, which is a clean close.
+///
+/// The ordered reader and its worker race to record one error, and
+/// [`CloseCause`] keeps the first writer, so both record through this. That
+/// includes the reader's admission failures, which keep their own causes.
+fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str {
+    use zakura_quic::ReadExactError::FinishedEarly;
+    use ZakuraHandlerError::*;
+
+    let rejected = matches!(
+        error,
+        RejectedFrame { .. } | OversizeFrame { .. } | QuicRead(FinishedEarly(_))
+    );
+    match (path, error) {
+        (ReadPath::Ordered, Oversize) => "ordered_oversize",
+        (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
+        (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
+        (ReadPath::Request, _) if rejected => "request_read_rejected",
+        (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
+        (ReadPath::Request, Timeout(_)) => "request_read_timeout",
+        (ReadPath::Ordered, _) => "ordered_read_transport",
+        (ReadPath::Request, _) => "request_read_transport",
+    }
 }
 
 fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
@@ -5013,7 +5055,9 @@ async fn request_stream_worker(
                 "closing Zakura request stream with invalid request frame"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.close_cause.record("request_read_error");
+            context
+                .close_cause
+                .record(read_close_cause(ReadPath::Request, &error));
             context.connection_token.cancel();
             return;
         }
@@ -6457,6 +6501,7 @@ mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
+    mod read_close_cause;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;
     use crate::{

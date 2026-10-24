@@ -13,13 +13,14 @@ categories = ["development-tools::testing"]
 publish = false
 
 [dependencies]
+chrono = { workspace = true }
+sha2 = { workspace = true }
 zakura-chain = { path = "../zakura-chain" }
 zakura-header-chain = { path = "../zakura-header-chain" }
 zakura-node-services = { path = "../zakura-node-services" }
+zakura-rt = { path = "../zakura-rt" }
 
 [dev-dependencies]
-chrono = { workspace = true }
-zakura-rt = { path = "../zakura-rt" }
 zakura-test = { path = "../zakura-test" }
 
 [lints]

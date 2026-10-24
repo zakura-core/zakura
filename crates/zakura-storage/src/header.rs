@@ -201,6 +201,8 @@ use zakura_node_services::header_chain::{
     ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
 
+pub mod adapter;
+pub mod fixture;
 #[cfg(test)]
 mod tests;
 

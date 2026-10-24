@@ -3537,11 +3537,13 @@ dependencies = [
  "tempfile",
  "tokio-stream",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-network",
  "zakura-node-services",
  "zakura-quic",
  "zakura-rt",
  "zakura-scheduler",
+ "zakura-storage",
 ]
 
 [[package]]
@@ -3601,6 +3603,7 @@ name = "zakura-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "sha2",
  "zakura-chain",
  "zakura-header-chain",
  "zakura-node-services",

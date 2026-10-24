@@ -105,6 +105,8 @@ pub(super) struct Registry {
     /// Consumed cursors kept so a peer's next page needs no new walk. They
     /// hold no capacity.
     continuations: BTreeMap<SourceId, Cursor>,
+    /// How many acquires continued from a cached cursor.
+    continuation_hits: u64,
 }
 
 impl Registry {
@@ -191,9 +193,15 @@ impl Registry {
         AcquirePathReply::CapacityBusy(signal)
     }
 
-    /// Takes `peer`'s continuation, if it has one.
+    /// Takes `peer`'s continuation, if it has one. A caller that then
+    /// rejects it drops it, as production does.
     pub(super) fn take_continuation(&mut self, peer: SourceId) -> Option<Cursor> {
         self.continuations.remove(&peer)
+    }
+
+    /// Counts an acquire that continued from a cached cursor.
+    pub(super) fn record_continuation(&mut self) {
+        self.continuation_hits = self.continuation_hits.saturating_add(1);
     }
 
     /// Installs `peer`'s lease, as `commit_reservation` does. Returns its
@@ -309,5 +317,10 @@ impl Registry {
     /// The peers with a cached continuation, in peer order.
     pub(super) fn continued(&self) -> Vec<SourceId> {
         self.continuations.keys().copied().collect()
+    }
+
+    /// How many acquires continued from a cached cursor.
+    pub(super) fn continuation_hits(&self) -> u64 {
+        self.continuation_hits
     }
 }

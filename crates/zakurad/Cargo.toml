@@ -234,6 +234,10 @@ zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["prop
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "4.0.0" }
+# The simulator's engine-backed header port, compared against
+# HeaderChainServicePort in its tests. Path-only, with no version, because
+# zakura-storage is never published, so packaging drops it.
+zakura-storage = { path = "../zakura-storage" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["rpc-client"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature

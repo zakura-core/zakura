@@ -2886,6 +2886,7 @@ dependencies = [
  "zakura-rpc",
  "zakura-script",
  "zakura-state",
+ "zakura-storage",
  "zakura-test",
  "zakura-utils",
  "zcash_script",

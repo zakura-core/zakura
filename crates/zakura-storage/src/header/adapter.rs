@@ -9,12 +9,11 @@
 //! above it. Above finality, production reads its database only to mirror the
 //! engine, so this adapter reads the engine directly.
 //!
-//! Each operation runs when its future is first polled. When and how the run
-//! completes it is the operation lifecycle's job, on top of this adapter.
-//! Two parts are narrower than production. `vct_repair_context` always
-//! answers `Stale`, since a simulation has no repair to resolve. Retained-path
-//! serving is not built yet, so `acquire_header_path`, `read_header_path` and
-//! `release_header_path` answer `Unavailable`.
+//! Each operation runs when its future is first polled, atomically under the
+//! engine and lease locks. When and how the run completes it is the
+//! operation lifecycle's job, on top of this adapter. `vct_repair_context` is
+//! narrower than production: it always answers `Stale`, since a simulation
+//! has no repair to resolve. Retained paths follow [`super::lease`].
 
 use std::sync::Arc;
 
@@ -35,11 +34,17 @@ use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetOutcome, ApplyHeaderTargetReply,
     HeaderChainFuture, LocatorReadPermit, Port, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath, ReadPathReply, RetainedHeaderPath,
-    SelectedChainMembership, TargetEntry, VctRepairContextReply,
+    RetainedHeaderPathPage, SelectedChainMembership, TargetEntry, VctRepairContextReply,
 };
-use zakura_rt::sync::{watch, Mutex, MutexGuard, PoisonError};
+use zakura_rt::{
+    sync::{watch, Mutex, MutexGuard, PoisonError},
+    time::Instant,
+};
 
-use super::fixture::{HeaderFixture, ScenarioClock};
+use super::{
+    fixture::{HeaderFixture, ScenarioClock},
+    lease::{Capacity, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
+};
 
 /// A header-chain port over one in-memory engine. A requester and a
 /// publisher sharing one `Arc<EnginePort>` see the same committed state.
@@ -48,6 +53,7 @@ pub struct EnginePort {
     key: AdapterKey,
     config: EngineConfig,
     engine: Mutex<HeaderChainEngine>,
+    leases: Mutex<Registry>,
     /// The committed snapshot. Apply sends on it while it holds the
     /// engine lock, so no consumer may hold a borrow of this watch while it
     /// takes the engine lock, or the two would deadlock.
@@ -114,6 +120,7 @@ impl EnginePort {
             key: AdapterKey::new(),
             config,
             engine: Mutex::new(engine),
+            leases: Mutex::new(Registry::default()),
             selected,
         }
     }
@@ -134,6 +141,300 @@ impl EnginePort {
     /// leaves the engine unchanged on error.
     fn engine(&self) -> MutexGuard<'_, HeaderChainEngine> {
         self.engine.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the lease registry, always after the engine when both are
+    /// held. Each registry change completes under the lock.
+    fn leases(&self) -> MutexGuard<'_, Registry> {
+        self.leases.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many retained-path leases are live, and so hold serving capacity.
+    pub fn live_leases(&self) -> usize {
+        self.leases().live()
+    }
+
+    /// The peers whose consumed lease is cached for continuation, in peer
+    /// order. The cache holds no capacity and keeps at most
+    /// [`MAX_RETAINED_PATH_LEASES`](super::lease::MAX_RETAINED_PATH_LEASES).
+    pub fn continued_peers(&self) -> Vec<SourceId> {
+        self.leases().continued()
+    }
+
+    /// How many acquires continued from a cached cursor instead of walking
+    /// the graph. A continuation's lease is the one a walk would build, so
+    /// this count is the only place the difference shows. Production keeps
+    /// no such count.
+    pub fn continuation_hits(&self) -> u64 {
+        self.leases().continuation_hits()
+    }
+
+    /// Leases the path toward `request`'s target, as
+    /// `HeaderChainReader::acquire_retained_path` does above finality.
+    fn acquire(&self, request: AcquirePath) -> Result<AcquirePathReply, PortError> {
+        let AcquirePath {
+            source: peer,
+            session_id,
+            scope,
+            target_tip_hash,
+            locator_hashes,
+        } = request;
+        // Checked before the registry, so a bad request sweeps nothing.
+        if locator_hashes.is_empty()
+            || locator_hashes.len() > zakura_header_chain::MAX_HEADER_LOCATOR_HASHES
+        {
+            return Err(unavailable(StoreError::Incoherent(
+                "retained path locator count is outside protocol bounds",
+            )));
+        }
+        let now = Instant::now();
+        let engine = self.engine();
+        let mut leases = self.leases();
+        let capacity = match leases.admit(peer, now, Capacity::Bounded) {
+            Ok(capacity) => capacity,
+            Err(refusal) => return Ok(refusal),
+        };
+        let snapshot = engine.snapshot();
+        if scope.branch.target_tip_hash != target_tip_hash
+            || scope.header_generation > snapshot.header_generation
+        {
+            return Ok(AcquirePathReply::Busy);
+        }
+        let continuation = leases.take_continuation(peer).filter(|cursor| {
+            cursor.session_id == session_id
+                && cursor.target.hash == target_tip_hash
+                && locator_hashes == [cursor.last_frontier.hash]
+                // A continuation can't extend the range its class permits.
+                && (capacity == Capacity::General
+                    || Capacity::for_range(cursor.last_frontier, cursor.target)
+                        == Capacity::Bounded)
+        });
+        if let Some(cursor) = continuation {
+            leases.record_continuation();
+            return Ok(self.commit_lease(
+                &engine,
+                &mut leases,
+                peer,
+                Spec {
+                    session_id,
+                    target: cursor.target,
+                    common_ancestor: cursor.last_frontier,
+                    scope,
+                    position: cursor.position,
+                    retained_path: cursor.retained_path,
+                    capacity,
+                },
+                now,
+            ));
+        }
+        let finalized = snapshot.frontiers.finalized;
+        // At most 13 hashes, so a slice lookup is enough.
+        let locators = locator_hashes.as_slice();
+        let max_depth = (capacity == Capacity::Bounded).then_some(MAX_HEADER_SYNC_HEIGHT_RANGE);
+        // Nothing below the genesis anchor exists, so a target the engine
+        // doesn't retain isn't retained anywhere.
+        let Some(target_node) = engine.graph().header_node(target_tip_hash) else {
+            return Ok(AcquirePathReply::TargetNotRetained);
+        };
+        let mut path = match ancestry(&engine, target_node, finalized, locators, max_depth)? {
+            Ancestry::Path(path) => path,
+            Ancestry::Pruned => return Ok(AcquirePathReply::HistoryPruned),
+            Ancestry::BeyondReserve => return Ok(leases.beyond_reserve()),
+        };
+        let target = path[0];
+        path.reverse();
+        let finalized_end = target.height.min(finalized.height);
+        // The anchor is the only finalized header, so it's the only finalized
+        // locator that can give the intersection.
+        let common_ancestor = path
+            .first()
+            .copied()
+            .filter(|frontier| locators.contains(&frontier.hash))
+            .or_else(|| {
+                (locators.contains(&finalized.hash) && finalized.height <= finalized_end)
+                    .then_some(finalized)
+            });
+        let Some(common_ancestor) = common_ancestor else {
+            return Ok(AcquirePathReply::NoLocatorIntersection);
+        };
+        if capacity == Capacity::Bounded
+            && Capacity::for_range(common_ancestor, target) != Capacity::Bounded
+        {
+            return Ok(leases.beyond_reserve());
+        }
+        let retained_path: Arc<[block::Hash]> = path
+            .iter()
+            .filter(|frontier| {
+                frontier.height > common_ancestor.height && frontier.height > finalized_end
+            })
+            .map(|frontier| frontier.hash)
+            .collect();
+        let position = if common_ancestor == target {
+            Position::Complete
+        } else {
+            Position::Retained { next: 0 }
+        };
+        Ok(self.commit_lease(
+            &engine,
+            &mut leases,
+            peer,
+            Spec {
+                session_id,
+                target,
+                common_ancestor,
+                scope,
+                position,
+                retained_path,
+                capacity,
+            },
+            now,
+        ))
+    }
+
+    /// Installs a lease for `spec` once its target is still retained, as
+    /// `commit_path_lease` does, and seals its handle with this port's key.
+    fn commit_lease(
+        &self,
+        engine: &HeaderChainEngine,
+        leases: &mut Registry,
+        peer: SourceId,
+        spec: Spec,
+        now: Instant,
+    ) -> AcquirePathReply {
+        let retained = engine
+            .graph()
+            .header_node(spec.target.hash)
+            .map(|node| zakura_header_chain::Frontier::new(node.height, node.hash));
+        if retained != Some(spec.target) {
+            return AcquirePathReply::TargetNotRetained;
+        }
+        let (session_id, common_ancestor, target, scope) = (
+            spec.session_id,
+            spec.common_ancestor,
+            spec.target,
+            spec.scope,
+        );
+        match leases.commit(peer, spec, now) {
+            Some(lease_id) => {
+                AcquirePathReply::Acquired(Box::new(RetainedHeaderPath::from_adapter(
+                    &self.key,
+                    lease_id,
+                    peer,
+                    session_id,
+                    common_ancestor,
+                    target,
+                    scope,
+                )))
+            }
+            None => AcquirePathReply::Busy,
+        }
+    }
+
+    /// Reads one page of a leased path, as `HeaderChainReader::read_retained_path`
+    /// and the production adapter do. A served page consumes the lease. A
+    /// simulation commits no block bodies and nothing below the anchor, so
+    /// every body size and finalized tree root is unknown.
+    fn read(
+        &self,
+        path: RetainedHeaderPath,
+        request: ReadPath,
+    ) -> Result<ReadPathReply, PortError> {
+        let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) else {
+            return Err(PortError::Unavailable { source: None });
+        };
+        let max_count = request.max_header_count;
+        // Checked before the registry, so a bad request sweeps nothing.
+        if max_count == 0 || max_count > MAX_HEADER_SYNC_HEIGHT_RANGE {
+            return Err(unavailable(StoreError::Incoherent(
+                "retained path page count is outside protocol bounds",
+            )));
+        }
+        let now = Instant::now();
+        let engine = self.engine();
+        let mut leases = self.leases();
+        let Some(cursor) = leases.get(peer, session_id, lease_id, now) else {
+            return Ok(ReadPathReply::Unavailable);
+        };
+        if cursor.scope != path.scope || request.after_hash != cursor.last_frontier.hash {
+            return Ok(ReadPathReply::Unavailable);
+        }
+        // Widening u32 to usize is lossless on supported targets.
+        let count = max_count as usize;
+        let mut headers = Vec::new();
+        let mut aux_deliveries = Vec::new();
+        let mut previous = cursor.last_frontier;
+        let mut position = cursor.position;
+        while headers.len() < count {
+            let Position::Retained { next } = position else {
+                break;
+            };
+            let hash = *cursor.retained_path.get(next).ok_or_else(|| {
+                unavailable(StoreError::Incoherent(
+                    "retained header cursor exceeded its immutable suffix",
+                ))
+            })?;
+            // Retention may have retired a leased losing branch.
+            let Some(node) = engine.graph().header_node(hash) else {
+                return Ok(ReadPathReply::Unavailable);
+            };
+            let frontier = zakura_header_chain::Frontier::new(node.height, node.hash);
+            if previous.height.next().ok() != Some(frontier.height)
+                || node.header.previous_block_hash != previous.hash
+            {
+                return Err(unavailable(StoreError::Incoherent(
+                    "header cursor has a non-contiguous item",
+                )));
+            }
+            position = if next.saturating_add(1) == cursor.retained_path.len() {
+                Position::Complete
+            } else {
+                Position::Retained {
+                    next: next.saturating_add(1),
+                }
+            };
+            previous = frontier;
+            headers.push(node.header.clone());
+            aux_deliveries.push(engine.aux_deliveries(hash).to_vec());
+        }
+        let complete = position == Position::Complete;
+        if complete && previous != cursor.target {
+            return Err(unavailable(StoreError::Incoherent(
+                "header cursor completed before its exact target",
+            )));
+        }
+        if !leases.finish_page(
+            peer,
+            session_id,
+            lease_id,
+            cursor.last_frontier,
+            position,
+            previous,
+            now,
+        ) {
+            return Ok(ReadPathReply::Unavailable);
+        }
+        let count = headers.len();
+        Ok(ReadPathReply::Page(Box::new(RetainedHeaderPathPage {
+            common_ancestor: cursor.last_frontier,
+            target: cursor.target,
+            scope: cursor.scope,
+            headers,
+            aux_deliveries,
+            finalized_tree_aux: vec![None; count],
+            finalized_body_sizes: vec![None; count],
+            complete,
+        })))
+    }
+
+    /// Ends a leased path, as `HeaderChainReader::release_retained_path`
+    /// does. A repeat, or a lease that already ended, does nothing.
+    fn release(&self, path: RetainedHeaderPath) -> Result<(), PortError> {
+        let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) else {
+            return Err(PortError::Unavailable { source: None });
+        };
+        self.leases()
+            .release(peer, session_id, lease_id, path.scope);
+        Ok(())
     }
 
     /// The selected-path locator, as `HeaderChainReader::committed_selected_locator`
@@ -415,24 +716,24 @@ impl Port for EnginePort {
 
     fn acquire_header_path(
         &self,
-        _request: AcquirePath,
+        request: AcquirePath,
     ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-        Box::pin(async { Err(PortError::Unavailable { source: None }) })
+        Box::pin(async move { self.acquire(request) })
     }
 
     fn read_header_path(
         &self,
-        _path: RetainedHeaderPath,
-        _request: ReadPath,
+        path: RetainedHeaderPath,
+        request: ReadPath,
     ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-        Box::pin(async { Err(PortError::Unavailable { source: None }) })
+        Box::pin(async move { self.read(path, request) })
     }
 
     fn release_header_path(
         &self,
-        _path: RetainedHeaderPath,
+        path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-        Box::pin(async { Err(PortError::Unavailable { source: None }) })
+        Box::pin(async move { self.release(path) })
     }
 
     fn prepare_header_target(
@@ -459,6 +760,56 @@ impl Port for EnginePort {
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         Box::pin(async move { self.membership(hash) })
     }
+}
+
+/// The result of a target-first ancestry walk.
+enum Ancestry {
+    /// Target first, down to the nearest locator or the finalized anchor.
+    Path(Vec<zakura_header_chain::Frontier>),
+    /// An ancestor is missing from the retained graph.
+    Pruned,
+    /// The walk passed a bounded lease's range first.
+    BeyondReserve,
+}
+
+/// Walks from `target` toward `finalized` until it meets a locator, as
+/// `retained_ancestry_to_nearest_locator` does, over the retained graph.
+/// `max_depth` bounds the walk for a reserve-slot lease.
+fn ancestry(
+    engine: &HeaderChainEngine,
+    target: &zakura_header_chain::HeaderNode,
+    finalized: zakura_header_chain::Frontier,
+    locators: &[block::Hash],
+    max_depth: Option<u32>,
+) -> Result<Ancestry, PortError> {
+    let target_height = target.height;
+    let mut path = vec![zakura_header_chain::Frontier::new(
+        target.height,
+        target.hash,
+    )];
+    let mut current = target;
+    while current.height > finalized.height && !locators.contains(&current.hash) {
+        if max_depth.is_some_and(|max| target_height.0.saturating_sub(current.height.0) >= max) {
+            return Ok(Ancestry::BeyondReserve);
+        }
+        let Some(parent) = engine.graph().header_node(current.parent_hash) else {
+            return Ok(Ancestry::Pruned);
+        };
+        if parent.height.next().ok() != Some(current.height) {
+            return Err(unavailable(StoreError::Incoherent(
+                "retained target path has non-contiguous heights",
+            )));
+        }
+        path.push(zakura_header_chain::Frontier::new(
+            parent.height,
+            parent.hash,
+        ));
+        current = parent;
+    }
+    if !locators.contains(&current.hash) && path.last().copied() != Some(finalized) {
+        return Ok(Ancestry::Pruned);
+    }
+    Ok(Ancestry::Path(path))
 }
 
 /// Authorizes exactly one header completion, as zakura-state's

@@ -156,6 +156,59 @@ fn the_same_plan_repeats() {
     }
 }
 
+/// Lease deadlines run on virtual time. A lease left idle while the run
+/// sleeps past 30 s is swept by another peer's acquire, which fires the
+/// signal its owner's second acquire waits on.
+#[test]
+fn idle_leases_expire_on_virtual_time() {
+    use zakura_node_services::header_chain::{AcquirePath, AcquirePathReply};
+
+    let fixture = HeaderFixture::regtest();
+    let port = Arc::new(EnginePort::new(&fixture));
+    let released = Arc::new(Mutex::new(None));
+    let mut config = config(2, 2_000);
+    config.scheduler.stack_size = zakura_scheduler::SchedulerConfig::default().stack_size;
+    let report = run(
+        config,
+        inputs(1, 0).remove(0),
+        |sim| {
+            let port = port.clone();
+            let released = released.clone();
+            sim.scheduler().spawn_root("leases", async move {
+                let anchor = fixture.anchor();
+                let main = fixture.extend(anchor, 2, 0);
+                admit(&fixture, &port, anchor, &main, 1).await;
+                let tip = main[1].hash();
+                let acquire = |peer: u8| AcquirePath {
+                    source: zakura_header_chain::SourceId::from_digest([peer; 32]),
+                    session_id: 1,
+                    scope: zakura_header_chain::HeaderWorkAuthority::for_target(
+                        &port.snapshot(),
+                        tip,
+                    ),
+                    target_tip_hash: tip,
+                    locator_hashes: vec![anchor.hash],
+                };
+                let first = port.acquire_header_path(acquire(1)).await;
+                assert!(matches!(first, Ok(AcquirePathReply::Acquired(_))));
+                let Ok(AcquirePathReply::CapacityBusy(signal)) =
+                    port.acquire_header_path(acquire(1)).await
+                else {
+                    panic!("a held lease refuses its peer");
+                };
+                zakura_rt::time::sleep(std::time::Duration::from_secs(31)).await;
+                let other = port.acquire_header_path(acquire(2)).await;
+                assert!(matches!(other, Ok(AcquirePathReply::Acquired(_))));
+                *released.lock().unwrap() = Some(signal.is_released());
+            });
+        },
+        &mut NoChecks,
+    );
+    assert_eq!(report.cleanup.panicked, 0, "{:?}", report.end);
+    assert_eq!(*released.lock().unwrap(), Some(true));
+    assert_eq!(port.live_leases(), 1);
+}
+
 /// Prepares `headers` on `parent` through `port`, with every body size set
 /// to `body_size`, against the snapshot the port has now.
 async fn prepare(

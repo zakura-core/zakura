@@ -21,6 +21,8 @@ zakura-node-services = { path = "../zakura-node-services" }
 zakura-rt = { path = "../zakura-rt" }
 
 [dev-dependencies]
+# A paused clock for the lease idle-deadline tests.
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 zakura-test = { path = "../zakura-test" }
 
 [lints]

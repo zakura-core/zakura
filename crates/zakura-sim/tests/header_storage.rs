@@ -152,3 +152,118 @@ fn the_same_plan_repeats() {
         assert_eq!(format!("{seen:?}"), format!("{seen_again:?}"));
     }
 }
+
+/// Prepares `headers` on `parent` through `port`, with every body size set
+/// to `body_size`, against the snapshot the port has now.
+async fn prepare(
+    fixture: &HeaderFixture,
+    port: &EnginePort,
+    parent: Frontier,
+    headers: &[Arc<zakura_chain::block::Header>],
+    request_id: u64,
+    body_size: u32,
+) -> zakura_node_services::header_chain::PreparedHeaderTarget {
+    let mut request = fixture.target_request(&port.snapshot(), parent, headers, request_id);
+    let mut entries = request.entries.into_vec();
+    for entry in &mut entries {
+        entry.body_size = body_size;
+    }
+    request.entries = entries.try_into().expect("the batch still fits");
+    port.prepare_header_target(request)
+        .await
+        .expect("fixture headers prepare in the run")
+}
+
+/// Polls `future` once, outside a run. The port completes each operation
+/// on its first poll.
+fn ready<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("the port completes on its first poll"),
+    }
+}
+
+/// Two applies race while a reader follows the watch and membership. Apply
+/// A only adds body-size hints to the committed H1..H2, which moves the
+/// state version but not the header generation. Apply B, prepared on that
+/// same generation, extends to H3. Under every plan, the watch must end at
+/// the engine's final snapshot, and a header the reader finds selected must
+/// never be above the watch's tip. Both hold only if install and
+/// publication form one step.
+#[test]
+fn concurrent_applies_publish_in_commit_order() {
+    for plan in inputs(64, 64) {
+        let fixture = HeaderFixture::regtest();
+        let port = Arc::new(EnginePort::new(&fixture));
+        let anchor = fixture.anchor();
+        let main = fixture.extend(anchor, 3, 0);
+        let h2 = Frontier::new(zakura_chain::block::Height(2), main[1].hash());
+        let request = fixture.target_request(&port.snapshot(), anchor, &main[..2], 1);
+        let prepared = ready(port.prepare_header_target(request)).expect("H1..H2 prepare");
+        ready(port.apply_header_target(prepared)).expect("H1..H2 apply");
+        let violations = Arc::new(Mutex::new(Vec::new()));
+        let mut config = config(2, 4_000);
+        config.scheduler.stack_size = zakura_scheduler::SchedulerConfig::default().stack_size;
+        let report = run(
+            config,
+            plan,
+            |sim| {
+                let (a_port, a_fixture, a_headers) = (port.clone(), fixture.clone(), main.clone());
+                sim.scheduler().spawn_root("apply-hints", async move {
+                    let target =
+                        prepare(&a_fixture, &a_port, anchor, &a_headers[..2], 2, 1_000).await;
+                    // A loses to B's new tip if B commits first.
+                    let _ = a_port.apply_header_target(target).await;
+                });
+                let (b_port, b_fixture, b_headers) = (port.clone(), fixture.clone(), main.clone());
+                sim.scheduler().spawn_root("apply-h3", async move {
+                    let target = prepare(&b_fixture, &b_port, h2, &b_headers[2..], 3, 0).await;
+                    // Either apply may fail as stale. Only what gets
+                    // published matters.
+                    let _ = b_port.apply_header_target(target).await;
+                });
+                let (r_port, violations) = (port.clone(), violations.clone());
+                let hashes: Vec<_> = main.iter().map(|header| header.hash()).collect();
+                sim.scheduler().spawn_root("reader", async move {
+                    let watch = r_port.selected_chain();
+                    for _ in 0..8 {
+                        for hash in &hashes {
+                            let membership = r_port
+                                .selected_chain_contains(*hash)
+                                .await
+                                .expect("membership reads");
+                            let published = watch
+                                .borrow()
+                                .as_ref()
+                                .map(|snapshot| snapshot.frontiers.header_best.height);
+                            if let SelectedChainMembership::Selected(frontier) = membership {
+                                if published < Some(frontier.height) {
+                                    violations.lock().unwrap().push(format!(
+                                        "{frontier:?} selected above the watch's {published:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        zakura_rt::task::yield_now().await;
+                    }
+                });
+            },
+            &mut NoChecks,
+        );
+        assert_eq!(report.cleanup.panicked, 0, "{:?}", report.end);
+        assert_eq!(
+            port.selected_chain().borrow().as_ref(),
+            Some(&port.snapshot()),
+            "the watch ends at the final commit"
+        );
+        assert!(
+            violations.lock().unwrap().is_empty(),
+            "{:?}",
+            violations.lock().unwrap()
+        );
+    }
+}

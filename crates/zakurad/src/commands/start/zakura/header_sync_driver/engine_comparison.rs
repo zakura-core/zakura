@@ -120,13 +120,14 @@ async fn admit(
         .collect()
 }
 
-/// A five-header main chain and a two-header fork from height 2, on
-/// `port`. Every port builds the same chain from the same fixture.
+/// A five-header main chain and a four-header fork from height 2, on
+/// `port`. The fork reaches height 6, so selection switches to it. Every
+/// port builds the same chain from the same fixture.
 async fn chain(port: &dyn Port) -> (Vec<Frontier>, Vec<Frontier>) {
     let fixture = HeaderFixture::regtest();
     let anchor = fixture.anchor();
     let main = admit(port, anchor, &fixture.extend(anchor, 5, 0), 1).await;
-    let fork = admit(port, main[1], &fixture.extend(main[1], 2, 1), 2).await;
+    let fork = admit(port, main[1], &fixture.extend(main[1], 4, 1), 2).await;
     (main, fork)
 }
 
@@ -151,12 +152,13 @@ fn acquire_request(
     }
 }
 
-/// An acquire reply's shape: its variant and, for a lease, its range.
+/// An acquire reply's shape: its variant and, for a lease, everything but
+/// the adapter's own handle and seal.
 fn acquire_shape(reply: &Result<AcquirePathReply, PortError>) -> String {
     match reply {
         Ok(AcquirePathReply::Acquired(path)) => format!(
-            "acquired {}..{}",
-            path.common_ancestor.height.0, path.target.height.0
+            "acquired {:?}..{:?} {:?}",
+            path.common_ancestor, path.target, path.scope
         ),
         Ok(AcquirePathReply::CapacityBusy(_)) => "capacity-busy".to_owned(),
         Ok(other) => format!("{other:?}"),
@@ -164,22 +166,11 @@ fn acquire_shape(reply: &Result<AcquirePathReply, PortError>) -> String {
     }
 }
 
-/// A read reply's shape: the page's headers and flags, or its variant.
+/// A read reply's shape: the whole page, which holds nothing specific to
+/// one adapter, or its variant.
 fn read_shape(reply: &Result<ReadPathReply, PortError>) -> String {
     match reply {
-        Ok(ReadPathReply::Page(page)) => format!(
-            "page {:?} complete={} sizes={:?} roots={}",
-            page.headers
-                .iter()
-                .map(|header| header.hash())
-                .collect::<Vec<_>>(),
-            page.complete,
-            page.finalized_body_sizes,
-            page.finalized_tree_aux
-                .iter()
-                .filter(|root| root.is_some())
-                .count(),
-        ),
+        Ok(ReadPathReply::Page(page)) => format!("page {page:?}"),
         Ok(ReadPathReply::Unavailable) => "unavailable".to_owned(),
         Err(error) => error_shape(error),
     }
@@ -210,47 +201,108 @@ fn page_request(after: block::Hash, count: u32) -> ReadPath {
     }
 }
 
-/// Committed snapshots, locators and membership agree after an extension
-/// and a heavier fork, and a locator read keeps its permit only until it
-/// ends.
-#[tokio::test]
-async fn selection_locator_and_membership_match() {
-    let mut seen = Vec::new();
-    for port in both().await {
-        let (main, fork) = chain(&*port).await;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = LocatorReadPermit::new(
-            semaphore
-                .clone()
-                .try_acquire_owned()
-                .expect("a fresh semaphore has a permit"),
-        );
-        let locator = port
-            .continuation_locator(permit)
-            .await
-            .expect("the locator reads")
-            .expect("an attached port has a locator");
-        // The read held the only clone, so its capacity is free again.
-        assert_eq!(semaphore.available_permits(), 1);
-        let mut memberships = Vec::new();
-        for frontier in main.iter().chain(&fork) {
-            memberships.push(
-                port.selected_chain_contains(frontier.hash)
-                    .await
-                    .expect("membership reads"),
-            );
-        }
+/// What a port shows of its selected chain: the committed snapshot, the
+/// locator, and the membership of `hashes`.
+async fn selection(
+    port: &dyn Port,
+    hashes: &[block::Hash],
+) -> (
+    zakura_header_chain::EngineSnapshot,
+    Vec<Frontier>,
+    Vec<SelectedChainMembership>,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = LocatorReadPermit::new(
+        semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("a fresh semaphore has a permit"),
+    );
+    let locator = port
+        .continuation_locator(permit)
+        .await
+        .expect("the locator reads")
+        .expect("an attached port has a locator");
+    // The read held the only clone, so its capacity is free again.
+    assert_eq!(semaphore.available_permits(), 1);
+    let mut memberships = Vec::new();
+    for hash in hashes {
         memberships.push(
-            port.selected_chain_contains(block::Hash([0xee; 32]))
+            port.selected_chain_contains(*hash)
                 .await
                 .expect("membership reads"),
         );
-        seen.push((snapshot(&*port), locator.entries().to_vec(), memberships));
+    }
+    (snapshot(port), locator.entries().to_vec(), memberships)
+}
+
+/// Committed snapshots, locators and membership agree on both branches:
+/// after the main chain alone, and after a heavier fork takes over. A
+/// locator read keeps its permit only until it ends.
+#[tokio::test]
+async fn selection_locator_and_membership_match() {
+    let fixture = HeaderFixture::regtest();
+    let anchor = fixture.anchor();
+    let main_headers = fixture.extend(anchor, 5, 0);
+    let main_frontiers: Vec<_> = (1..)
+        .zip(&main_headers)
+        .map(|(height, header)| Frontier::new(block::Height(height), header.hash()))
+        .collect();
+    let fork_headers = fixture.extend(main_frontiers[1], 4, 1);
+    let mut hashes: Vec<_> = main_headers
+        .iter()
+        .chain(&fork_headers)
+        .map(|header| header.hash())
+        .collect();
+    hashes.push(block::Hash([0xee; 32]));
+    let mut seen = Vec::new();
+    for port in both().await {
+        let port = &*port;
+        admit(port, anchor, &main_headers, 1).await;
+        let on_main = selection(port, &hashes).await;
+        let fork = admit(port, main_frontiers[1], &fork_headers, 2).await;
+        let on_fork = selection(port, &hashes).await;
+        seen.push((on_main, on_fork, fork));
     }
     assert_eq!(seen[0], seen[1]);
-    assert_eq!(seen[0].0.frontiers.header_best.height.0, 5);
+    let (
+        (main_snapshot, main_locator, main_members),
+        (fork_snapshot, fork_locator, fork_members),
+        fork,
+    ) = &seen[0];
+    assert_eq!(main_snapshot.frontiers.header_best, main_frontiers[4]);
+    assert_eq!(main_locator.first(), Some(&main_frontiers[4]));
+    assert_eq!(fork_snapshot.frontiers.header_best, fork[3]);
+    assert_eq!(fork_locator.first(), Some(&fork[3]));
+    for (index, frontier) in main_frontiers.iter().enumerate() {
+        assert_eq!(
+            main_members[index],
+            SelectedChainMembership::Selected(*frontier)
+        );
+        // After the switch only the shared prefix stays selected.
+        let expected = if index < 2 {
+            SelectedChainMembership::Selected(*frontier)
+        } else {
+            SelectedChainMembership::NotSelected
+        };
+        assert_eq!(fork_members[index], expected);
+    }
+    for (index, frontier) in fork.iter().enumerate() {
+        assert_eq!(
+            main_members[5 + index],
+            SelectedChainMembership::NotRetained
+        );
+        assert_eq!(
+            fork_members[5 + index],
+            SelectedChainMembership::Selected(*frontier)
+        );
+    }
     assert_eq!(
-        seen[0].2.last(),
+        main_members.last(),
+        Some(&SelectedChainMembership::NotRetained)
+    );
+    assert_eq!(
+        fork_members.last(),
         Some(&SelectedChainMembership::NotRetained)
     );
 }
@@ -277,6 +329,16 @@ async fn path_serving_matches() {
         let first = port
             .read_header_path(path.clone(), page_request(anchor.hash, 2))
             .await;
+        // Each header carries the delivery its admission recorded, so the
+        // whole-page comparison covers auxiliary deliveries too.
+        let Ok(ReadPathReply::Page(first_page)) = &first else {
+            panic!("the first page is served: {first:?}");
+        };
+        assert_eq!(first_page.headers.len(), 2);
+        assert!(first_page
+            .aux_deliveries
+            .iter()
+            .all(|deliveries| deliveries.len() == 1));
         shapes.push(read_shape(&first));
         // A served page consumed the lease.
         shapes.push(read_shape(
@@ -491,7 +553,15 @@ async fn idle_eviction_matches() {
         seen.push(events);
     }
     assert_eq!(seen[0], seen[1]);
-    assert_eq!(seen[0][1], "acquired 1..4 true");
+    // The empty locator sweeps nothing, C's acquire sweeps A's lease and
+    // wakes A's waiter, and A's handle then reads nothing.
+    assert_eq!(seen[0][0], "unavailable(source=true) false");
+    assert!(
+        seen[0][1].starts_with("acquired ") && seen[0][1].ends_with(" true"),
+        "{}",
+        seen[0][1]
+    );
+    assert_eq!(seen[0][2], "unavailable");
 }
 
 /// Timeouts: production fails a wedged state read at exactly the contract's
@@ -645,15 +715,13 @@ async fn expected_difference_no_reservations_sequentially_agree() {
     for port in both().await {
         let port = &*port;
         let (main, _) = chain(port).await;
-        let refused = port
-            .acquire_header_path(acquire_request(
-                port,
-                peer(1),
-                main[4].hash,
-                vec![main[0].hash; 14],
-            ))
-            .await;
-        // A refusal after the reservation step leaves no reservation behind.
+        // A valid request whose scope names another target passes the
+        // locator checks, so production reserves a slot before refusing it.
+        let mut scoped = acquire_request(port, peer(1), main[4].hash, vec![main[0].hash]);
+        scoped.scope = HeaderWorkAuthority::for_target(&snapshot(port), main[3].hash);
+        let refused = port.acquire_header_path(scoped).await;
+        // The refusal leaves no reservation behind, so the peer's next
+        // acquire succeeds.
         let next = port
             .acquire_header_path(acquire_request(
                 port,
@@ -662,6 +730,11 @@ async fn expected_difference_no_reservations_sequentially_agree() {
                 vec![main[0].hash],
             ))
             .await;
+        assert_eq!(acquire_shape(&refused), "Busy");
+        assert!(
+            matches!(next, Ok(AcquirePathReply::Acquired(_))),
+            "{next:?}"
+        );
         seen.push((acquire_shape(&refused), acquire_shape(&next)));
     }
     assert_eq!(seen[0], seen[1]);

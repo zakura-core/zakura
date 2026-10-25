@@ -83,6 +83,7 @@ run's actual start and checks the commit-window take ceiling. These cases prove
 pure decisions. They do not prove asynchronous reservation cleanup.
 
 The planned P1 registry will index the local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+<<<<<<< HEAD
 
 ## Discovery session and redial targets
 
@@ -131,3 +132,5 @@ per-node backoff. Its witness exercises a duplicate completion, failure backoff
 and a local-limit pause. Planted failures release reservations early or discard
 backoff. Final cleanup settles every remaining logical reservation. This does
 not prove that an asynchronous worker releases its admission permit.
+=======
+>>>>>>> test/pure-block-query-machine

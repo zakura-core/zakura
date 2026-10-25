@@ -1,12 +1,12 @@
 //! The subscriber's side: subscriptions this session opened.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    hash::Hash,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{collections::VecDeque, hash::Hash, sync::Arc};
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use super::{
     credit::{ResponseCredit, Totals},
@@ -477,7 +477,7 @@ impl<K, C> SharedSubscriptions<K, C> {
     }
 
     /// Lock the table. No holder panics, so the lock is never poisoned.
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Subscriptions<K, C>> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Subscriptions<K, C>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

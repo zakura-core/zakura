@@ -43,6 +43,8 @@ mod tests;
 
 pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
+#[cfg(feature = "internal-bench")]
+pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
 pub(crate) use chain::{Chain, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
 pub(crate) use shared_map::SharedMap;

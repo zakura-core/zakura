@@ -1,6 +1,5 @@
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
+use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 
 use super::{
     events::{Event, HeaderSyncHandle},
@@ -28,7 +27,7 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     let peer = session.peer_id().clone();
     let session_id = session.session_id();
     loop {
-        let frame = tokio::select! {
+        let frame = zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
             ended = &mut publishing => {
@@ -98,7 +97,7 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                 }
             }
         };
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
             result = handle.send(event) => {

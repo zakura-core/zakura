@@ -11,6 +11,7 @@ pub mod client;
 pub mod config;
 pub mod indexer;
 pub mod methods;
+pub mod node;
 pub mod queue;
 pub mod server;
 pub mod sync;

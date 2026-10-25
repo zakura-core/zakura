@@ -1,6 +1,9 @@
 //! Tests for the [`zakura_test::command`] module.
 
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use eyre::{eyre, Result};
 use regex::RegexSet;
@@ -294,6 +297,17 @@ fn failure_regex_reads_multi_line_output_on_expect_line() {
         .unwrap()
         .with_timeout(Duration::from_secs(5))
         .with_failure_regex_set("failure_message", RegexSet::empty());
+
+    // Error reporting kills the child after the first failure line. Wait until
+    // echo has written both lines so the assertion only checks unread output.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "echo did not exit within 5 seconds"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Any method that reads output should work here.
     // We use a non-matching regex, to trigger the failure panic.

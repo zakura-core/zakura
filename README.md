@@ -49,7 +49,7 @@ The installer can set up either standard Zakura or its
 You can run Zakura using our [Docker
 image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 The zcashd-compatible split-container mode uses the
-[zakuracore/zcashd:v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd:v1.3.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 
 This command will run our latest release and sync it to the tip:
 
@@ -105,17 +105,6 @@ Note that the package `clang` includes `libclang` as well.
 
 </details>
 
-On Windows, set this environment variable in PowerShell before building or
-installing Zakura:
-
-```powershell
-$env:ROCKSDB_UNITY_CHUNK = "1"
-```
-
-This compiles each bundled RocksDB C++ source separately. The default build
-combines sources, which causes a name collision with the Windows `CreateFile`
-API. CI sets this variable through the shared build setup action.
-
 Once you have the dependencies in place, you can install Zakura with:
 
 ```sh
@@ -125,7 +114,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.6.1 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.7.0 zakura
 ```
 
 Native x86-64 builds automatically use Pasta field assembly when the build

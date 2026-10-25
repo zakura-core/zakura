@@ -1,3 +1,8 @@
+use zakura_rt::{
+    sync::{atomic::AtomicU64, Mutex},
+    time,
+};
+
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
@@ -211,10 +216,10 @@ pub(super) struct RoutineWiring {
     pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
-    pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sequencer_input_bytes: Arc<AtomicU64>,
+    pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
@@ -358,7 +363,7 @@ pub(super) struct BlockSyncState {
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
     /// throughput it separates a download-limited sync from a commit-limited one.
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
 }
 
 impl BlockSyncState {
@@ -375,9 +380,7 @@ impl BlockSyncState {
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
-            received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
-                Instant::now(),
-            ))),
+            received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }
     }
 
@@ -1051,7 +1054,7 @@ pub(super) struct RateMeter {
 impl RateMeter {
     pub(super) fn new(interval: Duration) -> Self {
         Self {
-            next_allowed: tokio::time::Instant::now().into_std(),
+            next_allowed: time::Instant::now().into_std(),
             interval,
         }
     }

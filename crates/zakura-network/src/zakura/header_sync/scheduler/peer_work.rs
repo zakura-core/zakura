@@ -1,15 +1,15 @@
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc, Mutex,
-    },
-};
+use std::{cmp::Ordering, sync::Arc};
 
 use zakura_header_chain::{
     EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
     MAX_STAGED_TARGETS_V1,
+};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        watch, Mutex, PoisonError,
+    },
 };
 
 use super::super::{
@@ -35,7 +35,7 @@ struct HeaderChunkUsage {
 struct HeaderChunkBudgetInner {
     capacity: usize,
     usage: Mutex<HeaderChunkUsage>,
-    released: tokio::sync::watch::Sender<u64>,
+    released: watch::Sender<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,18 +46,14 @@ impl Default for HeaderChunkBudget {
         Self(Arc::new(HeaderChunkBudgetInner {
             capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
             usage: Mutex::new(HeaderChunkUsage::default()),
-            released: tokio::sync::watch::channel(0).0,
+            released: watch::channel(0).0,
         }))
     }
 }
 
 impl HeaderChunkBudget {
     fn usage(&self) -> HeaderChunkUsage {
-        *self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.0.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn remaining(&self) -> usize {
@@ -76,11 +72,7 @@ impl HeaderChunkBudget {
         if count == 0 {
             return None;
         }
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         if count
             > self
                 .0
@@ -104,11 +96,7 @@ impl HeaderChunkBudget {
         if owned > reserved {
             return Err(());
         }
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         if usage.reserved < reserved {
             return Err(());
         }
@@ -126,11 +114,7 @@ impl HeaderChunkBudget {
     }
 
     fn release_reserved(&self, count: usize) {
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert!(usage.reserved >= count);
         usage.reserved = usage.reserved.saturating_sub(count);
         self.publish(*usage);
@@ -142,11 +126,7 @@ impl HeaderChunkBudget {
     }
 
     fn release_owned(&self, count: usize) {
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert!(usage.owned >= count);
         usage.owned = usage.owned.saturating_sub(count);
         self.publish(*usage);
@@ -447,9 +427,7 @@ impl PeerWorkQueue {
         self.scheduling_revision
     }
 
-    pub(in crate::zakura::header_sync) fn capacity_releases(
-        &self,
-    ) -> tokio::sync::watch::Receiver<u64> {
+    pub(in crate::zakura::header_sync) fn capacity_releases(&self) -> watch::Receiver<u64> {
         self.budget.0.released.subscribe()
     }
 

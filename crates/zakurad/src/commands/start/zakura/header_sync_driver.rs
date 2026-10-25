@@ -1334,6 +1334,9 @@ fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
 }
 
 #[cfg(test)]
+mod engine_comparison;
+
+#[cfg(test)]
 mod tests {
     use std::{future::pending, num::NonZeroU64};
 

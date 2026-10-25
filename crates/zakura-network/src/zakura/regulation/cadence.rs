@@ -29,9 +29,9 @@
 //! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
 //! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
 
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
-use tokio::time::Instant;
+use zakura_rt::{collections::HashMap, time::Instant};
 
 use crate::zakura::{
     wire_codec::{encode_frame, WireMessage},
@@ -230,7 +230,7 @@ struct Slot<M> {
     latest: Option<M>,
     last_sent: Option<Instant>,
     /// Alive while this row's last frame waits for its transport write.
-    unwritten: std::sync::Weak<()>,
+    unwritten: zakura_rt::sync::Weak<()>,
 }
 
 /// Why a message could not go to the [`CadenceSender`].
@@ -283,7 +283,7 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
                     send_interval: cadence.send_interval,
                     latest: None,
                     last_sent: None,
-                    unwritten: std::sync::Weak::new(),
+                    unwritten: zakura_rt::sync::Weak::new(),
                 })
             })
             .collect();
@@ -417,7 +417,7 @@ fn send_slot<M: WireMessage>(
         message_type: slot.message_type,
     })?;
     let written = std::sync::Arc::new(());
-    slot.unwritten = std::sync::Arc::downgrade(&written);
+    slot.unwritten = zakura_rt::sync::downgrade(&written);
     reserved.send(frame, FrameGuard::new(written));
     slot.last_sent = Some(now);
     Ok(RowSend::Queued)

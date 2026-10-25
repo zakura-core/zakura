@@ -614,7 +614,7 @@ const WITNESS: &[u8] = &[0, 1, 2, 7, 11, 7, 11, 3, 11, 3];
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn discovery_session_witness_reaches_close_after_recheck() {
     let summary = replay_discovery_session_bytes(WITNESS);

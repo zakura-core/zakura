@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::print_stdout,
-        reason = "CI retains these applicability counters"
+        reason = "witnesses print applicability counters"
     )]
     fn query_witness_exercises_ownership_and_caps() {
         let summary = replay_discovery_query_bytes(&[8, 24, 2, 4, 14, 6, 1, 23, 0, 4]);

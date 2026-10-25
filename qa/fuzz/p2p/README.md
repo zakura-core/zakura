@@ -54,9 +54,8 @@ cadence_witness -- --nocapture` from the repository root. Their printed counters
 are witness evidence; they do not claim applicability for every fuzz input.
 An empty input has zero applicability.
 
-Each nightly target keeps its own 900-second daily and 3,600-second weekly
-budget. CI restores corpora by target and decoder version. CI uploads the corpus,
-crash artifacts, witness counters, compiler version, source revision and fuzz log.
+No CI workflow schedules this target or the machine targets below. Run them
+with `cargo fuzz run` as shown above.
 Machine bytes are compatible with their target and decoder version. They are
 not portable simulator traces. The planned P1 registry will index these local
 property IDs and their witness paths.
@@ -83,9 +82,7 @@ reference keeps the first contiguous allowed run. It derives priority from that
 run's actual start and checks the commit-window take ceiling. These cases prove
 pure decisions. They do not prove asynchronous reservation cleanup.
 
-Each target receives its own 900-second daily and 3,600-second weekly budget.
-Keep the existing session budget intact. The planned P1 registry will index the
-local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+The planned P1 registry will index the local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
 
 ## Discovery session and redial targets
 
@@ -96,7 +93,7 @@ local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
 
 Both decoder-v1 targets read at most 512 bytes and reuse their existing
 independent models for proptest and cargo-fuzz. Empty inputs report zero
-applicability. Each target retains its own daily and weekly budget.
+applicability.
 
 `discovery_session` decodes hello, admitted answers and operation outcomes.
 It checks exchange completion, single settlement, and ownership checks before
@@ -121,7 +118,6 @@ the local IDs and witnesses.
 
 Both decoder-v1 targets share their existing proptest models with cargo-fuzz.
 They read at most 512 bytes and report zero applicability for empty histories.
-Each target has its own 900-second daily and 3,600-second weekly budget.
 
 `discovery_query` decodes reservation, queue, release and claim operations.
 Its model calculates wire caps independently and checks that an answer claims
@@ -148,8 +144,7 @@ not prove that an asynchronous worker releases its admission permit.
 These decoder-v1 targets reuse the owning modules' independent models. Proptest
 and cargo-fuzz call the same driver. Each decoder reads at most 512 bytes in
 four-byte operations. Empty inputs report zero applicability. Each target has
-two planted failures that must name its property ID, and its own daily and
-weekly fuzz budget.
+two planted failures that must name its property ID.
 
 `block_work_ownership` tracks each height's location, exact claim owner and
 charged bytes. The witness resets between two published claims, returns the

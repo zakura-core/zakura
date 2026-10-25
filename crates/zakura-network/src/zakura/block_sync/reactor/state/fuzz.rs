@@ -197,7 +197,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::print_stdout,
-        reason = "CI retains these applicability counters"
+        reason = "witnesses print applicability counters"
     )]
     fn query_witness_exercises_refusal_stale_identity_and_reset() {
         println!(

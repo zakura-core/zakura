@@ -538,7 +538,7 @@ const RETRY_WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn retry_witness_exercises_expiry_and_authority_changes() {
     let summary = replay_retry_authority_bytes(RETRY_WITNESS);
@@ -1030,7 +1030,7 @@ const TABLE_WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn registry_witness_exercises_replacement_and_exact_owner() {
     let summary = replay_peer_registry_bytes(TABLE_WITNESS);

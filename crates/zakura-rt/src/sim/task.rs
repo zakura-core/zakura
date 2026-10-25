@@ -114,19 +114,38 @@ where
 
 /// Runs `f` on tokio's blocking pool, as `tokio::task::spawn_blocking` does.
 ///
-/// Inside a run, `f` runs as an ordinary task labeled `blocking`, in one
-/// poll, on the run's one thread. Unlike tokio's blocking pool, it holds a
-/// simulated worker while it runs.
+/// Inside a run, `f` runs as a task labeled `blocking`, in one poll, on the
+/// run's one thread, through [`sim::Executor::spawn_blocking`]. Use
+/// [`spawn_blocking_named`] for a stable label of its own.
 #[track_caller]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    if sim::executor().is_none() {
+    spawn_blocking_named("blocking", f)
+}
+
+/// Runs `f` as [`spawn_blocking`] does, with `label` naming the task as in
+/// [`spawn_named`].
+#[track_caller]
+pub fn spawn_blocking_named<F, R>(label: &'static str, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
         return JoinHandle::tokio(tokio::task::spawn_blocking(f));
-    }
-    spawn_named("blocking", async move { f() })
+    };
+    spawn_in_run(
+        executor,
+        run,
+        label,
+        Location::caller(),
+        async move { f() },
+        |label, task| Some(executor.spawn_blocking(label, task)),
+    )
+    .expect("the infallible executor spawn always returns a task")
 }
 
 /// Lets other tasks run, as `tokio::task::yield_now` does.

@@ -49,7 +49,7 @@ pub(crate) enum Yield {
     Preempt,
     /// The future returned `Pending`. The task releases its worker.
     Pending,
-    /// A sync wait. The task keeps its worker.
+    /// A sync wait. The task keeps its worker, if it holds one.
     Park(ObjectId),
 }
 
@@ -62,6 +62,8 @@ pub(crate) struct TaskMeta {
     /// Set by the coroutine when it starts. Valid while the coroutine runs.
     pub(crate) yielder: *const TaskYielder,
     pub(crate) at: At,
+    /// A blocking job, which holds no worker, as on tokio's blocking pool.
+    pub(crate) blocking: bool,
     point_counts: BTreeMap<Op, u32>,
     child_counts: BTreeMap<&'static str, u32>,
 }
@@ -169,6 +171,7 @@ impl RunState {
                 n: 1,
                 site: None,
             },
+            blocking: false,
             point_counts: BTreeMap::from([(Op::Poll, 1)]),
             child_counts: BTreeMap::new(),
         });
@@ -238,14 +241,19 @@ impl RunState {
         id
     }
 
-    /// Tasks `run` accepts now. A task mid-poll already holds a worker. Any
-    /// other ready task needs a free one.
+    /// Tasks `run` accepts now. A task mid-poll already holds a worker, and
+    /// a blocking job needs none. Any other ready task needs a free one.
     fn eligible(&self) -> impl Iterator<Item = TaskId> + '_ {
-        let free = self.mid_poll.len() < self.workers;
+        let held = self
+            .mid_poll
+            .iter()
+            .filter(|t| !self.tasks[t.index()].blocking)
+            .count();
+        let free = held < self.workers;
         self.ready
             .iter()
             .copied()
-            .filter(move |t| free || self.mid_poll.contains(t))
+            .filter(move |t| free || self.mid_poll.contains(t) || self.tasks[t.index()].blocking)
     }
 
     /// True if some parked tasks wait on each other in a cycle, so no number

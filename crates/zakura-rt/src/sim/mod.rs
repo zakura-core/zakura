@@ -39,7 +39,8 @@ pub trait Executor {
     fn preempt(&self, point: Point);
 
     /// Parks the current task until [`Executor::unpark_all`] on `wait`. The
-    /// task keeps its simulated worker. Only synchronous waits, such as a
+    /// task keeps its simulated worker, if it holds one (see
+    /// [`Executor::spawn_blocking`]). Only synchronous waits, such as a
     /// contended `Mutex`, park. Async waits return `Pending` instead.
     ///
     /// `held_by` names the task holding `wait`, if known, so the scheduler can
@@ -58,6 +59,14 @@ pub trait Executor {
     /// it unpolled when the run can't take another task. Code that spawns
     /// from a `Drop` impl uses this, since a panic there could abort.
     fn try_spawn(&self, label: &'static str, task: BoxTask) -> Option<TaskId>;
+
+    /// Spawns `task` as a blocking job, with the parent and label
+    /// [`Executor::spawn`] would give it. The job runs without a simulated
+    /// worker, as on tokio's blocking pool, and an abort after its first poll
+    /// does nothing. Defaults to [`Executor::spawn`].
+    fn spawn_blocking(&self, label: &'static str, task: BoxTask) -> TaskId {
+        self.spawn(label, task)
+    }
 
     /// Requests cancellation. The task's future is dropped at its next poll
     /// boundary, as with tokio's abort. A no-op once the task has ended.

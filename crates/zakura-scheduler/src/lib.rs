@@ -266,7 +266,8 @@ pub struct ReadyTask {
     pub task: TaskId,
     /// Where it will resume.
     pub at: At,
-    /// True if it stopped mid-poll, so it already holds a worker.
+    /// True if it stopped mid-poll, so it already holds a worker, unless
+    /// it's a blocking job, which never holds one.
     pub mid_poll: bool,
 }
 
@@ -278,7 +279,7 @@ pub enum RunOutcome {
     /// The task's future returned `Pending`. It waits for its `Waker` and
     /// released its worker.
     Waiting,
-    /// The task parked on a sync wait and keeps its worker.
+    /// The task parked on a sync wait and keeps its worker, if it holds one.
     Parked(ObjectId),
     /// The task finished.
     Completed,
@@ -323,8 +324,10 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedulerConfig {
     /// Simulated runtime workers. A task holds one from the start of a poll
-    /// until the poll returns. At least 1. One worker hides every race inside
-    /// a single poll, so scenarios should use 2 or more.
+    /// until the poll returns. A blocking job, from
+    /// `zakura_rt::task::spawn_blocking`, holds none, as on tokio's blocking
+    /// pool. At least 1. One worker hides every race inside a single poll,
+    /// so scenarios should use 2 or more.
     pub workers: u16,
     /// The most tasks one run may spawn. A spawn past it panics in the
     /// spawning task.

@@ -57,7 +57,8 @@ pub fn preempt(point: Point) {
     }
 }
 
-/// Parks the current task until [`unpark_all`] on `wait`, keeping its worker.
+/// Parks the current task until [`unpark_all`] on `wait`, keeping its worker
+/// if it holds one.
 ///
 /// `held_by` names the task holding `wait`, if known, so the scheduler can
 /// tell a lock cycle from starved workers. Returns false without parking
@@ -112,6 +113,20 @@ pub fn spawn(label: &'static str, task: impl Future<Output = ()> + 'static) -> J
 pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
     let queued = with_run(|s| s.queue_spawn(label, task))
         .expect("zakura-rt spawns only while this run's executor is installed, and the run state outlives that");
+    queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
+}
+
+/// [`spawn_boxed`] for a blocking job. The job never holds a worker, so it
+/// can run, and park, while every worker is busy. Aborts reach it only at a
+/// poll boundary, as for any task.
+#[cfg(zakura_sim)]
+pub(crate) fn spawn_blocking_boxed(label: &'static str, task: BoxTask) -> TaskId {
+    let queued = with_run(|s| {
+        s.queue_spawn(label, task).inspect(|id| {
+            s.tasks[id.index()].blocking = true;
+        })
+    })
+    .expect("zakura-rt spawns only while this run's executor is installed, and the run state outlives that");
     queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
 }
 

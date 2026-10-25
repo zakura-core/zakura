@@ -51,6 +51,11 @@ impl rt::Executor for SchedulerExecutor {
         hooks::try_spawn_boxed(label, task).map(task_to_rt)
     }
 
+    /// Spawns `task` as a blocking job, which holds no simulated worker.
+    fn spawn_blocking(&self, label: &'static str, task: rt::BoxTask) -> rt::TaskId {
+        task_to_rt(hooks::spawn_blocking_boxed(label, task))
+    }
+
     fn abort(&self, task: rt::TaskId) {
         hooks::request_abort(task_from_rt(task));
     }

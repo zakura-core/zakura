@@ -388,6 +388,29 @@ fn prefix_replays_and_is_never_complete() {
 }
 
 #[test]
+fn prefix_option_keeps_a_complete_trace_whole() {
+    // Cut to ten steps, with an `end` that counts ten, so the reader takes it
+    // as complete. The run goes on past it either way.
+    let dir = record_named("discovery/wait-complete", DISCOVERY);
+    edit(dir.path(), |lines| {
+        let mut end = lines.pop().unwrap();
+        lines.truncate(2 + 10);
+        end["end"]["steps"] = json!(10);
+        lines.push(end);
+    });
+    let prefix = ReplayOptions {
+        prefix: true,
+        ..ReplayOptions::default()
+    };
+    for options in [ReplayOptions::default(), prefix] {
+        match divergence_of(replayed(dir.path(), options)) {
+            Divergence::PastEnd { step, .. } => assert_eq!(step, 11, "{options:?}"),
+            other => panic!("{options:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn observe_writes_the_full_log() {
     let dir = record_named("discovery/wait-complete", DISCOVERY);
     let observe = ReplayOptions {

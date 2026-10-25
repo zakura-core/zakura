@@ -37,7 +37,8 @@ pub struct ReplayOptions {
     /// success.
     pub allow_build_mismatch: bool,
     /// Accept a trace without its `end` record, and replay it to its last
-    /// step. The report is never a success.
+    /// step. A trace with `end` is still replayed in full. The report is
+    /// never a success.
     pub prefix: bool,
     /// Write [`OBSERVATIONS_FILE`] into the trace directory. It fails if the
     /// file exists.
@@ -201,7 +202,10 @@ fn replay_on<'h>(
             what: format!("the harness describes this scenario with a different {field}"),
         });
     }
-    let script = TraceScript::new(trace, options.prefix).map_err(ReplayError::InvalidTrace)?;
+    // Only a trace without `end` stops at its last step. A complete one is
+    // replayed in full under `prefix` too.
+    let script = TraceScript::new(trace, options.prefix && trace.end.is_none())
+        .map_err(ReplayError::InvalidTrace)?;
 
     let mut sink = VerifySink::new(trace);
     let (report, failure) =

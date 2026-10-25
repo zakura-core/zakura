@@ -36,15 +36,15 @@ use crate::components::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// A gossiped body claims a coinbase height that its header does not commit to.
+/// A gossiped body has no coinbase height, or claims one its header does not commit to.
 ///
 /// The body is not the block its header names, so only its supplier is at fault. See
 /// `crate::components::auth_download_height`. Inbound uses this typed evidence to score the
 /// supplier and retry the hash.
 #[derive(Copy, Clone, Debug, thiserror::Error)]
-#[error("gossiped block claimed a height its header does not commit to: {height:?} {hash:?}")]
+#[error("gossiped block has no header-bound coinbase height: {height:?} {hash:?}")]
 pub struct GossipedUnboundHeight {
-    pub height: block::Height,
+    pub height: Option<block::Height>,
     pub hash: block::Hash,
 }
 
@@ -689,9 +689,15 @@ where
                 })
                 .unwrap_or(block::Height(0));
 
-            let block_height = block
-                .coinbase_height()
-                .ok_or_else(|| (BoxError::from("gossiped block with no height"), None))?;
+            let Some(block_height) = block.coinbase_height() else {
+                if let Some(feedback) = &supplier_feedback {
+                    feedback.reject();
+                }
+                return Err((
+                    BoxError::from(GossipedUnboundHeight { height: None, hash }),
+                    advertiser_addr,
+                ));
+            };
 
             // Security: authenticate the claimed coinbase height before the height policies
             // below run. See `crate::components::auth_download_height`.
@@ -720,7 +726,7 @@ where
                 }
                 return Err((
                     BoxError::from(GossipedUnboundHeight {
-                        height: block_height,
+                        height: Some(block_height),
                         hash,
                     }),
                     advertiser_addr,
@@ -1419,7 +1425,7 @@ mod tests {
             .downcast_ref::<GossipedUnboundHeight>()
             .expect("the error must be the typed mismatch that Inbound scores");
 
-        assert_eq!(mismatch.height, block::Height(1));
+        assert_eq!(mismatch.height, Some(block::Height(1)));
         assert_eq!(mismatch.hash, canonical_hash);
     }
 
@@ -1446,7 +1452,7 @@ mod tests {
             );
             let (error, supplier) = downloads.next().await.unwrap().unwrap_err();
             let mismatch = error.downcast_ref::<GossipedUnboundHeight>().unwrap();
-            assert_eq!(mismatch.height, height);
+            assert_eq!(mismatch.height, Some(height));
             assert_eq!(supplier, Some(addr));
         }
     }

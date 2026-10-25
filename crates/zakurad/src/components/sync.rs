@@ -2673,6 +2673,10 @@ where
                 hash,
                 advertiser_addr,
                 ..
+            }
+            | BlockDownloadVerifyError::InvalidHeight {
+                hash,
+                advertiser_addr,
             } => Some((*hash, *advertiser_addr)),
             BlockDownloadVerifyError::Invalid {
                 error,
@@ -2698,7 +2702,11 @@ where
             if !self.poisoned_block_retry_counts.contains_key(&hash)
                 && self.poisoned_block_retry_counts.len() >= MAX_POISONED_BLOCK_RETRY_HASHES
             {
-                return Ok(());
+                warn!(
+                    ?hash,
+                    "poisoned sync block retry table full, restarting sync"
+                );
+                return response.map(|_| ()).map_err(Report::from);
             }
             let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
 
@@ -2729,10 +2737,10 @@ where
             warn!(
                 ?hash,
                 retry_limit = POISONED_BLOCK_RETRY_LIMIT,
-                "poisoned sync block retry budget exhausted, preserving other downloads"
+                "poisoned sync block retry budget exhausted, restarting sync"
             );
             metrics::counter!("sync.poisoned.block.retry.limit.count").increment(1);
-            return Ok(());
+            return response.map(|_| ()).map_err(Report::from);
         }
 
         if let Some((hash, kind)) = response
@@ -3077,22 +3085,14 @@ where
                 false
             }
             BlockDownloadVerifyError::InvalidHeight { .. } => {
-                debug!(
-                    error = ?e,
-                    %peer,
-                    "block has no valid height, \
-                     dropping the block and continuing sync"
-                );
+                // Required hashes use bounded replacement in the retry handler. Other callers
+                // must not restart the whole round for a single malformed body.
+                debug!(error = ?e, %peer, "block has no valid height, dropping the body");
                 false
             }
             BlockDownloadVerifyError::UnboundHeight { .. } => {
-                // `handle_block_response_with_missing_retry` handles every mismatch itself and
-                // returns success even once the requeue budget is exhausted, so that an
-                // exhausted budget keeps the round's other downloads. This arm is therefore
-                // only reached by a caller that bypasses the retry handler. The round's stall
-                // deadline recovers an exhausted hash: once the other downloads drain, no block
-                // completes within `BLOCK_VERIFY_TIMEOUT`, so the round restarts and obtains
-                // fresh tips and peers.
+                // Once bounded replacement fails, restart discovery rather than lose a required
+                // hash. Unrelated tip progress can keep the round's stall deadline alive.
                 warn!(
                     error = ?e,
                     %peer,

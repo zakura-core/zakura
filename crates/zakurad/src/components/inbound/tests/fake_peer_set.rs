@@ -923,6 +923,15 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 /// matching, scoring would stop, and every other test would stay green.
 #[tokio::test(flavor = "current_thread")]
 async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), crate::BoxError> {
+    inbound_bad_coinbase_scores_and_requeues(false).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_missing_coinbase_scores_and_requeues() -> Result<(), crate::BoxError> {
+    inbound_bad_coinbase_scores_and_requeues(true).await
+}
+
+async fn inbound_bad_coinbase_scores_and_requeues(missing: bool) -> Result<(), crate::BoxError> {
     let (
         inbound_service,
         _mempool,
@@ -943,7 +952,13 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
     let block_hash = canonical.hash();
 
-    let poisoned = poison_coinbase_height(&canonical, Height(1));
+    let poisoned = if missing {
+        let mut body = (*canonical).clone();
+        body.transactions.clear();
+        Arc::new(body)
+    } else {
+        poison_coinbase_height(&canonical, Height(1))
+    };
     assert_eq!(
         poisoned.hash(),
         block_hash,

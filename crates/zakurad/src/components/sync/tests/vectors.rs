@@ -4256,7 +4256,7 @@ async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate
 
 /// The poisoned-body requeue is bounded, so a peer can't hold the sync loop open forever.
 #[tokio::test]
-async fn poisoned_tip_child_preserves_round_after_retry_limit() {
+async fn poisoned_tip_child_restarts_round_after_retry_limit() {
     let (
         mut chain_sync,
         _sync_status,
@@ -4284,8 +4284,8 @@ async fn poisoned_tip_child_preserves_round_after_retry_limit() {
         .await;
 
     assert!(
-        result.is_ok(),
-        "an exhausted poisoned-body budget must preserve unrelated downloads"
+        result.is_err(),
+        "an exhausted poisoned-body budget must restart discovery for the required hash"
     );
     assert_eq!(
         chain_sync.poisoned_block_retry_counts.get(&block_hash),
@@ -4372,7 +4372,10 @@ async fn poisoned_body_budget_table_is_bounded() {
             advertiser_addr: None,
         }))
         .await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_err(),
+        "a full table must restart discovery for the required hash"
+    );
     assert_eq!(
         chain_sync.poisoned_block_retry_counts.len(),
         sync::MAX_POISONED_BLOCK_RETRY_HASHES
@@ -4571,4 +4574,48 @@ fn scaled_lookahead_stays_below_the_drop_height() {
             "multiplier {multiplier}"
         );
     }
+}
+
+/// A header-matching body without a coinbase must not consume the required hash.
+#[tokio::test]
+async fn missing_coinbase_retries_and_accepts_replacement() {
+    let (mut sync, _, mut verifier, mut peers, _, _) = setup_chain_sync();
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = canonical.hash();
+    let mut malformed = (*canonical).clone();
+    malformed.transactions.clear();
+    let addr = "127.0.0.1:8233".parse().unwrap();
+    let (sender, mut scores) = tokio::sync::mpsc::channel(2);
+    sync.misbehavior_sender = sender;
+    sync.downloads.download_and_verify(hash).await.unwrap();
+    peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            Arc::new(malformed),
+            Some(addr),
+        ))]));
+    let result = sync.downloads.next().await.unwrap();
+    assert!(matches!(
+        result,
+        Err(BlockDownloadVerifyError::InvalidHeight { .. })
+    ));
+    sync.handle_block_response_with_missing_retry(result)
+        .await
+        .unwrap();
+    assert_eq!(scores.recv().await, Some((addr, 100)));
+    peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((canonical, None))]));
+    verifier
+        .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
+        .await
+        .respond(hash);
+    assert_eq!(
+        sync.downloads.next().await.unwrap().unwrap(),
+        (Height(1), hash)
+    );
 }

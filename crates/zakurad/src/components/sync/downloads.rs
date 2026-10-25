@@ -716,11 +716,11 @@ where
                 // A body with no coinbase height cannot be the block this header commits to.
                 // The block identifier comes from the header, so the response still satisfies
                 // the requested hash: only the supplier is implicated, and without excluding it
-                // the same peer stays eligible for this hash on every retry. The advertiser
-                // stays unattributed, because it did not choose the body.
+                // the same peer stays eligible for this hash on every retry. Preserve the
+                // supplying address for scoring and route the hash through bounded recovery.
                 let Some(block_height) = block.coinbase_height() else {
                     if let Some(feedback) = &supplier_feedback { feedback.reject(); }
-                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None });
+                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
 
                 // Security: authenticate the claimed coinbase height before any height policy

@@ -93,6 +93,7 @@ fn try_main() -> Result<(), BoxError> {
             rt_imports::check(&repo_root()?)
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
+        Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -301,6 +302,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
     )?;
+    writeln!(
+        output,
+        "  cargo xtask replay <dir> [--allow-build-mismatch] [--prefix] [--observe]"
+    )?;
     writeln!(output)?;
     writeln!(
         output,
@@ -340,5 +345,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Runs a zakura-sim harness on one input in the simulator build and writes its trace."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Replays a zakura-sim trace Exact in the simulator build, on an equivalent build only."
     )
 }

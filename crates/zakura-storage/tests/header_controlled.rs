@@ -799,3 +799,53 @@ fn shutdown_ends_everything_without_running_work() {
     assert!(port.pending().is_empty());
     assert!(port.take_events().is_empty());
 }
+
+/// #1721 review P2 (Astra): two applies with the same owner, prepared from
+/// the same headers with different body sizes, carry different auxiliary
+/// deliveries, so their request digests differ. Apply records also name
+/// the supplier.
+#[test]
+fn apply_digests_cover_the_sealed_insertion() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let targets: Vec<_> = [0, 1_000]
+        .into_iter()
+        .map(|body_size| {
+            let mut request = HeaderFixture::regtest().target_request(
+                &port.engine().snapshot(),
+                chain[0],
+                &next,
+                2,
+            );
+            let mut entries = request.entries.into_vec();
+            entries[0].body_size = body_size;
+            request.entries = entries.try_into().expect("one entry fits");
+            ready(port.engine().prepare_header_target(request)).expect("fixture headers prepare")
+        })
+        .collect();
+    assert_eq!(targets[0].owner(), targets[1].owner());
+    let source = targets[0].source();
+    let mut applies: Vec<_> = targets
+        .into_iter()
+        .map(|target| port.apply_header_target(target))
+        .collect();
+    for apply in &mut applies {
+        submit(apply);
+    }
+    let submitted: Vec<_> = port
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            StorageEvent::Submitted {
+                attribution,
+                request_digest,
+                ..
+            } => Some((attribution.peer, request_digest)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(submitted.len(), 2);
+    assert_eq!(submitted[0].0, Some(source));
+    assert_eq!(submitted[1].0, Some(source));
+    assert_ne!(submitted[0].1, submitted[1].1);
+}

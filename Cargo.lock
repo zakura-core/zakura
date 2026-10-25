@@ -3609,6 +3609,7 @@ dependencies = [
  "zakura-header-chain",
  "zakura-node-services",
  "zakura-rt",
+ "zakura-scheduler",
  "zakura-test",
 ]
 

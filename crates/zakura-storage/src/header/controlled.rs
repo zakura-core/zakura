@@ -45,8 +45,11 @@ use zakura_node_services::header_chain::{
 use zakura_rt::{sync::watch, time::Instant};
 
 use super::{
-    adapter::EnginePort, fixture::HeaderFixture, lease::LeaseEnd, FaultGate, FromReply, HeaderOp,
-    HeaderReply, HeaderRequest, IllegalOutcome, Outcome, ADAPTER_DEADLINE,
+    adapter::EnginePort,
+    fixture::HeaderFixture,
+    lease::{Effects, LeaseEnd},
+    FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
+    ADAPTER_DEADLINE,
 };
 
 /// A pending operation's ID, unique within its port. IDs count up from 1 in
@@ -171,8 +174,14 @@ impl std::error::Error for CompleteError {}
 pub struct ControlledPort {
     engine: EnginePort,
     /// The run's own bookkeeping, so a std lock: it adds no scheduling points
-    /// production lacks, and the run locks it from outside any task. It's
-    /// never held across a `zakura_rt` call or the engine.
+    /// production lacks, and the run locks it from outside any task. So it's
+    /// never held across a scheduling point, or a task suspended there would
+    /// block the run's only thread: no `zakura_rt` call or engine call runs
+    /// under it, and a removed slot or replaced waker drops only after it's
+    /// released, since a reply can hold the last sender of a capacity signal,
+    /// whose drop is a scheduling point. It may be taken under the engine's
+    /// lease lock, to record an event with the change it records, but never
+    /// the other way round.
     ops: Mutex<Ops>,
 }
 
@@ -221,7 +230,9 @@ impl ControlledPort {
     }
 
     /// The engine port underneath. Its own `Port` methods run at once, which
-    /// suits setting up a chain before the run starts.
+    /// suits setting up a chain before the run starts. A task in the run
+    /// must not call them: an apply can suspend under the engine lock, which
+    /// the run takes to complete operations.
     pub fn engine(&self) -> &EnginePort {
         &self.engine
     }
@@ -335,13 +346,14 @@ impl ControlledPort {
         let op = request.op();
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
-        let reply = match early {
+        let (reply, effects) = match early {
             Some(reply) => {
                 drop(request);
-                reply
+                (reply, Effects::default())
             }
             None => self.engine.execute(request),
         };
+        let mut lease_ends = effects.fire();
         let (caller, abandoned, attribution, request_digest) = {
             let mut ops = self.ops();
             let slot = ops
@@ -355,14 +367,16 @@ impl ControlledPort {
                     (Some(waker), None, attribution, request_digest)
                 }
                 None => {
-                    ops.slots.remove(&id);
-                    (None, Some(reply), attribution, request_digest)
+                    let removed = ops.slots.remove(&id);
+                    (None, Some((removed, reply)), attribution, request_digest)
                 }
             }
         };
-        if let Some(reply) = &abandoned {
-            self.abandon(reply);
+        if let Some((_, reply)) = &abandoned {
+            // The completion's own record carries the ends.
+            lease_ends.extend(self.abandon(reply, |_| {}).fire());
         }
+        drop(abandoned);
         let completion = Completion {
             id,
             op,
@@ -370,7 +384,7 @@ impl ControlledPort {
             request_digest,
             outcome,
             delivered: caller.is_some(),
-            lease_ends: self.engine.take_lease_ends(),
+            lease_ends,
             state_digest: self.engine.state_digest(),
         };
         self.ops()
@@ -384,10 +398,18 @@ impl ControlledPort {
     }
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take
-    /// it. Other replies own nothing.
-    fn abandon(&self, reply: &HeaderReply) {
-        if let HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) = reply {
-            self.engine.abandon(path);
+    /// it, and returns the effects to fire once no lock is held. Other
+    /// replies own nothing. Calls `record` with the lease ends as the lease
+    /// ends, as [`EnginePort::abandon`] does.
+    fn abandon(&self, reply: &HeaderReply, record: impl FnOnce(&[LeaseEnd])) -> Effects {
+        match reply {
+            HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) => {
+                self.engine.abandon(path, record)
+            }
+            _ => {
+                record(&[]);
+                Effects::default()
+            }
         }
     }
 
@@ -411,8 +433,7 @@ impl ControlledPort {
         let dropped = slots.keys().copied().collect();
         // Dropped outside the lock, since a request's permit wakes waiters.
         drop(slots);
-        self.engine.shut_down_leases();
-        let lease_ends = self.engine.take_lease_ends();
+        let lease_ends = self.engine.shut_down_leases().fire();
         self.ops().events.push(StorageEvent::ShutDown {
             dropped,
             lease_ends,
@@ -517,7 +538,9 @@ impl<T: FromReply> Future for Call<'_, T> {
                     self.state = CallState::Done;
                     Poll::Ready(T::from_reply(reply))
                 } else {
-                    slot.caller = Some(cx.waker().clone());
+                    let replaced = slot.caller.replace(cx.waker().clone());
+                    drop(ops);
+                    drop(replaced);
                     Poll::Pending
                 }
             }
@@ -538,8 +561,10 @@ impl<T> Drop for Call<'_, T> {
         };
         if !matches!(slot.stage, Stage::Replied(_)) {
             // Accepted work outlives its caller.
-            slot.caller = None;
+            let caller = slot.caller.take();
             ops.events.push(StorageEvent::CallerDropped { id });
+            drop(ops);
+            drop(caller);
             return;
         }
         let Some(Slot {
@@ -550,12 +575,13 @@ impl<T> Drop for Call<'_, T> {
             unreachable!("the stage was checked above under the same lock");
         };
         drop(ops);
-        self.port.abandon(&reply);
-        let lease_ends = self.port.engine.take_lease_ends();
-        self.port
-            .ops()
-            .events
-            .push(StorageEvent::ReplyDropped { id, lease_ends });
+        let effects = self.port.abandon(&reply, |lease_ends| {
+            self.port.ops().events.push(StorageEvent::ReplyDropped {
+                id,
+                lease_ends: lease_ends.to_vec(),
+            });
+        });
+        effects.fire();
     }
 }
 
@@ -573,6 +599,7 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
                 })
         }
         HeaderRequest::PrepareHeaderTarget(prepare) => (Some(prepare.source), None),
+        HeaderRequest::ApplyHeaderTarget { target } => (Some(target.source()), None),
         _ => (None, None),
     };
     Attribution {
@@ -583,16 +610,22 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
 }
 
 /// A digest of `request`. Path and target handles redact their identity
-/// from `Debug`, so a path this port issued adds its lease, peer and
-/// session.
+/// and contents from `Debug`, so a path this port issued adds its lease,
+/// peer and session, and a target this port sealed adds its whole
+/// insertion: supplier, headers and auxiliary deliveries.
 fn digest(request: &HeaderRequest, key: &AdapterKey) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v1");
     hasher.update(format!("{request:?}").as_bytes());
-    if let HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } =
-        request
-    {
-        hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+    match request {
+        HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } => {
+            hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+        }
+        HeaderRequest::ApplyHeaderTarget { target } => {
+            // `into_insert` consumes the target, so this opens a clone.
+            hasher.update(format!("{:?}", target.clone().into_insert(key).ok()).as_bytes());
+        }
+        _ => {}
     }
     hasher.finalize().into()
 }

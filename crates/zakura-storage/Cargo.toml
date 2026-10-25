@@ -25,5 +25,10 @@ zakura-rt = { path = "../zakura-rt" }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 zakura-test = { path = "../zakura-test" }
 
+# The real scheduler, for tests that stop a task at each of its scheduling
+# points and act as the run would there.
+[target.'cfg(zakura_sim)'.dev-dependencies]
+zakura-scheduler = { path = "../zakura-scheduler" }
+
 [lints]
 workspace = true

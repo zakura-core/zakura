@@ -242,6 +242,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
 
+      - name: Affected documentation tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_check_pr_docs.py
+
       - name: CI alert tests
         if: ${{ !cancelled() }}
         run: |

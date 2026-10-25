@@ -194,6 +194,7 @@ pub fn spawn_bench_sequencer(
         frontiers,
         Some(owner.authority()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        Arc::new(super::BlockSyncClock),
         body_input_rx,
         control_rx,
         body_input_bytes.clone(),

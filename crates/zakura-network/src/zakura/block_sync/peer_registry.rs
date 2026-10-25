@@ -195,10 +195,15 @@ impl BodyRetryKey {
     }
 }
 
-pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+/// The monotonic instant at which UTC `deadline` arrives by `clock`, or now if
+/// it has passed. `clock` must be the one that dated `deadline`.
+pub(super) fn retry_deadline_instant(
+    deadline: chrono::DateTime<chrono::Utc>,
+    clock: &dyn zakura_header_chain::Clock,
+) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
-        .signed_duration_since(super::utc_now())
+        .signed_duration_since(clock.now())
         .to_std()
         .unwrap_or(Duration::ZERO);
     monotonic_now

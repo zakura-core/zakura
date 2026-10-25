@@ -104,7 +104,7 @@ fn synchronize_persisted_body_alarm(
                 (
                     zakura_header_chain::BodyWorkAuthority::for_view(view),
                     view.frontiers.header_best.hash,
-                    retry_deadline_instant(summary.next_probe_at),
+                    retry_deadline_instant(summary.next_probe_at, &BlockSyncClock),
                 )
             })
     });
@@ -240,6 +240,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         initial_body_scope,
         crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
+        Arc::new(BlockSyncClock),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),

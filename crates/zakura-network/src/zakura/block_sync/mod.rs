@@ -91,6 +91,18 @@ fn utc_now() -> chrono::DateTime<chrono::Utc> {
     time::utc_now().into()
 }
 
+/// A header-chain [`Clock`](zakura_header_chain::Clock) that reads [`utc_now`], so
+/// body-retry deadlines and their conversion to `Instant`s share one clock.
+#[derive(Copy, Clone, Debug, Default)]
+struct BlockSyncClock;
+
+impl zakura_header_chain::Clock for BlockSyncClock {
+    /// Returns [`utc_now`].
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        utc_now()
+    }
+}
+
 #[cfg(test)]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
     zakura_header_chain::BodyWorkAuthority {

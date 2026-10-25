@@ -1286,7 +1286,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn header_reactor_witness_exercises_locator_deadlines_and_repair() {
     let summary = replay_header_reactor_bytes(WITNESS);

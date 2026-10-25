@@ -1149,7 +1149,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn reactor_witness_exercises_refusal_retry_reset_and_authority() {
     let summary = replay_block_reactor_bytes(WITNESS);

@@ -45,8 +45,11 @@ use zakura_node_services::header_chain::{
 use zakura_rt::{sync::watch, time::Instant};
 
 use super::{
-    adapter::EnginePort, fixture::HeaderFixture, lease::LeaseEnd, FaultGate, FromReply, HeaderOp,
-    HeaderReply, HeaderRequest, IllegalOutcome, Outcome, ADAPTER_DEADLINE,
+    adapter::EnginePort,
+    fixture::HeaderFixture,
+    lease::{Effects, LeaseEnd},
+    FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
+    ADAPTER_DEADLINE,
 };
 
 /// A pending operation's ID, unique within its port. IDs count up from 1 in
@@ -333,13 +336,14 @@ impl ControlledPort {
         let op = request.op();
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
-        let reply = match early {
+        let (reply, effects) = match early {
             Some(reply) => {
                 drop(request);
-                reply
+                (reply, Effects::default())
             }
             None => self.engine.execute(request),
         };
+        let mut lease_ends = effects.fire();
         let (caller, abandoned, attribution, request_digest) = {
             let mut ops = self.ops();
             let slot = ops
@@ -359,7 +363,7 @@ impl ControlledPort {
             }
         };
         if let Some((_, reply)) = &abandoned {
-            self.abandon(reply);
+            lease_ends.extend(self.abandon(reply).fire());
         }
         drop(abandoned);
         let completion = Completion {
@@ -369,7 +373,7 @@ impl ControlledPort {
             request_digest,
             outcome,
             delivered: caller.is_some(),
-            lease_ends: self.engine.take_lease_ends(),
+            lease_ends,
             state_digest: self.engine.state_digest(),
         };
         self.ops()
@@ -383,10 +387,14 @@ impl ControlledPort {
     }
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take
-    /// it. Other replies own nothing.
-    fn abandon(&self, reply: &HeaderReply) {
-        if let HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) = reply {
-            self.engine.abandon(path);
+    /// it, and returns the effects to fire once no lock is held. Other
+    /// replies own nothing.
+    fn abandon(&self, reply: &HeaderReply) -> Effects {
+        match reply {
+            HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) => {
+                self.engine.abandon(path)
+            }
+            _ => Effects::default(),
         }
     }
 
@@ -410,8 +418,7 @@ impl ControlledPort {
         let dropped = slots.keys().copied().collect();
         // Dropped outside the lock, since a request's permit wakes waiters.
         drop(slots);
-        self.engine.shut_down_leases();
-        let lease_ends = self.engine.take_lease_ends();
+        let lease_ends = self.engine.shut_down_leases().fire();
         self.ops().events.push(StorageEvent::ShutDown {
             dropped,
             lease_ends,
@@ -553,8 +560,7 @@ impl<T> Drop for Call<'_, T> {
             unreachable!("the stage was checked above under the same lock");
         };
         drop(ops);
-        self.port.abandon(&reply);
-        let lease_ends = self.port.engine.take_lease_ends();
+        let lease_ends = self.port.abandon(&reply).fire();
         self.port
             .ops()
             .events

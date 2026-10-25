@@ -6,6 +6,7 @@
 
 use std::{
     future::{poll_fn, Future},
+    panic::{catch_unwind, AssertUnwindSafe},
     pin::pin,
     sync::{mpsc, Arc},
     task::{Context, Poll, Waker},
@@ -19,9 +20,10 @@ use zakura_node_services::header_chain::{
 };
 use zakura_scheduler::{At, Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, TaskId};
 use zakura_storage::header::{
-    controlled::{ControlledPort, OpId},
+    controlled::{ControlledPort, OpId, StorageEvent},
     fixture::HeaderFixture,
-    Outcome,
+    lease::LeaseEnd,
+    HeaderOp, Outcome, Release,
 };
 
 /// Polls `future` once, outside any task. The engine port runs each
@@ -163,4 +165,143 @@ fn dropping_an_unread_reply_never_suspends_under_the_bookkeeping_lock() {
         points.iter().any(|at| at.op == Op::Release),
         "the reply's drop reached no release point: {points:?}"
     );
+}
+
+/// Operations the competing task submits, more than any drop has points.
+const COMPETING: u64 = 32;
+
+/// Spawns a task that submits [`COMPETING`] membership reads and keeps
+/// them pending, so the run always has a completion to pick. Runs it until
+/// it waits. They get IDs 1 to `COMPETING`.
+fn spawn_competing(sched: &mut Scheduler, port: &Arc<ControlledPort>, target: Frontier) {
+    let caller = port.clone();
+    let task = sched
+        .spawn_root("competing", async move {
+            let mut calls: Vec<_> = (0..COMPETING)
+                .map(|_| caller.selected_chain_contains(target.hash))
+                .collect();
+            poll_fn(|cx| {
+                for call in &mut calls {
+                    assert!(call.as_mut().poll(cx).is_pending());
+                }
+                Poll::Ready(())
+            })
+            .await;
+            zakura_rt::time::sleep(Duration::from_secs(1_000)).await;
+        })
+        .task();
+    step(sched, task, |_| {});
+}
+
+/// A task drops an unread `Acquired` reply, after another acquire for the
+/// same peer registered a capacity waiter if `with_waiter`. At every
+/// scheduling point the drop reaches, acts as the run may there: takes the
+/// lease lock, lists pending operations, and completes a competing
+/// operation. Returns what went wrong, and every event.
+fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
+    let mut sched = scheduler();
+    let (port, target) = chain();
+    spawn_competing(&mut sched, &port, target);
+    let task = spawn_unread_acquire(&mut sched, &port, target);
+    let unread = OpId(COMPETING + 1);
+    assert!(
+        port.complete(unread, Outcome::Engine)
+            .expect("completes")
+            .delivered
+    );
+    let waiter = with_waiter.then(|| {
+        match ready(port.engine().acquire_header_path(acquire(&port, target))) {
+            Ok(AcquirePathReply::CapacityBusy(signal)) => signal,
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
+    });
+
+    sched.advance_to(SimInstant::from_start(Duration::from_secs(10)));
+    let mut problems = Vec::new();
+    let mut events = port.take_events();
+    let mut competing = (1..=COMPETING).map(OpId);
+    step(&mut sched, task, |at| {
+        if catch_unwind(AssertUnwindSafe(|| port.engine().live_leases())).is_err() {
+            problems.push(format!("the lease lock was held at {at}"));
+            return;
+        }
+        if !listing_is_free(&port) {
+            problems.push(format!("the bookkeeping lock was held at {at}"));
+            return;
+        }
+        let id = competing.next().expect("enough competing operations");
+        let completion = port.complete(id, Outcome::Engine).expect("completes");
+        if !completion.lease_ends.is_empty() {
+            problems.push(format!(
+                "operation {} took lease ends {:?} at {at}",
+                id.0, completion.lease_ends
+            ));
+        }
+        events.extend(port.take_events());
+    });
+    if !problems.is_empty() {
+        // A task suspended with a lock held never releases it, so shutting
+        // the run down would hang.
+        std::mem::forget(sched);
+        return (problems, events);
+    }
+    events.extend(port.take_events());
+    if let Some(waiter) = waiter {
+        assert!(waiter.is_released(), "the waiter's signal fired");
+    }
+    (problems, events)
+}
+
+/// The unread acquire's `ReplyDropped` lease ends.
+fn reply_dropped_ends(events: &[StorageEvent]) -> Vec<LeaseEnd> {
+    events
+        .iter()
+        .find_map(|event| match event {
+            StorageEvent::ReplyDropped { id, lease_ends } if *id == OpId(COMPETING + 1) => {
+                Some(lease_ends.clone())
+            }
+            _ => None,
+        })
+        .expect("the unread reply was dropped")
+}
+
+/// #1721 review P1: abandoning an unread `Acquired` reply fires the capacity
+/// signal another acquire waits on, a scheduling point. The run must still
+/// be able to take the lease lock there, or its next completion panics
+/// outside a task, so signals fire only after the lock is released.
+#[test]
+fn abandoning_with_a_capacity_waiter_never_suspends_under_a_lock() {
+    let (problems, events) = abandon_with_probes(true);
+    assert!(problems.is_empty(), "{problems:#?}");
+    assert!(matches!(
+        reply_dropped_ends(&events).as_slice(),
+        [LeaseEnd {
+            release: Release::LeaseAbandonedAcquire,
+            ..
+        }]
+    ));
+}
+
+/// #1721 review P2: a completion the run picks while a task abandons an
+/// unread `Acquired` reply never takes that lease's end, which stays with
+/// the abandonment's `ReplyDropped`.
+#[test]
+fn an_abandoned_lease_end_stays_with_its_reply() {
+    let (problems, events) = abandon_with_probes(false);
+    assert!(problems.is_empty(), "{problems:#?}");
+    assert!(matches!(
+        reply_dropped_ends(&events).as_slice(),
+        [LeaseEnd {
+            release: Release::LeaseAbandonedAcquire,
+            ..
+        }]
+    ));
+    let completed = events
+        .iter()
+        .filter(|event| {
+            matches!(event, StorageEvent::Completed(completion)
+                if completion.op == HeaderOp::SelectedChainContains)
+        })
+        .count();
+    assert!(completed > 0, "no competing completion ran during the drop");
 }

@@ -108,6 +108,29 @@ pub struct LeaseEnd {
     pub release: Release,
 }
 
+/// What registry changes leave to do once the registry's lock is released:
+/// the leases they ended, and the capacity signals to fire. Firing or
+/// dropping a signal is a scheduling point in a simulator run, and a task
+/// suspended there with the lock held would leave the run unable to take
+/// it, so signals never fire under the lock.
+#[must_use = "the capacity signals must fire"]
+#[derive(Debug, Default)]
+pub(crate) struct Effects {
+    ends: Vec<LeaseEnd>,
+    signals: Vec<ServingCapacitySignal>,
+}
+
+impl Effects {
+    /// Fires the capacity signals in the order the registry released them,
+    /// and returns the lease ends. Call it with no lock held.
+    pub(crate) fn fire(self) -> Vec<LeaseEnd> {
+        for signal in self.signals {
+            signal.release();
+        }
+        self.ends
+    }
+}
+
 /// Every live lease, at most one per peer, and the continuation cache.
 #[derive(Debug, Default)]
 pub(super) struct Registry {
@@ -120,8 +143,8 @@ pub(super) struct Registry {
     continuations: BTreeMap<SourceId, Cursor>,
     /// How many acquires continued from a cached cursor.
     continuation_hits: u64,
-    /// Leases ended since the last [`Registry::take_ended`], in order.
-    ended: Vec<LeaseEnd>,
+    /// What changes since the last [`Registry::take_effects`] left to do.
+    effects: Effects,
 }
 
 impl Registry {
@@ -137,18 +160,16 @@ impl Registry {
         }
     }
 
-    /// Removes `peer`'s lease, records why, and fires its signal and any
-    /// capacity waiters.
+    /// Removes `peer`'s lease, records why, and queues its signal and any
+    /// capacity waiters' to fire.
     fn remove_peer(&mut self, peer: SourceId, release: Release) -> Option<Cursor> {
         let mut cursor = self.by_peer.remove(&peer)?;
-        self.ended.push(LeaseEnd {
+        self.effects.ends.push(LeaseEnd {
             peer,
             lease_id: cursor.lease_id,
             release,
         });
-        if let Some(signal) = cursor.capacity_signal.take() {
-            signal.release();
-        }
+        self.effects.signals.extend(cursor.capacity_signal.take());
         self.notify_capacity();
         Some(cursor)
     }
@@ -161,17 +182,13 @@ impl Registry {
             .count()
     }
 
-    /// Fires each class's waiting signal once the class has room.
+    /// Queues each class's waiting signal to fire once the class has room.
     fn notify_capacity(&mut self) {
         if self.general_count() < Capacity::General.limit() {
-            if let Some(signal) = self.general_capacity.take() {
-                signal.release();
-            }
+            self.effects.signals.extend(self.general_capacity.take());
         }
         if self.by_peer.len() < Capacity::Bounded.limit() {
-            if let Some(signal) = self.fallback_capacity.take() {
-                signal.release();
-            }
+            self.effects.signals.extend(self.fallback_capacity.take());
         }
     }
 
@@ -343,9 +360,9 @@ impl Registry {
         self.continuations.clear();
     }
 
-    /// The leases ended since the last call, in the order they ended.
-    pub(super) fn take_ended(&mut self) -> Vec<LeaseEnd> {
-        std::mem::take(&mut self.ended)
+    /// What the changes since the last call left to do.
+    pub(super) fn take_effects(&mut self) -> Effects {
+        std::mem::take(&mut self.effects)
     }
 
     /// Feeds the live leases and the continuation cache to `out`, in peer

@@ -63,6 +63,8 @@ pub struct PendingOp {
     pub op: HeaderOp,
     /// The outcomes the run may complete it with now, in canonical order.
     pub enabled: Vec<Outcome>,
+    /// How long ago it was submitted.
+    pub since_submit: Duration,
     /// Whether its caller still waits for the reply.
     pub caller_waiting: bool,
 }
@@ -238,12 +240,16 @@ impl ControlledPort {
             .slots
             .iter()
             .filter_map(|(id, slot)| match &slot.stage {
-                Stage::Pending { request, submitted } => Some(PendingOp {
-                    id: *id,
-                    op: request.op(),
-                    enabled: request.enabled(key, now.saturating_duration_since(*submitted)),
-                    caller_waiting: slot.caller.is_some(),
-                }),
+                Stage::Pending { request, submitted } => {
+                    let since_submit = now.saturating_duration_since(*submitted);
+                    Some(PendingOp {
+                        id: *id,
+                        op: request.op(),
+                        enabled: request.enabled(key, since_submit),
+                        since_submit,
+                        caller_waiting: slot.caller.is_some(),
+                    })
+                }
                 Stage::Running | Stage::Replied(_) => None,
             })
             .collect()

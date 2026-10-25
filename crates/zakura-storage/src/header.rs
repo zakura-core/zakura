@@ -353,6 +353,20 @@ pub enum Release {
     Shutdown,
 }
 
+impl Release {
+    /// A short name for records, such as `lease-released`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Release::LocatorPermitOnFinish => "locator-permit-on-finish",
+            Release::LeaseConsumedByRead => "lease-consumed-by-read",
+            Release::LeaseReleased => "lease-released",
+            Release::LeaseAbandonedAcquire => "lease-abandoned-acquire",
+            Release::LeaseIdleExpired => "lease-idle-expired",
+            Release::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// Why state refuses an acquire before leasing a path, following
 /// `RetainedPathLeaseRegistry::reserve` and `acquire_retained_path`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

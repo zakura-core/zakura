@@ -221,6 +221,7 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
+        self.observe_sources(st);
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -314,6 +315,7 @@ impl Sim {
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
+            self.observe_sources(st);
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {
@@ -397,6 +399,13 @@ impl Sim {
             offers: &offers,
         })
         .is_ok_and(|enabled| enabled.is_empty())
+    }
+
+    /// Lets every source append what happened inside it to the current step.
+    fn observe_sources(&mut self, st: &mut State) {
+        for source in &mut self.sources {
+            source.observe(&mut st.log);
+        }
     }
 
     /// Runs `action` and records what it did.

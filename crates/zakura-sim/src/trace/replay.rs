@@ -62,14 +62,22 @@ pub struct ReplayReport {
     /// The first `end` field that differed, such as `end.properties`. Set
     /// only on a build mismatch.
     pub end_mismatch: Option<&'static str>,
+    /// The options it ran with.
+    pub options: ReplayOptions,
 }
 
 impl ReplayReport {
-    /// True only for a complete trace replayed on an equivalent build, where
-    /// every pick, draw, observation digest and `end` field matched. A
-    /// matching violation is a success.
+    /// True only for a complete trace replayed on an equivalent build, with
+    /// neither diagnostic option set, where every pick, draw, observation
+    /// digest and `end` field matched. A matching violation is a success.
+    /// An option can make a replay fail, but never makes it verified.
     pub fn verified(&self) -> bool {
-        self.complete && !self.build_mismatch
+        let ReplayOptions {
+            allow_build_mismatch,
+            prefix,
+            observe: _,
+        } = self.options;
+        self.complete && !self.build_mismatch && !allow_build_mismatch && !prefix
     }
 }
 
@@ -219,7 +227,7 @@ fn replay_on<'h>(
             });
         }
         Some(HarnessFailure::Plan(PlanError::PrefixEnd { .. })) => {
-            return finish(strict, &sink, None, false, build_mismatch);
+            return finish(strict, &sink, None, false, build_mismatch, options);
         }
         _ => {}
     }
@@ -229,7 +237,14 @@ fn replay_on<'h>(
         .expect("every run emits its end record, after its steps");
     let Some(recorded) = &trace.end else {
         // A prefix whose run ended on its own at the prefix's last step.
-        return finish(strict, &sink, Some(produced), false, build_mismatch);
+        return finish(
+            strict,
+            &sink,
+            Some(produced),
+            false,
+            build_mismatch,
+            options,
+        );
     };
     let end_mismatch = end_difference(recorded, &produced);
     if strict && end_mismatch.is_some() {
@@ -237,7 +252,7 @@ fn replay_on<'h>(
             return Err(ReplayError::Harness(failure));
         }
     }
-    let mut report = finish(strict, &sink, Some(produced), true, build_mismatch)?;
+    let mut report = finish(strict, &sink, Some(produced), true, build_mismatch, options)?;
     match end_mismatch {
         Some(field) if strict => Err(ReplayError::Nondeterministic {
             step: report.end.as_ref().map_or(0, |end| end.steps),
@@ -259,6 +274,7 @@ fn finish(
     end: Option<EndRecord>,
     complete: bool,
     build_mismatch: bool,
+    options: ReplayOptions,
 ) -> Result<ReplayReport, ReplayError> {
     if let (true, Some((step, field))) = (strict, sink.first) {
         return Err(ReplayError::Nondeterministic { step, field });
@@ -270,6 +286,7 @@ fn finish(
         obs_mismatches: sink.mismatches,
         first_obs_mismatch: sink.first,
         end_mismatch: None,
+        options,
     })
 }
 

@@ -177,6 +177,30 @@ fn allow_build_mismatch_never_succeeds() {
 }
 
 #[test]
+fn diagnostic_flags_never_verify() {
+    // The recording executable, so the build is equivalent: only the flags
+    // differ from a plain replay.
+    let dir = record_named("discovery/wait-complete", DISCOVERY);
+    assert!(replayed(dir.path(), ReplayOptions::default())
+        .unwrap()
+        .verified());
+    for options in [
+        ReplayOptions {
+            allow_build_mismatch: true,
+            ..ReplayOptions::default()
+        },
+        ReplayOptions {
+            prefix: true,
+            ..ReplayOptions::default()
+        },
+    ] {
+        let report = replayed(dir.path(), options).unwrap();
+        assert!(!report.build_mismatch, "{options:?}");
+        assert!(!report.verified(), "{options:?}: {report:?}");
+    }
+}
+
+#[test]
 fn changed_pick_diverges() {
     let dir = record_named("discovery/wait-complete", DISCOVERY);
     let trace = open(dir.path());

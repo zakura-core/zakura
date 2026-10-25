@@ -634,7 +634,7 @@ proptest! {
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn fixed_seeds_exercise_every_session_rule() {
     let mut total = ServiceSessionReplaySummary::default();

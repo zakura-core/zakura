@@ -54,9 +54,8 @@ cadence_witness -- --nocapture` from the repository root. Their printed counters
 are witness evidence; they do not claim applicability for every fuzz input.
 An empty input has zero applicability.
 
-Each nightly target keeps its own 900-second daily and 3,600-second weekly
-budget. CI restores corpora by target and decoder version. CI uploads the corpus,
-crash artifacts, witness counters, compiler version, source revision and fuzz log.
+No CI workflow schedules this target or the machine targets below. Run them
+with `cargo fuzz run` as shown above.
 Machine bytes are compatible with their target and decoder version. They are
 not portable simulator traces. The planned P1 registry will index these local
 property IDs and their witness paths.
@@ -83,6 +82,4 @@ reference keeps the first contiguous allowed run. It derives priority from that
 run's actual start and checks the commit-window take ceiling. These cases prove
 pure decisions. They do not prove asynchronous reservation cleanup.
 
-Each target receives its own 900-second daily and 3,600-second weekly budget.
-Keep the existing session budget intact. The planned P1 registry will index the
-local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+The planned P1 registry will index the local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.

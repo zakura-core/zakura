@@ -591,6 +591,7 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
                 })
         }
         HeaderRequest::PrepareHeaderTarget(prepare) => (Some(prepare.source), None),
+        HeaderRequest::ApplyHeaderTarget { target } => (Some(target.source()), None),
         _ => (None, None),
     };
     Attribution {
@@ -601,16 +602,22 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
 }
 
 /// A digest of `request`. Path and target handles redact their identity
-/// from `Debug`, so a path this port issued adds its lease, peer and
-/// session.
+/// and contents from `Debug`, so a path this port issued adds its lease,
+/// peer and session, and a target this port sealed adds its whole
+/// insertion: supplier, headers and auxiliary deliveries.
 fn digest(request: &HeaderRequest, key: &AdapterKey) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v1");
     hasher.update(format!("{request:?}").as_bytes());
-    if let HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } =
-        request
-    {
-        hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+    match request {
+        HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } => {
+            hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+        }
+        HeaderRequest::ApplyHeaderTarget { target } => {
+            // `into_insert` consumes the target, so this opens a clone.
+            hasher.update(format!("{:?}", target.clone().into_insert(key).ok()).as_bytes());
+        }
+        _ => {}
     }
     hasher.finalize().into()
 }

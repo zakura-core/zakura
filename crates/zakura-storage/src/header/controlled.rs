@@ -169,8 +169,12 @@ impl std::error::Error for CompleteError {}
 pub struct ControlledPort {
     engine: EnginePort,
     /// The run's own bookkeeping, so a std lock: it adds no scheduling points
-    /// production lacks, and the run locks it from outside any task. It's
-    /// never held across a `zakura_rt` call or the engine.
+    /// production lacks, and the run locks it from outside any task. So it's
+    /// never held across a scheduling point, or a task suspended there would
+    /// block the run's only thread: no `zakura_rt` call or engine call runs
+    /// under it, and a removed slot or replaced waker drops only after it's
+    /// released, since a reply can hold the last sender of a capacity signal,
+    /// whose drop is a scheduling point.
     ops: Mutex<Ops>,
 }
 
@@ -349,14 +353,15 @@ impl ControlledPort {
                     (Some(waker), None, attribution, request_digest)
                 }
                 None => {
-                    ops.slots.remove(&id);
-                    (None, Some(reply), attribution, request_digest)
+                    let removed = ops.slots.remove(&id);
+                    (None, Some((removed, reply)), attribution, request_digest)
                 }
             }
         };
-        if let Some(reply) = &abandoned {
+        if let Some((_, reply)) = &abandoned {
             self.abandon(reply);
         }
+        drop(abandoned);
         let completion = Completion {
             id,
             op,
@@ -511,7 +516,9 @@ impl<T: FromReply> Future for Call<'_, T> {
                     self.state = CallState::Done;
                     Poll::Ready(T::from_reply(reply))
                 } else {
-                    slot.caller = Some(cx.waker().clone());
+                    let replaced = slot.caller.replace(cx.waker().clone());
+                    drop(ops);
+                    drop(replaced);
                     Poll::Pending
                 }
             }
@@ -532,8 +539,10 @@ impl<T> Drop for Call<'_, T> {
         };
         if !matches!(slot.stage, Stage::Replied(_)) {
             // Accepted work outlives its caller.
-            slot.caller = None;
+            let caller = slot.caller.take();
             ops.events.push(StorageEvent::CallerDropped { id });
+            drop(ops);
+            drop(caller);
             return;
         }
         let Some(Slot {

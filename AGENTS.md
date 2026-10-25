@@ -48,6 +48,20 @@ cargo nextest run --profile all-tests --locked --release --features default-rele
 cargo nextest run --profile zakura-integration
 ```
 
+### Documentation lint before a PR
+
+Before opening a PR that changes Rust code, crate documentation inputs, or shared build configuration, run the affected-crate rustdoc check below. Compilation and Clippy do not catch rustdoc warnings. Commit the changes first because the selector compares Git commits and does not inspect uncommitted files. Fetch the PR's target branch and use its merge base with `HEAD` (the example targets `main`).
+
+```bash
+git fetch origin main
+RUSTUP_TOOLCHAIN=nightly-2026-09-06 \
+RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links -D warnings" \
+  python3 .github/workflows/scripts/check_pr_docs.py \
+  --base "$(git merge-base origin/main HEAD)" --head HEAD
+```
+
+Keep the toolchain and warning flags aligned with the `docs` job in `.github/workflows/tests-unit.yml`. Fix reported warnings before opening the PR. If local toolchain or build dependencies prevent the check, record that limitation in the draft PR and use its docs CI result. Unrelated prose or operator-script changes do not require a local Rust documentation build.
+
 ## Commit & Pull Request Guidelines
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)

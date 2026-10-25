@@ -84,8 +84,13 @@ pub enum HarnessError {
     UnknownHarness(String),
     /// `meta.scenario` doesn't deserialize as the harness's scenario.
     Scenario(serde_json::Error),
-    /// The run ended in a harness failure, from `RunEnd::harness`.
-    Run(HarnessFailure),
+    /// The run ended in a harness failure.
+    Run {
+        /// The failure, from `RunEnd::harness`.
+        failure: HarnessFailure,
+        /// The run's report, for callers that still read its log.
+        report: Box<RunReport>,
+    },
 }
 
 impl fmt::Display for HarnessError {
@@ -96,7 +101,9 @@ impl fmt::Display for HarnessError {
             HarnessError::Scenario(error) => {
                 write!(f, "the scenario doesn't fit the harness: {error}")
             }
-            HarnessError::Run(failure) => write!(f, "the run hit a harness failure: {failure}"),
+            HarnessError::Run { failure, .. } => {
+                write!(f, "the run hit a harness failure: {failure}")
+            }
         }
     }
 }
@@ -107,8 +114,8 @@ impl std::error::Error for HarnessError {}
 /// `extra` runs after the harness's own checker in a [`Tee`], for callers
 /// that collect more than the harness checks.
 ///
-/// Returns the report, or [`HarnessError::Run`] if the run ended in a
-/// harness failure. The `end` record goes to `sink` either way.
+/// Returns the report, or [`HarnessError::Run`] with it if the run ended in
+/// a harness failure. The `end` record goes to `sink` either way.
 pub fn run_harness<S: Subsystem>(
     scenario: &S::Scenario,
     input: PlanInput,
@@ -127,7 +134,10 @@ pub fn run_harness<S: Subsystem>(
     drop(checker);
     drop(this);
     match (&report.end.outcome, &report.end.harness) {
-        (Outcome::Harness, Some(failure)) => Err(HarnessError::Run(failure.clone())),
+        (Outcome::Harness, Some(failure)) => Err(HarnessError::Run {
+            failure: failure.clone(),
+            report: Box::new(report),
+        }),
         _ => Ok(report),
     }
 }

@@ -20,7 +20,9 @@ use zakura_sim::{
 fn run_wait_complete(plan: PlanInput) -> RunReport {
     match run_harness::<WaitComplete>(&Default::default(), plan, &mut MemorySink::default(), None) {
         Ok(report) => report,
-        Err(HarnessError::Run(failure)) => panic!("the run hit a harness failure: {failure}"),
+        Err(HarnessError::Run { failure, .. }) => {
+            panic!("the run hit a harness failure: {failure}")
+        }
         Err(error) => panic!("{error}"),
     }
 }

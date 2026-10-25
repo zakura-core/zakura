@@ -3,7 +3,8 @@
 //! A trace directory holds `trace.jsonl`, whose line 1 is `meta`, line 2 is
 //! `init`, then one line per step and `end` last. Beside it, `input.bin`
 //! holds the fuzz input that produced the run, if bytes did, and `blobs/`
-//! holds fixtures by SHA-256.
+//! holds fixtures by SHA-256. [`replay`] reruns a trace Exact on an
+//! equivalent build.
 //!
 //! A trace directory isn't a security boundary. The reader bounds what it
 //! allocates (see [`MAX_TRACE_BYTES`] and the limits beside it), and refuses
@@ -16,10 +17,15 @@
 
 pub mod meta;
 pub mod read;
+pub mod replay;
+mod verify;
 pub mod write;
 
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
+pub use replay::{
+    replay, replay_with, ReplayError, ReplayOptions, ReplayReport, OBSERVATIONS_FILE,
+};
 pub use write::{BlobStore, FileSink};
 
 /// The records, one JSON object per line.

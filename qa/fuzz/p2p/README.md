@@ -83,10 +83,6 @@ run's actual start and checks the commit-window take ceiling. These cases prove
 pure decisions. They do not prove asynchronous reservation cleanup.
 
 The planned P1 registry will index the local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> test/pure-discovery-machines
 
 ## Discovery session and redial targets
 
@@ -135,7 +131,6 @@ per-node backoff. Its witness exercises a duplicate completion, failure backoff
 and a local-limit pause. Planted failures release reservations early or discard
 backoff. Final cleanup settles every remaining logical reservation. This does
 not prove that an asynchronous worker releases its admission permit.
-<<<<<<< HEAD
 
 ## Block ownership and lifecycle targets
 
@@ -169,7 +164,3 @@ matches a replacement request, and resets the remaining window.
 These ledgers prove logical state transitions. Scheduled IO still needs separate
 proof that the actual guard or permit settles with its owner. P1 will register
 these local property IDs when its shared schema exists.
-=======
-=======
->>>>>>> test/pure-block-query-machine
->>>>>>> test/pure-discovery-machines

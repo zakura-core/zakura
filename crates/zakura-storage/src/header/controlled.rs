@@ -228,7 +228,9 @@ impl ControlledPort {
     }
 
     /// The engine port underneath. Its own `Port` methods run at once, which
-    /// suits setting up a chain before the run starts.
+    /// suits setting up a chain before the run starts. A task in the run
+    /// must not call them: an apply can suspend under the engine lock, which
+    /// the run takes to complete operations.
     pub fn engine(&self) -> &EnginePort {
         &self.engine
     }

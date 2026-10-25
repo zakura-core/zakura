@@ -718,7 +718,11 @@ impl EnginePort {
         // uncommitted snapshot, and still under the engine lock, as
         // production publishes under its writer lock. Dropping the lock first
         // would let a later commit publish before this one, leaving the watch
-        // behind the engine for good.
+        // behind the engine for good. Publishing is a scheduling point under
+        // a lock a `ControlledPort`'s run takes, which is safe only because
+        // that run applies outside any task, where points do nothing. Tasks
+        // may apply through this port directly only when no `ControlledPort`
+        // drives it, so they meet only each other here, and park.
         self.selected.send_replace(Some(after));
         drop(engine);
         Ok(match stalled {

@@ -43,8 +43,8 @@ use zakura_rt::{
 
 use super::{
     fixture::{HeaderFixture, ScenarioClock},
-    lease::{Capacity, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
-    FromReply, HeaderReply, HeaderRequest,
+    lease::{Capacity, LeaseEnd, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
+    FromReply, HeaderReply, HeaderRequest, Release,
 };
 
 /// A header-chain port over one in-memory engine. A requester and a
@@ -433,8 +433,13 @@ impl EnginePort {
         let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) else {
             return Err(PortError::Unavailable { source: None });
         };
-        self.leases()
-            .release(peer, session_id, lease_id, path.scope);
+        self.leases().release(
+            peer,
+            session_id,
+            lease_id,
+            path.scope,
+            Release::LeaseReleased,
+        );
         Ok(())
     }
 
@@ -730,9 +735,54 @@ impl EnginePort {
         }
     }
 
-    /// A future that runs `request` when first polled.
+    /// A future that runs `request` when first polled. Nothing reads this
+    /// port's lease ends, so they're dropped.
     fn run_on_poll<T: FromReply>(&self, request: HeaderRequest) -> HeaderChainFuture<'_, T> {
-        Box::pin(async move { T::from_reply(self.execute(request)) })
+        Box::pin(async move {
+            let reply = self.execute(request);
+            self.take_lease_ends();
+            T::from_reply(reply)
+        })
+    }
+
+    /// The leases ended since the last call, in the order they ended.
+    pub(crate) fn take_lease_ends(&self) -> Vec<LeaseEnd> {
+        self.leases().take_ended()
+    }
+
+    /// Ends the lease `path` names, if it's still live, because nobody
+    /// received the `Acquired` reply that carried it. A path another adapter
+    /// issued names nothing here.
+    pub(crate) fn abandon(&self, path: &RetainedHeaderPath) {
+        if let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) {
+            self.leases().release(
+                peer,
+                session_id,
+                lease_id,
+                path.scope,
+                Release::LeaseAbandonedAcquire,
+            );
+        }
+    }
+
+    /// Ends every lease, as service shutdown does.
+    pub(crate) fn shut_down_leases(&self) {
+        self.leases().shut_down();
+    }
+
+    /// A digest of the committed snapshot, the live leases and the
+    /// continuation cache. Equal histories give equal digests, in any
+    /// process.
+    pub fn state_digest(&self) -> [u8; 32] {
+        let engine = self.engine();
+        let leases = self.leases();
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-storage-header-state-v1");
+        // Every snapshot field is a plain value, so its `Debug` text is a
+        // complete encoding.
+        hasher.update(format!("{:?}", engine.snapshot()).as_bytes());
+        leases.digest_into(&mut |bytes| hasher.update(bytes));
+        hasher.finalize().into()
     }
 }
 

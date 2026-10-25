@@ -334,7 +334,7 @@ pub enum Deadline {
 }
 
 /// An event that ends capacity an operation owns.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Release {
     /// The operation's `LocatorReadPermit` clone drops when the operation
     /// finishes, not when its caller times out.

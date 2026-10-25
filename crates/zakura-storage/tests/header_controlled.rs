@@ -1,5 +1,6 @@
 //! The controlled header port: submission, enumeration, completion,
-//! cancellation and timeout gates (storage.md ST3.1, ST3.2 and ST3.6).
+//! cancellation, timeout gates, lease ends, records and shutdown
+//! (storage.md ST3.1 to ST3.4 and ST3.6).
 
 use std::{
     future::Future,
@@ -15,14 +16,16 @@ use std::{
 use zakura_chain::block;
 use zakura_header_chain::{ErrorCategory, Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{
-    AdapterKey, ApplyHeaderTargetOutcome, LocatorReadPermit, Port, PortError, PreparedHeaderTarget,
-    ReadPath, RetainedHeaderPath, SelectedChainMembership,
+    AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetOutcome, LocatorReadPermit, Port,
+    PortError, PreparedHeaderTarget, ReadPath, ReadPathReply, RetainedHeaderPath,
+    SelectedChainMembership,
 };
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
-    controlled::{CompleteError, ControlledPort, OpId},
+    controlled::{CompleteError, Completion, ControlledPort, OpId, StorageEvent},
     fixture::HeaderFixture,
-    Fault, HeaderOp, Outcome,
+    lease::LeaseEnd,
+    Fault, HeaderOp, Outcome, Release,
 };
 
 /// The engine outcome.
@@ -234,6 +237,7 @@ fn ids_and_enumeration_are_canonical() {
 fn completing_twice_or_illegally_changes_nothing() {
     let (port, chain) = chain(1);
     let before = port.engine().snapshot();
+    let digest = port.engine().state_digest();
     let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
     let mut apply = port.apply_header_target(prepared(&port, chain[0], &next, 2));
     let wakes = Arc::new(Wakes::default());
@@ -251,6 +255,7 @@ fn completing_twice_or_illegally_changes_nothing() {
         Err(CompleteError::NotPending(OpId(2)))
     );
     assert_eq!(port.engine().snapshot(), before);
+    assert_eq!(port.engine().state_digest(), digest);
     assert_eq!(
         listed(&port),
         [(1, HeaderOp::ApplyHeaderTarget, vec![ENGINE, LOCAL_RESOURCE])]
@@ -399,4 +404,398 @@ async fn prepare_and_apply_never_time_out() {
         before,
         "a fault never runs the work"
     );
+}
+
+/// The peer numbered `n`.
+fn peer(n: u8) -> SourceId {
+    SourceId::from_digest([n; 32])
+}
+
+/// `peer`'s acquire in `session` of the path from the anchor to `target`.
+fn acquire(
+    port: &ControlledPort,
+    peer: SourceId,
+    session_id: u64,
+    target: Frontier,
+) -> AcquirePath {
+    AcquirePath {
+        source: peer,
+        session_id,
+        scope: HeaderWorkAuthority::for_target(&port.engine().snapshot(), target.hash),
+        target_tip_hash: target.hash,
+        locator_hashes: vec![HeaderFixture::regtest().anchor().hash],
+    }
+}
+
+/// A read of one page of `path` after the anchor.
+fn first_page() -> ReadPath {
+    ReadPath {
+        after_hash: HeaderFixture::regtest().anchor().hash,
+        max_header_count: 1,
+        want_tree_aux: false,
+    }
+}
+
+/// Submits `call`, completes it with the engine outcome, and returns its
+/// reply and the completion.
+fn run<F: Future + Unpin>(port: &ControlledPort, mut call: F) -> (F::Output, Completion) {
+    submit(&mut call);
+    let id = port.pending().last().expect("the call is pending").id;
+    let completion = port
+        .complete(id, ENGINE)
+        .expect("the engine outcome is legal");
+    (ready(call), completion)
+}
+
+/// The leased path in `reply`.
+fn acquired(reply: Result<AcquirePathReply, PortError>) -> RetainedHeaderPath {
+    match reply {
+        Ok(AcquirePathReply::Acquired(path)) => *path,
+        other => panic!("expected a lease, got {other:?}"),
+    }
+}
+
+/// The lease end of `peer`'s `path` for `release`.
+fn ended(peer: SourceId, path: &RetainedHeaderPath, release: Release) -> LeaseEnd {
+    LeaseEnd {
+        peer,
+        lease_id: path.handle_id(),
+        release,
+    }
+}
+
+/// ST3.3: an apply whose caller is gone still commits at its completion and
+/// publishes on the watch. Only the reply is dropped.
+#[test]
+fn a_cancelled_apply_still_commits() {
+    let (port, chain) = chain(1);
+    let mut watch = port.selected_chain();
+    watch.borrow_and_update();
+    let before = port.engine().state_digest();
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let target = prepared(&port, chain[0], &next, 2);
+    let owner = target.owner();
+    let mut apply = port.apply_header_target(target);
+    submit(&mut apply);
+    drop(apply);
+
+    let completion = port.complete(OpId(1), ENGINE).expect("apply completes");
+    assert!(!completion.delivered);
+    assert_eq!(completion.attribution.owner, Some(owner));
+    assert_eq!(
+        port.engine().snapshot().frontiers.header_best.hash,
+        next[0].hash()
+    );
+    assert!(watch
+        .has_changed()
+        .expect("the engine port holds the sender"));
+    assert_ne!(completion.state_digest, before);
+    assert_eq!(completion.state_digest, port.engine().state_digest());
+    let events = port.take_events();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            StorageEvent::Submitted {
+                id: OpId(1),
+                op: HeaderOp::ApplyHeaderTarget,
+                ..
+            },
+            StorageEvent::CallerDropped { id: OpId(1) },
+            StorageEvent::Completed(Completion {
+                id: OpId(1),
+                delivered: false,
+                ..
+            }),
+        ]
+    ));
+}
+
+/// ST3.3: a read and a release from an old session, completing after the
+/// same peer's new session took a lease, leave the new lease alone.
+#[test]
+fn late_work_from_an_old_session_leaves_the_new_lease() {
+    let (port, chain) = chain(2);
+    let target = chain[1];
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, target)),
+    );
+    let old = acquired(reply);
+    let mut late_read = port.read_header_path(old.clone(), first_page());
+    submit(&mut late_read);
+    let (released, _) = run(&port, port.release_header_path(old.clone()));
+    released.expect("the release succeeds");
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 2, target)),
+    );
+    let new = acquired(reply);
+
+    let id = port.pending()[0].id;
+    let completion = port.complete(id, ENGINE).expect("the late read completes");
+    assert!(matches!(ready(late_read), Ok(ReadPathReply::Unavailable)));
+    assert!(completion.lease_ends.is_empty());
+    let (released, completion) = run(&port, port.release_header_path(old));
+    released.expect("a stale release still succeeds");
+    assert!(completion.lease_ends.is_empty());
+    assert_eq!(port.engine().live_leases(), 1);
+
+    let (page, _) = run(&port, port.read_header_path(new, first_page()));
+    assert!(matches!(page, Ok(ReadPathReply::Page(_))));
+}
+
+/// ST3.4: releasing a path twice succeeds both times and ends the lease
+/// once.
+#[test]
+fn a_repeated_release_ends_the_lease_once() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let path = acquired(reply);
+    let (first, completion) = run(&port, port.release_header_path(path.clone()));
+    first.expect("the release succeeds");
+    assert_eq!(
+        completion.lease_ends,
+        [ended(peer(1), &path, Release::LeaseReleased)]
+    );
+    let (second, completion) = run(&port, port.release_header_path(path));
+    second.expect("a repeat succeeds");
+    assert!(completion.lease_ends.is_empty());
+}
+
+/// ST3.4 and D3: an `Acquired` reply nobody takes ends its lease, whether
+/// the caller left before the completion or dropped the reply unread. The
+/// peer can then acquire again instead of waiting on itself.
+#[test]
+fn an_abandoned_acquire_ends_its_lease() {
+    let (port, chain) = chain(1);
+    let mut gone = port.acquire_header_path(acquire(&port, peer(1), 1, chain[0]));
+    submit(&mut gone);
+    drop(gone);
+    let completion = port
+        .complete(OpId(1), ENGINE)
+        .expect("the acquire completes");
+    assert!(!completion.delivered);
+    assert!(matches!(
+        completion.lease_ends.as_slice(),
+        [LeaseEnd {
+            release: Release::LeaseAbandonedAcquire,
+            ..
+        }]
+    ));
+    assert_eq!(port.engine().live_leases(), 0);
+
+    let mut unread = port.acquire_header_path(acquire(&port, peer(1), 1, chain[0]));
+    submit(&mut unread);
+    let completion = port
+        .complete(OpId(2), ENGINE)
+        .expect("the acquire completes");
+    assert!(completion.delivered);
+    assert_eq!(port.engine().live_leases(), 1);
+    port.take_events();
+    drop(unread);
+    assert_eq!(port.engine().live_leases(), 0);
+    assert!(matches!(
+        port.take_events().as_slice(),
+        [StorageEvent::ReplyDropped {
+            id: OpId(2),
+            lease_ends,
+        }] if matches!(
+            lease_ends.as_slice(),
+            [LeaseEnd { release: Release::LeaseAbandonedAcquire, .. }]
+        )
+    ));
+
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    acquired(reply);
+}
+
+/// ST3.4: a read whose caller is gone still consumes its lease, so the slot
+/// frees instead of leaking.
+#[test]
+fn a_cancelled_read_still_consumes_its_lease() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let path = acquired(reply);
+    let mut read = port.read_header_path(path.clone(), first_page());
+    submit(&mut read);
+    drop(read);
+    let completion = port.complete(OpId(2), ENGINE).expect("the read completes");
+    assert_eq!(
+        completion.lease_ends,
+        [ended(peer(1), &path, Release::LeaseConsumedByRead)]
+    );
+    assert_eq!(port.engine().live_leases(), 0);
+}
+
+/// ST3.4: a released handle, and a handle forged with this port's key but
+/// another lease ID, read nothing, and the forged read leaves the live
+/// lease alone.
+#[test]
+fn released_and_forged_handles_cannot_read() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let released = acquired(reply);
+    run(&port, port.release_header_path(released.clone()))
+        .0
+        .expect("the release succeeds");
+    let (read, _) = run(&port, port.read_header_path(released, first_page()));
+    assert!(matches!(read, Ok(ReadPathReply::Unavailable)));
+
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let live = acquired(reply);
+    let forged = RetainedHeaderPath::from_adapter(
+        port.engine().adapter_key(),
+        live.handle_id() + 1,
+        peer(1),
+        1,
+        live.common_ancestor,
+        live.target,
+        live.scope,
+    );
+    let (read, completion) = run(&port, port.read_header_path(forged, first_page()));
+    assert!(matches!(read, Ok(ReadPathReply::Unavailable)));
+    assert!(completion.lease_ends.is_empty());
+    assert_eq!(port.engine().live_leases(), 1);
+}
+
+/// The idle sweep's lease ends belong to the operation that swept them,
+/// whichever peer's it is.
+#[tokio::test(start_paused = true)]
+async fn an_idle_sweep_is_recorded_on_the_sweeping_acquire() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let idle = acquired(reply);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let (reply, completion) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(2), 1, chain[0])),
+    );
+    acquired(reply);
+    assert_eq!(
+        completion.lease_ends,
+        [ended(peer(1), &idle, Release::LeaseIdleExpired)]
+    );
+}
+
+/// Records name whose work an operation is. Request digests tell apart
+/// reads of different leases, which `Debug` alone can't, and state digests
+/// repeat on a fresh port with the same history.
+#[test]
+fn records_carry_attribution_and_digests() {
+    let histories: Vec<_> = (0..2)
+        .map(|_| {
+            let (port, chain) = chain(1);
+            let mut acquire_call = port.acquire_header_path(acquire(&port, peer(3), 9, chain[0]));
+            submit(&mut acquire_call);
+            port.complete(OpId(1), ENGINE)
+                .expect("the acquire completes");
+            let path = acquired(ready(acquire_call));
+            let forged = RetainedHeaderPath::from_adapter(
+                port.engine().adapter_key(),
+                path.handle_id() + 1,
+                peer(3),
+                9,
+                path.common_ancestor,
+                path.target,
+                path.scope,
+            );
+            let mut reads = [
+                port.read_header_path(path, first_page()),
+                port.read_header_path(forged, first_page()),
+            ];
+            for read in &mut reads {
+                submit(read);
+            }
+            let events = port.take_events();
+            let read_digests: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StorageEvent::Submitted {
+                        op: HeaderOp::ReadHeaderPath,
+                        attribution,
+                        request_digest,
+                        ..
+                    } => {
+                        assert_eq!(attribution.peer, Some(peer(3)));
+                        assert_eq!(attribution.session_id, Some(9));
+                        Some(*request_digest)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(read_digests.len(), 2);
+            assert_ne!(read_digests[0], read_digests[1]);
+            let StorageEvent::Completed(acquired) = &events[1] else {
+                panic!("expected the acquire's completion, got {:?}", events[1]);
+            };
+            assert_eq!(acquired.attribution.peer, Some(peer(3)));
+            (read_digests, acquired.state_digest)
+        })
+        .collect();
+    assert_eq!(histories[0], histories[1]);
+}
+
+/// D10: shutdown drops pending work unrun, with its inputs, drops untaken
+/// replies, and ends every lease. A call polled afterwards never reaches
+/// storage. A repeat does nothing.
+#[test]
+fn shutdown_ends_everything_without_running_work() {
+    let (port, chain) = chain(1);
+    let snapshot = port.engine().snapshot();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let mut apply = port.apply_header_target(prepared(&port, chain[0], &next, 2));
+    let mut locator = port.continuation_locator(permit(&semaphore));
+    let mut unread = port.acquire_header_path(acquire(&port, peer(1), 1, chain[0]));
+    submit(&mut apply);
+    drop(apply);
+    submit(&mut locator);
+    submit(&mut unread);
+    port.complete(OpId(3), ENGINE)
+        .expect("the acquire completes");
+    assert_eq!(port.engine().live_leases(), 1);
+    assert_eq!(semaphore.available_permits(), 0);
+    port.take_events();
+
+    port.shut_down();
+    assert_eq!(port.engine().snapshot(), snapshot, "the apply never ran");
+    assert_eq!(semaphore.available_permits(), 1);
+    assert_eq!(port.engine().live_leases(), 0);
+    assert!(port.pending().is_empty());
+    assert!(matches!(
+        port.take_events().as_slice(),
+        [StorageEvent::ShutDown { dropped, lease_ends }]
+            if dropped == &[OpId(1), OpId(2), OpId(3)]
+                && matches!(
+                    lease_ends.as_slice(),
+                    [LeaseEnd { release: Release::Shutdown, .. }]
+                )
+    ));
+
+    assert!(poll(&mut locator, Waker::noop()).is_pending());
+    assert!(poll(&mut unread, Waker::noop()).is_pending());
+    let mut after = port.selected_chain_contains(chain[0].hash);
+    assert!(poll(&mut after, Waker::noop()).is_pending());
+    drop((locator, unread, after));
+    port.shut_down();
+    assert!(port.pending().is_empty());
+    assert!(port.take_events().is_empty());
 }

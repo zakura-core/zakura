@@ -24,7 +24,10 @@ type BoxError = Box<dyn Error>;
 fn main() {
     if let Err(error) = try_main() {
         eprintln!("error: {error}");
-        std::process::exit(1);
+        let code = error
+            .downcast_ref::<sim::SimExit>()
+            .map_or(1, |exit| exit.code);
+        std::process::exit(code);
     }
 }
 

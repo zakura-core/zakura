@@ -230,6 +230,14 @@ fn replay_on<'h>(
                 _ => ReplayError::ScheduleDiverged(divergence),
             });
         }
+        // `Sim::run` doesn't check for unreached entries after a harness
+        // failure, so a failure before the trace's last step is caught here.
+        Some(failure) if sink.steps_seen < trace.steps.len() => {
+            return Err(match sink.first {
+                Some((step, field)) if strict => ReplayError::Nondeterministic { step, field },
+                _ => ReplayError::Harness(failure),
+            });
+        }
         Some(HarnessFailure::Plan(PlanError::PrefixEnd { .. })) => {
             return finish(strict, &sink, None, false, build_mismatch, options);
         }

@@ -21,6 +21,8 @@ pub(crate) struct VerifySink<'t> {
     pub(crate) mismatches: u64,
     /// The first record that differed: its step, 0 for `init`, and field.
     pub(crate) first: Option<(u64, &'static str)>,
+    /// Step records received.
+    pub(crate) steps_seen: usize,
     /// The replay's `end` record, once emitted.
     pub(crate) end: Option<EndRecord>,
 }
@@ -33,6 +35,7 @@ impl<'t> VerifySink<'t> {
             steps: &trace.steps,
             mismatches: 0,
             first: None,
+            steps_seen: 0,
             end: None,
         }
     }
@@ -53,6 +56,7 @@ impl RecordSink for VerifySink<'_> {
                 }
             }
             Record::Step(step) => {
+                self.steps_seen += 1;
                 let recorded = usize::try_from(step.step)
                     .ok()
                     .and_then(|n| n.checked_sub(1))

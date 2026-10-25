@@ -24,8 +24,8 @@ use zakura_sim::{
         meta::PropertyRef, replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport,
         Trace, TraceReader, OBSERVATIONS_FILE, TRACE_FILE,
     },
-    ActionSource, Checker, Divergence, Identity, NoChecks, Observation, ObservationLog, RunConfig,
-    Sim,
+    ActionSource, Checker, Divergence, HarnessFailure, Identity, NoChecks, Observation,
+    ObservationLog, RunConfig, Sim,
 };
 
 /// Records `harness` on the full fuzz `input`.
@@ -553,6 +553,104 @@ fn drain_picks_replay() {
     match divergence_of(replayed_spinners(dir.path())) {
         Divergence::DrainPick { step, .. } => assert_eq!(step, at),
         other => panic!("expected a drain divergence, got {other:?}"),
+    }
+}
+
+/// A source that offers one action, then two with the same identity, so a
+/// run ends with a harness failure as it gathers step 2's enabled set.
+struct Duplicates(Cell<bool>);
+
+impl ActionSource for Duplicates {
+    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if self.0.get() {
+            out.push((Identity::peer("dup", "twice"), 0));
+            out.push((Identity::peer("dup", "twice"), 1));
+        } else {
+            out.push((Identity::peer("dup", "once"), 0));
+        }
+    }
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, log: &mut ObservationLog) {
+        self.0.set(true);
+        log.push(Observation::Fake {
+            source: "dup".into(),
+            event: "once".into(),
+        });
+    }
+}
+
+/// The [`Duplicates`] source alone.
+struct DuplicateIdentity;
+
+no_view!(DuplicateIdentity);
+
+impl Subsystem for DuplicateIdentity {
+    const NAME: &'static str = "test/duplicate-identity";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+
+    /// Room for more steps than the run takes.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Adds the source.
+    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+        sim.add_source(Box::new(Duplicates(Cell::new(false))));
+        DuplicateIdentity
+    }
+
+    /// No checks.
+    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
+        Box::new(NoChecks)
+    }
+
+    /// No properties.
+    fn properties(_: &Fixed) -> Vec<PropertyRef> {
+        Vec::new()
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+#[test]
+fn harness_failure_before_a_prefix_ends_fails() {
+    let duplicates = entry::<DuplicateIdentity>();
+    let dir = record(&duplicates, &[]);
+    let trace = open(dir.path());
+    assert_eq!(trace.steps.len(), 1);
+    assert!(
+        trace.end.as_ref().unwrap().harness.is_some(),
+        "{:?}",
+        trace.end
+    );
+    // The recorded harness failure replays as recorded.
+    let report = replay_with(&trace, &duplicates, ReplayOptions::default()).unwrap();
+    assert!(report.verified(), "{report:?}");
+
+    // As a prefix with a step the run can't reach, it fails.
+    edit(dir.path(), |lines| {
+        lines.pop();
+        let mut extra = step(lines, 1).clone();
+        extra["step"] = json!(2);
+        lines.push(extra);
+    });
+    let prefix = ReplayOptions {
+        prefix: true,
+        ..ReplayOptions::default()
+    };
+    let trace = TraceReader::open_prefix(dir.path()).unwrap();
+    match replay_with(&trace, &duplicates, prefix) {
+        Err(ReplayError::Harness(HarnessFailure::DuplicateIdentity { identity })) => {
+            assert_eq!(identity, "peer:dup:twice");
+        }
+        other => panic!("expected the harness failure, got {other:?}"),
     }
 }
 

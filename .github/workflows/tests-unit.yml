@@ -504,13 +504,13 @@ jobs:
       - name: Lint the simulator build
         run: |
           cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets -- -D warnings
-          cargo clippy --locked -p zakura-network --lib --test sim_header_sync -- -D warnings
+          cargo clippy --locked -p zakura-network --lib --test sim_header_sync --test sim_block_sync -- -D warnings
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build
         run: |
           cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic
-          cargo test --locked -p zakura-network --test sim_header_sync
+          cargo test --locked -p zakura-network --test sim_header_sync --test sim_block_sync
           # Rustdoc needs the flag too, or the crate has no doc tests to run.
           RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
         env:

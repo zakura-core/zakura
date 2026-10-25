@@ -108,8 +108,9 @@ zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["prop
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 
-# The scheduler tests in `tests/sim_header_sync.rs` only build with
-# `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no version.
+# The scheduler tests in `tests/sim_header_sync.rs` and `tests/sim_block_sync.rs`
+# only build with `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no
+# version.
 [target.'cfg(zakura_sim)'.dev-dependencies]
 zakura-scheduler = { path = "../zakura-scheduler" }
 

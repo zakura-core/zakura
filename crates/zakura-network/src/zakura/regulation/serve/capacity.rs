@@ -1,14 +1,15 @@
 //! Serving capacity: node budgets, per-peer budgets, and serving metrics.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError,
-    },
-};
+use std::sync::Arc;
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        counter::{AtomicU64, AtomicUsize, Ordering},
+        Mutex, PoisonError,
+    },
+};
 
 use crate::zakura::{
     regulation::{
@@ -56,6 +57,9 @@ pub(crate) enum ServeConfigError {
 }
 
 /// Metric labels and test counters for one request row.
+///
+/// The counters only feed gauges and tests, so they're `sync::counter`
+/// atomics, which cost no preemption points in the simulator.
 #[derive(Debug)]
 pub(super) struct ServeMetrics {
     service: &'static str,

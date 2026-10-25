@@ -2,8 +2,8 @@
 
 use std::net::SocketAddr;
 
-use tokio::sync::watch;
 use zakura_quic::NodeSecretKey;
+use zakura_rt::sync::watch;
 
 use crate::zakura::{ZakuraHandshakeConfig, ZakuraPeerId};
 

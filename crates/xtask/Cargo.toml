@@ -11,11 +11,11 @@ publish = false
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
-test = false
 
 [dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile.workspace = true

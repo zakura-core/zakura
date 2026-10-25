@@ -13,12 +13,12 @@
 //! its connection-global count bucket exactly as-is. Document this split at the
 //! [`SessionGuard::new`] call site.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
-use tokio::sync::Notify;
+use zakura_rt::sync::{
+    atomic::{AtomicU64, Ordering},
+    Notify,
+};
 
 use super::Frame;
 

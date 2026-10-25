@@ -2,12 +2,9 @@
 #![doc(html_favicon_url = "https://zakura.com/assets/rustdoc/zakura-favicon-128.png")]
 #![doc(html_logo_url = "https://zakura.com/assets/rustdoc/zakura-icon.png")]
 #![doc(html_root_url = "https://docs.rs/zakura_test")]
-// Each lazy_static variable uses additional recursion
-#![recursion_limit = "512"]
 
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 
-use once_cell::sync::Lazy;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[allow(missing_docs)]
@@ -33,7 +30,7 @@ pub mod zip0244;
 /// This runtime should be used for tests that need a single thread for consistent timings.
 ///
 /// This shared runtime should be used in tests that use shared background tasks. An example is
-/// with shared global `Lazy<BatchVerifier>` types, because they spawn a background task when they
+/// with shared global `LazyLock<BatchVerifier>` types, because they spawn a background task when they
 /// are first initialized. This background task is stopped when the runtime is shut down, so having
 /// a runtime per test means that only the first test actually manages to successfully use the
 /// background task. Using the shared runtime allows the background task to keep running for the
@@ -45,7 +42,7 @@ pub mod zip0244;
 /// at a time, there's a risk of a test finishing while the timer is paused (due to a test failure,
 /// for example) and that means that the next test will already start with an incorrect timer
 /// state.
-pub static SINGLE_THREADED_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+pub static SINGLE_THREADED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -56,7 +53,7 @@ pub static SINGLE_THREADED_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(||
 /// This runtime should be used for tests that spawn blocking threads.
 ///
 /// See [`SINGLE_THREADED_RUNTIME`] for details.
-pub static MULTI_THREADED_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+pub static MULTI_THREADED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -38,6 +38,7 @@ use crate::zakura::{
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
+use tokio::time;
 use zakura_chain::{
     fmt::HexDebug,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -839,7 +840,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
             ServicePeerDirection::Outbound,
             &wiring.config,
             0,
-            std::time::Instant::now(),
+            Instant::now(),
         )
         .generation();
     wiring.registry.upsert_status(
@@ -5256,6 +5257,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -5477,6 +5479,7 @@ impl CappedSequencerTask {
             frontiers,
             Some(test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -5728,6 +5731,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),

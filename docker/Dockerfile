@@ -158,9 +158,13 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
     --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \
+    --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
+    --mount=type=bind,source=crates/zakura-scheduler,target=crates/zakura-scheduler \
+    --mount=type=bind,source=crates/zakura-sim,target=crates/zakura-sim \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-storage,target=crates/zakura-storage \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \

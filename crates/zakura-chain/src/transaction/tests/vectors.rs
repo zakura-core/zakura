@@ -3,10 +3,10 @@
 use arbitrary::v5_transactions;
 use chrono::DateTime;
 use eyre::{Result, WrapErr};
-use lazy_static::lazy_static;
 use rand_10::{rng as thread_rng, seq::IteratorRandom};
 use std::io::ErrorKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::LazyLock;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
@@ -25,17 +25,15 @@ use zakura_test::{
 
 use super::super::*;
 use super::ironwood_v6_tx_hash;
-lazy_static! {
-    pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: block::Height(0),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-    };
-}
+pub static EMPTY_V5_TX: LazyLock<Transaction> = LazyLock::new(|| Transaction::V5 {
+    network_upgrade: NetworkUpgrade::Nu5,
+    lock_time: LockTime::min_lock_time_timestamp(),
+    expiry_height: block::Height(0),
+    inputs: Vec::new(),
+    outputs: Vec::new(),
+    sapling_shielded_data: None,
+    orchard_shielded_data: None,
+});
 
 #[test]
 fn attributed_memory_size_counts_orchard_proof_capacity() {

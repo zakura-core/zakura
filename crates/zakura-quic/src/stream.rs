@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use bytes::{Buf as _, Bytes};
 use quinn_proto::{StreamId, VarInt};
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use zakura_rt::sync::oneshot::{self, error::TryRecvError};
 
 use crate::{
     driver::{ConnCmd, ConnRef, ReadReply},

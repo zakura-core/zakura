@@ -232,6 +232,10 @@ fn replay_exit_codes() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("never a successful replay"));
 
+    // The flag alone fails a replay, on the recording executable too.
+    let output = replay(&trace, &["--allow-build-mismatch"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+
     // A prefix that matches exits 0, and says it isn't complete.
     let path = trace.join(TRACE_FILE);
     let text = std::fs::read_to_string(&path).unwrap();
@@ -245,6 +249,8 @@ fn replay_exit_codes() {
     let output = replay(&trace, &["--prefix"]);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("not a complete run"));
+    let output = replay(&trace, &["--prefix", "--allow-build-mismatch"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
 
     // A changed pick diverges.
     edit_line(&trace, 3, |step| step["pick"] = json!("task:gone.1:poll#1"));

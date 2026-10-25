@@ -220,7 +220,9 @@ mod cli {
             || format!("{} steps", trace.steps.len()),
             |end| format!("{} after {} steps", outcome(end), end.steps),
         );
-        if report.build_mismatch {
+        // The flag is diagnostic, so it fails the command even when the
+        // builds turn out equivalent.
+        if options.allow_build_mismatch || report.build_mismatch {
             let first = report
                 .first_obs_mismatch
                 .map_or_else(String::new, |(step, field)| {
@@ -229,15 +231,26 @@ mod cli {
             let end = report
                 .end_mismatch
                 .map_or_else(String::new, |field| format!("; {field} differs"));
+            let build = if report.build_mismatch {
+                "on a build that isn't equivalent to the recording one"
+            } else {
+                "with --allow-build-mismatch"
+            };
             return Err(Error::Failed(format!(
-                "replayed trace {} on a build that isn't equivalent to the recording one: \
-                 {ran}; {} records differed{first}{end}. This is never a successful replay",
+                "replayed trace {} {build}: {ran}; {} records differed{first}{end}. \
+                 This is never a successful replay",
                 trace.id, report.obs_mismatches
             )));
         }
         if report.verified() {
             println!(
                 "replayed trace {}: {ran}; every pick, draw and observation matched",
+                trace.id
+            );
+        } else if report.complete {
+            println!(
+                "replayed trace {} with --prefix: {ran}; everything matched, but a \
+                 --prefix replay is never verified",
                 trace.id
             );
         } else {

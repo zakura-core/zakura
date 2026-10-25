@@ -196,7 +196,8 @@ fn spawn_competing(sched: &mut Scheduler, port: &Arc<ControlledPort>, target: Fr
 /// A task drops an unread `Acquired` reply, after another acquire for the
 /// same peer registered a capacity waiter if `with_waiter`. At every
 /// scheduling point the drop reaches, acts as the run may there: takes the
-/// lease lock, lists pending operations, and completes a competing
+/// lease lock, checks that a lease already gone has its `ReplyDropped`
+/// recorded, lists pending operations, and completes a competing
 /// operation. Returns what went wrong, and every event.
 fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
     let mut sched = scheduler();
@@ -221,9 +222,16 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
     let mut events = port.take_events();
     let mut competing = (1..=COMPETING).map(OpId);
     step(&mut sched, task, |at| {
-        if catch_unwind(AssertUnwindSafe(|| port.engine().live_leases())).is_err() {
+        let Ok(live) = catch_unwind(AssertUnwindSafe(|| port.engine().live_leases())) else {
             problems.push(format!("the lease lock was held at {at}"));
             return;
+        };
+        events.extend(port.take_events());
+        let recorded = events
+            .iter()
+            .any(|event| matches!(event, StorageEvent::ReplyDropped { .. }));
+        if live == 0 && !recorded {
+            problems.push(format!("the lease was gone before its record at {at}"));
         }
         if !listing_is_free(&port) {
             problems.push(format!("the bookkeeping lock was held at {at}"));
@@ -284,7 +292,8 @@ fn abandoning_with_a_capacity_waiter_never_suspends_under_a_lock() {
 
 /// #1721 review P2: a completion the run picks while a task abandons an
 /// unread `Acquired` reply never takes that lease's end, which stays with
-/// the abandonment's `ReplyDropped`.
+/// the abandonment's `ReplyDropped`. And the run never sees the lease gone
+/// before that record, so events follow state.
 #[test]
 fn an_abandoned_lease_end_stays_with_its_reply() {
     let (problems, events) = abandon_with_probes(false);

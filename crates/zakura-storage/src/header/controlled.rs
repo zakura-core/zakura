@@ -177,7 +177,9 @@ pub struct ControlledPort {
     /// block the run's only thread: no `zakura_rt` call or engine call runs
     /// under it, and a removed slot or replaced waker drops only after it's
     /// released, since a reply can hold the last sender of a capacity signal,
-    /// whose drop is a scheduling point.
+    /// whose drop is a scheduling point. It may be taken under the engine's
+    /// lease lock, to record an event with the change it records, but never
+    /// the other way round.
     ops: Mutex<Ops>,
 }
 
@@ -363,7 +365,8 @@ impl ControlledPort {
             }
         };
         if let Some((_, reply)) = &abandoned {
-            lease_ends.extend(self.abandon(reply).fire());
+            // The completion's own record carries the ends.
+            lease_ends.extend(self.abandon(reply, |_| {}).fire());
         }
         drop(abandoned);
         let completion = Completion {
@@ -388,13 +391,17 @@ impl ControlledPort {
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take
     /// it, and returns the effects to fire once no lock is held. Other
-    /// replies own nothing.
-    fn abandon(&self, reply: &HeaderReply) -> Effects {
+    /// replies own nothing. Calls `record` with the lease ends as the lease
+    /// ends, as [`EnginePort::abandon`] does.
+    fn abandon(&self, reply: &HeaderReply, record: impl FnOnce(&[LeaseEnd])) -> Effects {
         match reply {
             HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) => {
-                self.engine.abandon(path)
+                self.engine.abandon(path, record)
             }
-            _ => Effects::default(),
+            _ => {
+                record(&[]);
+                Effects::default()
+            }
         }
     }
 
@@ -560,11 +567,13 @@ impl<T> Drop for Call<'_, T> {
             unreachable!("the stage was checked above under the same lock");
         };
         drop(ops);
-        let lease_ends = self.port.abandon(&reply).fire();
-        self.port
-            .ops()
-            .events
-            .push(StorageEvent::ReplyDropped { id, lease_ends });
+        let effects = self.port.abandon(&reply, |lease_ends| {
+            self.port.ops().events.push(StorageEvent::ReplyDropped {
+                id,
+                lease_ends: lease_ends.to_vec(),
+            });
+        });
+        effects.fire();
     }
 }
 

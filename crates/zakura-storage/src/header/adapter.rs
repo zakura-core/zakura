@@ -43,7 +43,7 @@ use zakura_rt::{
 
 use super::{
     fixture::{HeaderFixture, ScenarioClock},
-    lease::{Capacity, Effects, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
+    lease::{Capacity, Effects, LeaseEnd, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
     FromReply, HeaderReply, HeaderRequest, Release,
 };
 
@@ -812,8 +812,14 @@ impl EnginePort {
     /// Ends the lease `path` names, if it's still live, because nobody
     /// received the `Acquired` reply that carried it, and returns the
     /// effects to fire once no lock is held. A path another adapter issued
-    /// names nothing here.
-    pub(crate) fn abandon(&self, path: &RetainedHeaderPath) -> Effects {
+    /// names nothing here. Calls `record` with the lease ends before
+    /// releasing the lease lock, so nothing can see the lease gone before
+    /// its record. `record` must not reach a scheduling point.
+    pub(crate) fn abandon(
+        &self,
+        path: &RetainedHeaderPath,
+        record: impl FnOnce(&[LeaseEnd]),
+    ) -> Effects {
         let mut leases = self.leases();
         if let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) {
             leases.release(
@@ -824,7 +830,9 @@ impl EnginePort {
                 Release::LeaseAbandonedAcquire,
             );
         }
-        leases.take_effects()
+        let effects = leases.take_effects();
+        record(effects.ends());
+        effects
     }
 
     /// Ends every lease, as service shutdown does, and returns the effects

@@ -121,6 +121,11 @@ pub(crate) struct Effects {
 }
 
 impl Effects {
+    /// The leases ended, in order.
+    pub(crate) fn ends(&self) -> &[LeaseEnd] {
+        &self.ends
+    }
+
     /// Fires the capacity signals in the order the registry released them,
     /// and returns the lease ends. Call it with no lock held.
     pub(crate) fn fire(self) -> Vec<LeaseEnd> {

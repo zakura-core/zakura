@@ -61,7 +61,7 @@ def main(argv=None):
         print("No workspace documentation inputs changed.")
         return 0
     print("Checking documentation: " + ", ".join(packages), flush=True)
-    command = ["cargo", "doc", "--locked", "--no-deps", "--all-features",
+    command = ["cargo", "doc", "--locked", "--keep-going", "--no-deps", "--all-features",
                "--document-private-items", "--target-dir", str(root / "target/internal")]
     for package in packages:
         command.extend(["--package", package])

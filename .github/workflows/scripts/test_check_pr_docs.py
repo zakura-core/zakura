@@ -58,7 +58,7 @@ class DocsSelectionTests(unittest.TestCase):
             self.assertEqual(docs.main(["--base", "base", "--head", "head"]), 101)
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0], [
-            "cargo", "doc", "--locked", "--no-deps", "--all-features", "--document-private-items",
+            "cargo", "doc", "--locked", "--keep-going", "--no-deps", "--all-features", "--document-private-items",
             "--target-dir", str(self.root / "target/internal"),
             "--package", "consumer", "--package", "private", "--package", "transitive",
         ])

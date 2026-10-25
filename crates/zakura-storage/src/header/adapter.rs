@@ -10,8 +10,8 @@
 //! engine, so this adapter reads the engine directly.
 //!
 //! Each operation runs when its future is first polled, atomically under the
-//! engine and lease locks. When and how the run completes it is the
-//! operation lifecycle's job, on top of this adapter. `vct_repair_context` is
+//! engine and lease locks. [`super::controlled`] runs the same operations
+//! when the run completes them instead. `vct_repair_context` is
 //! narrower than production: it always answers `Stale`, since a simulation
 //! has no repair to resolve. Retained paths follow [`super::lease`].
 
@@ -44,6 +44,7 @@ use zakura_rt::{
 use super::{
     fixture::{HeaderFixture, ScenarioClock},
     lease::{Capacity, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
+    FromReply, HeaderReply, HeaderRequest,
 };
 
 /// A header-chain port over one in-memory engine. A requester and a
@@ -693,32 +694,69 @@ impl EnginePort {
     }
 }
 
+impl EnginePort {
+    /// Runs `request` against the engine now and returns its reply. Both
+    /// this port and [`ControlledPort`](super::controlled::ControlledPort)
+    /// run every operation through here.
+    pub(crate) fn execute(&self, request: HeaderRequest) -> HeaderReply {
+        match request {
+            HeaderRequest::ContinuationLocator { permit } => {
+                let locator = self.locator().map(Some);
+                // The permit is held until the read finishes.
+                drop(permit);
+                HeaderReply::ContinuationLocator(locator)
+            }
+            HeaderRequest::VctRepairContext { .. } => {
+                HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale))
+            }
+            HeaderRequest::AcquireHeaderPath(request) => {
+                HeaderReply::AcquireHeaderPath(self.acquire(request))
+            }
+            HeaderRequest::ReadHeaderPath { path, request } => {
+                HeaderReply::ReadHeaderPath(self.read(path, request))
+            }
+            HeaderRequest::ReleaseHeaderPath { path } => {
+                HeaderReply::ReleaseHeaderPath(self.release(path))
+            }
+            HeaderRequest::PrepareHeaderTarget(request) => {
+                HeaderReply::PrepareHeaderTarget(self.prepare(request))
+            }
+            HeaderRequest::ApplyHeaderTarget { target } => {
+                HeaderReply::ApplyHeaderTarget(self.apply(target))
+            }
+            HeaderRequest::SelectedChainContains { hash } => {
+                HeaderReply::SelectedChainContains(self.membership(hash))
+            }
+        }
+    }
+
+    /// A future that runs `request` when first polled.
+    fn run_on_poll<T: FromReply>(&self, request: HeaderRequest) -> HeaderChainFuture<'_, T> {
+        Box::pin(async move { T::from_reply(self.execute(request)) })
+    }
+}
+
 impl Port for EnginePort {
     fn continuation_locator(
         &self,
         permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-        Box::pin(async move {
-            let locator = self.locator().map(Some);
-            // The permit is held until the read finishes.
-            drop(permit);
-            locator
-        })
+        self.run_on_poll(HeaderRequest::ContinuationLocator { permit })
     }
 
     fn vct_repair_context(
         &self,
-        _owner: BodyWorkOwner,
-        _height: block::Height,
+        owner: BodyWorkOwner,
+        height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
-        Box::pin(async { Ok(VctRepairContextReply::Stale) })
+        self.run_on_poll(HeaderRequest::VctRepairContext { owner, height })
     }
 
     fn acquire_header_path(
         &self,
         request: AcquirePath,
     ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-        Box::pin(async move { self.acquire(request) })
+        self.run_on_poll(HeaderRequest::AcquireHeaderPath(request))
     }
 
     fn read_header_path(
@@ -726,28 +764,28 @@ impl Port for EnginePort {
         path: RetainedHeaderPath,
         request: ReadPath,
     ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-        Box::pin(async move { self.read(path, request) })
+        self.run_on_poll(HeaderRequest::ReadHeaderPath { path, request })
     }
 
     fn release_header_path(
         &self,
         path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-        Box::pin(async move { self.release(path) })
+        self.run_on_poll(HeaderRequest::ReleaseHeaderPath { path })
     }
 
     fn prepare_header_target(
         &self,
         request: PrepareHeaderTarget,
     ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
-        Box::pin(async move { self.prepare(request) })
+        self.run_on_poll(HeaderRequest::PrepareHeaderTarget(request))
     }
 
     fn apply_header_target(
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
-        Box::pin(async move { self.apply(target) })
+        self.run_on_poll(HeaderRequest::ApplyHeaderTarget { target })
     }
 
     fn selected_chain(&self) -> watch::Receiver<Option<EngineSnapshot>> {
@@ -758,7 +796,7 @@ impl Port for EnginePort {
         &self,
         hash: block::Hash,
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
-        Box::pin(async move { self.membership(hash) })
+        self.run_on_poll(HeaderRequest::SelectedChainContains { hash })
     }
 }
 

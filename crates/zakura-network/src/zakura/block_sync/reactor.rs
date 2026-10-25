@@ -1453,7 +1453,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: previous.started_at,
             attempts: previous.attempts,
@@ -1517,7 +1517,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: now,
             attempts: 0,
@@ -2080,7 +2080,7 @@ impl BlockSyncReactor {
         if let Some((frontier, summary)) = current {
             let hash = format!("{:?}", frontier.hash);
             let height = frontier.height.0.to_string();
-            let age_seconds = chrono::Utc::now()
+            let age_seconds = utc_now()
                 .signed_duration_since(summary.started_at)
                 .num_milliseconds()
                 .max(0) as f64

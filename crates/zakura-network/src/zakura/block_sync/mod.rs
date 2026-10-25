@@ -85,6 +85,12 @@ pub use wire::{
     ZAKURA_STREAM_BLOCK_SYNC,
 };
 
+/// The current UTC time as chrono's type. Reads `zakura_rt::time::utc_now`,
+/// so a simulated run sees the scenario clock.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    time::utc_now().into()
+}
+
 #[cfg(test)]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
     zakura_header_chain::BodyWorkAuthority {

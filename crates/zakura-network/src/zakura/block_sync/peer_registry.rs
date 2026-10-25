@@ -198,7 +198,7 @@ impl BodyRetryKey {
 pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(super::utc_now())
         .to_std()
         .unwrap_or(Duration::ZERO);
     monotonic_now

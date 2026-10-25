@@ -137,7 +137,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::print_stdout,
-        reason = "CI retains these applicability counters"
+        reason = "witnesses print applicability counters"
     )]
     fn cadence_witness_exercises_every_hold_and_settlement() {
         let summary = replay_cadence_bytes(WITNESS);

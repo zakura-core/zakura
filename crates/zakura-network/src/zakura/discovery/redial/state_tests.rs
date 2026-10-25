@@ -395,7 +395,7 @@ proptest! {
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn redial_witness_exercises_limits_resets_and_lagging_registration() {
     let summary = replay_redial_bytes(&[1, 0, 29, 3, 0, 0, 7, 0, 0, 3, 0, 0, 3, 1, 60, 5, 0, 0]);

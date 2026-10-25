@@ -182,7 +182,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::print_stdout,
-        reason = "CI retains these applicability counters"
+        reason = "witnesses print applicability counters"
     )]
     fn fill_witness_uses_the_retained_run() {
         println!(

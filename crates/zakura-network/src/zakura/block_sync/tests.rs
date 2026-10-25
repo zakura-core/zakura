@@ -840,7 +840,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
             ServicePeerDirection::Outbound,
             &wiring.config,
             0,
-            std::time::Instant::now(),
+            Instant::now(),
         )
         .generation();
     wiring.registry.upsert_status(

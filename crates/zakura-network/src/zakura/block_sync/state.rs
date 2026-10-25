@@ -1,7 +1,4 @@
-use zakura_rt::{
-    sync::{atomic::AtomicU64, Mutex},
-    time,
-};
+use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
 use super::{
     bbr::{rounded_usize, BbrState},
@@ -301,7 +298,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_peer_until(peer, std::time::Instant::now() + cooldown);
+            .park_peer_until(peer, Instant::now() + cooldown);
     }
 
     /// Park this connection's session exactly as its no-progress routine does.
@@ -318,7 +315,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
+            .park_session_for_test(peer, conn_id, Instant::now() + cooldown);
     }
 
     /// Return the reactor's current local serving status, independent of peer delivery.
@@ -1054,7 +1051,7 @@ pub(super) struct RateMeter {
 impl RateMeter {
     pub(super) fn new(interval: Duration) -> Self {
         Self {
-            next_allowed: time::Instant::now().into_std(),
+            next_allowed: Instant::now(),
             interval,
         }
     }

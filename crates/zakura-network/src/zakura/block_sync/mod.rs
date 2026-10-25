@@ -4,12 +4,7 @@
 //! peer's stream-6 frames flow through the per-peer routine, the work queue, the
 //! commit pipeline, the registry, and the reactor.
 
-use std::{
-    collections::BTreeMap,
-    io,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
@@ -22,7 +17,7 @@ use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
     task::JoinHandle,
-    time,
+    time::{self, Instant},
 };
 
 use super::{

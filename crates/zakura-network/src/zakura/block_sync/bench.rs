@@ -17,11 +17,7 @@
 //! checkpoint verifier + state service as the `apply-verifier` rung. This is
 //! feature-gated (`internal-bench`) and is not part of the production API.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
@@ -31,6 +27,7 @@ use zakura_rt::{
         mpsc, watch,
     },
     task::JoinHandle,
+    time::Instant,
 };
 
 use crate::zakura::{

@@ -501,8 +501,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         .check_request_liveness(deadline - Duration::from_millis(1))
         .is_ok());
     assert!(
-        routine.earliest_deadline_sleep(None).deadline().into_std()
-            <= deadline + Duration::from_millis(1)
+        routine.earliest_deadline_sleep(None).deadline() <= deadline + Duration::from_millis(1)
     );
     assert!(matches!(
         routine.handle_deadlines(deadline).await,
@@ -608,9 +607,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         1,
         "the ending still owns authorization after all bodies arrive"
     );
-    assert!(routine
-        .check_request_liveness(time::Instant::now().into_std())
-        .is_ok());
+    assert!(routine.check_request_liveness(time::Instant::now()).is_ok());
     assert!(!connection.is_cancelled());
     routine
         .handle_frame(&mut block_sync_guard(), buffered.recv().await.unwrap())
@@ -806,7 +803,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
     routine.window.block_liveness_deadline = None;
-    time::advance(retirement.saturating_duration_since(time::Instant::now().into_std())).await;
+    time::advance(retirement.saturating_duration_since(time::Instant::now())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
         servable_low: block::Height(1),
@@ -1382,10 +1379,7 @@ async fn fast_peer_holding_one_exchange() -> (
     };
     let index = usize::try_from(first.0 - 1).unwrap();
     deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
-    assert!(fast
-        .window
-        .bbr_rtprop_ms(time::Instant::now().into_std())
-        .is_some());
+    assert!(fast.window.bbr_rtprop_ms(time::Instant::now()).is_some());
     assert_eq!(fast.requester.occupancy().len, 1);
     let floor = fast
         .work

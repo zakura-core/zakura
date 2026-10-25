@@ -4,12 +4,10 @@
 //! only the entries it touches, so filling or draining a window costs
 //! `O(N log N)` rather than `O(N²)`.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::OutstandingBlockRange;
 

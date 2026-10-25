@@ -23,7 +23,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use zakura_chain::block;
@@ -33,6 +33,7 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
+    time::Instant,
 };
 
 use super::{

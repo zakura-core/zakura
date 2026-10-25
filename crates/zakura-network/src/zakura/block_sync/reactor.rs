@@ -475,7 +475,7 @@ impl BlockSyncReactor {
             let status_refresh_at = self.status_refresh_at;
             let status_refresh = async move {
                 match status_refresh_at {
-                    Some(deadline) => time::sleep_until(deadline.into()).await,
+                    Some(deadline) => time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
             };
@@ -598,7 +598,7 @@ impl BlockSyncReactor {
 
     fn needed_query_retry_sleep(&self) -> time::Sleep {
         match self.needed_query_retry_at {
-            Some(deadline) => time::sleep_until(deadline.into()),
+            Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }
@@ -2260,7 +2260,7 @@ mod refill_target_tests {
                     ServicePeerDirection::Inbound,
                     config,
                     0,
-                    std::time::Instant::now(),
+                    Instant::now(),
                 )
                 .generation();
             registry.upsert_status(

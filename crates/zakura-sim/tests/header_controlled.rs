@@ -666,3 +666,153 @@ fn time_stops_where_a_timeout_opens() {
     }
     assert!(stopped > 0, "no plan left the operation pending until 30 s");
 }
+
+/// What one abandonment run did.
+#[derive(Default)]
+struct Abandonment {
+    /// The waiter got `CapacityBusy` and so registered a capacity signal.
+    waited: bool,
+    /// Steps where the run completed storage while the holder was stopped
+    /// mid-poll after it started dropping its reply.
+    interleaved: u32,
+}
+
+/// Spawns a task that submits peer 1's acquire of `target` in `session`,
+/// leaves its reply unread until `drop_at`, then drops the call.
+fn spawn_unread(
+    sim: &mut Sim,
+    name: &'static str,
+    port: &Arc<ControlledPort>,
+    session: u64,
+    drop_at: u64,
+) {
+    let caller = port.clone();
+    sim.scheduler().spawn_root(name, async move {
+        let target = HeaderFixture::regtest().anchor();
+        let mut call = caller.acquire_header_path(peer_acquire(&caller, target, session));
+        std::future::poll_fn(|cx| {
+            let _ = call.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        zakura_rt::time::sleep_until(
+            zakura_rt::time::Instant::now() + Duration::from_secs(drop_at),
+        )
+        .await;
+        drop(call);
+    });
+}
+
+/// Peer 1's acquire in `session` of the empty path to `target`, which is
+/// its own locator. It still takes a lease.
+fn peer_acquire(port: &ControlledPort, target: Frontier, session_id: u64) -> AcquirePath {
+    AcquirePath {
+        source: SourceId::from_digest([1; 32]),
+        session_id,
+        scope: HeaderWorkAuthority::for_target(&port.engine().snapshot(), target.hash),
+        target_tip_hash: target.hash,
+        locator_hashes: vec![target.hash],
+    }
+}
+
+/// Runs the abandonment scenario under `plan`: a holder leaves its
+/// `Acquired` reply unread for 5 s and drops it, a waiter's acquire for the
+/// same peer meanwhile gets `CapacityBusy` and waits on its signal, an idler
+/// leaves a `CapacityBusy` reply unread until 12 s, and a competing task
+/// keeps membership reads pending, so the run can complete storage at any
+/// point of the drops.
+fn abandonment_run(plan: PlanInput) -> (RunReport, Abandonment) {
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let seen = Arc::new(Mutex::new(Abandonment::default()));
+    let mut checker = {
+        let seen = seen.clone();
+        after_step(move |cx| {
+            let storage = cx.pick.to_string().starts_with("storage:");
+            let holder_dropping = cx.now.since_start() >= Duration::from_secs(5)
+                && cx.enabled.iter().any(|enabled| {
+                    let identity = enabled.identity.to_string();
+                    identity.starts_with("task:holder.1:") && !identity.contains(":poll#")
+                });
+            if storage && holder_dropping {
+                seen.lock().unwrap().interleaved += 1;
+            }
+            None
+        })
+    };
+    let report = run(
+        storage_config(2_000),
+        plan,
+        |sim| {
+            spawn_unread(sim, "holder", &port, 1, 5);
+            spawn_unread(sim, "idler", &port, 3, 12);
+            let waiter = port.clone();
+            let waiter_seen = seen.clone();
+            sim.scheduler().spawn_root("waiter", async move {
+                zakura_rt::time::sleep(Duration::from_secs(1)).await;
+                let target = HeaderFixture::regtest().anchor();
+                let reply = waiter
+                    .acquire_header_path(peer_acquire(&waiter, target, 2))
+                    .await;
+                if let Ok(AcquirePathReply::CapacityBusy(signal)) = reply {
+                    waiter_seen.lock().unwrap().waited = true;
+                    let _ =
+                        zakura_rt::time::timeout(Duration::from_secs(60), signal.released()).await;
+                }
+            });
+            let competing = port.clone();
+            sim.scheduler().spawn_root("competing", async move {
+                let anchor = HeaderFixture::regtest().anchor();
+                let mut calls: Vec<_> = (0..16)
+                    .map(|_| competing.selected_chain_contains(anchor.hash))
+                    .collect();
+                for call in &mut calls {
+                    let _ = call.await;
+                }
+            });
+            sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(
+                port.clone(),
+            )));
+        },
+        &mut checker,
+    );
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    (report, seen)
+}
+
+/// #1722 review P1: under many plans, the run may complete storage at any
+/// point while a task abandons an unread `Acquired` reply and wakes a
+/// capacity waiter, or drops an unread `CapacityBusy` reply. No such run
+/// panics or hangs, and every abandoned lease's end is recorded on its own
+/// reply: on `ReplyDropped`, or on the acquire's completion when its caller
+/// was already gone, never on another operation. Some plans must register a
+/// waiter and complete storage mid-drop, so the race is exercised.
+#[test]
+fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
+    let (mut waited, mut interleaved) = (0, 0);
+    for plan in inputs(128, 64) {
+        let (report, seen) = abandonment_run(plan);
+        assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        for entry in report.log.entries() {
+            let Observation::Storage { id, event, .. } = &entry.obs else {
+                continue;
+            };
+            let abandoned = |ends: &[zakura_sim::observe::LeaseEnd]| {
+                ends.iter()
+                    .any(|end| end.release == "lease-abandoned-acquire")
+            };
+            match event {
+                StorageEvent::Completed { op, lease_ends, .. } if abandoned(lease_ends) => {
+                    assert_eq!(
+                        op, "acquire_header_path",
+                        "operation {id} took an abandoned lease"
+                    );
+                }
+                _ => {}
+            }
+        }
+        waited += u32::from(seen.waited);
+        interleaved += seen.interleaved;
+    }
+    assert!(waited > 0, "no plan registered a capacity waiter");
+    assert!(interleaved > 0, "no plan completed storage mid-drop");
+}

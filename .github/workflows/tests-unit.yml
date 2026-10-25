@@ -670,7 +670,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           # Match lint.yml's daily docs job, including its job ID and target
           # directory, to reuse its main-branch cache without PR cache writes.

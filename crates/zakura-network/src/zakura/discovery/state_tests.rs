@@ -1192,7 +1192,7 @@ const STATE_WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn discovery_book_witness_exercises_provenance_quota_and_expiry() {
     let summary = replay_discovery_book_bytes(BOOK_WITNESS);
@@ -1217,7 +1217,7 @@ fn discovery_book_witness_exercises_provenance_quota_and_expiry() {
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn discovery_state_witness_exercises_stale_verification_and_expiry() {
     let summary = replay_discovery_state_bytes(STATE_WITNESS);

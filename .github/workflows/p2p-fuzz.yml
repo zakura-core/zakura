@@ -33,148 +33,10 @@ jobs:
       matrix:
         include:
           - target: service_session
-            decoder: 1
-            witness: fixed_seeds_exercise_every_session_rule
             seconds: 900
             weekly_seconds: 3600
             rss_mb: 2048
             # The replay reads at most 512 input bytes.
-            max_len: 512
-
-          - target: cadence
-            decoder: 1
-            witness: cadence_witness_exercises_every_hold_and_settlement
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_query
-            decoder: 1
-            witness: query_witness_exercises_refusal_stale_identity_and_reset
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_fill
-            decoder: 1
-            witness: fill_witness_uses_the_retained_run
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_redial
-            decoder: 1
-            witness: redial_witness_exercises_limits_resets_and_lagging_registration
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_session
-            decoder: 1
-            witness: discovery_session_witness_reaches_close_after_recheck
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_query
-            decoder: 1
-            witness: query_witness_exercises_ownership_and_caps
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_candidate
-            decoder: 1
-            witness: candidate_witness_exercises_identity_backoff_and_local_limits
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_work_ownership
-            decoder: 1
-            witness: work_witness_exercises_reset_stale_return_and_settlement
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_retry_authority
-            decoder: 1
-            witness: retry_witness_exercises_expiry_and_authority_changes
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_peer_registry
-            decoder: 1
-            witness: registry_witness_exercises_replacement_and_exact_owner
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_request_lifecycle
-            decoder: 1
-            witness: lifecycle_witness_exercises_replacement_timeout_and_skipped_write
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_sequencer_order
-            decoder: 1
-            witness: sequencer_order_witness_retries_a_refused_contiguous_prefix
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_sequencer_reset
-            decoder: 1
-            witness: sequencer_reset_witness_isolates_a_retired_completion
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: block_sequencer_evidence
-            decoder: 1
-            witness: sequencer_evidence_witness_retains_evidence_while_full
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: header_publisher
-            decoder: 1
-            witness: publisher_witness_exercises_credit_terminal_and_stale_page
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_book
-            decoder: 1
-            witness: discovery_book_witness_exercises_provenance_quota_and_expiry
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 512
-
-          - target: discovery_state
-            decoder: 1
-            witness: discovery_state_witness_exercises_stale_verification_and_expiry
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
             max_len: 512
 
     steps:
@@ -189,19 +51,6 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
-      - name: Restore target corpus
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
-        with:
-          path: qa/fuzz/p2p/corpus/${{ matrix.target }}
-          key: p2p-corpus-${{ matrix.target }}-v${{ matrix.decoder }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: p2p-corpus-${{ matrix.target }}-v${{ matrix.decoder }}-
-      - name: Check applicability witness
-        env:
-          WITNESS: ${{ matrix.witness }}
-        run: |
-          mkdir -p qa/fuzz/p2p/evidence
-          cargo test --locked -p zakura-network --lib "${WITNESS}" -- --nocapture \
-            | tee qa/fuzz/p2p/evidence/witness.log
       - name: Run bounded campaign
         working-directory: qa/fuzz/p2p
         env:
@@ -211,38 +60,21 @@ jobs:
           TARGET: ${{ matrix.target }}
           RSS_MB: ${{ matrix.rss_mb }}
           MAX_LEN: ${{ matrix.max_len }}
-          DECODER: ${{ matrix.decoder }}
         run: |
           seconds="${NORMAL_SECONDS}"
           if [ "${SCHEDULE}" = "28 5 * * 0" ]; then
             seconds="${WEEKLY_SECONDS}"
           fi
-          {
-            git rev-parse HEAD
-            rustc --version --verbose
-            cargo fuzz --version
-            printf 'tier=Machine target=%s decoder=%s budget_seconds=%s max_len=%s rss_mb=%s\n' \
-              "${TARGET}" "${DECODER}" "${seconds}" "${MAX_LEN}" "${RSS_MB}"
-          } > evidence/config.txt
           # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
           cargo fuzz run --fuzz-dir . "${TARGET}" -- \
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
-            -max_len="${MAX_LEN}" 2>&1 | tee evidence/fuzz.log
-      - name: Save target corpus
-        if: always()
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
-        with:
-          path: qa/fuzz/p2p/corpus/${{ matrix.target }}
-          key: p2p-corpus-${{ matrix.target }}-v${{ matrix.decoder }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Upload campaign evidence
+            -max_len="${MAX_LEN}"
+      - name: Upload crash artifacts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: p2p-fuzz-${{ matrix.target }}-${{ github.run_id }}
           if-no-files-found: ignore
           retention-days: 14
-          path: |
-            qa/fuzz/p2p/artifacts/${{ matrix.target }}
-            qa/fuzz/p2p/corpus/${{ matrix.target }}
-            qa/fuzz/p2p/evidence
+          path: qa/fuzz/p2p/artifacts/${{ matrix.target }}

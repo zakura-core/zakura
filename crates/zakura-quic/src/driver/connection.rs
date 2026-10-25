@@ -1,10 +1,10 @@
 //! The connection task: the peer routine that owns one QUIC connection.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     mem,
     net::{IpAddr, SocketAddr},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,10 @@ use quinn_proto::{
     ConnectionError, ConnectionEvent, ConnectionHandle, Dir, EndpointEvent, Event, StreamEvent,
     StreamId, Transmit, TransportError, TransportErrorCode, VarInt,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::Ordering, mpsc, oneshot, watch},
+};
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
 use crate::{
@@ -25,7 +28,7 @@ use crate::{
     endpoint::ConnectionSlot,
     error::{ReadError, WriteError},
     key::NodeId,
-    socket::SocketCell,
+    socket::{SocketCell, UdpIo},
     sys::canonical_ip,
     tls,
 };
@@ -38,13 +41,15 @@ const MAX_INPUTS_PER_WAKEUP: usize = 64;
 /// The shortest gap between two warnings about failed sends.
 const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The current time on tokio's clock, so paused-time tests drive quinn-proto.
+/// The driver's clock: `zakura-rt`'s monotonic clock, which is tokio's in
+/// production, so paused-time tests drive quinn-proto, and virtual inside a
+/// simulated run.
 pub(crate) fn now() -> Instant {
-    tokio::time::Instant::now().into_std()
+    zakura_rt::time::Instant::now().into_std()
 }
 
 /// Everything a connection task starts with.
-pub(crate) struct ConnTaskParams {
+pub(crate) struct ConnTaskParams<S> {
     pub(crate) handle: ConnectionHandle,
     pub(crate) conn: quinn_proto::Connection,
     pub(crate) shared: Arc<ConnShared>,
@@ -54,7 +59,7 @@ pub(crate) struct ConnTaskParams {
     pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    pub(crate) socket: Arc<SocketCell>,
+    pub(crate) socket: Arc<SocketCell<S>>,
     pub(crate) closing: watch::Receiver<bool>,
     pub(crate) network: watch::Receiver<u64>,
     pub(crate) probe: Arc<CongestionProbe>,
@@ -116,12 +121,12 @@ struct Exported {
     datagrams_sent: u64,
 }
 
-struct ConnTask {
+struct ConnTask<S: UdpIo> {
     handle: ConnectionHandle,
     conn: quinn_proto::Connection,
     shared: Arc<ConnShared>,
     to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    socket: Arc<SocketCell>,
+    socket: Arc<SocketCell<S>>,
     probe: Arc<CongestionProbe>,
     hooks: Arc<Hooks>,
     admitted: SocketAddr,
@@ -176,7 +181,7 @@ struct ConnTask {
 }
 
 /// Runs one connection until quinn-proto drains it.
-pub(crate) async fn run(params: ConnTaskParams) {
+pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
     let ConnTaskParams {
         handle,
         conn,
@@ -236,12 +241,12 @@ pub(crate) async fn run(params: ConnTaskParams) {
     };
 
     let mut cmds_open = true;
-    let mut timer = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut timer = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut timer_deadline: Option<Instant> = None;
-    let mut sampler = tokio::time::interval(SAMPLE_INTERVAL);
-    sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampler = zakura_rt::time::interval(SAMPLE_INTERVAL);
+    sampler.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     sampler.tick().await;
-    let mut publish = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut publish = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
     let mut publish_deadline: Option<Instant> = None;
     let mut closing_seen = false;
     if *closing.borrow() {
@@ -269,7 +274,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
             Some(deadline) if publish_deadline != Some(deadline) => {
                 publish
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 publish_deadline = Some(deadline);
             }
             Some(_) => {}
@@ -279,7 +284,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
             Some(deadline) if timer_deadline != Some(deadline) => {
                 timer
                     .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                    .reset(zakura_rt::time::Instant::from_std(deadline));
                 timer_deadline = Some(deadline);
             }
             Some(_) => {}
@@ -293,7 +298,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         // network progress themselves, while a peer can keep the queue full.
         // Datagrams first would let a flood starve close, limits, shutdown
         // and the PATH-3 check.
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             event = control.recv() => match event {
                 Some(event) => task.conn.handle_event(event),
@@ -353,13 +358,13 @@ pub(crate) async fn run(params: ConnTaskParams) {
             _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
             // Yield between transmit batches, so a busy connection can't hold
             // the worker thread.
-            () = tokio::task::yield_now(), if more_to_send => {}
+            () = zakura_rt::task::yield_now(), if more_to_send => {}
         }
     }
     task.drain_datagrams(&mut datagrams).await;
 }
 
-impl ConnTask {
+impl<S: UdpIo> ConnTask<S> {
     async fn drain_datagrams(
         &self,
         datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
@@ -1092,7 +1097,7 @@ impl ConnTask {
     }
 }
 
-impl Drop for ConnTask {
+impl<S: UdpIo> Drop for ConnTask<S> {
     fn drop(&mut self) {
         self.terminate(ConnectionError::LocallyClosed);
         if !self.drained_sent {
@@ -1157,16 +1162,16 @@ fn export_delta(previous: &Exported, next: &Exported) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{socket::UdpIo, NodeSecretKey};
-    use std::sync::atomic::AtomicUsize;
+    use crate::{socket::TokioUdpIo, NodeSecretKey};
+    use zakura_rt::sync::atomic::AtomicUsize;
 
-    fn task() -> ConnTask {
+    fn task() -> ConnTask<TokioUdpIo> {
         client_task().1
     }
 
     /// A task for a client connection that hasn't sent anything yet, and the
     /// client endpoint that routes its datagrams.
-    fn client_task() -> (quinn_proto::Endpoint, ConnTask) {
+    fn client_task() -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
             .client_config(key.public(), &[b"test"])
@@ -1185,7 +1190,7 @@ mod tests {
         let to_endpoint = mpsc::unbounded_channel().0;
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         udp.set_nonblocking(true).unwrap();
-        let socket = Arc::new(SocketCell::new(UdpIo::new(udp, false).unwrap()));
+        let socket = Arc::new(SocketCell::new(TokioUdpIo::new(udp, false).unwrap()));
         let probe = Arc::default();
         let hooks = Arc::default();
         let handshake = oneshot::channel().0;
@@ -1252,7 +1257,7 @@ mod tests {
     /// the client's first Initial.
     fn pump(
         client: &mut quinn_proto::Endpoint,
-        task: &mut ConnTask,
+        task: &mut ConnTask<TokioUdpIo>,
         server: &mut quinn_proto::Endpoint,
         accepted: &mut Option<(ConnectionHandle, quinn_proto::Connection)>,
     ) {

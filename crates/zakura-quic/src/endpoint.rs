@@ -1,19 +1,23 @@
 //! The endpoint: bind, serve, dial and shut down (API-2, SPEC §6 to §8).
 
 use std::{
-    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError, Weak,
-    },
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
-use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use quinn_proto::{ClientConfig, TransportConfig, VarInt};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        counter, downgrade, mpsc, oneshot, watch, Mutex, PoisonError, Weak,
+    },
+    task::{spawn_named, JoinHandle},
+    time::Instant,
+};
 
 use crate::{
     config::{QuicBindConfig, QuicConfig},
@@ -24,11 +28,21 @@ use crate::{
         ConnRef, Connecting, Handshake,
     },
     error::{BindError, ConnectError},
+    inputs::EndpointInputs,
     key::{NodeAddr, NodeId, NodeSecretKey},
-    socket::{bind_udp, SocketBuffers, UdpIo},
+    socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
-    tls::TlsConfig,
+    tls::{RuntimeUtc, TlsConfig},
 };
+
+/// Whether a `zakura_sim` run is active on this thread. Always false in a
+/// production build.
+fn in_simulated_run() -> bool {
+    #[cfg(zakura_sim)]
+    return zakura_rt::sim::executor().is_some();
+    #[cfg(not(zakura_sim))]
+    false
+}
 
 /// How often a wildcard-bound endpoint lists the host's interface addresses to
 /// notice a network change (SOCK-12).
@@ -112,13 +126,13 @@ pub(crate) struct SocketSlot {
     pub(crate) local_addr: SocketAddr,
     pub(crate) buffers: SocketBuffers,
     pub(crate) gso: bool,
-    pub(crate) rebinds: AtomicU64,
+    pub(crate) rebinds: counter::AtomicU64,
     pub(crate) inode: AtomicU64,
-    pub(crate) recv_calls: AtomicU64,
-    pub(crate) datagrams_received: AtomicU64,
-    pub(crate) queue_drops: AtomicU64,
-    pub(crate) oversize_drops: AtomicU64,
-    pub(crate) stopped: std::sync::atomic::AtomicBool,
+    pub(crate) recv_calls: counter::AtomicU64,
+    pub(crate) datagrams_received: counter::AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
+    pub(crate) oversize_drops: counter::AtomicU64,
+    pub(crate) stopped: AtomicBool,
 }
 
 /// State the handles and every endpoint task share. It holds no command
@@ -133,10 +147,21 @@ pub(crate) struct Shared {
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
-    pub(crate) network_changes: AtomicU64,
+    pub(crate) network_changes: counter::AtomicU64,
+    /// The injected randomness. Applied where each config is built: socket
+    /// endpoint configs, `serve` and every dial.
+    pub(crate) inputs: EndpointInputs,
 }
 
 impl Shared {
+    /// One socket's endpoint config, with the injected seed, reset key and
+    /// CID generator.
+    pub(crate) fn endpoint_config(&self) -> quinn_proto::EndpointConfig {
+        let mut config = self.config.endpoint_config();
+        self.inputs.apply_endpoint(&mut config);
+        config
+    }
+
     /// A connection's transport config, with its own instrumented controller
     /// (OBS-12).
     pub(crate) fn connection_transport(
@@ -171,7 +196,7 @@ struct SocketHandle {
     cmds: mpsc::UnboundedSender<EndpointCmd>,
     slot: Arc<SocketSlot>,
     /// The endpoint task, so `shutdown` can abort one that doesn't stop.
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for QuicEndpoint {
@@ -190,6 +215,29 @@ impl QuicEndpoint {
         bind: &QuicBindConfig,
         config: &QuicConfig,
     ) -> Result<Self, BindError> {
+        // A `u32` fits in `usize` on every supported target.
+        let factory = UdpFactory {
+            recv_buffer_bytes: config.recv_buffer_bytes as usize,
+            send_buffer_bytes: config.send_buffer_bytes as usize,
+            offload: config.gso,
+        };
+        Self::bind_with(secret, bind, config, factory, EndpointInputs::default())
+    }
+
+    /// Binds one socket per address in `bind` through `factory`, with the
+    /// randomness in `inputs` (API-2).
+    ///
+    /// `factory` also builds every SOCK-9 replacement. Only a socket with an
+    /// inode gets the SOCK-7 poller, and only one with buffer sizes gets the
+    /// SOCK-5 gauges. [`Self::bind`] is this with OS sockets and
+    /// `EndpointInputs::default()`, so production nodes use `bind`.
+    pub fn bind_with<F: SocketFactory>(
+        secret: NodeSecretKey,
+        bind: &QuicBindConfig,
+        config: &QuicConfig,
+        factory: F,
+        inputs: EndpointInputs,
+    ) -> Result<Self, BindError> {
         config.validate()?;
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
@@ -203,7 +251,7 @@ impl QuicEndpoint {
             id: secret.public(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
-            tls: TlsConfig::new(&secret),
+            tls: TlsConfig::with_inputs(&secret, &inputs)?,
             pending: PendingTable::default(),
             connections: ConnectionSlots::new(
                 bind.max_connections,
@@ -213,54 +261,76 @@ impl QuicEndpoint {
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
-            network_changes: AtomicU64::new(0),
+            network_changes: counter::AtomicU64::new(0),
+            inputs,
         });
+        let factory = Arc::new(factory);
         let mut bound = Vec::with_capacity(bind.addrs.len());
         for addr in &bind.addrs {
-            let socket_error = |source| BindError::Socket {
+            let socket = factory.bind(*addr).map_err(|source| BindError::Socket {
                 addr: *addr,
                 source,
-            };
-            let socket = bind_udp(
-                *addr,
-                config.recv_buffer_bytes as usize,
-                config.send_buffer_bytes as usize,
-            )
-            .map_err(socket_error)?;
-            let io = UdpIo::new(socket.socket, config.gso).map_err(socket_error)?;
-            bound.push((socket.local_addr, socket.buffers, socket.inode, io));
+            })?;
+            // SOCK-12: a wildcard socket starts the interface watcher, which
+            // reads the host's interfaces. Inside a simulated run that would
+            // let the host change the run.
+            if in_simulated_run() && socket.local_addr.ip().is_unspecified() {
+                return Err(BindError::Socket {
+                    addr: *addr,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a simulated run can't bind a wildcard address, whose interface \
+                         watcher would read the host's interfaces",
+                    ),
+                });
+            }
+            bound.push(socket);
         }
         let mut sockets = Vec::with_capacity(bound.len());
-        for (local_addr, buffers, inode, io) in bound {
+        for socket in bound {
             // SOCK-5.
-            metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
-                .set(buffers.recv_effective as f64);
-            metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
-                .set(buffers.send_effective as f64);
+            if let Some(buffers) = socket.buffers {
+                metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
+                    .set(buffers.recv_effective as f64);
+                metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
+                    .set(buffers.send_effective as f64);
+            }
             let slot = Arc::new(SocketSlot {
-                local_addr,
-                buffers,
-                gso: io.gso(),
-                rebinds: AtomicU64::new(0),
-                inode: AtomicU64::new(inode.unwrap_or(0)),
-                recv_calls: AtomicU64::new(0),
-                datagrams_received: AtomicU64::new(0),
-                queue_drops: AtomicU64::new(0),
-                oversize_drops: AtomicU64::new(0),
-                stopped: std::sync::atomic::AtomicBool::new(false),
+                local_addr: socket.local_addr,
+                buffers: socket.buffers.unwrap_or_default(),
+                gso: socket.io.gso(),
+                rebinds: counter::AtomicU64::new(0),
+                inode: AtomicU64::new(socket.inode.unwrap_or(0)),
+                recv_calls: counter::AtomicU64::new(0),
+                datagrams_received: counter::AtomicU64::new(0),
+                queue_drops: counter::AtomicU64::new(0),
+                oversize_drops: counter::AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
-            let task =
-                tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
+            let task = spawn_named(
+                "quic.endpoint",
+                EndpointTask::new(
+                    shared.clone(),
+                    slot.clone(),
+                    factory.clone(),
+                    socket.io,
+                    cmds_rx,
+                )
+                .run(),
+            );
+            // SOCK-7: an injected socket has no inode to poll.
             #[cfg(target_os = "linux")]
-            tokio::spawn(kernel_drop_poller(
-                Arc::downgrade(&slot),
-                config.kernel_drop_poll_interval(),
-            ));
+            if socket.inode.is_some() {
+                spawn_named(
+                    "quic.kernel_drop_poller",
+                    kernel_drop_poller(downgrade(&slot), config.kernel_drop_poll_interval()),
+                );
+            }
             sockets.push(SocketHandle {
                 cmds,
                 slot,
-                task: std::sync::Mutex::new(Some(task)),
+                task: Mutex::new(Some(task)),
             });
         }
         // SOCK-12: a socket bound to a specific address keeps sending from it,
@@ -269,11 +339,10 @@ impl QuicEndpoint {
             .iter()
             .any(|socket| socket.slot.local_addr.ip().is_unspecified())
         {
-            tokio::spawn(watch_interfaces(
-                Arc::downgrade(&shared),
-                local_interface_ips,
-                INTERFACE_POLL,
-            ));
+            spawn_named(
+                "quic.interface_watcher",
+                watch_interfaces(downgrade(&shared), local_interface_ips, INTERFACE_POLL),
+            );
         }
         Ok(Self {
             inner: Arc::new(Inner { shared, sockets }),
@@ -364,8 +433,10 @@ impl QuicEndpoint {
         let acceptor: Arc<dyn Acceptor> = Arc::new(acceptor);
         let alpns = acceptor.alpns();
         let crypto = self.inner.shared.tls.server_config(alpns.clone())?;
-        let mut server = ServerConfig::with_crypto(Arc::new(crypto));
+        let mut server = self.inner.shared.inputs.server_config(Arc::new(crypto));
         self.inner.shared.config.apply_server_limits(&mut server);
+        // Retry tokens carry their issue time, so they read the runtime's UTC.
+        server.time_source(Arc::new(RuntimeUtc));
         let server = Arc::new(server);
 
         let ban = acceptor.clone();
@@ -478,7 +549,7 @@ impl QuicEndpoint {
             let delay = stagger * index as u32;
             attempts.push(async move {
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    zakura_rt::time::sleep(delay).await;
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
@@ -522,6 +593,7 @@ impl QuicEndpoint {
     ) -> Result<(ConnRef, Handshake), ConnectError> {
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
+        self.inner.shared.inputs.apply_client(&mut client);
         client.transport_config(
             self.inner
                 .shared
@@ -560,7 +632,7 @@ impl QuicEndpoint {
         // The endpoint tasks enforce the 3 s drain; the extra second covers
         // their exit.
         let all = futures::future::join_all(done);
-        if tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
+        if zakura_rt::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
             .await
             .is_ok()
         {
@@ -577,7 +649,7 @@ impl QuicEndpoint {
                 .take();
             if let Some(task) = task {
                 task.abort();
-                let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+                let _ = zakura_rt::time::timeout(Duration::from_secs(1), task).await;
             }
         }
     }
@@ -662,7 +734,7 @@ async fn establish(
     let established = connecting.established();
     match deadline {
         // Dropping the attempt at the deadline closes the connection.
-        Some(deadline) => match tokio::time::timeout(deadline, established).await {
+        Some(deadline) => match zakura_rt::time::timeout(deadline, established).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
             Err(_) => Err(ConnectError::HandshakeTimeout),
         },
@@ -709,7 +781,7 @@ pub(crate) async fn inbound_handshake(
 /// shutdown drain bound in case the task is gone.
 async fn wait_closed(shared: &crate::driver::ConnShared) {
     let mut closed = shared.closed.subscribe();
-    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
+    let _ = zakura_rt::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
 }
 
 /// Applies the acceptor's rules, then this crate's optional limits (ADM-3).
@@ -775,8 +847,8 @@ pub(crate) async fn watch_interfaces(
     interval: Duration,
 ) {
     let mut known = list_ips();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticker = zakura_rt::time::interval(interval);
+    ticker.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
@@ -801,7 +873,7 @@ pub(crate) async fn watch_interfaces(
 /// Exports the socket's `/proc/net/udp` drop count as a counter (SOCK-7).
 #[cfg(target_os = "linux")]
 async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = zakura_rt::time::interval(interval);
     let mut baseline: Option<(u64, u64)> = None;
     loop {
         ticker.tick().await;

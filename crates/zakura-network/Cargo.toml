@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "10.0.0-rc1"
+version = "11.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -23,6 +23,18 @@ readme = "../../README.md"
 keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "network-programming"]
+
+# Test-only sources are over a third of the crate and only compile under
+# `cfg(test)`. These two `tests` modules also build under `proptest-impl`.
+exclude = [
+    "tests/",
+    "proptest-regressions/",
+    "src/**/tests/",
+    "src/**/tests.rs",
+    "src/**/*_tests.rs",
+    "!src/peer/client/tests.rs",
+    "!src/peer/minimum_peer_version/tests.rs",
+]
 
 [features]
 default = []
@@ -52,7 +64,6 @@ chrono = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
-lazy_static = { workspace = true }
 pin-project = { workspace = true }
 rand_10 = { workspace = true }
 rayon = { workspace = true }
@@ -74,11 +85,12 @@ tracing = { workspace = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["async-error"] }
+zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
 zakura-quic = { path = "../zakura-quic", version = "0.1.0" }
+zakura-rt = { path = "../zakura-rt", version = "0.1.0-rc0" }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -92,9 +104,15 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "ne
 toml = { workspace = true, features = ["display"] }
 tracing-subscriber = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
-zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }
+zakura-test = { path = "../zakura-test/", version = "4.0.0" }
+
+# The scheduler tests in `tests/sim_header_sync.rs` and `tests/sim_block_sync.rs`
+# only build with `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no
+# version.
+[target.'cfg(zakura_sim)'.dev-dependencies]
+zakura-scheduler = { path = "../zakura-scheduler" }
 
 [lints]
 workspace = true

@@ -5,6 +5,7 @@
 //! requests, parameter decoding, notifications, batches, malformed input, HTTP methods and
 //! content types, response size limits, and cookie authentication.
 
+use crate::tests::test_rpc::TestRpcImpl;
 use std::{
     fmt::Write as _,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -28,7 +29,7 @@ use zakura_network::address_book_peers::MockAddressBookPeers;
 use zakura_node_services::BoxError;
 use zakura_test::mock_service::MockService;
 
-use crate::{config::rpc::Config, methods::RpcImpl};
+use crate::config::rpc::Config;
 
 use super::super::RpcServer;
 
@@ -78,7 +79,7 @@ async fn start_server(conf: Config) -> SocketAddr {
     let block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, _rpc_queue_task) = RpcImpl::new(
+    let (rpc_impl, _rpc_queue_task) = TestRpcImpl::new_for_tests(
         Network::new_regtest(Default::default()),
         Default::default(),
         false,

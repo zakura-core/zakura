@@ -28,20 +28,12 @@
 //! release, never for a timer.
 
 use std::{
-    any::Any,
-    collections::BTreeMap,
-    future::Future,
-    num::NonZeroU32,
-    ops::Bound,
-    panic::AssertUnwindSafe,
-    pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    any::Any, collections::BTreeMap, future::Future, num::NonZeroU32, ops::Bound,
+    panic::AssertUnwindSafe, pin::Pin, sync::Arc,
 };
 
 use futures::FutureExt;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch, Notify};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 use zakura_header_chain::{
     BranchId, EngineSnapshot, Frontier, HeaderGeneration, HeaderWorkAuthority, SourceId,
@@ -50,7 +42,11 @@ use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, Port, PortError, ReadPath, ReadPathReply, RetainedHeaderPath,
     RetainedHeaderPathPage, SelectedChainMembership, ServingCapacitySignal,
 };
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
+use zakura_rt::{
+    sync::{mpsc, watch, CancellationToken, Mutex, MutexGuard, Notify, PoisonError},
+    task::JoinHandle,
+};
 
 use super::{
     entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
@@ -220,7 +216,7 @@ impl Publisher {
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    ) -> (Self, JoinHandle<()>) {
         let limits_row = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         let shared = Arc::new(Mutex::new(Shared {
@@ -231,20 +227,23 @@ impl Publisher {
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);
-        let task = spawn_erased(publish::<HEADER_BYTES>(
-            Task {
-                shared: shared.clone(),
-                wake: wake.clone(),
-                port,
-                push,
-                owner,
-                limits,
-                panics,
-            },
-            send,
-            panicked,
-            cancel,
-        ));
+        let task = spawn_erased_named(
+            "header_sync_publisher",
+            publish::<HEADER_BYTES>(
+                Task {
+                    shared: shared.clone(),
+                    wake: wake.clone(),
+                    port,
+                    push,
+                    owner,
+                    limits,
+                    panics,
+                },
+                send,
+                panicked,
+                cancel,
+            ),
+        );
         (
             Self {
                 shared,
@@ -266,7 +265,7 @@ impl Publisher {
         if applied == Ok(Applied::Live) {
             self.wake.notify_one();
         }
-        tokio::task::coop::consume_budget().await;
+        zakura_rt::task::coop::consume_budget().await;
         applied
     }
 }
@@ -694,7 +693,7 @@ fn page_bytes(count: u32, schema: AuxSchema, header_bytes: usize) -> usize {
 
 /// Lock `shared`, recovering from a poisoned lock: every update leaves the
 /// state consistent before it can panic.
-fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -773,6 +772,10 @@ enum Admission {
 }
 
 /// How a page in progress finished.
+// The simulator build's sync wrappers make `PushSend` about 376 bytes, past
+// clippy's threshold. One `Progress` is returned per page, so boxing the send
+// would only add an allocation per page in production.
+#[cfg_attr(zakura_sim, allow(clippy::large_enum_variant))]
 enum Progress<'a> {
     Page(Page, PushSend<'a>),
     Other(Output),
@@ -801,7 +804,7 @@ async fn publish<const HEADER_BYTES: usize>(
                 work = None;
             }
             let terminal = terminal.send(&send, frame);
-            tokio::pin!(terminal);
+            zakura_rt::pin!(terminal);
             // A full queue must not keep a cancelled session's task alive,
             // hide a page job's panic, or stop another subscription's page.
             // That page settles at once: its job gives its execution slots
@@ -809,7 +812,7 @@ async fn publish<const HEADER_BYTES: usize>(
             // for is queued instead of kept. A page whose subscription ends
             // later in this batch fails its commit and is dropped.
             loop {
-                tokio::select! {
+                zakura_rt::select! {
                     biased;
                     () = cancel.cancelled() => return,
                     Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
@@ -852,7 +855,7 @@ async fn publish<const HEADER_BYTES: usize>(
         let capacity = lock(&task.shared).capacity_signals();
         // The page in progress goes first, so a stream of wakes cannot starve
         // it. Each wake still reaches `end_due` on the next pass.
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return,
             // See `Publisher::spawn`.
@@ -945,7 +948,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         } else {
             Admission::Page(push.acquire(bytes).await)
         };
-        let running = tokio::spawn(async move {
+        let running = zakura_rt::task::spawn_named("header_sync_page_job", async move {
             let job = AssertUnwindSafe(run_job::<HEADER_BYTES>(&*port, owner, &job));
             match job.catch_unwind().await {
                 Ok(output) => Some((output, permit)),

@@ -21,16 +21,16 @@
 //! reservation); it feeds the request budget reservation and the advisory
 //! receive-path size-hint mismatch metric, which never discards a hash-matched body.
 
-use std::{
-    num::NonZeroU64,
+use std::{num::NonZeroU64, sync::Arc};
+
+use zakura_chain::block;
+use zakura_rt::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Mutex as StdMutex, MutexGuard, Notify,
     },
 };
-
-use tokio::sync::Notify;
-use zakura_chain::block;
 
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
@@ -107,8 +107,7 @@ struct WorkQueueInner {
     in_flight_reserved: ReservedTally,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
-    request_writes:
-        std::collections::HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
+    request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
 }
 
 /// A running count and byte sum of nonzero reservations.
@@ -196,7 +195,7 @@ impl WorkQueue {
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
                 in_flight_reserved: ReservedTally::default(),
-                request_writes: std::collections::HashMap::new(),
+                request_writes: HashMap::new(),
             }),
             available: Notify::new(),
             revocations: AtomicU64::new(0),
@@ -233,7 +232,7 @@ impl WorkQueue {
         inner.floor_estimate_bytes = floor.max(1);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, WorkQueueInner> {
+    fn lock(&self) -> MutexGuard<'_, WorkQueueInner> {
         self.inner
             .lock()
             .expect("work queue mutex is never poisoned")

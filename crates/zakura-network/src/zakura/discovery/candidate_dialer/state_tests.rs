@@ -773,7 +773,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn candidate_witness_exercises_identity_backoff_and_local_limits() {
     let summary = replay_candidate_dial_bytes(WITNESS);

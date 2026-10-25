@@ -689,7 +689,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn lifecycle_witness_exercises_replacement_timeout_and_skipped_write() {
     let summary = replay_request_lifecycle_bytes(WITNESS);

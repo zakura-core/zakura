@@ -904,7 +904,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn work_witness_exercises_reset_stale_return_and_settlement() {
     let summary = replay_work_ownership_bytes(WITNESS);

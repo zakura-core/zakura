@@ -1519,7 +1519,7 @@ const WITNESS: &[u8] = &[
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn publisher_witness_exercises_credit_terminal_and_stale_page() {
     let summary = replay_header_publisher_bytes(WITNESS);

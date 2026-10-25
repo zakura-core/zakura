@@ -1098,7 +1098,7 @@ const EVIDENCE_WITNESS: &[u8] = &[0, 0, 2, 2, 0, 0, 1, 0, 0];
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn sequencer_order_witness_retries_a_refused_contiguous_prefix() {
     let summary = replay_sequencer_order_bytes(ORDER_WITNESS);
@@ -1122,7 +1122,7 @@ fn sequencer_order_witness_retries_a_refused_contiguous_prefix() {
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn sequencer_reset_witness_isolates_a_retired_completion() {
     let summary = replay_sequencer_reset_bytes(RESET_WITNESS);
@@ -1146,7 +1146,7 @@ fn sequencer_reset_witness_isolates_a_retired_completion() {
 #[test]
 #[allow(
     clippy::print_stdout,
-    reason = "CI retains these applicability counters"
+    reason = "witnesses print applicability counters"
 )]
 fn sequencer_evidence_witness_retains_evidence_while_full() {
     let summary = replay_sequencer_evidence_bytes(EVIDENCE_WITNESS);

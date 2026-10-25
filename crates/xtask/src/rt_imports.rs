@@ -13,8 +13,15 @@
 //! The suggested replacements come from the `pub use` items in `zakura-rt`'s
 //! `lib.rs`, so the crate stays the one list of runtime names.
 //!
-//! The check does not yet cover `std::time::{Instant, SystemTime}`,
-//! `std::thread`, or the timer adapters in `tokio_stream`.
+//! Time and threads follow the same rule. The check flags std's `Instant`,
+//! the wall-clock reads `SystemTime::now`, `Utc::now` and `Local::now`, std's
+//! thread spawns, sleeps and parks, and whole-module imports of `std::time` and
+//! `std::thread`. The wall-clock reads are matched by spelling, so a renamed
+//! `SystemTime` or chrono type slips through. `Duration`, `UNIX_EPOCH`, the
+//! `SystemTime` type and `std::thread::panicking` stay allowed.
+//!
+//! The check does not yet cover the timer adapters in `tokio_stream`, or
+//! `std::thread::available_parallelism`, a host property discovery reads.
 
 use std::{
     fmt, fs,
@@ -64,6 +71,18 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
     "make_rng",
 ];
 
+/// `std::thread` items that start, block or yield an OS thread, which a
+/// simulated run can't schedule.
+const THREAD_ITEMS: [&str; 7] = [
+    "spawn",
+    "sleep",
+    "park",
+    "park_timeout",
+    "scope",
+    "Builder",
+    "yield_now",
+];
+
 /// Direct runtime paths the v2 code may keep, with the reason for each.
 ///
 /// For `zakura-quic` this is the bypass inventory M3.7 asks for. Two more
@@ -74,7 +93,7 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 12] = [
+const ALLOWED: [(&str, &str, &str); 16] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -136,7 +155,32 @@ const ALLOWED: [(&str, &str, &str); 12] = [
         "Arc::downgrade",
         SIM_HARNESS,
     ),
+    (
+        "crates/zakura-quic/src/congestion.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/driver/connection.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/driver/endpoint.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::time::Instant",
+        SIM_HARNESS,
+    ),
 ];
+
+/// Why `zakura-quic`'s driver may name std's `Instant`.
+const QUINN_INSTANT: &str = "quinn-proto's API takes std's Instant, and the driver \
+     reads time only through driver::connection::now, which reads zakura_rt's \
+     clock and so follows a simulated run's virtual time";
 
 /// Why `zakura-quic`'s `sim` module may use std's runtime names. It compiles
 /// only under `cfg(any(test, zakura_sim))`, which the check doesn't treat as
@@ -387,12 +431,33 @@ impl Rules {
             | ["std", "sync", "RwLock" | "RwLockReadGuard" | "RwLockWriteGuard" | "Condvar" | "Barrier"
             | "BarrierWaitResult" | "mpsc", ..]
             | ["futures" | "futures_util", "select"] => Some(MISSING_NAME.to_owned()),
+            ["std", "thread", name, ..] if THREAD_ITEMS.contains(name) => {
+                Some(MISSING_NAME.to_owned())
+            }
             // `Arc::downgrade` makes std's `Weak`, whose reads have no
             // preemption points. Matched by spelling, so a renamed `Arc`
             // import slips through.
             ["Arc", "downgrade"] | ["std" | "alloc", "sync", "Arc", "downgrade"] => {
                 Some("zakura_rt::sync::downgrade".to_owned())
             }
+            ["std", "time", "Instant", rest @ ..] => Some(
+                ["zakura_rt::time::Instant"]
+                    .into_iter()
+                    .chain(rest.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            ),
+            // The wall clock. Matched by spelling, like `Arc::downgrade`, so a
+            // renamed `SystemTime` or chrono type slips through.
+            ["SystemTime", "now"]
+            | ["std", "time", "SystemTime", "now"]
+            | ["Utc" | "Local", "now"]
+            | ["chrono", "Utc" | "Local", "now"]
+            | ["chrono", "offset", "Utc" | "Local", "now"] => {
+                Some("zakura_rt::time::utc_now".to_owned())
+            }
+            // A module import would let the code name the items above through it.
+            ["std", "time" | "thread"] => Some(MODULE_IMPORT.to_owned()),
             _ => None,
         }
     }
@@ -864,6 +929,82 @@ mod tests {
                 "Arc::downgrade -> zakura_rt::sync::downgrade",
                 "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
                 "core::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+            ]
+        );
+    }
+
+    #[test]
+    fn std_clocks_and_threads_are_flagged() {
+        let source = "
+            use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+            use std::thread::{panicking, Builder};
+            fn f() {
+                let _ = std::time::Instant::now();
+                let _ = SystemTime::now();
+                let _ = std::time::SystemTime::now();
+                let _ = std::time::SystemTime::UNIX_EPOCH;
+                let _ = Utc::now();
+                let _ = Local::now();
+                let _ = chrono::Utc::now();
+                let _ = chrono::Local::now();
+                let _ = chrono::offset::Utc::now();
+                let _ = chrono::offset::Local::now();
+                let _ = chrono::Utc::now;
+                std::thread::spawn(|| {});
+                std::thread::sleep(Duration::ZERO);
+                std::thread::park();
+                std::thread::park_timeout(Duration::ZERO);
+                std::thread::scope(|_| {});
+                std::thread::yield_now();
+                let _ = std::thread::panicking();
+            }
+        ";
+        let (missing, utc_now) = (MISSING_NAME, "zakura_rt::time::utc_now");
+        assert_eq!(
+            violations(source),
+            [
+                "std::time::Instant -> zakura_rt::time::Instant".to_owned(),
+                format!("std::thread::Builder -> {missing}"),
+                "std::time::Instant::now -> zakura_rt::time::Instant::now".to_owned(),
+                format!("SystemTime::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("Utc::now -> {utc_now}"),
+                format!("Local::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("chrono::Local::now -> {utc_now}"),
+                format!("chrono::offset::Utc::now -> {utc_now}"),
+                format!("chrono::offset::Local::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("std::thread::spawn -> {missing}"),
+                format!("std::thread::sleep -> {missing}"),
+                format!("std::thread::park -> {missing}"),
+                format!("std::thread::park_timeout -> {missing}"),
+                format!("std::thread::scope -> {missing}"),
+                format!("std::thread::yield_now -> {missing}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn std_time_and_thread_module_imports_are_flagged() {
+        let source = "
+            use std::time::*;
+            use std::time;
+            use std::time as t;
+            use std::thread;
+            use std::thread as threads;
+            use std::{thread::{self}, time::{Duration, UNIX_EPOCH}};
+            use core::time::Duration as CoreDuration;
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::time -> zakura_rt names, imported by item",
+                "std::time -> zakura_rt names, imported by item",
+                "std::time -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
             ]
         );
     }

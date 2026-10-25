@@ -98,8 +98,12 @@ impl std::error::Error for CompleteError {}
 pub struct ControlledPort {
     engine: EnginePort,
     /// The run's own bookkeeping, so a std lock: it adds no scheduling points
-    /// production lacks, and the run locks it from outside any task. It's
-    /// never held across a `zakura_rt` call or the engine.
+    /// production lacks, and the run locks it from outside any task. So it's
+    /// never held across a scheduling point, or a task suspended there would
+    /// block the run's only thread: no `zakura_rt` call or engine call runs
+    /// under it, and a removed slot or replaced waker drops only after it's
+    /// released, since a reply can hold the last sender of a capacity signal,
+    /// whose drop is a scheduling point.
     ops: Mutex<Ops>,
 }
 
@@ -259,7 +263,7 @@ impl ControlledPort {
             }
             None => self.engine.execute(request),
         };
-        let caller = {
+        let (caller, removed) = {
             let mut ops = self.ops();
             let slot = ops
                 .slots
@@ -268,14 +272,12 @@ impl ControlledPort {
             match slot.caller.take() {
                 Some(waker) => {
                     slot.stage = Stage::Replied(reply);
-                    Some(waker)
+                    (Some(waker), None)
                 }
-                None => {
-                    ops.slots.remove(&id);
-                    None
-                }
+                None => (None, Some((ops.slots.remove(&id), reply))),
             }
         };
+        drop(removed);
         let delivered = caller.is_some();
         // Woken outside the lock, since a waker can run scheduler code.
         if let Some(waker) = caller {
@@ -366,7 +368,9 @@ impl<T: FromReply> Future for Call<'_, T> {
                     self.state = CallState::Done;
                     Poll::Ready(T::from_reply(reply))
                 } else {
-                    slot.caller = Some(cx.waker().clone());
+                    let replaced = slot.caller.replace(cx.waker().clone());
+                    drop(ops);
+                    drop(replaced);
                     Poll::Pending
                 }
             }
@@ -384,12 +388,14 @@ impl<T> Drop for Call<'_, T> {
         let Some(slot) = ops.slots.get_mut(&id) else {
             return;
         };
-        if matches!(slot.stage, Stage::Replied(_)) {
-            ops.slots.remove(&id);
+        let (removed, caller) = if matches!(slot.stage, Stage::Replied(_)) {
+            (ops.slots.remove(&id), None)
         } else {
             // Accepted work outlives its caller.
-            slot.caller = None;
-        }
+            (None, slot.caller.take())
+        };
+        drop(ops);
+        drop((removed, caller));
     }
 }
 

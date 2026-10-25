@@ -83,6 +83,16 @@ run's actual start and checks the commit-window take ceiling. These cases prove
 pure decisions. They do not prove asynchronous reservation cleanup.
 
 The planned P1 registry will index the local IDs and witnesses. Machine decoder-v1 bytes are not portable sim traces.
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+>>>>>>> test/pure-discovery-machines
+>>>>>>> test/pure-block-ownership
+>>>>>>> test/pure-sequencer-machines
 
 ## Discovery session and redial targets
 
@@ -131,6 +141,7 @@ per-node backoff. Its witness exercises a duplicate completion, failure backoff
 and a local-limit pause. Planted failures release reservations early or discard
 backoff. Final cleanup settles every remaining logical reservation. This does
 not prove that an asynchronous worker releases its admission permit.
+<<<<<<< HEAD
 
 ## Block ownership and lifecycle targets
 
@@ -164,6 +175,7 @@ matches a replacement request, and resets the remaining window.
 These ledgers prove logical state transitions. Scheduled IO still needs separate
 proof that the actual guard or permit settles with its owner. P1 will register
 these local property IDs when its shared schema exists.
+<<<<<<< HEAD
 
 ## Sequencer targets
 
@@ -188,6 +200,7 @@ block 1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.
 
 These tests prove logical submission and evidence ownership. They do not prove
 decoded-memory retention or asynchronous channel delivery.
+<<<<<<< HEAD
 
 ## Header publisher target
 
@@ -206,3 +219,11 @@ ledger with the independent model.
 
 The target checks the publisher state. Scheduled storage waits and transport writes remain
 separate simulator adapter obligations.
+=======
+=======
+=======
+=======
+>>>>>>> test/pure-block-query-machine
+>>>>>>> test/pure-discovery-machines
+>>>>>>> test/pure-block-ownership
+>>>>>>> test/pure-sequencer-machines

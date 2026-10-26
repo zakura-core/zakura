@@ -22,7 +22,7 @@ use crate::{
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     evidence::{Checkpoint, Mark, StorageId},
-    observe::{Exit, Observation},
+    observe::{storage_delivery, Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
         ViolationRecord,
@@ -463,7 +463,7 @@ impl Sim {
                     detail,
                 })?;
         }
-        for (service, checkpoint) in &self.evidence {
+        for (instance, (service, checkpoint)) in (0..).zip(&self.evidence) {
             let detail = match checkpoint.get() {
                 Mark::NotObserved => {
                     "NotObserved: the setup observation never completed".to_owned()
@@ -473,7 +473,8 @@ impl Sim {
                     delivered.step, st.step
                 ),
                 Mark::Observed(delivered) => {
-                    let (facts, states) = logged_storage(&st.log, st.step, service);
+                    let (facts, states) =
+                        storage_delivery(st.log.of_step(st.step), service, instance);
                     if facts == delivered.facts && states == delivered.states {
                         continue;
                     }
@@ -485,7 +486,7 @@ impl Sim {
                 }
             };
             return Err(HarnessFailure::SourceEvidence {
-                source: format!("storage:{service}"),
+                source: format!("storage:{service}#{instance}"),
                 detail,
             });
         }
@@ -589,28 +590,6 @@ impl State {
             ..self.end(Outcome::Harness)
         }
     }
-}
-
-/// The sequence numbers of `service`'s storage facts in `log` at `step`, and
-/// its states' watermarks, in order.
-fn logged_storage(log: &ObservationLog, step: u64, service: &str) -> (Vec<u64>, Vec<u64>) {
-    let (mut facts, mut states) = (Vec::new(), Vec::new());
-    for obs in log.of_step(step) {
-        match obs {
-            Observation::Storage {
-                service: logged,
-                seq,
-                ..
-            } if logged == service => facts.push(*seq),
-            Observation::StorageState {
-                service: logged,
-                through_seq,
-                ..
-            } if logged == service => states.push(*through_seq),
-            _ => {}
-        }
-    }
-    (facts, states)
 }
 
 /// What `source` offers at `now`.

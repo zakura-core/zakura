@@ -54,6 +54,8 @@ pub enum Observation {
     Storage {
         /// The service, such as `header`.
         service: String,
+        /// The storage instance's registration index in its run.
+        instance: u64,
         /// The fact's sequence number, from 1 per service.
         seq: u64,
         /// Its transaction's number, from 1 per service.
@@ -65,6 +67,8 @@ pub enum Observation {
     StorageState {
         /// The service.
         service: String,
+        /// The storage instance's registration index in its run.
+        instance: u64,
         /// The last fact the state reflects.
         through_seq: u64,
         /// The state.
@@ -503,6 +507,34 @@ pub struct StorageContinuation {
     pub next: Option<u64>,
     /// How many hashes its path retains.
     pub retained: u64,
+}
+
+/// The sequence numbers of the facts that storage `instance` of `service`
+/// logged in `observations`, and its states' watermarks, in order.
+pub(crate) fn storage_delivery<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    service: &str,
+    instance: u64,
+) -> (Vec<u64>, Vec<u64>) {
+    let (mut facts, mut states) = (Vec::new(), Vec::new());
+    for obs in observations {
+        match obs {
+            Observation::Storage {
+                service: logged,
+                instance: index,
+                seq,
+                ..
+            } if logged == service && *index == instance => facts.push(*seq),
+            Observation::StorageState {
+                service: logged,
+                instance: index,
+                through_seq,
+                ..
+            } if logged == service && *index == instance => states.push(*through_seq),
+            _ => {}
+        }
+    }
+    (facts, states)
 }
 
 /// How a task ended.

@@ -29,9 +29,9 @@ use zakura_storage::header::{
 use crate::{
     evidence::{Checkpoint, StorageId},
     observe::{
-        Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
-        StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
-        WorkScope,
+        storage_delivery, Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease,
+        StorageLeaseState, StorageOperation, StoragePoint, StorageRequest, StorageResult,
+        StorageState, WorkOwner, WorkScope,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -63,6 +63,10 @@ pub struct HeaderStorage {
     checkpoint: Checkpoint,
     /// Binds it to the run that holds its checkpoint.
     id: StorageId,
+    /// The service in its action identities: `header` for the run's first
+    /// instance, so one-instance runs keep their identities, and
+    /// `header-<index>` for each later one, so instances never share one.
+    label: String,
 }
 
 impl HeaderStorage {
@@ -109,6 +113,10 @@ impl HeaderStorage {
             model: OwnerModel::new(),
             delivered: None,
             checkpoint,
+            label: match id.index {
+                0 => SERVICE.to_owned(),
+                index => format!("{SERVICE}-{index}"),
+            },
             id,
         }
     }
@@ -423,8 +431,8 @@ fn lease_fact(fact: LeaseFact) -> StorageFact {
     }
 }
 
-/// `fact` as an observation.
-fn observation(fact: Fact) -> Observation {
+/// `fact` as storage `instance`'s observation.
+fn observation(fact: Fact, instance: u64) -> Observation {
     let fact_kind = match fact.kind {
         FactKind::Submitted {
             id,
@@ -457,6 +465,7 @@ fn observation(fact: Fact) -> Observation {
     };
     Observation::Storage {
         service: SERVICE.to_owned(),
+        instance,
         seq: fact.seq,
         txn: fact.txn,
         fact: fact_kind,
@@ -523,28 +532,19 @@ fn state(state: &OwnerState) -> StorageState {
     }
 }
 
-/// Checks that `appended`, the entries one observation added, deliver
-/// exactly the `drained` sequence numbers, contiguous with the facts
-/// `delivered` before, and, if `with_state`, one state watermarked at the
-/// last of them. Returns the last fact delivered.
+/// Checks that `appended`, the entries one observation of storage
+/// `instance` added, deliver exactly the `drained` sequence numbers,
+/// contiguous with the facts `delivered` before, and, if `with_state`, one
+/// state watermarked at the last of them. Returns the last fact delivered.
 fn check_delivery(
     appended: &[Entry],
+    instance: u64,
     drained: &[u64],
     delivered: u64,
     with_state: bool,
 ) -> Result<u64, String> {
-    let (mut seqs, mut marks) = (Vec::new(), Vec::new());
-    for entry in appended {
-        match &entry.obs {
-            Observation::Storage { service, seq, .. } if service == SERVICE => seqs.push(*seq),
-            Observation::StorageState {
-                service,
-                through_seq,
-                ..
-            } if service == SERVICE => marks.push(*through_seq),
-            _ => {}
-        }
-    }
+    let (seqs, marks) =
+        storage_delivery(appended.iter().map(|entry| &entry.obs), SERVICE, instance);
     let contiguous = drained
         .first()
         .is_none_or(|first| *first == delivered.saturating_add(1));
@@ -573,7 +573,7 @@ impl ActionSource for HeaderStorage {
                     .find_map(|(code, known)| (known == outcome).then_some(code))
                     .expect("OUTCOMES lists every outcome");
                 out.push((
-                    Identity::storage(SERVICE, op.id.0, outcome.name()),
+                    Identity::storage(&self.label, op.id.0, outcome.name()),
                     op.id.0 * CODES + code,
                 ));
             }
@@ -630,16 +630,23 @@ impl ActionSource for HeaderStorage {
         let drained: Vec<u64> = facts.iter().map(|fact| fact.seq).collect();
         let cursor = log.entries().len();
         for fact in facts {
-            log.push(observation(fact));
+            log.push(observation(fact, self.id.index));
         }
         if with_state {
             log.push(Observation::StorageState {
                 service: SERVICE.to_owned(),
+                instance: self.id.index,
                 through_seq: actual.through_seq,
                 state: state(&actual),
             });
         }
-        let last = check_delivery(&log.entries()[cursor..], &drained, delivered, with_state)?;
+        let last = check_delivery(
+            &log.entries()[cursor..],
+            self.id.index,
+            &drained,
+            delivered,
+            with_state,
+        )?;
         self.delivered = Some(last);
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
@@ -663,6 +670,7 @@ mod tests {
     fn fact(seq: u64) -> Observation {
         Observation::Storage {
             service: SERVICE.to_owned(),
+            instance: 0,
             seq,
             txn: seq,
             fact: StorageFact::CallerDropped { id: 1 },
@@ -673,6 +681,7 @@ mod tests {
     fn state_through(seq: u64) -> Observation {
         Observation::StorageState {
             service: SERVICE.to_owned(),
+            instance: 0,
             through_seq: seq,
             state: state(&OwnerState::default()),
         }
@@ -692,16 +701,16 @@ mod tests {
     fn an_edited_log_is_undelivered() {
         let whole = || vec![fact(3), fact(4), fact(5), state_through(5)];
         assert_eq!(
-            check_delivery(&entries(whole()), &[3, 4, 5], 2, true),
+            check_delivery(&entries(whole()), 0, &[3, 4, 5], 2, true),
             Ok(5)
         );
         for dropped in 0..4 {
             let mut edited = whole();
             edited.remove(dropped);
-            let failure = check_delivery(&entries(edited), &[3, 4, 5], 2, true)
+            let failure = check_delivery(&entries(edited), 0, &[3, 4, 5], 2, true)
                 .expect_err("an edited log doesn't deliver the batch");
             assert!(failure.starts_with("Undelivered"), "{failure}");
         }
-        assert!(check_delivery(&entries(whole()), &[3, 4, 5], 1, true).is_err());
+        assert!(check_delivery(&entries(whole()), 0, &[3, 4, 5], 1, true).is_err());
     }
 }

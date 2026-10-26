@@ -1159,7 +1159,7 @@ fn storage_the_run_never_observes_fails_at_setup() {
     let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
         panic!("expected a source evidence failure, got {:?}", report.end);
     };
-    assert_eq!(source, "storage:header");
+    assert_eq!(source, "storage:header#0");
     assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
@@ -1197,6 +1197,67 @@ fn storage_from_a_dropped_run_fails_a_later_one() {
             panic!("expected a source evidence failure, got {:?}", report.end);
         };
         assert!(detail.starts_with("ForeignRun"), "{detail}");
+    }
+}
+
+/// A run with two storage instances on their own ports, each read by its
+/// own task, with instance `divert`, if any, observing into a copy of the
+/// log at setup.
+fn two_storage_run(divert: Option<u64>) -> RunReport {
+    run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            for instance in 0..2 {
+                let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+                let caller = port.clone();
+                sim.scheduler().spawn_root(
+                    ["caller-0", "caller-1"][instance as usize],
+                    async move {
+                        let anchor = HeaderFixture::regtest().anchor();
+                        let _ = caller.selected_chain_contains(anchor.hash).await;
+                    },
+                );
+                let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+                if divert == Some(instance) {
+                    sim.add_source(Box::new(Divert {
+                        inner: storage,
+                        at: 0,
+                        duplicate: false,
+                    }));
+                } else {
+                    sim.add_source(Box::new(storage));
+                }
+            }
+        },
+        &mut zakura_sim::NoChecks,
+    )
+}
+
+/// Storage instances are told apart by their registration index, not
+/// their service: two instances that both deliver pass, and either one
+/// delivering into a copy of the log fails, though the other's matching
+/// entries are in the run log.
+#[test]
+fn each_storage_instance_is_checked_on_its_own() {
+    let both = two_storage_run(None);
+    assert_eq!(
+        both.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        },
+        "{:?}",
+        both.end
+    );
+    for divert in 0..2 {
+        let report = two_storage_run(Some(divert));
+        assert_eq!(report.end.outcome, Outcome::Harness, "diverting {divert}");
+        assert_eq!(report.end.steps, 0, "the diverted setup fails");
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert_eq!(*source, format!("storage:header#{divert}"));
+        assert!(detail.starts_with("Undelivered"), "{detail}");
     }
 }
 

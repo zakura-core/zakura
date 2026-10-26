@@ -790,14 +790,14 @@ fn unsupported_format() {
     let dir = recorded(plan());
     // A newer format may add fields, so the version is checked first.
     edit_meta(dir.path(), |meta| {
-        meta["format"] = json!(2);
+        meta["format"] = json!(zakura_sim::record::FORMAT_VERSION + 1);
         meta["requires_hints"] = json!(true);
     });
     assert_eq!(
         invalid(dir.path()),
         Invalid::UnsupportedVersion {
             field: "format",
-            found: 2
+            found: zakura_sim::record::FORMAT_VERSION + 1
         }
     );
 }

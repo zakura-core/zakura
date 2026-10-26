@@ -103,6 +103,9 @@ pub enum Inconclusive {
     AssumptionLost,
     /// An obligation was still open at run end, within its bound.
     ObligationOpen,
+    /// The run ended at a harness failure, so its evidence may be
+    /// incomplete.
+    HarnessFailed,
 }
 
 impl fmt::Display for Inconclusive {
@@ -112,6 +115,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::AssumptionsNeverHeld => "assumptions-never-held",
             Inconclusive::AssumptionLost => "assumption-lost",
             Inconclusive::ObligationOpen => "obligation-open",
+            Inconclusive::HarnessFailed => "harness-failed",
         })
     }
 }

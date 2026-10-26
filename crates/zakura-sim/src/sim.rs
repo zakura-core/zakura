@@ -16,6 +16,7 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
+    evidence::{Checkpoint, Evidence, Mark},
     observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
@@ -94,6 +95,8 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
+    /// Each evidence source's index and the checkpoint it sets.
+    evidence: Vec<(usize, Checkpoint)>,
     config: RunConfig,
 }
 
@@ -116,6 +119,7 @@ impl Sim {
             choices,
             failure,
             sources: Vec::new(),
+            evidence: Vec::new(),
             config,
         }
     }
@@ -130,6 +134,17 @@ impl Sim {
     pub fn add_source(&mut self, source: Box<dyn ActionSource>) -> SourceId {
         self.sources.push(source);
         SourceId(self.sources.len() - 1)
+    }
+
+    /// Adds a source whose observations are evidence, and keeps its
+    /// checkpoint. At setup and after every step, the run ends with
+    /// [`HarnessFailure::SourceEvidence`] unless the checkpoint names that
+    /// step.
+    pub fn add_evidence<S: ActionSource + 'static>(&mut self, evidence: Evidence<S>) -> SourceId {
+        let (source, checkpoint) = evidence.into_parts();
+        let id = self.add_source(Box::new(source));
+        self.evidence.push((id.0, checkpoint));
+        id
     }
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
@@ -232,7 +247,9 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
-        self.observe_sources(st);
+        if let Err(failure) = self.observe_sources(st) {
+            return st.end_harness(failure);
+        }
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -320,13 +337,13 @@ impl Sim {
                 _ => Owner::NoTask,
             };
             self.choices.borrow_mut().set_owner(owner);
-            self.execute(chosen.action, st);
+            let executed = self.execute(chosen.action, st);
             let draws = {
                 let mut choices = self.choices.borrow_mut();
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
-            self.observe_sources(st);
+            let observed = executed.and_then(|()| self.observe_sources(st));
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {
@@ -340,6 +357,10 @@ impl Sim {
                 obs: Some(digest(st.log.of_step(st.step))),
             }));
             if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
+            // Ends before the checker, which would read incomplete evidence.
+            if let Err(failure) = observed {
                 return st.end_harness(failure);
             }
             ready = match next {
@@ -412,19 +433,46 @@ impl Sim {
         .is_ok_and(|enabled| enabled.is_empty())
     }
 
-    /// Lets every source append what happened inside it to the current step.
-    fn observe_sources(&mut self, st: &mut State) {
-        for source in &mut self.sources {
-            source.observe(&mut st.log);
+    /// Lets every source append what happened inside it to the current
+    /// step, then requires every evidence source's checkpoint to name it.
+    fn observe_sources(&mut self, st: &mut State) -> Result<(), HarnessFailure> {
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            source
+                .observe(&mut st.log)
+                .map_err(|detail| HarnessFailure::SourceEvidence {
+                    source: index,
+                    detail,
+                })?;
         }
+        for (index, checkpoint) in &self.evidence {
+            let detail = match checkpoint.get() {
+                Mark::Observed(step) if step == st.step => continue,
+                Mark::NotObserved => {
+                    "NotObserved: the setup observation never completed".to_owned()
+                }
+                Mark::Observed(step) => format!(
+                    "BoundarySkipped: the last observation was at step {step}, not {}",
+                    st.step
+                ),
+            };
+            return Err(HarnessFailure::SourceEvidence {
+                source: *index,
+                detail,
+            });
+        }
+        Ok(())
     }
 
-    /// Runs `action` and records what it did.
-    fn execute(&mut self, action: Action, st: &mut State) {
+    /// Runs `action` and records what it did. A task's outcome is pushed
+    /// after the sources are drained, so what it made a source do comes
+    /// first in the step.
+    fn execute(&mut self, action: Action, st: &mut State) -> Result<(), HarnessFailure> {
         match action {
             Action::RunTask(task) => {
                 let name = st.names[&task].clone();
-                let obs = match self.sched_mut().run(task) {
+                let outcome = self.sched_mut().run(task);
+                self.observe_sources(st)?;
+                let obs = match outcome {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
@@ -448,6 +496,7 @@ impl Sim {
             }
             Action::Source { source, local } => self.sources[source.0].execute(local, &mut st.log),
         }
+        Ok(())
     }
 
     /// The scheduler's ready tasks with their identities. Records each task

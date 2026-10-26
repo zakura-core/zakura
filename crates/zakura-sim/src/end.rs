@@ -54,6 +54,15 @@ pub enum HarnessFailure {
         /// The step it names.
         step: u64,
     },
+    /// A source's evidence was incomplete: its facts disagreed with its
+    /// state, didn't reach the log, or it skipped a boundary.
+    SourceEvidence {
+        /// The source's index in the run.
+        source: usize,
+        /// What was wrong, led by the failure's name, such as
+        /// `BoundarySkipped`.
+        detail: String,
+    },
 }
 
 impl fmt::Display for HarnessFailure {
@@ -90,6 +99,9 @@ impl fmt::Display for HarnessFailure {
                     f,
                     "{property} holds since step {step}, which the run didn't take"
                 )
+            }
+            HarnessFailure::SourceEvidence { source, detail } => {
+                write!(f, "source {source}'s evidence failed: {detail}")
             }
         }
     }

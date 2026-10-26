@@ -39,8 +39,9 @@ pub enum PropertyOutcome {
     },
     /// No evaluation applied.
     NotApplicable,
-    /// An obligation was still open at run end, within its bound, or the
-    /// property's assumptions never held.
+    /// An obligation was still open at run end, within its bound, the
+    /// property's assumptions never held, or a harness failure ended the
+    /// run.
     Inconclusive {
         /// Which of the two.
         reason: String,

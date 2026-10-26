@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
-    end::RunEnd,
+    end::{Outcome, RunEnd},
     Observation, ObservationLog,
 };
 
@@ -316,13 +316,26 @@ impl<S: HasView> Checker for RegistryChecker<S> {
 
     /// Reports each property's outcome. An obligation still open now leaves
     /// the property `Inconclusive`, never `Held`.
-    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+    /// Each property's outcome. After a harness failure, a property that
+    /// held or never applied is inconclusive, since the run's evidence may
+    /// be incomplete. A violation found before the failure stands.
+    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        let harness_failed = end.outcome == Outcome::Harness;
         self.properties
             .iter()
             .zip(&self.state)
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
-                outcome: outcome(property, state),
+                outcome: match outcome(property, state) {
+                    PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+                        if harness_failed =>
+                    {
+                        PropertyOutcome::Inconclusive {
+                            reason: Inconclusive::HarnessFailed.to_string(),
+                        }
+                    }
+                    outcome => outcome,
+                },
                 holds_since: state.holds_since.map(|(step, _)| step),
             })
             .collect()

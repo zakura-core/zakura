@@ -23,13 +23,13 @@ use zakura_node_services::header_chain::{
 use zakura_rt::sync::Semaphore;
 use zakura_scheduler::{SchedulerConfig, Status};
 use zakura_sim::{
-    check::after_step, observe::StorageEvent, IdleStatus, Observation, Outcome, PlanInput,
-    RunConfig, RunReport, Sim, Violation,
+    check::after_step,
+    observe::{StorageFact, StorageRequest},
+    IdleStatus, Observation, Outcome, PlanInput, RunConfig, RunReport, Sim, Violation,
 };
 use zakura_storage::header::{
     controlled::{ControlledPort, FactKind},
     fixture::HeaderFixture,
-    HeaderOp,
 };
 
 /// A run config with 2 workers and `budget` steps. Tasks keep the default
@@ -51,6 +51,32 @@ fn violation(property: &str, step: u64, actual: String) -> Violation {
     }
 }
 
+/// Whether `fact` heads its transaction, which it ends.
+fn is_head(fact: &StorageFact) -> bool {
+    matches!(
+        fact,
+        StorageFact::Submitted { .. }
+            | StorageFact::CallerDropped { .. }
+            | StorageFact::ReplyTaken { .. }
+            | StorageFact::ReplyDropped { .. }
+            | StorageFact::Completed { .. }
+            | StorageFact::ShutDown { .. }
+    )
+}
+
+/// The head of every storage transaction `report` logged, in order.
+fn heads(report: &RunReport) -> Vec<StorageFact> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage { fact, .. } if is_head(fact) => Some(fact.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What one delivery run did, beyond its report.
 #[derive(Default)]
 struct Seen {
@@ -60,6 +86,8 @@ struct Seen {
     locator_timed_out: bool,
     /// Pages the publisher was served.
     pages: u32,
+    /// The locator caller holds its permit clone.
+    caller_permit: bool,
 }
 
 /// The applied targets, and the semaphore the locator caller's permit
@@ -203,6 +231,7 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
                 .try_acquire_owned()
                 .expect("the locator caller is the only permit holder"),
         );
+        locator_seen.lock().unwrap().caller_permit = true;
         let reply = zakura_rt::time::timeout(
             Duration::from_secs(30),
             locator.continuation_locator(permit.clone()),
@@ -211,11 +240,16 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
         if reply.is_err() {
             locator_seen.lock().unwrap().locator_timed_out = true;
         }
+        // Cleared first: the last clone's drop frees the permit before its
+        // scheduling point, so no step sees the permit back but the clone
+        // still counted.
+        locator_seen.lock().unwrap().caller_permit = false;
+        drop(permit);
     });
 
-    sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(
+    sim.add_evidence(zakura_sim::storage::HeaderStorage::new(
         delivery.port.clone(),
-    )));
+    ));
 }
 
 /// Checks the storage invariants after every step of a delivery run:
@@ -224,13 +258,15 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
 /// * A step that picks `storage:header:<id>:<outcome>` logs exactly that
 ///   completion, and no other step logs one, so a completion lands on the
 ///   step that caused it with the outcome the `Plan` picked.
-/// * While the locator operation is pending, its permit is held, even after
-///   its caller timed out.
+/// * The locator's semaphore has a permit out exactly while the caller
+///   holds its clone or storage holds the operation's, so a clone leaked
+///   anywhere else shows, even after both legitimate holders let go.
 /// * The watch holds exactly the engine's committed snapshot, so a commit
 ///   and its publication are one step.
 fn delivery_checks(
     port: Arc<ControlledPort>,
     locator_capacity: Arc<Semaphore>,
+    seen: Arc<Mutex<Seen>>,
 ) -> impl zakura_sim::Checker {
     let mut submitted = BTreeSet::new();
     let mut completed = BTreeSet::new();
@@ -238,14 +274,14 @@ fn delivery_checks(
     after_step(move |cx| {
         let mut completions = Vec::new();
         for obs in cx.observations() {
-            let Observation::Storage { id, event, .. } = obs else {
+            let Observation::Storage { fact, .. } = obs else {
                 continue;
             };
-            match event {
-                StorageEvent::Submitted { .. } => {
+            match fact {
+                StorageFact::Submitted { id, .. } => {
                     submitted.insert(*id);
                 }
-                StorageEvent::Completed { outcome, .. } => {
+                StorageFact::Completed { id, outcome, .. } => {
                     completions.push(format!("storage:header:{id}:{outcome}"));
                     if !submitted.contains(id) || !completed.insert(*id) {
                         return Some(violation(
@@ -255,7 +291,7 @@ fn delivery_checks(
                         ));
                     }
                 }
-                StorageEvent::CallerDropped | StorageEvent::ReplyDropped { .. } => {}
+                _ => {}
             }
         }
         let pick = cx.pick.to_string();
@@ -271,15 +307,13 @@ fn delivery_checks(
                 format!("picked {}, completed {completions:?}", cx.pick),
             ));
         }
-        let locator_pending = port
-            .pending()
-            .iter()
-            .any(|op| op.op == HeaderOp::ContinuationLocator);
-        if locator_pending && locator_capacity.available_permits() != 0 {
+        let held = seen.lock().unwrap().caller_permit || !port.owner_state().permits.is_empty();
+        let available = locator_capacity.available_permits();
+        if available != usize::from(!held) {
             return Some(violation(
                 "storage/locator-permit-held",
                 cx.step,
-                "the permit came back while its operation was pending".to_owned(),
+                format!("{available} permits free while held is {held}"),
             ));
         }
         let published = watch.borrow().clone();
@@ -297,7 +331,11 @@ fn delivery_checks(
 /// Runs `spawn` under `plan` with the invariant checks.
 fn checked_run(plan: PlanInput, spawn: fn(&mut Sim, &Delivery)) -> (RunReport, Delivery) {
     let delivery = delivery();
-    let mut checks = delivery_checks(delivery.port.clone(), delivery.locator_capacity.clone());
+    let mut checks = delivery_checks(
+        delivery.port.clone(),
+        delivery.locator_capacity.clone(),
+        delivery.seen.clone(),
+    );
     let report = run(
         storage_config(4_000),
         plan,
@@ -372,22 +410,13 @@ fn a_timed_out_locator_keeps_its_permit_until_completion() {
         if !delivery.seen.lock().unwrap().locator_timed_out {
             continue;
         }
-        let events: Vec<_> = report
-            .log
-            .entries()
-            .iter()
-            .filter_map(|entry| match &entry.obs {
-                Observation::Storage { event, .. } => Some(event.clone()),
-                _ => None,
-            })
-            .collect();
-        match events.as_slice() {
-            [StorageEvent::Submitted { .. }, StorageEvent::CallerDropped, StorageEvent::Completed {
+        match heads(&report).as_slice() {
+            [StorageFact::Submitted { .. }, StorageFact::CallerDropped { .. }, StorageFact::Completed {
                 delivered: false, ..
             }] => before += 1,
-            [StorageEvent::Submitted { .. }, StorageEvent::Completed {
+            [StorageFact::Submitted { .. }, StorageFact::Completed {
                 delivered: true, ..
-            }, StorageEvent::ReplyDropped { .. }] => after += 1,
+            }, StorageFact::ReplyDropped { .. }] => after += 1,
             other => panic!("unexpected history {other:?}"),
         }
     }
@@ -436,7 +465,7 @@ fn a_completion_wakes_a_task_the_scheduler_sees_as_deadlocked() {
                     .await
                     .expect("the engine outcome comes first");
             });
-            sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(port)));
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
         },
         &mut checker,
     );
@@ -559,26 +588,16 @@ fn shutdown_releases_everything_and_logs_nothing() {
                 );
                 let _ = caller.continuation_locator(permit).await;
             });
-            sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(
-                port.clone(),
-            )));
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port.clone()));
             held = Some((port, semaphore));
         },
         &mut zakura_sim::NoChecks,
     );
     let (port, semaphore) = held.expect("setup ran");
     assert_eq!(report.end.outcome, Outcome::Budget);
-    let logged: Vec<_> = report
-        .log
-        .entries()
-        .iter()
-        .filter_map(|entry| match &entry.obs {
-            Observation::Storage { event, .. } => Some(event.clone()),
-            _ => None,
-        })
-        .collect();
+    let logged = heads(&report);
     assert!(
-        matches!(logged.as_slice(), [StorageEvent::Submitted { .. }]),
+        matches!(logged.as_slice(), [StorageFact::Submitted { .. }]),
         "{logged:?}"
     );
 
@@ -632,14 +651,18 @@ fn bounded_storage_completes_within_its_latency() {
                 sim.scheduler().spawn_root("sleeper", async move {
                     zakura_rt::time::sleep(Duration::from_secs(60)).await;
                 });
-                sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::bounded(
+                sim.add_evidence(zakura_sim::storage::HeaderStorage::bounded(
                     port.clone(),
                     bound,
-                )));
+                ));
             },
             &mut checker,
         );
-        assert_ne!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+        assert!(
+            !matches!(report.end.outcome, Outcome::Violation | Outcome::Harness),
+            "{:?}",
+            report.end
+        );
     }
 }
 
@@ -685,11 +708,15 @@ fn time_stops_where_a_timeout_opens() {
                 sim.scheduler().spawn_root("sleeper", async move {
                     zakura_rt::time::sleep(Duration::from_secs(60)).await;
                 });
-                sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(port)));
+                sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
             },
             &mut checker,
         );
-        assert_ne!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
+        assert!(
+            !matches!(report.end.outcome, Outcome::Violation | Outcome::Harness),
+            "{:?}",
+            report.end
+        );
         stopped += usize::from(report.picks.iter().any(|pick| pick.identity == gate));
     }
     assert!(stopped > 0, "no plan left the operation pending until 30 s");
@@ -797,9 +824,7 @@ fn abandonment_run(plan: PlanInput) -> (RunReport, Abandonment) {
                     let _ = call.await;
                 }
             });
-            sim.add_source(Box::new(zakura_sim::storage::HeaderStorage::new(
-                port.clone(),
-            )));
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port.clone()));
         },
         &mut checker,
     );
@@ -821,34 +846,41 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
     for plan in inputs(128, 64) {
         let (report, seen) = abandonment_run(plan);
         assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
-        let mut ops = std::collections::BTreeMap::new();
+        let mut acquires = BTreeSet::new();
+        // Whether the transaction being read ended an abandoned lease.
+        let mut abandoned = false;
         for entry in report.log.entries() {
-            let Observation::Storage { id, event, .. } = &entry.obs else {
+            let Observation::Storage { fact, .. } = &entry.obs else {
                 continue;
             };
-            let abandoned = |ends: &[zakura_sim::observe::LeaseEnd]| {
-                ends.iter()
-                    .any(|end| end.release == "lease-abandoned-acquire")
-            };
-            match event {
-                StorageEvent::Submitted { op, .. } => {
-                    ops.insert(*id, op.as_str());
+            match fact {
+                StorageFact::Submitted {
+                    id,
+                    request: StorageRequest::AcquireHeaderPath { .. },
+                    ..
+                } => {
+                    acquires.insert(*id);
                 }
-                StorageEvent::Completed { op, lease_ends, .. } if abandoned(lease_ends) => {
-                    assert_eq!(
-                        op, "acquire_header_path",
+                StorageFact::CapabilityEnded { release, .. } => {
+                    abandoned |= release == "lease-abandoned-acquire";
+                }
+                StorageFact::Completed { id, .. } if abandoned => {
+                    assert!(
+                        acquires.contains(id),
                         "operation {id} took an abandoned lease"
                     );
                 }
-                StorageEvent::ReplyDropped { lease_ends } if abandoned(lease_ends) => {
-                    assert_eq!(
-                        ops.get(id),
-                        Some(&"acquire_header_path"),
+                StorageFact::ReplyDropped { id } if abandoned => {
+                    assert!(
+                        acquires.contains(id),
                         "operation {id}'s dropped reply took an abandoned lease"
                     );
                     dropped += 1;
                 }
                 _ => {}
+            }
+            if is_head(fact) {
+                abandoned = false;
             }
         }
         waited += u32::from(seen.waited);

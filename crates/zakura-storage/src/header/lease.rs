@@ -17,7 +17,10 @@ use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{AcquirePathReply, ServingCapacitySignal};
 
 use super::{
-    evidence::{CapacityClass, LeaseFact, LeaseKey, RetentionEnd, SignalClass, Waiter},
+    evidence::{
+        CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey, LeaseState,
+        OwnerState, RetentionEnd, SignalClass, Waiter,
+    },
     Release,
 };
 use zakura_rt::time::Instant;
@@ -556,6 +559,67 @@ impl Registry {
                 .as_bytes());
             }
         }
+    }
+
+    /// Fills the registry's part of `state`: the live leases, the cached
+    /// continuations, the class waiters and the counters.
+    pub(super) fn fill(&self, state: &mut OwnerState) {
+        let projected = |peer: &SourceId, cursor: &Cursor| {
+            (
+                Self::key(*peer, cursor),
+                cursor.scope,
+                cursor.target,
+                cursor.last_frontier,
+            )
+        };
+        state.leases = self
+            .by_peer
+            .iter()
+            .map(|(peer, cursor)| {
+                let (lease, scope, target, last_frontier) = projected(peer, cursor);
+                LeaseState {
+                    lease,
+                    scope,
+                    target,
+                    last_frontier,
+                    capacity: match cursor.capacity {
+                        Capacity::General => CapacityClass::General,
+                        Capacity::Bounded => CapacityClass::Bounded,
+                    },
+                    waiter: cursor.capacity_signal.is_some(),
+                }
+            })
+            .collect();
+        state.continuations = self
+            .continuations
+            .iter()
+            .map(|(peer, cursor)| {
+                let (lease, scope, target, last_frontier) = projected(peer, cursor);
+                ContinuationState {
+                    lease,
+                    scope,
+                    target,
+                    last_frontier,
+                }
+            })
+            .collect();
+        state.class_waiters = ClassWaiters {
+            general: self.general_capacity.is_some(),
+            fallback: self.fallback_capacity.is_some(),
+        };
+        state.last_lease_id = self.next_lease_id;
+        state.continuation_hits = self.continuation_hits;
+    }
+
+    /// Whether the registry has never held anything: no lease issued, no
+    /// continuation, no waiter and no hit.
+    pub(super) fn is_pristine(&self) -> bool {
+        self.next_lease_id == 0
+            && self.by_peer.is_empty()
+            && self.continuations.is_empty()
+            && self.general_capacity.is_none()
+            && self.fallback_capacity.is_none()
+            && self.continuation_hits == 0
     }
 
     /// How many leases are live.

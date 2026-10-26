@@ -20,7 +20,8 @@ use zakura_node_services::header_chain::{
 };
 use zakura_scheduler::{At, Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, TaskId};
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId},
+    controlled::{BindError, ControlledPort, Fact, FactKind, OpId},
+    evidence::ResultIdentity,
     fixture::HeaderFixture,
     lease::LeaseEnd,
     HeaderOp, Outcome, Release,
@@ -205,11 +206,15 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
     spawn_competing(&mut sched, &port, target);
     let task = spawn_unread_acquire(&mut sched, &port, target);
     let unread = OpId(COMPETING + 1);
-    assert!(
-        port.complete(unread, Outcome::Engine)
-            .expect("completes")
-            .delivered
-    );
+    let completion = port.complete(unread, Outcome::Engine).expect("completes");
+    assert!(completion.delivered);
+    let ResultIdentity::Acquired {
+        lease: unread_lease,
+        ..
+    } = completion.result
+    else {
+        panic!("expected a lease, got {:?}", completion.result);
+    };
     let waiter = with_waiter.then(|| {
         match ready(port.engine().acquire_header_path(acquire(&port, target))) {
             Ok(AcquirePathReply::CapacityBusy(signal)) => signal,
@@ -226,6 +231,14 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
             problems.push(format!("the lease lock was held at {at}"));
             return;
         };
+        let state = port.owner_state();
+        let slot_held = state.operations.iter().any(|op| op.id == unread);
+        let lease_held = state.leases.iter().any(|lease| lease.lease == unread_lease);
+        if slot_held != lease_held {
+            problems.push(format!(
+                "the reply's slot and its lease changed apart at {at}"
+            ));
+        }
         events.extend(port.take_facts());
         let recorded = events
             .iter()
@@ -277,6 +290,16 @@ fn reply_dropped_ends(facts: &[Fact]) -> Vec<LeaseEnd> {
             _ => None,
         })
         .collect()
+}
+
+/// C2: a port binds only inside an active run, here the scheduler's.
+#[test]
+fn binding_needs_an_active_run() {
+    let (port, _) = chain();
+    assert_eq!(port.bind_to_run(), Err(BindError::NotInRun));
+    let sched = scheduler();
+    assert_eq!(port.bind_to_run(), Ok(()));
+    drop(sched);
 }
 
 /// #1721 review P1: abandoning an unread `Acquired` reply fires the capacity

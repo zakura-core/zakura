@@ -284,6 +284,24 @@ fn changed_bound_diverges() {
 }
 
 #[test]
+fn renamed_draw_diverges() {
+    let dir = spinners();
+    let trace = open(dir.path());
+    let at = first_step(&trace, |s| s.draws.iter().any(|d| d.bound.0 == 2));
+    // The same bound, so only the name can tell the draws apart.
+    edit(dir.path(), |lines| {
+        step(lines, at)["draws"][0]["draw"] = json!("elsewhere.1:select#1")
+    });
+    match divergence_of(replayed_spinners(dir.path())) {
+        Divergence::Draw { step, wanted, .. } => {
+            assert_eq!(step, at);
+            assert!(wanted.starts_with("elsewhere.1:select#1 "), "{wanted}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn missing_init_draw_diverges() {
     let dir = record_named("discovery/wait-complete", DISCOVERY);
     assert!(!open(dir.path()).init.unwrap().draws.is_empty());

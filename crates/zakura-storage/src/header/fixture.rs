@@ -51,7 +51,9 @@ impl HeaderFixture {
     /// `count` headers extending `parent`, parent first. `branch` goes in each
     /// nonce, so two branches from the same parent never share a header.
     /// Each header's time is genesis plus its height in seconds, so times
-    /// rise along every branch.
+    /// rise along every branch. Those fixed historical times validate the
+    /// same whichever clock validation reads, which is what lets a port
+    /// commit them before its run starts.
     ///
     /// # Panics
     ///

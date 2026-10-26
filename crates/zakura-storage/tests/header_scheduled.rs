@@ -21,7 +21,7 @@ use zakura_node_services::header_chain::{
 use zakura_scheduler::{At, Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, TaskId};
 use zakura_storage::header::{
     controlled::{BindError, ControlledPort, Fact, FactKind, OpId},
-    evidence::ResultIdentity,
+    evidence::{OwnerModel, ResultIdentity},
     fixture::HeaderFixture,
     lease::LeaseEnd,
     HeaderOp, Outcome, Release,
@@ -198,9 +198,10 @@ fn spawn_competing(sched: &mut Scheduler, port: &Arc<ControlledPort>, target: Fr
 /// same peer, completed through the controlled port, registered a capacity
 /// waiter if `with_waiter`. At every
 /// scheduling point the drop reaches, acts as the run may there: takes the
-/// lease lock, checks that a lease already gone has its `ReplyDropped`
-/// recorded, lists pending operations, and completes a competing
-/// operation. Returns what went wrong, and every event.
+/// lease lock, checks the facts so far and the actual owner state against
+/// an [`OwnerModel`], checks that a lease already gone has its
+/// `ReplyDropped` recorded, lists pending operations, and completes a
+/// competing operation. Returns what went wrong, and every event.
 fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
     let mut sched = scheduler();
     let (port, target) = chain();
@@ -231,13 +232,24 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
     sched.advance_to(SimInstant::from_start(Duration::from_secs(10)));
     let mut problems = Vec::new();
     let mut events = port.take_facts();
+    let mut model = OwnerModel::new();
+    assert_eq!(
+        model.check_boundary(&events, &port.owner_state()),
+        Ok(()),
+        "the setup matches the model"
+    );
     let mut competing = (1..=COMPETING).map(OpId);
     step(&mut sched, task, |at| {
         let Ok(live) = catch_unwind(AssertUnwindSafe(|| port.engine().live_leases())) else {
             problems.push(format!("the lease lock was held at {at}"));
             return;
         };
+        let facts = port.take_facts();
         let state = port.owner_state();
+        if let Err(failure) = model.check_boundary(&facts, &state) {
+            problems.push(format!("the owner model failed with {failure:?} at {at}"));
+        }
+        events.extend(facts);
         let slot_held = state.operations.iter().any(|op| op.id == unread);
         let lease_held = state.leases.iter().any(|lease| lease.lease == unread_lease);
         if slot_held != lease_held {
@@ -245,7 +257,6 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
                 "the reply's slot and its lease changed apart at {at}"
             ));
         }
-        events.extend(port.take_facts());
         let recorded = events
             .iter()
             .any(|fact| matches!(fact.kind, FactKind::ReplyDropped { .. }));
@@ -264,7 +275,14 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
                 id.0, completion.lease_ends
             ));
         }
-        events.extend(port.take_facts());
+        let facts = port.take_facts();
+        if let Err(failure) = model.check_boundary(&facts, &port.owner_state()) {
+            problems.push(format!(
+                "the owner model failed with {failure:?} after completing {} at {at}",
+                id.0
+            ));
+        }
+        events.extend(facts);
     });
     if !problems.is_empty() {
         // A task suspended with a lock held never releases it, so shutting
@@ -272,7 +290,13 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
         std::mem::forget(sched);
         return (problems, events);
     }
-    events.extend(port.take_facts());
+    let facts = port.take_facts();
+    if let Err(failure) = model.check_boundary(&facts, &port.owner_state()) {
+        problems.push(format!(
+            "the owner model failed with {failure:?} after the drop"
+        ));
+    }
+    events.extend(facts);
     if let Some(waiter) = waiter {
         assert!(waiter.is_released(), "the waiter's signal fired");
     }

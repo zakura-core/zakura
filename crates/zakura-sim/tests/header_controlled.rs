@@ -1675,3 +1675,199 @@ fn a_release_ends_its_live_lease() {
         }
     )));
 }
+
+/// Where [`late_drop_run`] drops its storage.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum LateDrop {
+    /// Nowhere: the run's own shutdown drops it.
+    Never,
+    /// In the checker's `after_step` at step `.0`.
+    AfterStep(u64),
+    /// In the checker's `at_end`.
+    AtEnd,
+    /// In the sink, as it takes step `.0`'s record.
+    Sink(u64),
+}
+
+/// Storage a source and a cleanup checker or sink share.
+type Shared = Rc<std::cell::RefCell<Option<zakura_sim::storage::HeaderStorage>>>;
+
+/// A source that forwards to shared storage while it's there.
+struct SharedSource(Shared);
+
+impl ActionSource for SharedSource {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if let Some(inner) = &*self.0.borrow() {
+            inner.enabled(now, out);
+        }
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(inner) = &*self.0.borrow() {
+            inner.boundaries(now, out);
+        }
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.0
+            .borrow_mut()
+            .as_mut()
+            .expect("dropped storage offers no actions")
+            .execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        match &mut *self.0.borrow_mut() {
+            Some(inner) => inner.observe(log),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A checker that drops the shared storage at `when`, and records the
+/// outcome its `at_end` saw.
+struct Dropper {
+    shared: Shared,
+    when: LateDrop,
+    saw: Rc<std::cell::Cell<Option<Outcome>>>,
+}
+
+impl zakura_sim::Checker for Dropper {
+    fn after_step(&mut self, cx: &zakura_sim::StepCtx<'_>) -> Option<Violation> {
+        if self.when == LateDrop::AfterStep(cx.step) {
+            self.shared.borrow_mut().take();
+        }
+        None
+    }
+
+    fn at_end(
+        &mut self,
+        end: &zakura_sim::RunEnd,
+        _: &ObservationLog,
+    ) -> Vec<zakura_sim::PropertyReport> {
+        self.saw.set(Some(end.outcome));
+        if self.when == LateDrop::AtEnd {
+            self.shared.borrow_mut().take();
+        }
+        Vec::new()
+    }
+}
+
+/// A sink that keeps every record and drops the shared storage at `when`.
+struct DroppingSink {
+    shared: Shared,
+    when: LateDrop,
+    records: zakura_sim::MemorySink,
+}
+
+impl zakura_sim::RecordSink for DroppingSink {
+    fn record(&mut self, record: zakura_sim::Record) {
+        if let zakura_sim::Record::Step(step) = &record {
+            if self.when == LateDrop::Sink(step.step) {
+                self.shared.borrow_mut().take();
+            }
+        }
+        self.records.record(record);
+    }
+}
+
+/// One task's membership read, with a property that always holds, and the
+/// storage dropped at `when`. Returns the report, the records, and the
+/// outcome the checkers' `at_end` saw.
+fn late_drop_run(when: LateDrop) -> (RunReport, Vec<String>, Outcome) {
+    let mut sim = Sim::new(storage_config(100), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let caller = port.clone();
+    sim.scheduler().spawn_root("caller", async move {
+        let anchor = HeaderFixture::regtest().anchor();
+        let _ = caller.selected_chain_contains(anchor.hash).await;
+    });
+    let storage = zakura_sim::storage::HeaderStorage::new(&mut sim, port);
+    let shared: Shared = Rc::new(std::cell::RefCell::new(Some(storage)));
+    sim.add_source(Box::new(SharedSource(shared.clone())));
+    let property = Property {
+        id: PropertyId::new("test/always"),
+        claim: "always holds",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: PropertyStatus::Active,
+        check: always,
+        witness: None,
+    };
+    let registry = Registry::new(vec![property]).expect("one property");
+    let calm = RegistryChecker::new(
+        registry,
+        Rc::new(Calm),
+        Assumptions::none(),
+        &[Source::View],
+    );
+    let saw = Rc::new(std::cell::Cell::new(None));
+    let mut checker = zakura_sim::property::Tee(
+        calm,
+        Dropper {
+            shared: shared.clone(),
+            when,
+            saw: saw.clone(),
+        },
+    );
+    let mut sink = DroppingSink {
+        shared,
+        when,
+        records: zakura_sim::MemorySink::default(),
+    };
+    let report = sim.run(&mut checker, &mut sink);
+    let saw = saw.get().expect("the run called at_end");
+    (report, sink.records.lines(), saw)
+}
+
+/// Any drop of storage before the log freezes fails the run, wherever it
+/// happens: in the last step's `after_step`, in `at_end`, or in the sink as
+/// it takes the last step's record. A drop before `at_end` already reaches
+/// it as a harness failure. The property reports `harness-failed` in the
+/// report and in the end record. The run's own shutdown, after the log
+/// freezes, still passes.
+#[test]
+fn storage_dropped_after_the_last_step_fails_the_run() {
+    let (whole, _, _) = late_drop_run(LateDrop::Never);
+    assert_eq!(
+        whole.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        },
+        "{:?}",
+        whole.end
+    );
+    assert_eq!(
+        whole.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 3 }
+    );
+    let last = whole.end.steps;
+    for when in [
+        LateDrop::AfterStep(last),
+        LateDrop::AtEnd,
+        LateDrop::Sink(last),
+    ] {
+        let (report, lines, saw) = late_drop_run(when);
+        assert_eq!(report.end.outcome, Outcome::Harness, "{when:?}");
+        if when != LateDrop::AtEnd {
+            assert_eq!(saw, Outcome::Harness, "{when:?} reaches at_end");
+        }
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("Dropped"), "{when:?}: {detail}");
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Inconclusive {
+                reason: "harness-failed".to_owned()
+            },
+            "{when:?}"
+        );
+        let end = lines.last().expect("the run ends with an end record");
+        assert!(
+            end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+            "{when:?}: {end}"
+        );
+    }
+}

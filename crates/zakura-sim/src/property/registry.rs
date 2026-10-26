@@ -327,13 +327,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
                 outcome: match outcome(property, state) {
-                    PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
-                        if harness_failed =>
-                    {
-                        PropertyOutcome::Inconclusive {
-                            reason: Inconclusive::HarnessFailed.to_string(),
-                        }
-                    }
+                    outcome if harness_failed => outcome.after_harness_failure(),
                     outcome => outcome,
                 },
                 holds_since: state.holds_since.map(|(step, _)| step),

@@ -199,12 +199,33 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
+        // Storage the last step's checker or sink dropped after it observed
+        // fails the run before its properties are reported.
+        let end = match self.end_evidence(&end, &state) {
+            Some(failure) => state.end_harness(failure),
+            None => end,
+        };
         // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
         let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
+        };
+        // And so does storage `at_end` dropped, which the checker reported
+        // before it knew.
+        let (end, properties) = match self.end_evidence(&end, &state) {
+            Some(failure) => (
+                state.end_harness(failure),
+                properties
+                    .into_iter()
+                    .map(|report| PropertyReport {
+                        outcome: report.outcome.after_harness_failure(),
+                        ..report
+                    })
+                    .collect(),
+            ),
+            None => (end, properties),
         };
         state.log.freeze();
         let cleanup = self.shut_down();
@@ -463,6 +484,23 @@ impl Sim {
                     detail,
                 })?;
         }
+        self.check_evidence(st)
+    }
+
+    /// The evidence failure that ends a run which `end` didn't already end
+    /// at a harness failure, if any of its storage was dropped, or skipped
+    /// a boundary, after its last observation. Checked before the log
+    /// freezes, so the run's own shutdown, after it, never fails here.
+    fn end_evidence(&self, end: &RunEnd, st: &State) -> Option<HarnessFailure> {
+        match end.outcome {
+            Outcome::Harness => None,
+            _ => self.check_evidence(st).err(),
+        }
+    }
+
+    /// Requires every storage checkpoint to name the current step, with the
+    /// run's own log holding exactly what it records.
+    fn check_evidence(&self, st: &State) -> Result<(), HarnessFailure> {
         for (instance, (service, checkpoint)) in (0..).zip(&self.evidence) {
             let detail = match checkpoint.get() {
                 Mark::NotObserved => {

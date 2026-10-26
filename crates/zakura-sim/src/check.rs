@@ -53,6 +53,22 @@ pub enum PropertyOutcome {
     },
 }
 
+impl PropertyOutcome {
+    /// This outcome once a harness failure ended the run: one that held or
+    /// never applied is inconclusive, since the run's evidence may be
+    /// incomplete. A violation found before the failure stands.
+    pub(crate) fn after_harness_failure(self) -> Self {
+        match self {
+            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable => {
+                PropertyOutcome::Inconclusive {
+                    reason: crate::property::Inconclusive::HarnessFailed.to_string(),
+                }
+            }
+            outcome => outcome,
+        }
+    }
+}
+
 /// A property's ID and its run outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

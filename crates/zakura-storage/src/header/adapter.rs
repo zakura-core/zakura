@@ -15,7 +15,7 @@
 //! narrower than production: it always answers `Stale`, since a simulation
 //! has no repair to resolve. Retained paths follow [`super::lease`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use sha2::{Digest, Sha256};
 use zakura_chain::block;
@@ -55,10 +55,13 @@ pub struct EnginePort {
     config: EngineConfig,
     engine: Mutex<HeaderChainEngine>,
     leases: Mutex<Registry>,
-    /// The committed snapshot. Apply sends on it while it holds the
-    /// engine lock, so no consumer may hold a borrow of this watch while it
-    /// takes the engine lock, or the two would deadlock.
-    selected: watch::Sender<Option<EngineSnapshot>>,
+    /// The committed snapshot's watch, until shutdown closes it. Apply
+    /// sends on it while it holds the engine lock, so no consumer may hold
+    /// a borrow of this watch while it takes the engine lock, or the two
+    /// would deadlock. A std lock, held only to clone or take the sender:
+    /// sending and subscribing are scheduling points in a simulator run, so
+    /// they use a clone after the lock is released.
+    selected: StdMutex<Option<watch::Sender<Option<EngineSnapshot>>>>,
 }
 
 impl EnginePort {
@@ -122,7 +125,7 @@ impl EnginePort {
             config,
             engine: Mutex::new(engine),
             leases: Mutex::new(Registry::default()),
-            selected,
+            selected: StdMutex::new(Some(selected)),
         }
     }
 
@@ -723,7 +726,9 @@ impl EnginePort {
         // that run applies outside any task, where points do nothing. Tasks
         // may apply through this port directly only when no `ControlledPort`
         // drives it, so they meet only each other here, and park.
-        self.selected.send_replace(Some(after));
+        if let Some(selected) = self.selected_sender() {
+            selected.send_replace(Some(after));
+        }
         drop(engine);
         Ok(match stalled {
             Some(receipt) => ApplyHeaderTargetOutcome::ResourceStalled(receipt),
@@ -847,6 +852,28 @@ impl EnginePort {
         leases.take_effects()
     }
 
+    /// A clone of the selected-chain watch's sender, or `None` once
+    /// shutdown closed it.
+    fn selected_sender(&self) -> Option<watch::Sender<Option<EngineSnapshot>>> {
+        self.selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Closes the selected-chain watch, as service shutdown does: every
+    /// receiver sees it closed once no clone of the sender is left.
+    pub(crate) fn close_selected_chain(&self) {
+        let selected = self
+            .selected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Dropped after the lock, since the last sender's drop is a
+        // scheduling point.
+        drop(selected);
+    }
+
     /// A digest of the committed snapshot, the live leases and the
     /// continuation cache. Equal histories give equal digests, in any
     /// process.
@@ -915,8 +942,12 @@ impl Port for EnginePort {
         self.run_on_poll(HeaderRequest::ApplyHeaderTarget { target })
     }
 
+    /// The committed snapshot's watch, or after shutdown a closed one.
     fn selected_chain(&self) -> watch::Receiver<Option<EngineSnapshot>> {
-        self.selected.subscribe()
+        match self.selected_sender() {
+            Some(selected) => selected.subscribe(),
+            None => watch::channel(None).1,
+        }
     }
 
     fn selected_chain_contains(

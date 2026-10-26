@@ -800,6 +800,22 @@ fn shutdown_ends_everything_without_running_work() {
     assert!(port.take_events().is_empty());
 }
 
+/// Shutdown closes the selected-chain watch, so a receiver taken before it
+/// sees the watch closed, and one taken after it starts closed.
+#[test]
+fn shutdown_closes_the_selected_chain_watch() {
+    let (port, _) = chain(1);
+    let before = port.selected_chain();
+    assert!(
+        before.has_changed().is_ok(),
+        "the watch is open until shutdown"
+    );
+
+    port.shut_down();
+    assert!(before.has_changed().is_err());
+    assert!(port.selected_chain().has_changed().is_err());
+}
+
 /// #1721 review P2 (Astra): two applies with the same owner, prepared from
 /// the same headers with different body sizes, carry different auxiliary
 /// deliveries, so their request digests differ. Apply records also name
@@ -848,4 +864,41 @@ fn apply_digests_cover_the_sealed_insertion() {
     assert_eq!(submitted[0].0, Some(source));
     assert_eq!(submitted[1].0, Some(source));
     assert_ne!(submitted[0].1, submitted[1].1);
+}
+
+/// A caller that polls again with a different waker, as a task does when a
+/// `select!` moves the call, gets the completion's wake on the new waker.
+/// The old one is never woken.
+#[test]
+fn a_completion_wakes_the_latest_waker() {
+    let (port, chain) = chain(1);
+    let mut call = port.selected_chain_contains(chain[0].hash);
+    let (first, second) = (Arc::new(Wakes::default()), Arc::new(Wakes::default()));
+    assert!(poll(&mut call, &Waker::from(first.clone())).is_pending());
+    assert!(poll(&mut call, &Waker::from(second.clone())).is_pending());
+    port.complete(OpId(1), ENGINE)
+        .expect("membership completes");
+    assert_eq!((first.count(), second.count()), (0, 1));
+}
+
+/// A completion with nobody waiting drops its reply rather than keeping
+/// it in the port. A prepared target holds its headers, so once the
+/// prepare completes for a caller that's gone, the test's copy is the only
+/// one left.
+#[test]
+fn a_reply_nobody_waits_for_is_dropped() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let request =
+        HeaderFixture::regtest().target_request(&port.engine().snapshot(), chain[0], &next, 2);
+    let mut prepare = port.prepare_header_target(request);
+    submit(&mut prepare);
+    drop(prepare);
+    assert!(
+        Arc::strong_count(&next[0]) > 1,
+        "the pending request holds it"
+    );
+    let completion = port.complete(OpId(1), ENGINE).expect("prepare completes");
+    assert!(!completion.delivered);
+    assert_eq!(Arc::strong_count(&next[0]), 1, "the reply was dropped");
 }

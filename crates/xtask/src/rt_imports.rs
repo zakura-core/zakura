@@ -25,6 +25,10 @@
 //! the bare spellings `SystemTime::now`, `Utc::now`, `Local::now` and
 //! `Arc::downgrade` stay flagged too.
 //!
+//! `UNIX_EPOCH.elapsed()` and `SystemTime::elapsed` read the wall clock too,
+//! so they're flagged. `.elapsed()` on another `SystemTime` value isn't,
+//! since the check doesn't know a value's type.
+//!
 //! The check does not yet cover the timer adapters in `tokio_stream`, or
 //! `std::thread::available_parallelism`, a host property discovery reads.
 
@@ -496,9 +500,14 @@ impl Rules {
                     .collect::<Vec<_>>()
                     .join("::"),
             ),
-            // The wall clock.
-            ["SystemTime", "now"]
-            | ["std", "time", "SystemTime", "now"]
+            // The wall clock. `UNIX_EPOCH.elapsed()` reads it too, and the
+            // visitor checks that call as the path `UNIX_EPOCH::elapsed`.
+            ["SystemTime", "now" | "elapsed"]
+            | ["std", "time", "SystemTime", "now" | "elapsed"]
+            | ["UNIX_EPOCH", "elapsed"]
+            | ["std", "time", "UNIX_EPOCH", "elapsed"]
+            | ["SystemTime", "UNIX_EPOCH", "elapsed"]
+            | ["std", "time", "SystemTime", "UNIX_EPOCH", "elapsed"]
             | ["Utc" | "Local", "now"]
             | ["chrono", "Utc" | "Local", "now"]
             | ["chrono", "offset", "Utc" | "Local", "now"] => {
@@ -800,6 +809,27 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         self.scopes.push(Scope::of(false, items));
         visit::visit_block(self, block);
         self.scopes.pop();
+    }
+
+    /// Checks `receiver.elapsed()` as the path `receiver::elapsed` when the
+    /// receiver is a path, so `UNIX_EPOCH.elapsed()` meets the wall-clock rule.
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if let (syn::Expr::Path(receiver), true) = (&*call.receiver, call.method == "elapsed") {
+            let segments: Vec<String> = receiver
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .chain([call.method.to_string()])
+                .collect();
+            let segments = if receiver.path.leading_colon.is_some() {
+                segments
+            } else {
+                self.resolve(&segments)
+            };
+            self.check(&segments, call.method.span());
+        }
+        visit::visit_expr_method_call(self, call);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
@@ -1186,6 +1216,33 @@ mod tests {
                 "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
                 "std::time::Instant -> zakura_rt::time::Instant",
                 "std::time::Instant::now -> zakura_rt::time::Instant::now",
+            ]
+        );
+    }
+
+    /// `elapsed` on `UNIX_EPOCH` is `SystemTime::now` underneath, however
+    /// the epoch is named.
+    #[test]
+    fn unix_epoch_elapsed_is_flagged() {
+        let source = "
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn f() {
+                let _ = UNIX_EPOCH.elapsed();
+                let _ = std::time::UNIX_EPOCH.elapsed();
+                let _ = SystemTime::UNIX_EPOCH.elapsed();
+                let _ = SystemTime::elapsed(&UNIX_EPOCH);
+                let _ = UNIX_EPOCH.duration_since(UNIX_EPOCH);
+                let _ = Instant::elapsed(&start);
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::elapsed -> {utc_now}"),
             ]
         );
     }

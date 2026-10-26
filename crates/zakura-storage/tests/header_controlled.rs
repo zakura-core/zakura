@@ -1941,6 +1941,20 @@ fn only_a_pristine_port_binds() {
     }
 }
 
+/// `last_seq` names the last fact published, whether or not it was taken,
+/// and agrees with the owner state's watermark.
+#[test]
+fn last_seq_follows_publication() {
+    let (port, chain) = chain(1);
+    assert_eq!(port.last_seq(), 0);
+    complete(&port, port.selected_chain_contains(chain[0].hash));
+    let published = port.last_seq();
+    assert_eq!(published, port.owner_state().through_seq);
+    let facts = port.take_facts();
+    assert_eq!(facts.last().map(|fact| fact.seq), Some(published));
+    assert_eq!(port.last_seq(), published, "taking facts doesn't change it");
+}
+
 /// Submits `call`, drops it, and completes it with `outcome`, so the reply
 /// goes to nobody. Returns the completion.
 fn complete_abandoned<F: Future + Unpin>(

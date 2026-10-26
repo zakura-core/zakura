@@ -931,6 +931,33 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         visit::visit_expr_method_call(self, call);
     }
 
+    /// Checks `<Type>::item` and `<Type as Trait>::item` as the path
+    /// `Type::item`, since the type and the item are visited apart.
+    fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+        if let Some(qself) = &expr.qself {
+            let mut ty = &*qself.ty;
+            while let syn::Type::Paren(syn::TypeParen { elem, .. })
+            | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+            {
+                ty = elem;
+            }
+            if let syn::Type::Path(syn::TypePath { qself: None, path }) = ty {
+                let segments: Vec<String> = path
+                    .segments
+                    .iter()
+                    .chain(expr.path.segments.iter().skip(qself.position))
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                if path.leading_colon.is_some() {
+                    self.check(&segments, expr.span());
+                } else {
+                    self.check_written(&segments, expr.span());
+                }
+            }
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         for leaf in use_leaves(&item.tree) {
             self.check(&leaf.path, leaf.span);
@@ -1419,6 +1446,27 @@ mod tests {
         assert_eq!(
             violations(source),
             ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
+        );
+    }
+
+    /// A qualified call names the same associated item as the plain path.
+    #[test]
+    fn qualified_clock_reads_are_flagged() {
+        let source = "
+            use std::time::{Instant, SystemTime};
+            fn f() {
+                let _ = <std::time::Instant>::now();
+                let _ = <Instant>::now();
+                let _ = <std::time::SystemTime>::now();
+                let _ = <(SystemTime)>::now();
+                let _ = <SystemTime as Wall>::now();
+            }
+        ";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
+        let system = "std::time::SystemTime::now -> zakura_rt::time::utc_now";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [instant, instant, system, system, system]
         );
     }
 

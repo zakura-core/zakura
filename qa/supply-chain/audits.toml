@@ -4596,6 +4596,12 @@ criteria = "safe-to-deploy"
 delta = "0.17.4+10.4.2 -> 0.17.5+10.4.2"
 notes = "build.rs defaults ROCKSDB_UNITY_CHUNK to 1 on Windows targets, so Windows compiles one translation unit per RocksDB source (other targets unchanged; the variable still overrides). zakura_minimal.rs is restructured so each edit is an InsertAfter or Replace whose C++ is a raw multi-line string, and normalizes CRLF to LF before matching; the edited sources it generates are byte-for-byte identical to 0.17.4's. No new sources, flags, downloads, or links. Published from fork commit ed52fdf, which passed the fork's CI on Linux, macOS, and Windows, including a build without `full`."
 
+[[audits.zakura-librocksdb-sys]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.5+10.4.2 -> 0.17.7+10.4.2"
+notes = """The bundled RocksDB 10.4.2 and Snappy sources are unchanged, file for file; the package also excludes snappy/third_party (Google benchmark and googletest), which is never compiled. build.rs no longer runs bindgen: src/lib.rs includes the committed src/bindings.rs instead of OUT_DIR/bindings.rs, so bindgen and its libclang loading leave the build, and the bindgen-runtime and bindgen-static features become empty. src/bindings.rs is bindgen 0.72.1 output for rocksdb/include/rocksdb/c.h and contains only declarations: 942 extern "C" functions, opaque #[repr(C)] structs, constants, and type aliases, with no function bodies, #[link] attributes, or includes. build.rs also defines NO_PCLMUL on x86_64 targets without pclmulqdq, since RocksDB's port/lang.h assumes PCLMUL whenever AVX is enabled. Without `full`, zakura_excluded_sources.txt skips 58 RocksDB sources instead of 91, so no compiled code references a skipped source, and zakura_minimal.rs replaces the whole bodies of the disabled entry points (SST ingestion, column family import, remote compaction, tracing and replay) with their NotSupported returns, deletes the remote compaction branch of CompactionJob::ProcessKeyValueCompaction, makes plain table creation return NotSupported, and makes the unreachable WritePreparedSnapshotChecker::CheckInSnapshot abort; every edit still asserts its anchor occurs exactly once. No new sources outside RocksDB, flags beyond NO_PCLMUL, downloads, or links. Published from fork commit cf3bdeb, whose CI links and runs a minimal-build test with GCC 12 to 16, several clang versions, aarch64 Linux, macOS, and MSVC, in release and debug; zakura-state's tests pass against it."""
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4623,6 +4629,12 @@ who = "Claude <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 delta = "0.24.1 -> 0.24.2"
 notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.5; the Rust sources are unchanged. The CI workflow adds a build without `full` on each platform."
+
+[[audits.zakura-rocksdb]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.2 -> 0.24.4"
+notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.7; the library sources under src/ are unchanged. Adds tests/test_zakura_minimal.rs, a test of the RocksDB features Zakura uses, and CI scripts and a workflow that build without `full` across many toolchains and check the archive for undefined RocksDB symbols. README and CHANGELOG document the minimal build and the committed bindings."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

@@ -182,6 +182,7 @@ impl EnginePort {
     fn acquire(
         &self,
         request: AcquirePath,
+        txn: Option<u64>,
     ) -> (
         Result<AcquirePathReply, PortError>,
         Effects,
@@ -200,7 +201,7 @@ impl EnginePort {
         let peer = request.source;
         let engine = self.engine();
         let mut leases = self.leases();
-        let reply = self.acquire_locked(&engine, &mut leases, request, now);
+        let reply = self.acquire_locked(&engine, &mut leases, request, now, txn);
         let refusal = match &reply {
             Ok(AcquirePathReply::CapacityBusy(signal)) => Some(
                 leases
@@ -220,6 +221,7 @@ impl EnginePort {
         leases: &mut Registry,
         request: AcquirePath,
         now: Instant,
+        txn: Option<u64>,
     ) -> Result<AcquirePathReply, PortError> {
         let AcquirePath {
             source: peer,
@@ -270,6 +272,7 @@ impl EnginePort {
                     position: cursor.position,
                     retained_path: cursor.retained_path,
                     capacity,
+                    leased_txn: txn,
                 },
                 now,
                 Some(key),
@@ -334,6 +337,7 @@ impl EnginePort {
                 position,
                 retained_path,
                 capacity,
+                leased_txn: txn,
             },
             now,
             None,
@@ -821,8 +825,9 @@ impl EnginePort {
     /// lease registry's effects for the caller to fire once it holds no
     /// lock, and the reply's typed identity. Both this port and
     /// [`ControlledPort`](super::controlled::ControlledPort) run every
-    /// operation through here.
-    pub(crate) fn execute(&self, request: HeaderRequest) -> Executed {
+    /// operation through here. `txn` is the controlled transaction the
+    /// operation runs in, which a lease it creates records.
+    pub(crate) fn execute(&self, request: HeaderRequest, txn: Option<u64>) -> Executed {
         let (mut effects, mut locator_read, mut refusal) = (Effects::default(), None, None);
         let reply = match request {
             HeaderRequest::ContinuationLocator => HeaderReply::ContinuationLocator(
@@ -836,7 +841,7 @@ impl EnginePort {
             }
             HeaderRequest::AcquireHeaderPath(request) => {
                 let reply;
-                (reply, effects, refusal) = self.acquire(request);
+                (reply, effects, refusal) = self.acquire(request, txn);
                 HeaderReply::AcquireHeaderPath(reply)
             }
             HeaderRequest::ReadHeaderPath { path, request } => {
@@ -871,7 +876,7 @@ impl EnginePort {
     /// port's lease ends, so they're dropped.
     fn run_on_poll<T: FromReply>(&self, request: HeaderRequest) -> HeaderChainFuture<'_, T> {
         Box::pin(async move {
-            let executed = self.execute(request);
+            let executed = self.execute(request, None);
             executed.effects.fire();
             T::from_reply(executed.reply)
         })
@@ -961,7 +966,7 @@ impl Port for EnginePort {
         permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(async move {
-            let executed = self.execute(HeaderRequest::ContinuationLocator);
+            let executed = self.execute(HeaderRequest::ContinuationLocator, None);
             // The permit is held until the read finishes.
             drop(permit);
             executed.effects.fire();

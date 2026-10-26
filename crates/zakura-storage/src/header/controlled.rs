@@ -519,7 +519,7 @@ impl ControlledPort {
     pub fn complete(&self, id: OpId, outcome: Outcome) -> Result<Completion, CompleteError> {
         let now = Instant::now();
         let key = self.engine.adapter_key();
-        let (request, early, permit) = {
+        let (request, early, permit, txn) = {
             let mut ops = self.ops();
             let slot = ops
                 .slots
@@ -554,7 +554,13 @@ impl ControlledPort {
             else {
                 unreachable!("the stage was checked above under the same lock");
             };
-            (request, early, ops.permits.remove(&id))
+            // Only the run completes operations, outside any task, so no
+            // other transaction publishes before this one does.
+            let txn = ops
+                .last_txn
+                .checked_add(1)
+                .expect("a run publishes fewer than 2^64 transactions");
+            (request, early, ops.permits.remove(&id), txn)
         };
         let op = request.op();
         // Runs without the bookkeeping lock, since the engine and a dropped
@@ -573,7 +579,7 @@ impl ControlledPort {
                     reply,
                     effects,
                     result,
-                } = self.engine.execute(request);
+                } = self.engine.execute(request, Some(txn));
                 (reply, effects, result)
             }
         };
@@ -623,8 +629,8 @@ impl ControlledPort {
         let state_digest = self.engine.state_digest();
         let completion = {
             let mut ops = self.ops();
-            let mut completion = Completion {
-                txn: 0,
+            let completion = Completion {
+                txn,
                 id,
                 op,
                 request: identity,
@@ -636,9 +642,12 @@ impl ControlledPort {
                 generation,
                 state_digest,
             };
-            completion.txn = ops.last_txn.saturating_add(1);
             kinds.push(FactKind::Completed(Box::new(completion.clone())));
-            ops.publish(now, kinds);
+            let published = ops.publish(now, kinds);
+            assert_eq!(
+                published[0].txn, txn,
+                "only the run publishes between reserving the number and here"
+            );
             completion
         };
         // Woken outside the lock, since a waker can run scheduler code.

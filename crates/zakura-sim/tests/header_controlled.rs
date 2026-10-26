@@ -803,13 +803,15 @@ fn abandonment_run(plan: PlanInput) -> (RunReport, Abandonment) {
 /// panics or hangs, and every abandoned lease's end is recorded on its own
 /// reply: on `ReplyDropped`, or on the acquire's completion when its caller
 /// was already gone, never on another operation. Some plans must register a
-/// waiter and complete storage mid-drop, so the race is exercised.
+/// waiter, complete storage mid-drop and record an abandoned lease on a
+/// dropped reply, so the race is exercised.
 #[test]
 fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
-    let (mut waited, mut interleaved) = (0, 0);
+    let (mut waited, mut interleaved, mut dropped) = (0, 0, 0);
     for plan in inputs(128, 64) {
         let (report, seen) = abandonment_run(plan);
         assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        let mut ops = std::collections::BTreeMap::new();
         for entry in report.log.entries() {
             let Observation::Storage { id, event, .. } = &entry.obs else {
                 continue;
@@ -819,11 +821,22 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
                     .any(|end| end.release == "lease-abandoned-acquire")
             };
             match event {
+                StorageEvent::Submitted { op, .. } => {
+                    ops.insert(*id, op.as_str());
+                }
                 StorageEvent::Completed { op, lease_ends, .. } if abandoned(lease_ends) => {
                     assert_eq!(
                         op, "acquire_header_path",
                         "operation {id} took an abandoned lease"
                     );
+                }
+                StorageEvent::ReplyDropped { lease_ends } if abandoned(lease_ends) => {
+                    assert_eq!(
+                        ops.get(id),
+                        Some(&"acquire_header_path"),
+                        "operation {id}'s dropped reply took an abandoned lease"
+                    );
+                    dropped += 1;
                 }
                 _ => {}
             }
@@ -833,4 +846,5 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
     }
     assert!(waited > 0, "no plan registered a capacity waiter");
     assert!(interleaved > 0, "no plan completed storage mid-drop");
+    assert!(dropped > 0, "no dropped reply ended an abandoned lease");
 }

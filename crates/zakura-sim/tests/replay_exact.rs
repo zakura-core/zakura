@@ -6,6 +6,7 @@
 use std::{
     cell::Cell,
     path::Path,
+    process::Command,
     rc::Rc,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -19,13 +20,17 @@ use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
-    property::HasView,
+    property::{
+        Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
+        Status, Verdict,
+    },
+    record::OutcomeKind,
     trace::{
         meta::PropertyRef, replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport,
         Trace, TraceReader, OBSERVATIONS_FILE, TRACE_FILE,
     },
     ActionSource, Checker, Divergence, HarnessFailure, Identity, NoChecks, Observation,
-    ObservationLog, RunConfig, Sim,
+    ObservationLog, PropertyOutcome, RunConfig, Sim,
 };
 
 /// Records `harness` on the full fuzz `input`.
@@ -736,5 +741,266 @@ fn planted_host_clock_is_nondeterministic() {
     match replay_with(&open(dir.path()), &clock, ReplayOptions::default()) {
         Err(ReplayError::Nondeterministic { step, field }) => assert_eq!((step, field), (4, "obs")),
         other => panic!("expected Nondeterministic, got {other:?}"),
+    }
+}
+
+/// How [`Effects`] changes its observations on a later run, so a replay can
+/// show that each change is caught.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mutation {
+    /// Observe exactly what the recording did.
+    None,
+    /// Name another owner in step 1's first effect.
+    Owner,
+    /// Leave out step 1's second effect.
+    Omit,
+    /// Observe step 1's two effects in the other order.
+    Swap,
+}
+
+thread_local! {
+    /// The mutation [`Effects`] applies on this thread. Each test runs on its
+    /// own thread, so tests don't see each other's.
+    static MUTATION: Cell<Mutation> = const { Cell::new(Mutation::None) };
+}
+
+/// A source of storage-like operations. Step `n` runs operation `n`, which
+/// observes two effects in order: applying it, then releasing its lease.
+/// Each effect names its connection, session, generation, operation and
+/// owner, as typed storage evidence will.
+struct Effects(Cell<u64>);
+
+/// The operations [`Effects`] offers.
+const OPERATIONS: u64 = 3;
+
+/// The effects operation `op` observes.
+fn effects(op: u64) -> Vec<String> {
+    ["apply", "release"]
+        .iter()
+        .map(|effect| {
+            format!(
+                "{effect} conn=p1.c{op} session=s2 generation={op} op={op} owner=header-sync/{op}"
+            )
+        })
+        .collect()
+}
+
+impl ActionSource for Effects {
+    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        let op = self.0.get() + 1;
+        if op <= OPERATIONS {
+            out.push((Identity::storage("header-store", op, "success"), 0));
+        }
+    }
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, log: &mut ObservationLog) {
+        let op = self.0.get() + 1;
+        self.0.set(op);
+        let mut events = effects(op);
+        if op == 1 {
+            match MUTATION.get() {
+                Mutation::None => {}
+                Mutation::Owner => {
+                    events[0] = events[0].replace("owner=header-sync/1", "owner=block-sync/1")
+                }
+                Mutation::Omit => drop(events.pop()),
+                Mutation::Swap => events.swap(0, 1),
+            }
+        }
+        for event in events {
+            log.push(Observation::Fake {
+                source: "storage".into(),
+                event,
+            });
+        }
+    }
+}
+
+/// The [`Effects`] source, checked by a registry.
+struct EffectsHarness;
+
+no_view!(EffectsHarness);
+
+/// A `Known` property and an `Active` one that both fail at operation 2.
+const KNOWN: PropertyId = PropertyId::new("test/effects-known");
+const ACTIVE: PropertyId = PropertyId::new("test/effects-active");
+
+/// Fails at the step whose effects name operation 2.
+fn at_operation_2(cx: &mut CheckCtx<'_, EffectsHarness>) -> Verdict {
+    let second = cx
+        .observations()
+        .any(|obs| matches!(obs, Observation::Fake { event, .. } if event.contains(" op=2 ")));
+    if second {
+        let expected = format!("{} never fails", cx.id());
+        cx.violated(expected, "operation 2 applied and released")
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// [`KNOWN`] or [`ACTIVE`], with `status`.
+fn effects_property(id: PropertyId, status: Status) -> Property<EffectsHarness> {
+    Property {
+        id,
+        claim: "operation 2 never runs",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[],
+        status,
+        check: at_operation_2,
+        witness: None,
+    }
+}
+
+/// Both properties, `Known` first.
+fn effects_properties() -> Vec<Property<EffectsHarness>> {
+    vec![
+        effects_property(KNOWN, Status::Known { issue: 1 }),
+        effects_property(ACTIVE, Status::Active),
+    ]
+}
+
+impl Subsystem for EffectsHarness {
+    const NAME: &'static str = "test/effects";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+
+    /// Room for every operation.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(100, 10)
+    }
+
+    /// Adds the source.
+    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+        sim.add_source(Box::new(Effects(Cell::new(0))));
+        EffectsHarness
+    }
+
+    /// The registry of both properties.
+    fn checker(this: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
+        let registry = Registry::new(effects_properties()).expect("the two IDs differ");
+        Box::new(RegistryChecker::new(
+            registry,
+            Rc::clone(this),
+            Assumptions::none(),
+            &[],
+        ))
+    }
+
+    /// Both properties.
+    fn properties(_: &Fixed) -> Vec<PropertyRef> {
+        effects_properties()
+            .into_iter()
+            .map(|p| PropertyRef {
+                id: p.id.to_string(),
+                status: p.status,
+            })
+            .collect()
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// [`EffectsHarness`]' entry, which isn't in `HARNESSES`.
+const EFFECTS: HarnessEntry = entry::<EffectsHarness>();
+
+/// Set to a trace directory when this test binary runs as the replay child.
+const EFFECTS_CHILD: &str = "ZAKURA_SIM_EFFECTS_TRACE";
+
+/// Marks a verified replay in the child's output.
+const VERIFIED: &str = "zakura-sim-effects-verified";
+
+/// Replays the trace that [`EFFECTS_CHILD`] names when run as the child, and
+/// does nothing otherwise.
+#[test]
+fn effects_replay_child() {
+    if let Some(dir) = std::env::var_os(EFFECTS_CHILD) {
+        let report = replay_with(&open(Path::new(&dir)), &EFFECTS, ReplayOptions::default())
+            .expect("the effects trace replays");
+        assert!(report.verified(), "{report:?}");
+        #[allow(
+            clippy::print_stdout,
+            reason = "the parent test reads the child's stdout"
+        )]
+        {
+            println!("\n{VERIFIED}");
+        }
+    }
+}
+
+#[test]
+fn effects_replay_in_a_fresh_process() {
+    let dir = record(&EFFECTS, &[]);
+    let trace = open(dir.path());
+    // Both effects of each operation, in order, in its step's digest.
+    for step in &trace.steps {
+        let obs: Vec<Observation> = effects(step.step)
+            .into_iter()
+            .map(|event| Observation::Fake {
+                source: "storage".into(),
+                event,
+            })
+            .collect();
+        let json = serde_json::to_vec(&obs).unwrap();
+        let digest: String = Sha256::digest(&json)[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            step.obs.as_deref(),
+            Some(digest.as_str()),
+            "step {}",
+            step.step
+        );
+    }
+    // The Active failure ends the run at operation 2, and both reports name
+    // that step.
+    let end = trace.end.clone().unwrap();
+    assert_eq!((end.outcome, end.steps), (OutcomeKind::Violation, 2));
+    let violation = end.violation.as_ref().unwrap();
+    assert_eq!(
+        (violation.property.as_str(), violation.step),
+        (ACTIVE.as_str(), 2)
+    );
+    assert_eq!(violation.actual, "operation 2 applied and released");
+    let violated: Vec<&str> = end
+        .properties
+        .iter()
+        .filter(|report| matches!(&report.outcome, PropertyOutcome::Violated { witness } if witness == &[2]))
+        .map(|report| report.property.as_str())
+        .collect();
+    assert_eq!(violated, [KNOWN.as_str(), ACTIVE.as_str()]);
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "effects_replay_child", "--nocapture"])
+        .env(EFFECTS_CHILD, dir.path())
+        .output()
+        .expect("the test binary reruns itself");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(VERIFIED),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn changed_effects_are_nondeterministic() {
+    let dir = record(&EFFECTS, &[]);
+    for mutation in [Mutation::Owner, Mutation::Omit, Mutation::Swap] {
+        MUTATION.set(mutation);
+        let result = replay_with(&open(dir.path()), &EFFECTS, ReplayOptions::default());
+        MUTATION.set(Mutation::None);
+        match result {
+            Err(ReplayError::Nondeterministic { step, field }) => {
+                assert_eq!((step, field), (1, "obs"), "{mutation:?}");
+            }
+            other => panic!("{mutation:?}: expected Nondeterministic, got {other:?}"),
+        }
     }
 }

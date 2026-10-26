@@ -221,6 +221,9 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
 /// Checks the storage invariants after every step of a delivery run:
 ///
 /// * Each operation completes at most once, and only after its submission.
+/// * A step that picks `storage:header:<id>:<outcome>` logs exactly that
+///   completion, and no other step logs one, so a completion lands on the
+///   step that caused it with the outcome the `Plan` picked.
 /// * While the locator operation is pending, its permit is held, even after
 ///   its caller timed out.
 /// * The watch holds exactly the engine's committed snapshot, so a commit
@@ -233,6 +236,7 @@ fn delivery_checks(
     let mut completed = BTreeSet::new();
     let watch = port.selected_chain();
     after_step(move |cx| {
+        let mut completions = Vec::new();
         for obs in cx.observations() {
             let Observation::Storage { id, event, .. } = obs else {
                 continue;
@@ -241,7 +245,8 @@ fn delivery_checks(
                 StorageEvent::Submitted { .. } => {
                     submitted.insert(*id);
                 }
-                StorageEvent::Completed { .. } => {
+                StorageEvent::Completed { outcome, .. } => {
+                    completions.push(format!("storage:header:{id}:{outcome}"));
                     if !submitted.contains(id) || !completed.insert(*id) {
                         return Some(violation(
                             "storage/complete-once",
@@ -252,6 +257,19 @@ fn delivery_checks(
                 }
                 StorageEvent::CallerDropped | StorageEvent::ReplyDropped { .. } => {}
             }
+        }
+        let pick = cx.pick.to_string();
+        let expected = if pick.starts_with("storage:header:") {
+            vec![pick]
+        } else {
+            Vec::new()
+        };
+        if completions != expected {
+            return Some(violation(
+                "storage/completion-is-the-pick",
+                cx.step,
+                format!("picked {}, completed {completions:?}", cx.pick),
+            ));
         }
         let locator_pending = port
             .pending()
@@ -795,13 +813,15 @@ fn abandonment_run(plan: PlanInput) -> (RunReport, Abandonment) {
 /// panics or hangs, and every abandoned lease's end is recorded on its own
 /// reply: on `ReplyDropped`, or on the acquire's completion when its caller
 /// was already gone, never on another operation. Some plans must register a
-/// waiter and complete storage mid-drop, so the race is exercised.
+/// waiter, complete storage mid-drop and record an abandoned lease on a
+/// dropped reply, so the race is exercised.
 #[test]
 fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
-    let (mut waited, mut interleaved) = (0, 0);
+    let (mut waited, mut interleaved, mut dropped) = (0, 0, 0);
     for plan in inputs(128, 64) {
         let (report, seen) = abandonment_run(plan);
         assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        let mut ops = std::collections::BTreeMap::new();
         for entry in report.log.entries() {
             let Observation::Storage { id, event, .. } = &entry.obs else {
                 continue;
@@ -811,11 +831,22 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
                     .any(|end| end.release == "lease-abandoned-acquire")
             };
             match event {
+                StorageEvent::Submitted { op, .. } => {
+                    ops.insert(*id, op.as_str());
+                }
                 StorageEvent::Completed { op, lease_ends, .. } if abandoned(lease_ends) => {
                     assert_eq!(
                         op, "acquire_header_path",
                         "operation {id} took an abandoned lease"
                     );
+                }
+                StorageEvent::ReplyDropped { lease_ends } if abandoned(lease_ends) => {
+                    assert_eq!(
+                        ops.get(id),
+                        Some(&"acquire_header_path"),
+                        "operation {id}'s dropped reply took an abandoned lease"
+                    );
+                    dropped += 1;
                 }
                 _ => {}
             }
@@ -825,4 +856,5 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
     }
     assert!(waited > 0, "no plan registered a capacity waiter");
     assert!(interleaved > 0, "no plan completed storage mid-drop");
+    assert!(dropped > 0, "no dropped reply ended an abandoned lease");
 }

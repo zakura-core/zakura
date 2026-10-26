@@ -51,7 +51,7 @@ pub enum Boundary {
 /// Actions outside the scheduler, such as datagrams or storage completions.
 ///
 /// `enabled` and `boundaries` must be pure functions of the source's state, so
-/// a run replays. Only `execute` changes it.
+/// a run replays. Only `execute` and `observe` change it.
 pub trait ActionSource {
     /// Appends each action enabled at `now`, with the index `execute` takes.
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>);

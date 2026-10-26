@@ -282,6 +282,22 @@ struct Slot {
     presence: Weak<CallerToken>,
     identity: RequestIdentity,
     request_digest: [u8; 32],
+    /// Whether the request fails an adapter-side input check. Those checks
+    /// read only a handle's or a target's seal, which can't change after
+    /// submission, so they run once, there, rather than on every listing.
+    rejected: bool,
+}
+
+impl Slot {
+    /// The outcomes legal `since_submit` after submission, in canonical
+    /// order, as [`HeaderRequest::enabled`] gives them.
+    fn enabled(&self, request: &HeaderRequest, since_submit: Duration) -> Vec<Outcome> {
+        if self.rejected {
+            vec![Outcome::Rejected]
+        } else {
+            request.op().enabled(since_submit).collect()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -444,7 +460,6 @@ impl ControlledPort {
     /// Every pending operation in ID order, with the outcomes legal now.
     pub fn pending(&self) -> Vec<PendingOp> {
         let now = Instant::now();
-        let key = self.engine.adapter_key();
         self.ops()
             .slots
             .iter()
@@ -454,7 +469,7 @@ impl ControlledPort {
                     Some(PendingOp {
                         id: *id,
                         op: request.op(),
-                        enabled: request.enabled(key, since_submit),
+                        enabled: slot.enabled(request, since_submit),
                         since_submit,
                         caller_waiting: slot.caller.is_some(),
                     })
@@ -468,16 +483,16 @@ impl ControlledPort {
     /// none will without a completion. Only a timeout's gate opens later.
     pub fn next_gate(&self) -> Option<Duration> {
         let now = Instant::now();
-        let key = self.engine.adapter_key();
         self.ops()
             .slots
             .values()
             .filter_map(|slot| match &slot.stage {
-                Stage::Pending { request, submitted } => Some((request, *submitted)),
-                Stage::Running | Stage::Replied { .. } => None,
+                // A rejected request has only its rejection, whenever it runs.
+                Stage::Pending { request, submitted } if !slot.rejected => {
+                    Some((request, *submitted))
+                }
+                Stage::Pending { .. } | Stage::Running | Stage::Replied { .. } => None,
             })
-            // A rejected request has only its rejection, whenever it runs.
-            .filter(|(request, _)| request.rejected_by(key).is_none())
             .filter(|(request, _)| {
                 request
                     .op()
@@ -521,9 +536,9 @@ impl ControlledPort {
                     since_submit,
                 })
             };
-            request
-                .check(key, outcome, since_submit)
-                .map_err(CompleteError::Illegal)?;
+            if !slot.enabled(request, since_submit).contains(&outcome) {
+                return Err(illegal());
+            }
             // A fault or rejection needs no engine, so its reply is built
             // before anything is taken.
             let early = match outcome {
@@ -657,8 +672,8 @@ impl ControlledPort {
 
     /// Shuts the service down, as the end of a run does. Drops every pending
     /// operation unrun, with its inputs, and every untaken reply, then ends
-    /// every lease. No caller is woken, and a call polled afterwards never
-    /// completes. A repeat does nothing.
+    /// every lease and closes the selected-chain watch. No caller is woken,
+    /// and a call polled afterwards never completes. A repeat does nothing.
     ///
     /// Only the run shuts a port down, outside any task: its transaction is
     /// published at its end, which a task could otherwise interleave.
@@ -692,6 +707,7 @@ impl ControlledPort {
                 .into_iter()
                 .map(FactKind::Lease),
         );
+        self.engine.close_selected_chain();
         kinds.push(FactKind::ShutDown { dropped });
         self.ops().publish(now, kinds);
     }
@@ -755,26 +771,28 @@ impl<T: FromReply> Future for Call<'_, T> {
         let mut ops = port.ops();
         match &mut self.state {
             CallState::Unsubmitted(submission) => {
-                let submission = submission
+                let Submission { request, permit } = *submission
                     .take()
                     .expect("an unsubmitted call holds its request");
+                // Inspected without the lock, since digesting an apply walks
+                // its whole insertion.
+                drop(ops);
+                let key = port.engine.adapter_key();
+                let (request, request_digest, rejected) = inspect(request, key);
+                let mut ops = port.ops();
                 if ops.shut_down {
                     drop(ops);
                     // Dropped outside the lock, with its permit.
-                    drop(submission);
+                    drop((request, permit));
                     self.state = CallState::Orphaned;
                     return Poll::Pending;
                 }
-                let Submission { request, permit } = *submission;
                 ops.last = ops
                     .last
                     .checked_add(1)
                     .expect("a run submits fewer than 2^64 operations");
                 let id = OpId(ops.last);
-                let key = port.engine.adapter_key();
-                let (identity, request_digest) =
-                    (RequestIdentity::of(&request, key), digest(&request, key));
-                let token = Arc::new(CallerToken);
+                let (identity, token) = (RequestIdentity::of(&request, key), Arc::new(CallerToken));
                 ops.slots.insert(
                     id,
                     Slot {
@@ -786,6 +804,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                         presence: Arc::downgrade(&token),
                         identity: identity.clone(),
                         request_digest,
+                        rejected,
                     },
                 );
                 let mut kinds = Vec::new();
@@ -897,25 +916,48 @@ impl<T> Drop for Call<'_, T> {
     }
 }
 
-/// A digest of `request`. Path and target handles redact their identity
-/// and contents from `Debug`, so a path this port issued adds its lease,
-/// peer and session, and a target this port sealed adds its whole
-/// insertion: supplier, headers and auxiliary deliveries.
-fn digest(request: &HeaderRequest, key: &AdapterKey) -> [u8; 32] {
+/// Digests `request` and runs its adapter-side input checks, for the
+/// adapter holding `key`, and gives the request back. It takes the request
+/// by value so it can open a sealed target and seal it again, rather than
+/// clone it.
+///
+/// Path and target handles redact their identity and contents from
+/// `Debug`. So a path this port issued adds its lease, peer and session,
+/// and a target this port sealed adds its insertion: supplier, parent,
+/// completion, each header's hash and each auxiliary delivery.
+fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32], bool) {
     let mut hasher = Sha256::new();
-    hasher.update(b"zakura-storage-header-request-v1");
+    hasher.update(b"zakura-storage-header-request-v2");
     hasher.update(format!("{request:?}").as_bytes());
-    match request {
-        HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } => {
-            hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+    let (request, rejected) = match request {
+        HeaderRequest::ApplyHeaderTarget { target } => match target.into_insert(key) {
+            Ok(insert) => {
+                hasher.update(insert.source.digest());
+                hasher.update(insert.parent_hash.0);
+                hasher.update(format!("{:?}", insert.completion).as_bytes());
+                for header in insert.batch.headers() {
+                    hasher.update(header.hash.0);
+                }
+                for aux in &insert.aux {
+                    hasher.update(format!("{aux:?}").as_bytes());
+                }
+                let target = PreparedHeaderTarget::from_insert(key, insert);
+                (HeaderRequest::ApplyHeaderTarget { target }, false)
+            }
+            Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true),
+        },
+        request => {
+            if let HeaderRequest::ReadHeaderPath { path, .. }
+            | HeaderRequest::ReleaseHeaderPath { path } = &request
+            {
+                hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+            }
+            // No other request's input checks open a sealed target.
+            let rejected = request.rejected_by(key).is_some();
+            (request, rejected)
         }
-        HeaderRequest::ApplyHeaderTarget { target } => {
-            // `into_insert` consumes the target, so this opens a clone.
-            hasher.update(format!("{:?}", target.clone().into_insert(key).ok()).as_bytes());
-        }
-        _ => {}
-    }
-    hasher.finalize().into()
+    };
+    (request, hasher.finalize().into(), rejected)
 }
 
 impl Port for ControlledPort {

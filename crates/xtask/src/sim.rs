@@ -1,20 +1,39 @@
-//! `cargo xtask record`: runs the `zakura-sim` binary in the simulator build.
+//! `cargo xtask record` and `cargo xtask replay`: run the `zakura-sim` binary
+//! in the simulator build.
 //!
 //! xtask is a normal build, so it can't link `zakura-sim`, which only exists
 //! behind `--cfg zakura_sim`. It runs the binary through `cargo run` instead,
 //! with the flag and target directory CI's `sim-build` job uses, so the two
 //! share a build cache.
 
-use std::{env, ffi::OsString, path::Path, process::Command};
+use std::{env, error::Error, ffi::OsString, fmt, path::Path, process::Command};
 
-use crate::{run_command, BoxError};
+use crate::{run_command, BoxError, CommandError};
 
 /// The simulator build's flag.
 const SIM_RUSTFLAGS: &str = "--cfg zakura_sim";
 
+/// A `zakura-sim` run that exited with `code`, which xtask exits with too:
+/// the binary's codes are its contract, 2 for a usage error and 1 for a
+/// failed run.
+#[derive(Debug)]
+pub(super) struct SimExit {
+    pub(super) code: i32,
+    error: CommandError,
+}
+
+impl fmt::Display for SimExit {
+    /// The failed command and its status.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl Error for SimExit {}
+
 /// Runs `zakura-sim <subcommand> <args>` from the workspace at `repo_root`,
 /// passing the arguments through unchanged. Relative paths in them resolve
-/// against the current directory.
+/// against the current directory. A nonzero exit fails with [`SimExit`].
 pub(super) fn run(
     repo_root: &Path,
     subcommand: &str,
@@ -33,4 +52,14 @@ pub(super) fn run(
             .arg(subcommand)
             .args(args),
     )
+    .map_err(|error| match error.downcast::<CommandError>() {
+        Ok(error) => match error.status.code() {
+            Some(code) => Box::new(SimExit {
+                code,
+                error: *error,
+            }) as BoxError,
+            None => error,
+        },
+        Err(error) => error,
+    })
 }

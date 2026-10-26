@@ -274,10 +274,9 @@ value:
 
 The above-floor gauge records an admission input, not a resource, so it keeps
 the value the latest admission read. It counts every reservation above the
-current download floor, including commit-window work, and it does not record how
-admission classified each request. So it cannot supply the above-window,
-non-floor quantity that `lookahead-overshoot-bound` bounds; that property needs
-worst-case reservations recorded at admission. The budget charges a request before the
+current download floor, including commit-window work, so it is a diagnostic.
+`lookahead-overshoot-bound` instead sums the estimates of outstanding
+above-window requests from the request records. The budget charges a request before the
 work queue does and releases it after, so the budget gauge can exceed the work
 gauge while a request is in transition. The two gauges are written separately,
 so only a reader that sees no request in transition can compare them.

@@ -217,6 +217,9 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
 /// Checks the storage invariants after every step of a delivery run:
 ///
 /// * Each operation completes at most once, and only after its submission.
+/// * A step that picks `storage:header:<id>:<outcome>` logs exactly that
+///   completion, and no other step logs one, so a completion lands on the
+///   step that caused it with the outcome the `Plan` picked.
 /// * While the locator operation is pending, its permit is held, even after
 ///   its caller timed out.
 /// * The watch holds exactly the engine's committed snapshot, so a commit
@@ -229,6 +232,7 @@ fn delivery_checks(
     let mut completed = BTreeSet::new();
     let watch = port.selected_chain();
     after_step(move |cx| {
+        let mut completions = Vec::new();
         for obs in cx.observations() {
             let Observation::Storage { id, event, .. } = obs else {
                 continue;
@@ -237,7 +241,8 @@ fn delivery_checks(
                 StorageEvent::Submitted { .. } => {
                     submitted.insert(*id);
                 }
-                StorageEvent::Completed { .. } => {
+                StorageEvent::Completed { outcome, .. } => {
+                    completions.push(format!("storage:header:{id}:{outcome}"));
                     if !submitted.contains(id) || !completed.insert(*id) {
                         return Some(violation(
                             "storage/complete-once",
@@ -248,6 +253,19 @@ fn delivery_checks(
                 }
                 StorageEvent::CallerDropped | StorageEvent::ReplyDropped { .. } => {}
             }
+        }
+        let pick = cx.pick.to_string();
+        let expected = if pick.starts_with("storage:header:") {
+            vec![pick]
+        } else {
+            Vec::new()
+        };
+        if completions != expected {
+            return Some(violation(
+                "storage/completion-is-the-pick",
+                cx.step,
+                format!("picked {}, completed {completions:?}", cx.pick),
+            ));
         }
         let locator_pending = port
             .pending()

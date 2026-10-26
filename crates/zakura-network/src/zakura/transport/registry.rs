@@ -313,6 +313,9 @@ impl ServiceRegistry {
     /// Layouts without message tables never appear: legacy gossip's kinds 2
     /// and 3 and the header-sync passthrough stream declare none. The
     /// connection's control stream belongs to no service.
+    ///
+    /// This lists every alternative a service registers. A session negotiates
+    /// at most one of them per service from its capability mask.
     pub fn session_layouts(&self) -> impl Iterator<Item = &SessionLayout> {
         // Every member stream keys its layout, so keep only the primary's entry.
         let mut layouts: Vec<&SessionLayout> = self
@@ -848,6 +851,13 @@ mod tests {
             .into();
         assert_eq!(layouts, negotiated);
         assert_eq!(registry.persistent_streams_for_negotiated(1), [legacy]);
+        // A mask with both of the service's tabled alternatives negotiates one
+        // complete layout, though the enumeration lists both.
+        let both = registry.persistent_streams_for_negotiated(2 | 4);
+        assert!(
+            both == pair || both == [single],
+            "negotiation picks one layout: {both:?}"
+        );
     }
 
     #[test]

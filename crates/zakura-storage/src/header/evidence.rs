@@ -368,3 +368,91 @@ impl ResultIdentity {
         }
     }
 }
+
+/// Which slots a lease uses: an ordinary slot, or one a path short enough
+/// for one page may take, including the reserve slot.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CapacityClass {
+    /// An ordinary slot.
+    General,
+    /// Any slot, for a path of at most one page.
+    Bounded,
+}
+
+/// A capacity signal a refused acquire waits on.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Waiter {
+    /// The signal on a peer's live lease, for that peer's next acquire.
+    Peer(LeaseKey),
+    /// The ordinary class's signal.
+    General,
+    /// The reserve class's signal.
+    Fallback,
+}
+
+/// Why a retained path stopped being held.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RetentionEnd {
+    /// Together with its capability: a release, an idle expiry, an abandoned
+    /// acquire, shutdown, or a read that served the last header.
+    WithCapability,
+    /// The continuation cache was full when another consumed lease moved in,
+    /// and this continuation had the lowest lease ID.
+    Evicted,
+    /// An acquire continued from this cached cursor, as lease `into`.
+    Continued {
+        /// The new lease's ID.
+        into: u64,
+    },
+    /// An acquire took this cached cursor but didn't continue from it.
+    Discarded,
+    /// Shutdown cleared the continuation cache.
+    ShutdownCleared,
+}
+
+/// One change the lease registry made, in the order it made them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseFact {
+    /// A lease began, with its path retained, or continued from a cached
+    /// cursor.
+    Leased {
+        /// The new lease.
+        lease: LeaseKey,
+        /// Its work scope.
+        scope: HeaderWorkAuthority,
+        /// Its target.
+        target: Frontier,
+        /// Where its next page starts.
+        common_ancestor: Frontier,
+        /// Its slot class.
+        capacity: CapacityClass,
+        /// The cached lease it continued from, if any.
+        continued_from: Option<u64>,
+    },
+    /// A lease's handle stopped working and its slot freed.
+    CapabilityEnded {
+        /// The lease.
+        lease: LeaseKey,
+        /// The event that ended it.
+        release: super::Release,
+    },
+    /// A consumed lease's path moved into the continuation cache, with its
+    /// last served header.
+    RetentionCached {
+        /// The consumed lease.
+        lease: LeaseKey,
+        /// The last header served.
+        last_frontier: Frontier,
+    },
+    /// A retained path stopped being held.
+    RetentionEnded {
+        /// The lease the path belonged to.
+        lease: LeaseKey,
+        /// Why.
+        why: RetentionEnd,
+    },
+    /// A refusal registered a capacity signal that wasn't set yet.
+    WaiterSet(Waiter),
+    /// A capacity signal fired and was cleared.
+    WaiterFired(Waiter),
+}

@@ -42,9 +42,9 @@ use zakura_rt::{
 };
 
 use super::{
-    evidence::{ResultIdentity, SignalClass},
+    evidence::{LeaseFact, LeaseKey, ResultIdentity, SignalClass},
     fixture::{HeaderFixture, ScenarioClock},
-    lease::{Capacity, Effects, LeaseEnd, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
+    lease::{Capacity, Effects, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
     FromReply, HeaderReply, HeaderRequest, Release,
 };
 
@@ -238,16 +238,25 @@ impl EnginePort {
         {
             return Ok(AcquirePathReply::Busy);
         }
-        let continuation = leases.take_continuation(peer).filter(|cursor| {
-            cursor.session_id == session_id
-                && cursor.target.hash == target_tip_hash
-                && locator_hashes == [cursor.last_frontier.hash]
-                // A continuation can't extend the range its class permits.
-                && (capacity == Capacity::General
-                    || Capacity::for_range(cursor.last_frontier, cursor.target)
-                        == Capacity::Bounded)
-        });
-        if let Some(cursor) = continuation {
+        let continuation = match leases.take_continuation(peer) {
+            Some((key, cursor))
+                if cursor.session_id == session_id
+                    && cursor.target.hash == target_tip_hash
+                    && locator_hashes == [cursor.last_frontier.hash]
+                    // A continuation can't extend the range its class permits.
+                    && (capacity == Capacity::General
+                        || Capacity::for_range(cursor.last_frontier, cursor.target)
+                            == Capacity::Bounded) =>
+            {
+                Some((key, cursor))
+            }
+            Some((key, _)) => {
+                leases.discard(key);
+                None
+            }
+            None => None,
+        };
+        if let Some((key, cursor)) = continuation {
             leases.record_continuation();
             return Ok(self.commit_lease(
                 engine,
@@ -263,6 +272,7 @@ impl EnginePort {
                     capacity,
                 },
                 now,
+                Some(key),
             ));
         }
         let finalized = snapshot.frontiers.finalized;
@@ -326,11 +336,14 @@ impl EnginePort {
                 capacity,
             },
             now,
+            None,
         ))
     }
 
     /// Installs a lease for `spec` once its target is still retained, as
     /// `commit_path_lease` does, and seals its handle with this port's key.
+    /// `continued_from` is the cached lease `spec` continues, whose path is
+    /// discarded if no lease is installed.
     fn commit_lease(
         &self,
         engine: &HeaderChainEngine,
@@ -338,12 +351,16 @@ impl EnginePort {
         peer: SourceId,
         spec: Spec,
         now: Instant,
+        continued_from: Option<LeaseKey>,
     ) -> AcquirePathReply {
         let retained = engine
             .graph()
             .header_node(spec.target.hash)
             .map(|node| zakura_header_chain::Frontier::new(node.height, node.hash));
         if retained != Some(spec.target) {
+            if let Some(continuation) = continued_from {
+                leases.discard(continuation);
+            }
             return AcquirePathReply::TargetNotRetained;
         }
         let (session_id, common_ancestor, target, scope) = (
@@ -352,7 +369,7 @@ impl EnginePort {
             spec.target,
             spec.scope,
         );
-        match leases.commit(peer, spec, now) {
+        match leases.commit(peer, spec, now, continued_from) {
             Some(lease_id) => {
                 AcquirePathReply::Acquired(Box::new(RetainedHeaderPath::from_adapter(
                     &self.key,
@@ -863,14 +880,15 @@ impl EnginePort {
     /// Ends the lease `path` names, if it's still live, because nobody
     /// received the `Acquired` reply that carried it, and returns the
     /// effects to fire once no lock is held. A path another adapter issued
-    /// names nothing here. Calls `record` with the lease ends before
+    /// names nothing here. Calls `record` with the lease facts before
     /// releasing the lease lock, so nothing can see the lease gone before
-    /// its record. `record` must not reach a scheduling point.
-    pub(crate) fn abandon(
+    /// its record, and returns what `record` returns. `record` must not
+    /// reach a scheduling point.
+    pub(crate) fn abandon<R>(
         &self,
         path: &RetainedHeaderPath,
-        record: impl FnOnce(&[LeaseEnd]),
-    ) -> Effects {
+        record: impl FnOnce(&[LeaseFact]) -> R,
+    ) -> (R, Effects) {
         let mut leases = self.leases();
         if let Some((lease_id, peer, session_id)) = path.adapter_identity(&self.key) {
             leases.release(
@@ -882,8 +900,7 @@ impl EnginePort {
             );
         }
         let effects = leases.take_effects();
-        record(effects.ends());
-        effects
+        (record(effects.facts()), effects)
     }
 
     /// Ends every lease, as service shutdown does, and returns the effects

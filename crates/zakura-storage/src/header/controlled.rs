@@ -15,9 +15,17 @@
 //! the caller drops it unread, is abandoned: an `Acquired` reply's lease
 //! ends, as zakura-state's `PendingRetainedPathAcquisition` ends it.
 //!
-//! Every submission, caller drop, completion, abandoned reply and shutdown
-//! goes on an event queue, in order, which [`ControlledPort::take_events`]
-//! drains.
+//! Every change is published as a transaction: a submission, a caller
+//! dropping its call, a caller taking or dropping its reply, a completion,
+//! or shutdown. A transaction's [`Fact`]s carry one transaction number and
+//! consecutive sequence numbers, in the order the changes happened, and end
+//! with one head fact that names the transaction.
+//! [`ControlledPort::take_facts`] drains them.
+//!
+//! A change a task makes, such as dropping its call, is published in the
+//! critical section that makes it. A change the run makes, a completion or
+//! shutdown, is published at its end: the run makes it outside any task, so
+//! no task can run in between and see the change before its facts.
 
 use std::{
     collections::BTreeMap,
@@ -33,7 +41,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use zakura_chain::block;
-use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, HeaderLocator};
+use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, HeaderGeneration, HeaderLocator};
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture,
     LocatorReadPermit, Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply,
@@ -44,6 +52,7 @@ use zakura_rt::{sync::watch, time::Instant};
 
 use super::{
     adapter::{EnginePort, Executed},
+    evidence::LeaseFact,
     evidence::{RequestIdentity, ResultIdentity},
     fixture::HeaderFixture,
     lease::{Effects, LeaseEnd},
@@ -74,6 +83,8 @@ pub struct PendingOp {
 /// What [`ControlledPort::complete`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
+    /// The completion's transaction number.
+    pub txn: u64,
     /// The operation's ID.
     pub id: OpId,
     /// The operation.
@@ -89,18 +100,48 @@ pub struct Completion {
     /// Whether the reply went to a waiting caller. `false` if the caller had
     /// dropped its future, so the reply was abandoned.
     pub delivered: bool,
-    /// The leases that ended in this completion, in order: those the
-    /// operation swept, consumed or released, and an abandoned acquire's.
+    /// The leases whose capability ended in this completion, in order:
+    /// those the operation swept, consumed or released, and an abandoned
+    /// acquire's.
     pub lease_ends: Vec<LeaseEnd>,
+    /// The engine's header generation once the completion finished.
+    pub generation: HeaderGeneration,
     /// [`EnginePort::state_digest`] once the completion finished.
     pub state_digest: [u8; 32],
 }
 
-/// One lifecycle event, in the order [`ControlledPort::take_events`] gives
-/// them.
+/// One published change.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StorageEvent {
-    /// A call's first poll submitted an operation.
+pub struct Fact {
+    /// Its sequence number, from 1, unique and gapless within the port.
+    pub seq: u64,
+    /// Its transaction's number, from 1. A transaction's facts are
+    /// consecutive.
+    pub txn: u64,
+    /// When its transaction happened.
+    pub at: Instant,
+    /// What changed.
+    pub kind: FactKind,
+}
+
+/// What a [`Fact`] records. The head kinds name their transaction and come
+/// last in it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FactKind {
+    /// A submitted locator's permit moved into storage's permit container.
+    PermitTaken {
+        /// The operation.
+        id: OpId,
+    },
+    /// Storage's permit for a locator left its container, at the
+    /// operation's completion or at shutdown.
+    PermitDropped {
+        /// The operation.
+        id: OpId,
+    },
+    /// A change in the lease registry.
+    Lease(LeaseFact),
+    /// Head: a call's first poll submitted an operation.
     Submitted {
         /// The new operation's ID.
         id: OpId,
@@ -109,28 +150,39 @@ pub enum StorageEvent {
         /// A digest of its request.
         request_digest: [u8; 32],
     },
-    /// A caller dropped its future while its operation was pending. The
-    /// operation stays pending.
+    /// Head: a caller dropped its call while the operation was pending.
+    /// The operation stays pending.
     CallerDropped {
         /// The operation.
         id: OpId,
     },
-    /// The run completed an operation.
-    Completed(Completion),
-    /// A caller dropped a delivered reply without taking it.
+    /// Head: a caller took its reply.
+    ReplyTaken {
+        /// The operation.
+        id: OpId,
+    },
+    /// Head: a caller dropped its delivered reply without taking it.
     ReplyDropped {
         /// The operation.
         id: OpId,
-        /// The lease an abandoned `Acquired` reply ended, if any.
-        lease_ends: Vec<LeaseEnd>,
     },
-    /// The port shut down.
+    /// Head: the run completed an operation.
+    Completed(Box<Completion>),
+    /// Head: the port shut down.
     ShutDown {
         /// The operations it dropped, pending or with an untaken reply.
         dropped: Vec<OpId>,
-        /// Every lease that was still live.
-        lease_ends: Vec<LeaseEnd>,
     },
+}
+
+impl FactKind {
+    /// Whether this kind names its transaction and comes last in it.
+    pub fn is_head(&self) -> bool {
+        !matches!(
+            self,
+            FactKind::PermitTaken { .. } | FactKind::PermitDropped { .. } | FactKind::Lease(_)
+        )
+    }
 }
 
 /// Why [`ControlledPort::complete`] refused a completion. A refusal changes
@@ -182,8 +234,11 @@ struct Ops {
     /// the operation is taken to run, or at shutdown, and drops after the
     /// lock is released, since the last permit's drop is a scheduling point.
     permits: BTreeMap<OpId, LocatorReadPermit>,
-    /// Events not yet taken.
-    events: Vec<StorageEvent>,
+    /// The last sequence number and transaction number handed out.
+    last_seq: u64,
+    last_txn: u64,
+    /// Facts not yet taken.
+    facts: Vec<Fact>,
     /// Set by shutdown, after which nothing is submitted.
     shut_down: bool,
 }
@@ -225,6 +280,40 @@ enum Stage {
     Running,
     /// Completed, with the reply its caller hasn't polled yet.
     Replied { reply: HeaderReply },
+}
+
+impl Ops {
+    /// Publishes `kinds` as one transaction at `at`, in order, and returns
+    /// its facts.
+    fn publish(&mut self, at: Instant, kinds: Vec<FactKind>) -> Vec<Fact> {
+        debug_assert!(
+            kinds.last().is_some_and(FactKind::is_head)
+                && kinds[..kinds.len() - 1].iter().all(|kind| !kind.is_head()),
+            "a transaction ends with exactly one head fact"
+        );
+        self.last_txn = self
+            .last_txn
+            .checked_add(1)
+            .expect("a run publishes fewer than 2^64 transactions");
+        let txn = self.last_txn;
+        let facts: Vec<Fact> = kinds
+            .into_iter()
+            .map(|kind| {
+                self.last_seq = self
+                    .last_seq
+                    .checked_add(1)
+                    .expect("a run publishes fewer than 2^64 facts");
+                Fact {
+                    seq: self.last_seq,
+                    txn,
+                    at,
+                    kind,
+                }
+            })
+            .collect();
+        self.facts.extend(facts.iter().cloned());
+        facts
+    }
 }
 
 impl ControlledPort {
@@ -371,8 +460,13 @@ impl ControlledPort {
             }
         };
         // The permit is held until the read finishes.
+        let permit_dropped = permit.is_some();
         drop(permit);
-        let mut lease_ends = effects.fire();
+        let mut kinds: Vec<FactKind> = Vec::new();
+        if permit_dropped {
+            kinds.push(FactKind::PermitDropped { id });
+        }
+        kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
         let (caller, abandoned, identity, request_digest) = {
             let mut ops = self.ops();
             let slot = ops
@@ -392,24 +486,40 @@ impl ControlledPort {
             }
         };
         if let Some((_, reply)) = &abandoned {
-            // The completion's own record carries the ends.
-            lease_ends.extend(self.abandon(reply, |_| {}).fire());
+            // The completion's own transaction carries the facts.
+            let ((), effects) = self.abandon(reply, |_| ());
+            kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
         }
         drop(abandoned);
-        let completion = Completion {
-            id,
-            op,
-            request: identity,
-            result,
-            request_digest,
-            outcome,
-            delivered: caller.is_some(),
-            lease_ends,
-            state_digest: self.engine.state_digest(),
+        let lease_ends = kinds
+            .iter()
+            .filter_map(|kind| match kind {
+                FactKind::Lease(fact) => LeaseEnd::of(fact),
+                _ => None,
+            })
+            .collect();
+        let generation = self.engine.snapshot().header_generation;
+        let state_digest = self.engine.state_digest();
+        let completion = {
+            let mut ops = self.ops();
+            let mut completion = Completion {
+                txn: 0,
+                id,
+                op,
+                request: identity,
+                result,
+                request_digest,
+                outcome,
+                delivered: caller.is_some(),
+                lease_ends,
+                generation,
+                state_digest,
+            };
+            completion.txn = ops.last_txn.saturating_add(1);
+            kinds.push(FactKind::Completed(Box::new(completion.clone())));
+            ops.publish(now, kinds);
+            completion
         };
-        self.ops()
-            .events
-            .push(StorageEvent::Completed(completion.clone()));
         // Woken outside the lock, since a waker can run scheduler code.
         if let Some(waker) = caller {
             waker.wake();
@@ -419,30 +529,42 @@ impl ControlledPort {
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take
     /// it, and returns the effects to fire once no lock is held. Other
-    /// replies own nothing. Calls `record` with the lease ends as the lease
-    /// ends, as [`EnginePort::abandon`] does.
-    fn abandon(&self, reply: &HeaderReply, record: impl FnOnce(&[LeaseEnd])) -> Effects {
+    /// replies own nothing. Calls `record` with the lease facts as the lease
+    /// ends and returns its value, as [`EnginePort::abandon`] does.
+    fn abandon<R>(
+        &self,
+        reply: &HeaderReply,
+        record: impl FnOnce(&[LeaseFact]) -> R,
+    ) -> (R, Effects) {
         match reply {
             HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))) => {
                 self.engine.abandon(path, record)
             }
-            _ => {
-                record(&[]);
-                Effects::default()
-            }
+            _ => (record(&[]), Effects::default()),
         }
     }
 
-    /// The events since the last call, in order.
-    pub fn take_events(&self) -> Vec<StorageEvent> {
-        mem::take(&mut self.ops().events)
+    /// The facts published since the last call, in order.
+    pub fn take_facts(&self) -> Vec<Fact> {
+        mem::take(&mut self.ops().facts)
     }
 
     /// Shuts the service down, as the end of a run does. Drops every pending
     /// operation unrun, with its inputs, and every untaken reply, then ends
     /// every lease and closes the selected-chain watch. No caller is woken,
     /// and a call polled afterwards never completes. A repeat does nothing.
+    ///
+    /// Only the run shuts a port down, outside any task: its transaction is
+    /// published at its end, which a task could otherwise interleave.
     pub fn shut_down(&self) {
+        #[cfg(zakura_sim)]
+        debug_assert!(
+            zakura_rt::sim::executor()
+                .and_then(|executor| executor.current_task())
+                .is_none(),
+            "only the run shuts a controlled port down"
+        );
+        let now = Instant::now();
         let (slots, permits) = {
             let mut ops = self.ops();
             if mem::replace(&mut ops.shut_down, true) {
@@ -451,14 +573,22 @@ impl ControlledPort {
             (mem::take(&mut ops.slots), mem::take(&mut ops.permits))
         };
         let dropped = slots.keys().copied().collect();
+        let mut kinds: Vec<FactKind> = permits
+            .keys()
+            .map(|id| FactKind::PermitDropped { id: *id })
+            .collect();
         // Dropped outside the lock, since a permit wakes waiters.
         drop((slots, permits));
-        let lease_ends = self.engine.shut_down_leases().fire();
+        kinds.extend(
+            self.engine
+                .shut_down_leases()
+                .fire()
+                .into_iter()
+                .map(FactKind::Lease),
+        );
         self.engine.close_selected_chain();
-        self.ops().events.push(StorageEvent::ShutDown {
-            dropped,
-            lease_ends,
-        });
+        kinds.push(FactKind::ShutDown { dropped });
+        self.ops().publish(now, kinds);
     }
 
     /// A future that submits `request` on its first poll and resolves to its
@@ -550,14 +680,17 @@ impl<T: FromReply> Future for Call<'_, T> {
                         rejected,
                     },
                 );
+                let mut kinds = Vec::new();
                 if let Some(permit) = permit {
                     ops.permits.insert(id, permit);
+                    kinds.push(FactKind::PermitTaken { id });
                 }
-                ops.events.push(StorageEvent::Submitted {
+                kinds.push(FactKind::Submitted {
                     id,
                     request: identity,
                     request_digest,
                 });
+                ops.publish(Instant::now(), kinds);
                 drop(ops);
                 self.state = CallState::Submitted(id);
                 Poll::Pending
@@ -576,6 +709,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     else {
                         unreachable!("the stage was checked above under the same lock");
                     };
+                    ops.publish(Instant::now(), vec![FactKind::ReplyTaken { id }]);
                     drop(ops);
                     self.state = CallState::Done;
                     Poll::Ready(T::from_reply(reply))
@@ -597,32 +731,57 @@ impl<T> Drop for Call<'_, T> {
         let CallState::Submitted(id) = self.state else {
             return;
         };
-        let mut ops = self.port.ops();
+        let port = self.port;
+        let mut ops = port.ops();
         let Some(slot) = ops.slots.get_mut(&id) else {
             return;
         };
-        if !matches!(slot.stage, Stage::Replied { .. }) {
-            // Accepted work outlives its caller.
-            let caller = slot.caller.take();
-            ops.events.push(StorageEvent::CallerDropped { id });
-            drop(ops);
-            drop(caller);
-            return;
-        }
-        let Some(Slot {
-            stage: Stage::Replied { reply, .. },
-            ..
-        }) = ops.slots.remove(&id)
-        else {
-            unreachable!("the stage was checked above under the same lock");
+        let acquired = match &slot.stage {
+            Stage::Replied {
+                reply: HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))),
+            } => Some((**path).clone()),
+            Stage::Replied { .. } => None,
+            Stage::Pending { .. } | Stage::Running => {
+                // Accepted work outlives its caller.
+                let caller = slot.caller.take();
+                ops.publish(Instant::now(), vec![FactKind::CallerDropped { id }]);
+                drop(ops);
+                drop(caller);
+                return;
+            }
         };
+        let Some(path) = acquired else {
+            let removed = ops.slots.remove(&id);
+            ops.publish(Instant::now(), vec![FactKind::ReplyDropped { id }]);
+            drop(ops);
+            drop(removed);
+            return;
+        };
+        // The lease lock's acquisition is a scheduling point, so the slot
+        // stays until the lease ends and both are recorded together under
+        // it.
         drop(ops);
-        let effects = self.port.abandon(&reply, |lease_ends| {
-            self.port.ops().events.push(StorageEvent::ReplyDropped {
-                id,
-                lease_ends: lease_ends.to_vec(),
-            });
+        let (removed, effects) = port.engine.abandon(&path, |lease_facts| {
+            let mut ops = port.ops();
+            let replied = matches!(
+                ops.slots.get(&id),
+                Some(Slot {
+                    stage: Stage::Replied { .. },
+                    ..
+                })
+            );
+            if !replied {
+                return None;
+            }
+            let removed = ops.slots.remove(&id);
+            let mut kinds: Vec<FactKind> =
+                lease_facts.iter().cloned().map(FactKind::Lease).collect();
+            kinds.push(FactKind::ReplyDropped { id });
+            ops.publish(Instant::now(), kinds);
+            removed
         });
+        // Dropped and fired outside every lock.
+        drop(removed);
         effects.fire();
     }
 }

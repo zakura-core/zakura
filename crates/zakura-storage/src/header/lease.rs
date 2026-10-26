@@ -16,7 +16,10 @@ use zakura_chain::block;
 use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{AcquirePathReply, ServingCapacitySignal};
 
-use super::{evidence::SignalClass, Release};
+use super::{
+    evidence::{CapacityClass, LeaseFact, LeaseKey, RetentionEnd, SignalClass, Waiter},
+    Release,
+};
 use zakura_rt::time::Instant;
 
 /// Most leases held at once, zakura-state's `MAX_RETAINED_PATH_LEASES`.
@@ -108,31 +111,45 @@ pub struct LeaseEnd {
     pub release: Release,
 }
 
+impl LeaseEnd {
+    /// The capability end `fact` records, if it records one.
+    pub fn of(fact: &LeaseFact) -> Option<Self> {
+        match fact {
+            LeaseFact::CapabilityEnded { lease, release } => Some(LeaseEnd {
+                peer: lease.peer,
+                lease_id: lease.lease_id,
+                release: *release,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// What registry changes leave to do once the registry's lock is released:
-/// the leases they ended, and the capacity signals to fire. Firing or
-/// dropping a signal is a scheduling point in a simulator run, and a task
-/// suspended there with the lock held would leave the run unable to take
-/// it, so signals never fire under the lock.
+/// the facts they recorded, in order, and the capacity signals to fire.
+/// Firing or dropping a signal is a scheduling point in a simulator run,
+/// and a task suspended there with the lock held would leave the run unable
+/// to take it, so signals never fire under the lock.
 #[must_use = "the capacity signals must fire"]
 #[derive(Debug, Default)]
 pub(crate) struct Effects {
-    ends: Vec<LeaseEnd>,
+    facts: Vec<LeaseFact>,
     signals: Vec<ServingCapacitySignal>,
 }
 
 impl Effects {
-    /// The leases ended, in order.
-    pub(crate) fn ends(&self) -> &[LeaseEnd] {
-        &self.ends
+    /// The facts recorded, in order.
+    pub(crate) fn facts(&self) -> &[LeaseFact] {
+        &self.facts
     }
 
     /// Fires the capacity signals in the order the registry released them,
-    /// and returns the lease ends. Call it with no lock held.
-    pub(crate) fn fire(self) -> Vec<LeaseEnd> {
+    /// and returns the facts. Call it with no lock held.
+    pub(crate) fn fire(self) -> Vec<LeaseFact> {
         for signal in self.signals {
             signal.release();
         }
-        self.ends
+        self.facts
     }
 }
 
@@ -161,20 +178,44 @@ impl Registry {
             .filter_map(|(peer, cursor)| (cursor.idle_deadline <= now).then_some(*peer))
             .collect();
         for peer in expired {
-            self.remove_peer(peer, Release::LeaseIdleExpired);
+            self.end_with_capability(peer, Release::LeaseIdleExpired);
+        }
+    }
+
+    /// The key of `peer`'s lease `cursor`.
+    fn key(peer: SourceId, cursor: &Cursor) -> LeaseKey {
+        LeaseKey {
+            peer,
+            session_id: cursor.session_id,
+            lease_id: cursor.lease_id,
+        }
+    }
+
+    /// Ends `peer`'s lease with `release` and its retained path with it.
+    fn end_with_capability(&mut self, peer: SourceId, release: Release) {
+        if let Some(cursor) = self.remove_peer(peer, release) {
+            self.effects.facts.push(LeaseFact::RetentionEnded {
+                lease: Self::key(peer, &cursor),
+                why: RetentionEnd::WithCapability,
+            });
         }
     }
 
     /// Removes `peer`'s lease, records why, and queues its signal and any
-    /// capacity waiters' to fire.
+    /// capacity waiters' to fire. The caller records what happens to the
+    /// retained path.
     fn remove_peer(&mut self, peer: SourceId, release: Release) -> Option<Cursor> {
         let mut cursor = self.by_peer.remove(&peer)?;
-        self.effects.ends.push(LeaseEnd {
-            peer,
-            lease_id: cursor.lease_id,
-            release,
-        });
-        self.effects.signals.extend(cursor.capacity_signal.take());
+        let lease = Self::key(peer, &cursor);
+        self.effects
+            .facts
+            .push(LeaseFact::CapabilityEnded { lease, release });
+        if let Some(signal) = cursor.capacity_signal.take() {
+            self.effects
+                .facts
+                .push(LeaseFact::WaiterFired(Waiter::Peer(lease)));
+            self.effects.signals.push(signal);
+        }
         self.notify_capacity();
         Some(cursor)
     }
@@ -190,10 +231,20 @@ impl Registry {
     /// Queues each class's waiting signal to fire once the class has room.
     fn notify_capacity(&mut self) {
         if self.general_count() < Capacity::General.limit() {
-            self.effects.signals.extend(self.general_capacity.take());
+            if let Some(signal) = self.general_capacity.take() {
+                self.effects
+                    .facts
+                    .push(LeaseFact::WaiterFired(Waiter::General));
+                self.effects.signals.push(signal);
+            }
         }
         if self.by_peer.len() < Capacity::Bounded.limit() {
-            self.effects.signals.extend(self.fallback_capacity.take());
+            if let Some(signal) = self.fallback_capacity.take() {
+                self.effects
+                    .facts
+                    .push(LeaseFact::WaiterFired(Waiter::Fallback));
+                self.effects.signals.push(signal);
+            }
         }
     }
 
@@ -209,6 +260,16 @@ impl Registry {
     ) -> Result<Capacity, AcquirePathReply> {
         self.expire(now);
         if let Some(cursor) = self.by_peer.get_mut(&peer) {
+            if cursor.capacity_signal.is_none() {
+                let lease = Self::key(peer, cursor);
+                self.effects
+                    .facts
+                    .push(LeaseFact::WaiterSet(Waiter::Peer(lease)));
+            }
+            let cursor = self
+                .by_peer
+                .get_mut(&peer)
+                .expect("the lease was found above");
             return Err(AcquirePathReply::CapacityBusy(
                 cursor.capacity_signal.get_or_insert_default().clone(),
             ));
@@ -219,10 +280,13 @@ impl Registry {
         if capacity == Capacity::Bounded && self.by_peer.len() < Capacity::Bounded.limit() {
             return Ok(Capacity::Bounded);
         }
-        let signal = match capacity {
-            Capacity::General => &mut self.general_capacity,
-            Capacity::Bounded => &mut self.fallback_capacity,
+        let (signal, waiter) = match capacity {
+            Capacity::General => (&mut self.general_capacity, Waiter::General),
+            Capacity::Bounded => (&mut self.fallback_capacity, Waiter::Fallback),
         };
+        if signal.is_none() {
+            self.effects.facts.push(LeaseFact::WaiterSet(waiter));
+        }
         Err(AcquirePathReply::CapacityBusy(
             signal.get_or_insert_default().clone(),
         ))
@@ -254,15 +318,32 @@ impl Registry {
     /// The refusal for a reserve admission whose path needs an ordinary
     /// slot, as `reject_beyond_reserve` gives it.
     pub(super) fn beyond_reserve(&mut self) -> AcquirePathReply {
+        if self.general_capacity.is_none() {
+            self.effects
+                .facts
+                .push(LeaseFact::WaiterSet(Waiter::General));
+        }
         let signal = self.general_capacity.get_or_insert_default().clone();
         self.notify_capacity();
         AcquirePathReply::CapacityBusy(signal)
     }
 
     /// Takes `peer`'s continuation, if it has one. A caller that then
-    /// rejects it drops it, as production does.
-    pub(super) fn take_continuation(&mut self, peer: SourceId) -> Option<Cursor> {
-        self.continuations.remove(&peer)
+    /// doesn't continue from it drops it, as production does, and calls
+    /// [`Self::discard`].
+    pub(super) fn take_continuation(&mut self, peer: SourceId) -> Option<(LeaseKey, Cursor)> {
+        self.continuations
+            .remove(&peer)
+            .map(|cursor| (Self::key(peer, &cursor), cursor))
+    }
+
+    /// Records that a taken continuation's path was dropped without
+    /// continuing.
+    pub(super) fn discard(&mut self, continuation: LeaseKey) {
+        self.effects.facts.push(LeaseFact::RetentionEnded {
+            lease: continuation,
+            why: RetentionEnd::Discarded,
+        });
     }
 
     /// Counts an acquire that continued from a cached cursor.
@@ -273,9 +354,41 @@ impl Registry {
     /// Installs `peer`'s lease, as `commit_reservation` does. Returns its
     /// lease ID, or `None` if the ID counter ran out, which production
     /// answers with `Busy`.
-    pub(super) fn commit(&mut self, peer: SourceId, spec: Spec, now: Instant) -> Option<u64> {
-        let lease_id = self.next_lease_id.checked_add(1)?;
+    pub(super) fn commit(
+        &mut self,
+        peer: SourceId,
+        spec: Spec,
+        now: Instant,
+        continued_from: Option<LeaseKey>,
+    ) -> Option<u64> {
+        let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            if let Some(continuation) = continued_from {
+                self.discard(continuation);
+            }
+            return None;
+        };
         self.next_lease_id = lease_id;
+        if let Some(continuation) = continued_from {
+            self.effects.facts.push(LeaseFact::RetentionEnded {
+                lease: continuation,
+                why: RetentionEnd::Continued { into: lease_id },
+            });
+        }
+        self.effects.facts.push(LeaseFact::Leased {
+            lease: LeaseKey {
+                peer,
+                session_id: spec.session_id,
+                lease_id,
+            },
+            scope: spec.scope,
+            target: spec.target,
+            common_ancestor: spec.common_ancestor,
+            capacity: match spec.capacity {
+                Capacity::General => CapacityClass::General,
+                Capacity::Bounded => CapacityClass::Bounded,
+            },
+            continued_from: continued_from.map(|continuation| continuation.lease_id),
+        });
         self.by_peer.insert(
             peer,
             Cursor {
@@ -327,7 +440,7 @@ impl Registry {
             .get(&peer)
             .is_some_and(|cursor| cursor.idle_deadline <= now)
         {
-            self.remove_peer(peer, Release::LeaseIdleExpired);
+            self.end_with_capability(peer, Release::LeaseIdleExpired);
             return false;
         }
         let Some(cursor) = self.by_peer.get_mut(&peer) else {
@@ -344,7 +457,13 @@ impl Registry {
         let cursor = self
             .remove_peer(peer, Release::LeaseConsumedByRead)
             .expect("the lease was checked above");
-        if cursor.position != Position::Complete {
+        let lease = Self::key(peer, &cursor);
+        if cursor.position == Position::Complete {
+            self.effects.facts.push(LeaseFact::RetentionEnded {
+                lease,
+                why: RetentionEnd::WithCapability,
+            });
+        } else {
             if self.continuations.len() >= MAX_RETAINED_PATH_LEASES {
                 let oldest = self
                     .continuations
@@ -352,8 +471,19 @@ impl Registry {
                     .min_by_key(|(_, cursor)| cursor.lease_id)
                     .map(|(peer, _)| *peer)
                     .expect("a full continuation cache is nonempty");
-                self.continuations.remove(&oldest);
+                let evicted = self
+                    .continuations
+                    .remove(&oldest)
+                    .expect("the oldest continuation was found above");
+                self.effects.facts.push(LeaseFact::RetentionEnded {
+                    lease: Self::key(oldest, &evicted),
+                    why: RetentionEnd::Evicted,
+                });
             }
+            self.effects.facts.push(LeaseFact::RetentionCached {
+                lease,
+                last_frontier: cursor.last_frontier,
+            });
             self.continuations.insert(peer, cursor);
         }
         true
@@ -373,7 +503,7 @@ impl Registry {
             cursor.session_id == session_id && cursor.lease_id == lease_id && cursor.scope == scope
         });
         if matches {
-            self.remove_peer(peer, release);
+            self.end_with_capability(peer, release);
         }
         matches
     }
@@ -383,9 +513,14 @@ impl Registry {
     pub(super) fn shut_down(&mut self) {
         let peers: Vec<_> = self.by_peer.keys().copied().collect();
         for peer in peers {
-            self.remove_peer(peer, Release::Shutdown);
+            self.end_with_capability(peer, Release::Shutdown);
         }
-        self.continuations.clear();
+        for (peer, cursor) in std::mem::take(&mut self.continuations) {
+            self.effects.facts.push(LeaseFact::RetentionEnded {
+                lease: Self::key(peer, &cursor),
+                why: RetentionEnd::ShutdownCleared,
+            });
+        }
     }
 
     /// What the changes since the last call left to do.

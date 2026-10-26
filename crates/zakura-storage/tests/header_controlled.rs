@@ -27,8 +27,8 @@ use zakura_storage::header::{
     controlled::{CompleteError, Completion, ControlledPort, FactKind, OpId},
     evidence::{
         CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
-        LeaseState, OperationStage, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass,
-        Waiter,
+        LeaseState, OperationStage, PathPosition, RequestIdentity, ResultIdentity, RetentionEnd,
+        SignalClass, Waiter,
     },
     fixture::HeaderFixture,
     lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
@@ -1305,6 +1305,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
             scope: first.scope,
             target: chain[2],
             common_ancestor: anchor,
+            position: PathPosition::Retained { next: 0 },
             capacity: CapacityClass::General,
             continued_from: None,
         }
@@ -1373,6 +1374,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
             LeaseFact::RetentionCached {
                 lease: l2,
                 last_frontier: chain[0],
+                position: PathPosition::Retained { next: 1 },
             },
         ]
     );
@@ -1408,6 +1410,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
                 scope: third.scope,
                 target: chain[2],
                 common_ancestor: chain[0],
+                position: PathPosition::Retained { next: 1 },
                 capacity: CapacityClass::General,
                 continued_from: Some(l2.lease_id),
             },
@@ -1561,6 +1564,7 @@ fn a_full_continuation_cache_evicts_before_caching() {
             LeaseFact::RetentionCached {
                 lease: newest,
                 last_frontier: chain[0],
+                position: PathPosition::Retained { next: 1 },
             },
         ]
     );
@@ -1722,7 +1726,7 @@ fn owner_state_reads_every_container() {
     let (port, chain) = chain(3);
     let anchor = HeaderFixture::regtest().anchor();
     let semaphore = Arc::new(Semaphore::new(1));
-    let (reply, _) = run(
+    let (reply, leased) = run(
         &port,
         port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
     );
@@ -1786,8 +1790,10 @@ fn owner_state_reads_every_container() {
             scope: live.scope,
             target: chain[2],
             last_frontier: anchor,
+            position: PathPosition::Retained { next: 0 },
             capacity: CapacityClass::General,
             waiter: true,
+            leased_txn: Some(leased.txn),
         }]
     );
     assert_eq!(
@@ -1797,6 +1803,8 @@ fn owner_state_reads_every_container() {
             scope: cached.scope,
             target: chain[2],
             last_frontier: chain[0],
+            position: PathPosition::Retained { next: 1 },
+            retained: 3,
         }]
     );
     assert_eq!(state.class_waiters, ClassWaiters::default());

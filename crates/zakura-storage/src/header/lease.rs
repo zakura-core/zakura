@@ -19,7 +19,7 @@ use zakura_node_services::header_chain::{AcquirePathReply, ServingCapacitySignal
 use super::{
     evidence::{
         CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey, LeaseState,
-        OwnerState, RetentionEnd, SignalClass, Waiter,
+        OwnerState, PathPosition, RetentionEnd, SignalClass, Waiter,
     },
     Release,
 };
@@ -74,6 +74,17 @@ pub(super) enum Position {
     Complete,
 }
 
+impl Position {
+    /// This position as evidence reports it.
+    fn evidence(self) -> PathPosition {
+        match self {
+            // usize always fits in u64 on supported targets.
+            Position::Retained { next } => PathPosition::Retained { next: next as u64 },
+            Position::Complete => PathPosition::Complete,
+        }
+    }
+}
+
 /// One peer's lease, or a consumed lease kept for continuation.
 #[derive(Clone, Debug)]
 pub(super) struct Cursor {
@@ -89,6 +100,8 @@ pub(super) struct Cursor {
     pub(super) retained_path: Arc<[block::Hash]>,
     idle_deadline: Instant,
     pub(super) capacity: Capacity,
+    /// The controlled transaction that created the lease, if one did.
+    leased_txn: Option<u64>,
 }
 
 /// What a new lease covers.
@@ -101,6 +114,8 @@ pub(super) struct Spec {
     pub(super) position: Position,
     pub(super) retained_path: Arc<[block::Hash]>,
     pub(super) capacity: Capacity,
+    /// The controlled transaction creating the lease, if one is.
+    pub(super) leased_txn: Option<u64>,
 }
 
 /// A lease that ended, and why.
@@ -386,6 +401,7 @@ impl Registry {
             scope: spec.scope,
             target: spec.target,
             common_ancestor: spec.common_ancestor,
+            position: spec.position.evidence(),
             capacity: match spec.capacity {
                 Capacity::General => CapacityClass::General,
                 Capacity::Bounded => CapacityClass::Bounded,
@@ -405,6 +421,7 @@ impl Registry {
                 retained_path: spec.retained_path,
                 idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
                 capacity: spec.capacity,
+                leased_txn: spec.leased_txn,
             },
         );
         Some(lease_id)
@@ -486,6 +503,7 @@ impl Registry {
             self.effects.facts.push(LeaseFact::RetentionCached {
                 lease,
                 last_frontier: cursor.last_frontier,
+                position: cursor.position.evidence(),
             });
             self.continuations.insert(peer, cursor);
         }
@@ -582,11 +600,13 @@ impl Registry {
                     scope,
                     target,
                     last_frontier,
+                    position: cursor.position.evidence(),
                     capacity: match cursor.capacity {
                         Capacity::General => CapacityClass::General,
                         Capacity::Bounded => CapacityClass::Bounded,
                     },
                     waiter: cursor.capacity_signal.is_some(),
+                    leased_txn: cursor.leased_txn,
                 }
             })
             .collect();
@@ -600,6 +620,9 @@ impl Registry {
                     scope,
                     target,
                     last_frontier,
+                    position: cursor.position.evidence(),
+                    // usize always fits in u64 on supported targets.
+                    retained: cursor.retained_path.len() as u64,
                 }
             })
             .collect();

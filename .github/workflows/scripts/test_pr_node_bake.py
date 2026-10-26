@@ -43,9 +43,10 @@ class SnapshotHeight(unittest.TestCase):
             "if sys.argv[3:] == ['start']:\n"
             " import tomllib\n"
             " settings = tomllib.loads(config)\n"
-            " assert settings['state']['storage_mode'] == 'pruned'\n"
-            " assert settings['state']['debug_stop_at_height'] == 0\n"
             " cache = pathlib.Path(settings['state']['cache_dir'])\n"
+            " mode = 'archive' if cache.name == 'sandblast' else 'pruned'\n"
+            " assert settings['state']['storage_mode'] == mode\n"
+            " assert settings['state']['debug_stop_at_height'] == 0\n"
             " assert (cache / 'restored').exists()\n"
             " assert settings['consensus']['checkpoint_sync']\n"
             " assert settings['consensus']['vct_fast_sync']\n"
@@ -131,7 +132,7 @@ class SnapshotHeight(unittest.TestCase):
         return self.run_script(
             shell_function("read_state_height")
             + shell_function("fetch_tip_state")
-            + shell_function("upgrade_tip_state")
+            + shell_function("upgrade_restored_state")
             + f"\nexport REQUIRE_UPGRADE=1 UPGRADE_STATUS={upgrade_status}\n"
             + r"""
 MAINNET_MNT="$PWD/mainnet"
@@ -252,6 +253,36 @@ python3() {
                 self.assertIn("could not upgrade restored Mainnet database", result.stderr)
                 self.assertFalse((self.root / "mainnet-state-height").exists())
                 self.assertFalse((self.root / "testnet-state-height").exists())
+
+    def test_bake_upgrades_sandblast_archive_in_archive_mode(self):
+        source = pathlib.Path(__file__).with_name("pr-node-bake.sh").read_text()
+        start = 'fetch_state "$SANDBLAST_URL"'
+        body = start + source.split(start, 1)[1].split("\n\n", 1)[0]
+        marker = self.root / "mainnet/sandblast/upgraded"
+        for status in (0, 1, 124):
+            with self.subTest(status=status):
+                marker.unlink(missing_ok=True)
+                result = self.run_script(
+                    shell_function("upgrade_restored_state")
+                    + f"\nexport UPGRADE_STATUS={status}\n"
+                    + r"""
+MAINNET_MNT="$PWD/mainnet"
+SANDBLAST_URL=https://snapshots.example/sandblast.tar.zst
+SANDBLAST_SHA256=unused
+fetch_state() {
+  mkdir -p "$3"
+  touch "$3/restored"
+}
+""" + body,
+                    {},
+                )
+                if status == 0:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(marker.exists())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("could not upgrade restored Mainnet database", result.stderr)
+                    self.assertFalse(marker.exists())
 
     def test_bake_stops_without_publishing_an_unreadable_database_height(self):
         for network in ("Mainnet", "Testnet"):

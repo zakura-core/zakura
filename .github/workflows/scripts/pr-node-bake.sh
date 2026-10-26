@@ -205,14 +205,15 @@ fetch_tip_state() {
   IFS=$'\t' read -r url sha <<< "$fields"
   echo "$network tip: $(printf '%s\n' "$metadata" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
   fetch_state "$url" "$sha" "$dest" "$network"
-  upgrade_tip_state "$dest" "$network"
+  upgrade_restored_state "$dest" "$network" pruned
 }
 
-upgrade_tip_state() {
+upgrade_restored_state() {
   # tip-height opens read-only and cannot reuse a previous major-version path.
   # Normal startup performs supported format upgrades before checking the stop
   # height. Stop at the existing tip before any network sync or block commits.
-  local cache_dir="$1" network="$2" config output
+  # storage_mode must match how runs open this tree, since pruning is one-way.
+  local cache_dir="$1" network="$2" storage_mode="$3" config output
   case "$network" in
     mainnet) network=Mainnet ;;
     testnet) network=Testnet ;;
@@ -225,7 +226,7 @@ p2p_stack = "zakura"
 
 [state]
 cache_dir = "$cache_dir"
-storage_mode = "pruned"
+storage_mode = "$storage_mode"
 debug_stop_at_height = 0
 
 [consensus]
@@ -270,8 +271,12 @@ mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
 mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 
-# Mainnet sandblast: pinned archive just before the 2022 spam region.
+# Mainnet sandblast: pinned archive just before the 2022 spam region. The
+# archive keeps the DB format it was published with, so upgrade it here rather
+# than inside a timed perf-bench run, whose preflight only accepts the current
+# or previous major.
 fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
+upgrade_restored_state "$MAINNET_MNT/sandblast" mainnet archive
 
 # Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
 # reliably because pruning removes transaction data rollback-state needs.

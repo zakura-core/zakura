@@ -203,6 +203,22 @@ struct Slot {
     caller: Option<Waker>,
     attribution: Attribution,
     request_digest: [u8; 32],
+    /// Whether the request fails an adapter-side input check. Those checks
+    /// read only a handle's or a target's seal, which can't change after
+    /// submission, so they run once, there, rather than on every listing.
+    rejected: bool,
+}
+
+impl Slot {
+    /// The outcomes legal `since_submit` after submission, in canonical
+    /// order, as [`HeaderRequest::enabled`] gives them.
+    fn enabled(&self, request: &HeaderRequest, since_submit: Duration) -> Vec<Outcome> {
+        if self.rejected {
+            vec![Outcome::Rejected]
+        } else {
+            request.op().enabled(since_submit).collect()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -244,7 +260,6 @@ impl ControlledPort {
     /// Every pending operation in ID order, with the outcomes legal now.
     pub fn pending(&self) -> Vec<PendingOp> {
         let now = Instant::now();
-        let key = self.engine.adapter_key();
         self.ops()
             .slots
             .iter()
@@ -252,7 +267,7 @@ impl ControlledPort {
                 Stage::Pending { request, submitted } => Some(PendingOp {
                     id: *id,
                     op: request.op(),
-                    enabled: request.enabled(key, now.saturating_duration_since(*submitted)),
+                    enabled: slot.enabled(request, now.saturating_duration_since(*submitted)),
                     caller_waiting: slot.caller.is_some(),
                 }),
                 Stage::Running | Stage::Replied(_) => None,
@@ -264,16 +279,16 @@ impl ControlledPort {
     /// none will without a completion. Only a timeout's gate opens later.
     pub fn next_gate(&self) -> Option<Duration> {
         let now = Instant::now();
-        let key = self.engine.adapter_key();
         self.ops()
             .slots
             .values()
             .filter_map(|slot| match &slot.stage {
-                Stage::Pending { request, submitted } => Some((request, *submitted)),
-                Stage::Running | Stage::Replied(_) => None,
+                // A rejected request has only its rejection, whenever it runs.
+                Stage::Pending { request, submitted } if !slot.rejected => {
+                    Some((request, *submitted))
+                }
+                Stage::Pending { .. } | Stage::Running | Stage::Replied(_) => None,
             })
-            // A rejected request has only its rejection, whenever it runs.
-            .filter(|(request, _)| request.rejected_by(key).is_none())
             .filter(|(request, _)| {
                 request
                     .op()
@@ -317,9 +332,9 @@ impl ControlledPort {
                     since_submit,
                 })
             };
-            request
-                .check(key, outcome, since_submit)
-                .map_err(CompleteError::Illegal)?;
+            if !slot.enabled(request, since_submit).contains(&outcome) {
+                return Err(illegal());
+            }
             // A fault or rejection needs no engine, so its reply is built
             // before anything is taken.
             let early = match outcome {
@@ -492,6 +507,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     attribution(&request, key),
                     digest(&request, key),
                 );
+                let rejected = request.rejected_by(key).is_some();
                 ops.slots.insert(
                     id,
                     Slot {
@@ -502,6 +518,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                         caller: Some(cx.waker().clone()),
                         attribution,
                         request_digest,
+                        rejected,
                     },
                 );
                 ops.events.push(StorageEvent::Submitted {

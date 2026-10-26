@@ -5,10 +5,18 @@
 
 mod support;
 
+use std::{
+    cell::RefCell,
+    future::Future,
+    task::{Context, Poll, Waker},
+};
+
 use support::{inputs, recorded};
+use zakura_network::zakura::{ZakuraDiscoveryHandle, ZakuraNodeRecord};
+use zakura_quic::NodeId;
 use zakura_sim::{
     harness::{
-        discovery::{run_config, spawn, WaitComplete, WaitCompleteWakes, PROPERTY},
+        discovery::{run_config, spawn, Spawned, WaitComplete, WaitCompleteWakes, PROPERTY},
         run_harness, HarnessError,
     },
     record::DrawRecord,
@@ -31,7 +39,14 @@ fn run_wait_complete(plan: PlanInput) -> RunReport {
 /// records, and the checker, whose choices build inputs by hand.
 fn run(plan: PlanInput) -> (RunReport, Vec<String>, WaitCompleteWakes) {
     let mut checker = WaitCompleteWakes::new();
-    let (report, lines) = recorded(run_config(), plan, spawn, &mut checker);
+    let (report, lines) = recorded(
+        run_config(),
+        plan,
+        |sim| {
+            spawn(sim);
+        },
+        &mut checker,
+    );
     (report, lines, checker)
 }
 
@@ -132,7 +147,14 @@ fn reverted_fix_misses_the_wakeup() {
 
     // Unchecked, the run shows what that costs: the source sits out its
     // 2 s initial-exchange timeout.
-    let (report, _) = recorded(run_config(), Plan::from_fuzz(INPUT), spawn, &mut NoChecks);
+    let (report, _) = recorded(
+        run_config(),
+        Plan::from_fuzz(INPUT),
+        |sim| {
+            spawn(sim);
+        },
+        &mut NoChecks,
+    );
     assert!(
         report
             .picks
@@ -184,6 +206,37 @@ fn holding_the_source_back_finds_no_violation() {
     let bytes = hold_source_back().expect_err("the fix wakes the source");
     let (report, _, _) = run(Plan::from_fuzz(&bytes));
     assert_wakes(&report);
+}
+
+/// The book's record for `node`, read once the run has ended. Every task has
+/// stopped by then, so the book's lock is free and the read finishes in one
+/// poll.
+fn book_record(handle: &ZakuraDiscoveryHandle, node: NodeId) -> Option<ZakuraNodeRecord> {
+    let read = std::pin::pin!(handle.record_for(node));
+    match read.poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(record) => record,
+        Poll::Pending => panic!("the book's lock is free after the run"),
+    }
+}
+
+/// The peer's Hello record is valid for the run's clock, so it enters the
+/// book rather than being dropped as expired or too far ahead.
+#[test]
+fn the_peer_record_enters_the_book() {
+    let spawned = RefCell::new(None);
+    let mut checker = WaitCompleteWakes::new();
+    let (report, _) = recorded(
+        run_config(),
+        Plan::from_fuzz(INPUT),
+        |sim| *spawned.borrow_mut() = Some(spawn(sim)),
+        &mut checker,
+    );
+    assert_wakes(&report);
+    let Spawned { handle, peer } = spawned.into_inner().expect("the setup ran");
+    assert!(
+        book_record(&handle, peer).is_some(),
+        "the peer's Hello record passed validation and entered the book"
+    );
 }
 
 #[test]

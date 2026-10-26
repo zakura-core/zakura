@@ -19,11 +19,13 @@
 //! `std::thread`. `Duration`, `UNIX_EPOCH`, the `SystemTime` type and
 //! `std::thread::panicking` stay allowed.
 //!
-//! A path's first segment resolves through the names `use` items bind in
-//! scope, renames included, so `use std::time::SystemTime as Clock` doesn't
-//! hide `Clock::now()`. A type alias or a glob import still hides the path, so
-//! the bare spellings `SystemTime::now`, `Utc::now`, `Local::now` and
-//! `Arc::downgrade` stay flagged too.
+//! Paths resolve through the names `use` items bind, renames included, and
+//! on through `self`, `super`, the file's inline modules and further `use`
+//! items, so `use std::time::SystemTime as Clock` or a local re-export doesn't
+//! hide `Clock::now()`. When a path resolves to something the rules don't
+//! know, such as a path through `crate`, a type alias or a glob, its written
+//! spelling is checked as well, so the bare spellings `SystemTime::now`,
+//! `Utc::now`, `Local::now` and `Arc::downgrade` stay flagged.
 //!
 //! `UNIX_EPOCH.elapsed()` and `SystemTime::elapsed` read the wall clock too,
 //! so they're flagged. `.elapsed()` on another `SystemTime` value isn't,
@@ -328,13 +330,7 @@ fn check_file(
     findings.files += 1;
 
     let relative = relative_path(repo_root, path);
-    let mut visitor = PathVisitor {
-        file: &relative,
-        rules,
-        findings,
-        scopes: Vec::new(),
-    };
-    visitor.visit_module(&file.items);
+    PathVisitor::new(&relative, rules, findings).visit_file_items(&file.items);
 
     // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`, and
     // a crate's `lib.rs` keeps them beside it.
@@ -611,76 +607,166 @@ fn use_leaves(tree: &UseTree) -> Vec<UseLeaf> {
     leaves
 }
 
+/// How many `use` hops resolution follows from one path before it stops.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// The paths each name is bound to by `use` in one module or block.
+type Bindings = BTreeMap<String, Vec<Vec<String>>>;
+
 struct PathVisitor<'a> {
     file: &'a str,
     rules: &'a Rules,
     findings: &'a mut Findings,
-    /// The names `use` items bind in each scope around the current item,
-    /// innermost last.
-    scopes: Vec<Scope>,
+    /// What each module in the file binds, by its path from the file's root
+    /// module.
+    modules: BTreeMap<Vec<String>, Bindings>,
+    /// The module being visited, from the file's root module.
+    module: Vec<String>,
+    /// What the blocks around the current item bind, innermost last.
+    blocks: Vec<Bindings>,
 }
 
-/// The names one module or block binds with `use`, each to the path it
-/// imports.
-struct Scope {
-    /// A module starts a fresh namespace: names from the scopes outside it
-    /// aren't visible inside.
-    module: bool,
-    names: BTreeMap<String, Vec<String>>,
+/// What the production `use` items among `items` bind. Globs and `_` bind
+/// nothing.
+fn bindings<'a>(items: impl IntoIterator<Item = &'a Item>) -> Bindings {
+    let mut names = Bindings::new();
+    let leaves = items
+        .into_iter()
+        .filter_map(|item| match item {
+            Item::Use(item) if !is_test_only(&item.attrs) => Some(use_leaves(&item.tree)),
+            _ => None,
+        })
+        .flatten();
+    for leaf in leaves {
+        if let Some(name) = leaf.name.filter(|name| name != "_") {
+            names.insert(name, vec![leaf.path]);
+        }
+    }
+    names
 }
 
-impl Scope {
-    /// The scope of `items`: what their production `use` items bind. Globs
-    /// and `_` bind nothing.
-    fn of<'a>(module: bool, items: impl IntoIterator<Item = &'a Item>) -> Scope {
-        let names = items
-            .into_iter()
-            .filter_map(|item| match item {
-                Item::Use(item) if !is_test_only(&item.attrs) => Some(use_leaves(&item.tree)),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|leaf| Some((leaf.name.filter(|name| name != "_")?, leaf.path)))
-            .collect();
-        Scope { module, names }
+/// Records what `items` and the inline modules under them bind, under
+/// `module`.
+fn collect_modules(
+    items: &[Item],
+    module: &mut Vec<String>,
+    modules: &mut BTreeMap<Vec<String>, Bindings>,
+) {
+    modules.insert(module.clone(), bindings(items));
+    for item in items {
+        if let Item::Mod(item) = item {
+            if let (Some((_, items)), false) = (&item.content, is_test_only(&item.attrs)) {
+                module.push(item.ident.to_string());
+                collect_modules(items, module, modules);
+                module.pop();
+            }
+        }
     }
 }
 
-impl PathVisitor<'_> {
-    /// Visits a module's items with the names its `use` items bind in scope.
-    fn visit_module(&mut self, items: &[Item]) {
-        self.scopes.push(Scope::of(true, items));
+impl<'a> PathVisitor<'a> {
+    /// A visitor for the file at `file`, a path from the repository root.
+    fn new(file: &'a str, rules: &'a Rules, findings: &'a mut Findings) -> Self {
+        PathVisitor {
+            file,
+            rules,
+            findings,
+            modules: BTreeMap::new(),
+            module: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Visits a file's items, after recording what each of its modules
+    /// binds so paths through inline modules resolve.
+    fn visit_file_items(&mut self, items: &[Item]) {
+        collect_modules(items, &mut Vec::new(), &mut self.modules);
         for item in items {
             self.visit_item(item);
         }
-        self.scopes.pop();
     }
 
-    /// `segments` with its first segment replaced by the path a `use` in
-    /// scope bound it to, so `Instant::now` after `use std::time::Instant`
-    /// reads as `std::time::Instant::now`.
-    fn resolve(&self, segments: &[String]) -> Vec<String> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(path) = scope.names.get(&segments[0]) {
-                return path.iter().chain(&segments[1..]).cloned().collect();
+    /// The paths `name` is bound to in `module`. In the module being
+    /// visited, the enclosing blocks come first.
+    fn bound(&self, module: &[String], name: &str) -> Option<&Vec<Vec<String>>> {
+        let blocks = if module == self.module.as_slice() {
+            &self.blocks[..]
+        } else {
+            &[]
+        };
+        blocks
+            .iter()
+            .rev()
+            .chain(self.modules.get(module))
+            .find_map(|names| names.get(name))
+    }
+
+    /// Every path `segments` can name, following `use` bindings, `self`,
+    /// `super` and the file's inline modules, so `SystemTime::now` after
+    /// `use clocks::SystemTime`, with `clocks` re-exporting std's, reads as
+    /// `std::time::SystemTime::now`. A path that leaves the file, such as
+    /// one through `crate`, stays as far as it resolved.
+    fn resolve(&self, segments: &[String]) -> Vec<Vec<String>> {
+        let mut resolved = Vec::new();
+        let mut pending = vec![(segments.to_vec(), self.module.clone(), 0)];
+        while let Some((mut path, mut module, hops)) = pending.pop() {
+            loop {
+                let next = module
+                    .iter()
+                    .cloned()
+                    .chain([path[0].clone()])
+                    .collect::<Vec<_>>();
+                match path[0].as_str() {
+                    _ if path.len() == 1 => break,
+                    "self" => {}
+                    "super" if !module.is_empty() => {
+                        module.pop();
+                    }
+                    _ if self.modules.contains_key(&next) => module = next,
+                    _ => break,
+                }
+                path.remove(0);
             }
-            if scope.module {
-                break;
+            match self.bound(&module, &path[0]) {
+                Some(targets) if hops < MAX_ALIAS_HOPS => {
+                    for target in targets {
+                        let target = target.iter().chain(&path[1..]).cloned().collect();
+                        pending.push((target, module.clone(), hops + 1));
+                    }
+                }
+                _ => resolved.push(path),
             }
         }
-        segments.to_vec()
+        resolved
     }
 
-    fn check(&mut self, segments: &[String], span: Span) {
+    /// Checks the path written as `segments` against every path it can
+    /// name, and reports one violation if any of them is forbidden. When a
+    /// path resolves to something the rules don't know, outside `zakura_rt`,
+    /// the written spelling is checked too, so `SystemTime::now` through a
+    /// local re-export stays flagged.
+    fn check_written(&mut self, segments: &[String], span: Span) {
+        for path in self.resolve(segments) {
+            let known = self.rules.replacement(&path).is_some() || path[0] == "zakura_rt";
+            let path = if known { path } else { segments.to_vec() };
+            if self.check(&path, span) {
+                return;
+            }
+        }
+    }
+
+    /// Reports `segments` if the rules forbid it and the allowlist doesn't
+    /// allow it here. Returns whether it reported.
+    fn check(&mut self, segments: &[String], span: Span) -> bool {
         let Some(replacement) = self.rules.replacement(segments) else {
-            return;
+            return false;
         };
         let allowance = ALLOWED
             .iter()
             .position(|(file, path, _)| *file == self.file && segments.join("::") == *path);
         if let Some(allowance) = allowance {
             self.findings.allowances_used[allowance] = true;
-            return;
+            return false;
         }
         let start = span.start();
         self.findings.violations.push(Violation {
@@ -688,6 +774,7 @@ impl PathVisitor<'_> {
             path: segments.join("::"),
             replacement,
         });
+        true
     }
 
     /// Checks `a::b::c` paths inside macro arguments, which syn leaves as tokens.
@@ -710,7 +797,7 @@ impl PathVisitor<'_> {
                         next += 3;
                     }
                     if segments.len() > 1 {
-                        self.check(&self.resolve(&segments), ident.span());
+                        self.check_written(&segments, ident.span());
                     }
                     i = next;
                 }
@@ -797,7 +884,18 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if let Some((_, items)) = &item.content {
-            self.visit_module(items);
+            // A module doesn't see the names its parent's blocks bind.
+            let blocks = std::mem::take(&mut self.blocks);
+            self.module.push(item.ident.to_string());
+            // A module inside a function body isn't in the file's table yet.
+            if !self.modules.contains_key(&self.module) {
+                collect_modules(items, &mut self.module.clone(), &mut self.modules);
+            }
+            for item in items {
+                self.visit_item(item);
+            }
+            self.module.pop();
+            self.blocks = blocks;
         }
     }
 
@@ -806,9 +904,9 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
             syn::Stmt::Item(item) => Some(item),
             _ => None,
         });
-        self.scopes.push(Scope::of(false, items));
+        self.blocks.push(bindings(items));
         visit::visit_block(self, block);
-        self.scopes.pop();
+        self.blocks.pop();
     }
 
     /// Checks `receiver.elapsed()` as the path `receiver::elapsed` when the
@@ -822,12 +920,11 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
                 .map(|segment| segment.ident.to_string())
                 .chain([call.method.to_string()])
                 .collect();
-            let segments = if receiver.path.leading_colon.is_some() {
-                segments
+            if receiver.path.leading_colon.is_some() {
+                self.check(&segments, call.method.span());
             } else {
-                self.resolve(&segments)
-            };
-            self.check(&segments, call.method.span());
+                self.check_written(&segments, call.method.span());
+            }
         }
         visit::visit_expr_method_call(self, call);
     }
@@ -855,7 +952,7 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         if path.leading_colon.is_some() {
             self.check(&segments, path.span());
         } else if segments.len() > 1 {
-            self.check(&self.resolve(&segments), path.span());
+            self.check_written(&segments, path.span());
         }
         visit::visit_path(self, path);
     }
@@ -1149,13 +1246,7 @@ mod tests {
         let rules = Rules::load(&repo_root).expect("zakura-rt's lib.rs parses");
         let parsed = syn::parse_file(source).expect("the fixture parses");
         let mut findings = Findings::default();
-        let mut visitor = PathVisitor {
-            file,
-            rules: &rules,
-            findings: &mut findings,
-            scopes: Vec::new(),
-        };
-        visitor.visit_module(&parsed.items);
+        PathVisitor::new(file, &rules, &mut findings).visit_file_items(&parsed.items);
         findings
             .violations
             .iter()
@@ -1244,6 +1335,60 @@ mod tests {
                 format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
                 format!("std::time::SystemTime::elapsed -> {utc_now}"),
             ]
+        );
+    }
+
+    /// Local re-exports, `self` and `super` paths and chained renames resolve
+    /// to std's clocks. A path that leaves the file keeps its written
+    /// spelling's check, and one that ends in `zakura_rt` passes.
+    #[test]
+    fn local_reexports_and_chained_aliases_resolve() {
+        let source = "
+            mod clocks {
+                pub use std::time::SystemTime;
+                pub mod inner {
+                    pub use super::SystemTime as Wall;
+                }
+            }
+            use clocks::SystemTime;
+            use self::clocks::inner::Wall;
+            use chrono::Utc as U1;
+            use U1 as U2;
+            use crate::elsewhere::Utc;
+            fn f() {
+                let _ = SystemTime::now();
+                let _ = Wall::now();
+                let _ = U2::now();
+                let _ = Utc::now();
+            }
+            fn g() {
+                use zakura_rt::time::Instant as SystemTime;
+                let _ = SystemTime::now();
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("Utc::now -> {utc_now}"),
+            ]
+        );
+
+        let source = "
+            mod clocks {
+                pub use std::time::Instant;
+            }
+            use clocks::Instant;
+            fn f() -> Instant {
+                Instant::now()
+            }
+        ";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
         );
     }
 

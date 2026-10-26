@@ -850,14 +850,29 @@ mod tests {
             .map(|capability| registry.persistent_streams_for_negotiated(capability))
             .into();
         assert_eq!(layouts, negotiated);
-        assert_eq!(registry.persistent_streams_for_negotiated(1), [legacy]);
-        // A mask with both of the service's tabled alternatives negotiates one
-        // complete layout, though the enumeration lists both.
-        let both = registry.persistent_streams_for_negotiated(2 | 4);
-        assert!(
-            both == pair || both == [single],
-            "negotiation picks one layout: {both:?}"
-        );
+        // Every mask negotiates at most one complete layout per service,
+        // preferring the highest primary version, while the enumeration stays
+        // fixed.
+        for mask in 0..32 {
+            let mut expected = if mask & 4 != 0 {
+                vec![single]
+            } else if mask & 2 != 0 {
+                pair.to_vec()
+            } else if mask & 1 != 0 {
+                vec![legacy]
+            } else {
+                vec![]
+            };
+            if mask & 16 != 0 {
+                expected.push(other);
+            }
+            assert_eq!(
+                registry.persistent_streams_for_negotiated(mask),
+                expected,
+                "mask {mask}"
+            );
+            assert_eq!(registry.session_layouts().count(), 3);
+        }
     }
 
     #[test]

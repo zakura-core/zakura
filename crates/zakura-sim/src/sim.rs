@@ -208,24 +208,30 @@ impl Sim {
         // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
+        // Read even when a failure is already recorded. One `at_end` or its
+        // reports caused still replaces the outcome, as before, and storage
+        // `at_end` dropped ends the run only if nothing else did.
+        let dropped = self.check_evidence(&state).err();
         let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
-        // And so does storage `at_end` dropped, which the checker reported
-        // before it knew.
-        let (end, properties) = match self.end_evidence(&end, &state) {
-            Some(failure) => (
-                state.end_harness(failure),
-                properties
-                    .into_iter()
-                    .map(|report| PropertyReport {
-                        outcome: report.outcome.after_harness_failure(),
-                        ..report
-                    })
-                    .collect(),
-            ),
-            None => (end, properties),
+        let end = match dropped {
+            Some(failure) if end.outcome != Outcome::Harness => state.end_harness(failure),
+            _ => end,
+        };
+        // Last, so it covers every way the run ended at a harness failure,
+        // which the checker may have reported before it knew. The report and
+        // the end record both take these.
+        let properties = match end.outcome {
+            Outcome::Harness => properties
+                .into_iter()
+                .map(|report| PropertyReport {
+                    outcome: report.outcome.after_harness_failure(),
+                    ..report
+                })
+                .collect(),
+            _ => properties,
         };
         state.log.freeze();
         let cleanup = self.shut_down();

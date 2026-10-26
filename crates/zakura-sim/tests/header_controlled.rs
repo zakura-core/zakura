@@ -1687,6 +1687,9 @@ enum LateDrop {
     AtEnd,
     /// In the sink, as it takes step `.0`'s record.
     Sink(u64),
+    /// In the checker's `at_end`, which then also draws from the plan,
+    /// harness code's `DrawOutsideStep`.
+    AtEndDrawing,
 }
 
 /// Storage a source and a cleanup checker or sink share.
@@ -1746,8 +1749,12 @@ impl zakura_sim::Checker for Dropper {
         _: &ObservationLog,
     ) -> Vec<zakura_sim::PropertyReport> {
         self.saw.set(Some(end.outcome));
-        if self.when == LateDrop::AtEnd {
+        if matches!(self.when, LateDrop::AtEnd | LateDrop::AtEndDrawing) {
             self.shared.borrow_mut().take();
+        }
+        if self.when == LateDrop::AtEndDrawing {
+            // Seeding a map draws.
+            let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
         }
         Vec::new()
     }
@@ -1870,4 +1877,91 @@ fn storage_dropped_after_the_last_step_fails_the_run() {
             "{when:?}: {end}"
         );
     }
+}
+
+/// The property's outcome after any harness failure, in the report and
+/// the end record alike.
+fn assert_harness_failed(report: &RunReport, lines: &[String]) {
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Inconclusive {
+            reason: "harness-failed".to_owned()
+        }
+    );
+    let end = lines.last().expect("the run ends with an end record");
+    assert!(
+        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        "{end}"
+    );
+}
+
+/// A drop inside `at_end` that also draws ends at `DrawOutsideStep`, which
+/// outranks the drop, and the property still reports `harness-failed`,
+/// though `at_end` reported it held.
+#[test]
+fn a_dropping_at_end_that_draws_is_still_inconclusive() {
+    let (report, lines, saw) = late_drop_run(LateDrop::AtEndDrawing);
+    assert_eq!(
+        saw,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        }
+    );
+    assert_eq!(report.end.harness, Some(HarnessFailure::DrawOutsideStep));
+    assert_harness_failed(&report, &lines);
+}
+
+/// A checker that draws from the plan in `at_end`.
+struct DrawsAtEnd;
+
+impl zakura_sim::Checker for DrawsAtEnd {
+    fn after_step(&mut self, _: &zakura_sim::StepCtx<'_>) -> Option<Violation> {
+        None
+    }
+
+    fn at_end(
+        &mut self,
+        _: &zakura_sim::RunEnd,
+        _: &ObservationLog,
+    ) -> Vec<zakura_sim::PropertyReport> {
+        // Seeding a map draws.
+        let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
+        Vec::new()
+    }
+}
+
+/// D2 covers any harness failure, not only storage's: with no storage at
+/// all, a draw in `at_end` leaves a property that held inconclusive.
+#[test]
+fn a_drawing_at_end_without_storage_is_inconclusive() {
+    let property = Property {
+        id: PropertyId::new("test/always"),
+        claim: "always holds",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: PropertyStatus::Active,
+        check: always,
+        witness: None,
+    };
+    let registry = Registry::new(vec![property]).expect("one property");
+    let calm = RegistryChecker::new(
+        registry,
+        Rc::new(Calm),
+        Assumptions::none(),
+        &[Source::View],
+    );
+    let mut checker = zakura_sim::property::Tee(calm, DrawsAtEnd);
+    let (report, lines) = recorded(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            sim.scheduler().spawn_root("idle", async {
+                zakura_rt::task::yield_now().await;
+            });
+        },
+        &mut checker,
+    );
+    assert_eq!(report.end.harness, Some(HarnessFailure::DrawOutsideStep));
+    assert_harness_failed(&report, &lines);
 }

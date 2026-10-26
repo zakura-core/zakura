@@ -305,7 +305,9 @@ fn reports_outside_the_run_are_a_harness_failure() {
         (&[kept.clone()][..], &[kept][..])
     );
 
-    // So does a holds_since past the last step.
+    // So does a holds_since past the last step, and like any harness
+    // failure it leaves a property that didn't apply inconclusive, in the
+    // report and in the end record alike.
     let (run, end) = run_and_read(&mut reports_at_end(|steps| {
         at_end(PropertyOutcome::NotApplicable, Some(steps + 1))
     }));
@@ -317,9 +319,15 @@ fn reports_outside_the_run_are_a_harness_failure() {
         })
     );
     assert_eq!(end.outcome, OutcomeKind::Harness);
+    let inconclusive = at_end(
+        PropertyOutcome::Inconclusive {
+            reason: "harness-failed".into(),
+        },
+        None,
+    );
     assert_eq!(
-        end.properties,
-        [at_end(PropertyOutcome::NotApplicable, None)]
+        (&run.properties[..], &end.properties[..]),
+        (&[inconclusive.clone()][..], &[inconclusive][..])
     );
 
     // References to the run's own steps, including holds_since 0 and the

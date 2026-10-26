@@ -866,6 +866,20 @@ fn apply_digests_cover_the_sealed_insertion() {
     assert_ne!(submitted[0].1, submitted[1].1);
 }
 
+/// D12: a locator submitted after shutdown never reaches storage, and its
+/// permit comes back as soon as the call is polled.
+#[test]
+fn a_locator_after_shutdown_returns_its_permit() {
+    let (port, _) = chain(1);
+    port.shut_down();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut call = port.continuation_locator(permit(&semaphore));
+    assert_eq!(semaphore.available_permits(), 0);
+    assert!(poll(&mut call, Waker::noop()).is_pending());
+    assert_eq!(semaphore.available_permits(), 1);
+    assert!(port.pending().is_empty());
+}
+
 /// Two applies of the same headers with the same owner, supplier and
 /// auxiliary deliveries, sealed for different targets, have different
 /// request digests: one may commit while the other is stale.

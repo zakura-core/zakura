@@ -635,7 +635,7 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
 /// Path and target handles redact their identity and contents from
 /// `Debug`. So a path this port issued adds its lease, peer and session,
 /// and a target this port sealed adds its insertion: supplier, parent,
-/// completion, each header's hash and each auxiliary delivery.
+/// target, completion, each header's hash and each auxiliary delivery.
 fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32], bool) {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v2");
@@ -645,6 +645,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32]
             Ok(insert) => {
                 hasher.update(insert.source.digest());
                 hasher.update(insert.parent_hash.0);
+                hasher.update(insert.target_tip_hash.0);
                 hasher.update(format!("{:?}", insert.completion).as_bytes());
                 for header in insert.batch.headers() {
                     hasher.update(header.hash.0);

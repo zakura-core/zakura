@@ -821,7 +821,9 @@ impl StartCmd {
             None => {
                 #[cfg(feature = "indexer-rpc")]
                 warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                spawn_erased(std::future::pending().in_current_span())
+                spawn_erased(
+                    std::future::pending::<Result<(), tower::BoxError>>().in_current_span(),
+                )
             }
         };
         node_tasks.track(&indexer_rpc_task_handle);

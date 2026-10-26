@@ -980,9 +980,31 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         visit::visit_path(self, path);
     }
 
+    /// Visits a macro's arguments as code when they parse as
+    /// comma-separated expressions, like `dbg!` and `assert_eq!`, or as
+    /// statements, so imports and calls inside them meet the same rules.
+    /// Arguments with syntax of their own, like `select!`'s, get the token
+    /// scan.
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.visit_path(&mac.path);
-        self.check_tokens(mac.tokens.clone());
+        if let Ok(args) = mac.parse_body_with(Punctuated::<syn::Expr, Token![,]>::parse_terminated)
+        {
+            for arg in &args {
+                Visit::visit_expr(self, arg);
+            }
+        } else if let Ok(stmts) = mac.parse_body_with(syn::Block::parse_within) {
+            let items = stmts.iter().filter_map(|stmt| match stmt {
+                syn::Stmt::Item(item) => Some(item),
+                _ => None,
+            });
+            self.blocks.push(bindings(items));
+            for stmt in &stmts {
+                Visit::visit_stmt(self, stmt);
+            }
+            self.blocks.pop();
+        } else {
+            self.check_tokens(mac.tokens.clone());
+        }
     }
 }
 
@@ -1518,6 +1540,29 @@ mod tests {
                 format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
                 format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
             ]
+        );
+    }
+
+    /// Arguments that parse as expressions or statements are visited as
+    /// code, with block-local imports and the alias map.
+    #[test]
+    fn macro_arguments_are_visited_as_code() {
+        let source = "
+            use std::time::{Instant, UNIX_EPOCH};
+            fn f(t: Instant) {
+                dbg!({ use std::time::Instant as Tick; Tick::now() });
+                dbg!(std::time::UNIX_EPOCH.elapsed());
+                assert!(Instant::now() > t, \"{:?}\", t);
+                assert_eq!(<std::time::Instant>::now(), t);
+                println!(\"{:?}\", (&UNIX_EPOCH).elapsed());
+                let _ = vec![Instant::now(); 2];
+            }
+        ";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
+        let epoch = "std::time::UNIX_EPOCH::elapsed -> zakura_rt::time::utc_now";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [instant, epoch, instant, instant, epoch, instant]
         );
     }
 

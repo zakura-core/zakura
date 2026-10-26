@@ -7,28 +7,39 @@ mod support;
 
 use std::{
     collections::BTreeSet,
+    num::NonZeroU64,
     process::Command,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use sha2::{Digest, Sha256};
-use support::{config, inputs, run};
+use support::{config, inputs, recorded, run};
 use zakura_chain::block;
-use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
+use zakura_header_chain::{
+    BodyWorkAuthority, BodyWorkEpoch, BodyWorkOwner, BranchId, Frontier, HeaderGeneration,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId, VerifiedGeneration,
+};
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, ApplyHeaderTargetOutcome, LocatorReadPermit, Port, ReadPath,
     ReadPathReply,
 };
 use zakura_rt::sync::Semaphore;
-use zakura_scheduler::{SchedulerConfig, Status};
+use zakura_scheduler::{SchedulerConfig, SimInstant, Status};
 use zakura_sim::{
     check::after_step,
-    observe::{StorageFact, StorageRequest},
-    IdleStatus, Observation, Outcome, PlanInput, RunConfig, RunReport, Sim, Violation,
+    observe::{StorageFact, StorageRequest, StorageResult},
+    property::{
+        Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
+        Source, Status as PropertyStatus, Verdict,
+    },
+    ActionSource, Boundary, HarnessFailure, Identity, IdleStatus, Observation, ObservationLog,
+    Outcome, PlanInput, PropertyOutcome, RunConfig, RunReport, Sim, Violation,
 };
 use zakura_storage::header::{
     controlled::{ControlledPort, FactKind},
+    evidence::RequestIdentity,
     fixture::HeaderFixture,
 };
 
@@ -889,4 +900,493 @@ fn abandoning_unread_replies_in_a_run_keeps_the_storage_driver_working() {
     assert!(waited > 0, "no plan registered a capacity waiter");
     assert!(interleaved > 0, "no plan completed storage mid-drop");
     assert!(dropped > 0, "no dropped reply ended an abandoned lease");
+}
+
+/// C+ owner encoding: a header owner, a body-repair owner, and a VCT
+/// repair's body owner, each varied in one field at a time, all encode
+/// differently, so no owner field is lost.
+#[test]
+fn every_owner_field_reaches_the_encoding() {
+    let base = HeaderWorkAuthority {
+        header_generation: HeaderGeneration::new(1),
+        branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+    };
+    let authorities = [
+        base,
+        HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(2),
+            ..base
+        },
+        HeaderWorkAuthority {
+            branch: BranchId::new(block::Hash([3; 32]), block::Hash([2; 32])),
+            ..base
+        },
+        HeaderWorkAuthority {
+            branch: BranchId::new(block::Hash([1; 32]), block::Hash([4; 32])),
+            ..base
+        },
+    ];
+    let id = |n| NonZeroU64::new(n).expect("request IDs start at 1");
+    let body = |header, verified, epoch| BodyWorkAuthority {
+        header,
+        verified_generation: VerifiedGeneration::new(verified),
+        body_work_epoch: BodyWorkEpoch::new(epoch),
+    };
+    // Each varies one field of the first, which has every field at 1.
+    let mut bodies: Vec<BodyWorkOwner> = authorities
+        .iter()
+        .map(|authority| body(*authority, 1, 1).bind(1, id(1)))
+        .collect();
+    bodies.extend([
+        body(base, 2, 1).bind(1, id(1)),
+        body(base, 1, 2).bind(1, id(1)),
+        body(base, 1, 1).bind(2, id(1)),
+        body(base, 1, 1).bind(1, id(2)),
+    ]);
+    let mut headers: Vec<HeaderSyncWorkOwner> = authorities
+        .iter()
+        .map(|authority| HeaderSyncWorkOwner::Header(authority.bind(1, id(1))))
+        .collect();
+    headers.extend([
+        HeaderSyncWorkOwner::Header(base.bind(2, id(1))),
+        HeaderSyncWorkOwner::Header(base.bind(1, id(2))),
+    ]);
+    let owners = headers
+        .into_iter()
+        .chain(bodies.iter().copied().map(HeaderSyncWorkOwner::BodyRepair));
+    let mut encodings: Vec<String> = owners
+        .map(|owner| {
+            serde_json::to_string(&zakura_sim::storage::work_owner(owner))
+                .expect("an owner encodes")
+        })
+        .collect();
+    encodings.extend(bodies.into_iter().map(|owner| {
+        let request = RequestIdentity::VctRepairContext {
+            owner,
+            height: block::Height(1),
+        };
+        serde_json::to_string(&zakura_sim::storage::request(&request)).expect("a request encodes")
+    }));
+    let distinct: BTreeSet<&String> = encodings.iter().collect();
+    assert_eq!(distinct.len(), encodings.len(), "{encodings:#?}");
+}
+
+/// A storage source that forwards everything to `inner` but skips the
+/// observation at step `skip`, as a buggy wrapper might.
+struct SkipAt<S> {
+    inner: S,
+    skip: u64,
+}
+
+impl<S: ActionSource> ActionSource for SkipAt<S> {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.inner.enabled(now, out);
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.inner.boundaries(now, out);
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if log.step() == self.skip {
+            return Ok(());
+        }
+        self.inner.observe(log)
+    }
+}
+
+/// A run where one task reads membership through a controlled port, with
+/// the storage source wrapped to skip its observation at `skip`, if any.
+fn skipping_run(skip: Option<u64>) -> RunReport {
+    run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let caller = port.clone();
+            sim.scheduler().spawn_root("caller", async move {
+                let anchor = HeaderFixture::regtest().anchor();
+                let _ = caller.selected_chain_contains(anchor.hash).await;
+            });
+            let storage = zakura_sim::storage::HeaderStorage::new(port);
+            match skip {
+                Some(skip) => sim.add_evidence(storage.map(|inner| SkipAt { inner, skip })),
+                None => sim.add_evidence(storage),
+            };
+        },
+        &mut zakura_sim::NoChecks,
+    )
+}
+
+/// C1: the run holds each evidence source's checkpoint, so a wrapper that
+/// skips one observation ends the run at that boundary, whether it's the
+/// setup, an interior step or the final step.
+#[test]
+fn a_skipped_observation_ends_the_run_there() {
+    let whole = skipping_run(None);
+    assert_eq!(
+        whole.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        }
+    );
+    let last = whole.end.steps;
+    assert!(last > 2, "the run has an interior step");
+    for (skip, failure) in [
+        (0, "NotObserved"),
+        (1, "BoundarySkipped"),
+        (last, "BoundarySkipped"),
+    ] {
+        let report = skipping_run(Some(skip));
+        assert_eq!(report.end.outcome, Outcome::Harness, "skipping {skip}");
+        assert_eq!(report.end.steps, skip);
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with(failure), "skipping {skip}: {detail}");
+    }
+}
+
+/// The world the harness-failure scenario's property reads: nothing.
+struct Calm;
+
+impl HasView for Calm {
+    type View = ();
+
+    /// Nothing.
+    fn view(&self) {}
+}
+
+/// Holds at every step.
+fn always(_: &mut CheckCtx<'_, Calm>) -> Verdict {
+    Verdict::Holds
+}
+
+/// D2: a property holds at step 1, then a task steals the port's facts at
+/// step 2, so storage's evidence fails there. The run ends at the harness
+/// failure, and the property reports `harness-failed`, not `held`, both in
+/// the report and in the serialized end record.
+#[test]
+fn a_property_is_inconclusive_after_an_evidence_failure() {
+    const CALM: PropertyId = PropertyId::new("test/always");
+    let property = Property {
+        id: CALM,
+        claim: "always holds",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: PropertyStatus::Active,
+        check: always,
+        witness: None,
+    };
+    let registry = Registry::new(vec![property]).expect("one property");
+    let mut checker = RegistryChecker::new(
+        registry,
+        Rc::new(Calm),
+        Assumptions::none(),
+        &[Source::View],
+    );
+    let (report, lines) = recorded(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let thief = port.clone();
+            sim.scheduler().spawn_root("thief", async move {
+                zakura_rt::task::yield_now().await;
+                let anchor = HeaderFixture::regtest().anchor();
+                let mut call = thief.selected_chain_contains(anchor.hash);
+                std::future::poll_fn(|cx| {
+                    assert!(call.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                thief.take_facts();
+                std::future::pending::<()>().await;
+            });
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+        },
+        &mut checker,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert_eq!(report.end.steps, 2);
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    // The stolen facts are the last ones, so the state is ahead of them.
+    assert!(detail.starts_with("Stale"), "{detail}");
+    let inconclusive = PropertyOutcome::Inconclusive {
+        reason: "harness-failed".to_owned(),
+    };
+    assert_eq!(report.properties[0].outcome, inconclusive);
+    let end = lines.last().expect("the run ends with an end record");
+    assert!(
+        end.contains(r#""inconclusive":{"reason":"harness-failed"}"#),
+        "{end}"
+    );
+}
+
+/// The storage facts and the other observations a run logged at `step`.
+fn step_log(report: &RunReport, step: u64) -> Vec<&Observation> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| entry.step == step)
+        .map(|entry| &entry.obs)
+        .collect()
+}
+
+/// The sequence numbers of the storage facts in `observations`.
+fn seqs(observations: &[&Observation]) -> Vec<u64> {
+    observations
+        .iter()
+        .filter_map(|obs| match obs {
+            Observation::Storage { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D3, task side: one poll takes a reply and submits two operations. In
+/// that step the three storage facts come in sequence order, then the
+/// state, and only then the task's own outcome.
+#[test]
+fn a_tasks_storage_facts_precede_its_outcome() {
+    let report = run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let caller = port.clone();
+            sim.scheduler().spawn_root("caller", async move {
+                let anchor = HeaderFixture::regtest().anchor();
+                let first = caller.selected_chain_contains(anchor.hash);
+                let mut calls = [
+                    caller.selected_chain_contains(anchor.hash),
+                    caller.selected_chain_contains(anchor.hash),
+                ];
+                let _ = first.await;
+                std::future::poll_fn(|cx| {
+                    let mut done = true;
+                    for call in &mut calls {
+                        done &= call.as_mut().poll(cx).is_ready();
+                    }
+                    if done {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            });
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    let step = report
+        .log
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Storage {
+                    fact: StorageFact::ReplyTaken { .. },
+                    ..
+                }
+            )
+        })
+        .expect("the caller took its first reply")
+        .step;
+    let logged = step_log(&report, step);
+    let facts: Vec<_> = logged
+        .iter()
+        .filter_map(|obs| match obs {
+            Observation::Storage { fact, .. } => Some(fact),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [
+                StorageFact::ReplyTaken { id: 1 },
+                StorageFact::Submitted { id: 2, .. },
+                StorageFact::Submitted { id: 3, .. },
+            ]
+        ),
+        "{facts:?}"
+    );
+    assert!(seqs(&logged).is_sorted());
+    assert!(
+        matches!(
+            logged.as_slice(),
+            [
+                Observation::Storage { .. },
+                Observation::Storage { .. },
+                Observation::Storage { .. },
+                Observation::StorageState { .. },
+                Observation::TaskWaiting { .. },
+            ]
+        ),
+        "{logged:?}"
+    );
+}
+
+/// Peer `n`'s acquire in session 1 of the empty path to the anchor.
+fn anchor_acquire(port: &ControlledPort, n: u8) -> AcquirePath {
+    let anchor = HeaderFixture::regtest().anchor();
+    AcquirePath {
+        source: SourceId::from_digest([n; 32]),
+        session_id: 1,
+        scope: HeaderWorkAuthority::for_target(&port.engine().snapshot(), anchor.hash),
+        target_tip_hash: anchor.hash,
+        locator_hashes: vec![anchor.hash],
+    }
+}
+
+/// D3, source side: one completion sweeps peer 1's idle lease, firing the
+/// waiter a refused acquire left on it, then leases to peer 2. Its step
+/// logs the four lease facts and the completion in sequence order.
+#[test]
+fn a_completions_lease_facts_come_in_order() {
+    let report = run(
+        storage_config(200),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let caller = port.clone();
+            sim.scheduler().spawn_root("caller", async move {
+                let held = caller.acquire_header_path(anchor_acquire(&caller, 1)).await;
+                let refused = caller.acquire_header_path(anchor_acquire(&caller, 1)).await;
+                assert!(matches!(refused, Ok(AcquirePathReply::CapacityBusy(_))));
+                zakura_rt::time::sleep(Duration::from_secs(31)).await;
+                let other = caller.acquire_header_path(anchor_acquire(&caller, 2)).await;
+                assert!(matches!(other, Ok(AcquirePathReply::Acquired(_))));
+                drop((held, refused, other));
+            });
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+    let step = report
+        .log
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Storage {
+                    fact: StorageFact::CapabilityEnded { release, .. },
+                    ..
+                } if release == "lease-idle-expired"
+            )
+        })
+        .expect("the third acquire swept the idle lease")
+        .step;
+    let logged = step_log(&report, step);
+    let facts: Vec<_> = logged
+        .iter()
+        .filter_map(|obs| match obs {
+            Observation::Storage { fact, .. } => Some(fact),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            facts.as_slice(),
+            [
+                StorageFact::CapabilityEnded { .. },
+                StorageFact::WaiterFired { .. },
+                StorageFact::RetentionEnded { .. },
+                StorageFact::Leased { .. },
+                StorageFact::Completed { id: 3, .. },
+            ]
+        ),
+        "{facts:?}"
+    );
+    assert!(seqs(&logged).is_sorted());
+}
+
+/// Retained after release: an acquire, then its release with no read,
+/// completed by the run, which ends the live lease the release names. A
+/// release that kept the lease and recorded nothing would end the run
+/// with `MissingEffect`.
+#[test]
+fn a_release_ends_its_live_lease() {
+    let report = run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let caller = port.clone();
+            sim.scheduler().spawn_root("caller", async move {
+                let Ok(AcquirePathReply::Acquired(path)) =
+                    caller.acquire_header_path(anchor_acquire(&caller, 1)).await
+                else {
+                    panic!("the only peer gets a lease");
+                };
+                caller
+                    .release_header_path(*path)
+                    .await
+                    .expect("the engine outcome comes first");
+            });
+            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        },
+        "{:?}",
+        report.end
+    );
+    let facts: Vec<_> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage { fact, .. } => Some(fact),
+            _ => None,
+        })
+        .collect();
+    let leased = facts
+        .iter()
+        .find_map(|fact| match fact {
+            StorageFact::Leased { lease, .. } => Some(lease),
+            _ => None,
+        })
+        .expect("the acquire leased");
+    let release = facts
+        .iter()
+        .find_map(|fact| match fact {
+            StorageFact::Submitted {
+                request: StorageRequest::ReleaseHeaderPath { lease, .. },
+                ..
+            } => lease.as_ref(),
+            _ => None,
+        })
+        .expect("the release was submitted");
+    assert_eq!(release, leased, "the release names the live lease");
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        StorageFact::CapabilityEnded { lease, release }
+            if lease == leased && release == "lease-released"
+    )));
+    assert!(facts.iter().any(|fact| matches!(
+        fact,
+        StorageFact::Completed {
+            result: StorageResult::Released,
+            ..
+        }
+    )));
 }

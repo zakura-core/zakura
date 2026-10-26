@@ -42,6 +42,7 @@ use zakura_rt::{
 };
 
 use super::{
+    evidence::{ResultIdentity, SignalClass},
     fixture::{HeaderFixture, ScenarioClock},
     lease::{Capacity, Effects, LeaseEnd, Position, Registry, Spec, MAX_HEADER_SYNC_HEIGHT_RANGE},
     FromReply, HeaderReply, HeaderRequest, Release,
@@ -172,9 +173,17 @@ impl EnginePort {
 
     /// Leases the path toward `request`'s target, as
     /// `HeaderChainReader::acquire_retained_path` does above finality.
-    /// Returns the reply and the registry's effects, for the caller to fire
-    /// once every lock is released.
-    fn acquire(&self, request: AcquirePath) -> (Result<AcquirePathReply, PortError>, Effects) {
+    /// Returns the reply, the registry's effects for the caller to fire once
+    /// every lock is released, and for a `CapacityBusy` reply, which signal
+    /// it handed out, read while the registry is still locked.
+    fn acquire(
+        &self,
+        request: AcquirePath,
+    ) -> (
+        Result<AcquirePathReply, PortError>,
+        Effects,
+        Option<SignalClass>,
+    ) {
         // Checked before the registry, so a bad request sweeps nothing.
         if request.locator_hashes.is_empty()
             || request.locator_hashes.len() > zakura_header_chain::MAX_HEADER_LOCATOR_HASHES
@@ -182,13 +191,22 @@ impl EnginePort {
             let error = unavailable(StoreError::Incoherent(
                 "retained path locator count is outside protocol bounds",
             ));
-            return (Err(error), Effects::default());
+            return (Err(error), Effects::default(), None);
         }
         let now = Instant::now();
+        let peer = request.source;
         let engine = self.engine();
         let mut leases = self.leases();
         let reply = self.acquire_locked(&engine, &mut leases, request, now);
-        (reply, leases.take_effects())
+        let refusal = match &reply {
+            Ok(AcquirePathReply::CapacityBusy(signal)) => Some(
+                leases
+                    .signal_class(peer, signal)
+                    .expect("a refusal hands out one of the registry's signals"),
+            ),
+            _ => None,
+        };
+        (reply, leases.take_effects(), refusal)
     }
 
     /// [`Self::acquire`] once its input check passed, under the engine and
@@ -503,16 +521,31 @@ impl EnginePort {
 
     /// The selected-path locator, as `HeaderChainReader::committed_selected_locator`
     /// reads it.
-    fn locator(&self) -> Result<HeaderLocator, PortError> {
+    fn locator(
+        &self,
+    ) -> Result<
+        (
+            HeaderLocator,
+            HeaderGeneration,
+            zakura_header_chain::Frontier,
+        ),
+        PortError,
+    > {
         let engine = self.engine();
-        HeaderLocator::for_selected_path(&engine.snapshot(), |height| {
+        let snapshot = engine.snapshot();
+        let locator = HeaderLocator::for_selected_path(&snapshot, |height| {
             let projection = engine.selected_projection();
             let index = projection
                 .binary_search_by_key(&height, |frontier| frontier.height)
                 .map_err(|_| StoreError::Incoherent("committed selected projection has a gap"))?;
             Ok(Some(projection[index].hash))
         })
-        .map_err(unavailable)
+        .map_err(unavailable)?;
+        Ok((
+            locator,
+            snapshot.header_generation,
+            snapshot.frontiers.finalized,
+        ))
     }
 
     /// The validation lease for `parent_hash`, as `HeaderChainStore::validation_context`
@@ -762,30 +795,37 @@ impl EnginePort {
 }
 
 impl EnginePort {
-    /// Runs `request` against the engine now and returns its reply, with the
+    /// Runs `request` against the engine now and returns its reply, the
     /// lease registry's effects for the caller to fire once it holds no
-    /// lock. Both this port and
+    /// lock, and the reply's typed identity. Both this port and
     /// [`ControlledPort`](super::controlled::ControlledPort) run every
     /// operation through here.
-    pub(crate) fn execute(&self, request: HeaderRequest) -> (HeaderReply, Effects) {
+    pub(crate) fn execute(&self, request: HeaderRequest) -> Executed {
+        let (mut effects, mut locator_read, mut refusal) = (Effects::default(), None, None);
         let reply = match request {
-            HeaderRequest::ContinuationLocator => {
-                HeaderReply::ContinuationLocator(self.locator().map(Some))
-            }
+            HeaderRequest::ContinuationLocator => HeaderReply::ContinuationLocator(
+                self.locator().map(|(locator, generation, finalized)| {
+                    locator_read = Some((generation, finalized));
+                    Some(locator)
+                }),
+            ),
             HeaderRequest::VctRepairContext { .. } => {
                 HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale))
             }
             HeaderRequest::AcquireHeaderPath(request) => {
-                let (reply, effects) = self.acquire(request);
-                return (HeaderReply::AcquireHeaderPath(reply), effects);
+                let reply;
+                (reply, effects, refusal) = self.acquire(request);
+                HeaderReply::AcquireHeaderPath(reply)
             }
             HeaderRequest::ReadHeaderPath { path, request } => {
-                let (reply, effects) = self.read(path, request);
-                return (HeaderReply::ReadHeaderPath(reply), effects);
+                let reply;
+                (reply, effects) = self.read(path, request);
+                HeaderReply::ReadHeaderPath(reply)
             }
             HeaderRequest::ReleaseHeaderPath { path } => {
-                let (reply, effects) = self.release(path);
-                return (HeaderReply::ReleaseHeaderPath(reply), effects);
+                let reply;
+                (reply, effects) = self.release(path);
+                HeaderReply::ReleaseHeaderPath(reply)
             }
             HeaderRequest::PrepareHeaderTarget(request) => {
                 HeaderReply::PrepareHeaderTarget(self.prepare(request))
@@ -797,16 +837,21 @@ impl EnginePort {
                 HeaderReply::SelectedChainContains(self.membership(hash))
             }
         };
-        (reply, Effects::default())
+        let result = ResultIdentity::of(&reply, &self.key, locator_read, refusal);
+        Executed {
+            reply,
+            effects,
+            result,
+        }
     }
 
     /// A future that runs `request` when first polled. Nothing reads this
     /// port's lease ends, so they're dropped.
     fn run_on_poll<T: FromReply>(&self, request: HeaderRequest) -> HeaderChainFuture<'_, T> {
         Box::pin(async move {
-            let (reply, effects) = self.execute(request);
-            effects.fire();
-            T::from_reply(reply)
+            let executed = self.execute(request);
+            executed.effects.fire();
+            T::from_reply(executed.reply)
         })
     }
 
@@ -866,11 +911,11 @@ impl Port for EnginePort {
         permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(async move {
-            let (reply, effects) = self.execute(HeaderRequest::ContinuationLocator);
+            let executed = self.execute(HeaderRequest::ContinuationLocator);
             // The permit is held until the read finishes.
             drop(permit);
-            effects.fire();
-            FromReply::from_reply(reply)
+            executed.effects.fire();
+            FromReply::from_reply(executed.reply)
         })
     }
 
@@ -928,6 +973,16 @@ impl Port for EnginePort {
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         self.run_on_poll(HeaderRequest::SelectedChainContains { hash })
     }
+}
+
+/// What [`EnginePort::execute`] did.
+pub(crate) struct Executed {
+    /// The reply.
+    pub(crate) reply: HeaderReply,
+    /// The registry's effects, to fire once no lock is held.
+    pub(crate) effects: Effects,
+    /// The reply's typed identity.
+    pub(crate) result: ResultIdentity,
 }
 
 /// The result of a target-first ancestry walk.

@@ -1,0 +1,360 @@
+//! Typed evidence about the controlled header port: whose work each
+//! operation is and what it returned.
+//!
+//! Properties compare these values directly, so each keeps the full typed
+//! owner and every identity the request or result names. Digests remain for
+//! replay, not for comparison.
+
+use zakura_chain::block;
+use zakura_header_chain::{
+    BodyWorkOwner, ErrorCategory, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId,
+};
+use zakura_node_services::header_chain::{
+    AcquirePathReply, AdapterKey, ApplyHeaderTargetOutcome, ReadPathReply, RetainedHeaderPath,
+    SelectedChainMembership, VctRepairContextReply,
+};
+
+use super::{Fault, HeaderOp, HeaderReply, HeaderRequest};
+
+/// One retained-path lease: the peer holding it, that peer's session, and
+/// the lease ID the registry issued.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LeaseKey {
+    /// The peer.
+    pub peer: SourceId,
+    /// The peer's session.
+    pub session_id: u64,
+    /// The registry's lease ID.
+    pub lease_id: u64,
+}
+
+impl LeaseKey {
+    /// The lease `path` names, if the adapter holding `key` issued it.
+    pub(crate) fn of(path: &RetainedHeaderPath, key: &AdapterKey) -> Option<Self> {
+        path.adapter_identity(key)
+            .map(|(lease_id, peer, session_id)| LeaseKey {
+                peer,
+                session_id,
+                lease_id,
+            })
+    }
+}
+
+/// What an operation asked for, with its owner where its contract gives it
+/// one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestIdentity {
+    /// `continuation_locator`. Its only owned input is the permit, which
+    /// isn't an owner.
+    ContinuationLocator,
+    /// `vct_repair_context`.
+    VctRepairContext {
+        /// The repair owner.
+        owner: BodyWorkOwner,
+        /// The repaired height.
+        height: block::Height,
+    },
+    /// `acquire_header_path`.
+    AcquireHeaderPath {
+        /// The serving peer.
+        peer: SourceId,
+        /// Its session.
+        session_id: u64,
+        /// The work scope the lease is for.
+        scope: HeaderWorkAuthority,
+        /// The target.
+        target_tip_hash: block::Hash,
+        /// The locator, nearest first.
+        locators: Vec<block::Hash>,
+    },
+    /// `read_header_path`.
+    ReadHeaderPath {
+        /// The lease the handle names, or `None` for another adapter's
+        /// handle.
+        lease: Option<LeaseKey>,
+        /// The handle's scope.
+        scope: HeaderWorkAuthority,
+        /// Where the page starts.
+        after_hash: block::Hash,
+        /// The most headers asked for.
+        max_header_count: u32,
+    },
+    /// `release_header_path`.
+    ReleaseHeaderPath {
+        /// The lease the handle names, or `None` for another adapter's
+        /// handle.
+        lease: Option<LeaseKey>,
+        /// The handle's scope.
+        scope: HeaderWorkAuthority,
+    },
+    /// `prepare_header_target`.
+    PrepareHeaderTarget {
+        /// The work owner.
+        owner: HeaderSyncWorkOwner,
+        /// The header supplier.
+        source: SourceId,
+        /// The parent of the first header.
+        common_ancestor: Frontier,
+        /// The last header.
+        target: Frontier,
+        /// How many headers.
+        headers: u32,
+    },
+    /// `apply_header_target`.
+    ApplyHeaderTarget {
+        /// The work owner.
+        owner: HeaderSyncWorkOwner,
+        /// The header supplier.
+        source: SourceId,
+        /// The target.
+        target_tip_hash: block::Hash,
+    },
+    /// `selected_chain_contains`.
+    SelectedChainContains {
+        /// The header asked about.
+        hash: block::Hash,
+    },
+}
+
+impl RequestIdentity {
+    /// The identity of `request`, for the adapter holding `key`.
+    pub(crate) fn of(request: &HeaderRequest, key: &AdapterKey) -> Self {
+        match request {
+            HeaderRequest::ContinuationLocator => RequestIdentity::ContinuationLocator,
+            HeaderRequest::VctRepairContext { owner, height } => {
+                RequestIdentity::VctRepairContext {
+                    owner: *owner,
+                    height: *height,
+                }
+            }
+            HeaderRequest::AcquireHeaderPath(acquire) => RequestIdentity::AcquireHeaderPath {
+                peer: acquire.source,
+                session_id: acquire.session_id,
+                scope: acquire.scope,
+                target_tip_hash: acquire.target_tip_hash,
+                locators: acquire.locator_hashes.clone(),
+            },
+            HeaderRequest::ReadHeaderPath { path, request } => RequestIdentity::ReadHeaderPath {
+                lease: LeaseKey::of(path, key),
+                scope: path.scope,
+                after_hash: request.after_hash,
+                max_header_count: request.max_header_count,
+            },
+            HeaderRequest::ReleaseHeaderPath { path } => RequestIdentity::ReleaseHeaderPath {
+                lease: LeaseKey::of(path, key),
+                scope: path.scope,
+            },
+            HeaderRequest::PrepareHeaderTarget(prepare) => RequestIdentity::PrepareHeaderTarget {
+                owner: prepare.owner,
+                source: prepare.source,
+                common_ancestor: prepare.common_ancestor,
+                target: prepare.target,
+                // A request holds at most the transition cap, far below u32.
+                headers: u32::try_from(prepare.entries.len()).unwrap_or(u32::MAX),
+            },
+            HeaderRequest::ApplyHeaderTarget { target } => RequestIdentity::ApplyHeaderTarget {
+                owner: target.owner(),
+                source: target.source(),
+                target_tip_hash: target.target_tip_hash(),
+            },
+            HeaderRequest::SelectedChainContains { hash } => {
+                RequestIdentity::SelectedChainContains { hash: *hash }
+            }
+        }
+    }
+
+    /// The operation.
+    pub fn op(&self) -> HeaderOp {
+        match self {
+            RequestIdentity::ContinuationLocator => HeaderOp::ContinuationLocator,
+            RequestIdentity::VctRepairContext { .. } => HeaderOp::VctRepairContext,
+            RequestIdentity::AcquireHeaderPath { .. } => HeaderOp::AcquireHeaderPath,
+            RequestIdentity::ReadHeaderPath { .. } => HeaderOp::ReadHeaderPath,
+            RequestIdentity::ReleaseHeaderPath { .. } => HeaderOp::ReleaseHeaderPath,
+            RequestIdentity::PrepareHeaderTarget { .. } => HeaderOp::PrepareHeaderTarget,
+            RequestIdentity::ApplyHeaderTarget { .. } => HeaderOp::ApplyHeaderTarget,
+            RequestIdentity::SelectedChainContains { .. } => HeaderOp::SelectedChainContains,
+        }
+    }
+}
+
+/// Which capacity signal a `CapacityBusy` refusal handed out, read from the
+/// registry when the refusal was made.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SignalClass {
+    /// The refused peer's own lease's signal: the peer already held a lease.
+    Peer,
+    /// The ordinary class's signal: the path needed an ordinary slot and
+    /// only the reserve slot was free (`BeyondReserve`).
+    General,
+    /// The reserve class's signal: every slot was taken (`CapacityFull`).
+    Fallback,
+}
+
+/// What an operation returned, as typed identities. Captured when it
+/// completes and kept with an unread reply.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResultIdentity {
+    /// The run chose this fault.
+    Fault(Fault),
+    /// The adapter rejected the request before running it.
+    Rejected,
+    /// The engine path returned a `PortError`.
+    PortError,
+    /// A locator for the selected path.
+    Locator {
+        /// Its first entry, the selected tip.
+        tip: Frontier,
+        /// The header generation it was read at.
+        header_generation: HeaderGeneration,
+        /// The finalized anchor it was read at.
+        finalized: Frontier,
+    },
+    /// No locator, which the engine port never gives.
+    NoLocator,
+    /// The VCT repair context resolved.
+    VctResolved,
+    /// The VCT repair context was stale.
+    VctStale,
+    /// A leased path.
+    Acquired {
+        /// The new lease.
+        lease: LeaseKey,
+        /// Where its path starts.
+        common_ancestor: Frontier,
+        /// Its target.
+        target: Frontier,
+    },
+    /// `CapacityBusy`, with the signal it handed out.
+    CapacityBusy(SignalClass),
+    /// `Busy`.
+    Busy,
+    /// `TargetNotRetained`.
+    TargetNotRetained,
+    /// `NoLocatorIntersection`.
+    NoLocatorIntersection,
+    /// `HistoryPruned`.
+    HistoryPruned,
+    /// A served page.
+    Page {
+        /// The last header served, or the page's start if it served none.
+        last: Frontier,
+        /// How many headers.
+        count: u32,
+        /// Whether it reached the target.
+        complete: bool,
+    },
+    /// The read's `Unavailable` reply.
+    PageUnavailable,
+    /// A release, which always succeeds for this adapter's handles.
+    Released,
+    /// A sealed target.
+    Prepared,
+    /// A failed preparation.
+    PrepareFailed(ErrorCategory),
+    /// `Applied`.
+    Applied,
+    /// `ResourceStalled`.
+    ResourceStalled,
+    /// A failed apply.
+    ApplyFailed(ErrorCategory),
+    /// The header is on the selected chain here.
+    Selected(Frontier),
+    /// The header is retained but not selected.
+    NotSelected,
+    /// The header isn't retained.
+    NotRetained,
+}
+
+impl ResultIdentity {
+    /// The identity of an engine `reply`, for the adapter holding `key`.
+    /// A locator's generation and anchor and a refusal's signal class aren't
+    /// in the reply, so the caller passes what it read when the reply was
+    /// made.
+    pub(crate) fn of(
+        reply: &HeaderReply,
+        key: &AdapterKey,
+        locator_read: Option<(HeaderGeneration, Frontier)>,
+        refusal: Option<SignalClass>,
+    ) -> Self {
+        match reply {
+            HeaderReply::ContinuationLocator(Ok(Some(locator))) => {
+                let (header_generation, finalized) =
+                    locator_read.expect("the adapter reads a locator's generation with it");
+                ResultIdentity::Locator {
+                    tip: *locator
+                        .entries()
+                        .first()
+                        .expect("a selected-path locator is never empty"),
+                    header_generation,
+                    finalized,
+                }
+            }
+            HeaderReply::ContinuationLocator(Ok(None)) => ResultIdentity::NoLocator,
+            HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Resolved(_))) => {
+                ResultIdentity::VctResolved
+            }
+            HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale)) => {
+                ResultIdentity::VctStale
+            }
+            HeaderReply::AcquireHeaderPath(Ok(reply)) => match reply {
+                AcquirePathReply::Acquired(path) => ResultIdentity::Acquired {
+                    lease: LeaseKey::of(path, key).expect("the adapter seals its own paths"),
+                    common_ancestor: path.common_ancestor,
+                    target: path.target,
+                },
+                AcquirePathReply::CapacityBusy(_) => ResultIdentity::CapacityBusy(
+                    refusal.expect("the adapter classifies each refusal it makes"),
+                ),
+                AcquirePathReply::Busy => ResultIdentity::Busy,
+                AcquirePathReply::TargetNotRetained => ResultIdentity::TargetNotRetained,
+                AcquirePathReply::NoLocatorIntersection => ResultIdentity::NoLocatorIntersection,
+                AcquirePathReply::HistoryPruned => ResultIdentity::HistoryPruned,
+            },
+            HeaderReply::ReadHeaderPath(Ok(ReadPathReply::Page(page))) => {
+                // A page holds at most `MAX_HEADER_SYNC_HEIGHT_RANGE` headers.
+                let count = u32::try_from(page.headers.len()).unwrap_or(u32::MAX);
+                let last = page.headers.last().map_or(page.common_ancestor, |header| {
+                    Frontier::new(
+                        block::Height(page.common_ancestor.height.0.saturating_add(count)),
+                        header.hash(),
+                    )
+                });
+                ResultIdentity::Page {
+                    last,
+                    count,
+                    complete: page.complete,
+                }
+            }
+            HeaderReply::ReadHeaderPath(Ok(ReadPathReply::Unavailable)) => {
+                ResultIdentity::PageUnavailable
+            }
+            HeaderReply::ReleaseHeaderPath(Ok(())) => ResultIdentity::Released,
+            HeaderReply::PrepareHeaderTarget(Ok(_)) => ResultIdentity::Prepared,
+            HeaderReply::PrepareHeaderTarget(Err(error)) => {
+                ResultIdentity::PrepareFailed(error.category)
+            }
+            HeaderReply::ApplyHeaderTarget(Ok(ApplyHeaderTargetOutcome::Applied)) => {
+                ResultIdentity::Applied
+            }
+            HeaderReply::ApplyHeaderTarget(Ok(ApplyHeaderTargetOutcome::ResourceStalled(_))) => {
+                ResultIdentity::ResourceStalled
+            }
+            HeaderReply::ApplyHeaderTarget(Err(error)) => {
+                ResultIdentity::ApplyFailed(error.category)
+            }
+            HeaderReply::SelectedChainContains(Ok(membership)) => match membership {
+                SelectedChainMembership::Selected(frontier) => ResultIdentity::Selected(*frontier),
+                SelectedChainMembership::NotSelected => ResultIdentity::NotSelected,
+                SelectedChainMembership::NotRetained => ResultIdentity::NotRetained,
+            },
+            HeaderReply::ContinuationLocator(Err(_))
+            | HeaderReply::VctRepairContext(Err(_))
+            | HeaderReply::AcquireHeaderPath(Err(_))
+            | HeaderReply::ReadHeaderPath(Err(_))
+            | HeaderReply::ReleaseHeaderPath(Err(_))
+            | HeaderReply::SelectedChainContains(Err(_)) => ResultIdentity::PortError,
+        }
+    }
+}

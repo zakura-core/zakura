@@ -205,6 +205,7 @@ use zakura_node_services::header_chain::{
 
 pub mod adapter;
 pub mod controlled;
+pub mod evidence;
 pub mod fixture;
 pub mod lease;
 #[cfg(test)]

@@ -491,6 +491,12 @@ impl<T: FromReply> Future for Call<'_, T> {
                 let request = request
                     .take()
                     .expect("an unsubmitted call holds its request");
+                // Inspected without the lock, since digesting an apply walks
+                // its whole insertion.
+                drop(ops);
+                let key = port.engine.adapter_key();
+                let (request, request_digest, rejected) = inspect(*request, key);
+                let mut ops = port.ops();
                 if ops.shut_down {
                     drop(ops);
                     self.state = CallState::Orphaned;
@@ -501,18 +507,12 @@ impl<T: FromReply> Future for Call<'_, T> {
                     .checked_add(1)
                     .expect("a run submits fewer than 2^64 operations");
                 let id = OpId(ops.last);
-                let key = port.engine.adapter_key();
-                let (op, attribution, request_digest) = (
-                    request.op(),
-                    attribution(&request, key),
-                    digest(&request, key),
-                );
-                let rejected = request.rejected_by(key).is_some();
+                let (op, attribution) = (request.op(), attribution(&request, key));
                 ops.slots.insert(
                     id,
                     Slot {
                         stage: Stage::Pending {
-                            request: *request,
+                            request,
                             submitted: Instant::now(),
                         },
                         caller: Some(cx.waker().clone()),
@@ -620,25 +620,48 @@ fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
     }
 }
 
-/// A digest of `request`. Path and target handles redact their identity
-/// and contents from `Debug`, so a path this port issued adds its lease,
-/// peer and session, and a target this port sealed adds its whole
-/// insertion: supplier, headers and auxiliary deliveries.
-fn digest(request: &HeaderRequest, key: &AdapterKey) -> [u8; 32] {
+/// Digests `request` and runs its adapter-side input checks, for the
+/// adapter holding `key`, and gives the request back. It takes the request
+/// by value so it can open a sealed target and seal it again, rather than
+/// clone it.
+///
+/// Path and target handles redact their identity and contents from
+/// `Debug`. So a path this port issued adds its lease, peer and session,
+/// and a target this port sealed adds its insertion: supplier, parent,
+/// completion, each header's hash and each auxiliary delivery.
+fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32], bool) {
     let mut hasher = Sha256::new();
-    hasher.update(b"zakura-storage-header-request-v1");
+    hasher.update(b"zakura-storage-header-request-v2");
     hasher.update(format!("{request:?}").as_bytes());
-    match request {
-        HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } => {
-            hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+    let (request, rejected) = match request {
+        HeaderRequest::ApplyHeaderTarget { target } => match target.into_insert(key) {
+            Ok(insert) => {
+                hasher.update(insert.source.digest());
+                hasher.update(insert.parent_hash.0);
+                hasher.update(format!("{:?}", insert.completion).as_bytes());
+                for header in insert.batch.headers() {
+                    hasher.update(header.hash.0);
+                }
+                for aux in &insert.aux {
+                    hasher.update(format!("{aux:?}").as_bytes());
+                }
+                let target = PreparedHeaderTarget::from_insert(key, insert);
+                (HeaderRequest::ApplyHeaderTarget { target }, false)
+            }
+            Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true),
+        },
+        request => {
+            if let HeaderRequest::ReadHeaderPath { path, .. }
+            | HeaderRequest::ReleaseHeaderPath { path } = &request
+            {
+                hasher.update(format!("{:?}", path.adapter_identity(key)).as_bytes());
+            }
+            // No other request's input checks open a sealed target.
+            let rejected = request.rejected_by(key).is_some();
+            (request, rejected)
         }
-        HeaderRequest::ApplyHeaderTarget { target } => {
-            // `into_insert` consumes the target, so this opens a clone.
-            hasher.update(format!("{:?}", target.clone().into_insert(key).ok()).as_bytes());
-        }
-        _ => {}
-    }
-    hasher.finalize().into()
+    };
+    (request, hasher.finalize().into(), rejected)
 }
 
 impl Port for ControlledPort {

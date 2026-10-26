@@ -124,7 +124,7 @@ pub fn record(
     }
     let mut sink = FileSink::create(out, &meta).map_err(RecordError::Io)?;
     match (harness.run)(&meta.scenario, Plan::from_fuzz(plan), &mut sink) {
-        Ok(_) | Err(HarnessError::Run(_)) => {}
+        Ok(_) | Err(HarnessError::Run { .. }) => {}
         Err(error) => return Err(RecordError::Harness(error)),
     }
     sink.finish().map_err(RecordError::Io)?;

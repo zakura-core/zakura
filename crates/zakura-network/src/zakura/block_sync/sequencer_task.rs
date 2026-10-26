@@ -284,7 +284,7 @@ pub(super) struct SequencerTask {
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     /// Dates body-retry episodes and converts their deadlines to `Instant`s.
-    /// Production passes [`BlockSyncClock`](super::BlockSyncClock), so both
+    /// Production passes [`BlockSyncClock`], so both
     /// sides read the run's UTC.
     retry_clock: Arc<dyn zakura_header_chain::Clock>,
     body_input_rx: mpsc::Receiver<SequencedBody>,

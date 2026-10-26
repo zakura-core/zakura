@@ -838,7 +838,7 @@ impl Scheduler {
     /// Every coroutine and the whole run state, with its queued spawns,
     /// timers, join wakers and panic payloads, are forgotten as they are,
     /// as [`ClearRun`] does during a panic. Their stacks count as leaked in
-    /// [`StackPool`](crate::StackPool).
+    /// [`StackPool`].
     ///
     /// After an abandoned run, the caller must not wait on anything it shares
     /// with the run's tasks, by dropping it or otherwise, since a leaked task

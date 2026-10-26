@@ -151,7 +151,12 @@ jobs:
         run: |
           jq -r '"has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
 
+      # cargo-semver-checks below builds the previous release tag, whose
+      # zakura-librocksdb-sys runs bindgen. Drop libclang once that tag uses
+      # 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
       - name: Verify the preserved ready set
         run: python3 .github/scripts/release_state.py verify --state "$RUNNER_TEMP/release-state"
       - name: Validate the preserved candidate before import

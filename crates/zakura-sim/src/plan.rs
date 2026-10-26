@@ -13,7 +13,11 @@ use std::{collections::VecDeque, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Category, Identity};
+use crate::{
+    record::DrawRecord,
+    trace::{Invalid, Trace},
+    Category, Identity,
+};
 
 /// A `u64` that serializes as a lowercase `0x` hex string, so JSON tools keep
 /// every bit. Only the canonical form deserializes.
@@ -87,8 +91,108 @@ pub enum PlanInput {
     /// Fuzz bytes, decoded one choice at a time.
     Bytes(Vec<u8>),
     /// A scripted plan that follows picks by identity. Test scaffolding only.
-    /// Trace replay is separate (traces.md, Exact).
     Script(Plan),
+    /// A recorded trace's every pick and draw, which the run must make again
+    /// exactly (traces.md, Replay). Only [`crate::trace::replay`] builds one.
+    Trace(TraceScript),
+}
+
+/// A trace's picks and draws in run order, for Exact replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceScript {
+    entries: VecDeque<Recorded>,
+    /// True if the trace is a prefix, so running past its last step stops
+    /// the replay instead of diverging.
+    prefix: bool,
+}
+
+impl TraceScript {
+    /// `trace`'s `init` draws, then each step's pick and draws. Fails on a
+    /// draw whose recorded value isn't below its bound, so a hand-edited
+    /// trace can't hand production code an out-of-range answer.
+    pub(crate) fn new(trace: &Trace, prefix: bool) -> Result<Self, Invalid> {
+        let mut entries = VecDeque::new();
+        // `init` is line 2, and step n is line n + 2.
+        for draw in trace.init.iter().flat_map(|init| &init.draws) {
+            entries.push_back(Recorded::draw(0, 2, draw)?);
+        }
+        for step in &trace.steps {
+            let line = usize::try_from(step.step).map_or(usize::MAX, |n| n.saturating_add(2));
+            entries.push_back(Recorded::Pick {
+                step: step.step,
+                pick: step.pick.clone(),
+                options: step.options,
+                by: step.by,
+                offset: step.offset,
+            });
+            for draw in &step.draws {
+                entries.push_back(Recorded::draw(step.step, line, draw)?);
+            }
+        }
+        Ok(TraceScript { entries, prefix })
+    }
+}
+
+/// One recorded pick or draw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Recorded {
+    Pick {
+        step: u64,
+        pick: String,
+        options: usize,
+        by: By,
+        offset: Option<usize>,
+    },
+    Draw {
+        step: u64,
+        draw: String,
+        bound: u64,
+        value: u64,
+        by: By,
+    },
+}
+
+impl Recorded {
+    /// The entry for `draw`, taken at `step` and read from `line`. Fails if
+    /// its value isn't below its bound.
+    fn draw(step: u64, line: usize, draw: &DrawRecord) -> Result<Self, Invalid> {
+        let DrawRecord {
+            draw,
+            bound,
+            value,
+            by,
+        } = draw;
+        if bound.0 != 0 && value.0 >= bound.0 {
+            return Err(Invalid::Malformed {
+                line,
+                reason: format!("draw {draw} answers {value}, not below {bound}"),
+            });
+        }
+        Ok(Recorded::Draw {
+            step,
+            draw: draw.clone(),
+            bound: bound.0,
+            value: value.0,
+            by: *by,
+        })
+    }
+
+    /// The step that made it. `init` draws are step 0.
+    fn step(&self) -> u64 {
+        match self {
+            Recorded::Pick { step, .. } | Recorded::Draw { step, .. } => *step,
+        }
+    }
+}
+
+impl fmt::Display for Recorded {
+    /// `pick <identity>` or `draw <identity> below <bound>`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Recorded::Pick { pick, .. } => write!(f, "pick {pick}"),
+            Recorded::Draw { draw, bound, .. } => write!(f, "draw {draw} below {}", HexU64(*bound)),
+        }
+    }
 }
 
 /// What made a choice, as records show it.
@@ -103,7 +207,7 @@ pub enum By {
     Forced,
 }
 
-/// A scripted plan that the run couldn't follow.
+/// A scripted plan or trace that the run couldn't follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
     /// The script picks an action that isn't enabled.
@@ -118,6 +222,149 @@ pub enum PlanError {
         /// The script's entry.
         found: PlanChoice,
     },
+    /// The run asked for a pick or draw other than the trace's next one.
+    Diverged(Divergence),
+    /// The run went past a prefix trace's last step, so the prefix replayed
+    /// in full.
+    PrefixEnd {
+        /// The prefix's last step.
+        step: u64,
+    },
+}
+
+/// How a run left its trace. Steps count from 1, and step 0 is `init`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// The recorded pick isn't enabled. Identities compare in full, `at`
+    /// included.
+    Pick {
+        /// The step.
+        step: u64,
+        /// The recorded pick.
+        wanted: String,
+        /// Every enabled identity.
+        ready: Vec<String>,
+    },
+    /// A different number of actions is enabled.
+    Options {
+        /// The step.
+        step: u64,
+        /// The recorded count.
+        recorded: usize,
+        /// The count now.
+        found: usize,
+    },
+    /// A drain step's round-robin pick isn't the recorded one.
+    DrainPick {
+        /// The step.
+        step: u64,
+        /// The recorded pick.
+        wanted: String,
+        /// The round-robin pick.
+        found: String,
+    },
+    /// A draw's identity or bound isn't the recorded one.
+    Draw {
+        /// The step.
+        step: u64,
+        /// The recorded draw and bound.
+        wanted: String,
+        /// The run's draw and bound.
+        found: String,
+    },
+    /// The run asked for a pick where the trace has a draw, or the reverse.
+    Kind {
+        /// The trace entry's step.
+        step: u64,
+        /// What the run asked for: `pick` or `draw`.
+        wanted: &'static str,
+        /// The trace's entry.
+        found: String,
+    },
+    /// The run asked for a pick or draw after the trace's last one.
+    PastEnd {
+        /// The step it asked in.
+        step: u64,
+        /// What it asked for: `pick` or `draw`.
+        wanted: &'static str,
+    },
+    /// The run ended before the trace's last pick or draw.
+    Unreached {
+        /// The first unreached entry's step.
+        step: u64,
+        /// The entry.
+        wanted: String,
+    },
+}
+
+impl Divergence {
+    /// The step it happened at.
+    pub fn step(&self) -> u64 {
+        match self {
+            Divergence::Pick { step, .. }
+            | Divergence::Options { step, .. }
+            | Divergence::DrainPick { step, .. }
+            | Divergence::Draw { step, .. }
+            | Divergence::Kind { step, .. }
+            | Divergence::PastEnd { step, .. }
+            | Divergence::Unreached { step, .. } => *step,
+        }
+    }
+}
+
+impl fmt::Display for Divergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Divergence::Pick {
+                step,
+                wanted,
+                ready,
+            } => write!(
+                f,
+                "step {step}: recorded pick {wanted} isn't enabled; enabled: {}",
+                ready.join(", ")
+            ),
+            Divergence::Options {
+                step,
+                recorded,
+                found,
+            } => write!(
+                f,
+                "step {step}: {found} actions are enabled, and the trace recorded {recorded}"
+            ),
+            Divergence::DrainPick {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the drain picked {found}, and the trace recorded {wanted}"
+            ),
+            Divergence::Draw {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the run took {found}, and the trace recorded {wanted}"
+            ),
+            Divergence::Kind {
+                step,
+                wanted,
+                found,
+            } => write!(
+                f,
+                "step {step}: the run asked for a {wanted}, and the trace has {found}"
+            ),
+            Divergence::PastEnd { step, wanted } => write!(
+                f,
+                "step {step}: the run asked for a {wanted} after the trace's last one"
+            ),
+            Divergence::Unreached { step, wanted } => {
+                write!(f, "step {step}: the run ended before the trace's {wanted}")
+            }
+        }
+    }
 }
 
 impl fmt::Display for PlanError {
@@ -129,6 +376,10 @@ impl fmt::Display for PlanError {
                     f,
                     "the run asked for a {wanted}, but the script has {found}"
                 )
+            }
+            PlanError::Diverged(divergence) => write!(f, "the replay diverged at {divergence}"),
+            PlanError::PrefixEnd { step } => {
+                write!(f, "the prefix replayed to its last step, {step}")
             }
         }
     }
@@ -161,8 +412,16 @@ pub(crate) struct Answer {
 /// The remaining input.
 #[derive(Debug)]
 enum Input {
-    Bytes { bytes: Vec<u8>, offset: usize },
+    Bytes {
+        bytes: Vec<u8>,
+        offset: usize,
+    },
     Script(VecDeque<PlanChoice>),
+    Trace {
+        script: TraceScript,
+        /// The step of the last recorded pick taken, 0 before the first.
+        step: u64,
+    },
 }
 
 /// Makes a run's choices from its [`PlanInput`].
@@ -181,6 +440,7 @@ impl Decider {
         let input = match input {
             PlanInput::Bytes(bytes) => Input::Bytes { bytes, offset: 0 },
             PlanInput::Script(plan) => Input::Script(plan.choices.into()),
+            PlanInput::Trace(script) => Input::Trace { script, step: 0 },
         };
         Decider {
             input,
@@ -203,7 +463,23 @@ impl Decider {
             "the enabled set is sorted and has no duplicates"
         );
         let n = options.len();
-        let decision = if n == 1 {
+        let decision = if let Input::Trace { .. } = self.input {
+            let (recorded, by, offset) = self.next_recorded_pick(options)?;
+            Decision {
+                index: options
+                    .iter()
+                    .position(|o| o.to_string() == recorded)
+                    .ok_or_else(|| {
+                        PlanError::Diverged(Divergence::Pick {
+                            step: self.trace_step(),
+                            wanted: recorded,
+                            ready: options.iter().map(ToString::to_string).collect(),
+                        })
+                    })?,
+                by,
+                offset,
+            }
+        } else if n == 1 {
             Decision {
                 index: 0,
                 by: By::Forced,
@@ -251,7 +527,10 @@ impl Decider {
     /// Picks one of `options` by round-robin alone, ignoring the input, as
     /// the drain after a budget does. The same preconditions as
     /// [`pick`](Self::pick) apply.
-    pub(crate) fn pick_round_robin(&mut self, options: &[Identity]) -> Decision {
+    ///
+    /// A trace input still checks the pick against its record, so a drain
+    /// that leaves the trace stops before the step runs.
+    pub(crate) fn pick_round_robin(&mut self, options: &[Identity]) -> Result<Decision, PlanError> {
         assert!(!options.is_empty(), "a pick needs an enabled action");
         let decision = Decision {
             index: self.round_robin(options),
@@ -262,16 +541,44 @@ impl Decider {
             },
             offset: None,
         };
+        if let Input::Trace { .. } = self.input {
+            // Round-robin makes the same `by` the recording did, so only the
+            // pick needs checking.
+            let (recorded, _, _) = self.next_recorded_pick(options)?;
+            let found = options[decision.index].to_string();
+            if found != recorded {
+                return Err(PlanError::Diverged(Divergence::DrainPick {
+                    step: self.trace_step(),
+                    wanted: recorded,
+                    found,
+                }));
+            }
+        }
         let picked = &options[decision.index];
         self.cursor = Some((picked.category, picked.key.clone()));
-        decision
+        Ok(decision)
     }
 
-    /// Answers a draw below `bound`, or any `u64` when `bound` is 0.
+    /// Answers draw `identity` below `bound`, or any `u64` when `bound` is
+    /// 0.
     ///
     /// `ordinal` counts this draw among its task's draws of the same kind,
-    /// from 1. An exhausted input answers [`default_draw`] for it.
-    pub(crate) fn draw(&mut self, bound: u64, ordinal: u32) -> Result<Answer, PlanError> {
+    /// from 1. An exhausted input answers [`default_draw`] for it. A trace
+    /// input answers the recorded value, after checking the identity and
+    /// bound, bound-1 draws included.
+    pub(crate) fn draw(
+        &mut self,
+        identity: &str,
+        bound: u64,
+        ordinal: u32,
+    ) -> Result<Answer, PlanError> {
+        if let Input::Trace { .. } = self.input {
+            let answer = self.next_recorded_draw(identity, bound)?;
+            if answer.by == By::Bytes {
+                self.resolved.push(PlanChoice::Draw(HexU64(answer.value)));
+            }
+            return Ok(answer);
+        }
         if bound == 1 {
             return Ok(Answer {
                 value: 0,
@@ -312,6 +619,112 @@ impl Decider {
         Ok(answer)
     }
 
+    /// Fails if a trace input has picks or draws the run never reached.
+    /// Other inputs always pass.
+    pub(crate) fn finish(&self) -> Result<(), PlanError> {
+        match &self.input {
+            Input::Trace { script, .. } => match script.entries.front() {
+                Some(next) => Err(PlanError::Diverged(Divergence::Unreached {
+                    step: next.step(),
+                    wanted: next.to_string(),
+                })),
+                None => Ok(()),
+            },
+            Input::Bytes { .. } | Input::Script(_) => Ok(()),
+        }
+    }
+
+    /// The step of the last recorded pick a trace input gave, 0 before the
+    /// first or for other inputs.
+    fn trace_step(&self) -> u64 {
+        match self.input {
+            Input::Trace { step, .. } => step,
+            Input::Bytes { .. } | Input::Script(_) => 0,
+        }
+    }
+
+    /// Takes a trace input's next entry, which must be a pick among
+    /// `options.len()` actions. Returns its identity, `by` and offset.
+    fn next_recorded_pick(
+        &mut self,
+        options: &[Identity],
+    ) -> Result<(String, By, Option<usize>), PlanError> {
+        let Input::Trace { script, step } = &mut self.input else {
+            unreachable!("only called for a trace input");
+        };
+        let diverged = |d| Err(PlanError::Diverged(d));
+        match script.entries.pop_front() {
+            Some(Recorded::Pick {
+                step: at,
+                pick,
+                options: recorded,
+                by,
+                offset,
+            }) => {
+                *step = at;
+                if recorded != options.len() && options.iter().any(|o| o.to_string() == pick) {
+                    return diverged(Divergence::Options {
+                        step: at,
+                        recorded,
+                        found: options.len(),
+                    });
+                }
+                Ok((pick, by, offset))
+            }
+            Some(found @ Recorded::Draw { .. }) => diverged(Divergence::Kind {
+                step: found.step(),
+                wanted: "pick",
+                found: found.to_string(),
+            }),
+            None if script.prefix => Err(PlanError::PrefixEnd { step: *step }),
+            None => diverged(Divergence::PastEnd {
+                step: step.saturating_add(1),
+                wanted: "pick",
+            }),
+        }
+    }
+
+    /// Takes a trace input's next entry, which must be draw `identity` below
+    /// `bound`, and answers it.
+    fn next_recorded_draw(&mut self, identity: &str, bound: u64) -> Result<Answer, PlanError> {
+        let Input::Trace { script, step } = &mut self.input else {
+            unreachable!("only called for a trace input");
+        };
+        let diverged = |d| Err(PlanError::Diverged(d));
+        match script.entries.pop_front() {
+            Some(Recorded::Draw {
+                draw,
+                bound: recorded,
+                value,
+                by,
+                step: at,
+            }) => {
+                if draw != identity || recorded != bound {
+                    return diverged(Divergence::Draw {
+                        step: at,
+                        wanted: format!("{draw} below {}", HexU64(recorded)),
+                        found: format!("{identity} below {}", HexU64(bound)),
+                    });
+                }
+                Ok(Answer {
+                    value,
+                    by,
+                    offset: None,
+                })
+            }
+            Some(found @ Recorded::Pick { .. }) => diverged(Divergence::Kind {
+                // The draw belongs to the step before the recorded pick.
+                step: found.step().saturating_sub(1),
+                wanted: "draw",
+                found: found.to_string(),
+            }),
+            None => diverged(Divergence::PastEnd {
+                step: *step,
+                wanted: "draw",
+            }),
+        }
+    }
+
     /// The real choices made so far, as a script that replays them. Choices
     /// after it ran out are the same defaults on replay.
     pub(crate) fn resolved(&self) -> Plan {
@@ -344,6 +757,7 @@ impl Decider {
                 }
             }
             Input::Script(choices) => choices.pop_front().map(Next::Script),
+            Input::Trace { .. } => unreachable!("trace inputs take recorded entries instead"),
         }
     }
 
@@ -441,7 +855,7 @@ mod tests {
             .all(|p| p.by == By::Default && p.offset.is_none()));
         let indices: Vec<_> = picks.iter().map(|p| p.index).collect();
         assert_eq!(indices, [0, 1, 2, 0, 1, 2]);
-        assert_eq!(d.draw(3, 1).unwrap().by, By::Default);
+        assert_eq!(d.draw("t:rng#1", 3, 1).unwrap().by, By::Default);
         assert!(d.resolved().choices.is_empty());
     }
 
@@ -450,7 +864,7 @@ mod tests {
         let mut d = bytes(&[1]);
         let forced = d.pick(&tasks(1)).unwrap();
         assert_eq!((forced.index, forced.by), (0, By::Forced));
-        assert_eq!(d.draw(1, 1).unwrap().by, By::Forced);
+        assert_eq!(d.draw("t:rng#1", 1, 1).unwrap().by, By::Forced);
         let next = d.pick(&tasks(2)).unwrap();
         assert_eq!((next.index, next.by, next.offset), (1, By::Bytes, Some(0)));
     }
@@ -462,10 +876,10 @@ mod tests {
         assert_eq!(d.pick(&tasks(256)).unwrap().index, 255);
         let two = d.pick(&tasks(300)).unwrap();
         assert_eq!((two.index, two.offset), (0x0102, Some(1)));
-        assert_eq!(d.draw(5, 1).unwrap().value, 2);
+        assert_eq!(d.draw("t:rng#1", 5, 1).unwrap().value, 2);
         // A bound-0 draw takes eight bytes and keeps the whole value.
         let mut d = bytes(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let seed = d.draw(0, 1).unwrap();
+        let seed = d.draw("t:rng#1", 0, 1).unwrap();
         assert_eq!(seed.value, 0x0807_0605_0403_0201);
         assert_eq!((seed.by, seed.offset), (By::Bytes, Some(0)));
     }
@@ -485,14 +899,18 @@ mod tests {
             ((1 << 32) + 1, 0x0807_0605_0403_0201 % ((1 << 32) + 1), 10),
         ];
         for (bound, value, offset) in cases {
-            let answer = d.draw(bound, 1).unwrap();
+            let answer = d.draw("t:rng#1", bound, 1).unwrap();
             assert_eq!(
                 (answer.value, answer.by, answer.offset),
                 (value, By::Bytes, Some(offset)),
                 "bound {bound:#x}"
             );
         }
-        assert_eq!(d.draw(2, 1).unwrap().by, By::Default, "all 18 bytes used");
+        assert_eq!(
+            d.draw("t:rng#1", 2, 1).unwrap().by,
+            By::Default,
+            "all 18 bytes used"
+        );
     }
 
     #[test]
@@ -506,7 +924,7 @@ mod tests {
             (1, By::Bytes, Some(1))
         );
         assert_eq!(d.pick(&tasks(4)).unwrap().by, By::Default);
-        let seed = d.draw(0, 1).unwrap();
+        let seed = d.draw("t:rng#1", 0, 1).unwrap();
         assert_eq!((seed.value, seed.by), (0, By::Default));
     }
 
@@ -550,7 +968,7 @@ mod tests {
         let mut d = Decider::new(PlanInput::Script(script));
         let pick = d.pick(&options).unwrap();
         assert_eq!((pick.index, pick.by, pick.offset), (2, By::Bytes, None));
-        assert_eq!(d.draw(3, 1).unwrap().value, 1);
+        assert_eq!(d.draw("t:rng#1", 3, 1).unwrap().value, 1);
         // The script ran out, so round-robin goes on after t002.
         assert_eq!(d.pick(&options).unwrap().index, 0);
     }
@@ -612,7 +1030,7 @@ mod tests {
                 // usize always fits in u64 on supported targets.
                 Ask::Pick(n) => d.pick(&tasks(*n)).unwrap().index as u64,
                 // The test's ordinal only needs to differ between draws.
-                Ask::Draw(bound) => d.draw(*bound, i as u32 + 1).unwrap().value,
+                Ask::Draw(bound) => d.draw("t:rng#1", *bound, i as u32 + 1).unwrap().value,
             })
             .collect()
     }

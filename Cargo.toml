@@ -117,24 +117,17 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 rustls-pki-types = "1.12"
 # Zakura's fork of rocksdb 0.24.0 (https://github.com/zakura-core/rust-rocksdb-wrapper).
 # It compiles the bundled RocksDB C++ as a unity build, 16 sources per
-# translation unit. The library is still named `rocksdb`, so no code changes
-# are needed.
+# translation unit, and without its default `full` feature it also leaves out
+# RocksDB features Zakura does not use (see the fork's README). The library is
+# still named `rocksdb`, so no code changes are needed.
 #
-# `full` compiles all of RocksDB. Without it, zakura-librocksdb-sys 0.17.5 skips
-# the sources of features Zakura does not use, but still compiles
-# utilities/transactions/snapshot_checker.cc, which calls into the skipped
-# write-prepared transaction code. Whether that dangling reference survives
-# the link depends on the C++ toolchain: GCC 16 keeps it, and `zakurad` fails
-# to link with an undefined `WritePreparedTxnDB::GetCommitEntry`. Keep `full`
-# until a fork release removes the reference.
+# The fork's CI links that build with many GCC and clang versions, in release
+# and debug, and checks that no compiled code references the skipped sources,
+# because 0.24.2's build failed to link with GCC 16 (#1583).
 #
-# `bindgen-runtime` makes zakura-librocksdb-sys's bindgen load libclang itself.
-# Without it, a build that resolves a second bindgen version elsewhere (for
-# example the fresh placeholder project cargo-semver-checks generates) unifies
-# clang-sys into runtime mode while this bindgen never loads the library, and
-# the build script panics with "a `libclang` shared library is not loaded on
-# this thread".
-rocksdb = { version = "=0.24.2", package = "zakura-rocksdb", default-features = false, features = ["bindgen-runtime", "full"] }
+# The fork commits its RocksDB C API bindings, so building needs neither
+# bindgen nor libclang.
+rocksdb = { version = "=0.24.4", package = "zakura-rocksdb", default-features = false }
 secp256k1 = "0.33"
 semver = "1.0.26"
 serde = "1.0.219"

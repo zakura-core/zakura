@@ -201,7 +201,11 @@ jobs:
         with:
           tool: cargo-semver-checks
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh
@@ -263,7 +267,11 @@ jobs:
         with:
           tool: cargo-public-api
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh
@@ -314,7 +322,11 @@ jobs:
         with:
           tool: cargo-semver-checks
 
+      # The published baselines depend on zakura-librocksdb-sys 0.17.5, which
+      # runs bindgen. Drop libclang once every baseline is 0.17.7 or later.
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          libclang: true
 
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh

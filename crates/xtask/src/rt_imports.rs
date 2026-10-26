@@ -639,7 +639,9 @@ fn bindings<'a>(items: impl IntoIterator<Item = &'a Item>) -> Bindings {
         .flatten();
     for leaf in leaves {
         if let Some(name) = leaf.name.filter(|name| name != "_") {
-            names.insert(name, vec![leaf.path]);
+            // Keep every binding: `cfg` alternatives can bind one name to
+            // different paths, and each one runs in some build.
+            names.entry(name).or_default().push(leaf.path);
         }
     }
     names
@@ -1389,6 +1391,34 @@ mod tests {
         assert_eq!(
             violations_in("crates/zakura-quic/src/driver/connection.rs", source),
             ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
+        );
+    }
+
+    /// `cfg` alternatives that bind one name are all checked, whichever
+    /// comes last.
+    #[test]
+    fn every_conditional_binding_is_checked() {
+        let sim = "#[cfg(zakura_sim)] use std::time::Instant;";
+        let production = "#[cfg(not(zakura_sim))] use zakura_rt::time::Instant;";
+        for (first, second) in [(sim, production), (production, sim)] {
+            let source = format!("{first} {second} fn f() -> Instant {{ Instant::now() }}");
+            assert_eq!(
+                violations_in("crates/zakura-quic/src/driver/connection.rs", &source),
+                ["std::time::Instant::now -> zakura_rt::time::Instant::now"],
+                "{first} {second}"
+            );
+        }
+
+        let source = "
+            #[cfg(zakura_sim)]
+            use std::time::SystemTime;
+            #[cfg(not(zakura_sim))]
+            use zakura_rt::time::Instant as SystemTime;
+            fn f() { let _ = SystemTime::now(); }
+        ";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
         );
     }
 

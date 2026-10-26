@@ -95,7 +95,7 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
-    /// Each evidence checkpoint the run holds, by name.
+    /// Each storage checkpoint the run holds, by its service.
     evidence: Vec<(String, Checkpoint)>,
     config: RunConfig,
 }
@@ -136,12 +136,13 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
-    /// Holds `checkpoint`, named `name`, for an evidence source being
-    /// created. At setup and after every step, the run ends with
-    /// [`HarnessFailure::SourceEvidence`] unless it names that step, however
+    /// Holds `checkpoint` for a storage source of `service` being created.
+    /// At setup and after every step, the run ends with
+    /// [`HarnessFailure::SourceEvidence`] unless it names that step and the
+    /// run's own log holds exactly the facts and states it records, however
     /// the source was wrapped or added, or if it never was.
-    pub(crate) fn register_evidence(&mut self, name: &str, checkpoint: Checkpoint) {
-        self.evidence.push((name.to_owned(), checkpoint));
+    pub(crate) fn register_storage(&mut self, service: &str, checkpoint: Checkpoint) {
+        self.evidence.push((service.to_owned(), checkpoint));
     }
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
@@ -441,19 +442,29 @@ impl Sim {
                     detail,
                 })?;
         }
-        for (name, checkpoint) in &self.evidence {
+        for (service, checkpoint) in &self.evidence {
             let detail = match checkpoint.get() {
-                Mark::Observed(step) if step == st.step => continue,
                 Mark::NotObserved => {
                     "NotObserved: the setup observation never completed".to_owned()
                 }
-                Mark::Observed(step) => format!(
-                    "BoundarySkipped: the last observation was at step {step}, not {}",
-                    st.step
+                Mark::Observed(delivered) if delivered.step != st.step => format!(
+                    "BoundarySkipped: the last observation was at step {}, not {}",
+                    delivered.step, st.step
                 ),
+                Mark::Observed(delivered) => {
+                    let (facts, states) = logged_storage(&st.log, st.step, service);
+                    if facts == delivered.facts && states == delivered.states {
+                        continue;
+                    }
+                    format!(
+                        "Undelivered: at step {} the run log holds facts {facts:?} and states \
+                         {states:?}, but storage delivered facts {:?} and states {:?}",
+                        st.step, delivered.facts, delivered.states
+                    )
+                }
             };
             return Err(HarnessFailure::SourceEvidence {
-                source: name.clone(),
+                source: format!("storage:{service}"),
                 detail,
             });
         }
@@ -557,6 +568,28 @@ impl State {
             ..self.end(Outcome::Harness)
         }
     }
+}
+
+/// The sequence numbers of `service`'s storage facts in `log` at `step`, and
+/// its states' watermarks, in order.
+fn logged_storage(log: &ObservationLog, step: u64, service: &str) -> (Vec<u64>, Vec<u64>) {
+    let (mut facts, mut states) = (Vec::new(), Vec::new());
+    for obs in log.of_step(step) {
+        match obs {
+            Observation::Storage {
+                service: logged,
+                seq,
+                ..
+            } if logged == service => facts.push(*seq),
+            Observation::StorageState {
+                service: logged,
+                through_seq,
+                ..
+            } if logged == service => states.push(*through_seq),
+            _ => {}
+        }
+    }
+    (facts, states)
 }
 
 /// What `source` offers at `now`.

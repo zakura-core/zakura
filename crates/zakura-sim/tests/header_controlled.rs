@@ -1002,8 +1002,10 @@ impl<S: ActionSource> ActionSource for SkipAt<S> {
 }
 
 /// A run where one task reads membership through a controlled port, with
-/// the storage source wrapped to skip its observation at `skip`, if any.
-fn skipping_run(skip: Option<u64>) -> RunReport {
+/// the storage source added as `wrap` makes it.
+fn wrapped_run(
+    wrap: impl FnOnce(zakura_sim::storage::HeaderStorage) -> Box<dyn ActionSource>,
+) -> RunReport {
     run(
         storage_config(100),
         PlanInput::Bytes(Vec::new()),
@@ -1015,16 +1017,99 @@ fn skipping_run(skip: Option<u64>) -> RunReport {
                 let _ = caller.selected_chain_contains(anchor.hash).await;
             });
             let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
-            match skip {
-                Some(skip) => sim.add_source(Box::new(SkipAt {
-                    inner: storage,
-                    skip,
-                })),
-                None => sim.add_source(Box::new(storage)),
-            };
+            sim.add_source(wrap(storage));
         },
         &mut zakura_sim::NoChecks,
     )
+}
+
+/// [`wrapped_run`] with the source skipping its observation at `skip`, if
+/// any.
+fn skipping_run(skip: Option<u64>) -> RunReport {
+    wrapped_run(|inner| match skip {
+        Some(skip) => Box::new(SkipAt { inner, skip }),
+        None => Box::new(inner),
+    })
+}
+
+/// A storage source that forwards everything to `inner`, but at step `at`
+/// observes into a copy of the log, or observes and then logs the last
+/// entry again, as buggy wrappers might.
+struct Divert<S> {
+    inner: S,
+    at: u64,
+    duplicate: bool,
+}
+
+impl<S: ActionSource> ActionSource for Divert<S> {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.inner.enabled(now, out);
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.inner.boundaries(now, out);
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if log.step() != self.at {
+            return self.inner.observe(log);
+        }
+        if !self.duplicate {
+            return self.inner.observe(&mut log.clone());
+        }
+        let cursor = log.entries().len();
+        self.inner.observe(log)?;
+        if let Some(last) = log.entries()[cursor..].last() {
+            log.push(last.obs.clone());
+        }
+        Ok(())
+    }
+}
+
+/// The run checks its own log against what storage records it delivered,
+/// so storage that delivers into a copy of the log, at setup, an interior
+/// step or the final step, or whose delivery is logged twice, ends the run
+/// at that step.
+#[test]
+fn storage_delivered_anywhere_but_the_run_log_ends_the_run() {
+    let whole = skipping_run(None);
+    let last = whole.end.steps;
+    let delivering: BTreeSet<u64> = whole
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry.obs, Observation::Storage { .. }))
+        .map(|entry| entry.step)
+        .collect();
+    let interior = *delivering
+        .iter()
+        .find(|step| **step != 0 && **step != last)
+        .expect("storage delivers at an interior step");
+    assert!(delivering.contains(&last), "the final step delivers");
+    for (at, duplicate) in [
+        (0, false),
+        (interior, false),
+        (last, false),
+        (interior, true),
+    ] {
+        let report = wrapped_run(|inner| {
+            Box::new(Divert {
+                inner,
+                at,
+                duplicate,
+            })
+        });
+        assert_eq!(report.end.outcome, Outcome::Harness, "at {at}");
+        assert_eq!(report.end.steps, at);
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("Undelivered"), "at {at}: {detail}");
+    }
 }
 
 /// C1: the run holds each evidence source's checkpoint, so a wrapper that

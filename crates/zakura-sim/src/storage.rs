@@ -27,7 +27,7 @@ use zakura_storage::header::{
 };
 
 use crate::{
-    evidence::{Checkpoint, Mark},
+    evidence::Checkpoint,
     observe::{
         Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
@@ -100,7 +100,7 @@ impl HeaderStorage {
              inside the run"
         );
         let checkpoint = Checkpoint::default();
-        sim.register_evidence(&format!("storage:{SERVICE}"), checkpoint.clone());
+        sim.register_storage(SERVICE, checkpoint.clone());
         HeaderStorage {
             port,
             max_latency,
@@ -630,7 +630,10 @@ impl ActionSource for HeaderStorage {
         }
         let last = check_delivery(&log.entries()[cursor..], &drained, delivered, with_state)?;
         self.delivered = Some(last);
-        self.checkpoint.set(Mark::Observed(log.step()));
+        // The run checks its own log against this, since the log this source
+        // was handed may not be the run's.
+        self.checkpoint
+            .record(log.step(), &drained, with_state.then_some(last));
         Ok(())
     }
 }

@@ -220,6 +220,9 @@ pub enum CompleteError {
     NotPending(OpId),
     /// The contract doesn't allow this outcome for the operation now.
     Illegal(IllegalOutcome),
+    /// The port is bound to another run. See
+    /// [`ControlledPort::refused_outside_run`].
+    OutsideRun,
 }
 
 impl fmt::Display for CompleteError {
@@ -227,6 +230,7 @@ impl fmt::Display for CompleteError {
         match self {
             CompleteError::NotPending(id) => write!(f, "no header operation {} is pending", id.0),
             CompleteError::Illegal(illegal) => illegal.fmt(f),
+            CompleteError::OutsideRun => f.write_str("the port is bound to another run"),
         }
     }
 }
@@ -269,6 +273,12 @@ struct Ops {
     shut_down: bool,
     /// Set once the port is bound to a run.
     bound: bool,
+    /// The run it's bound to.
+    #[cfg(zakura_sim)]
+    run: Option<zakura_rt::sim::RunId>,
+    /// Set when something used the port outside that run.
+    #[cfg(zakura_sim)]
+    refused: bool,
 }
 
 /// One submitted operation.
@@ -320,6 +330,22 @@ enum Stage {
 }
 
 impl Ops {
+    /// Whether the port is bound to a run that isn't the one active now,
+    /// which also marks it. The caller then refuses its change, before it
+    /// changes owner state or publishes. Never true for an unbound port, or
+    /// outside the simulator build.
+    fn refuse_outside_run(&mut self) -> bool {
+        #[cfg(zakura_sim)]
+        if self
+            .run
+            .is_some_and(|run| zakura_rt::sim::run_id() != Some(run))
+        {
+            self.refused = true;
+            return true;
+        }
+        false
+    }
+
     /// Publishes `kinds` as one transaction at `at`, in order, and returns
     /// its facts.
     fn publish(&mut self, at: Instant, kinds: Vec<FactKind>) -> Vec<Fact> {
@@ -436,6 +462,13 @@ impl ControlledPort {
     /// the port isn't pristine, since earlier activity would carry instants
     /// from outside the run, or if it's already bound. Outside the
     /// simulator build there's no run to check, so only pristineness counts.
+    ///
+    /// Once bound, a submission, reply take, caller drop or completion made
+    /// outside that run, after it ended or in a later one, is refused: it
+    /// changes nothing and publishes nothing, and
+    /// [`Self::refused_outside_run`] reports it. Shutdown is exempt, since
+    /// it's cleanup that a run does after it ends, and its facts are never
+    /// observed.
     pub fn bind_to_run(&self) -> Result<(), BindError> {
         #[cfg(zakura_sim)]
         if zakura_rt::sim::executor().is_none() {
@@ -447,8 +480,28 @@ impl ControlledPort {
         if !self.is_pristine() {
             return Err(BindError::NotPristine);
         }
-        self.ops().bound = true;
+        let mut ops = self.ops();
+        ops.bound = true;
+        #[cfg(zakura_sim)]
+        {
+            ops.run = zakura_rt::sim::run_id();
+        }
         Ok(())
+    }
+
+    /// Whether something used the port outside the run it's bound to. That
+    /// use was refused before it changed owner state or published a fact,
+    /// so the port's evidence doesn't cover it. Always `false` outside the
+    /// simulator build.
+    pub fn refused_outside_run(&self) -> bool {
+        #[cfg(zakura_sim)]
+        {
+            self.ops().refused
+        }
+        #[cfg(not(zakura_sim))]
+        {
+            false
+        }
     }
 
     /// Locks the bookkeeping. Every change to it completes under the lock, so
@@ -521,6 +574,9 @@ impl ControlledPort {
         let key = self.engine.adapter_key();
         let (request, early, permit, txn) = {
             let mut ops = self.ops();
+            if ops.refuse_outside_run() {
+                return Err(CompleteError::OutsideRun);
+            }
             let slot = ops
                 .slots
                 .get_mut(&id)
@@ -794,7 +850,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     rejected,
                 } = inspect(request, key);
                 let mut ops = port.ops();
-                if ops.shut_down {
+                if ops.shut_down || ops.refuse_outside_run() {
                     drop(ops);
                     // Dropped outside the lock, with its permit.
                     drop((request, permit));
@@ -839,6 +895,9 @@ impl<T: FromReply> Future for Call<'_, T> {
             }
             CallState::Submitted(id) => {
                 let id = *id;
+                if ops.refuse_outside_run() {
+                    return Poll::Pending;
+                }
                 // Only shutdown removes a slot before its call takes the reply.
                 let Some(slot) = ops.slots.get_mut(&id) else {
                     return Poll::Pending;
@@ -876,6 +935,9 @@ impl<T> Drop for Call<'_, T> {
         };
         let port = self.port;
         let mut ops = port.ops();
+        if ops.refuse_outside_run() {
+            return;
+        }
         let Some(slot) = ops.slots.get_mut(&id) else {
             return;
         };

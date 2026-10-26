@@ -20,7 +20,7 @@ use zakura_node_services::header_chain::{
 };
 use zakura_scheduler::{At, Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, TaskId};
 use zakura_storage::header::{
-    controlled::{BindError, ControlledPort, Fact, FactKind, OpId},
+    controlled::{BindError, CompleteError, ControlledPort, Fact, FactKind, OpId},
     evidence::ResultIdentity,
     fixture::HeaderFixture,
     lease::LeaseEnd,
@@ -318,6 +318,35 @@ fn binding_needs_an_active_run() {
     assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
     assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
     drop(sched);
+}
+
+/// A port bound to a run refuses use outside it, after that run ends or in
+/// a later run: a call polled then submits and publishes nothing, a
+/// completion is refused, and the port reports the refusal, so its
+/// evidence never carries another clock's instants.
+#[test]
+fn a_bound_port_refuses_use_outside_its_run() {
+    for later in [false, true] {
+        let (port, target) = chain();
+        let sched = scheduler();
+        assert_eq!(port.bind_to_run(), Ok(()));
+        drop(sched);
+        let other = later.then(scheduler);
+        assert!(!port.refused_outside_run());
+        let mut call = port.selected_chain_contains(target.hash);
+        assert!(pin!(&mut call)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(port.take_facts().is_empty(), "later run: {later}");
+        assert!(port.pending().is_empty());
+        assert!(port.refused_outside_run());
+        assert_eq!(
+            port.complete(OpId(1), Outcome::Engine),
+            Err(CompleteError::OutsideRun)
+        );
+        drop(call);
+        drop(other);
+    }
 }
 
 /// #1721 review P1: abandoning an unread `Acquired` reply fires the capacity

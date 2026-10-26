@@ -8,10 +8,11 @@ use std::{
 };
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::HARNESSES,
-    trace::{TraceReader, INPUT_FILE, TRACE_FILE},
+    trace::{TraceReader, INPUT_FILE, OBSERVATIONS_FILE, TRACE_FILE},
 };
 
 /// Runs the binary with `args`.
@@ -264,5 +265,55 @@ fn replay_exit_codes() {
     );
     for flags in [&["--bogus"][..], &["extra"], &["--prefix", "--prefix"]] {
         assert_eq!(replay(&trace, flags).status.code(), Some(2), "{flags:?}");
+    }
+}
+
+#[test]
+fn observe_exports_typed_observations_in_a_fresh_process() {
+    let dir = TempDir::new().unwrap();
+    let trace = record(dir.path(), "discovery/wait-complete", &[0, 1, 7, 3, 9, 1]);
+    let output = replay(&trace, &["--observe"]);
+    assert!(output.status.success(), "{output:?}");
+    let steps = TraceReader::open(&trace).unwrap().steps;
+    let log = std::fs::read_to_string(trace.join(OBSERVATIONS_FILE)).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), steps.len() + 1, "steps 0 to the last");
+    let mut tags = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["step"], json!(n));
+        for obs in parsed["obs"].as_array().unwrap() {
+            tags.push(
+                obs["obs"]
+                    .as_str()
+                    .expect("each observation names its kind")
+                    .to_owned(),
+            );
+        }
+        // Step 0 has no digest, and every other line hashes, byte for byte,
+        // to its step's.
+        if n > 0 {
+            let obs = line
+                .strip_prefix(&format!(r#"{{"step":{n},"obs":"#))
+                .and_then(|rest| rest.strip_suffix('}'))
+                .unwrap();
+            let digest: String = Sha256::digest(obs.as_bytes())[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(
+                steps[n - 1].obs.as_deref(),
+                Some(digest.as_str()),
+                "step {n}"
+            );
+        }
+    }
+    for tag in [
+        "task-spawned",
+        "task-reached",
+        "task-waiting",
+        "task-exited",
+    ] {
+        assert!(tags.iter().any(|t| t == tag), "{tag} in {tags:?}");
     }
 }

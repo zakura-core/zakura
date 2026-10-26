@@ -107,6 +107,9 @@ pub enum RequestIdentity {
         owner: HeaderSyncWorkOwner,
         /// The header supplier.
         source: SourceId,
+        /// The parent the sealed insertion starts from, or `None` for
+        /// another adapter's target, whose insertion this port can't open.
+        parent_hash: Option<block::Hash>,
         /// The target.
         target_tip_hash: block::Hash,
     },
@@ -118,8 +121,14 @@ pub enum RequestIdentity {
 }
 
 impl RequestIdentity {
-    /// The identity of `request`, for the adapter holding `key`.
-    pub(crate) fn of(request: &HeaderRequest, key: &AdapterKey) -> Self {
+    /// The identity of `request`, for the adapter holding `key`. An apply's
+    /// parent is sealed in its target, so the caller that opened the target
+    /// passes it as `apply_parent`. Other requests ignore it.
+    pub(crate) fn of(
+        request: &HeaderRequest,
+        key: &AdapterKey,
+        apply_parent: Option<block::Hash>,
+    ) -> Self {
         match request {
             HeaderRequest::ContinuationLocator => RequestIdentity::ContinuationLocator,
             HeaderRequest::VctRepairContext { owner, height } => {
@@ -156,6 +165,7 @@ impl RequestIdentity {
             HeaderRequest::ApplyHeaderTarget { target } => RequestIdentity::ApplyHeaderTarget {
                 owner: target.owner(),
                 source: target.source(),
+                parent_hash: apply_parent,
                 target_tip_hash: target.target_tip_hash(),
             },
             HeaderRequest::SelectedChainContains { hash } => {

@@ -787,7 +787,12 @@ impl<T: FromReply> Future for Call<'_, T> {
                 // its whole insertion.
                 drop(ops);
                 let key = port.engine.adapter_key();
-                let (request, request_digest, rejected) = inspect(request, key);
+                let Inspected {
+                    request,
+                    identity,
+                    request_digest,
+                    rejected,
+                } = inspect(request, key);
                 let mut ops = port.ops();
                 if ops.shut_down {
                     drop(ops);
@@ -801,7 +806,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     .checked_add(1)
                     .expect("a run submits fewer than 2^64 operations");
                 let id = OpId(ops.last);
-                let (identity, token) = (RequestIdentity::of(&request, key), Arc::new(CallerToken));
+                let token = Arc::new(CallerToken);
                 ops.slots.insert(
                     id,
                     Slot {
@@ -925,22 +930,32 @@ impl<T> Drop for Call<'_, T> {
     }
 }
 
-/// Digests `request` and runs its adapter-side input checks, for the
-/// adapter holding `key`, and gives the request back. It takes the request
-/// by value so it can open a sealed target and seal it again, rather than
-/// clone it.
+/// What [`inspect`] learned about a request, with the request itself.
+struct Inspected {
+    request: HeaderRequest,
+    identity: RequestIdentity,
+    request_digest: [u8; 32],
+    /// Whether it fails an adapter-side input check.
+    rejected: bool,
+}
+
+/// Identifies and digests `request` and runs its adapter-side input
+/// checks, for the adapter holding `key`, and gives the request back. It
+/// takes the request by value so it can open a sealed target and seal it
+/// again, rather than clone it.
 ///
 /// Path and target handles redact their identity and contents from
 /// `Debug`. So a path this port issued adds its lease, peer and session,
 /// and a target this port sealed adds its insertion: supplier, parent,
 /// completion, each header's hash and each auxiliary delivery.
-fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32], bool) {
+fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v2");
     hasher.update(format!("{request:?}").as_bytes());
-    let (request, rejected) = match request {
+    let (request, rejected, apply_parent) = match request {
         HeaderRequest::ApplyHeaderTarget { target } => match target.into_insert(key) {
             Ok(insert) => {
+                let parent = insert.parent_hash;
                 hasher.update(insert.source.digest());
                 hasher.update(insert.parent_hash.0);
                 hasher.update(format!("{:?}", insert.completion).as_bytes());
@@ -951,9 +966,13 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32]
                     hasher.update(format!("{aux:?}").as_bytes());
                 }
                 let target = PreparedHeaderTarget::from_insert(key, insert);
-                (HeaderRequest::ApplyHeaderTarget { target }, false)
+                (
+                    HeaderRequest::ApplyHeaderTarget { target },
+                    false,
+                    Some(parent),
+                )
             }
-            Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true),
+            Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true, None),
         },
         request => {
             if let HeaderRequest::ReadHeaderPath { path, .. }
@@ -963,10 +982,15 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> (HeaderRequest, [u8; 32]
             }
             // No other request's input checks open a sealed target.
             let rejected = request.rejected_by(key).is_some();
-            (request, rejected)
+            (request, rejected, None)
         }
     };
-    (request, hasher.finalize().into(), rejected)
+    Inspected {
+        identity: RequestIdentity::of(&request, key, apply_parent),
+        request,
+        request_digest: hasher.finalize().into(),
+        rejected,
+    }
 }
 
 impl Port for ControlledPort {

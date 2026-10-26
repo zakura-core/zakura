@@ -730,6 +730,13 @@ impl ControlledPort {
         }
     }
 
+    /// The sequence number of the last fact published, 0 before any. A
+    /// cheap read for a checker that needs to know only whether facts were
+    /// published since it last looked.
+    pub fn last_seq(&self) -> u64 {
+        self.ops().last_seq
+    }
+
     /// The facts published since the last call, in order.
     pub fn take_facts(&self) -> Vec<Fact> {
         mem::take(&mut self.ops().facts)

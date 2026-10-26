@@ -2813,6 +2813,7 @@ async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await
 }
 
+#[cfg(feature = "indexer-rpc")]
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     use std::sync::Arc;

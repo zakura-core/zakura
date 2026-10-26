@@ -26,8 +26,13 @@ exclude = ["*.proto"]
 # Production features that activate extra dependencies, or extra features in
 # dependencies
 
+default = ["indexer-rpc"]
+
+# The indexer gRPC server and the `sync` client that reads from it
+indexer-rpc = ["dep:tonic", "dep:prost", "dep:tonic-prost", "dep:tokio-stream"]
+
 # Indexer support: serve raw finalized block ranges on the indexer gRPC service
-indexer = ["zakura-state/indexer"]
+indexer = ["indexer-rpc", "zakura-state/indexer"]
 
 # Experimental internal miner support
 internal-miner = []
@@ -74,10 +79,10 @@ tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros"] }
 tower = { workspace = true }
 
 # gRPC server dependencies
-tonic = { workspace = true }
-prost = { workspace = true }
-tonic-prost = { workspace = true }
-tokio-stream = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
 
 tracing = { workspace = true }
 

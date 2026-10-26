@@ -69,7 +69,7 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus"]
+default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -86,8 +86,11 @@ portable = ["dep:orchard", "orchard/portable"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
+# The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured
+indexer-rpc = ["zakura-rpc/indexer-rpc"]
+
 # Indexer support
-indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
+indexer = ["indexer-rpc", "zakura-state/indexer", "zakura-rpc/indexer"]
 
 # Per-block commit-phase timing histograms (zakura.state.write.*), for perf profiling
 commit-metrics = ["zakura-state/commit-metrics"]
@@ -150,7 +153,7 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "11.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
-zakura-rpc = { path = "../zakura-rpc", version = "13.0.1" }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", default-features = false }
 zakura-state = { path = "../zakura-state", version = "11.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.0" }
 zcash_script = { workspace = true }
@@ -231,7 +234,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "12.0.0", features 
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "11.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["proptest-impl"] }
-zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", features = ["proptest-impl"] }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", default-features = false, features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # The simulator's engine-backed header port, compared against

@@ -270,7 +270,7 @@ MAINNET_MNT="$PWD/mainnet"
 SANDBLAST_URL=https://snapshots.example/sandblast.tar.zst
 SANDBLAST_SHA256=unused
 fetch_state() {
-  mkdir -p "$3"
+  mkdir -p "$3/state/v30/mainnet"
   touch "$3/restored"
 }
 """ + body,
@@ -279,6 +279,8 @@ fetch_state() {
                 if status == 0:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertTrue(marker.exists())
+                    self.assertIn("Upgraded sandblast to", result.stdout)
+                    self.assertIn("sandblast/state/v30/mainnet", result.stdout)
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("could not upgrade restored Mainnet database", result.stderr)

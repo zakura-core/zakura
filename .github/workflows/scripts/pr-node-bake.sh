@@ -277,6 +277,7 @@ mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 # or previous major.
 fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
 upgrade_restored_state "$MAINNET_MNT/sandblast" mainnet archive
+echo "Upgraded sandblast to $(ls -d "$MAINNET_MNT"/sandblast/state/v*/mainnet)"
 
 # Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
 # reliably because pruning removes transaction data rollback-state needs.

@@ -15,6 +15,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use zakura_chain::block;
 use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{AcquirePathReply, ServingCapacitySignal};
+
+use super::Release;
 use zakura_rt::time::Instant;
 
 /// Most leases held at once, zakura-state's `MAX_RETAINED_PATH_LEASES`.
@@ -95,6 +97,45 @@ pub(super) struct Spec {
     pub(super) capacity: Capacity,
 }
 
+/// A lease that ended, and why.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct LeaseEnd {
+    /// The peer that held it.
+    pub peer: SourceId,
+    /// Its lease ID.
+    pub lease_id: u64,
+    /// The event that ended it.
+    pub release: Release,
+}
+
+/// What registry changes leave to do once the registry's lock is released:
+/// the leases they ended, and the capacity signals to fire. Firing or
+/// dropping a signal is a scheduling point in a simulator run, and a task
+/// suspended there with the lock held would leave the run unable to take
+/// it, so signals never fire under the lock.
+#[must_use = "the capacity signals must fire"]
+#[derive(Debug, Default)]
+pub(crate) struct Effects {
+    ends: Vec<LeaseEnd>,
+    signals: Vec<ServingCapacitySignal>,
+}
+
+impl Effects {
+    /// The leases ended, in order.
+    pub(crate) fn ends(&self) -> &[LeaseEnd] {
+        &self.ends
+    }
+
+    /// Fires the capacity signals in the order the registry released them,
+    /// and returns the lease ends. Call it with no lock held.
+    pub(crate) fn fire(self) -> Vec<LeaseEnd> {
+        for signal in self.signals {
+            signal.release();
+        }
+        self.ends
+    }
+}
+
 /// Every live lease, at most one per peer, and the continuation cache.
 #[derive(Debug, Default)]
 pub(super) struct Registry {
@@ -107,6 +148,8 @@ pub(super) struct Registry {
     continuations: BTreeMap<SourceId, Cursor>,
     /// How many acquires continued from a cached cursor.
     continuation_hits: u64,
+    /// What changes since the last [`Registry::take_effects`] left to do.
+    effects: Effects,
 }
 
 impl Registry {
@@ -118,16 +161,20 @@ impl Registry {
             .filter_map(|(peer, cursor)| (cursor.idle_deadline <= now).then_some(*peer))
             .collect();
         for peer in expired {
-            self.remove_peer(peer);
+            self.remove_peer(peer, Release::LeaseIdleExpired);
         }
     }
 
-    /// Removes `peer`'s lease, fires its signal and any capacity waiters.
-    fn remove_peer(&mut self, peer: SourceId) -> Option<Cursor> {
+    /// Removes `peer`'s lease, records why, and queues its signal and any
+    /// capacity waiters' to fire.
+    fn remove_peer(&mut self, peer: SourceId, release: Release) -> Option<Cursor> {
         let mut cursor = self.by_peer.remove(&peer)?;
-        if let Some(signal) = cursor.capacity_signal.take() {
-            signal.release();
-        }
+        self.effects.ends.push(LeaseEnd {
+            peer,
+            lease_id: cursor.lease_id,
+            release,
+        });
+        self.effects.signals.extend(cursor.capacity_signal.take());
         self.notify_capacity();
         Some(cursor)
     }
@@ -140,17 +187,13 @@ impl Registry {
             .count()
     }
 
-    /// Fires each class's waiting signal once the class has room.
+    /// Queues each class's waiting signal to fire once the class has room.
     fn notify_capacity(&mut self) {
         if self.general_count() < Capacity::General.limit() {
-            if let Some(signal) = self.general_capacity.take() {
-                signal.release();
-            }
+            self.effects.signals.extend(self.general_capacity.take());
         }
         if self.by_peer.len() < Capacity::Bounded.limit() {
-            if let Some(signal) = self.fallback_capacity.take() {
-                signal.release();
-            }
+            self.effects.signals.extend(self.fallback_capacity.take());
         }
     }
 
@@ -261,7 +304,7 @@ impl Registry {
             .get(&peer)
             .is_some_and(|cursor| cursor.idle_deadline <= now)
         {
-            self.remove_peer(peer);
+            self.remove_peer(peer, Release::LeaseIdleExpired);
             return false;
         }
         let Some(cursor) = self.by_peer.get_mut(&peer) else {
@@ -275,7 +318,9 @@ impl Registry {
         }
         cursor.position = position;
         cursor.last_frontier = last_frontier;
-        let cursor = self.remove_peer(peer).expect("the lease was checked above");
+        let cursor = self
+            .remove_peer(peer, Release::LeaseConsumedByRead)
+            .expect("the lease was checked above");
         if cursor.position != Position::Complete {
             if self.continuations.len() >= MAX_RETAINED_PATH_LEASES {
                 let oldest = self
@@ -291,22 +336,68 @@ impl Registry {
         true
     }
 
-    /// Ends `peer`'s lease if session, lease and scope all match. Returns
-    /// whether it did.
+    /// Ends `peer`'s lease with `release` if session, lease and scope all
+    /// match. Returns whether it did.
     pub(super) fn release(
         &mut self,
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
         scope: HeaderWorkAuthority,
+        release: Release,
     ) -> bool {
         let matches = self.by_peer.get(&peer).is_some_and(|cursor| {
             cursor.session_id == session_id && cursor.lease_id == lease_id && cursor.scope == scope
         });
         if matches {
-            self.remove_peer(peer);
+            self.remove_peer(peer, release);
         }
         matches
+    }
+
+    /// Ends every lease and drops the continuation cache, as service
+    /// shutdown does.
+    pub(super) fn shut_down(&mut self) {
+        let peers: Vec<_> = self.by_peer.keys().copied().collect();
+        for peer in peers {
+            self.remove_peer(peer, Release::Shutdown);
+        }
+        self.continuations.clear();
+    }
+
+    /// What the changes since the last call left to do.
+    pub(super) fn take_effects(&mut self) -> Effects {
+        std::mem::take(&mut self.effects)
+    }
+
+    /// Feeds the live leases and the continuation cache to `out`, in peer
+    /// order, for a state digest. Idle deadlines are left out, since an
+    /// `Instant`'s value depends on the process.
+    pub(super) fn digest_into(&self, out: &mut impl FnMut(&[u8])) {
+        out(&self.next_lease_id.to_le_bytes());
+        out(&self.continuation_hits.to_le_bytes());
+        for (tag, map) in [(b'L', &self.by_peer), (b'C', &self.continuations)] {
+            out(&[tag]);
+            // usize always fits in u64 on supported targets.
+            out(&(map.len() as u64).to_le_bytes());
+            for (peer, cursor) in map {
+                out(&peer.digest());
+                out(format!(
+                    "{:?}",
+                    (
+                        cursor.lease_id,
+                        cursor.session_id,
+                        cursor.target,
+                        cursor.scope,
+                        cursor.position,
+                        cursor.last_frontier,
+                        cursor.capacity,
+                        &cursor.retained_path,
+                    )
+                )
+                .as_bytes());
+            }
+        }
     }
 
     /// How many leases are live.

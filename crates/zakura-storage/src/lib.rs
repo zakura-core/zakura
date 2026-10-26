@@ -7,7 +7,7 @@
 //! So far the crate holds the header side in [`header`]: the contract for
 //! the operations a header-chain
 //! [`Port`](zakura_node_services::header_chain::Port) serves, a port over the
-//! real header-chain engine, and the fixture chains it loads. The
-//! controllable operation lifecycle builds on both.
+//! real header-chain engine, the fixture chains it loads, and a port whose
+//! operations wait for the run to complete them.
 
 pub mod header;

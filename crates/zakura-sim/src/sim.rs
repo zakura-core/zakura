@@ -148,9 +148,20 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
+        // A trace replay that ended before its record did diverged.
+        let unreached = match end.outcome {
+            Outcome::Harness => None,
+            _ => self.choices.borrow().decider.finish().err(),
+        };
         // A failure the last step's code left behind outranks the outcome,
-        // and so does evidence that names a step the run didn't take.
-        let end = match self.failure.take().or_else(|| evidence_outside_run(&end)) {
+        // and so do an unreached trace record and evidence that names a step
+        // the run didn't take.
+        let end = match self
+            .failure
+            .take()
+            .or_else(|| unreached.map(HarnessFailure::Plan))
+            .or_else(|| evidence_outside_run(&end))
+        {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
@@ -221,6 +232,7 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
+        self.observe_sources(st);
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -281,7 +293,7 @@ impl Sim {
                 let mut choices = self.choices.borrow_mut();
                 match phase {
                     Phase::Live => choices.decider.pick(&identities),
-                    Phase::Drain => Ok(choices.decider.pick_round_robin(&identities)),
+                    Phase::Drain => choices.decider.pick_round_robin(&identities),
                 }
             };
             let decision = match decision {
@@ -314,6 +326,7 @@ impl Sim {
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
+            self.observe_sources(st);
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {
@@ -397,6 +410,13 @@ impl Sim {
             offers: &offers,
         })
         .is_ok_and(|enabled| enabled.is_empty())
+    }
+
+    /// Lets every source append what happened inside it to the current step.
+    fn observe_sources(&mut self, st: &mut State) {
+        for source in &mut self.sources {
+            source.observe(&mut st.log);
+        }
     }
 
     /// Runs `action` and records what it did.

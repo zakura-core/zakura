@@ -388,6 +388,58 @@ mod tests {
         assert_eq!(digest(obs.iter()), "917a4440abdd4f53", "{bump}");
     }
 
+    /// Storage observations came after the format's first version. Adding a
+    /// variant changes no other variant's encoding, so this pins them
+    /// separately.
+    #[test]
+    fn storage_observation_encoding_is_pinned() {
+        use crate::observe::{LeaseEnd, StorageEvent};
+
+        let storage = |id, event| Observation::Storage {
+            service: "header".into(),
+            id,
+            event,
+        };
+        let ends = || {
+            vec![LeaseEnd {
+                peer: "01".into(),
+                lease: 3,
+                release: "lease-released".into(),
+            }]
+        };
+        let obs = [
+            storage(
+                1,
+                StorageEvent::Submitted {
+                    op: "acquire_header_path".into(),
+                    request: "ab".into(),
+                    owner: None,
+                    peer: Some("01".into()),
+                    session: Some(2),
+                },
+            ),
+            storage(1, StorageEvent::CallerDropped),
+            storage(
+                1,
+                StorageEvent::Completed {
+                    op: "acquire_header_path".into(),
+                    outcome: "engine".into(),
+                    owner: None,
+                    delivered: false,
+                    lease_ends: ends(),
+                    state: "cd".into(),
+                },
+            ),
+            storage(2, StorageEvent::ReplyDropped { lease_ends: ends() }),
+        ];
+        assert_eq!(
+            serde_json::to_string(&obs).unwrap(),
+            r#"[{"obs":"storage","service":"header","id":1,"event":{"event":"submitted","op":"acquire_header_path","request":"ab","peer":"01","session":2}},{"obs":"storage","service":"header","id":1,"event":{"event":"caller-dropped"}},{"obs":"storage","service":"header","id":1,"event":{"event":"completed","op":"acquire_header_path","outcome":"engine","delivered":false,"lease_ends":[{"peer":"01","lease":3,"release":"lease-released"}],"state":"cd"}},{"obs":"storage","service":"header","id":2,"event":{"event":"reply-dropped","lease_ends":[{"peer":"01","lease":3,"release":"lease-released"}]}}]"#,
+            "a storage observation's encoding changed, which changes `obs` digests, \
+             so bump FORMAT_VERSION and update this test"
+        );
+    }
+
     #[test]
     fn records_round_trip_and_reject_unknown_fields() {
         for record in samples() {

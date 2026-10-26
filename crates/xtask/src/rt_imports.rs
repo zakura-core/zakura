@@ -13,10 +13,51 @@
 //! The suggested replacements come from the `pub use` items in `zakura-rt`'s
 //! `lib.rs`, so the crate stays the one list of runtime names.
 //!
-//! The check does not yet cover `std::time::{Instant, SystemTime}`,
-//! `std::thread`, or the timer adapters in `tokio_stream`.
+//! Time and threads follow the same rule. The check flags std's `Instant`,
+//! the wall-clock reads `SystemTime::now`, `Utc::now` and `Local::now`, std's
+//! thread spawns, sleeps and parks, and whole-module imports of `std::time` and
+//! `std::thread`. `Duration`, `UNIX_EPOCH`, the `SystemTime` type and
+//! `std::thread::panicking` stay allowed.
+//!
+//! Scopes aren't tracked. A first pass records every path each name is
+//! bound to by a production `use`, or by a non-generic `type` alias of a plain
+//! path, anywhere in the file, in any module, block, `cfg` alternative or
+//! macro argument. A path is flagged if its written
+//! spelling, or any expansion of it, hits a rule: expansion drops `self`,
+//! `super`, `crate` and the file's inline module names from the front, and
+//! replaces a bound first segment with each path the file binds it to,
+//! renames and local re-exports included. Expansion can only add findings, so
+//! the bare spellings `SystemTime::now`, `Utc::now`, `Local::now` and
+//! `Arc::downgrade` stay flagged however they're imported. Qualified calls
+//! such as `<Instant>::now()` are checked as the plain path.
+//! `UNIX_EPOCH.elapsed()`, under any parentheses or `&`, and
+//! `SystemTime::elapsed` read the wall clock, so they're flagged. In a file
+//! allowed to name std's `Instant`, every `.elapsed()` call is flagged, since
+//! the receiver's type isn't known. Macro arguments that parse as expressions
+//! or statements, as `dbg!`, `assert!`, `assert_eq!` and `println!` take, are
+//! visited as code under the same rules.
+//!
+//! The trade-off is false positives on purpose. A file that binds one name to
+//! both a std clock and a zakura_rt one is flagged wherever it uses the name,
+//! even where Rust would pick the zakura_rt one, and renaming one import fixes
+//! it. Because `crate::` is dropped, a local shim module named like a runtime
+//! crate, such as `crate::tokio`, would be flagged too. Nothing in the tree
+//! trips either today.
+//!
+//! Limits: macros with syntax of their own, such as `tokio::select!` or a
+//! DSL, can't be parsed generically and only get a token scan. It sees
+//! written-out paths like `std::time::Instant::now`, expanded through the
+//! file's names, but not imports made inside the macro. Only simple path
+//! aliases are followed: a generic `type` alias, or one whose target isn't a
+//! plain path, isn't. `.elapsed()` on a
+//! `SystemTime` value other than the epoch isn't flagged outside the files
+//! that may name std's `Instant`, since the check doesn't know a value's type.
+//! The timer adapters in `tokio_stream` and
+//! `std::thread::available_parallelism`, a host property discovery reads,
+//! aren't covered yet.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -64,7 +105,22 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
     "make_rng",
 ];
 
+/// `std::thread` items that start, block or yield an OS thread, which a
+/// simulated run can't schedule.
+const THREAD_ITEMS: [&str; 7] = [
+    "spawn",
+    "sleep",
+    "park",
+    "park_timeout",
+    "scope",
+    "Builder",
+    "yield_now",
+];
+
 /// Direct runtime paths the v2 code may keep, with the reason for each.
+///
+/// Each entry allows one exact path, so allowing a type doesn't allow its
+/// associated items, such as `Instant::now`.
 ///
 /// For `zakura-quic` this is the bypass inventory M3.7 asks for. Two more
 /// pieces of state outlive a simulated run without a runtime path to flag:
@@ -74,7 +130,7 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 12] = [
+const ALLOWED: [(&str, &str, &str); 24] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -88,13 +144,22 @@ const ALLOWED: [(&str, &str, &str); 12] = [
     (
         "crates/zakura-quic/src/socket.rs",
         "tokio::net::UdpSocket",
-        "the production socket and its Linux fast path, which a simulated run \
-         replaces with an injected socket through the socket factory",
+        PRODUCTION_SOCKET,
     ),
     (
         "crates/zakura-quic/src/socket.rs",
-        "tokio::io::Interest",
-        "readiness for the production socket, which a simulated run never binds",
+        "tokio::net::UdpSocket::from_std",
+        PRODUCTION_SOCKET,
+    ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::io::Interest::READABLE",
+        SOCKET_READINESS,
+    ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::io::Interest::WRITABLE",
+        SOCKET_READINESS,
     ),
     (
         "crates/zakura-quic/src/sim/net.rs",
@@ -109,6 +174,16 @@ const ALLOWED: [(&str, &str, &str); 12] = [
     (
         "crates/zakura-quic/src/sim/net.rs",
         "std::sync::PoisonError",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::Mutex::new",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::PoisonError::into_inner",
         SIM_HARNESS,
     ),
     (
@@ -133,10 +208,63 @@ const ALLOWED: [(&str, &str, &str); 12] = [
     ),
     (
         "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Arc::downgrade",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
         "Arc::downgrade",
         SIM_HARNESS,
     ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Mutex::new",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Mutex::default",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::PoisonError::into_inner",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/congestion.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/driver/connection.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/driver/endpoint.rs",
+        "std::time::Instant",
+        QUINN_INSTANT,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::time::Instant",
+        SIM_HARNESS,
+    ),
 ];
+
+/// Why `zakura-quic` may name tokio's socket.
+const PRODUCTION_SOCKET: &str = "the production socket and its Linux fast path, which a \
+     simulated run replaces with an injected socket through the socket factory";
+
+/// Why `zakura-quic` may name tokio's readiness flags.
+const SOCKET_READINESS: &str =
+    "readiness for the production socket, which a simulated run never binds";
+
+/// Why `zakura-quic`'s driver may name std's `Instant`.
+const QUINN_INSTANT: &str = "quinn-proto's API takes std's Instant, and the driver \
+     reads time only through driver::connection::now, which reads zakura_rt's \
+     clock and so follows a simulated run's virtual time";
 
 /// Why `zakura-quic`'s `sim` module may use std's runtime names. It compiles
 /// only under `cfg(any(test, zakura_sim))`, which the check doesn't treat as
@@ -229,14 +357,7 @@ fn check_file(
     findings.files += 1;
 
     let relative = relative_path(repo_root, path);
-    let mut visitor = PathVisitor {
-        file: &relative,
-        rules,
-        findings,
-    };
-    for item in &file.items {
-        visitor.visit_item(item);
-    }
+    PathVisitor::new(&relative, rules, findings).visit_file_items(&file.items);
 
     // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`, and
     // a crate's `lib.rs` keeps them beside it.
@@ -387,12 +508,36 @@ impl Rules {
             | ["std", "sync", "RwLock" | "RwLockReadGuard" | "RwLockWriteGuard" | "Condvar" | "Barrier"
             | "BarrierWaitResult" | "mpsc", ..]
             | ["futures" | "futures_util", "select"] => Some(MISSING_NAME.to_owned()),
+            ["std", "thread", name, ..] if THREAD_ITEMS.contains(name) => {
+                Some(MISSING_NAME.to_owned())
+            }
             // `Arc::downgrade` makes std's `Weak`, whose reads have no
-            // preemption points. Matched by spelling, so a renamed `Arc`
-            // import slips through.
+            // preemption points.
             ["Arc", "downgrade"] | ["std" | "alloc", "sync", "Arc", "downgrade"] => {
                 Some("zakura_rt::sync::downgrade".to_owned())
             }
+            ["std", "time", "Instant", rest @ ..] => Some(
+                ["zakura_rt::time::Instant"]
+                    .into_iter()
+                    .chain(rest.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            ),
+            // The wall clock. `UNIX_EPOCH.elapsed()` reads it too, and the
+            // visitor checks that call as the path `UNIX_EPOCH::elapsed`.
+            ["SystemTime", "now" | "elapsed"]
+            | ["std", "time", "SystemTime", "now" | "elapsed"]
+            | ["UNIX_EPOCH", "elapsed"]
+            | ["std", "time", "UNIX_EPOCH", "elapsed"]
+            | ["SystemTime", "UNIX_EPOCH", "elapsed"]
+            | ["std", "time", "SystemTime", "UNIX_EPOCH", "elapsed"]
+            | ["Utc" | "Local", "now"]
+            | ["chrono", "Utc" | "Local", "now"]
+            | ["chrono", "offset", "Utc" | "Local", "now"] => {
+                Some("zakura_rt::time::utc_now".to_owned())
+            }
+            // A module import would let the code name the items above through it.
+            ["std", "time" | "thread"] => Some(MODULE_IMPORT.to_owned()),
             _ => None,
         }
     }
@@ -489,33 +634,160 @@ fn use_leaves(tree: &UseTree) -> Vec<UseLeaf> {
     leaves
 }
 
+/// How many `use` hops expansion follows from one path before it stops.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// What a file that may name std's `Instant` uses instead of `.elapsed()`.
+const ELAPSED_IN_STD_INSTANT_FILE: &str = "`saturating_duration_since` against zakura_rt's \
+     clock, such as the driver's `now()`: this file may name std's Instant, so `.elapsed()` \
+     can read the host clock";
+
 struct PathVisitor<'a> {
     file: &'a str,
     rules: &'a Rules,
     findings: &'a mut Findings,
+    /// Every path each name is bound to by a production `use` anywhere in
+    /// the file: any module, block, `cfg` alternative or macro argument.
+    names: BTreeMap<String, BTreeSet<Vec<String>>>,
+    /// The names of the file's inline modules.
+    modules: BTreeSet<String>,
+    /// True on the first pass, which only records `names` and `modules`.
+    collecting: bool,
 }
 
-impl PathVisitor<'_> {
-    fn check(&mut self, segments: &[String], span: Span) {
+impl<'a> PathVisitor<'a> {
+    /// A visitor for the file at `file`, a path from the repository root.
+    fn new(file: &'a str, rules: &'a Rules, findings: &'a mut Findings) -> Self {
+        PathVisitor {
+            file,
+            rules,
+            findings,
+            names: BTreeMap::new(),
+            modules: BTreeSet::new(),
+            collecting: false,
+        }
+    }
+
+    /// Visits a file's items twice: first to record every name its `use`
+    /// items bind and its inline modules, then to check its paths.
+    fn visit_file_items(&mut self, items: &[Item]) {
+        for collecting in [true, false] {
+            self.collecting = collecting;
+            for item in items {
+                self.visit_item(item);
+            }
+        }
+    }
+
+    /// `segments` and every path it can expand to, the most expanded first.
+    /// `self`, `super`, `crate` and the file's inline module names drop off
+    /// the front, and a bound first segment becomes each path the file
+    /// binds that name to, anywhere, so `SystemTime::now` after
+    /// `use clocks::SystemTime` also reads as std's when `clocks` re-exports
+    /// it. Only binding replacements count toward [`MAX_ALIAS_HOPS`].
+    /// Scopes aren't tracked, so expansion can only add findings.
+    fn expansions(&self, segments: &[String]) -> Vec<Vec<String>> {
+        let mut seen = BTreeSet::new();
+        let mut layers = vec![self.without_prefixes(segments.to_vec(), &mut seen)];
+        for _ in 0..MAX_ALIAS_HOPS {
+            let mut next = Vec::new();
+            for path in layers.last().into_iter().flatten() {
+                for target in self.names.get(&path[0]).into_iter().flatten() {
+                    let target = target.iter().chain(&path[1..]).cloned().collect();
+                    next.extend(self.without_prefixes(target, &mut seen));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            layers.push(next);
+        }
+        layers.into_iter().rev().flatten().collect()
+    }
+
+    /// `path` and each shorter path left by dropping `self`, `super`,
+    /// `crate` or an inline module name off its front, skipping any in
+    /// `seen` and adding the rest to it.
+    fn without_prefixes(
+        &self,
+        mut path: Vec<String>,
+        seen: &mut BTreeSet<Vec<String>>,
+    ) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        loop {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+            let first = path[0].as_str();
+            if path.len() == 1
+                || !(matches!(first, "self" | "super" | "crate") || self.modules.contains(first))
+            {
+                return paths;
+            }
+            path.remove(0);
+        }
+    }
+
+    /// Checks the path written as `segments` and each of its expansions, and
+    /// reports one violation if any of them is forbidden here.
+    fn check_written(&mut self, segments: &[String], span: Span) {
+        for path in self.expansions(segments) {
+            if self.check(&path, span) {
+                return;
+            }
+        }
+    }
+
+    /// Whether the allowlist lets this file name std's `Instant`.
+    fn names_std_instant(&self) -> bool {
+        ALLOWED
+            .iter()
+            .any(|(file, path, _)| *file == self.file && *path == "std::time::Instant")
+    }
+
+    /// Checks a path written as `segments`: as written if it starts with `::`,
+    /// and otherwise through [`Self::check_written`].
+    fn check_path(&mut self, segments: &[String], absolute: bool, span: Span) {
+        if absolute {
+            self.check(segments, span);
+        } else {
+            self.check_written(segments, span);
+        }
+    }
+
+    /// Reports `segments` if the rules forbid it and the allowlist doesn't
+    /// allow it here. Returns whether it reported.
+    fn check(&mut self, segments: &[String], span: Span) -> bool {
+        if self.collecting {
+            return false;
+        }
         let Some(replacement) = self.rules.replacement(segments) else {
-            return;
+            return false;
         };
         let allowance = ALLOWED
             .iter()
-            .position(|(file, prefix, _)| *file == self.file && starts_with(segments, prefix));
+            .position(|(file, path, _)| *file == self.file && segments.join("::") == *path);
         if let Some(allowance) = allowance {
             self.findings.allowances_used[allowance] = true;
-            return;
+            return false;
         }
+        self.report(segments.join("::"), replacement, span);
+        true
+    }
+
+    /// Records a violation of `path` at `span`, suggesting `replacement`.
+    fn report(&mut self, path: String, replacement: String, span: Span) {
         let start = span.start();
         self.findings.violations.push(Violation {
             location: format!("{}:{}:{}", self.file, start.line, start.column + 1),
-            path: segments.join("::"),
+            path,
             replacement,
         });
     }
 
-    /// Checks `a::b::c` paths inside macro arguments, which syn leaves as tokens.
+    /// Checks written-out `a::b::c` paths inside macro arguments that don't
+    /// parse as code, expanded through the file's names. Imports inside such
+    /// arguments aren't seen.
     fn check_tokens(&mut self, tokens: TokenStream) {
         let tokens: Vec<TokenTree> = tokens.into_iter().collect();
         let mut i = 0;
@@ -535,7 +807,7 @@ impl PathVisitor<'_> {
                         next += 3;
                     }
                     if segments.len() > 1 {
-                        self.check(&segments, ident.span());
+                        self.check_written(&segments, ident.span());
                     }
                     i = next;
                 }
@@ -620,9 +892,82 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         }
     }
 
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if self.collecting && item.content.is_some() {
+            self.modules.insert(item.ident.to_string());
+        }
+        visit::visit_item_mod(self, item);
+    }
+
+    /// Checks `receiver.elapsed()` as the path `receiver::elapsed` when the
+    /// receiver is a path, under any parentheses or `&`, so
+    /// `(&UNIX_EPOCH).elapsed()` meets the wall-clock rule. In a file that
+    /// may name std's `Instant`, every `.elapsed()` is flagged, since the
+    /// receiver's type isn't known.
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "elapsed" && !self.collecting && self.names_std_instant() {
+            let replacement = ELAPSED_IN_STD_INSTANT_FILE.to_owned();
+            self.report(".elapsed()".to_owned(), replacement, call.method.span());
+            return visit::visit_expr_method_call(self, call);
+        }
+        let mut receiver = &*call.receiver;
+        while let syn::Expr::Paren(syn::ExprParen { expr, .. })
+        | syn::Expr::Reference(syn::ExprReference { expr, .. })
+        | syn::Expr::Group(syn::ExprGroup { expr, .. }) = receiver
+        {
+            receiver = expr;
+        }
+        if let (syn::Expr::Path(receiver), true) = (receiver, call.method == "elapsed") {
+            if let Some((mut segments, absolute)) = expr_path_segments(receiver) {
+                segments.push(call.method.to_string());
+                self.check_path(&segments, absolute, call.method.span());
+            }
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    /// Checks `<Type>::item` and `<Type as Trait>::item` as the path
+    /// `Type::item`, since the type and the item are visited apart.
+    fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+        if expr.qself.is_some() {
+            if let Some((segments, absolute)) = expr_path_segments(expr) {
+                self.check_path(&segments, absolute, expr.span());
+            }
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
+    /// Records a non-generic `type X = path;` as a binding of `X`, like a
+    /// `use`, then checks the aliased path.
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        let mut ty = &*item.ty;
+        while let syn::Type::Paren(syn::TypeParen { elem, .. })
+        | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+        {
+            ty = elem;
+        }
+        if let (true, syn::Type::Path(syn::TypePath { qself: None, path })) =
+            (self.collecting && item.generics.params.is_empty(), ty)
+        {
+            let target = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string());
+            self.names
+                .entry(item.ident.to_string())
+                .or_default()
+                .insert(target.collect());
+        }
+        visit::visit_item_type(self, item);
+    }
+
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         for leaf in use_leaves(&item.tree) {
-            self.check(&leaf.path, leaf.span);
+            if !self.collecting {
+                self.check(&leaf.path, leaf.span);
+            } else if let Some(name) = leaf.name.filter(|name| name != "_") {
+                self.names.entry(name).or_default().insert(leaf.path);
+            }
         }
     }
 
@@ -640,16 +985,62 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
             .collect();
         // A one-segment path names a local item or binding, like a `core`
         // variable, not a crate.
-        if segments.len() > 1 || path.leading_colon.is_some() {
+        if path.leading_colon.is_some() {
             self.check(&segments, path.span());
+        } else if segments.len() > 1 {
+            self.check_written(&segments, path.span());
         }
         visit::visit_path(self, path);
     }
 
+    /// Visits a macro's arguments as code when they parse as
+    /// comma-separated expressions, like `dbg!` and `assert_eq!`, or as
+    /// statements, so imports and calls inside them meet the same rules.
+    /// Arguments with syntax of their own, like `select!`'s, get the token
+    /// scan.
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.visit_path(&mac.path);
-        self.check_tokens(mac.tokens.clone());
+        if let Ok(args) = mac.parse_body_with(Punctuated::<syn::Expr, Token![,]>::parse_terminated)
+        {
+            for arg in &args {
+                Visit::visit_expr(self, arg);
+            }
+        } else if let Ok(stmts) = mac.parse_body_with(syn::Block::parse_within) {
+            for stmt in &stmts {
+                Visit::visit_stmt(self, stmt);
+            }
+        } else {
+            self.check_tokens(mac.tokens.clone());
+        }
     }
+}
+
+/// The segments of an expression path, with a qualified type joined to its
+/// associated item so `<Type as Trait>::item` reads as `Type::item`, and
+/// whether the path starts with `::`. `None` for a qualified type that isn't
+/// a plain path.
+fn expr_path_segments(expr: &syn::ExprPath) -> Option<(Vec<String>, bool)> {
+    let idents = |segments: &mut dyn Iterator<Item = &syn::PathSegment>| {
+        segments.map(|segment| segment.ident.to_string()).collect()
+    };
+    let Some(qself) = &expr.qself else {
+        let segments = idents(&mut expr.path.segments.iter());
+        return Some((segments, expr.path.leading_colon.is_some()));
+    };
+    let mut ty = &*qself.ty;
+    while let syn::Type::Paren(syn::TypeParen { elem, .. })
+    | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+    {
+        ty = elem;
+    }
+    let syn::Type::Path(syn::TypePath { qself: None, path }) = ty else {
+        return None;
+    };
+    let mut segments = path
+        .segments
+        .iter()
+        .chain(expr.path.segments.iter().skip(qself.position));
+    Some((idents(&mut segments), path.leading_colon.is_some()))
 }
 
 fn item_attrs(item: &Item) -> Option<&[Attribute]> {
@@ -736,23 +1127,7 @@ mod tests {
 
     /// Each violation in `source` as `path -> replacement`.
     fn violations(source: &str) -> Vec<String> {
-        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        let rules = Rules::load(&repo_root).expect("zakura-rt's lib.rs parses");
-        let file = syn::parse_file(source).expect("the fixture parses");
-        let mut findings = Findings::default();
-        let mut visitor = PathVisitor {
-            file: "fixture.rs",
-            rules: &rules,
-            findings: &mut findings,
-        };
-        for item in &file.items {
-            visitor.visit_item(item);
-        }
-        findings
-            .violations
-            .iter()
-            .map(|violation| format!("{} -> {}", violation.path, violation.replacement))
-            .collect()
+        violations_in("fixture.rs", source)
     }
 
     #[test]
@@ -810,11 +1185,14 @@ mod tests {
                 info!(\"{:?}\", crate::tokio::spawn);
             }
         ";
+        // `crate::tokio` may be a local module, but expansion drops `crate`
+        // and can only add findings.
         assert_eq!(
             violations(source),
             [
                 "tokio::select -> zakura_rt::select",
                 "tokio::time::sleep -> zakura_rt::time::sleep",
+                "tokio::spawn -> zakura_rt::task::spawn",
             ]
         );
     }
@@ -865,6 +1243,433 @@ mod tests {
                 "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
                 "core::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
             ]
+        );
+    }
+
+    #[test]
+    fn std_clocks_and_threads_are_flagged() {
+        let source = "
+            use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+            use std::thread::{panicking, Builder};
+            fn f() {
+                let _ = std::time::Instant::now();
+                let _ = SystemTime::now();
+                let _ = std::time::SystemTime::now();
+                let _ = std::time::SystemTime::UNIX_EPOCH;
+                let _ = Utc::now();
+                let _ = Local::now();
+                let _ = chrono::Utc::now();
+                let _ = chrono::Local::now();
+                let _ = chrono::offset::Utc::now();
+                let _ = chrono::offset::Local::now();
+                let _ = chrono::Utc::now;
+                std::thread::spawn(|| {});
+                std::thread::sleep(Duration::ZERO);
+                std::thread::park();
+                std::thread::park_timeout(Duration::ZERO);
+                std::thread::scope(|_| {});
+                std::thread::yield_now();
+                let _ = std::thread::panicking();
+            }
+        ";
+        let (missing, utc_now) = (MISSING_NAME, "zakura_rt::time::utc_now");
+        assert_eq!(
+            violations(source),
+            [
+                "std::time::Instant -> zakura_rt::time::Instant".to_owned(),
+                format!("std::thread::Builder -> {missing}"),
+                "std::time::Instant::now -> zakura_rt::time::Instant::now".to_owned(),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("Utc::now -> {utc_now}"),
+                format!("Local::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("chrono::Local::now -> {utc_now}"),
+                format!("chrono::offset::Utc::now -> {utc_now}"),
+                format!("chrono::offset::Local::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("std::thread::spawn -> {missing}"),
+                format!("std::thread::sleep -> {missing}"),
+                format!("std::thread::park -> {missing}"),
+                format!("std::thread::park_timeout -> {missing}"),
+                format!("std::thread::scope -> {missing}"),
+                format!("std::thread::yield_now -> {missing}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn std_time_and_thread_module_imports_are_flagged() {
+        let source = "
+            use std::time::*;
+            use std::time;
+            use std::time as t;
+            use std::thread;
+            use std::thread as threads;
+            use std::{thread::{self}, time::{Duration, UNIX_EPOCH}};
+            use core::time::Duration as CoreDuration;
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::time -> zakura_rt names, imported by item",
+                "std::time -> zakura_rt names, imported by item",
+                "std::time -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
+                "std::thread -> zakura_rt names, imported by item",
+            ]
+        );
+    }
+
+    /// Each violation in `source` as `path -> replacement`, checked as the
+    /// repository file `file`, so its allowlist entries apply.
+    fn violations_in(file: &str, source: &str) -> Vec<String> {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        let rules = Rules::load(&repo_root).expect("zakura-rt's lib.rs parses");
+        let parsed = syn::parse_file(source).expect("the fixture parses");
+        let mut findings = Findings::default();
+        PathVisitor::new(file, &rules, &mut findings).visit_file_items(&parsed.items);
+        findings
+            .violations
+            .iter()
+            .map(|violation| format!("{} -> {}", violation.path, violation.replacement))
+            .collect()
+    }
+
+    /// The driver may name std's `Instant` for quinn-proto, but reading the
+    /// clock through it bypasses `driver::connection::now`.
+    #[test]
+    fn an_allowed_instant_type_does_not_allow_reading_the_clock() {
+        let source = "
+            use std::time::{Duration, Instant};
+            fn f(deadline: Option<Instant>) -> Instant {
+                let _ = Instant::now();
+                std::time::Instant::now()
+            }
+        ";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [
+                "std::time::Instant::now -> zakura_rt::time::Instant::now",
+                "std::time::Instant::now -> zakura_rt::time::Instant::now",
+            ]
+        );
+    }
+
+    /// Renamed imports resolve, in the module, in a block, and in a child
+    /// module, since the check doesn't track scopes.
+    #[test]
+    fn renamed_imports_are_flagged() {
+        let source = "
+            use std::time::SystemTime as Clock;
+            use chrono::Utc as U;
+            use chrono::offset::Local as L;
+            use std::sync::Arc as Shared;
+            fn f(a: &Shared<u8>) {
+                let _ = Clock::now();
+                let _ = U::now();
+                let _ = L::now();
+                let _ = Shared::downgrade(a);
+                let _ = Clock::UNIX_EPOCH;
+            }
+            fn g() {
+                use std::time::Instant as Tick;
+                let _ = Tick::now();
+            }
+            mod inner {
+                fn h() { let _ = Clock::now(); }
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::time::SystemTime::now -> zakura_rt::time::utc_now",
+                "chrono::Utc::now -> zakura_rt::time::utc_now",
+                "chrono::offset::Local::now -> zakura_rt::time::utc_now",
+                "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+                "std::time::Instant -> zakura_rt::time::Instant",
+                "std::time::Instant::now -> zakura_rt::time::Instant::now",
+                "std::time::SystemTime::now -> zakura_rt::time::utc_now",
+            ]
+        );
+    }
+
+    /// `elapsed` on `UNIX_EPOCH` is `SystemTime::now` underneath, however
+    /// the epoch is named.
+    #[test]
+    fn unix_epoch_elapsed_is_flagged() {
+        let source = "
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn f() {
+                let _ = UNIX_EPOCH.elapsed();
+                let _ = std::time::UNIX_EPOCH.elapsed();
+                let _ = SystemTime::UNIX_EPOCH.elapsed();
+                let _ = SystemTime::elapsed(&UNIX_EPOCH);
+                let _ = UNIX_EPOCH.duration_since(UNIX_EPOCH);
+                let _ = Instant::elapsed(&start);
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::elapsed -> {utc_now}"),
+            ]
+        );
+    }
+
+    /// Local re-exports, `self` and `super` paths and chained renames resolve
+    /// to std's clocks, and a path that leaves the file keeps its written
+    /// spelling's check. A zakura_rt rename spelled `SystemTime` is flagged
+    /// too: the file also binds that name to std's clock, and the written
+    /// spelling is always checked.
+    #[test]
+    fn local_reexports_and_chained_aliases_resolve() {
+        let source = "
+            mod clocks {
+                pub use std::time::SystemTime;
+                pub mod inner {
+                    pub use super::SystemTime as Wall;
+                }
+            }
+            use clocks::SystemTime;
+            use self::clocks::inner::Wall;
+            use chrono::Utc as U1;
+            use U1 as U2;
+            use crate::elsewhere::Utc;
+            fn f() {
+                let _ = SystemTime::now();
+                let _ = Wall::now();
+                let _ = U2::now();
+                let _ = Utc::now();
+            }
+            fn g() {
+                use zakura_rt::time::Instant as SystemTime;
+                let _ = SystemTime::now();
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+                format!("chrono::Utc::now -> {utc_now}"),
+                format!("Utc::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
+            ]
+        );
+
+        let source = "
+            mod clocks {
+                pub use std::time::Instant;
+            }
+            use clocks::Instant;
+            fn f() -> Instant {
+                Instant::now()
+            }
+        ";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
+        );
+    }
+
+    /// `cfg` alternatives that bind one name are all checked, whichever
+    /// comes last.
+    #[test]
+    fn every_conditional_binding_is_checked() {
+        let sim = "#[cfg(zakura_sim)] use std::time::Instant;";
+        let production = "#[cfg(not(zakura_sim))] use zakura_rt::time::Instant;";
+        for (first, second) in [(sim, production), (production, sim)] {
+            let source = format!("{first} {second} fn f() -> Instant {{ Instant::now() }}");
+            assert_eq!(
+                violations_in("crates/zakura-quic/src/driver/connection.rs", &source),
+                ["std::time::Instant::now -> zakura_rt::time::Instant::now"],
+                "{first} {second}"
+            );
+        }
+
+        let source = "
+            #[cfg(zakura_sim)]
+            use std::time::SystemTime;
+            #[cfg(not(zakura_sim))]
+            use zakura_rt::time::Instant as SystemTime;
+            fn f() { let _ = SystemTime::now(); }
+        ";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
+        );
+    }
+
+    /// A qualified call names the same associated item as the plain path.
+    #[test]
+    fn qualified_clock_reads_are_flagged() {
+        let source = "
+            use std::time::{Instant, SystemTime};
+            fn f() {
+                let _ = <std::time::Instant>::now();
+                let _ = <Instant>::now();
+                let _ = <std::time::SystemTime>::now();
+                let _ = <(SystemTime)>::now();
+                let _ = <SystemTime as Wall>::now();
+            }
+        ";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
+        let system = "std::time::SystemTime::now -> zakura_rt::time::utc_now";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [instant, instant, system, system, system]
+        );
+    }
+
+    /// The epoch's `elapsed` is flagged through parentheses and references.
+    /// The `zakura_rt` epoch in `g` is flagged too, since the file also binds
+    /// `UNIX_EPOCH` to std's and the spelling is always checked.
+    #[test]
+    fn wrapped_epoch_receivers_are_flagged() {
+        let source = "
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn f() {
+                let _ = (std::time::UNIX_EPOCH).elapsed();
+                let _ = (&UNIX_EPOCH).elapsed();
+                let _ = (&(SystemTime::UNIX_EPOCH)).elapsed();
+                let _ = <SystemTime>::UNIX_EPOCH.elapsed();
+            }
+            fn g() {
+                use zakura_rt::time::UNIX_EPOCH;
+                let _ = (&UNIX_EPOCH).elapsed();
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+            ]
+        );
+    }
+
+    /// Arguments that parse as expressions or statements are visited as
+    /// code, with block-local imports and the alias map.
+    #[test]
+    fn macro_arguments_are_visited_as_code() {
+        let source = "
+            use std::time::{Instant, UNIX_EPOCH};
+            fn f(t: Instant) {
+                dbg!({ use std::time::Instant as Tick; Tick::now() });
+                dbg!(std::time::UNIX_EPOCH.elapsed());
+                assert!(Instant::now() > t, \"{:?}\", t);
+                assert_eq!(<std::time::Instant>::now(), t);
+                println!(\"{:?}\", (&UNIX_EPOCH).elapsed());
+                let _ = vec![Instant::now(); 2];
+            }
+        ";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now".to_owned();
+        // The driver file may name std's Instant, so any `.elapsed()` is flagged.
+        let elapsed = format!(".elapsed() -> {ELAPSED_IN_STD_INSTANT_FILE}");
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [
+                instant.clone(),
+                elapsed.clone(),
+                instant.clone(),
+                instant.clone(),
+                elapsed,
+                instant
+            ]
+        );
+    }
+
+    /// Same-named `cfg` modules can't hide each other's bindings: every
+    /// binding in the file counts.
+    #[test]
+    fn conditional_modules_cannot_hide_a_clock() {
+        let source = "
+            #[cfg(zakura_sim)]
+            mod clock {
+                use std::time::SystemTime as Clock;
+                pub fn read() { let _ = Clock::now(); }
+            }
+            #[cfg(not(zakura_sim))]
+            mod clock {
+                use zakura_rt::time::Instant as Clock;
+                pub fn read() { let _ = Clock::now(); }
+            }
+        ";
+        let system = "std::time::SystemTime::now -> zakura_rt::time::utc_now";
+        // The union rule flags both bodies, since either `Clock` may be std's.
+        assert_eq!(violations(source), [system, system]);
+    }
+
+    /// A `self::` path is checked against every binding of its name, so
+    /// shadowing can't hide a std read. The union rule also flags the
+    /// runtime-only order, which renaming one import fixes.
+    #[test]
+    fn self_paths_check_every_binding() {
+        let std_module = "use std::time::Instant; fn f() { use zakura_rt::time::Instant; let _ = self::Instant::now(); }";
+        let rt_module = "use zakura_rt::time::Instant; fn f() { use std::time::Instant; let _ = self::Instant::now(); }";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
+        for source in [std_module, rt_module] {
+            assert_eq!(
+                violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+                [instant],
+                "{source}"
+            );
+        }
+    }
+
+    /// A file that may name std's `Instant` can't call `.elapsed()`, since
+    /// the check can't tell a std `Instant` receiver from another.
+    #[test]
+    fn std_instant_files_cannot_call_elapsed() {
+        let source = "fn age(start: std::time::Instant) { let _ = start.elapsed(); }";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [format!(".elapsed() -> {ELAPSED_IN_STD_INSTANT_FILE}")]
+        );
+        let elsewhere = "fn age(start: Start) { let _ = start.elapsed(); }";
+        assert_eq!(violations(elsewhere), Vec::<String>::new());
+    }
+
+    /// A plain `type` alias binds its name like a `use` does.
+    #[test]
+    fn simple_type_aliases_are_followed() {
+        let source = "type Clock = std::time::SystemTime; fn read() -> Clock { Clock::now() }";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
+        );
+        let source = "type Clock = std::time::Instant; fn read() -> Clock { Clock::now() }";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
+        );
+    }
+
+    /// Dropping module prefixes doesn't use up the hop budget, so a chain of
+    /// re-exports through sibling modules still reaches std's clock.
+    #[test]
+    fn module_prefixes_do_not_count_as_hops() {
+        let source = "
+            mod first { pub use std::time::SystemTime as Raw; }
+            mod second { pub use super::first::Raw as Middle; }
+            mod third { pub use super::second::Middle as Wall; }
+            use third::Wall as Clock;
+            fn read() -> Clock { Clock::now() }
+        ";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
         );
     }
 

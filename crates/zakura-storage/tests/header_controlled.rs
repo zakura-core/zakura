@@ -23,8 +23,9 @@ use zakura_node_services::header_chain::{
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
     controlled::{CompleteError, Completion, ControlledPort, OpId, StorageEvent},
+    evidence::{LeaseKey, RequestIdentity, ResultIdentity, SignalClass},
     fixture::HeaderFixture,
-    lease::LeaseEnd,
+    lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
     Fault, HeaderOp, Outcome, Release,
 };
 
@@ -481,7 +482,11 @@ fn a_cancelled_apply_still_commits() {
 
     let completion = port.complete(OpId(1), ENGINE).expect("apply completes");
     assert!(!completion.delivered);
-    assert_eq!(completion.attribution.owner, Some(owner));
+    assert!(matches!(
+        completion.request,
+        RequestIdentity::ApplyHeaderTarget { owner: applied, .. } if applied == owner
+    ));
+    assert_eq!(completion.result, ResultIdentity::Applied);
     assert_eq!(
         port.engine().snapshot().frontiers.header_best.hash,
         next[0].hash()
@@ -497,7 +502,7 @@ fn a_cancelled_apply_still_commits() {
         [
             StorageEvent::Submitted {
                 id: OpId(1),
-                op: HeaderOp::ApplyHeaderTarget,
+                request: RequestIdentity::ApplyHeaderTarget { .. },
                 ..
             },
             StorageEvent::CallerDropped { id: OpId(1) },
@@ -729,13 +734,12 @@ fn records_carry_attribution_and_digests() {
                 .iter()
                 .filter_map(|event| match event {
                     StorageEvent::Submitted {
-                        op: HeaderOp::ReadHeaderPath,
-                        attribution,
+                        request: RequestIdentity::ReadHeaderPath { lease, .. },
                         request_digest,
                         ..
                     } => {
-                        assert_eq!(attribution.peer, Some(peer(3)));
-                        assert_eq!(attribution.session_id, Some(9));
+                        let lease = lease.expect("both handles carry this port's seal");
+                        assert_eq!((lease.peer, lease.session_id), (peer(3), 9));
                         Some(*request_digest)
                     }
                     _ => None,
@@ -746,7 +750,11 @@ fn records_carry_attribution_and_digests() {
             let StorageEvent::Completed(acquired) = &events[1] else {
                 panic!("expected the acquire's completion, got {:?}", events[1]);
             };
-            assert_eq!(acquired.attribution.peer, Some(peer(3)));
+            assert!(matches!(
+                acquired.request,
+                RequestIdentity::AcquireHeaderPath { peer: acquirer, session_id: 9, .. }
+                    if acquirer == peer(3)
+            ));
             (read_digests, acquired.state_digest)
         })
         .collect();
@@ -853,10 +861,10 @@ fn apply_digests_cover_the_sealed_insertion() {
         .into_iter()
         .filter_map(|event| match event {
             StorageEvent::Submitted {
-                attribution,
+                request: RequestIdentity::ApplyHeaderTarget { source, .. },
                 request_digest,
                 ..
-            } => Some((attribution.peer, request_digest)),
+            } => Some((Some(source), request_digest)),
             _ => None,
         })
         .collect();
@@ -878,6 +886,238 @@ fn a_locator_after_shutdown_returns_its_permit() {
     assert!(poll(&mut call, Waker::noop()).is_pending());
     assert_eq!(semaphore.available_permits(), 1);
     assert!(port.pending().is_empty());
+}
+
+/// `count` headers on the anchor, admitted in batches no longer than the
+/// transition cap through the engine port directly. Returns the port and
+/// the headers' frontiers.
+fn long_chain(count: u32) -> (ControlledPort, Vec<Frontier>) {
+    let fixture = HeaderFixture::regtest();
+    let port = ControlledPort::new(&fixture);
+    let cap = u32::try_from(zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1)
+        .expect("the cap fits u32");
+    let (mut parent, mut frontiers, mut request_id) = (fixture.anchor(), Vec::new(), 1);
+    while frontiers.len() < count as usize {
+        // Widening a header count to usize is lossless on supported targets.
+        let batch = fixture.extend(parent, (count - frontiers.len() as u32).min(cap), 0);
+        let target = prepared(&port, parent, &batch, request_id);
+        assert_eq!(
+            ready(port.engine().apply_header_target(target)).expect("fixture headers apply"),
+            ApplyHeaderTargetOutcome::Applied
+        );
+        for header in &batch {
+            parent = Frontier::new(block::Height(parent.height.0 + 1), header.hash());
+            frontiers.push(parent);
+        }
+        request_id += 1;
+    }
+    (port, frontiers)
+}
+
+/// A read of `count` headers after `after`.
+fn page_after(after: Frontier, count: u32) -> ReadPath {
+    ReadPath {
+        after_hash: after.hash,
+        max_header_count: count,
+        want_tree_aux: false,
+    }
+}
+
+/// B2: each operation's typed request and result identity, from the
+/// locator's generation and anchor to a page's last header and a lease's
+/// key, with the owner each request carries.
+#[test]
+fn completions_carry_typed_identities() {
+    let (port, chain) = chain(3);
+    let anchor = HeaderFixture::regtest().anchor();
+    let snapshot = port.engine().snapshot();
+    let semaphore = Arc::new(Semaphore::new(1));
+
+    let (_, locator) = run(&port, port.continuation_locator(permit(&semaphore)));
+    assert_eq!(locator.request, RequestIdentity::ContinuationLocator);
+    assert_eq!(
+        locator.result,
+        ResultIdentity::Locator {
+            tip: chain[2],
+            header_generation: snapshot.header_generation,
+            finalized: anchor,
+        }
+    );
+
+    let (reply, acquire_completion) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 5, chain[2])),
+    );
+    let path = acquired(reply);
+    let lease = LeaseKey {
+        peer: peer(1),
+        session_id: 5,
+        lease_id: path.handle_id(),
+    };
+    assert_eq!(
+        acquire_completion.request,
+        RequestIdentity::AcquireHeaderPath {
+            peer: peer(1),
+            session_id: 5,
+            scope: path.scope,
+            target_tip_hash: chain[2].hash,
+            locators: vec![anchor.hash],
+        }
+    );
+    assert_eq!(
+        acquire_completion.result,
+        ResultIdentity::Acquired {
+            lease,
+            common_ancestor: anchor,
+            target: chain[2],
+        }
+    );
+
+    let (_, read) = run(
+        &port,
+        port.read_header_path(path.clone(), page_after(anchor, 2)),
+    );
+    assert_eq!(
+        read.request,
+        RequestIdentity::ReadHeaderPath {
+            lease: Some(lease),
+            scope: path.scope,
+            after_hash: anchor.hash,
+            max_header_count: 2,
+        }
+    );
+    assert_eq!(
+        read.result,
+        ResultIdentity::Page {
+            last: chain[1],
+            count: 2,
+            complete: false,
+        }
+    );
+    let mut continued = acquire(&port, peer(1), 5, chain[2]);
+    continued.locator_hashes = vec![chain[1].hash];
+    let (reply, _) = run(&port, port.acquire_header_path(continued));
+    let rest = acquired(reply);
+    let (_, read) = run(
+        &port,
+        port.read_header_path(rest.clone(), page_after(chain[1], 2)),
+    );
+    assert_eq!(
+        read.result,
+        ResultIdentity::Page {
+            last: chain[2],
+            count: 1,
+            complete: true,
+        }
+    );
+    let (_, release) = run(&port, port.release_header_path(rest.clone()));
+    assert_eq!(release.result, ResultIdentity::Released);
+    let (_, stale) = run(
+        &port,
+        port.read_header_path(rest.clone(), page_after(chain[2], 1)),
+    );
+    assert_eq!(stale.result, ResultIdentity::PageUnavailable);
+    let (_, bad) = run(&port, port.read_header_path(rest, page_after(chain[2], 0)));
+    assert_eq!(bad.result, ResultIdentity::PortError);
+
+    let (_, selected) = run(&port, port.selected_chain_contains(chain[1].hash));
+    assert_eq!(selected.result, ResultIdentity::Selected(chain[1]));
+    let (_, unknown) = run(&port, port.selected_chain_contains(block::Hash([0xee; 32])));
+    assert_eq!(unknown.result, ResultIdentity::NotRetained);
+
+    let next = HeaderFixture::regtest().extend(chain[2], 1, 0);
+    let request =
+        HeaderFixture::regtest().target_request(&port.engine().snapshot(), chain[2], &next, 9);
+    let owner = request.owner;
+    let (target, prepare) = run(&port, port.prepare_header_target(request));
+    assert_eq!(
+        prepare.request,
+        RequestIdentity::PrepareHeaderTarget {
+            owner,
+            source: SourceId::from_digest([7; 32]),
+            common_ancestor: chain[2],
+            target: Frontier::new(block::Height(4), next[0].hash()),
+            headers: 1,
+        }
+    );
+    assert_eq!(prepare.result, ResultIdentity::Prepared);
+    let (_, apply) = run(
+        &port,
+        port.apply_header_target(target.expect("fixture headers prepare")),
+    );
+    assert_eq!(apply.result, ResultIdentity::Applied);
+
+    let body_owner = zakura_header_chain::BodyWorkAuthority {
+        header: path.scope,
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+    }
+    .bind(8, std::num::NonZeroU64::new(9).expect("nine is nonzero"));
+    let (_, vct) = run(&port, port.vct_repair_context(body_owner, block::Height(2)));
+    assert_eq!(
+        vct.request,
+        RequestIdentity::VctRepairContext {
+            owner: body_owner,
+            height: block::Height(2),
+        }
+    );
+    assert_eq!(vct.result, ResultIdentity::VctStale);
+
+    let mut faulted = port.selected_chain_contains(chain[0].hash);
+    submit(&mut faulted);
+    let id = port.pending()[0].id;
+    let fault = port
+        .complete(id, UNAVAILABLE)
+        .expect("unavailable is legal");
+    assert_eq!(fault.result, ResultIdentity::Fault(Fault::Unavailable));
+    let mut foreign = port.read_header_path(foreign_path(&port, chain[1]), first_page());
+    submit(&mut foreign);
+    let id = port.pending()[0].id;
+    let rejected = port
+        .complete(id, Outcome::Rejected)
+        .expect("a foreign handle is rejected");
+    assert_eq!(rejected.result, ResultIdentity::Rejected);
+}
+
+/// B2: a `CapacityBusy` refusal names the signal it handed out, read from
+/// the registry: the peer's own lease, the ordinary class for a path
+/// beyond the reserve slot, and the reserve class when every slot is taken.
+#[test]
+fn refusals_name_the_signal_they_hand_out() {
+    let (port, chain) = long_chain(4_001);
+    let short = |n| {
+        let mut request = acquire(&port, peer(n), 1, chain[1]);
+        request.locator_hashes = vec![chain[0].hash];
+        request
+    };
+    for n in 1..u8::try_from(MAX_RETAINED_PATH_LEASES).expect("16 fits u8") {
+        acquired(run(&port, port.acquire_header_path(short(n))).0);
+    }
+    let (_, again) = run(&port, port.acquire_header_path(short(1)));
+    assert_eq!(
+        again.result,
+        ResultIdentity::CapacityBusy(SignalClass::Peer)
+    );
+    let (_, beyond) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(100), 1, chain[4_000])),
+    );
+    assert_eq!(
+        beyond.result,
+        ResultIdentity::CapacityBusy(SignalClass::General)
+    );
+    acquired(
+        run(
+            &port,
+            port.acquire_header_path(acquire(&port, peer(101), 1, chain[3_999])),
+        )
+        .0,
+    );
+    let (_, full) = run(&port, port.acquire_header_path(short(102)));
+    assert_eq!(
+        full.result,
+        ResultIdentity::CapacityBusy(SignalClass::Fallback)
+    );
 }
 
 /// Two applies of the same headers with the same owner, supplier and

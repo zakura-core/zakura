@@ -11,6 +11,7 @@ use std::{sync::Arc, time::Duration};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
     controlled::{ControlledPort, OpId, StorageEvent as PortEvent},
+    evidence::RequestIdentity,
     lease::LeaseEnd as PortLeaseEnd,
     Fault, Outcome,
 };
@@ -85,35 +86,63 @@ fn lease_ends(ends: Vec<PortLeaseEnd>) -> Vec<LeaseEnd> {
         .collect()
 }
 
+/// The owner, peer and session `request` names, in today's observation
+/// form: the owner as its `Debug` text and the peer as hex, until the
+/// typed observation encoding replaces them.
+fn attribution(request: &RequestIdentity) -> (Option<String>, Option<String>, Option<u64>) {
+    match request {
+        RequestIdentity::ContinuationLocator | RequestIdentity::SelectedChainContains { .. } => {
+            (None, None, None)
+        }
+        RequestIdentity::VctRepairContext { owner, .. } => {
+            (Some(format!("{owner:?}")), None, Some(owner.session_id()))
+        }
+        RequestIdentity::AcquireHeaderPath {
+            peer, session_id, ..
+        } => (None, Some(hex(&peer.digest())), Some(*session_id)),
+        RequestIdentity::ReadHeaderPath { lease, .. }
+        | RequestIdentity::ReleaseHeaderPath { lease, .. } => (
+            None,
+            lease.map(|lease| hex(&lease.peer.digest())),
+            lease.map(|lease| lease.session_id),
+        ),
+        RequestIdentity::PrepareHeaderTarget { owner, source, .. }
+        | RequestIdentity::ApplyHeaderTarget { owner, source, .. } => (
+            Some(format!("{owner:?}")),
+            Some(hex(&source.digest())),
+            Some(owner.session_id()),
+        ),
+    }
+}
+
 /// `event` as an observation, or `None` for shutdown, which happens only
 /// after the log is frozen.
 fn observation(event: PortEvent) -> Option<Observation> {
     let (id, event) = match event {
         PortEvent::Submitted {
             id,
-            op,
-            attribution,
+            request,
             request_digest,
-        } => (
-            id,
-            StorageEvent::Submitted {
-                op: op.name().to_owned(),
-                request: hex(&request_digest),
-                owner: attribution.owner.map(|owner| format!("{owner:?}")),
-                peer: attribution.peer.map(|peer| hex(&peer.digest())),
-                session: attribution.session_id,
-            },
-        ),
+        } => {
+            let (owner, peer, session) = attribution(&request);
+            (
+                id,
+                StorageEvent::Submitted {
+                    op: request.op().name().to_owned(),
+                    request: hex(&request_digest),
+                    owner,
+                    peer,
+                    session,
+                },
+            )
+        }
         PortEvent::CallerDropped { id } => (id, StorageEvent::CallerDropped),
         PortEvent::Completed(completion) => (
             completion.id,
             StorageEvent::Completed {
                 op: completion.op.name().to_owned(),
                 outcome: completion.outcome.name().to_owned(),
-                owner: completion
-                    .attribution
-                    .owner
-                    .map(|owner| format!("{owner:?}")),
+                owner: attribution(&completion.request).0,
                 delivered: completion.delivered,
                 lease_ends: lease_ends(completion.lease_ends),
                 state: hex(&completion.state_digest),

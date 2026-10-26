@@ -33,9 +33,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use zakura_chain::block;
-use zakura_header_chain::{
-    BodyWorkOwner, EngineSnapshot, HeaderLocator, HeaderSyncWorkOwner, SourceId,
-};
+use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, HeaderLocator};
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture,
     LocatorReadPermit, Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply,
@@ -45,7 +43,8 @@ use zakura_node_services::header_chain::{
 use zakura_rt::{sync::watch, time::Instant};
 
 use super::{
-    adapter::EnginePort,
+    adapter::{EnginePort, Executed},
+    evidence::{RequestIdentity, ResultIdentity},
     fixture::HeaderFixture,
     lease::{Effects, LeaseEnd},
     FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
@@ -72,18 +71,6 @@ pub struct PendingOp {
     pub caller_waiting: bool,
 }
 
-/// Whose work an operation is, as far as its request says.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub struct Attribution {
-    /// A prepare's or apply's work owner.
-    pub owner: Option<HeaderSyncWorkOwner>,
-    /// The peer: an acquire's source, a path's holder when this port issued
-    /// the path, or a prepare's source.
-    pub peer: Option<SourceId>,
-    /// The peer's session, where the request names one.
-    pub session_id: Option<u64>,
-}
-
 /// What [`ControlledPort::complete`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
@@ -91,8 +78,10 @@ pub struct Completion {
     pub id: OpId,
     /// The operation.
     pub op: HeaderOp,
-    /// Whose work it was.
-    pub attribution: Attribution,
+    /// What it asked for, with its owner.
+    pub request: RequestIdentity,
+    /// What it returned.
+    pub result: ResultIdentity,
     /// A digest of its request, the same as at submission.
     pub request_digest: [u8; 32],
     /// The outcome it completed with.
@@ -115,10 +104,8 @@ pub enum StorageEvent {
     Submitted {
         /// The new operation's ID.
         id: OpId,
-        /// The operation.
-        op: HeaderOp,
-        /// Whose work it is.
-        attribution: Attribution,
+        /// What it asks for, with its owner.
+        request: RequestIdentity,
         /// A digest of its request.
         request_digest: [u8; 32],
     },
@@ -207,7 +194,7 @@ struct Slot {
     stage: Stage,
     /// The caller's waker, or `None` once the caller dropped its future.
     caller: Option<Waker>,
-    attribution: Attribution,
+    identity: RequestIdentity,
     request_digest: [u8; 32],
     /// Whether the request fails an adapter-side input check. Those checks
     /// read only a handle's or a target's seal, which can't change after
@@ -237,7 +224,7 @@ enum Stage {
     /// Taken by `complete`, which is running it.
     Running,
     /// Completed, with the reply its caller hasn't polled yet.
-    Replied(HeaderReply),
+    Replied { reply: HeaderReply },
 }
 
 impl ControlledPort {
@@ -280,7 +267,7 @@ impl ControlledPort {
                         caller_waiting: slot.caller.is_some(),
                     })
                 }
-                Stage::Running | Stage::Replied(_) => None,
+                Stage::Running | Stage::Replied { .. } => None,
             })
             .collect()
     }
@@ -297,7 +284,7 @@ impl ControlledPort {
                 Stage::Pending { request, submitted } if !slot.rejected => {
                     Some((request, *submitted))
                 }
-                Stage::Pending { .. } | Stage::Running | Stage::Replied(_) => None,
+                Stage::Pending { .. } | Stage::Running | Stage::Replied { .. } => None,
             })
             .filter(|(request, _)| {
                 request
@@ -365,31 +352,42 @@ impl ControlledPort {
         let op = request.op();
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
-        let (reply, effects) = match early {
+        let (reply, effects, result) = match early {
             Some(reply) => {
                 drop(request);
-                (reply, Effects::default())
+                let result = match outcome {
+                    Outcome::Fault(fault) => ResultIdentity::Fault(fault),
+                    Outcome::Rejected | Outcome::Engine => ResultIdentity::Rejected,
+                };
+                (reply, Effects::default(), result)
             }
-            None => self.engine.execute(request),
+            None => {
+                let Executed {
+                    reply,
+                    effects,
+                    result,
+                } = self.engine.execute(request);
+                (reply, effects, result)
+            }
         };
         // The permit is held until the read finishes.
         drop(permit);
         let mut lease_ends = effects.fire();
-        let (caller, abandoned, attribution, request_digest) = {
+        let (caller, abandoned, identity, request_digest) = {
             let mut ops = self.ops();
             let slot = ops
                 .slots
                 .get_mut(&id)
                 .expect("a running operation keeps its slot until it replies");
-            let (attribution, request_digest) = (slot.attribution, slot.request_digest);
+            let (identity, request_digest) = (slot.identity.clone(), slot.request_digest);
             match slot.caller.take() {
                 Some(waker) => {
-                    slot.stage = Stage::Replied(reply);
-                    (Some(waker), None, attribution, request_digest)
+                    slot.stage = Stage::Replied { reply };
+                    (Some(waker), None, identity, request_digest)
                 }
                 None => {
                     let removed = ops.slots.remove(&id);
-                    (None, Some((removed, reply)), attribution, request_digest)
+                    (None, Some((removed, reply)), identity, request_digest)
                 }
             }
         };
@@ -401,7 +399,8 @@ impl ControlledPort {
         let completion = Completion {
             id,
             op,
-            attribution,
+            request: identity,
+            result,
             request_digest,
             outcome,
             delivered: caller.is_some(),
@@ -533,7 +532,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     .checked_add(1)
                     .expect("a run submits fewer than 2^64 operations");
                 let id = OpId(ops.last);
-                let (op, attribution) = (request.op(), attribution(&request, key));
+                let identity = RequestIdentity::of(&request, key);
                 ops.slots.insert(
                     id,
                     Slot {
@@ -542,7 +541,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                             submitted: Instant::now(),
                         },
                         caller: Some(cx.waker().clone()),
-                        attribution,
+                        identity: identity.clone(),
                         request_digest,
                         rejected,
                     },
@@ -552,8 +551,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                 }
                 ops.events.push(StorageEvent::Submitted {
                     id,
-                    op,
-                    attribution,
+                    request: identity,
                     request_digest,
                 });
                 drop(ops);
@@ -566,9 +564,9 @@ impl<T: FromReply> Future for Call<'_, T> {
                 let Some(slot) = ops.slots.get_mut(&id) else {
                     return Poll::Pending;
                 };
-                if matches!(slot.stage, Stage::Replied(_)) {
+                if matches!(slot.stage, Stage::Replied { .. }) {
                     let Some(Slot {
-                        stage: Stage::Replied(reply),
+                        stage: Stage::Replied { reply, .. },
                         ..
                     }) = ops.slots.remove(&id)
                     else {
@@ -599,7 +597,7 @@ impl<T> Drop for Call<'_, T> {
         let Some(slot) = ops.slots.get_mut(&id) else {
             return;
         };
-        if !matches!(slot.stage, Stage::Replied(_)) {
+        if !matches!(slot.stage, Stage::Replied { .. }) {
             // Accepted work outlives its caller.
             let caller = slot.caller.take();
             ops.events.push(StorageEvent::CallerDropped { id });
@@ -608,7 +606,7 @@ impl<T> Drop for Call<'_, T> {
             return;
         }
         let Some(Slot {
-            stage: Stage::Replied(reply),
+            stage: Stage::Replied { reply, .. },
             ..
         }) = ops.slots.remove(&id)
         else {
@@ -622,30 +620,6 @@ impl<T> Drop for Call<'_, T> {
             });
         });
         effects.fire();
-    }
-}
-
-/// Whose work `request` is, for the adapter holding `key`.
-fn attribution(request: &HeaderRequest, key: &AdapterKey) -> Attribution {
-    let owner = request.owner();
-    let (peer, session_id) = match request {
-        HeaderRequest::AcquireHeaderPath(acquire) => {
-            (Some(acquire.source), Some(acquire.session_id))
-        }
-        HeaderRequest::ReadHeaderPath { path, .. } | HeaderRequest::ReleaseHeaderPath { path } => {
-            path.adapter_identity(key)
-                .map_or((None, None), |(_, peer, session)| {
-                    (Some(peer), Some(session))
-                })
-        }
-        HeaderRequest::PrepareHeaderTarget(prepare) => (Some(prepare.source), None),
-        HeaderRequest::ApplyHeaderTarget { target } => (Some(target.source()), None),
-        _ => (None, None),
-    };
-    Attribution {
-        owner,
-        peer,
-        session_id: session_id.or(owner.map(|owner| owner.session_id())),
     }
 }
 

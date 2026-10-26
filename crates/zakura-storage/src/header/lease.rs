@@ -16,7 +16,7 @@ use zakura_chain::block;
 use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{AcquirePathReply, ServingCapacitySignal};
 
-use super::Release;
+use super::{evidence::SignalClass, Release};
 use zakura_rt::time::Instant;
 
 /// Most leases held at once, zakura-state's `MAX_RETAINED_PATH_LEASES`.
@@ -226,6 +226,29 @@ impl Registry {
         Err(AcquirePathReply::CapacityBusy(
             signal.get_or_insert_default().clone(),
         ))
+    }
+
+    /// Which of the registry's signals `signal` is, for a refusal of `peer`.
+    /// `None` if it's none of them.
+    pub(super) fn signal_class(
+        &self,
+        peer: SourceId,
+        signal: &ServingCapacitySignal,
+    ) -> Option<SignalClass> {
+        let held = |slot: &Option<ServingCapacitySignal>| slot.as_ref() == Some(signal);
+        if self
+            .by_peer
+            .get(&peer)
+            .is_some_and(|cursor| held(&cursor.capacity_signal))
+        {
+            Some(SignalClass::Peer)
+        } else if held(&self.general_capacity) {
+            Some(SignalClass::General)
+        } else if held(&self.fallback_capacity) {
+            Some(SignalClass::Fallback)
+        } else {
+            None
+        }
     }
 
     /// The refusal for a reserve admission whose path needs an ordinary

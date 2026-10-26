@@ -604,12 +604,10 @@ impl ActionSource for HeaderStorage {
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
+        // Run IDs depend on the process, and the failure is replayed, so the
+        // text names neither.
         if log.run() != self.id.run {
-            return Err(format!(
-                "ForeignRun: storage registered with run {} observed in run {}",
-                self.id.run,
-                log.run()
-            ));
+            return Err("ForeignRun: storage registered with another run".to_owned());
         }
         let delivered = match self.delivered {
             Some(delivered) => delivered,

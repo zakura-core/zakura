@@ -290,15 +290,18 @@ impl ModelRegistry {
         self.leases.insert(lease.key.peer, lease);
     }
 
-    /// Whether `key` names a lease or continuation the registry holds.
-    fn knows(&self, key: &LeaseKey) -> bool {
+    /// Whether `key` names a live lease the registry holds.
+    fn knows_lease(&self, key: &LeaseKey) -> bool {
         self.leases
             .get(&key.peer)
             .is_some_and(|lease| lease.key == *key)
-            || self
-                .continuations
-                .get(&key.peer)
-                .is_some_and(|lease| lease.key == *key)
+    }
+
+    /// Whether `key` names a continuation the registry holds.
+    fn knows_continuation(&self, key: &LeaseKey) -> bool {
+        self.continuations
+            .get(&key.peer)
+            .is_some_and(|cached| cached.key == *key)
     }
 }
 
@@ -472,15 +475,21 @@ impl OwnerModel {
                 LeaseFact::CapabilityEnded { lease, .. }
                 | LeaseFact::RetentionCached { lease, .. }
                 | LeaseFact::WaiterSet(Waiter::Peer(lease))
-                | LeaseFact::WaiterFired(Waiter::Peer(lease)),
+                | LeaseFact::WaiterFired(Waiter::Peer(lease))
+                | LeaseFact::RetentionEnded {
+                    lease,
+                    why: RetentionEnd::WithCapability,
+                },
             ) => lease,
+            // Every other retention end names a cached continuation.
             FactKind::Lease(LeaseFact::RetentionEnded { lease, .. }) => {
-                return (!self.registry.knows(lease) && !created.contains(lease))
+                return (!self.registry.knows_continuation(lease))
                     .then_some(Owner::Continuation(*lease))
             }
             _ => return None,
         };
-        (!self.registry.knows(lease) && !created.contains(lease)).then_some(Owner::Lease(*lease))
+        (!self.registry.knows_lease(lease) && !created.contains(lease))
+            .then_some(Owner::Lease(*lease))
     }
 
     /// The non-head facts `head`'s transaction must hold, applying the
@@ -966,14 +975,14 @@ impl OwnerModel {
                 actual
                     .leases
                     .iter()
-                    .find(|lease| !self.registry.knows(&lease.lease))
+                    .find(|lease| !self.registry.knows_lease(&lease.lease))
                     .map(|lease| Owner::Lease(lease.lease))
             })
             .or_else(|| {
                 actual
                     .continuations
                     .iter()
-                    .find(|cached| !self.registry.knows(&cached.lease))
+                    .find(|cached| !self.registry.knows_continuation(&cached.lease))
                     .map(|cached| Owner::Continuation(cached.lease))
             });
         if let Some(owner) = unknown {

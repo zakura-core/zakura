@@ -331,3 +331,27 @@ fn a_shutdown_dropping_an_unseen_operation_is_an_unknown_owner() {
         })
     );
 }
+
+/// A partial read through the engine port moves a known lease into the
+/// continuation cache without a fact, so the state holds a continuation
+/// the model never created, even though it knows the key as a lease.
+#[test]
+fn an_engine_partial_read_is_an_unknown_continuation() {
+    let (port, chain) = chain(3);
+    let mut model = OwnerModel::new();
+    let path = acquired(run(
+        &port,
+        port.acquire_header_path(acquire(&port, chain[2])),
+    ));
+    checked(&port, &mut model);
+    let lease = model.state().leases[0].lease;
+    let anchor = HeaderFixture::regtest().anchor();
+    ready(port.engine().read_header_path(path, page_after(anchor, 1))).expect("the page reads");
+    assert_eq!(
+        model.check_boundary(&port.take_facts(), &port.owner_state()),
+        Err(ModelFailure::UnknownOwner {
+            txn: None,
+            owner: Owner::Continuation(lease),
+        })
+    );
+}

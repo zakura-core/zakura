@@ -1,19 +1,22 @@
 //! The header-sync reactor on the deterministic scheduler. These only build
 //! with `RUSTFLAGS="--cfg zakura_sim"`, in a separate `CARGO_TARGET_DIR`.
 //!
-//! The reactor runs with inert storage and no peers. A small seeded `Plan`
-//! stands in for `zakura-sim`: it picks which ready task runs and answers
-//! every random draw.
+//! Each reactor runs with inert storage. A small seeded `Plan` stands in for
+//! `zakura-sim`: it picks which ready task runs and answers every random
+//! draw.
 #![cfg(zakura_sim)]
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use zakura_chain::parameters::Network;
 use zakura_network::zakura::{
-    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig,
-    LOCAL_MAX_MESSAGE_BYTES,
+    framed_channel, spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncService,
+    HeaderSyncStartup, Peer, Service, ServicePeerDirection, ZakuraHeaderSyncConfig, ZakuraPeerId,
+    LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
+use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::CancellationToken;
 use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
 
@@ -191,4 +194,115 @@ fn the_same_plan_replays_the_same_run() {
     // Plan 8 orders the first steps differently, so the comparisons above
     // would catch a run that ignored its plan.
     assert_ne!(first, other);
+}
+
+/// The peer identity of the node whose key is `seed` repeated.
+fn peer_id(seed: u8) -> ZakuraPeerId {
+    let node = NodeSecretKey::from_bytes(&[seed; 32]).public();
+    ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id")
+}
+
+/// Two reactors, Nora and Mira, each behind its own service. Nora dials
+/// Mira, so each service gets one versioned session over a pair of
+/// in-memory streams, one each way.
+#[test]
+fn two_reactors_meet_over_memory_streams() {
+    let plan = Rc::new(RefCell::new(Plan(3)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+
+    let shutdown = CancellationToken::new();
+    let exits = Rc::new(RefCell::new(Vec::new()));
+    let mut nodes = Vec::new();
+    for name in ["nora", "mira"] {
+        let (handle, actions, reactor) =
+            spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+        let exits = Rc::clone(&exits);
+        sched.spawn_root(name, async move {
+            let exit = match reactor.await {
+                Ok(()) => "completed".to_owned(),
+                Err(error) => format!("{error}"),
+            };
+            exits.borrow_mut().push(exit);
+        });
+        let service = HeaderSyncService::new(handle.clone());
+        nodes.push((handle, actions, service));
+    }
+
+    // Nora writes what Mira reads, and the other way round.
+    let (nora_send, mira_recv) = framed_channel(8);
+    let (mira_send, nora_recv) = framed_channel(8);
+    let connections = [CancellationToken::new(), CancellationToken::new()];
+    let sides = [
+        (
+            peer_id(2),
+            ServicePeerDirection::Outbound,
+            (nora_recv, nora_send),
+        ),
+        (
+            peer_id(1),
+            ServicePeerDirection::Inbound,
+            (mira_recv, mira_send),
+        ),
+    ];
+    for (((remote, direction, streams), (_, _, service)), connection) in
+        sides.into_iter().zip(&nodes).zip(&connections)
+    {
+        service.add_peer(Peer::new_versioned(
+            1,
+            remote,
+            ZAKURA_CAP_HEADER_SYNC,
+            direction,
+            ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            1,
+            streams,
+            connection.clone(),
+        ));
+    }
+
+    let mut steps = Vec::new();
+    let settled = run_until_idle(&mut sched, &plan, &mut steps);
+    assert_eq!(settled, Status::WaitingOnTime, "{steps:?}");
+    let connected: Vec<_> = nodes
+        .iter()
+        .map(|(handle, _, _)| {
+            let snapshot = handle.peer_snapshot();
+            (snapshot.outbound_peers, snapshot.inbound_peers)
+        })
+        .collect();
+    assert_eq!(connected, [(1, 0), (0, 1)], "each reactor admits its peer");
+    assert!(
+        connections
+            .iter()
+            .all(|connection| !connection.is_cancelled()),
+        "neither service refused its session"
+    );
+
+    // A node shutdown stops the reactors and closes the transport's
+    // connections, which ends each session's tasks.
+    shutdown.cancel();
+    for connection in &connections {
+        connection.cancel();
+    }
+    let end = loop {
+        match run_until_idle(&mut sched, &plan, &mut steps) {
+            Status::WaitingOnTime => {
+                let next = sched.next_deadline().expect("WaitingOnTime has a timer");
+                sched.advance_to(next);
+            }
+            other => break other,
+        }
+    };
+    assert_eq!(end, Status::Quiescent, "every task ends after shutdown");
+    drop(nodes);
+    assert_eq!(sched.shutdown(), Default::default(), "no task was left");
+    assert_eq!(*exits.borrow(), ["completed", "completed"]);
+    assert!(
+        !steps.iter().any(|step| step.starts_with("panicked")),
+        "{steps:?}"
+    );
 }

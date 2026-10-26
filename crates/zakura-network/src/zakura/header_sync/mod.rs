@@ -37,8 +37,9 @@ pub use scheduler::retry::{
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use service::drive_header_sync_actions;
+pub(crate) use service::HeaderSyncPassthroughService;
+pub use service::HeaderSyncService;
 pub use service::PeerSession;
-pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use v9::replay_header_sync_v9_codec_bytes;
 pub use v9::{Headers, HeadersOutcome, HeadersOutcomeCode, Status};

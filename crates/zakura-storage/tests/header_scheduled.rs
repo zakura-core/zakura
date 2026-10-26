@@ -195,7 +195,8 @@ fn spawn_competing(sched: &mut Scheduler, port: &Arc<ControlledPort>, target: Fr
 }
 
 /// A task drops an unread `Acquired` reply, after another acquire for the
-/// same peer registered a capacity waiter if `with_waiter`. At every
+/// same peer, completed through the controlled port, registered a capacity
+/// waiter if `with_waiter`. At every
 /// scheduling point the drop reaches, acts as the run may there: takes the
 /// lease lock, checks that a lease already gone has its `ReplyDropped`
 /// recorded, lists pending operations, and completes a competing
@@ -216,8 +217,13 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
         panic!("expected a lease, got {:?}", completion.result);
     };
     let waiter = with_waiter.then(|| {
-        match ready(port.engine().acquire_header_path(acquire(&port, target))) {
-            Ok(AcquirePathReply::CapacityBusy(signal)) => signal,
+        let mut call = port.acquire_header_path(acquire(&port, target));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        port.complete(OpId(COMPETING + 2), Outcome::Engine)
+            .expect("the refusal completes");
+        match call.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(AcquirePathReply::CapacityBusy(signal))) => signal,
             other => panic!("expected CapacityBusy, got {other:?}"),
         }
     });

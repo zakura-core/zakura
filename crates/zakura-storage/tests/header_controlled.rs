@@ -1941,6 +1941,75 @@ fn only_a_pristine_port_binds() {
     }
 }
 
+/// Submits `call`, drops it, and completes it with `outcome`, so the reply
+/// goes to nobody. Returns the completion.
+fn complete_abandoned<F: Future + Unpin>(
+    port: &ControlledPort,
+    mut call: F,
+    outcome: Outcome,
+) -> Completion {
+    submit(&mut call);
+    drop(call);
+    let id = port.pending().last().expect("the call is pending").id;
+    port.complete(id, outcome).expect("the outcome is legal")
+}
+
+/// Every completion whose caller is gone removes its slot, whatever the
+/// operation returned, not only an abandoned `Acquired`: a membership, a
+/// locator, a prepare, a refusal, a page and a release, and a fault and a
+/// rejection.
+#[test]
+fn an_undelivered_completion_leaves_no_operation() {
+    let (port, chain) = chain(3);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    let held = acquired(reply);
+    let next = HeaderFixture::regtest().extend(chain[2], 1, 0);
+    let request =
+        HeaderFixture::regtest().target_request(&port.engine().snapshot(), chain[2], &next, 9);
+    let anchor = HeaderFixture::regtest().anchor();
+
+    let completions = [
+        complete_abandoned(&port, port.selected_chain_contains(chain[0].hash), ENGINE),
+        complete_abandoned(&port, port.continuation_locator(permit(&semaphore)), ENGINE),
+        complete_abandoned(&port, port.prepare_header_target(request), ENGINE),
+        complete_abandoned(
+            &port,
+            port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+            ENGINE,
+        ),
+        complete_abandoned(
+            &port,
+            port.read_header_path(held.clone(), page_after(anchor, 1)),
+            ENGINE,
+        ),
+        complete_abandoned(&port, port.release_header_path(held), ENGINE),
+        complete_abandoned(
+            &port,
+            port.selected_chain_contains(chain[0].hash),
+            UNAVAILABLE,
+        ),
+        complete_abandoned(
+            &port,
+            port.release_header_path(foreign_path(&port, chain[2])),
+            Outcome::Rejected,
+        ),
+    ];
+    for completion in &completions {
+        assert!(!completion.delivered);
+        assert!(
+            !matches!(completion.result, ResultIdentity::Acquired { .. }),
+            "{:?} isn't an abandoned lease",
+            completion.op
+        );
+    }
+    assert!(port.owner_state().operations.is_empty());
+    assert!(port.pending().is_empty());
+}
+
 /// D14: the snapshot reads each caller's presence from a token its call
 /// owns. A pending call is alive until dropped. A replied call is alive
 /// while it waits, although the port gave up its waker at the completion.

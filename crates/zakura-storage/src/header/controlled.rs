@@ -191,6 +191,10 @@ struct Ops {
     /// The last ID handed out.
     last: u64,
     slots: BTreeMap<OpId, Slot>,
+    /// Storage's clone of each pending locator's permit. It leaves here when
+    /// the operation is taken to run, or at shutdown, and drops after the
+    /// lock is released, since the last permit's drop is a scheduling point.
+    permits: BTreeMap<OpId, LocatorReadPermit>,
     /// Events not yet taken.
     events: Vec<StorageEvent>,
     /// Set by shutdown, after which nothing is submitted.
@@ -306,7 +310,7 @@ impl ControlledPort {
     pub fn complete(&self, id: OpId, outcome: Outcome) -> Result<Completion, CompleteError> {
         let now = Instant::now();
         let key = self.engine.adapter_key();
-        let (request, early) = {
+        let (request, early, permit) = {
             let mut ops = self.ops();
             let slot = ops
                 .slots
@@ -341,7 +345,7 @@ impl ControlledPort {
             else {
                 unreachable!("the stage was checked above under the same lock");
             };
-            (request, early)
+            (request, early, ops.permits.remove(&id))
         };
         let op = request.op();
         // Runs without the bookkeeping lock, since the engine and a dropped
@@ -353,6 +357,8 @@ impl ControlledPort {
             }
             None => self.engine.execute(request),
         };
+        // The permit is held until the read finishes.
+        drop(permit);
         let mut lease_ends = effects.fire();
         let (caller, abandoned, attribution, request_digest) = {
             let mut ops = self.ops();
@@ -423,16 +429,16 @@ impl ControlledPort {
     /// every lease. No caller is woken, and a call polled afterwards never
     /// completes. A repeat does nothing.
     pub fn shut_down(&self) {
-        let slots = {
+        let (slots, permits) = {
             let mut ops = self.ops();
             if mem::replace(&mut ops.shut_down, true) {
                 return;
             }
-            mem::take(&mut ops.slots)
+            (mem::take(&mut ops.slots), mem::take(&mut ops.permits))
         };
         let dropped = slots.keys().copied().collect();
-        // Dropped outside the lock, since a request's permit wakes waiters.
-        drop(slots);
+        // Dropped outside the lock, since a permit wakes waiters.
+        drop((slots, permits));
         let lease_ends = self.engine.shut_down_leases().fire();
         self.ops().events.push(StorageEvent::ShutDown {
             dropped,
@@ -442,10 +448,14 @@ impl ControlledPort {
 
     /// A future that submits `request` on its first poll and resolves to its
     /// reply.
-    fn submit<T: FromReply + 'static>(&self, request: HeaderRequest) -> HeaderChainFuture<'_, T> {
+    fn submit<T: FromReply + 'static>(
+        &self,
+        request: HeaderRequest,
+        permit: Option<LocatorReadPermit>,
+    ) -> HeaderChainFuture<'_, T> {
         Box::pin(Call {
             port: self,
-            state: CallState::Unsubmitted(Some(Box::new(request))),
+            state: CallState::Unsubmitted(Some(Box::new(Submission { request, permit }))),
             reply: PhantomData,
         })
     }
@@ -458,9 +468,16 @@ struct Call<'a, T> {
     reply: PhantomData<fn() -> T>,
 }
 
+/// A call's request, and storage's clone of a locator's permit, until the
+/// call's first poll submits them.
+struct Submission {
+    request: HeaderRequest,
+    permit: Option<LocatorReadPermit>,
+}
+
 enum CallState {
     /// Not polled yet. A call dropped here never reaches storage.
-    Unsubmitted(Option<Box<HeaderRequest>>),
+    Unsubmitted(Option<Box<Submission>>),
     /// Submitted as this operation.
     Submitted(OpId),
     /// Polled after shutdown, so never submitted. It never completes.
@@ -478,15 +495,18 @@ impl<T: FromReply> Future for Call<'_, T> {
         let port = self.port;
         let mut ops = port.ops();
         match &mut self.state {
-            CallState::Unsubmitted(request) => {
-                let request = request
+            CallState::Unsubmitted(submission) => {
+                let submission = submission
                     .take()
                     .expect("an unsubmitted call holds its request");
                 if ops.shut_down {
                     drop(ops);
+                    // Dropped outside the lock, with its permit.
+                    drop(submission);
                     self.state = CallState::Orphaned;
                     return Poll::Pending;
                 }
+                let Submission { request, permit } = *submission;
                 ops.last = ops
                     .last
                     .checked_add(1)
@@ -502,7 +522,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     id,
                     Slot {
                         stage: Stage::Pending {
-                            request: *request,
+                            request,
                             submitted: Instant::now(),
                         },
                         caller: Some(cx.waker().clone()),
@@ -510,6 +530,9 @@ impl<T: FromReply> Future for Call<'_, T> {
                         request_digest,
                     },
                 );
+                if let Some(permit) = permit {
+                    ops.permits.insert(id, permit);
+                }
                 ops.events.push(StorageEvent::Submitted {
                     id,
                     op,
@@ -635,7 +658,7 @@ impl Port for ControlledPort {
         &self,
         permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-        self.submit(HeaderRequest::ContinuationLocator { permit })
+        self.submit(HeaderRequest::ContinuationLocator, Some(permit))
     }
 
     fn vct_repair_context(
@@ -643,14 +666,14 @@ impl Port for ControlledPort {
         owner: BodyWorkOwner,
         height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
-        self.submit(HeaderRequest::VctRepairContext { owner, height })
+        self.submit(HeaderRequest::VctRepairContext { owner, height }, None)
     }
 
     fn acquire_header_path(
         &self,
         request: AcquirePath,
     ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-        self.submit(HeaderRequest::AcquireHeaderPath(request))
+        self.submit(HeaderRequest::AcquireHeaderPath(request), None)
     }
 
     fn read_header_path(
@@ -658,28 +681,28 @@ impl Port for ControlledPort {
         path: RetainedHeaderPath,
         request: ReadPath,
     ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-        self.submit(HeaderRequest::ReadHeaderPath { path, request })
+        self.submit(HeaderRequest::ReadHeaderPath { path, request }, None)
     }
 
     fn release_header_path(
         &self,
         path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-        self.submit(HeaderRequest::ReleaseHeaderPath { path })
+        self.submit(HeaderRequest::ReleaseHeaderPath { path }, None)
     }
 
     fn prepare_header_target(
         &self,
         request: PrepareHeaderTarget,
     ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
-        self.submit(HeaderRequest::PrepareHeaderTarget(request))
+        self.submit(HeaderRequest::PrepareHeaderTarget(request), None)
     }
 
     fn apply_header_target(
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
-        self.submit(HeaderRequest::ApplyHeaderTarget { target })
+        self.submit(HeaderRequest::ApplyHeaderTarget { target }, None)
     }
 
     /// The engine's watch. It's synchronous, so it's never pending.
@@ -691,6 +714,6 @@ impl Port for ControlledPort {
         &self,
         hash: block::Hash,
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
-        self.submit(HeaderRequest::SelectedChainContains { hash })
+        self.submit(HeaderRequest::SelectedChainContains { hash }, None)
     }
 }

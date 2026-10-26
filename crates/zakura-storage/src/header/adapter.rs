@@ -769,11 +769,8 @@ impl EnginePort {
     /// operation through here.
     pub(crate) fn execute(&self, request: HeaderRequest) -> (HeaderReply, Effects) {
         let reply = match request {
-            HeaderRequest::ContinuationLocator { permit } => {
-                let locator = self.locator().map(Some);
-                // The permit is held until the read finishes.
-                drop(permit);
-                HeaderReply::ContinuationLocator(locator)
+            HeaderRequest::ContinuationLocator => {
+                HeaderReply::ContinuationLocator(self.locator().map(Some))
             }
             HeaderRequest::VctRepairContext { .. } => {
                 HeaderReply::VctRepairContext(Ok(VctRepairContextReply::Stale))
@@ -868,7 +865,13 @@ impl Port for EnginePort {
         &self,
         permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-        self.run_on_poll(HeaderRequest::ContinuationLocator { permit })
+        Box::pin(async move {
+            let (reply, effects) = self.execute(HeaderRequest::ContinuationLocator);
+            // The permit is held until the read finishes.
+            drop(permit);
+            effects.fire();
+            FromReply::from_reply(reply)
+        })
     }
 
     fn vct_repair_context(

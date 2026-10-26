@@ -947,7 +947,7 @@ struct Inspected {
 /// Path and target handles redact their identity and contents from
 /// `Debug`. So a path this port issued adds its lease, peer and session,
 /// and a target this port sealed adds its insertion: supplier, parent,
-/// completion, each header's hash and each auxiliary delivery.
+/// target, completion, each header's hash and each auxiliary delivery.
 fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v2");
@@ -958,6 +958,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
                 let parent = insert.parent_hash;
                 hasher.update(insert.source.digest());
                 hasher.update(insert.parent_hash.0);
+                hasher.update(insert.target_tip_hash.0);
                 hasher.update(format!("{:?}", insert.completion).as_bytes());
                 for header in insert.batch.headers() {
                     hasher.update(header.hash.0);

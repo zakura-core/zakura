@@ -1033,3 +1033,43 @@ impl Port for ControlledPort {
         self.submit(HeaderRequest::SelectedChainContains { hash }, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D14: a call that returns its reply gives up its token at once, even
+    /// while its future stays allocated, so nothing reads it as present.
+    #[test]
+    fn a_call_drops_its_token_when_it_returns() {
+        let fixture = HeaderFixture::regtest();
+        let port = ControlledPort::new(&fixture);
+        let mut call: Call<'_, Result<SelectedChainMembership, PortError>> = Call {
+            port: &port,
+            state: CallState::Unsubmitted(Some(Box::new(Submission {
+                request: HeaderRequest::SelectedChainContains {
+                    hash: fixture.anchor().hash,
+                },
+                permit: None,
+            }))),
+            token: None,
+            reply: PhantomData,
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut call).poll(&mut cx).is_pending());
+        let token = Arc::downgrade(
+            call.token
+                .as_ref()
+                .expect("a submitted call holds its token"),
+        );
+        port.complete(OpId(1), Outcome::Engine)
+            .expect("membership completes");
+        assert!(
+            token.upgrade().is_some(),
+            "an unread reply's caller is present"
+        );
+
+        assert!(Pin::new(&mut call).poll(&mut cx).is_ready());
+        assert!(token.upgrade().is_none());
+    }
+}

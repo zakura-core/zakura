@@ -2076,3 +2076,167 @@ fn a_drawing_at_end_without_storage_is_inconclusive() {
     assert_eq!(report.end.harness, Some(HarnessFailure::DrawOutsideStep));
     assert_harness_failed(&report, &lines);
 }
+
+/// What [`live_port_run`] does with the port beyond the run's own use.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Poke {
+    /// Nothing.
+    Nothing,
+    /// Polls a call on another thread, outside the bound run, just before
+    /// storage's observation at step `.0`.
+    RefuseBefore(u64),
+    /// Polls a call on another thread in the checker's `at_end`.
+    RefuseAtEnd,
+    /// Shuts the port down in the checker's `at_end`, with the storage
+    /// still alive.
+    ShutDownAtEnd,
+}
+
+/// Polls a membership call on `port` from a thread with no run, which a
+/// bound port refuses.
+fn poll_outside_the_run(port: &ControlledPort) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let anchor = HeaderFixture::regtest().anchor();
+                let mut call = port.selected_chain_contains(anchor.hash);
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(call.as_mut().poll(&mut cx).is_pending());
+            })
+            .join()
+            .expect("the poll doesn't panic");
+    });
+}
+
+/// A storage source that, at step `at`, uses its port from outside the
+/// run just before observing.
+struct RefuseBefore<S> {
+    inner: S,
+    port: Arc<ControlledPort>,
+    at: u64,
+}
+
+impl<S: ActionSource> ActionSource for RefuseBefore<S> {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.inner.enabled(now, out);
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.inner.boundaries(now, out);
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if log.step() == self.at {
+            poll_outside_the_run(&self.port);
+        }
+        self.inner.observe(log)
+    }
+}
+
+/// A checker that uses the port in `at_end` as `poke` says.
+struct PokeAtEnd {
+    port: Arc<ControlledPort>,
+    poke: Poke,
+}
+
+impl zakura_sim::Checker for PokeAtEnd {
+    fn after_step(&mut self, _: &zakura_sim::StepCtx<'_>) -> Option<Violation> {
+        None
+    }
+
+    fn at_end(
+        &mut self,
+        _: &zakura_sim::RunEnd,
+        _: &ObservationLog,
+    ) -> Vec<zakura_sim::PropertyReport> {
+        match self.poke {
+            Poke::RefuseAtEnd => poll_outside_the_run(&self.port),
+            Poke::ShutDownAtEnd => self.port.shut_down(),
+            Poke::Nothing | Poke::RefuseBefore(_) => {}
+        }
+        Vec::new()
+    }
+}
+
+/// One task's membership read, with a property that always holds, and the
+/// port used as `poke` says. Returns the report and the records.
+fn live_port_run(poke: Poke) -> (RunReport, Vec<String>) {
+    let mut sim = Sim::new(storage_config(100), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let caller = port.clone();
+    sim.scheduler().spawn_root("caller", async move {
+        let anchor = HeaderFixture::regtest().anchor();
+        let _ = caller.selected_chain_contains(anchor.hash).await;
+    });
+    let storage = zakura_sim::storage::HeaderStorage::new(&mut sim, port.clone());
+    match poke {
+        Poke::RefuseBefore(at) => sim.add_source(Box::new(RefuseBefore {
+            inner: storage,
+            port: port.clone(),
+            at,
+        })),
+        _ => sim.add_source(Box::new(storage)),
+    };
+    let property = Property {
+        id: PropertyId::new("test/always"),
+        claim: "always holds",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: PropertyStatus::Active,
+        check: always,
+        witness: None,
+    };
+    let registry = Registry::new(vec![property]).expect("one property");
+    let calm = RegistryChecker::new(
+        registry,
+        Rc::new(Calm),
+        Assumptions::none(),
+        &[Source::View],
+    );
+    let mut checker = zakura_sim::property::Tee(calm, PokeAtEnd { port, poke });
+    let mut sink = zakura_sim::MemorySink::default();
+    let report = sim.run(&mut checker, &mut sink);
+    (report, sink.lines())
+}
+
+/// Every evidence check reads the port live, so use outside the run, or
+/// facts published after storage's last observation, fail the run at that
+/// check, at a step or at the final check before the log freezes. The
+/// property then reports `harness-failed`. A run whose port does nothing
+/// beyond what storage observed passes.
+#[test]
+fn the_port_is_checked_live_at_every_evidence_check() {
+    let (quiet, _) = live_port_run(Poke::Nothing);
+    assert_eq!(
+        quiet.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        },
+        "{:?}",
+        quiet.end
+    );
+    assert_eq!(
+        quiet.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 3 }
+    );
+    let last = quiet.end.steps;
+    for (poke, step, failure) in [
+        (Poke::RefuseBefore(1), 1, "RefusedOutsideRun"),
+        (Poke::RefuseAtEnd, last, "RefusedOutsideRun"),
+        (Poke::ShutDownAtEnd, last, "Unobserved"),
+    ] {
+        let (report, lines) = live_port_run(poke);
+        assert_eq!(report.end.outcome, Outcome::Harness, "{poke:?}");
+        assert_eq!(report.end.steps, step, "{poke:?}");
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with(failure), "{poke:?}: {detail}");
+        assert_harness_failed(&report, &lines);
+    }
+}

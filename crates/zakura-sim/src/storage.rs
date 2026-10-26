@@ -106,7 +106,7 @@ impl HeaderStorage {
             "a storage source needs a pristine port: build it before the run and use it only \
              inside the run"
         );
-        let checkpoint = Checkpoint::default();
+        let checkpoint = Checkpoint::new(&port);
         let id = sim.register_storage(SERVICE, checkpoint.clone());
         HeaderStorage {
             port,
@@ -653,7 +653,7 @@ impl ActionSource for HeaderStorage {
         self.delivered = Some(last);
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
-        self.checkpoint.record(log.step(), &sent);
+        self.checkpoint.record(log.step(), &sent, last);
         Ok(())
     }
 }

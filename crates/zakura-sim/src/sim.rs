@@ -518,24 +518,37 @@ impl Sim {
                     delivered.step, st.step
                 ),
                 Mark::Observed(delivered) => {
+                    // The port is read live, since activity after the last
+                    // observation leaves the mark as it was.
+                    let port = checkpoint.port();
+                    let live = port.as_ref().map_or(0, |port| port.last_seq());
                     // Exactly what storage delivered, payloads and order
                     // included, so the checker reads what the model checked.
                     let logged = storage_entries(st.log.of_step(st.step), service, instance);
-                    if logged.iter().copied().eq(&delivered.observations) {
+                    if port.as_ref().is_some_and(|port| port.refused_outside_run()) {
+                        "RefusedOutsideRun: the port refused use outside its run".to_owned()
+                    } else if live > delivered.through_seq {
+                        format!(
+                            "Unobserved: the port published facts {}..={live} after its last \
+                             observation",
+                            delivered.through_seq + 1
+                        )
+                    } else if logged.iter().copied().eq(&delivered.observations) {
                         continue;
+                    } else {
+                        let differs = logged
+                            .iter()
+                            .zip(&delivered.observations)
+                            .position(|(logged, sent)| *logged != sent)
+                            .unwrap_or(logged.len().min(delivered.observations.len()));
+                        format!(
+                            "Undelivered: at step {} the run log holds {} storage entries and \
+                             storage delivered {}, first differing at entry {differs}",
+                            st.step,
+                            logged.len(),
+                            delivered.observations.len()
+                        )
                     }
-                    let differs = logged
-                        .iter()
-                        .zip(&delivered.observations)
-                        .position(|(logged, sent)| *logged != sent)
-                        .unwrap_or(logged.len().min(delivered.observations.len()));
-                    format!(
-                        "Undelivered: at step {} the run log holds {} storage entries and \
-                         storage delivered {}, first differing at entry {differs}",
-                        st.step,
-                        logged.len(),
-                        delivered.observations.len()
-                    )
                 }
             };
             return Err(HarnessFailure::SourceEvidence {

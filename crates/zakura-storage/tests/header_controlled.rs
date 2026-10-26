@@ -874,6 +874,44 @@ fn apply_digests_cover_the_sealed_insertion() {
     assert_ne!(submitted[0].1, submitted[1].1);
 }
 
+/// Two applies with the same owner, supplier and target, prepared on
+/// different parents, cover different ranges, so their typed identities
+/// differ by the parent their sealed insertions name.
+#[test]
+fn apply_identities_name_their_parent() {
+    let (port, chain) = chain(1);
+    let anchor = HeaderFixture::regtest().anchor();
+    let headers = HeaderFixture::regtest().extend(anchor, 3, 0);
+    assert_eq!(headers[0].hash(), chain[0].hash);
+    let targets = [
+        prepared(&port, anchor, &headers, 2),
+        prepared(&port, chain[0], &headers[1..], 2),
+    ];
+    let named =
+        |target: &PreparedHeaderTarget| (target.owner(), target.source(), target.target_tip_hash());
+    assert_eq!(named(&targets[0]), named(&targets[1]));
+    for target in targets {
+        submit(&mut port.apply_header_target(target));
+    }
+    let identities: Vec<_> = port
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            StorageEvent::Submitted { request, .. } => Some(request),
+            _ => None,
+        })
+        .collect();
+    let parents: Vec<_> = identities
+        .iter()
+        .map(|identity| match identity {
+            RequestIdentity::ApplyHeaderTarget { parent_hash, .. } => *parent_hash,
+            other => panic!("expected an apply, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(parents, [Some(anchor.hash), Some(chain[0].hash)]);
+    assert_ne!(identities[0], identities[1]);
+}
+
 /// D12: a locator submitted after shutdown never reaches storage, and its
 /// permit comes back as soon as the call is polled.
 #[test]

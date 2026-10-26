@@ -380,6 +380,19 @@ pub enum Waiter {
     Fallback,
 }
 
+/// Where a retained path's next page starts.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum PathPosition {
+    /// At this index of the retained hashes, counted from the one above the
+    /// common ancestor.
+    Retained {
+        /// The index.
+        next: u64,
+    },
+    /// Every header has been served.
+    Complete,
+}
+
 /// Why a retained path stopped being held.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RetentionEnd {
@@ -414,6 +427,8 @@ pub enum LeaseFact {
         target: Frontier,
         /// Where its next page starts.
         common_ancestor: Frontier,
+        /// The cursor's index into the retained path.
+        position: PathPosition,
         /// Its slot class.
         capacity: CapacityClass,
         /// The cached lease it continued from, if any.
@@ -433,6 +448,8 @@ pub enum LeaseFact {
         lease: LeaseKey,
         /// The last header served.
         last_frontier: Frontier,
+        /// The cursor's index into the retained path.
+        position: PathPosition,
     },
     /// A retained path stopped being held.
     RetentionEnded {
@@ -524,10 +541,16 @@ pub struct LeaseState {
     pub target: Frontier,
     /// The last header served, or where the path starts.
     pub last_frontier: Frontier,
+    /// The cursor's index into the retained path.
+    pub position: PathPosition,
     /// Its slot class.
     pub capacity: CapacityClass,
     /// Whether its peer has a refused acquire waiting on it.
     pub waiter: bool,
+    /// The transaction that created it, as the registry stored it. `None`
+    /// for a lease made through the engine port directly, outside any
+    /// controlled transaction.
+    pub leased_txn: Option<u64>,
 }
 
 /// One consumed lease's path, cached for its peer's next page.
@@ -541,6 +564,10 @@ pub struct ContinuationState {
     pub target: Frontier,
     /// The last header served.
     pub last_frontier: Frontier,
+    /// The cursor's index into the retained path.
+    pub position: PathPosition,
+    /// How many hashes the path retains above its common ancestor.
+    pub retained: u64,
 }
 
 /// Whether each capacity class has a waiting signal.

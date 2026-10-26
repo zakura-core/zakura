@@ -964,6 +964,11 @@ fn page_after(after: Frontier, count: u32) -> ReadPath {
 /// B2: each operation's typed request and result identity, from the
 /// locator's generation and anchor to a page's last header and a lease's
 /// key, with the owner each request carries.
+///
+/// Its `PortError` read is input validation only: a page count of zero. A
+/// read finding the engine incoherent needs a cursor that disagrees with
+/// the graph, which no sequence of port calls produces, so nothing here
+/// covers that branch.
 #[test]
 fn completions_carry_typed_identities() {
     let (port, chain) = chain(3);
@@ -1055,6 +1060,7 @@ fn completions_carry_typed_identities() {
         port.read_header_path(rest.clone(), page_after(chain[2], 1)),
     );
     assert_eq!(stale.result, ResultIdentity::PageUnavailable);
+    // A zero page count fails input validation before the registry.
     let (_, bad) = run(&port, port.read_header_path(rest, page_after(chain[2], 0)));
     assert_eq!(bad.result, ResultIdentity::PortError);
 

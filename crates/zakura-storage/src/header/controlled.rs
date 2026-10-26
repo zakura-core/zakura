@@ -34,7 +34,7 @@ use std::{
     marker::PhantomData,
     mem,
     pin::Pin,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -53,7 +53,9 @@ use zakura_rt::{sync::watch, time::Instant};
 use super::{
     adapter::{EnginePort, Executed},
     evidence::LeaseFact,
-    evidence::{OperationStage, OperationState, OwnerState, RequestIdentity, ResultIdentity},
+    evidence::{
+        CallerPresence, OperationStage, OperationState, OwnerState, RequestIdentity, ResultIdentity,
+    },
     fixture::HeaderFixture,
     lease::{Effects, LeaseEnd},
     FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
@@ -275,6 +277,9 @@ struct Slot {
     stage: Stage,
     /// The caller's waker, or `None` once the caller dropped its future.
     caller: Option<Waker>,
+    /// The call's token, which dies with the call, whatever this
+    /// bookkeeping says.
+    presence: Weak<CallerToken>,
     identity: RequestIdentity,
     request_digest: [u8; 32],
 }
@@ -372,6 +377,11 @@ impl ControlledPort {
                     .map(|(id, slot)| OperationState {
                         id: *id,
                         request: slot.identity.clone(),
+                        caller: if slot.presence.strong_count() > 0 {
+                            CallerPresence::Alive
+                        } else {
+                            CallerPresence::Gone
+                        },
                         stage: match &slot.stage {
                             Stage::Pending { .. } => OperationStage::Pending {
                                 caller_waiting: slot.caller.is_some(),
@@ -696,6 +706,7 @@ impl ControlledPort {
         Box::pin(Call {
             port: self,
             state: CallState::Unsubmitted(Some(Box::new(Submission { request, permit }))),
+            token: None,
             reply: PhantomData,
         })
     }
@@ -705,8 +716,16 @@ impl ControlledPort {
 struct Call<'a, T> {
     port: &'a ControlledPort,
     state: CallState,
+    /// Held from submission until the call returns its reply or is
+    /// dropped. Its slot holds a `Weak` to it.
+    token: Option<Arc<CallerToken>>,
     reply: PhantomData<fn() -> T>,
 }
+
+/// The token a submitted call owns, so the port can read whether the call
+/// still exists.
+#[derive(Debug)]
+struct CallerToken;
 
 /// A call's request, and storage's clone of a locator's permit, until the
 /// call's first poll submits them.
@@ -755,6 +774,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                 let key = port.engine.adapter_key();
                 let (identity, request_digest) =
                     (RequestIdentity::of(&request, key), digest(&request, key));
+                let token = Arc::new(CallerToken);
                 ops.slots.insert(
                     id,
                     Slot {
@@ -763,6 +783,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                             submitted: Instant::now(),
                         },
                         caller: Some(cx.waker().clone()),
+                        presence: Arc::downgrade(&token),
                         identity: identity.clone(),
                         request_digest,
                     },
@@ -780,6 +801,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                 ops.publish(Instant::now(), kinds);
                 drop(ops);
                 self.state = CallState::Submitted(id);
+                self.token = Some(token);
                 Poll::Pending
             }
             CallState::Submitted(id) => {
@@ -799,6 +821,7 @@ impl<T: FromReply> Future for Call<'_, T> {
                     ops.publish(Instant::now(), vec![FactKind::ReplyTaken { id }]);
                     drop(ops);
                     self.state = CallState::Done;
+                    self.token = None;
                     Poll::Ready(T::from_reply(reply))
                 } else {
                     let replaced = slot.caller.replace(cx.waker().clone());

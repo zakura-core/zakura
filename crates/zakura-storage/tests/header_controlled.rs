@@ -24,8 +24,9 @@ use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
     controlled::{BindError, CompleteError, Completion, ControlledPort, FactKind, OpId},
     evidence::{
-        CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey, LeaseState,
-        OperationStage, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
+        CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
+        LeaseState, OperationStage, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass,
+        Waiter,
     },
     fixture::HeaderFixture,
     lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
@@ -1866,4 +1867,42 @@ fn only_a_pristine_port_binds() {
     ))));
     assert!(!leased.is_pristine(), "a setup lease is owner state");
     assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
+}
+
+/// D14: the snapshot reads each caller's presence from a token its call
+/// owns. A pending call is alive until dropped. A replied call is alive
+/// while it waits, although the port gave up its waker at the completion.
+#[test]
+fn caller_presence_is_read_from_the_call() {
+    let (port, chain) = chain(1);
+    let presence = |port: &ControlledPort| {
+        port.owner_state()
+            .operations
+            .into_iter()
+            .map(|op| (op.id, op.caller))
+            .collect::<Vec<_>>()
+    };
+    let mut pending = port.selected_chain_contains(chain[0].hash);
+    let mut replied = port.selected_chain_contains(chain[0].hash);
+    submit(&mut pending);
+    submit(&mut replied);
+    assert_eq!(
+        presence(&port),
+        [
+            (OpId(1), CallerPresence::Alive),
+            (OpId(2), CallerPresence::Alive)
+        ]
+    );
+    port.complete(OpId(2), ENGINE)
+        .expect("membership completes");
+    drop(pending);
+    assert_eq!(
+        presence(&port),
+        [
+            (OpId(1), CallerPresence::Gone),
+            (OpId(2), CallerPresence::Alive)
+        ]
+    );
+    ready(replied).expect("membership reads");
+    assert_eq!(presence(&port), [(OpId(1), CallerPresence::Gone)]);
 }

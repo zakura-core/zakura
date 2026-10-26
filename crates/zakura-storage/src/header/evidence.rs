@@ -480,6 +480,19 @@ pub struct OperationState {
     pub request: RequestIdentity,
     /// Where it is.
     pub stage: OperationStage,
+    /// Whether its caller's call still exists, read from a token the call
+    /// owns, not from the port's bookkeeping.
+    pub caller: CallerPresence,
+}
+
+/// Whether a caller's call still exists. A call drops its token when it
+/// returns its reply or is dropped, whatever the port's bookkeeping did.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CallerPresence {
+    /// The call is still waiting for its reply.
+    Alive,
+    /// The call took its reply or was dropped.
+    Gone,
 }
 
 /// Where an operation is.

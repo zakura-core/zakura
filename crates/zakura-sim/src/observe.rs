@@ -532,6 +532,8 @@ pub struct ObservationLog {
     entries: Vec<Entry>,
     step: u64,
     frozen: bool,
+    /// The run the log belongs to, 0 for one no run made.
+    run: u64,
 }
 
 impl ObservationLog {
@@ -564,6 +566,16 @@ impl ObservationLog {
     /// The step being appended to, 0 during setup.
     pub fn step(&self) -> u64 {
         self.step
+    }
+
+    /// The run the log belongs to, 0 for one no run made.
+    pub(crate) fn run(&self) -> u64 {
+        self.run
+    }
+
+    /// Marks the log as `run`'s.
+    pub(crate) fn set_run(&mut self, run: u64) {
+        self.run = run;
     }
 
     /// Starts appending to `step`.

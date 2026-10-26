@@ -1163,6 +1163,43 @@ fn storage_the_run_never_observes_fails_at_setup() {
     assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
+/// Storage belongs to the run that created it. Storage made with a first
+/// run that's then dropped, and added to a second run, whether through a
+/// wrapper that skips its final observation or plainly, fails the second
+/// run instead of letting its evidence go unchecked there.
+#[test]
+fn storage_from_a_dropped_run_fails_a_later_one() {
+    let last = skipping_run(None).end.steps;
+    for wrapped in [true, false] {
+        let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+        let mut first = Sim::new(storage_config(100), PlanInput::Bytes(Vec::new()));
+        let storage = zakura_sim::storage::HeaderStorage::new(&mut first, port.clone());
+        drop(first);
+        let mut second = Sim::new(storage_config(100), PlanInput::Bytes(Vec::new()));
+        second.scheduler().spawn_root("caller", async move {
+            let anchor = HeaderFixture::regtest().anchor();
+            let _ = port.selected_chain_contains(anchor.hash).await;
+        });
+        if wrapped {
+            second.add_source(Box::new(SkipAt {
+                inner: storage,
+                skip: last,
+            }));
+        } else {
+            second.add_source(Box::new(storage));
+        }
+        let report = second.run(
+            &mut zakura_sim::NoChecks,
+            &mut zakura_sim::MemorySink::default(),
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness, "wrapped: {wrapped}");
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("ForeignRun"), "{detail}");
+    }
+}
+
 /// The world the harness-failure scenario's property reads: nothing.
 struct Calm;
 

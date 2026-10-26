@@ -5,7 +5,12 @@
 //! ends at a violation, when nothing is enabled, or after its step budget and
 //! a bounded drain.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use zakura_scheduler::{
     CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
@@ -16,7 +21,7 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
-    evidence::{Checkpoint, Mark},
+    evidence::{Checkpoint, Mark, StorageId},
     observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
@@ -24,6 +29,10 @@ use crate::{
     },
     Identity, ObservationLog, Plan, PlanInput,
 };
+
+/// The next run's ID. IDs are never serialized, so their values don't
+/// affect replay.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// The property a run violates when it spins at one instant too long.
 pub const NO_LIVELOCK: &str = "sim/no-livelock";
@@ -95,8 +104,11 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
-    /// Each storage checkpoint the run holds, by its service.
+    /// Each storage checkpoint the run holds, by its service, in
+    /// registration order.
     evidence: Vec<(String, Checkpoint)>,
+    /// This run's ID, unique within the process.
+    run_id: u64,
     config: RunConfig,
 }
 
@@ -120,6 +132,7 @@ impl Sim {
             failure,
             sources: Vec::new(),
             evidence: Vec::new(),
+            run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
         }
     }
@@ -141,8 +154,15 @@ impl Sim {
     /// [`HarnessFailure::SourceEvidence`] unless it names that step and the
     /// run's own log holds exactly the facts and states it records, however
     /// the source was wrapped or added, or if it never was.
-    pub(crate) fn register_storage(&mut self, service: &str, checkpoint: Checkpoint) {
+    /// Returns the source's identity, which binds it to this run.
+    pub(crate) fn register_storage(&mut self, service: &str, checkpoint: Checkpoint) -> StorageId {
+        let id = StorageId {
+            run: self.run_id,
+            // usize always fits in u64 on supported targets.
+            index: self.evidence.len() as u64,
+        };
         self.evidence.push((service.to_owned(), checkpoint));
+        id
     }
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
@@ -150,6 +170,7 @@ impl Sim {
     /// each step, then `end`.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
+        state.log.set_run(self.run_id);
         let draws = {
             let mut choices = self.choices.borrow_mut();
             // The sink is harness code, so a draw inside it is a failure.

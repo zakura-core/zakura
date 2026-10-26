@@ -27,7 +27,7 @@ use zakura_storage::header::{
 };
 
 use crate::{
-    evidence::Checkpoint,
+    evidence::{Checkpoint, StorageId},
     observe::{
         Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
@@ -61,6 +61,8 @@ pub struct HeaderStorage {
     /// bound at the first observation.
     delivered: Option<u64>,
     checkpoint: Checkpoint,
+    /// Binds it to the run that holds its checkpoint.
+    id: StorageId,
 }
 
 impl HeaderStorage {
@@ -100,13 +102,14 @@ impl HeaderStorage {
              inside the run"
         );
         let checkpoint = Checkpoint::default();
-        sim.register_storage(SERVICE, checkpoint.clone());
+        let id = sim.register_storage(SERVICE, checkpoint.clone());
         HeaderStorage {
             port,
             max_latency,
             model: OwnerModel::new(),
             delivered: None,
             checkpoint,
+            id,
         }
     }
 }
@@ -600,6 +603,14 @@ impl ActionSource for HeaderStorage {
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        // Only the run holding the checkpoint checks what this delivers.
+        if log.run() != self.id.run {
+            return Err(format!(
+                "ForeignRun: storage registered with run {} observed in run {}",
+                self.id.run,
+                log.run()
+            ));
+        }
         let delivered = match self.delivered {
             Some(delivered) => delivered,
             None => {

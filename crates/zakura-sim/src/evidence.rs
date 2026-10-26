@@ -9,6 +9,17 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+/// A storage source's identity: the run that registered it and its index
+/// among that run's storage sources. Only the index is ever serialized,
+/// since run IDs differ between processes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StorageId {
+    /// The registering run, unique within the process.
+    pub(crate) run: u64,
+    /// The index among that run's storage sources.
+    pub(crate) index: u64,
+}
+
 /// What an evidence source last observed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Mark {

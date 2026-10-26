@@ -22,7 +22,7 @@ use zakura_sim::{
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
     property::{
         Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
-        Status, Verdict,
+        Sources, Status, Verdict,
     },
     record::OutcomeKind,
     trace::{
@@ -943,7 +943,7 @@ impl Subsystem for EffectsHarness {
             registry,
             Rc::clone(this),
             Assumptions::none(),
-            &[],
+            &Sources::observed(&[]),
         ))
     }
 

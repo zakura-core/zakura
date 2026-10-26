@@ -5,12 +5,12 @@ use std::{collections::BTreeSet, fmt, rc::Rc};
 use zakura_scheduler::{Op, SimInstant};
 
 use super::{
-    Assume, Assumptions, CheckCtx, HasView, Inconclusive, Kind, LivenessBound, Obligation,
-    Property, PropertyId, Source, Status, Verdict,
+    Assume, Assumptions, Capture, Cardinality, CheckCtx, HasView, Inconclusive, Kind,
+    LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
-    end::RunEnd,
+    end::{HarnessFailure, RunEnd},
     Observation, ObservationLog,
 };
 
@@ -73,6 +73,13 @@ impl<A: Checker, B: Checker> Checker for Tee<A, B> {
     /// Passes `events` to `.0`.
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.0.observe_events(events);
+    }
+
+    /// `.0`'s failure, or else `.1`'s.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.0
+            .harness_failure()
+            .or_else(|| self.1.harness_failure())
     }
 }
 
@@ -155,10 +162,59 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+/// The sources a harness observes, and the ones its tier excludes with a
+/// reason (properties.md, Tiers). A source in neither list is one the
+/// harness should have and lacks.
+#[derive(Clone, Debug, Default)]
+pub struct Sources {
+    observed: Vec<Source>,
+    excluded: Vec<(Source, &'static str)>,
+}
+
+impl Sources {
+    /// A harness that observes `observed` and excludes nothing.
+    pub fn observed(observed: &[Source]) -> Self {
+        Sources {
+            observed: observed.to_vec(),
+            excluded: Vec::new(),
+        }
+    }
+
+    /// These sources, with `source` excluded for `reason`, such as "the
+    /// Real tier has no view".
+    pub fn excluding(mut self, source: Source, reason: &'static str) -> Self {
+        self.excluded.push((source, reason));
+        self
+    }
+
+    /// Whether the harness has `source`: `Ok` if it observes it,
+    /// `Err(Some(reason))` if its tier excludes it, and `Err(None)` if it
+    /// lacks it.
+    fn has(&self, source: Source) -> Result<(), Option<&'static str>> {
+        if self.observed.contains(&source) {
+            return Ok(());
+        }
+        Err(self
+            .excluded
+            .iter()
+            .find(|(excluded, _)| *excluded == source)
+            .map(|(_, reason)| *reason))
+    }
+}
+
 /// Evaluates a [`Registry`] as a run's checker.
 ///
+/// A property that needs a source the harness's tier excludes never runs,
+/// and its report names the exclusion. One that needs a source the harness
+/// neither observes nor excludes fails the run as a harness failure, so a
+/// lost source never reads as `Held` or as a silent `NotApplicable`.
+///
+/// A property that needs the view runs only if the view shows the state at
+/// the step's boundary ([`HasView::captured`]). A stale view fails the run
+/// as a harness failure.
+///
 /// After each step, for each property whose assumptions the scenario
-/// declares and whose sources the harness observes, in registry order:
+/// declares, in registry order:
 ///
 /// 1. It updates `holds_since` from the property's assumptions. When one
 ///    stops holding, the property's open obligations end, and the property
@@ -170,20 +226,24 @@ impl std::error::Error for RegistryError {}
 ///    clock. A discharge at exactly the deadline is in time.
 /// 4. It walks the step's observations in order. A point first counts
 ///    toward each `Ops` bound it reaches, and expires that obligation once
-///    past `max`. Then the observation discharges the oldest open obligation
-///    whose trigger it follows and that it matches.
+///    past `max`. Then the observation discharges the open obligations
+///    whose trigger it follows and that it matches: the oldest one of
+///    [`Cardinality::One`], and every one of [`Cardinality::Every`].
 /// 5. When no task can run after the step, it expires every
 ///    `BeforeQuiescence` obligation still open.
 ///
-/// It returns the step's first new violation of an `Active` property, which
-/// ends the run. A `Known` or `Draft` violation is only recorded, so the run
-/// goes on.
+/// It evaluates every property before it returns the step's first new
+/// violation of an `Active` property, which ends the run. A `Known` or
+/// `Draft` violation is only recorded, so the run goes on. Each report
+/// keeps every violation its property had.
 pub struct RegistryChecker<S: HasView> {
     properties: Vec<Property<S>>,
     state: Vec<PropertyState>,
     handle: Rc<S>,
     holds: fn(&S, Assume) -> bool,
     events: Vec<CheckEvent>,
+    /// The first harness failure not yet reported.
+    failure: Option<HarnessFailure>,
 }
 
 /// One property's progress through a run.
@@ -191,15 +251,16 @@ pub struct RegistryChecker<S: HasView> {
 struct PropertyState {
     /// True if the scenario declares every assumption the property needs.
     declared: bool,
-    /// The sources the property needs that the harness doesn't observe.
-    missing: Vec<Source>,
+    /// The first source the property needs that the harness's tier
+    /// excludes, and why. The property never runs.
+    excluded: Option<String>,
     /// Evaluations that returned `Holds`.
     applicable: u32,
     /// True once an evaluation returned `Holds` or `Violated`, and the
     /// `Applicable` event went out.
     announced: bool,
-    /// The first violation.
-    violation: Option<Violation>,
+    /// Every violation, in order.
+    violations: Vec<Violation>,
     /// Open obligations, oldest first.
     open: Vec<Open>,
     /// The step and time after which all the property's assumptions have
@@ -231,26 +292,40 @@ impl Open {
 impl<S: HasView> RegistryChecker<S> {
     /// A checker for `registry`'s properties. Checks read the harness's view
     /// through `handle`, `assumptions` says what the scenario declares, and
-    /// `sources` names what the harness observes. A property that needs a
-    /// source outside `sources` never runs and is `NotApplicable`.
+    /// `sources` says what the harness observes and what its tier excludes.
+    /// A property that needs a source the harness lacks leaves a harness
+    /// failure for the run's first [`Checker::harness_failure`] call.
     pub fn new(
         registry: Registry<S>,
         handle: Rc<S>,
         assumptions: Assumptions<S>,
-        sources: &[Source],
+        sources: &Sources,
     ) -> Self {
+        let mut failure = None;
         let state = registry
             .properties
             .iter()
-            .map(|property| PropertyState {
-                declared: property.assumes.iter().all(|a| assumptions.declares(*a)),
-                missing: property
-                    .needs
-                    .iter()
-                    .copied()
-                    .filter(|need| !sources.contains(need))
-                    .collect(),
-                ..PropertyState::default()
+            .map(|property| {
+                let mut excluded = None;
+                for need in property.needs {
+                    match sources.has(*need) {
+                        Ok(()) => {}
+                        Err(Some(reason)) => {
+                            excluded.get_or_insert_with(|| format!("{need:?}: {reason}"));
+                        }
+                        Err(None) => {
+                            failure.get_or_insert_with(|| HarnessFailure::MissingSource {
+                                property: property.id.to_string(),
+                                source: format!("{need:?}"),
+                            });
+                        }
+                    }
+                }
+                PropertyState {
+                    declared: property.assumes.iter().all(|a| assumptions.declares(*a)),
+                    excluded,
+                    ..PropertyState::default()
+                }
             })
             .collect();
         RegistryChecker {
@@ -259,18 +334,19 @@ impl<S: HasView> RegistryChecker<S> {
             handle,
             holds: assumptions.holds,
             events: Vec::new(),
+            failure,
         }
     }
 
-    /// The sources property `id` needs that the harness doesn't observe, in
-    /// `needs` order, for the evidence report to name. Empty for a property
-    /// that runs, or isn't registered.
-    pub fn missing_sources(&self, id: &PropertyId) -> &[Source] {
+    /// Why the harness doesn't run property `id`: the excluded source it
+    /// needs and the exclusion's reason. `None` for a property that runs,
+    /// or isn't registered.
+    pub fn exclusion(&self, id: &PropertyId) -> Option<&str> {
         self.properties
             .iter()
             .zip(&self.state)
             .find(|(property, _)| &property.id == id)
-            .map_or(&[], |(_, state)| &state.missing)
+            .and_then(|(_, state)| state.excluded.as_deref())
     }
 
     /// The step after which all of property `id`'s assumptions have held so
@@ -290,26 +366,38 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// Evaluates every property after a step, as the type's docs describe.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         let mut first = None;
+        let mut capture = None;
         for (property, state) in self.properties.iter().zip(&mut self.state) {
-            if !state.declared || !state.missing.is_empty() {
+            if !state.declared || state.excluded.is_some() {
                 continue;
             }
-            let Some(violation) = step_property(
+            if property.needs.contains(&Source::View) {
+                let captured = *capture.get_or_insert_with(|| self.handle.captured());
+                if !captured.fresh_at(cx.step) {
+                    self.failure
+                        .get_or_insert_with(|| HarnessFailure::StaleView {
+                            property: property.id.to_string(),
+                            step: cx.step,
+                            captured: match captured {
+                                Capture::AfterStep(step) => Some(step),
+                                Capture::Live | Capture::Missing => None,
+                            },
+                        });
+                    continue;
+                }
+            }
+            let violations = step_property(
                 property,
                 state,
                 &self.handle,
                 self.holds,
                 &mut self.events,
                 cx,
-            ) else {
-                continue;
-            };
-            if state.violation.is_none() {
-                state.violation = Some(violation.clone());
-                if property.status == Status::Active && first.is_none() {
-                    first = Some(violation);
-                }
+            );
+            if property.status == Status::Active && first.is_none() {
+                first = violations.first().cloned();
             }
+            state.violations.extend(violations);
         }
         first
     }
@@ -324,6 +412,8 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 property: property.id.to_string(),
                 outcome: outcome(property, state),
                 holds_since: state.holds_since.map(|(step, _)| step),
+                excluded: state.excluded.clone(),
+                violations: state.violations.clone(),
             })
             .collect()
     }
@@ -332,9 +422,15 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     fn events(&mut self) -> Vec<CheckEvent> {
         std::mem::take(&mut self.events)
     }
+
+    /// The first missing source or stale view, once.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.failure.take()
+    }
 }
 
-/// Steps one declared property, and returns its first violation this step.
+/// Steps one declared property, and returns its violations this step: the
+/// check's, then each expired obligation's.
 fn step_property<S: HasView>(
     property: &Property<S>,
     state: &mut PropertyState,
@@ -342,7 +438,7 @@ fn step_property<S: HasView>(
     holds: fn(&S, Assume) -> bool,
     events: &mut Vec<CheckEvent>,
     cx: &StepCtx<'_>,
-) -> Option<Violation> {
+) -> Vec<Violation> {
     let event = |to| CheckEvent::Lifecycle {
         property: property.id.clone(),
         to,
@@ -366,11 +462,11 @@ fn step_property<S: HasView>(
             _ => {}
         }
         if !hold {
-            return None;
+            return Vec::new();
         }
     }
 
-    let mut violation = None;
+    let mut violations = Vec::new();
     let mut ccx = CheckCtx::new(cx, handle, property);
     let verdict = (property.check)(&mut ccx);
     if verdict != Verdict::NotApplicable && !state.announced {
@@ -380,7 +476,7 @@ fn step_property<S: HasView>(
     match verdict {
         Verdict::Holds => state.applicable = state.applicable.saturating_add(1),
         Verdict::NotApplicable => {}
-        Verdict::Violated(v) => violation = Some(v),
+        Verdict::Violated(v) => violations.push(v),
     }
     for obligation in ccx.into_obligations() {
         events.push(event(Lifecycle::Obliged));
@@ -392,7 +488,6 @@ fn step_property<S: HasView>(
     }
 
     let floor = state.holds_since.map(|(_, at)| at);
-    let mut expired = Vec::new();
     // Every observation of the step happened at `cx.now`, so none can
     // discharge an obligation whose deadline is already behind it.
     state.open.retain(|open| {
@@ -403,7 +498,7 @@ fn step_property<S: HasView>(
             deadline(&open.obligation, floor, within).is_some_and(|deadline| cx.now > deadline);
         if overdue {
             events.push(event(Lifecycle::Expired));
-            expired.push(expiry(property, open, floor, cx));
+            violations.push(expiry(property, open, floor, cx));
         }
         !overdue
     });
@@ -422,17 +517,24 @@ fn step_property<S: HasView>(
                 return true;
             }
             events.push(event(Lifecycle::Expired));
-            expired.push(expiry(property, open, floor, cx));
+            violations.push(expiry(property, open, floor, cx));
             false
         });
-        let matched = state.open.iter().position(|open| {
+        let mut one_discharged = false;
+        state.open.retain(|open| {
             let obligation = &open.obligation;
-            open.follows(cx.step, at) && (obligation.discharged_by)(&obligation.key, obs)
+            if !open.follows(cx.step, at) || !(obligation.discharged_by)(&obligation.key, obs) {
+                return true;
+            }
+            let discharge = match obligation.cardinality {
+                Cardinality::Every => true,
+                Cardinality::One => !std::mem::replace(&mut one_discharged, true),
+            };
+            if discharge {
+                events.push(event(Lifecycle::Discharged));
+            }
+            !discharge
         });
-        if let Some(i) = matched {
-            state.open.remove(i);
-            events.push(event(Lifecycle::Discharged));
-        }
     }
 
     state.open.retain(|open| {
@@ -440,14 +542,11 @@ fn step_property<S: HasView>(
             && cx.status != zakura_scheduler::Status::Running;
         if gone {
             events.push(event(Lifecycle::Expired));
-            expired.push(expiry(property, open, floor, cx));
+            violations.push(expiry(property, open, floor, cx));
         }
         !gone
     });
-    if let Some(v) = expired.into_iter().next() {
-        violation.get_or_insert(v);
-    }
-    violation
+    violations
 }
 
 /// True if `obs` is `task` reaching a point of the operation named `op`.
@@ -519,12 +618,12 @@ fn expiry<S: HasView>(
 /// A property's run outcome, from strongest to weakest: violated,
 /// inconclusive, held, then not applicable.
 fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> PropertyOutcome {
-    if let Some(violation) = &state.violation {
+    if let Some(violation) = state.violations.first() {
         return PropertyOutcome::Violated {
             witness: violation.witness.clone(),
         };
     }
-    if !state.declared || !state.missing.is_empty() {
+    if !state.declared || state.excluded.is_some() {
         return PropertyOutcome::NotApplicable;
     }
     let reason = if !property.assumes.is_empty() && !state.ever_held {

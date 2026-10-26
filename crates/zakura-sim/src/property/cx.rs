@@ -3,18 +3,59 @@
 use std::ops::Deref;
 
 use super::{
-    Kind, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Subject, Verdict,
+    Cardinality, Kind, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Subject,
+    Verdict,
 };
 use crate::{check::Violation, Observation, StepCtx};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
+///
+/// The view is actual state: what the owners hold after the step, read
+/// without a guard event or a rejection. It never defines what the protocol
+/// allows; a check compares it against an independent model or bound.
+///
+/// The registry reads the view at the boundary after each step, the
+/// coherent boundary every check shares. A write that a task makes and
+/// undoes with no preemption point between them is invisible there. A claim
+/// about such intermediate states needs its own observation boundary.
 pub trait HasView {
     /// A snapshot of the state checks may read.
     type View;
 
     /// The view now, after the step.
     fn view(&self) -> Self::View;
+
+    /// When the state [`view`](HasView::view) returns was captured. The
+    /// registry fails the run as a harness failure when a check that needs
+    /// the view would read state captured before the step's boundary.
+    fn captured(&self) -> Capture {
+        Capture::Live
+    }
+}
+
+/// When a view's state was captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capture {
+    /// `view` reads the owners' state when called, so it is always the state
+    /// at the current boundary.
+    Live,
+    /// `view` returns the snapshot the owners took at the boundary after
+    /// this step.
+    AfterStep(u64),
+    /// No snapshot exists yet.
+    Missing,
+}
+
+impl Capture {
+    /// True if the view shows the state at the boundary after `step`.
+    pub fn fresh_at(self, step: u64) -> bool {
+        match self {
+            Capture::Live => true,
+            Capture::AfterStep(at) => at == step,
+            Capture::Missing => false,
+        }
+    }
 }
 
 /// What one property's check sees after a step: the step itself, through
@@ -55,7 +96,8 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// An obligation on `subject`, opened at this step under the property's
     /// liveness bound. `trigger` is the trigger's position in
     /// [`StepCtx::observations`], as [`Obligation::trigger`] describes. Its
-    /// witness is this step.
+    /// witness is this step, and one observation discharges only it
+    /// ([`Cardinality::One`]); set `cardinality` for a shared discharge.
     ///
     /// # Panics
     ///
@@ -82,6 +124,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             trigger,
             bound,
             discharged_by,
+            cardinality: Cardinality::One,
             witness: vec![self.step.step],
         }
     }

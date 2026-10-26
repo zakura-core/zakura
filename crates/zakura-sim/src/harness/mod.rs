@@ -282,4 +282,9 @@ impl Checker for Dyn<'_> {
     fn observe_events(&mut self, events: &[CheckEvent]) {
         self.0.observe_events(events);
     }
+
+    /// Forwards to the checker.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.0.harness_failure()
+    }
 }

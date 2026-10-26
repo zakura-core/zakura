@@ -221,11 +221,7 @@ impl<F: Fixture> Checker for RaceChecker<F> {
             },
             _ => PropertyOutcome::NotApplicable,
         };
-        vec![PropertyReport {
-            property: F::NAME.to_owned(),
-            outcome,
-            holds_since: None,
-        }]
+        vec![PropertyReport::new(F::NAME, outcome)]
     }
 }
 

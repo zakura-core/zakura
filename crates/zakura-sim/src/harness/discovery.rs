@@ -442,11 +442,7 @@ impl Checker for WaitCompleteWakes {
             },
             None => PropertyOutcome::NotApplicable,
         };
-        vec![PropertyReport {
-            property: PROPERTY.into(),
-            outcome,
-            holds_since: None,
-        }]
+        vec![PropertyReport::new(PROPERTY, outcome)]
     }
 }
 

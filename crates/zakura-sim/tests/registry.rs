@@ -1,24 +1,33 @@
 //! P1a: the property registry and `RegistryChecker`, over real runs of
-//! small tasks (properties.md, P1.1, P1.2 and P1.4).
+//! small tasks (properties.md, P1.1, P1.2 and P1.4), and the P1a
+//! follow-up's actual-state contract: source capabilities, view freshness,
+//! event positions, discharge cardinality, and retained violations.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+    time::Duration,
+};
 
 use support::{config, picks, run};
 use zakura_rt::{sync::Mutex, task, time};
 use zakura_scheduler::Op;
+use zakura_scheduler::SimInstant;
 use zakura_sim::{
     fake::FakeStorage,
     observe::Exit,
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Lifecycle,
-        LivenessBound, ObligationKey, Property, PropertyId, Registry, RegistryChecker,
-        RegistryError, Source, Status, Subject, Tee, Verdict,
+        Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent, HasView,
+        Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Registry,
+        RegistryChecker, RegistryError, Source, Sources, Status, Subject, Tee, Verdict,
     },
-    Checker, IdleStatus, Observation, ObservationLog, Outcome, Plan, PropertyOutcome,
-    PropertyReport, RunEnd, RunReport, Sim, StepCtx, Violation,
+    ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, Observation,
+    ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
+    StepCtx, Violation,
 };
 
 /// The state tasks share with the checks.
@@ -28,6 +37,8 @@ struct World {
     honest: Cell<bool>,
     /// A counter tasks bump, for safety checks to read.
     level: Cell<u32>,
+    /// When the view was captured. `None` reads the state live.
+    captured: Cell<Option<Capture>>,
 }
 
 impl HasView for World {
@@ -36,6 +47,11 @@ impl HasView for World {
     /// The counter.
     fn view(&self) -> u32 {
         self.level.get()
+    }
+
+    /// The capture the test set, or a live read.
+    fn captured(&self) -> Capture {
+        self.captured.get().unwrap_or(Capture::Live)
     }
 }
 
@@ -131,8 +147,12 @@ fn request_served(
     }
 }
 
-/// What these runs observe: tasks, fake storage, and the world.
-const OBSERVED: &[Source] = &[Source::Schedule, Source::Storage, Source::View];
+/// What these runs observe: tasks, fake storage, and the world. They
+/// exclude frames, since no peer runs.
+fn observed() -> Sources {
+    Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+        .excluding(Source::Frames, "no peer runs")
+}
 
 /// Runs `properties` under `assumptions` over the tasks `setup` spawns,
 /// with `extra` after the registry in a [`Tee`]. Returns the report and the
@@ -144,7 +164,7 @@ fn run_with<C: Checker>(
     extra: C,
     setup: impl FnOnce(&mut Sim),
 ) -> (RunReport, RegistryChecker<World>, C) {
-    run_observing(world, properties, assumptions, OBSERVED, extra, setup)
+    run_observing(world, properties, assumptions, &observed(), extra, setup)
 }
 
 /// [`run_with`], observing `sources`.
@@ -152,7 +172,7 @@ fn run_observing<C: Checker>(
     world: Rc<World>,
     properties: Vec<Property<World>>,
     assumptions: Assumptions<World>,
-    sources: &[Source],
+    sources: &Sources,
     extra: C,
     setup: impl FnOnce(&mut Sim),
 ) -> (RunReport, RegistryChecker<World>, C) {
@@ -226,11 +246,10 @@ impl Checker for Recorder {
 
     /// Reports `test/recorder` as not applicable.
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
-        vec![PropertyReport {
-            property: "test/recorder".to_owned(),
-            outcome: PropertyOutcome::NotApplicable,
-            holds_since: None,
-        }]
+        vec![PropertyReport::new(
+            "test/recorder",
+            PropertyOutcome::NotApplicable,
+        )]
     }
 
     /// Keeps `events`.
@@ -1018,9 +1037,10 @@ fn frames_property() -> Property<World> {
 
 /// Review: a run that observes only scheduling never saw a frame, so a
 /// property that needs frames is `NotApplicable`, not `Held` for finding no
-/// bad ones. It never runs, so it never emits `Applicable`.
+/// bad ones. Its report names the exclusion, and it never runs, so it never
+/// emits `Applicable`.
 #[test]
-fn missing_source_not_applicable() {
+fn excluded_source_not_applicable() {
     let (report, checker, recorder) = run_with(
         honest(),
         vec![frames_property()],
@@ -1033,14 +1053,23 @@ fn missing_source_not_applicable() {
         PropertyOutcome::NotApplicable
     );
     assert_eq!(recorder.points(), []);
-    assert_eq!(checker.missing_sources(&NO_BAD_FRAMES), [Source::Frames]);
+    assert_eq!(
+        checker.exclusion(&NO_BAD_FRAMES),
+        Some("Frames: no peer runs")
+    );
+    let excluded = report
+        .properties
+        .iter()
+        .find(|p| p.property == NO_BAD_FRAMES.as_str())
+        .and_then(|p| p.excluded.as_deref());
+    assert_eq!(excluded, Some("Frames: no peer runs"));
 
     // A harness that observes frames runs it.
     let (report, checker, _) = run_observing(
         honest(),
         vec![frames_property()],
         Assumptions::none(),
-        &[Source::Frames, Source::Schedule],
+        &Sources::observed(&[Source::Frames, Source::Schedule]),
         Recorder::default(),
         |sim| exit_after(sim, "request-p1", Duration::ZERO),
     );
@@ -1048,5 +1077,454 @@ fn missing_source_not_applicable() {
         outcome(&report, &NO_BAD_FRAMES),
         PropertyOutcome::Held { applicable: 1 }
     );
-    assert_eq!(checker.missing_sources(&NO_BAD_FRAMES), []);
+    assert_eq!(checker.exclusion(&NO_BAD_FRAMES), None);
+}
+
+/// P1 follow-up: a source a property needs that the harness neither
+/// observes nor excludes is a harness failure, never `Held` or a silent
+/// `NotApplicable`.
+#[test]
+fn missing_source_fails_the_harness() {
+    let (report, _, _) = run_observing(
+        honest(),
+        vec![frames_property()],
+        Assumptions::none(),
+        &Sources::observed(&[Source::Schedule]),
+        Recorder::default(),
+        |sim| exit_after(sim, "request-p1", Duration::ZERO),
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert_eq!(
+        report.end.harness,
+        Some(HarnessFailure::MissingSource {
+            property: NO_BAD_FRAMES.to_string(),
+            source: "Frames".to_owned(),
+        })
+    );
+    assert_eq!(report.end.steps, 1, "the first step's boundary reports it");
+}
+
+/// P1 follow-up: a check that reads the view must see the state at the
+/// step's boundary. A snapshot from an earlier boundary, or none, fails the
+/// run as a harness failure before the check runs.
+#[test]
+fn stale_view_fails_the_harness() {
+    for (captured, shown) in [(Capture::AfterStep(0), Some(0)), (Capture::Missing, None)] {
+        let world = honest();
+        world.captured.set(Some(captured));
+        let report = report(
+            world,
+            vec![level(Status::Active)],
+            Assumptions::none(),
+            |sim| {
+                exit_after(sim, "tail", Duration::ZERO);
+            },
+        );
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        assert_eq!(
+            report.end.harness,
+            Some(HarnessFailure::StaleView {
+                property: LEVEL.to_string(),
+                step: 1,
+                captured: shown,
+            })
+        );
+    }
+}
+
+const EVEN: PropertyId = PropertyId::new("test/counter-even");
+
+/// Writes `value` to the counter only if it is even: the guarded path.
+fn guarded_write(world: &World, value: u32) {
+    if value.is_multiple_of(2) {
+        world.level.set(value);
+    }
+}
+
+/// Fails while the counter is odd, reading only the actual counter.
+fn counter_even(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    match cx.view() {
+        level if level % 2 == 1 => cx.violated("an even counter", format!("counter {level}")),
+        _ => Verdict::Holds,
+    }
+}
+
+/// A safety property over the actual counter.
+fn even() -> Property<World> {
+    Property {
+        id: EVEN,
+        claim: "the counter stays even",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: counter_even,
+        witness: None,
+    }
+}
+
+/// P1 follow-up acceptance: a guarded writer `a` and an unguarded writer
+/// `d` both write the counter. The invariant reads the counter itself, so it
+/// catches an odd value from either path, with no guard event in the log.
+#[test]
+fn invariant_reads_actual_state_from_any_writer() {
+    let run = |unguarded: Option<u32>| {
+        let world = honest();
+        let a = world.clone();
+        let d = world.clone();
+        report(world, vec![even()], Assumptions::none(), |sim| {
+            sim.scheduler().spawn_root("a", async move {
+                guarded_write(&a, 3);
+                task::yield_now().await;
+                guarded_write(&a, 4);
+            });
+            sim.scheduler().spawn_root("d", async move {
+                task::yield_now().await;
+                if let Some(value) = unguarded {
+                    d.level.set(value);
+                }
+            });
+        })
+    };
+
+    let guarded = run(None);
+    assert!(
+        matches!(outcome(&guarded, &EVEN), PropertyOutcome::Held { .. }),
+        "the guard refused 3: {:?}",
+        guarded.properties
+    );
+
+    let bypassed = run(Some(5));
+    let violation = bypassed.end.violation.as_ref().expect("d wrote 5");
+    assert_eq!(violation.step, exit_step(&bypassed.log, "d.1"));
+    assert_eq!(violation.actual, "counter 5");
+    assert!(
+        !bypassed
+            .log
+            .entries()
+            .iter()
+            .any(|e| matches!(e.obs, Observation::Fake { .. })),
+        "nothing but the counter shows the bad write"
+    );
+}
+
+/// P1 follow-up acceptance: the registry reads the view at each step's
+/// boundary. A task that writes 1 and restores 0 with no preemption point
+/// between them leaves no trace there, so the check can't see it. That is
+/// the documented scope of a boundary check, not coverage of the
+/// intermediate state. A preemption point between the two writes is a
+/// boundary, and the check sees the write there.
+#[test]
+fn write_then_restore_is_seen_only_at_a_boundary() {
+    let run = |yield_between: bool| {
+        let world = honest();
+        let task_world = world.clone();
+        report(world, vec![even()], Assumptions::none(), |sim| {
+            sim.scheduler().spawn_root("writer", async move {
+                task_world.level.set(1);
+                if yield_between {
+                    task::yield_now().await;
+                }
+                task_world.level.set(0);
+            });
+        })
+    };
+
+    let inside_one_step = run(false);
+    assert_eq!(
+        outcome(&inside_one_step, &EVEN),
+        PropertyOutcome::Held { applicable: 1 },
+        "the restore lands before the step's boundary"
+    );
+
+    let across_a_boundary = run(true);
+    assert_eq!(across_a_boundary.end.outcome, Outcome::Violation);
+    assert_eq!(
+        across_a_boundary.end.violation.map(|v| v.actual).as_deref(),
+        Some("counter 1")
+    );
+}
+
+/// A scripted wire for tests: each action logs one step's events, in order,
+/// as `wire` fake events. Time can't pass while steps remain.
+#[derive(Clone)]
+struct Wire(Rc<RefCell<VecDeque<&'static [&'static str]>>>);
+
+impl Wire {
+    /// A wire that takes one action per entry of `steps`.
+    fn new(steps: &[&'static [&'static str]]) -> Self {
+        Wire(Rc::new(RefCell::new(steps.iter().copied().collect())))
+    }
+}
+
+impl ActionSource for Wire {
+    /// The next step, while any remain.
+    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        let left = self.0.borrow().len();
+        if left > 0 {
+            out.push((Identity::peer("wire", &left.to_string()), 0));
+        }
+    }
+
+    /// Holds time at now while steps remain.
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if !self.0.borrow().is_empty() {
+            out.push(Boundary::Deadline(now));
+        }
+    }
+
+    /// Logs the next step's events.
+    fn execute(&mut self, _: u64, log: &mut ObservationLog) {
+        let events = self
+            .0
+            .borrow_mut()
+            .pop_front()
+            .expect("`enabled` offered the next step");
+        for event in events {
+            log.push(Observation::Fake {
+                source: "wire".to_owned(),
+                event: (*event).to_owned(),
+            });
+        }
+    }
+}
+
+/// The subject of a wire event `kind:<subject>`.
+fn wire<'o>(obs: &'o Observation, kind: &str) -> Option<&'o str> {
+    match obs {
+        Observation::Fake { source, event } if source == "wire" => {
+            event.strip_prefix(kind)?.strip_prefix(':')
+        }
+        _ => None,
+    }
+}
+
+/// Opens one obligation per `kind:<subject>` wire event this step, with
+/// `subject` building its subject and `discharged_by` and `cardinality` set.
+fn oblige_each(
+    cx: &mut CheckCtx<'_, World>,
+    kind: &str,
+    subject: fn(String) -> Subject,
+    discharged_by: fn(&ObligationKey, &Observation) -> bool,
+    cardinality: Cardinality,
+) -> Verdict {
+    let triggers: Vec<(usize, String)> = cx
+        .observations()
+        .enumerate()
+        .filter_map(|(at, obs)| Some((at, wire(obs, kind)?.to_owned())))
+        .collect();
+    for (at, name) in &triggers {
+        let obligation = Obligation {
+            cardinality,
+            ..cx.obligation(Some(*at), subject(name.clone()), discharged_by)
+        };
+        cx.oblige(obligation);
+    }
+    if triggers.is_empty() {
+        Verdict::NotApplicable
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// Opens an owner's obligation for each `req:<owner>`.
+fn wire_requests(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    oblige_each(cx, "req", Subject::Owner, wire_done, Cardinality::One)
+}
+
+/// True if `obs` is `done:<owner>` for the key's owner.
+fn wire_done(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(&key.subject, Subject::Owner(owner) if wire(obs, "done") == Some(owner))
+}
+
+/// Opens a session's consequence obligation for each `fault:<session>`.
+fn wire_faults(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    oblige_each(
+        cx,
+        "fault",
+        Subject::Session,
+        wire_close,
+        Cardinality::Every,
+    )
+}
+
+/// True if `obs` is `close:<session>` for the key's session.
+fn wire_close(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(&key.subject, Subject::Session(session) if wire(obs, "close") == Some(session))
+}
+
+/// A two-second liveness property over the wire with `check`.
+fn wire_property(check: fn(&mut CheckCtx<'_, World>) -> Verdict) -> Property<World> {
+    Property {
+        id: SERVED,
+        claim: "the node answers each wire trigger within 2 s",
+        kind: Kind::Liveness { bound: TWO_SECONDS },
+        assumes: &[],
+        needs: &[Source::Schedule],
+        status: Status::Known { issue: 1523 },
+        check,
+        witness: None,
+    }
+}
+
+/// Runs `check` over the wire `steps`, then lets time reach 5 s, past every
+/// deadline.
+fn over_wire(
+    check: fn(&mut CheckCtx<'_, World>) -> Verdict,
+    steps: &[&'static [&'static str]],
+) -> (RunReport, Recorder) {
+    let wire = Wire::new(steps);
+    let (report, _, recorder) = run_with(
+        honest(),
+        vec![wire_property(check)],
+        Assumptions::none(),
+        Recorder::default(),
+        |sim| {
+            sim.add_source(Box::new(wire));
+            exit_after(sim, "tail", Duration::from_secs(5));
+        },
+    );
+    (report, recorder)
+}
+
+/// Property `id`'s report in `report`.
+fn property_report<'r>(report: &'r RunReport, id: &PropertyId) -> &'r PropertyReport {
+    report
+        .properties
+        .iter()
+        .find(|p| p.property == id.as_str())
+        .unwrap_or_else(|| panic!("{id} has a report"))
+}
+
+/// P1 follow-up acceptance: three events in one step keep their order. The
+/// completion between two requests from one owner discharges the first, and
+/// the second, which came after it, stays open and expires.
+#[test]
+fn events_in_one_step_keep_their_order() {
+    let (report, recorder) = over_wire(wire_requests, &[&["req:p1", "done:p1", "req:p1"]]);
+    assert_eq!(
+        recorder.points(),
+        [
+            Lifecycle::Applicable,
+            Lifecycle::Obliged,
+            Lifecycle::Obliged,
+            Lifecycle::Discharged,
+            Lifecycle::Expired,
+        ]
+    );
+    let violations = &property_report(&report, &SERVED).violations;
+    assert_eq!(violations.len(), 1, "{violations:?}");
+}
+
+/// P1 follow-up acceptance: one close discharges every earlier consequence
+/// on its session, and only those. `s2`'s consequence waits on another
+/// session, and `s3`'s close came before its trigger in the same step, so
+/// both expire. One step expires both, and the report keeps both
+/// violations.
+#[test]
+fn close_discharges_every_earlier_consequence() {
+    let (report, recorder) = over_wire(
+        wire_faults,
+        &[
+            &["fault:s1"],
+            &["fault:s1", "fault:s2"],
+            &["close:s3", "fault:s3"],
+            &["close:s1"],
+        ],
+    );
+    let points = recorder.points();
+    let count = |point| points.iter().filter(|p| **p == point).count();
+    assert_eq!(count(Lifecycle::Obliged), 4);
+    assert_eq!(count(Lifecycle::Discharged), 2, "one close, two discharges");
+    assert_eq!(count(Lifecycle::Expired), 2);
+
+    let violations = &property_report(&report, &SERVED).violations;
+    assert_eq!(violations.len(), 2, "{violations:?}");
+    assert_eq!(violations[0].step, violations[1].step);
+    assert!(violations[0].expected.contains("s2"), "{violations:?}");
+    assert!(violations[1].expected.contains("s3"), "{violations:?}");
+    assert_eq!(
+        outcome(&report, &SERVED),
+        PropertyOutcome::Violated {
+            witness: violations[0].witness.clone()
+        }
+    );
+}
+
+/// A counter-is-zero property with `id` and `status`.
+fn level_zero(id: PropertyId, status: Status) -> Property<World> {
+    Property {
+        id,
+        check: |cx| match cx.view() {
+            0 => Verdict::Holds,
+            level => cx.violated("level 0", format!("level {level}")),
+        },
+        ..level(status)
+    }
+}
+
+/// P1 follow-up acceptance: the registry evaluates every property at the
+/// failing boundary before it ends the run. A `Known` property before the
+/// `Active` one and a `Draft` property after it fail at the same step, and
+/// all three reports keep that violation.
+#[test]
+fn known_and_active_failures_at_one_boundary() {
+    const KNOWN: PropertyId = PropertyId::new("test/known-zero");
+    const ACTIVE: PropertyId = PropertyId::new("test/active-zero");
+    const DRAFT: PropertyId = PropertyId::new("test/draft-zero");
+    let world = honest();
+    let task_world = world.clone();
+    let report = report(
+        world,
+        vec![
+            level_zero(KNOWN, Status::Known { issue: 1523 }),
+            level_zero(ACTIVE, Status::Active),
+            level_zero(DRAFT, Status::Draft),
+        ],
+        Assumptions::none(),
+        |sim| {
+            sim.scheduler()
+                .spawn_root("bump", async move { bump(&task_world) });
+        },
+    );
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("the Active one ended it");
+    assert_eq!(violation.property, ACTIVE.as_str());
+    for id in [&KNOWN, &ACTIVE, &DRAFT] {
+        let violations = &property_report(&report, id).violations;
+        assert_eq!(violations.len(), 1, "{id}: {violations:?}");
+        assert_eq!(violations[0].step, violation.step, "{id}");
+    }
+}
+
+/// P1 follow-up: a `Known` property that keeps failing keeps every
+/// violation, not only its first.
+#[test]
+fn every_violation_retained() {
+    let world = honest();
+    let task_world = world.clone();
+    let report = report(
+        world,
+        vec![level_zero(LEVEL, Status::Known { issue: 1523 })],
+        Assumptions::none(),
+        |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
+            });
+        },
+    );
+    let violations = &property_report(&report, &LEVEL).violations;
+    let actual: Vec<&str> = violations.iter().map(|v| v.actual.as_str()).collect();
+    assert_eq!(actual, ["level 1", "level 2"]);
+    assert_eq!(
+        outcome(&report, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: violations[0].witness.clone()
+        }
+    );
 }

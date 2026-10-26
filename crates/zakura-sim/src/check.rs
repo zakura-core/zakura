@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
 use crate::{
-    end::RunEnd, observe::Observation, property::CheckEvent, Enabled, Identity, ObservationLog,
+    end::{HarnessFailure, RunEnd},
+    observe::Observation,
+    property::CheckEvent,
+    Enabled, Identity, ObservationLog,
 };
 
 /// A property that failed, and the steps its failure depends on.
@@ -64,6 +67,30 @@ pub struct PropertyReport {
     /// until properties declare assumptions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holds_since: Option<u64>,
+    /// Why the harness doesn't run the property: the excluded source it
+    /// needs and the exclusion's reason. Set only with `NotApplicable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<String>,
+    /// Every violation, in the order the run found them. `Violated`'s
+    /// witness is the first one's. A `Known` or `Draft` property can fail
+    /// again after its first violation, and one step can expire several
+    /// obligations, so the first alone can hide the rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<Violation>,
+}
+
+impl PropertyReport {
+    /// A report of `outcome` for `property`, with no `holds_since`,
+    /// exclusion, or retained violations.
+    pub fn new(property: impl Into<String>, outcome: PropertyOutcome) -> Self {
+        PropertyReport {
+            property: property.into(),
+            outcome,
+            holds_since: None,
+            excluded: None,
+            violations: Vec::new(),
+        }
+    }
 }
 
 /// Which part of the run a step belongs to.
@@ -120,6 +147,13 @@ pub trait Checker {
     /// Receives the events of a checker that runs before this one in a
     /// [`crate::property::Tee`].
     fn observe_events(&mut self, _events: &[CheckEvent]) {}
+
+    /// A harness failure the checker found, such as a source a property
+    /// needs that the harness lacks, or a stale view. The run calls it after
+    /// every step and before `at_end`, and ends at the first failure.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        None
+    }
 }
 
 /// A checker that checks nothing.

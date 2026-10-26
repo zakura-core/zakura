@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::RangeInclusive,
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,10 +20,11 @@ use zakura_network::zakura::{
     ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraNodeRecord, ZakuraNodeRecordBody,
     ZakuraPeerId, ZakuraServiceId, ZAKURA_CAP_DISCOVERY, ZAKURA_STREAM_DISCOVERY,
 };
-use zakura_quic::NodeSecretKey;
+use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken},
+    time::utc_now,
 };
 use zakura_scheduler::{SchedulerConfig, Status};
 
@@ -92,9 +93,10 @@ impl Subsystem for WaitComplete {
 /// The property this harness checks (properties.md, Discovery).
 pub const PROPERTY: &str = "discovery/wait-complete-wakes";
 
-/// A signed record for `secret`, valid for ten minutes.
+/// A signed record for `secret`, valid for ten minutes of the run's UTC, which
+/// is the clock discovery validates it against.
 fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig) -> ZakuraNodeRecord {
-    let now = SystemTime::now()
+    let now = utc_now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs();
@@ -116,10 +118,18 @@ fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig) -> ZakuraNo
     ZakuraNodeRecord::sign(body, secret).expect("a fixture record signs")
 }
 
+/// What a test can read after a run of [`spawn`]'s scenario.
+pub struct Spawned {
+    /// A clone of the handle the node's discovery service runs on.
+    pub handle: ZakuraDiscoveryHandle,
+    /// The scripted peer's node id, which its Hello record carries.
+    pub peer: NodeId,
+}
+
 /// Starts the discovery service with one inbound peer, and a task that plays
 /// the peer: it waits for the node's three messages, then answers with its
 /// Hello, Peers and Services.
-pub fn spawn(sim: &mut Sim) {
+pub fn spawn(sim: &mut Sim) -> Spawned {
     let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
     let local = NodeSecretKey::from_bytes(&[21; 32]);
     let peer_secret = NodeSecretKey::from_bytes(&[22; 32]);
@@ -145,6 +155,10 @@ pub fn spawn(sim: &mut Sim) {
         connected_rx,
     )
     .expect("the fixture config is valid");
+    let spawned = Spawned {
+        handle: handle.clone(),
+        peer: peer_secret.public(),
+    };
     let service = DiscoveryService::new(handle);
     let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())
         .expect("a node id is a valid peer id");
@@ -203,6 +217,7 @@ pub fn spawn(sim: &mut Sim) {
         // Holds the stream open, as a live peer would.
         std::future::pending::<()>().await;
     });
+    spawned
 }
 
 /// Where `DiscoveryExchangeProgress` lives, and the lines of its

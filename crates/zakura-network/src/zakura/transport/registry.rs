@@ -768,6 +768,7 @@ mod tests {
         use crate::zakura::{LayoutError, MessageRole, MessageRule, PayloadLen};
 
         const REQUEST: MessageRule = MessageRule {
+            name: "request",
             message_type: 2,
             payload: PayloadLen::exact(8),
             role: MessageRole::Request {
@@ -776,6 +777,7 @@ mod tests {
             },
         };
         const ENDING: MessageRule = MessageRule {
+            name: "ending",
             message_type: 3,
             payload: PayloadLen::exact(8),
             role: MessageRole::Response {

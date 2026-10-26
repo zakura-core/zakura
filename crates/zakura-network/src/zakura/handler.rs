@@ -10508,6 +10508,7 @@ mod tests {
         use crate::zakura::{block_sync_streams, MessageRole, PayloadLen};
 
         const REQUEST: MessageRule = MessageRule {
+            name: "request",
             message_type: 2,
             payload: PayloadLen::exact(9),
             role: MessageRole::Request {
@@ -10516,6 +10517,7 @@ mod tests {
             },
         };
         const RESPONSE: MessageRule = MessageRule {
+            name: "response",
             message_type: 3,
             payload: PayloadLen::between(1, 99),
             role: MessageRole::Response {

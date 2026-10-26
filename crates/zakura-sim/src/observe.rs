@@ -50,6 +50,15 @@ pub enum Observation {
         /// How many timers fired.
         fired: usize,
     },
+    /// A storage operation's lifecycle event.
+    Storage {
+        /// The service, such as `header`.
+        service: String,
+        /// The operation's ID within its service.
+        id: u64,
+        /// What happened.
+        event: StorageEvent,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -57,6 +66,62 @@ pub enum Observation {
         /// What happened.
         event: String,
     },
+}
+
+/// What happened to a storage operation. Digests and peers are hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum StorageEvent {
+    /// A task's call submitted it.
+    Submitted {
+        /// The operation, such as `read_header_path`.
+        op: String,
+        /// A digest of its request.
+        request: String,
+        /// The work owner, when the request names one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        /// The peer, when the request names one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+        /// The peer's session, when the request names one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<u64>,
+    },
+    /// Its caller stopped waiting. The operation stays pending.
+    CallerDropped,
+    /// The run completed it.
+    Completed {
+        /// The operation.
+        op: String,
+        /// The outcome, as in its action identity.
+        outcome: String,
+        /// The work owner, when the request names one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        /// Whether the reply reached a waiting caller.
+        delivered: bool,
+        /// The leases it ended.
+        lease_ends: Vec<LeaseEnd>,
+        /// A digest of the service's state after it.
+        state: String,
+    },
+    /// Its caller dropped the delivered reply without taking it.
+    ReplyDropped {
+        /// The lease the abandoned reply ended, if any.
+        lease_ends: Vec<LeaseEnd>,
+    },
+}
+
+/// A lease a storage event ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LeaseEnd {
+    /// The peer that held it, in hex.
+    pub peer: String,
+    /// Its lease ID.
+    pub lease: u64,
+    /// Why it ended, such as `lease-released`.
+    pub release: String,
 }
 
 /// How a task ended.

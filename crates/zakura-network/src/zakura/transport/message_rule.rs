@@ -38,6 +38,7 @@ mod tests;
 /// ```
 /// # use zakura_network::zakura::{MessageRole, MessageRule, PayloadLen};
 /// const GET_ITEMS: MessageRule = MessageRule {
+///     name: "get-items",
 ///     message_type: 2,
 ///     payload: PayloadLen::exact(8),
 ///     role: MessageRole::Request {
@@ -46,6 +47,7 @@ mod tests;
 ///     },
 /// };
 /// const ITEMS_DONE: MessageRule = MessageRule {
+///     name: "items-done",
 ///     message_type: 4,
 ///     payload: PayloadLen::exact(8),
 ///     role: MessageRole::Response {
@@ -56,6 +58,10 @@ mod tests;
 /// ```
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MessageRule {
+    /// Row name: lowercase ASCII letters, digits, and hyphens, unique within a
+    /// session layout. [`Stream::check_layout`] enforces both. Property IDs,
+    /// labels, and metric labels use it, so a rename is a deliberate change.
+    pub name: &'static str,
     /// Frame-header message type.
     pub message_type: u16,
     /// Payload length bounds, checked from the frame header before the payload
@@ -113,6 +119,7 @@ pub enum MessageRole {
     /// ```compile_fail,E0080
     /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -123,6 +130,7 @@ pub enum MessageRole {
     ///     },
     /// };
     /// const ENDED: MessageRule = MessageRule {
+    ///     name: "ended",
     ///     message_type: 3,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Response { request: 1, ends_exchange: true },
@@ -208,6 +216,7 @@ pub struct Credit {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
@@ -231,6 +240,7 @@ pub struct Credit {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
@@ -253,6 +263,7 @@ pub struct Credit {
 ///     send_interval: Duration::from_secs(30),
 /// };
 /// # const STATUS: MessageRule = MessageRule {
+/// #     name: "status",
 /// #     message_type: 1,
 /// #     payload: PayloadLen::exact(8),
 /// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },

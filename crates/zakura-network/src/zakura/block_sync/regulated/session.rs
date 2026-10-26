@@ -120,6 +120,13 @@ impl Serving {
         }
     }
 
+    /// `peer`'s live serving leases, as execution slots and output bytes
+    /// held, read from the slot budgets rather than from serving gauges.
+    #[cfg(test)]
+    pub(crate) fn leases_held(&self, peer: &ZakuraPeerId) -> (usize, u64) {
+        self.capacity.peer_held(peer)
+    }
+
     pub(crate) fn session(
         &self,
         peer: &ZakuraPeerId,
@@ -181,6 +188,18 @@ impl ServingSession {
             .map_err(SinkReject::protocol)?;
         self.ranges.insert(start, (last, id));
         Ok(())
+    }
+
+    /// Each admitted range, as its first and last height, whose ending the
+    /// session hasn't published. Drains published endings first, as
+    /// [`Self::admit`] does.
+    #[cfg(test)]
+    pub(crate) fn live_ranges(&mut self) -> Vec<(Height, Height)> {
+        self.remove_completed();
+        self.ranges
+            .iter()
+            .map(|(start, (last, _))| (*start, *last))
+            .collect()
     }
 
     /// Drain under the ending-publication lock before reusing any live range.

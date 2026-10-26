@@ -35,6 +35,8 @@ use zakura_rt::{
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 mod request_write;
+#[cfg(test)]
+pub(super) use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
 pub(super) use request_write::{RequestWrite, RequestWriteStatus};
 

@@ -20,6 +20,29 @@ impl RequestKey {
     const MAX: Self = Self(u64::MAX);
 }
 
+/// One outstanding request, as [`OutstandingRequests::ownership`] reads it.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct RequestOwnership {
+    pub(in crate::zakura::block_sync) key: RequestKey,
+    pub(in crate::zakura::block_sync) owner: zakura_header_chain::BodyWorkOwner,
+    pub(in crate::zakura::block_sync) write:
+        crate::zakura::block_sync::work_queue::RequestWritePhase,
+    pub(in crate::zakura::block_sync) heights: Vec<RequestedHeight>,
+}
+
+/// One height of an outstanding request.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) struct RequestedHeight {
+    pub(in crate::zakura::block_sync) height: block::Height,
+    /// The size estimate the request reserved for this height at admission.
+    /// A received body's wire bytes minus this is the hint's error.
+    pub(in crate::zakura::block_sync) estimated_bytes: u64,
+    /// The body arrived, so the height no longer holds its estimate.
+    pub(in crate::zakura::block_sync) received: bool,
+}
+
 /// Outstanding requests in issue order with secondary indexes.
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::block_sync) struct OutstandingRequests {
@@ -54,6 +77,31 @@ impl OutstandingRequests {
         &self,
     ) -> impl Iterator<Item = &OutstandingBlockRange> + '_ {
         self.requests.values()
+    }
+
+    /// Every outstanding request with its owner, write phase, and each
+    /// height's admission estimate, read from the request map rather than
+    /// from `reserved_bytes`.
+    #[cfg(test)]
+    pub(in crate::zakura::block_sync) fn ownership(&self) -> Vec<RequestOwnership> {
+        self.requests
+            .iter()
+            .map(|(key, outstanding)| RequestOwnership {
+                key: *key,
+                owner: outstanding.request.owner,
+                write: outstanding.write_status.phase(),
+                heights: outstanding
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .map(|expected| RequestedHeight {
+                        height: expected.height,
+                        estimated_bytes: expected.estimated_bytes,
+                        received: outstanding.has_received(expected.height),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Keyed requests in issue order.

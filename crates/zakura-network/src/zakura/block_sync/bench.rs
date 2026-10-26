@@ -261,6 +261,7 @@ impl BenchBodyFeeder {
             previous_block_hash,
             body,
             bytes,
+            None,
             self.bench_peer.clone(),
             Instant::now(),
             self.body_input_bytes.clone(),

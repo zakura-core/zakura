@@ -282,6 +282,53 @@ async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
     cancel.cancel();
 }
 
+/// A session's live ranges and its peer's serving leases, read from the range
+/// map and the slot budgets, follow a blocked read: the finished range leaves
+/// both, the blocked one holds one execution slot, and its ending returns
+/// both to empty.
+#[tokio::test]
+async fn live_ranges_and_leases_follow_a_blocked_read() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=2),
+        ..Default::default()
+    });
+    let blocked = Arc::new(Semaphore::new(0));
+    source
+        .gates
+        .lock()
+        .unwrap()
+        .insert(Height(2), blocked.clone());
+    let peer = ZakuraPeerId::new(vec![65; 32]).unwrap();
+    let (serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+    assert_eq!(served(&mut output).await, done(1, 1));
+    let settled = |session: &mut ServingSession, ranges: &[(Height, Height)], slots| {
+        session.live_ranges() == ranges && serving.leases_held(&peer).0 == slots
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !settled(&mut session, &[(Height(2), Height(2))], 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the blocked height 2 read keeps its range and one execution slot");
+
+    blocked.add_permits(1);
+    assert_eq!(served(&mut output).await, Served::Block(Height(2)));
+    assert_eq!(served(&mut output).await, done(2, 1));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !settled(&mut session, &[], 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ending releases the range and the slot");
+    assert_eq!(serving.leases_held(&peer), (0, 0));
+    cancel.cancel();
+}
+
 /// Concurrent multi-block requests, reused every round, are each answered with
 /// their first block and `BlocksDone(1)`, since we advertise one block per
 /// response. Ranges may interleave with each other but each ends exactly once,

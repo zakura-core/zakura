@@ -1520,10 +1520,18 @@ async fn byte_gauges_follow_work_and_input_owners() {
         above
     );
 
-    // Receipt moves the body's bytes from its reservation to the queue.
+    // Receipt moves the body's bytes from its reservation to the queue, and
+    // the body carries the estimate its request reserved.
+    let first_estimate = work
+        .ownership_snapshot()
+        .iter()
+        .find(|item| item.height == block::Height(1))
+        .map(|item| item.estimated_bytes);
+    assert!(first_estimate.is_some());
     deliver(&mut routine, BlockSyncMessage::Block(first)).await;
     let mut queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
     assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].admitted_estimate_bytes, first_estimate);
     let (reserved, queued_bytes) = check(&queued, "receipt");
     assert!(reserved < charged);
     assert!(queued_bytes > 0);

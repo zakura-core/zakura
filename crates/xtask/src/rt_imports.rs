@@ -757,6 +757,16 @@ impl<'a> PathVisitor<'a> {
         }
     }
 
+    /// Checks a path written as `segments`: as written if it starts with `::`,
+    /// and otherwise through [`Self::check_written`].
+    fn check_path(&mut self, segments: &[String], absolute: bool, span: Span) {
+        if absolute {
+            self.check(segments, span);
+        } else {
+            self.check_written(segments, span);
+        }
+    }
+
     /// Reports `segments` if the rules forbid it and the allowlist doesn't
     /// allow it here. Returns whether it reported.
     fn check(&mut self, segments: &[String], span: Span) -> bool {
@@ -912,20 +922,20 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
     }
 
     /// Checks `receiver.elapsed()` as the path `receiver::elapsed` when the
-    /// receiver is a path, so `UNIX_EPOCH.elapsed()` meets the wall-clock rule.
+    /// receiver is a path, under any parentheses or `&`, so
+    /// `(&UNIX_EPOCH).elapsed()` meets the wall-clock rule.
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if let (syn::Expr::Path(receiver), true) = (&*call.receiver, call.method == "elapsed") {
-            let segments: Vec<String> = receiver
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .chain([call.method.to_string()])
-                .collect();
-            if receiver.path.leading_colon.is_some() {
-                self.check(&segments, call.method.span());
-            } else {
-                self.check_written(&segments, call.method.span());
+        let mut receiver = &*call.receiver;
+        while let syn::Expr::Paren(syn::ExprParen { expr, .. })
+        | syn::Expr::Reference(syn::ExprReference { expr, .. })
+        | syn::Expr::Group(syn::ExprGroup { expr, .. }) = receiver
+        {
+            receiver = expr;
+        }
+        if let (syn::Expr::Path(receiver), true) = (receiver, call.method == "elapsed") {
+            if let Some((mut segments, absolute)) = expr_path_segments(receiver) {
+                segments.push(call.method.to_string());
+                self.check_path(&segments, absolute, call.method.span());
             }
         }
         visit::visit_expr_method_call(self, call);
@@ -934,25 +944,9 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
     /// Checks `<Type>::item` and `<Type as Trait>::item` as the path
     /// `Type::item`, since the type and the item are visited apart.
     fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
-        if let Some(qself) = &expr.qself {
-            let mut ty = &*qself.ty;
-            while let syn::Type::Paren(syn::TypeParen { elem, .. })
-            | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
-            {
-                ty = elem;
-            }
-            if let syn::Type::Path(syn::TypePath { qself: None, path }) = ty {
-                let segments: Vec<String> = path
-                    .segments
-                    .iter()
-                    .chain(expr.path.segments.iter().skip(qself.position))
-                    .map(|segment| segment.ident.to_string())
-                    .collect();
-                if path.leading_colon.is_some() {
-                    self.check(&segments, expr.span());
-                } else {
-                    self.check_written(&segments, expr.span());
-                }
+        if expr.qself.is_some() {
+            if let Some((segments, absolute)) = expr_path_segments(expr) {
+                self.check_path(&segments, absolute, expr.span());
             }
         }
         visit::visit_expr_path(self, expr);
@@ -990,6 +984,34 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         self.visit_path(&mac.path);
         self.check_tokens(mac.tokens.clone());
     }
+}
+
+/// The segments of an expression path, with a qualified type joined to its
+/// associated item so `<Type as Trait>::item` reads as `Type::item`, and
+/// whether the path starts with `::`. `None` for a qualified type that isn't
+/// a plain path.
+fn expr_path_segments(expr: &syn::ExprPath) -> Option<(Vec<String>, bool)> {
+    let idents = |segments: &mut dyn Iterator<Item = &syn::PathSegment>| {
+        segments.map(|segment| segment.ident.to_string()).collect()
+    };
+    let Some(qself) = &expr.qself else {
+        let segments = idents(&mut expr.path.segments.iter());
+        return Some((segments, expr.path.leading_colon.is_some()));
+    };
+    let mut ty = &*qself.ty;
+    while let syn::Type::Paren(syn::TypeParen { elem, .. })
+    | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+    {
+        ty = elem;
+    }
+    let syn::Type::Path(syn::TypePath { qself: None, path }) = ty else {
+        return None;
+    };
+    let mut segments = path
+        .segments
+        .iter()
+        .chain(expr.path.segments.iter().skip(qself.position));
+    Some((idents(&mut segments), path.leading_colon.is_some()))
 }
 
 fn item_attrs(item: &Item) -> Option<&[Attribute]> {
@@ -1467,6 +1489,35 @@ mod tests {
         assert_eq!(
             violations_in("crates/zakura-quic/src/driver/connection.rs", source),
             [instant, instant, system, system, system]
+        );
+    }
+
+    /// The epoch's `elapsed` is flagged through parentheses and references,
+    /// and an epoch that resolves into `zakura_rt` passes.
+    #[test]
+    fn wrapped_epoch_receivers_are_flagged() {
+        let source = "
+            use std::time::{SystemTime, UNIX_EPOCH};
+            fn f() {
+                let _ = (std::time::UNIX_EPOCH).elapsed();
+                let _ = (&UNIX_EPOCH).elapsed();
+                let _ = (&(SystemTime::UNIX_EPOCH)).elapsed();
+                let _ = <SystemTime>::UNIX_EPOCH.elapsed();
+            }
+            fn g() {
+                use zakura_rt::time::UNIX_EPOCH;
+                let _ = (&UNIX_EPOCH).elapsed();
+            }
+        ";
+        let utc_now = "zakura_rt::time::utc_now";
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+            ]
         );
     }
 

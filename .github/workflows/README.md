@@ -38,6 +38,8 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 - **`create-release.yml`** — the only supported path for creating `v*` release tags. For a normal release, it dispatches the advisory Mainnet VCT handoff canary, deploys the release commit to `us-east-0`, and calls `release-binaries.yml` to build and verify every asset. The protected-environment approval waits only for validation and asset staging, so the start canary remains visible in the same workflow without delaying approval. Start-canary infrastructure or reliability failures are advisory; a failed canary rolls `us-east-0` back to its previous binary first. Emergency source-first releases skip the canaries and pre-tag asset build. See the release runbook before using it.
 - **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. The canonical repository uses Depot builders by default; set the `RELEASE_BUILD_BACKEND` repository variable to `github` for an immediate fallback. Gated on the tag matching the `zakura` package version.
+- **`release-drafter.yml`** — manual: compiles PR titles since the last release
+  into a draft GitHub release note.
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed
   PR fragments into the versioned root changelog before the release PR runs
   the protected release gate.

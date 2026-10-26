@@ -58,6 +58,7 @@ PR. To prepare them for assembly:
 
 Do not copy GitHub draft release notes or edit the shared `[Unreleased]`
 section. The version-aware assembly runs after all package version bumps below.
+Release Drafter remains responsible for the separate GitHub release-note draft.
 
 ## README
 

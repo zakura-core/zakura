@@ -242,6 +242,27 @@ fn a_row_name_appears_once_per_layout() {
 }
 
 #[test]
+fn a_row_name_is_lowercase_letters_digits_and_hyphens() {
+    for name in ["", "Get", "get blocks", "get_blocks", "gét"] {
+        assert_eq!(
+            check(&[persistent(
+                64,
+                leak(&[STATUS, request(name, 2), PART, DONE])
+            )]),
+            Err(LayoutError::MalformedName { message_type: 2 }),
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[STATUS, request("get-2", 2), PART, DONE])
+        )]),
+        Ok(())
+    );
+}
+
+#[test]
 fn a_row_fits_its_stream_frame_cap() {
     let largest = 1024 - FRAME_HEADER_BYTES;
     let fitting = MessageRule {

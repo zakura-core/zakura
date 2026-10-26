@@ -58,7 +58,8 @@ mod tests;
 /// ```
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MessageRule {
-    /// Row name: lowercase, hyphenated, unique within a session layout. Property IDs,
+    /// Row name: lowercase ASCII letters, digits, and hyphens, unique within a
+    /// session layout. [`Stream::check_layout`] enforces both. Property IDs,
     /// labels, and metric labels use it, so a rename is a deliberate change.
     pub name: &'static str,
     /// Frame-header message type.

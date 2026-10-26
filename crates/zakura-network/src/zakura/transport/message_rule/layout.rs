@@ -85,6 +85,36 @@ pub enum LayoutError {
         /// The repeated row name.
         name: &'static str,
     },
+    /// A row name is empty, or holds a byte other than a lowercase ASCII
+    /// letter, a digit, or a hyphen.
+    ///
+    /// This row's name has a space and capitals:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{MessageRole, MessageRule, PayloadLen, Stream};
+    /// const GET_ITEMS: MessageRule = MessageRule {
+    ///     name: "Get Items",
+    ///     message_type: 2,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Request {
+    ///         max_in_flight: 4,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const ITEMS_DONE: MessageRule = MessageRule {
+    /// #     name: "items-done", message_type: 4, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 2, ends_exchange: true },
+    /// # };
+    /// # const ITEMS: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[GET_ITEMS, ITEMS_DONE]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&ITEMS);
+    /// ```
+    MalformedName {
+        /// The row with the malformed name.
+        message_type: u16,
+    },
     /// A row's largest payload does not fit its stream's frame cap.
     PayloadAboveFrameCap {
         /// The stream carrying the row.
@@ -348,6 +378,9 @@ impl LayoutError {
                 "each message type appears in exactly one row of its layout"
             }
             Self::DuplicateName { .. } => "each row name appears in exactly one row of its layout",
+            Self::MalformedName { .. } => {
+                "each row name is lowercase ASCII letters, digits, and hyphens"
+            }
             Self::PayloadAboveFrameCap { .. } => "each row's largest frame fits its stream's cap",
             Self::AnnouncementOnRequestResponse { .. } => {
                 "a request/response stream carries only requests and responses"
@@ -395,6 +428,7 @@ impl fmt::Display for LayoutError {
             | Self::PartialTables { kind }
             | Self::EmptyTable { kind } => write!(f, " (stream kind {kind})"),
             Self::DuplicateMessageType { message_type }
+            | Self::MalformedName { message_type }
             | Self::NoRequestsInFlight { message_type }
             | Self::EmptyCadence { message_type }
             | Self::RefillNotFasterThanSender { message_type }
@@ -502,6 +536,8 @@ impl Stream {
     ///   tables passes the remaining rules trivially;
     /// - every table has a row, and each message type and each row name
     ///   appears in exactly one row of the layout;
+    /// - each row name is nonempty lowercase ASCII letters, digits, and
+    ///   hyphens;
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;
@@ -570,6 +606,9 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
         }
         if count_names(layout, row.name) > 1 {
             return Err(LayoutError::DuplicateName { name: row.name });
+        }
+        if !well_formed_name(row.name) {
+            return Err(LayoutError::MalformedName { message_type });
         }
         // Widening a u32 to usize is lossless on every supported target.
         let frame_cap = stream.frame_cap as usize;
@@ -736,6 +775,22 @@ const fn count_names(layout: &[Stream], name: &str) -> usize {
         }
     }
     count
+}
+
+/// Whether `name` is nonempty lowercase ASCII letters, digits, and hyphens.
+const fn well_formed_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    if name.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    while index < name.len() {
+        if !matches!(name[index], b'a'..=b'z' | b'0'..=b'9' | b'-') {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 /// Whether `a` and `b` are the same name. `str` equality is not `const`.

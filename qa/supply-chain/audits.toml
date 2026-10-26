@@ -695,6 +695,12 @@ criteria = "safe-to-deploy"
 version = "0.4.2"
 notes = "Reviewed all production implementations and manifest. No unsafe, build script or ambient operations. Choice constructors preserve 0/1; selection/equality delegate to cmov and slices visit all elements for equal public lengths. CtOption always owns an initialized value even when absent, and conversion to ordinary Option is explicitly variable-time. Caller constraints: custom traits/closures must meet timing contracts; lookup index types must represent the traversal count; signed negation excludes MIN with overflow checks. Source review only; no independent all-platform timing assessment."
 
+[[audits.ctutils]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.4.2 -> 0.4.6"
+notes = "Reviewed the complete 0.4.2-to-0.4.6 package diff. The substantive change is the RUSTSEC-2026-0385 fix: Choice::to_u8/u16/u32/u64/u128_mask now negate to_u8(), which passes the byte through core::hint::black_box, instead of the raw field, so LLVM can no longer turn mask generation into a branch; to_bool and to_u8 become const fn, and the vartime variants are deprecated aliases of them. On 32-bit targets u128 lt/le (and the CtLt/CtGt u128 impls) compare 64-bit halves through opaque per-half predicates instead of a full-width subtraction. The bitle/bitlt/bitnz macros move unchanged into a new public primitives module, which wraps them in black_box only on ARM targets without pointer-width atomics (Thumb-1) and adds borrowing subtraction, overflowing addition and leading/trailing zero counts that use native instructions on x86, x86_64, aarch64, thumb2 and zbb and a fixed-stage masked fallback elsewhere; the formulas match Hacker's Delight and the package's tests compare them with core integer operations at carry and zero boundaries. Choice::and keeps both operands opaque on Thumb-1. The crate still declares forbid(unsafe_code) and build = false, has no ambient I/O, and the manifest only raises rust-version to 1.87 (below this workspace's 1.97) and the optional subtle minimum to 2.6. Zakura reaches ctutils only through universal-hash's Poly1305 tag comparison. Source review only: the package tests were not run, and generated code was not inspected on any target."
+
 [[audits.curve25519-dalek]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"

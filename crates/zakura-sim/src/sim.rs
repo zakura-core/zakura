@@ -148,9 +148,20 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
+        // A trace replay that ended before its record did diverged.
+        let unreached = match end.outcome {
+            Outcome::Harness => None,
+            _ => self.choices.borrow().decider.finish().err(),
+        };
         // A failure the last step's code left behind outranks the outcome,
-        // and so does evidence that names a step the run didn't take.
-        let end = match self.failure.take().or_else(|| evidence_outside_run(&end)) {
+        // and so do an unreached trace record and evidence that names a step
+        // the run didn't take.
+        let end = match self
+            .failure
+            .take()
+            .or_else(|| unreached.map(HarnessFailure::Plan))
+            .or_else(|| evidence_outside_run(&end))
+        {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
@@ -281,7 +292,7 @@ impl Sim {
                 let mut choices = self.choices.borrow_mut();
                 match phase {
                     Phase::Live => choices.decider.pick(&identities),
-                    Phase::Drain => Ok(choices.decider.pick_round_robin(&identities)),
+                    Phase::Drain => choices.decider.pick_round_robin(&identities),
                 }
             };
             let decision = match decision {

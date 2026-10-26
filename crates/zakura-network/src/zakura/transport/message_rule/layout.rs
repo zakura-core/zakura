@@ -51,6 +51,40 @@ pub enum LayoutError {
         /// The repeated message type.
         message_type: u16,
     },
+    /// A row name appears in more than one row of the layout.
+    ///
+    /// These two rows share a name:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{MessageRole, MessageRule, PayloadLen, Stream};
+    /// const GET_ITEMS: MessageRule = MessageRule {
+    ///     name: "items",
+    ///     message_type: 2,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Request {
+    ///         max_in_flight: 4,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// const ITEMS_DONE: MessageRule = MessageRule {
+    ///     name: "items",
+    ///     message_type: 4,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Response {
+    ///         request: GET_ITEMS.message_type,
+    ///         ends_exchange: true,
+    ///     },
+    /// };
+    /// # const ITEMS: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[GET_ITEMS, ITEMS_DONE]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&ITEMS);
+    /// ```
+    DuplicateName {
+        /// The repeated row name.
+        name: &'static str,
+    },
     /// A row's largest payload does not fit its stream's frame cap.
     PayloadAboveFrameCap {
         /// The stream carrying the row.
@@ -97,6 +131,7 @@ pub enum LayoutError {
     /// #     Credit, MessageRole, MessageRule, PayloadLen, Stream, StreamMode,
     /// # };
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -107,11 +142,11 @@ pub enum LayoutError {
     ///     },
     /// };
     /// # const PAGE: MessageRule = MessageRule {
-    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     name: "page", message_type: 2, payload: PayloadLen::between(8, 64),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
     /// # };
     /// # const ENDED: MessageRule = MessageRule {
-    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     name: "ended", message_type: 3, payload: PayloadLen::exact(8),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
@@ -136,6 +171,7 @@ pub enum LayoutError {
     /// ```compile_fail,E0080
     /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -146,11 +182,11 @@ pub enum LayoutError {
     ///     },
     /// };
     /// # const PAGE: MessageRule = MessageRule {
-    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     name: "page", message_type: 2, payload: PayloadLen::between(8, 64),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
     /// # };
     /// # const ENDED: MessageRule = MessageRule {
-    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     name: "ended", message_type: 3, payload: PayloadLen::exact(8),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
@@ -171,6 +207,7 @@ pub enum LayoutError {
     /// ```compile_fail,E0080
     /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -181,11 +218,11 @@ pub enum LayoutError {
     ///     },
     /// };
     /// # const PAGE: MessageRule = MessageRule {
-    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     name: "page", message_type: 2, payload: PayloadLen::between(8, 64),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
     /// # };
     /// # const ENDED: MessageRule = MessageRule {
-    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     name: "ended", message_type: 3, payload: PayloadLen::exact(8),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
@@ -207,6 +244,7 @@ pub enum LayoutError {
     /// ```compile_fail,E0080
     /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -217,11 +255,11 @@ pub enum LayoutError {
     ///     },
     /// };
     /// # const PAGE: MessageRule = MessageRule {
-    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     name: "page", message_type: 2, payload: PayloadLen::between(8, 64),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
     /// # };
     /// # const ENDED: MessageRule = MessageRule {
-    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     name: "ended", message_type: 3, payload: PayloadLen::exact(8),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
@@ -249,6 +287,7 @@ pub enum LayoutError {
     /// ```compile_fail,E0080
     /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
     /// const WATCH: MessageRule = MessageRule {
+    ///     name: "watch",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Subscription {
@@ -259,11 +298,11 @@ pub enum LayoutError {
     ///     },
     /// };
     /// # const PAGE: MessageRule = MessageRule {
-    /// #     message_type: 2, payload: PayloadLen::between(8192, 8192),
+    /// #     name: "page", message_type: 2, payload: PayloadLen::between(8192, 8192),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
     /// # };
     /// # const ENDED: MessageRule = MessageRule {
-    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     name: "ended", message_type: 3, payload: PayloadLen::exact(8),
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
@@ -308,6 +347,7 @@ impl LayoutError {
             Self::DuplicateMessageType { .. } => {
                 "each message type appears in exactly one row of its layout"
             }
+            Self::DuplicateName { .. } => "each row name appears in exactly one row of its layout",
             Self::PayloadAboveFrameCap { .. } => "each row's largest frame fits its stream's cap",
             Self::AnnouncementOnRequestResponse { .. } => {
                 "a request/response stream carries only requests and responses"
@@ -368,6 +408,7 @@ impl fmt::Display for LayoutError {
             | Self::RequestWithoutEnding { message_type } => {
                 write!(f, " (message type {message_type})")
             }
+            Self::DuplicateName { name } => write!(f, " (row name {name})"),
             Self::PayloadAboveFrameCap { kind, message_type }
             | Self::AnnouncementOnRequestResponse { kind, message_type }
             | Self::SubscriptionOnRequestResponse { kind, message_type } => {
@@ -389,6 +430,7 @@ impl Stream {
     /// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
     /// # use std::time::Duration;
     /// const STATUS: MessageRule = MessageRule {
+    ///     name: "status",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Announcement {
@@ -417,6 +459,7 @@ impl Stream {
     /// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
     /// # use std::time::Duration;
     /// const STATUS: MessageRule = MessageRule {
+    ///     name: "status",
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(1024),
     ///     role: MessageRole::Announcement {
@@ -457,8 +500,8 @@ impl Stream {
     ///   and a session's streams have distinct kinds and share one capability;
     /// - every stream declares a message table, or none does; a layout without
     ///   tables passes the remaining rules trivially;
-    /// - every table has a row, and each message type appears in exactly one
-    ///   row of the layout;
+    /// - every table has a row, and each message type and each row name
+    ///   appears in exactly one row of the layout;
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;
@@ -524,6 +567,9 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
         let message_type = row.message_type;
         if count_rows(layout, message_type) > 1 {
             return Err(LayoutError::DuplicateMessageType { message_type });
+        }
+        if count_names(layout, row.name) > 1 {
+            return Err(LayoutError::DuplicateName { name: row.name });
         }
         // Widening a u32 to usize is lossless on every supported target.
         let frame_cap = stream.frame_cap as usize;
@@ -678,6 +724,34 @@ const fn count_rows(layout: &[Stream], message_type: u16) -> usize {
         }
     }
     count
+}
+
+/// Number of rows in `layout` named `name`.
+const fn count_names(layout: &[Stream], name: &str) -> usize {
+    let mut rows = Rows::new(layout);
+    let mut count = 0;
+    while let Some(row) = rows.next() {
+        if same_name(row.name, name) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Whether `a` and `b` are the same name. `str` equality is not `const`.
+const fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < a.len() {
+        if a[index] != b[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 /// The row of `message_type` in `layout`.

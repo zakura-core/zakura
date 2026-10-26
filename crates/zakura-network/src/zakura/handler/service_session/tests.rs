@@ -1221,6 +1221,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
 #[tokio::test]
 async fn request_response_tables_reject_the_other_role_before_payloads() -> Result<(), BoxError> {
     const PING: MessageRule = MessageRule {
+        name: "ping",
         message_type: LEGACY_REQUEST_PING,
         payload: PayloadLen::exact(8),
         role: MessageRole::Request {
@@ -1229,6 +1230,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
         },
     };
     const PONG: MessageRule = MessageRule {
+        name: "pong",
         message_type: LEGACY_RESPONSE_PONG,
         payload: PayloadLen::exact(8),
         role: MessageRole::Response {

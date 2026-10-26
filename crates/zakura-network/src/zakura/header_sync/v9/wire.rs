@@ -139,6 +139,7 @@ pub(crate) type OutcomePayload = (LeU64, BlockHash, U8);
 
 /// Each side's frontier and serving caps, sent at most once a second.
 const STATUS: MessageRule = MessageRule {
+    name: "status",
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
@@ -152,6 +153,7 @@ const STATUS: MessageRule = MessageRule {
 
 /// Opens, renews, and closes a subscription.
 pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
+    name: "subscribe-headers",
     message_type: message_type::SUBSCRIBE_HEADERS,
     payload: PayloadLen::of::<UpdatePayload>(),
     role: MessageRole::Subscription {
@@ -168,6 +170,7 @@ pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
 
 /// Ends a subscription. It spends no credit.
 const HEADERS_OUTCOME: MessageRule = MessageRule {
+    name: "headers-outcome",
     message_type: message_type::HEADERS_OUTCOME,
     payload: PayloadLen::of::<OutcomePayload>(),
     role: MessageRole::Response {
@@ -180,6 +183,7 @@ const HEADERS_OUTCOME: MessageRule = MessageRule {
 /// `header_bytes`. Pages do not end the subscription.
 const fn headers_row(header_bytes: usize) -> MessageRule {
     MessageRule {
+        name: "headers",
         message_type: message_type::HEADERS,
         payload: PayloadLen::between(
             smallest_page(header_bytes, AuxSchema::None),

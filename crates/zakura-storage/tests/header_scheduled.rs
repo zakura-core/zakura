@@ -292,13 +292,25 @@ fn reply_dropped_ends(facts: &[Fact]) -> Vec<LeaseEnd> {
         .collect()
 }
 
-/// C2: a port binds only inside an active run, here the scheduler's.
+/// C2: a port binds only inside an active run, here the scheduler's, only
+/// while pristine, and only once.
 #[test]
 fn binding_needs_an_active_run() {
-    let (port, _) = chain();
+    let (port, target) = chain();
+    let (leased, _) = chain();
+    acquired(
+        ready(
+            leased
+                .engine()
+                .acquire_header_path(acquire(&leased, target)),
+        )
+        .expect("acquires"),
+    );
     assert_eq!(port.bind_to_run(), Err(BindError::NotInRun));
     let sched = scheduler();
     assert_eq!(port.bind_to_run(), Ok(()));
+    assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
+    assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
     drop(sched);
 }
 

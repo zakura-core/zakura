@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, OpId, StorageEvent as PortEvent},
+    controlled::{ControlledPort, Fact, FactKind, OpId},
     evidence::RequestIdentity,
     lease::LeaseEnd as PortLeaseEnd,
     Fault, Outcome,
@@ -115,55 +115,70 @@ fn attribution(request: &RequestIdentity) -> (Option<String>, Option<String>, Op
     }
 }
 
-/// `event` as an observation, or `None` for shutdown, which happens only
-/// after the log is frozen.
-fn observation(event: PortEvent) -> Option<Observation> {
-    let (id, event) = match event {
-        PortEvent::Submitted {
-            id,
-            request,
-            request_digest,
-        } => {
-            let (owner, peer, session) = attribution(&request);
-            (
+/// `facts` as observations in today's schema, one per transaction head.
+/// A `Completed` or `ReplyDropped` observation lists the capability ends
+/// its transaction recorded. A reply take, the permit facts and the other
+/// lease facts have no observation yet, and neither has shutdown, which
+/// happens only after the log is frozen. A transaction is published whole,
+/// so one drain never splits it.
+fn observations(facts: Vec<Fact>) -> Vec<Observation> {
+    let mut out = Vec::new();
+    let mut ends = Vec::new();
+    for fact in facts {
+        let (id, event) = match fact.kind {
+            FactKind::Lease(lease) => {
+                ends.extend(PortLeaseEnd::of(&lease));
+                continue;
+            }
+            FactKind::PermitTaken { .. } | FactKind::PermitDropped { .. } => continue,
+            FactKind::Submitted {
                 id,
-                StorageEvent::Submitted {
-                    op: request.op().name().to_owned(),
-                    request: hex(&request_digest),
-                    owner,
-                    peer,
-                    session,
+                request,
+                request_digest,
+            } => {
+                let (owner, peer, session) = attribution(&request);
+                (
+                    id,
+                    StorageEvent::Submitted {
+                        op: request.op().name().to_owned(),
+                        request: hex(&request_digest),
+                        owner,
+                        peer,
+                        session,
+                    },
+                )
+            }
+            FactKind::CallerDropped { id } => (id, StorageEvent::CallerDropped),
+            FactKind::Completed(completion) => (
+                completion.id,
+                StorageEvent::Completed {
+                    op: completion.op.name().to_owned(),
+                    outcome: completion.outcome.name().to_owned(),
+                    owner: attribution(&completion.request).0,
+                    delivered: completion.delivered,
+                    lease_ends: lease_ends(std::mem::take(&mut ends)),
+                    state: hex(&completion.state_digest),
                 },
-            )
-        }
-        PortEvent::CallerDropped { id } => (id, StorageEvent::CallerDropped),
-        PortEvent::Completed(completion) => (
-            completion.id,
-            StorageEvent::Completed {
-                op: completion.op.name().to_owned(),
-                outcome: completion.outcome.name().to_owned(),
-                owner: attribution(&completion.request).0,
-                delivered: completion.delivered,
-                lease_ends: lease_ends(completion.lease_ends),
-                state: hex(&completion.state_digest),
-            },
-        ),
-        PortEvent::ReplyDropped {
-            id,
-            lease_ends: ends,
-        } => (
-            id,
-            StorageEvent::ReplyDropped {
-                lease_ends: lease_ends(ends),
-            },
-        ),
-        PortEvent::ShutDown { .. } => return None,
-    };
-    Some(Observation::Storage {
-        service: SERVICE.to_owned(),
-        id: id.0,
-        event,
-    })
+            ),
+            FactKind::ReplyDropped { id } => (
+                id,
+                StorageEvent::ReplyDropped {
+                    lease_ends: lease_ends(std::mem::take(&mut ends)),
+                },
+            ),
+            FactKind::ReplyTaken { .. } | FactKind::ShutDown { .. } => {
+                ends.clear();
+                continue;
+            }
+        };
+        ends.clear();
+        out.push(Observation::Storage {
+            service: SERVICE.to_owned(),
+            id: id.0,
+            event,
+        });
+    }
+    out
 }
 
 impl ActionSource for HeaderStorage {
@@ -205,10 +220,8 @@ impl ActionSource for HeaderStorage {
     }
 
     fn observe(&mut self, log: &mut ObservationLog) {
-        for event in self.port.take_events() {
-            if let Some(observation) = observation(event) {
-                log.push(observation);
-            }
+        for observation in observations(self.port.take_facts()) {
+            log.push(observation);
         }
     }
 }

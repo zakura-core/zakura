@@ -91,6 +91,17 @@ impl SequencedBody {
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
     }
+
+    /// The wire bytes this body charges to the input-queue counter: its size
+    /// while queued, zero once it left the queue.
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> u64 {
+        if self.queue_accounting.active {
+            self.queue_accounting.bytes
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1308,6 +1319,7 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod ownership;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;

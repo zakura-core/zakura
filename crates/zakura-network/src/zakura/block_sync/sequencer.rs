@@ -86,6 +86,30 @@ struct InFlightSubmission {
     detached: bool,
 }
 
+/// The bodies the sequencer holds past the reorder buffer, read from its maps
+/// rather than from its running totals.
+///
+/// An attached submission and its `applying` entry share one body, so the two
+/// lists can name the same wire bytes. Sum each list on its own.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SequencerOwnership {
+    /// Each `applying` body's height and wire bytes.
+    pub(super) applying: Vec<(block::Height, u64)>,
+    /// Each decoded submission the driver can still retain.
+    pub(super) submissions: Vec<SubmissionOwnership>,
+}
+
+/// One decoded submission and its wire bytes.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct SubmissionOwnership {
+    pub(super) height: block::Height,
+    pub(super) bytes: u64,
+    /// The body left `applying` while the driver can still retain it.
+    pub(super) detached: bool,
+}
+
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AdvanceOutcome {
@@ -312,6 +336,27 @@ impl Sequencer {
             .values()
             .map(|submission| submission.bytes)
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Every body held in `applying` or by an in-flight submission.
+    #[cfg(test)]
+    pub(super) fn ownership_snapshot(&self) -> SequencerOwnership {
+        SequencerOwnership {
+            applying: self
+                .applying
+                .iter()
+                .map(|(height, applying)| (*height, applying.bytes))
+                .collect(),
+            submissions: self
+                .in_flight_submissions
+                .values()
+                .map(|submission| SubmissionOwnership {
+                    height: submission.height,
+                    bytes: submission.bytes,
+                    detached: submission.detached,
+                })
+                .collect(),
+        }
     }
 
     #[cfg(test)]

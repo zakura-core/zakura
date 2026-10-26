@@ -67,6 +67,29 @@ pub(super) struct WorkItem {
     answered_elsewhere: bool,
 }
 
+/// Where a queued item sits in its download lifecycle.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkItemPlace {
+    Pending,
+    /// Taken by a request that has not yet published its reservation here.
+    Provisional,
+    InFlight,
+}
+
+/// One queued item's owner and byte quantities.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkItemOwnership {
+    pub(super) height: block::Height,
+    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
+    pub(super) place: WorkItemPlace,
+    /// The size estimate a request for this item reserves.
+    pub(super) estimated_bytes: u64,
+    /// The estimate bytes this item currently charges to the queue's tally.
+    pub(super) reserved_bytes: u64,
+}
+
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct WorkReturnOutcome {
@@ -1148,6 +1171,35 @@ impl WorkQueue {
             .chain(inner.in_flight.values())
             .map(|item| item.budget.reserved_charge())
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Every queued item with its owner and byte quantities, read from the
+    /// queue maps rather than from the maintained tallies.
+    #[cfg(test)]
+    pub(super) fn ownership_snapshot(&self) -> Vec<WorkItemOwnership> {
+        let inner = self.lock();
+        let pending = inner
+            .pending
+            .iter()
+            .map(|(height, item)| (height, item, WorkItemPlace::Pending));
+        let in_flight = inner.in_flight.iter().map(|(height, item)| {
+            let place = if item.provisional {
+                WorkItemPlace::Provisional
+            } else {
+                WorkItemPlace::InFlight
+            };
+            (height, item, place)
+        });
+        pending
+            .chain(in_flight)
+            .map(|(height, item, place)| WorkItemOwnership {
+                height: *height,
+                owner: item.owner,
+                place,
+                estimated_bytes: item.estimated_bytes,
+                reserved_bytes: item.budget.reserved_charge(),
+            })
+            .collect()
     }
 
     /// Number of contiguous runs across `pending` (one queued range per maximal

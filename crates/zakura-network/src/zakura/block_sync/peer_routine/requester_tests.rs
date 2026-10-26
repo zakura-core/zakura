@@ -1453,3 +1453,94 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
 }
+
+/// The admission gauges equal sums over the work queue's owners and the queued
+/// bodies after charge, receipt, transfer out of the queue, timeout, and reset.
+#[tokio::test]
+async fn admission_gauges_match_work_and_input_owners() {
+    use super::super::{tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace};
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(first.hash());
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            second.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    let (body_sender, mut bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    let (view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    // Returns the reservation and queue gauges after checking them against the owners.
+    let check = |routine: &PeerRoutine, queued: &[SequencedBody], label: &str| {
+        let view = *routine.sequencer_view.borrow();
+        routine.admission_snapshot(&view);
+        let reserved_above: u64 = routine
+            .work
+            .ownership_snapshot()
+            .iter()
+            .filter(|item| {
+                item.place == WorkItemPlace::InFlight && item.height > view.download_floor
+            })
+            .map(|item| item.reserved_bytes)
+            .sum();
+        let queued_bytes: u64 = queued.iter().map(SequencedBody::queued_bytes).sum();
+        let gauges = (
+            recorder.bytes("sync.block.work.reserved_above_floor_bytes"),
+            recorder.bytes("sync.block.sequencer_input.queued_bytes"),
+        );
+        assert_eq!(gauges, (reserved_above, queued_bytes), "after {label}");
+        gauges
+    };
+
+    assert_eq!(check(&routine, &[], "start"), (0, 0));
+
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let (charged, _) = check(&routine, &[], "charge");
+    assert!(charged > 0);
+
+    // Receipt moves the body's bytes from its reservation to the queue.
+    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
+    let mut queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
+    assert_eq!(queued.len(), 1);
+    let (reserved, queued_bytes) = check(&routine, &queued, "receipt");
+    assert!(reserved < charged);
+    assert!(queued_bytes > 0);
+
+    // The sequencer takes the body out of the queue.
+    queued[0].leave_queue();
+    assert_eq!(check(&routine, &queued, "dequeue").1, 0);
+    drop(queued);
+
+    // A timeout returns the next request's reservation.
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(check(&routine, &[], "second charge").0 > 0);
+    let deadline = routine.window.outstanding.first().unwrap().deadline;
+    assert!(routine.expire_due_timeouts(deadline));
+    assert_eq!(check(&routine, &[], "timeout"), (0, 0));
+
+    // The sequencer view supplies the applying and submission gauges.
+    view_tx.send_modify(|view| {
+        view.applying_buffered_bytes = 300;
+        view.in_flight_submission_bytes = 200;
+    });
+    check(&routine, &[], "view change");
+    assert_eq!(recorder.bytes("sync.block.applying.buffered_bytes"), 300);
+    assert_eq!(recorder.bytes("sync.block.submission.in_flight_bytes"), 200);
+}

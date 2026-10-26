@@ -12,6 +12,8 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
+use super::work_queue::WorkQueue;
+
 mod trace;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
@@ -2022,8 +2024,7 @@ impl BlockSyncReactor {
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
-        metrics::gauge!("sync.block.budget.reserved_bytes")
-            .set(self.state.budget.reserved() as f64);
+        publish_budget_ledger_gauges(&self.state.budget, &self.state.work_queue);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.last_view.reorder_buffered_bytes as f64);
         metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
@@ -2202,6 +2203,18 @@ pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeI
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Publish both request-budget ledgers together, so a reader compares the
+/// shared byte budget with the work queue's reservation tally from one point.
+///
+/// The budget charges a request before the work queue does and releases it
+/// after, so the budget gauge can exceed the work gauge while a request is in
+/// transition. The two gauges agree once no request is in transition.
+pub(super) fn publish_budget_ledger_gauges(budget: &ByteBudget, work: &WorkQueue) {
+    // These lossy casts are metrics-only gauges; the ledgers keep integer values.
+    metrics::gauge!("sync.block.budget.reserved_bytes").set(budget.reserved() as f64);
+    metrics::gauge!("sync.block.work.reserved_bytes").set(work.reserved_bytes() as f64);
 }
 
 fn set_block_reactor_active_connection_gauge(active_connections: usize) {

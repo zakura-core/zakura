@@ -255,6 +255,26 @@ The `sync.block.backlog.at_cap` gauge is latched to 1 whenever a pass stops on
 above-floor grant. `sync.block.request.floor_bypass` counts floor requests that
 borrowed a bypass slot.
 
+### Byte gauges
+
+Resource-bound tests read these gauges, so their names are a test contract.
+Each gauge is written where its reader takes the same value:
+
+| Gauge | Measures | Written |
+| --- | --- | --- |
+| `sync.block.applying.buffered_bytes` | Wire bytes of bodies in `applying`; a detached submission no longer counts | At each admission snapshot |
+| `sync.block.sequencer_input.queued_bytes` | Wire bytes of bodies in the sequencer input queue | At each admission snapshot |
+| `sync.block.submission.in_flight_bytes` | Wire bytes of decoded submissions the driver can still retain, including detached ones | At each admission snapshot |
+| `sync.block.work.reserved_above_floor_bytes` | Request-estimate bytes that in-flight work above the download floor reserves | At each admission snapshot |
+| `sync.block.work.reserved_bytes` | Request-estimate bytes that the work queue's ledger reserves | With `sync.block.budget.reserved_bytes`, at each reactor metrics publication |
+| `sync.block.budget.reserved_bytes` | Bytes charged to the shared in-flight request budget | With `sync.block.work.reserved_bytes` |
+| `sync.block.reorder.buffered_bytes` | Wire bytes of bodies in the reorder buffer | At each reactor metrics publication |
+
+An admission-snapshot gauge keeps the value the latest admission decision read
+until the next snapshot. The budget charges a request before the work queue
+does and releases it after, so the budget gauge can exceed the work gauge while
+a request is in transition. The two agree once no request is in transition.
+
 ## Key config knobs (defaults)
 
 | Knob | Default | Notes |

@@ -203,6 +203,22 @@ impl RetainedPipelineBytes {
 }
 
 impl AdmissionSnapshot {
+    /// Publish the byte quantities this snapshot gives admission.
+    ///
+    /// Admission reads these values here, not when they change, so a gauge
+    /// reader sees the values the latest admission decision used.
+    pub(super) fn publish_gauges(&self) {
+        // These lossy casts are metrics-only; admission keeps the integer values.
+        metrics::gauge!("sync.block.applying.buffered_bytes")
+            .set(self.applying_buffered_bytes as f64);
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes")
+            .set(self.sequencer_input_queued_bytes as f64);
+        metrics::gauge!("sync.block.submission.in_flight_bytes")
+            .set(self.in_flight_submission_bytes as f64);
+        metrics::gauge!("sync.block.work.reserved_above_floor_bytes")
+            .set(self.reserved_above_floor_bytes as f64);
+    }
+
     fn retained(&self) -> RetainedPipelineBytes {
         RetainedPipelineBytes {
             reorder_buffered_bytes: self.reorder_buffered_bytes,

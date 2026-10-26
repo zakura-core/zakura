@@ -1460,10 +1460,11 @@ impl PeerRoutine {
         [timed, ending].into_iter().flatten().min()
     }
 
+    /// Read the admission inputs and publish their byte gauges.
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
             self.work.reserved_above(view.download_floor);
-        AdmissionSnapshot {
+        let snapshot = AdmissionSnapshot {
             download_floor: view.download_floor,
             verified_block_tip: view.verified_tip,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
@@ -1480,7 +1481,9 @@ impl PeerRoutine {
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),
-        }
+        };
+        snapshot.publish_gauges();
+        snapshot
     }
 
     fn request_count_cap(&self) -> usize {

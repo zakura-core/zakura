@@ -1,24 +1,27 @@
-//! A metrics recorder that keeps the last value written to each gauge.
+//! A metrics recorder that keeps the current value of each gauge.
 
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
-/// Records the last value of every gauge. Install it with
+/// Records the current value of every gauge. Install it with
 /// [`metrics::set_default_local_recorder`] to capture this thread's writes.
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::block_sync) struct GaugeRecorder(Arc<Mutex<BTreeMap<String, f64>>>);
 
 impl GaugeRecorder {
-    /// The last value written to gauge `name`, as whole bytes.
+    /// The value of gauge `name`, as whole bytes. A gauge nobody wrote reads 0,
+    /// as it does in an exporter.
     pub(in crate::zakura::block_sync) fn bytes(&self, name: &str) -> u64 {
-        let value = *self
+        let value = self
             .0
             .lock()
             .expect("no gauge write panics")
             .get(name)
-            .unwrap_or_else(|| panic!("gauge {name} was written"));
+            .copied()
+            .unwrap_or_default();
+        assert!(value >= 0.0, "gauge {name} is {value}, below zero");
         // Test byte quantities are small whole numbers, which f64 holds exactly.
         value as u64
     }

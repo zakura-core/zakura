@@ -715,12 +715,12 @@ async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
 }
 
 /// Both budget-ledger gauges equal sums over the work queue's owners after
-/// each charge, transfer, and release path.
+/// each charge, transfer, and release path. No check calls a publication
+/// helper, so each gauge must follow its ledger on its own.
 #[test]
-fn budget_ledger_gauges_match_work_owners() {
+fn budget_ledger_gauges_follow_work_owners() {
     use crate::zakura::block_sync::{
-        reactor::publish_budget_ledger_gauges, tests::gauge_recorder::GaugeRecorder,
-        work_queue::WorkItemPlace,
+        tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace,
     };
 
     let recorder = GaugeRecorder::default();
@@ -728,7 +728,6 @@ fn budget_ledger_gauges_match_work_owners() {
     let mut f = Fixture::new();
     // Returns the work and budget gauges after checking them against the owners.
     let check = |f: &Fixture, label: &str| {
-        publish_budget_ledger_gauges(&f.budget, &f.work);
         let owners = f.work.ownership_snapshot();
         let reserved: u64 = owners.iter().map(|item| item.reserved_bytes).sum();
         let provisional: u64 = owners

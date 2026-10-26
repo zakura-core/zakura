@@ -121,6 +121,9 @@ impl SequencerInputAccounting {
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
+        // Gauge increments commute, so concurrent charges and releases leave the
+        // gauge equal to the counter. This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
         add_atomic_bytes(
             &input_decoded_attributed_memory_bytes,
             decoded_attributed_memory_size_bytes,
@@ -139,6 +142,8 @@ impl SequencerInputAccounting {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
+        // This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").decrement(self.bytes as f64);
         release_atomic_bytes(
             &self.input_decoded_attributed_memory_bytes,
             self.decoded_attributed_memory_size_bytes,

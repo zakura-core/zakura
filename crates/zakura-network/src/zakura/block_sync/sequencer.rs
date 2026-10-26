@@ -252,6 +252,13 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
+    /// Update the applying-byte total and its gauge together.
+    fn set_applying_buffered_bytes(&mut self, bytes: u64) {
+        self.applying_buffered_bytes = bytes;
+        // This lossy cast is metrics-only; the sequencer keeps the integer value.
+        metrics::gauge!("sync.block.applying.buffered_bytes").set(bytes as f64);
+    }
+
     pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
         self.applying_decoded_attributed_memory_bytes
             .saturating_add(self.detached_submission_decoded_attributed_memory_bytes)
@@ -317,6 +324,13 @@ impl Sequencer {
     /// including submissions detached from `applying`.
     pub(super) fn in_flight_submission_bytes(&self) -> u64 {
         self.in_flight_submission_bytes
+    }
+
+    /// Update the in-flight submission total and its gauge together.
+    fn set_in_flight_submission_bytes(&mut self, bytes: u64) {
+        self.in_flight_submission_bytes = bytes;
+        // This lossy cast is metrics-only; the sequencer keeps the integer value.
+        metrics::gauge!("sync.block.submission.in_flight_bytes").set(bytes as f64);
     }
 
     /// Number of decoded submissions the driver can still retain.
@@ -547,8 +561,9 @@ impl Sequencer {
                 },
             );
             // New bodies enter `applying` unsubmitted, so only the total grows.
-            self.applying_buffered_bytes =
-                self.applying_buffered_bytes.saturating_add(drained.bytes);
+            self.set_applying_buffered_bytes(
+                self.applying_buffered_bytes.saturating_add(drained.bytes),
+            );
             self.applying_decoded_attributed_memory_bytes = self
                 .applying_decoded_attributed_memory_bytes
                 .saturating_add(decoded_attributed_memory_size_bytes);
@@ -709,7 +724,7 @@ impl Sequencer {
             },
         );
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_add(1);
-        self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_add(bytes);
+        self.set_in_flight_submission_bytes(self.in_flight_submission_bytes.saturating_add(bytes));
         Some(SubmitItem {
             owner,
             source,
@@ -836,7 +851,7 @@ impl Sequencer {
         let detached = submission.detached;
         self.in_flight_submissions.remove(&token);
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
-        self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+        self.set_in_flight_submission_bytes(self.in_flight_submission_bytes.saturating_sub(bytes));
         if detached {
             self.detached_submission_decoded_attributed_memory_bytes = self
                 .detached_submission_decoded_attributed_memory_bytes
@@ -901,7 +916,9 @@ impl Sequencer {
                 .remove(&token)
                 .expect("submission exists because it matched above");
             self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
-            self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+            self.set_in_flight_submission_bytes(
+                self.in_flight_submission_bytes.saturating_sub(bytes),
+            );
             if submission.detached {
                 self.detached_submission_decoded_attributed_memory_bytes = self
                     .detached_submission_decoded_attributed_memory_bytes
@@ -957,7 +974,9 @@ impl Sequencer {
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
         let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
-        self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
+        self.set_applying_buffered_bytes(
+            self.applying_buffered_bytes.saturating_sub(removed.bytes),
+        );
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
             .saturating_sub(decoded_attributed_memory_bytes);
@@ -1086,7 +1105,7 @@ impl Sequencer {
             self.submitted_applies.clear();
         }
         self.applying.clear();
-        self.applying_buffered_bytes = 0;
+        self.set_applying_buffered_bytes(0);
         self.applying_decoded_attributed_memory_bytes = 0;
         self.attached_submission_count = 0;
         released

@@ -182,6 +182,22 @@ impl WorkQueueInner {
             .filter(|item| !item.provisional)
             .and_then(|item| item.owner)
     }
+
+    fn add_reserved_bytes(&mut self, bytes: u64) {
+        self.set_reserved_bytes(self.reserved_bytes.saturating_add(bytes));
+    }
+
+    fn sub_reserved_bytes(&mut self, bytes: u64) {
+        self.set_reserved_bytes(self.reserved_bytes.saturating_sub(bytes));
+    }
+
+    /// Update the reserved tally and its gauge together. The caller holds the
+    /// queue lock, so concurrent writers publish in tally order.
+    fn set_reserved_bytes(&mut self, bytes: u64) {
+        self.reserved_bytes = bytes;
+        // This lossy cast is metrics-only; the tally keeps the integer value.
+        metrics::gauge!("sync.block.work.reserved_bytes").set(bytes as f64);
+    }
 }
 
 /// Compute a clamped body-size estimate from a [`BlockSizeEstimate`] hint.
@@ -644,7 +660,7 @@ impl WorkQueue {
         }
         // Released (0) -> Reserved(estimate): the reserved total grows by exactly
         // the bytes just marked.
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
+        inner.add_reserved_bytes(marked);
         inner.in_flight_reserved.add_tally(added);
         marked
     }
@@ -694,7 +710,7 @@ impl WorkQueue {
                 item.answered_elsewhere = answered_elsewhere;
                 (item.budget.release_reserved(), item.owner)
             };
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
             inner.in_flight_reserved.sub(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             (released.saturating_add(outcome.released_bytes), claim)
@@ -746,7 +762,7 @@ impl WorkQueue {
             } else {
                 return 0;
             };
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             (released.saturating_add(outcome.released_bytes), claim)
         };
@@ -794,7 +810,7 @@ impl WorkQueue {
                 released = released.saturating_add(item.budget.release_reserved());
             }
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         inner.in_flight_reserved.sub_tally(released_in_flight);
         released
     }
@@ -822,7 +838,7 @@ impl WorkQueue {
                     moved = true;
                 }
             }
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
         }
         if moved {
             self.available.notify_waiters();
@@ -996,7 +1012,7 @@ impl WorkQueue {
             outcome.returned_count = outcome.returned_count.saturating_add(1);
             inner.pending.insert(height, item);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
+        inner.sub_reserved_bytes(outcome.released_bytes);
         if outcome.returned_count > 0 {
             self.available.notify_waiters();
         }
@@ -1042,7 +1058,7 @@ impl WorkQueue {
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         drop(inner);
         if revoked {
             self.note_revocation();
@@ -1097,7 +1113,7 @@ impl WorkQueue {
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         drop(inner);
         drop(claims);
         if revoked {

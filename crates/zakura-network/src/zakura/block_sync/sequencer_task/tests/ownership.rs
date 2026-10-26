@@ -2,12 +2,14 @@ use super::*;
 use zakura_chain::serialization::ZcashSerialize;
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES};
 
-/// Admission reads the applying and in-flight submission bytes from the
-/// published view. Each must equal the sum over the bodies the sequencer
-/// holds, through acceptance, submission, detachment, completion, commit, and
-/// reset.
+/// The applying and in-flight submission gauges, and the view admission reads,
+/// equal sums over the bodies the sequencer holds through acceptance,
+/// submission, detachment, completion, commit, and reset. The gauges are read
+/// before the view is published, so each must follow the sequencer on its own.
 #[tokio::test]
-async fn published_view_matches_sequencer_owners() {
+async fn byte_gauges_and_view_follow_sequencer_owners() {
+    let recorder = super::super::super::tests::gauge_recorder::GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let frontiers = genesis_frontiers();
     let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -35,11 +37,19 @@ async fn published_view_matches_sequencer_owners() {
         ZakuraTrace::noop(),
     );
     let check = |task: &mut SequencerTask, label: &str| {
-        task.publish_view();
-        let view = *view_rx.borrow();
         let owners = task.sequencer.ownership_snapshot();
         let applying: u64 = owners.applying.iter().map(|(_, bytes)| bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
+        assert_eq!(
+            (
+                recorder.bytes("sync.block.applying.buffered_bytes"),
+                recorder.bytes("sync.block.submission.in_flight_bytes"),
+            ),
+            (applying, submissions),
+            "gauges after {label}"
+        );
+        task.publish_view();
+        let view = *view_rx.borrow();
         assert_eq!(
             view.applying_buffered_bytes, applying,
             "applying bytes after {label}"

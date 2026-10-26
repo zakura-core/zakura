@@ -3560,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.1"
+version = "12.0.0"
 dependencies = [
  "chrono",
  "derive-new",

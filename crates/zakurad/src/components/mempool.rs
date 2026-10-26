@@ -1055,25 +1055,37 @@ impl Service<Request> for Mempool {
             }
 
             // Handle best chain tip changes
-            if let Some(TipAction::Grow { block }) = tip_action {
-                tracing::trace!(block_height = ?block.height, "handling blocks added to tip");
+            if let Some(TipAction::Grow {
+                block,
+                skipped_blocks,
+            }) = tip_action
+            {
+                tracing::trace!(
+                    block_height = ?block.height,
+                    skipped_blocks = skipped_blocks.len(),
+                    "handling blocks added to tip"
+                );
                 *last_seen_tip_hash = block.hash;
 
-                // Cancel downloads/verifications/storage of transactions
-                // with the same mined IDs as recently mined transactions.
-                let mined_ids = block.transaction_hashes.iter().cloned().collect();
-                tx_downloads.cancel(&mined_ids);
-                storage.clear_mined_dependencies(&mined_ids);
+                // Apply the added blocks in chain order, so every block's mined transactions
+                // and conflicting spends leave the mempool, even when this poll missed a tip.
+                for added_block in skipped_blocks.into_iter().chain(std::iter::once(block)) {
+                    // Cancel downloads/verifications/storage of transactions
+                    // with the same mined IDs as recently mined transactions.
+                    let mined_ids = added_block.transaction_hashes.iter().cloned().collect();
+                    tx_downloads.cancel(&mined_ids);
+                    storage.clear_mined_dependencies(&mined_ids);
 
-                let storage::RemovedTransactionIds { mined, invalidated } =
-                    storage.reject_and_remove_same_effects(&mined_ids, block.transactions);
+                    let storage::RemovedTransactionIds { mined, invalidated } = storage
+                        .reject_and_remove_same_effects(&mined_ids, added_block.transactions);
+
+                    mined_mempool_ids.extend(mined);
+                    invalidated_ids.extend(invalidated);
+                }
 
                 // Clear any transaction rejections if they might have become valid after
-                // the new block was added to the tip.
+                // the new blocks were added to the tip.
                 storage.clear_tip_rejections();
-
-                mined_mempool_ids.extend(mined);
-                invalidated_ids.extend(invalidated);
             }
 
             // Remove expired transactions from the mempool.

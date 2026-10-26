@@ -5,7 +5,7 @@
 //! * [LatestChainTip] for efficient access to the current best tip, and
 //! * [ChainTipChange] to `await` specific changes to the chain tip.
 
-use std::{fmt, sync::Arc};
+use std::{collections::VecDeque, fmt, iter, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
@@ -35,9 +35,29 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 #[cfg(test)]
 mod tests;
 
+/// The number of best tips published before the current tip that the chain tip channel keeps.
+///
+/// The list includes the tip a [`ChainTipChange`] last saw, so it can report up to one fewer
+/// skipped blocks as a [`TipAction::Grow`]. Skipping this many or more produces a
+/// [`TipAction::Reset`].
+const MAX_RECENT_TIP_ANCESTORS: usize = 16;
+
+/// The best tips published just before the current tip, oldest first.
+type RecentTipAncestors = Arc<VecDeque<Arc<ChainTipBlock>>>;
+
 /// The internal watch channel data type for [`ChainTipSender`], [`LatestChainTip`],
 /// and [`ChainTipChange`].
-type ChainTipData = Option<ChainTipBlock>;
+#[derive(Clone, Debug, Default)]
+struct ChainTipData {
+    /// The current best chain tip, if there is one.
+    tip: Option<ChainTipBlock>,
+
+    /// Up to [`MAX_RECENT_TIP_ANCESTORS`] tips published before `tip`, oldest first.
+    ///
+    /// Each block is the parent of the next one, and the last block is the parent of `tip`.
+    /// Publishing a tip that is not a child of the previous tip clears this list.
+    recent_ancestors: RecentTipAncestors,
+}
 
 /// A chain tip block, with precalculated block data.
 ///
@@ -180,7 +200,7 @@ impl ChainTipSender {
         let initial_tip = initial_tip.into();
         Self::record_new_tip(&initial_tip);
 
-        let (sender, receiver) = watch::channel(None);
+        let (sender, receiver) = watch::channel(ChainTipData::default());
 
         let mut sender = ChainTipSender {
             use_non_finalized_tip: false,
@@ -255,29 +275,36 @@ impl ChainTipSender {
     /// Possibly send an update to listeners.
     ///
     /// An update is only sent if the current best tip is different from the last best tip
-    /// that was sent.
+    /// that was sent. When the new tip is a child of the previous tip, the previous tip is
+    /// kept as a recent ancestor, so listeners that miss it can still apply its transactions.
     fn update(&mut self, new_tip: Option<ChainTipBlock>) {
-        // Correctness: the `self.sender.borrow()` must not be placed in a `let` binding to prevent
-        // a read-lock being created and living beyond the `self.sender.send(..)` call. If that
-        // happens, the `send` method will attempt to obtain a write-lock and will dead-lock.
-        // Without the binding, the guard is dropped at the end of the expression.
-        let active_hash = self
-            .sender
-            .borrow()
-            .as_ref()
-            .map(|active_value| active_value.hash);
-
-        let needs_update = match (new_tip.as_ref(), active_hash) {
-            // since the blocks have been contextually validated,
-            // we know their hashes cover all the block data
-            (Some(new_tip), Some(active_hash)) => new_tip.hash != active_hash,
-            (Some(_new_tip), None) => true,
-            (None, _active_value_hash) => false,
+        let Some(new_tip) = new_tip else {
+            return;
         };
 
-        if needs_update {
-            let _ = self.sender.send(new_tip);
-        }
+        // The tip and its ancestors change under one write lock, so readers always see an
+        // ancestor list that ends at the parent of the tip they read.
+        self.sender.send_if_modified(|data| {
+            // since the blocks have been contextually validated,
+            // we know their hashes cover all the block data
+            if data.tip.as_ref().map(|tip| tip.hash) == Some(new_tip.hash) {
+                return false;
+            }
+
+            let ancestors = Arc::make_mut(&mut data.recent_ancestors);
+            match data.tip.take() {
+                Some(previous_tip) if previous_tip.hash == new_tip.previous_block_hash => {
+                    ancestors.push_back(Arc::new(previous_tip));
+                    while ancestors.len() > MAX_RECENT_TIP_ANCESTORS {
+                        ancestors.pop_front();
+                    }
+                }
+                _ => ancestors.clear(),
+            }
+            data.tip = Some(new_tip);
+
+            true
+        });
     }
 
     /// Record `new_tip` in the current span.
@@ -301,7 +328,7 @@ impl ChainTipSender {
     fn record_fields(&self, new_tip: &Option<ChainTipBlock>) {
         let span = tracing::Span::current();
 
-        let old_tip = &*self.sender.borrow();
+        let old_tip = &self.sender.borrow().tip;
 
         Self::record_tip(&span, "new", new_tip);
         Self::record_tip(&span, "old", old_tip);
@@ -373,6 +400,15 @@ impl LatestChainTip {
     where
         F: FnOnce(&ChainTipBlock) -> U,
     {
+        self.with_chain_tip_block_and_ancestors(|block, _recent_ancestors| f(block))
+    }
+
+    /// Like [`Self::with_chain_tip_block`], but also passes the tips published just before the
+    /// current tip, oldest first, read under the same lock as the tip.
+    fn with_chain_tip_block_and_ancestors<U, F>(&self, f: F) -> Option<U>
+    where
+        F: FnOnce(&ChainTipBlock, &RecentTipAncestors) -> U,
+    {
         let span = tracing::Span::current();
 
         let register_span_fields = |chain_tip_block: Option<&ChainTipBlock>| {
@@ -398,12 +434,14 @@ impl LatestChainTip {
             );
         };
 
-        self.receiver.with_watch_data(|chain_tip_block| {
+        self.receiver.with_watch_data(|data| {
             // TODO: replace with Option::inspect when it stabilises
             //       https://github.com/rust-lang/rust/issues/91345
-            register_span_fields(chain_tip_block.as_ref());
+            register_span_fields(data.tip.as_ref());
 
-            chain_tip_block.as_ref().map(f)
+            data.tip
+                .as_ref()
+                .map(|block| f(block, &data.recent_ancestors))
         })
     }
 }
@@ -486,13 +524,20 @@ pub struct ChainTipChange {
 /// Actions that we can take in response to a [`ChainTipChange`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TipAction {
-    /// The chain tip was updated continuously,
-    /// using a child `block` of the previous block.
+    /// The chain tip was updated continuously, by adding `skipped_blocks` and then `block`
+    /// on top of the previous tip.
     ///
     /// The genesis block action is a `Grow`.
     Grow {
-        /// Information about the block used to grow the chain.
+        /// Information about the new tip block.
         block: ChainTipBlock,
+
+        /// Blocks added between the previous tip and `block`, oldest first.
+        ///
+        /// Empty when `block` is a child of the previous tip. Otherwise these blocks were
+        /// committed between two calls to the [`ChainTipChange`], and callers must apply them
+        /// before `block`.
+        skipped_blocks: Vec<ChainTipBlock>,
     },
 
     /// The chain tip was reset to a block with `height` and `hash`.
@@ -502,7 +547,7 @@ pub enum TipAction {
     ///   current tip,
     /// - extending the chain with a network upgrade activation block,
     /// - switching to a different best [`Chain`][1], also known as a rollback, and
-    /// - receiving multiple blocks since the previous change.
+    /// - skipping `MAX_RECENT_TIP_ANCESTORS` (16) or more blocks since the previous change.
     ///
     /// To keep the code and tests simple, Zebra performs the same reset
     /// actions, regardless of the reset reason.
@@ -531,14 +576,15 @@ impl ChainTipChange {
     /// If there have been no changes since the last time this method was called,
     /// it waits for the next tip change before returning.
     ///
-    /// If there have been multiple changes since the last time this method was called,
-    /// they are combined into a single [`TipAction::Reset`].
+    /// If several blocks extended the chain since the last time this method was called,
+    /// they are combined into a single [`TipAction::Grow`] that lists the skipped blocks.
+    /// Other combined changes become a single [`TipAction::Reset`].
     ///
     /// Returns an error if communication with the state is lost.
     ///
     /// ## Note
     ///
-    /// If a lot of blocks are committed at the same time,
+    /// If `MAX_RECENT_TIP_ANCESTORS` (16) or more blocks are skipped at the same time,
     /// the change will skip some blocks, and return a [`Reset`].
     #[instrument(
         skip(self),
@@ -547,11 +593,12 @@ impl ChainTipChange {
             network = ?self.network,
         ))]
     pub async fn wait_for_tip_change(&mut self) -> Result<TipAction, watch::error::RecvError> {
-        let block = self.tip_block_change().await?;
+        let (block, recent_ancestors) = self.tip_block_change().await?;
+        let block_hash = block.hash;
 
-        let action = self.action(block.clone());
+        let action = self.action(block, &recent_ancestors);
 
-        self.last_change_hash = Some(block.hash);
+        self.last_change_hash = Some(block_hash);
 
         Ok(action)
     }
@@ -568,17 +615,10 @@ impl ChainTipChange {
             network = ?self.network,
         ))]
     pub fn last_tip_change(&mut self) -> Option<TipAction> {
-        let block = self.latest_chain_tip.with_chain_tip_block(|block| {
-            if Some(block.hash) != self.last_change_hash {
-                Some(block.clone())
-            } else {
-                // Ignore an unchanged tip.
-                None
-            }
-        })??;
+        let (block, recent_ancestors) = self.changed_tip()?;
 
         let block_hash = block.hash;
-        let tip_action = self.action(block);
+        let tip_action = self.action(block, &recent_ancestors);
 
         self.last_change_hash = Some(block_hash);
 
@@ -628,18 +668,18 @@ impl ChainTipChange {
     }
 
     /// Return an action based on `block` and the last change we returned.
-    fn action(&self, block: ChainTipBlock) -> TipAction {
+    fn action(&self, block: ChainTipBlock, recent_ancestors: &RecentTipAncestors) -> TipAction {
         // check for an edge case that's dealt with by other code
         assert!(
             Some(block.hash) != self.last_change_hash,
             "ChainTipSender and ChainTipChange ignore unchanged tips"
         );
 
-        // If the previous block hash doesn't match, reset.
-        // We've either:
+        // If the new tip doesn't descend from the last change through blocks we still have,
+        // reset. We've either:
         // - just initialized this instance,
         // - changed the best chain to another fork (a rollback), or
-        // - skipped some blocks in the best chain.
+        // - skipped more blocks in the best chain than the channel keeps.
         //
         // Consensus rules:
         //
@@ -673,20 +713,78 @@ impl ChainTipChange {
         // TODO: confirm whether resetting at `activation_height - 1` (the `.next()` semantics
         // below) is intended for every network upgrade, or only for the temporary-disable soft
         // fork; ZIP-200 phrases the reset as "when the tip reaches ACTIVATION_HEIGHT".
-        let next_height = block
-            .height
-            .next()
-            .expect("chain tip height is far below Height::MAX");
-        if Some(block.previous_block_hash) != self.last_change_hash
-            || NetworkUpgrade::is_activation_height(&self.network, next_height)
-            || self
-                .network
-                .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
-        {
+        let Some(skipped_blocks) = self.skipped_blocks(&block, recent_ancestors) else {
+            return TipAction::reset_with(block);
+        };
+
+        let reaches_activation =
+            skipped_blocks
+                .iter()
+                .chain(iter::once(&block))
+                .any(|added_block| {
+                    let next_height = added_block
+                        .height
+                        .next()
+                        .expect("chain tip height is far below Height::MAX");
+
+                    NetworkUpgrade::is_activation_height(&self.network, next_height)
+                        || self
+                            .network
+                            .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+                });
+
+        if reaches_activation {
             TipAction::reset_with(block)
         } else {
-            TipAction::grow_with(block)
+            TipAction::grow_through(skipped_blocks, block)
         }
+    }
+
+    /// Returns the blocks added between the last change and `block`, oldest first.
+    ///
+    /// Returns an empty list when `block` is a child of the last change. Returns `None` when
+    /// `block` does not descend from the last change through `recent_ancestors`: there is no
+    /// last change, the best chain switched forks, or the skipped blocks are no longer kept.
+    fn skipped_blocks(
+        &self,
+        block: &ChainTipBlock,
+        recent_ancestors: &VecDeque<Arc<ChainTipBlock>>,
+    ) -> Option<Vec<ChainTipBlock>> {
+        let last_change_hash = self.last_change_hash?;
+
+        if block.previous_block_hash == last_change_hash {
+            return Some(Vec::new());
+        }
+
+        let last_change_index = recent_ancestors
+            .iter()
+            .rposition(|ancestor| ancestor.hash == last_change_hash)?;
+        let skipped_blocks: Vec<ChainTipBlock> = recent_ancestors
+            .iter()
+            .skip(last_change_index + 1)
+            .map(|ancestor| ChainTipBlock::clone(ancestor))
+            .collect();
+
+        // The sender only keeps a chain of children, but a grow must never hide a fork,
+        // so check every link from the last change to the new tip.
+        let mut parent_hash = last_change_hash;
+        for added_block in skipped_blocks.iter().chain(iter::once(block)) {
+            if added_block.previous_block_hash != parent_hash {
+                return None;
+            }
+            parent_hash = added_block.hash;
+        }
+
+        // Every block has a coinbase transaction, so an empty list means the transactions were
+        // pruned, and callers could not remove the transactions that block mined.
+        if skipped_blocks
+            .iter()
+            .any(|skipped_block| skipped_block.transactions.is_empty())
+        {
+            return None;
+        }
+
+        Some(skipped_blocks)
     }
 
     /// Create a new [`ChainTipChange`] from a [`LatestChainTip`] receiver and [`Network`].
@@ -698,10 +796,23 @@ impl ChainTipChange {
         }
     }
 
-    /// Wait until the next chain tip change, then return the corresponding [`ChainTipBlock`].
+    /// Returns the current tip and its recent ancestors, if the tip differs from the last change.
+    fn changed_tip(&self) -> Option<(ChainTipBlock, RecentTipAncestors)> {
+        self.latest_chain_tip
+            .with_chain_tip_block_and_ancestors(|block, recent_ancestors| {
+                (Some(block.hash) != self.last_change_hash)
+                    .then(|| (block.clone(), recent_ancestors.clone()))
+            })
+            .flatten()
+    }
+
+    /// Wait until the next chain tip change, then return the corresponding [`ChainTipBlock`]
+    /// and its recent ancestors.
     ///
     /// Returns an error if communication with the state is lost.
-    async fn tip_block_change(&mut self) -> Result<ChainTipBlock, watch::error::RecvError> {
+    async fn tip_block_change(
+        &mut self,
+    ) -> Result<(ChainTipBlock, RecentTipAncestors), watch::error::RecvError> {
         loop {
             // If there are multiple changes while this code is executing,
             // we don't rely on getting the first block or the latest block
@@ -718,19 +829,8 @@ impl ChainTipChange {
             // TODO: use `receiver.borrow_and_update()` in `with_chain_tip_block()`,
             //       once we upgrade to tokio 1.0 (#2200)
             //       and remove this extra check
-            let new_block = self
-                .latest_chain_tip
-                .with_chain_tip_block(|block| {
-                    if Some(block.hash) != self.last_change_hash {
-                        Some(block.clone())
-                    } else {
-                        None
-                    }
-                })
-                .flatten();
-
-            if let Some(block) = new_block {
-                return Ok(block);
+            if let Some(change) = self.changed_tip() {
+                return Ok(change);
             }
         }
     }
@@ -764,7 +864,7 @@ impl TipAction {
     /// regardless of the underlying variant.
     pub fn best_tip_hash(&self) -> block::Hash {
         match self {
-            Grow { block } => block.hash,
+            Grow { block, .. } => block.hash,
             Reset { hash, .. } => *hash,
         }
     }
@@ -773,7 +873,7 @@ impl TipAction {
     /// regardless of the underlying variant.
     pub fn best_tip_height(&self) -> block::Height {
         match self {
-            Grow { block } => block.height,
+            Grow { block, .. } => block.height,
             Reset { height, .. } => *height,
         }
     }
@@ -782,14 +882,25 @@ impl TipAction {
     /// regardless of the underlying variant.
     pub fn best_tip_hash_and_height(&self) -> (block::Hash, block::Height) {
         match self {
-            Grow { block } => (block.hash, block.height),
+            Grow { block, .. } => (block.hash, block.height),
             Reset { hash, height } => (*hash, *height),
         }
     }
 
-    /// Returns a [`Grow`] based on `block`.
+    /// Returns a [`Grow`] based on `block`, a child of the previous tip.
+    ///
+    /// Designed for use in tests.
+    #[cfg(test)]
     pub(crate) fn grow_with(block: ChainTipBlock) -> Self {
-        Grow { block }
+        Self::grow_through(Vec::new(), block)
+    }
+
+    /// Returns a [`Grow`] that adds `skipped_blocks`, oldest first, and then `block`.
+    pub(crate) fn grow_through(skipped_blocks: Vec<ChainTipBlock>, block: ChainTipBlock) -> Self {
+        Grow {
+            block,
+            skipped_blocks,
+        }
     }
 
     /// Returns a [`Reset`] based on `block`.
@@ -797,20 +908,6 @@ impl TipAction {
         Reset {
             height: block.height,
             hash: block.hash,
-        }
-    }
-
-    /// Converts this [`TipAction`] into a [`Reset`].
-    ///
-    /// Designed for use in tests.
-    #[cfg(test)]
-    pub(crate) fn into_reset(self) -> Self {
-        match self {
-            Grow { block } => Reset {
-                height: block.height,
-                hash: block.hash,
-            },
-            reset @ Reset { .. } => reset,
         }
     }
 }

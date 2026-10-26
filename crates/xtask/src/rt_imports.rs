@@ -27,12 +27,20 @@
 //! spelling is checked as well, so the bare spellings `SystemTime::now`,
 //! `Utc::now`, `Local::now` and `Arc::downgrade` stay flagged.
 //!
-//! `UNIX_EPOCH.elapsed()` and `SystemTime::elapsed` read the wall clock too,
-//! so they're flagged. `.elapsed()` on another `SystemTime` value isn't,
-//! since the check doesn't know a value's type.
+//! Every possible binding is checked, so `cfg` alternatives can't hide one
+//! another. Qualified calls such as `<Instant>::now()` are checked as the
+//! plain path. `UNIX_EPOCH.elapsed()`, under any parentheses or `&`, and
+//! `SystemTime::elapsed` read the wall clock, so they're flagged. Macro
+//! arguments that parse as expressions or statements, as `dbg!`, `assert!`,
+//! `assert_eq!` and `println!` take, are visited as code under the same rules.
 //!
-//! The check does not yet cover the timer adapters in `tokio_stream`, or
-//! `std::thread::available_parallelism`, a host property discovery reads.
+//! Limits: macros with syntax of their own, such as `tokio::select!` or a
+//! DSL, can't be parsed generically and only get a token scan, which sees
+//! written-out paths like `std::time::Instant::now` but not aliases.
+//! `.elapsed()` on a `SystemTime` value other than the epoch isn't flagged,
+//! since the check doesn't know a value's type. The timer adapters in
+//! `tokio_stream` and `std::thread::available_parallelism`, a host property
+//! discovery reads, aren't covered yet.
 
 use std::{
     collections::BTreeMap,
@@ -789,7 +797,9 @@ impl<'a> PathVisitor<'a> {
         true
     }
 
-    /// Checks `a::b::c` paths inside macro arguments, which syn leaves as tokens.
+    /// Checks written-out `a::b::c` paths inside macro arguments that don't
+    /// parse as code. Resolves them through the names in scope, but can't see
+    /// imports made inside the arguments.
     fn check_tokens(&mut self, tokens: TokenStream) {
         let tokens: Vec<TokenTree> = tokens.into_iter().collect();
         let mut i = 0;

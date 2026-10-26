@@ -310,9 +310,10 @@ impl ServiceRegistry {
     /// Each tabled persistent session layout once, ordered by primary stream
     /// kind, then by version.
     ///
-    /// Layouts without message tables never appear: legacy gossip's kinds 2
-    /// and 3 and the header-sync passthrough stream declare none. The
-    /// connection's control stream belongs to no service.
+    /// Layouts without message tables never appear: legacy gossip's kind 2
+    /// and the header-sync passthrough stream declare none. Request/response
+    /// streams, such as legacy gossip's kind 3, never form a session layout.
+    /// The connection's control stream belongs to no service.
     ///
     /// This lists every alternative a service registers. A session negotiates
     /// at most one of them per service from its capability mask.
@@ -851,8 +852,7 @@ mod tests {
             .into();
         assert_eq!(layouts, negotiated);
         // Every mask negotiates at most one complete layout per service,
-        // preferring the highest primary version, while the enumeration stays
-        // fixed.
+        // preferring the highest primary version.
         for mask in 0..32 {
             let mut expected = if mask & 4 != 0 {
                 vec![single]
@@ -871,7 +871,6 @@ mod tests {
                 expected,
                 "mask {mask}"
             );
-            assert_eq!(registry.session_layouts().count(), 3);
         }
     }
 

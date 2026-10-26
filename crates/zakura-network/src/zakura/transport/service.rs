@@ -274,11 +274,13 @@ impl Peer {
     /// cancellation token is a child of `cancel_token`, so cancelling
     /// `cancel_token` closes the connection and the session with it.
     ///
-    /// A session that replaces another needs a new `conn_id`, a new token,
-    /// and a `session_id` never used before for the same peer. Header sync
-    /// matches a session's teardown by peer and session ID alone, so a reused
-    /// ID would let the replaced session's late teardown remove its
-    /// replacement.
+    /// A session that replaces another needs a `conn_id` greater than the
+    /// current connection's for that peer, since [`ZakuraConnId`]s only
+    /// increase and header sync refuses a session from an older connection.
+    /// It also needs a new token and a `session_id` never used before for
+    /// the same peer. Header sync matches a session's teardown by peer and
+    /// session ID alone, so a reused ID would let the replaced session's
+    /// late teardown remove its replacement.
     #[allow(clippy::too_many_arguments)]
     pub fn new_versioned(
         conn_id: ZakuraConnId,

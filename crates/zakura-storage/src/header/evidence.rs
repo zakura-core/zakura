@@ -17,6 +17,10 @@ use zakura_node_services::header_chain::{
 
 use super::{controlled::OpId, Fault, HeaderOp, HeaderReply, HeaderRequest};
 
+mod model;
+
+pub use model::{ModelFailure, Owner, OwnerModel, StateField};
+
 /// One retained-path lease: the peer holding it, that peer's session, and
 /// the lease ID the registry issued.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

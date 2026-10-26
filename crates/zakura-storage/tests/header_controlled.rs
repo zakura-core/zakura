@@ -3,7 +3,9 @@
 //! (storage.md ST3.1 to ST3.4 and ST3.6).
 
 use std::{
+    cell::RefCell,
     future::Future,
+    ops::Deref,
     pin::pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,11 +26,11 @@ use zakura_rt::sync::Semaphore;
 #[cfg(not(zakura_sim))]
 use zakura_storage::header::controlled::BindError;
 use zakura_storage::header::{
-    controlled::{CompleteError, Completion, ControlledPort, FactKind, OpId},
+    controlled::{CompleteError, Completion, ControlledPort, Fact, FactKind, OpId},
     evidence::{
         CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
-        LeaseState, OperationStage, PathPosition, RequestIdentity, ResultIdentity, RetentionEnd,
-        SignalClass, Waiter,
+        LeaseState, OperationStage, OwnerModel, PathPosition, RequestIdentity, ResultIdentity,
+        RetentionEnd, SignalClass, Waiter,
     },
     fixture::HeaderFixture,
     lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
@@ -82,12 +84,66 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// A controlled port whose engine holds `count` headers on the anchor,
-/// admitted through the engine port directly. Returns the port and the
-/// headers' frontiers.
-fn chain(count: u32) -> (ControlledPort, Vec<Frontier>) {
+/// A controlled port whose every drained fact is checked, with the port's
+/// actual owner state, against an [`OwnerModel`] (ST3-B+2). Dropping it
+/// checks whatever the test left undrained.
+struct Checked {
+    port: ControlledPort,
+    /// `None` once a test stops checking.
+    model: RefCell<Option<OwnerModel>>,
+}
+
+impl Checked {
+    /// A checked port over a new pristine one.
+    fn new(fixture: &HeaderFixture) -> Self {
+        Checked {
+            port: ControlledPort::new(fixture),
+            model: RefCell::new(Some(OwnerModel::new())),
+        }
+    }
+
+    /// Stops checking, for a test that changes owner state outside the
+    /// controlled operations on purpose.
+    fn uncheck(&self) {
+        self.model.replace(None);
+    }
+
+    /// The facts published since the last drain, once the model has applied
+    /// them and matched the port's actual owner state. Panics if it can't.
+    fn take_facts(&self) -> Vec<Fact> {
+        let facts = self.port.take_facts();
+        if let Some(model) = self.model.borrow_mut().as_mut() {
+            let actual = self.port.owner_state();
+            if let Err(failure) = model.check_boundary(&facts, &actual) {
+                panic!("the owner model failed with {failure:?} on {facts:#?}");
+            }
+        }
+        facts
+    }
+}
+
+impl Deref for Checked {
+    type Target = ControlledPort;
+
+    fn deref(&self) -> &ControlledPort {
+        &self.port
+    }
+}
+
+impl Drop for Checked {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.take_facts();
+        }
+    }
+}
+
+/// A checked controlled port whose engine holds `count` headers on the
+/// anchor, admitted through the engine port directly. Returns the port and
+/// the headers' frontiers.
+fn chain(count: u32) -> (Checked, Vec<Frontier>) {
     let fixture = HeaderFixture::regtest();
-    let port = ControlledPort::new(&fixture);
+    let port = Checked::new(&fixture);
     let anchor = fixture.anchor();
     let headers = fixture.extend(anchor, count, 0);
     let prepared = prepared(&port, anchor, &headers, 1);
@@ -414,7 +470,7 @@ async fn prepare_and_apply_never_time_out() {
 }
 
 /// The kinds of every fact published since the last drain, in order.
-fn kinds(port: &ControlledPort) -> Vec<FactKind> {
+fn kinds(port: &Checked) -> Vec<FactKind> {
     port.take_facts()
         .into_iter()
         .map(|fact| fact.kind)
@@ -956,9 +1012,9 @@ fn a_locator_after_shutdown_returns_its_permit() {
 /// `count` headers on the anchor, admitted in batches no longer than the
 /// transition cap through the engine port directly. Returns the port and
 /// the headers' frontiers.
-fn long_chain(count: u32) -> (ControlledPort, Vec<Frontier>) {
+fn long_chain(count: u32) -> (Checked, Vec<Frontier>) {
     let fixture = HeaderFixture::regtest();
-    let port = ControlledPort::new(&fixture);
+    let port = Checked::new(&fixture);
     let cap = u32::try_from(zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1)
         .expect("the cap fits u32");
     let (mut parent, mut frontiers, mut request_id) = (fixture.anchor(), Vec::new(), 1);
@@ -1194,7 +1250,7 @@ fn refusals_name_the_signal_they_hand_out() {
 /// Every fact published since the last drain, grouped by transaction.
 /// Checks that sequence numbers are gapless, that each transaction's facts
 /// are consecutive, and that each ends with exactly one head.
-fn transactions(port: &ControlledPort) -> Vec<Vec<FactKind>> {
+fn transactions(port: &Checked) -> Vec<Vec<FactKind>> {
     let mut groups: Vec<(u64, Vec<FactKind>)> = Vec::new();
     let mut last_seq = None;
     for fact in port.take_facts() {
@@ -1924,6 +1980,7 @@ fn only_a_pristine_port_binds() {
     submit(&mut call);
     assert!(!used.is_pristine());
     let (leased, leased_headers) = chain(1);
+    leased.uncheck();
     acquired(ready(leased.engine().acquire_header_path(acquire(
         &leased,
         peer(1),

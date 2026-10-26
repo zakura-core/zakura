@@ -21,8 +21,10 @@ use zakura_node_services::header_chain::{
     SelectedChainMembership,
 };
 use zakura_rt::sync::Semaphore;
+#[cfg(not(zakura_sim))]
+use zakura_storage::header::controlled::BindError;
 use zakura_storage::header::{
-    controlled::{BindError, CompleteError, Completion, ControlledPort, FactKind, OpId},
+    controlled::{CompleteError, Completion, ControlledPort, FactKind, OpId},
     evidence::{
         CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
         LeaseState, OperationStage, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass,
@@ -1844,20 +1846,16 @@ async fn a_stale_abandoned_acquire_leaves_the_replacement_lease() {
 
 /// C2: a port binds to its run only while pristine. A committed setup
 /// chain is fine, any operation or lease isn't, and a second bind is
-/// refused.
+/// refused. The simulator build has no run here, so it checks binding in
+/// `tests/header_scheduled.rs`.
 #[test]
 fn only_a_pristine_port_binds() {
     let (port, headers) = chain(1);
     assert!(port.is_pristine(), "a committed chain isn't owner state");
-    assert_eq!(port.bind_to_run(), Ok(()));
-    assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
-
     let (used, _) = chain(1);
     let mut call = used.selected_chain_contains(headers[0].hash);
     submit(&mut call);
     assert!(!used.is_pristine());
-    assert_eq!(used.bind_to_run(), Err(BindError::NotPristine));
-
     let (leased, leased_headers) = chain(1);
     acquired(ready(leased.engine().acquire_header_path(acquire(
         &leased,
@@ -1866,7 +1864,14 @@ fn only_a_pristine_port_binds() {
         leased_headers[0],
     ))));
     assert!(!leased.is_pristine(), "a setup lease is owner state");
-    assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
+
+    #[cfg(not(zakura_sim))]
+    {
+        assert_eq!(port.bind_to_run(), Ok(()));
+        assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
+        assert_eq!(used.bind_to_run(), Err(BindError::NotPristine));
+        assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
+    }
 }
 
 /// D14: the snapshot reads each caller's presence from a token its call

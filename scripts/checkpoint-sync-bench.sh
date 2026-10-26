@@ -609,6 +609,13 @@ run_one() {
   local t_escape="" end_height="$START_HEIGHT" h now elapsed clean_stop=0
   while :; do
     now=$(date +%s); elapsed=$((now - t0))
+    # A binary that cannot reuse the fixture's DB format syncs from genesis, and
+    # scrape_height would still report START_HEIGHT plus its commit count.
+    h="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null \
+          | awk '$1=="state_finalized_block_height" {printf "%d", $2; exit}')" || true
+    if [[ -n "$h" ]] && (( h > 0 && h < START_HEIGHT )); then
+      die "$tag committed height $h below the fixture tip $START_HEIGHT; its DB format cannot reuse this state"
+    fi
     h="$(scrape_height "$logf")" || true
     # only trust sane readings: between the snapshot tip and just past the stop height
     if [[ -n "$h" ]] && (( h >= START_HEIGHT && h <= STOP_HEIGHT + 200 )); then

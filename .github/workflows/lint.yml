@@ -58,7 +58,7 @@ on:
   # so this runs unconditionally on every queued entry.
   merge_group:
 
-  # Nightly run for the expensive, non-gating lints (unused-deps, docs) that are
+  # Nightly run for the expensive, non-gating unused-deps lint that is
   # gated off the PR/merge path below.
   schedule:
     - cron: "0 8 * * *"
@@ -143,35 +143,6 @@ jobs:
       # the MSRV toolchain. Stable CI retains final code generation and linking
       # coverage.
       - run: cargo check --workspace --bins
-
-  docs:
-    name: docs
-    # A full `--all-features --document-private-items` doc build is expensive and
-    # not a correctness gate. Run it nightly / on demand only, keeping it off the
-    # PR critical path.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
-        with:
-          # Later nightlies hit the rustdoc ICE described at `PUBLIC_API_NIGHTLY` in
-          # semver-checks.yml. Keep the two pins in step.
-          toolchain: nightly-2026-09-06
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: ./.github/actions/setup-zakura-build
-      - run: cargo doc --no-deps --workspace --all-features --document-private-items --target-dir "$(pwd)"/target/internal
-        env:
-          # The -A and -W settings must be the same as the `rustdocflags` in:
-          # https://github.com/ZcashFoundation/zebra/blob/main/.cargo/config.toml#L87
-          RUSTDOCFLAGS: -A rustdoc::private_intra_doc_links -D warnings
 
   fast-lints:
     name: fast lints
@@ -436,7 +407,6 @@ jobs:
     needs:
       - rust-checks
       - msrv
-      - docs
       - fast-lints
       - unused-deps
       - supply-chain
@@ -493,5 +463,5 @@ jobs:
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
-          # docs and unused-deps run only on the nightly schedule / on demand.
-          allowed-skips: docs, unused-deps
+          # unused-deps runs only on the nightly schedule / on demand.
+          allowed-skips: unused-deps

@@ -20,8 +20,9 @@
 //! `std::thread::panicking` stay allowed.
 //!
 //! Scopes aren't tracked. A first pass records every path each name is
-//! bound to by a production `use` anywhere in the file, in any module, block,
-//! `cfg` alternative or macro argument. A path is flagged if its written
+//! bound to by a production `use`, or by a non-generic `type` alias of a plain
+//! path, anywhere in the file, in any module, block, `cfg` alternative or
+//! macro argument. A path is flagged if its written
 //! spelling, or any expansion of it, hits a rule: expansion drops `self`,
 //! `super`, `crate` and the file's inline module names from the front, and
 //! replaces a bound first segment with each path the file binds it to,
@@ -46,7 +47,9 @@
 //! Limits: macros with syntax of their own, such as `tokio::select!` or a
 //! DSL, can't be parsed generically and only get a token scan. It sees
 //! written-out paths like `std::time::Instant::now`, expanded through the
-//! file's names, but not imports made inside the macro. `.elapsed()` on a
+//! file's names, but not imports made inside the macro. Only simple path
+//! aliases are followed: a generic `type` alias, or one whose target isn't a
+//! plain path, isn't. `.elapsed()` on a
 //! `SystemTime` value other than the epoch isn't flagged outside the files
 //! that may name std's `Instant`, since the check doesn't know a value's type.
 //! The timer adapters in `tokio_stream` and
@@ -917,6 +920,30 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
         visit::visit_expr_path(self, expr);
     }
 
+    /// Records a non-generic `type X = path;` as a binding of `X`, like a
+    /// `use`, then checks the aliased path.
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        let mut ty = &*item.ty;
+        while let syn::Type::Paren(syn::TypeParen { elem, .. })
+        | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+        {
+            ty = elem;
+        }
+        if let (true, syn::Type::Path(syn::TypePath { qself: None, path })) =
+            (self.collecting && item.generics.params.is_empty(), ty)
+        {
+            let target = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string());
+            self.names
+                .entry(item.ident.to_string())
+                .or_default()
+                .insert(target.collect());
+        }
+        visit::visit_item_type(self, item);
+    }
+
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         for leaf in use_leaves(&item.tree) {
             if !self.collecting {
@@ -1595,6 +1622,21 @@ mod tests {
         );
         let elsewhere = "fn age(start: Start) { let _ = start.elapsed(); }";
         assert_eq!(violations(elsewhere), Vec::<String>::new());
+    }
+
+    /// A plain `type` alias binds its name like a `use` does.
+    #[test]
+    fn simple_type_aliases_are_followed() {
+        let source = "type Clock = std::time::SystemTime; fn read() -> Clock { Clock::now() }";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
+        );
+        let source = "type Clock = std::time::Instant; fn read() -> Clock { Clock::now() }";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
+        );
     }
 
     /// M3.7's bypass inventory: every runtime path left in `zakura-network`'s

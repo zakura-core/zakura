@@ -22,8 +22,11 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
-    controlled::{CompleteError, Completion, ControlledPort, OpId, StorageEvent},
-    evidence::{LeaseKey, RequestIdentity, ResultIdentity, SignalClass},
+    controlled::{CompleteError, Completion, ControlledPort, FactKind, OpId},
+    evidence::{
+        CapacityClass, LeaseFact, LeaseKey, RequestIdentity, ResultIdentity, RetentionEnd,
+        SignalClass, Waiter,
+    },
     fixture::HeaderFixture,
     lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
     Fault, HeaderOp, Outcome, Release,
@@ -407,6 +410,14 @@ async fn prepare_and_apply_never_time_out() {
     );
 }
 
+/// The kinds of every fact published since the last drain, in order.
+fn kinds(port: &ControlledPort) -> Vec<FactKind> {
+    port.take_facts()
+        .into_iter()
+        .map(|fact| fact.kind)
+        .collect()
+}
+
 /// The peer numbered `n`.
 fn peer(n: u8) -> SourceId {
     SourceId::from_digest([n; 32])
@@ -446,6 +457,12 @@ fn run<F: Future + Unpin>(port: &ControlledPort, mut call: F) -> (F::Output, Com
         .complete(id, ENGINE)
         .expect("the engine outcome is legal");
     (ready(call), completion)
+}
+
+/// Submits `call` and completes it with the engine outcome, for a call
+/// whose reply doesn't matter. Returns the completion.
+fn complete<F: Future + Unpin>(port: &ControlledPort, call: F) -> Completion {
+    run(port, call).1
 }
 
 /// The leased path in `reply`.
@@ -496,22 +513,17 @@ fn a_cancelled_apply_still_commits() {
         .expect("the engine port holds the sender"));
     assert_ne!(completion.state_digest, before);
     assert_eq!(completion.state_digest, port.engine().state_digest());
-    let events = port.take_events();
     assert!(matches!(
-        events.as_slice(),
+        kinds(&port).as_slice(),
         [
-            StorageEvent::Submitted {
+            FactKind::Submitted {
                 id: OpId(1),
                 request: RequestIdentity::ApplyHeaderTarget { .. },
                 ..
             },
-            StorageEvent::CallerDropped { id: OpId(1) },
-            StorageEvent::Completed(Completion {
-                id: OpId(1),
-                delivered: false,
-                ..
-            }),
-        ]
+            FactKind::CallerDropped { id: OpId(1) },
+            FactKind::Completed(completion),
+        ] if completion.id == OpId(1) && !completion.delivered
     ));
 }
 
@@ -599,18 +611,22 @@ fn an_abandoned_acquire_ends_its_lease() {
         .expect("the acquire completes");
     assert!(completion.delivered);
     assert_eq!(port.engine().live_leases(), 1);
-    port.take_events();
+    port.take_facts();
     drop(unread);
     assert_eq!(port.engine().live_leases(), 0);
     assert!(matches!(
-        port.take_events().as_slice(),
-        [StorageEvent::ReplyDropped {
-            id: OpId(2),
-            lease_ends,
-        }] if matches!(
-            lease_ends.as_slice(),
-            [LeaseEnd { release: Release::LeaseAbandonedAcquire, .. }]
-        )
+        kinds(&port).as_slice(),
+        [
+            FactKind::Lease(LeaseFact::CapabilityEnded {
+                release: Release::LeaseAbandonedAcquire,
+                ..
+            }),
+            FactKind::Lease(LeaseFact::RetentionEnded {
+                why: RetentionEnd::WithCapability,
+                ..
+            }),
+            FactKind::ReplyDropped { id: OpId(2) },
+        ]
     ));
 
     let (reply, _) = run(
@@ -729,11 +745,11 @@ fn records_carry_attribution_and_digests() {
             for read in &mut reads {
                 submit(read);
             }
-            let events = port.take_events();
+            let events = kinds(&port);
             let read_digests: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    StorageEvent::Submitted {
+                    FactKind::Submitted {
                         request: RequestIdentity::ReadHeaderPath { lease, .. },
                         request_digest,
                         ..
@@ -747,9 +763,13 @@ fn records_carry_attribution_and_digests() {
                 .collect();
             assert_eq!(read_digests.len(), 2);
             assert_ne!(read_digests[0], read_digests[1]);
-            let StorageEvent::Completed(acquired) = &events[1] else {
-                panic!("expected the acquire's completion, got {:?}", events[1]);
-            };
+            let acquired = events
+                .iter()
+                .find_map(|event| match event {
+                    FactKind::Completed(completion) => Some(completion),
+                    _ => None,
+                })
+                .expect("the acquire completed");
             assert!(matches!(
                 acquired.request,
                 RequestIdentity::AcquireHeaderPath { peer: acquirer, session_id: 9, .. }
@@ -781,7 +801,7 @@ fn shutdown_ends_everything_without_running_work() {
         .expect("the acquire completes");
     assert_eq!(port.engine().live_leases(), 1);
     assert_eq!(semaphore.available_permits(), 0);
-    port.take_events();
+    port.take_facts();
 
     port.shut_down();
     assert_eq!(port.engine().snapshot(), snapshot, "the apply never ran");
@@ -789,13 +809,19 @@ fn shutdown_ends_everything_without_running_work() {
     assert_eq!(port.engine().live_leases(), 0);
     assert!(port.pending().is_empty());
     assert!(matches!(
-        port.take_events().as_slice(),
-        [StorageEvent::ShutDown { dropped, lease_ends }]
-            if dropped == &[OpId(1), OpId(2), OpId(3)]
-                && matches!(
-                    lease_ends.as_slice(),
-                    [LeaseEnd { release: Release::Shutdown, .. }]
-                )
+        kinds(&port).as_slice(),
+        [
+            FactKind::PermitDropped { id: OpId(2) },
+            FactKind::Lease(LeaseFact::CapabilityEnded {
+                release: Release::Shutdown,
+                ..
+            }),
+            FactKind::Lease(LeaseFact::RetentionEnded {
+                why: RetentionEnd::WithCapability,
+                ..
+            }),
+            FactKind::ShutDown { dropped },
+        ] if dropped == &[OpId(1), OpId(2), OpId(3)]
     ));
 
     assert!(poll(&mut locator, Waker::noop()).is_pending());
@@ -805,7 +831,7 @@ fn shutdown_ends_everything_without_running_work() {
     drop((locator, unread, after));
     port.shut_down();
     assert!(port.pending().is_empty());
-    assert!(port.take_events().is_empty());
+    assert!(port.take_facts().is_empty());
 }
 
 /// Shutdown closes the selected-chain watch, so a receiver taken before it
@@ -856,11 +882,10 @@ fn apply_digests_cover_the_sealed_insertion() {
     for apply in &mut applies {
         submit(apply);
     }
-    let submitted: Vec<_> = port
-        .take_events()
+    let submitted: Vec<_> = kinds(&port)
         .into_iter()
         .filter_map(|event| match event {
-            StorageEvent::Submitted {
+            FactKind::Submitted {
                 request: RequestIdentity::ApplyHeaderTarget { source, .. },
                 request_digest,
                 ..
@@ -893,11 +918,10 @@ fn apply_identities_name_their_parent() {
     for target in targets {
         submit(&mut port.apply_header_target(target));
     }
-    let identities: Vec<_> = port
-        .take_events()
+    let identities: Vec<_> = kinds(&port)
         .into_iter()
-        .filter_map(|event| match event {
-            StorageEvent::Submitted { request, .. } => Some(request),
+        .filter_map(|kind| match kind {
+            FactKind::Submitted { request, .. } => Some(request),
             _ => None,
         })
         .collect();
@@ -1164,6 +1188,527 @@ fn refusals_name_the_signal_they_hand_out() {
     );
 }
 
+/// Every fact published since the last drain, grouped by transaction.
+/// Checks that sequence numbers are gapless, that each transaction's facts
+/// are consecutive, and that each ends with exactly one head.
+fn transactions(port: &ControlledPort) -> Vec<Vec<FactKind>> {
+    let mut groups: Vec<(u64, Vec<FactKind>)> = Vec::new();
+    let mut last_seq = None;
+    for fact in port.take_facts() {
+        if let Some(last) = last_seq {
+            assert_eq!(fact.seq, last + 1, "sequence numbers are gapless");
+        }
+        last_seq = Some(fact.seq);
+        match groups.last_mut() {
+            Some((txn, kinds)) if *txn == fact.txn => kinds.push(fact.kind),
+            _ => {
+                assert!(
+                    groups.iter().all(|(txn, _)| *txn < fact.txn),
+                    "a transaction's facts are consecutive"
+                );
+                groups.push((fact.txn, vec![fact.kind]));
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, kinds)| {
+            let (head, rest) = kinds.split_last().expect("a transaction has a head");
+            assert!(head.is_head() && rest.iter().all(|kind| !kind.is_head()));
+            kinds
+        })
+        .collect()
+}
+
+/// `txns` as slices, for slice patterns.
+fn slices(txns: &[Vec<FactKind>]) -> Vec<&[FactKind]> {
+    txns.iter().map(Vec::as_slice).collect()
+}
+
+/// The key of `path`'s lease, for `peer` in `session_id`.
+fn key(peer: SourceId, session_id: u64, path: &RetainedHeaderPath) -> LeaseKey {
+    LeaseKey {
+        peer,
+        session_id,
+        lease_id: path.handle_id(),
+    }
+}
+
+/// The lease fact `kind` records.
+fn lease_fact(kind: &FactKind) -> &LeaseFact {
+    match kind {
+        FactKind::Lease(fact) => fact,
+        other => panic!("expected a lease fact, got {other:?}"),
+    }
+}
+
+/// D15: submissions, caller drops and reply takes are one-transaction
+/// changes, and a locator's permit is taken at submission and dropped by
+/// its completion's transaction.
+#[test]
+fn task_side_changes_are_single_transactions() {
+    let (port, chain) = chain(1);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut locator = port.continuation_locator(permit(&semaphore));
+    submit(&mut locator);
+    drop(locator);
+    port.complete(OpId(1), ENGINE)
+        .expect("the locator completes");
+    assert!(matches!(
+        slices(&transactions(&port)).as_slice(),
+        [
+            [
+                FactKind::PermitTaken { id: OpId(1) },
+                FactKind::Submitted { id: OpId(1), .. },
+            ],
+            [FactKind::CallerDropped { id: OpId(1) }],
+            [
+                FactKind::PermitDropped { id: OpId(1) },
+                FactKind::Completed(_)
+            ],
+        ]
+    ));
+
+    let (_, _) = run(&port, port.selected_chain_contains(chain[0].hash));
+    assert!(matches!(
+        slices(&transactions(&port)).as_slice(),
+        [
+            [FactKind::Submitted { id: OpId(2), .. }],
+            [FactKind::Completed(_)],
+            [FactKind::ReplyTaken { id: OpId(2) }],
+        ]
+    ));
+}
+
+/// B5 and the plan's acquire, read and release tables: each path publishes
+/// exactly its lease facts, in the registry's order, before its
+/// completion.
+#[test]
+fn acquire_read_and_release_paths_publish_their_lease_facts() {
+    let (port, chain) = chain(3);
+    let anchor = HeaderFixture::regtest().anchor();
+
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    let first = acquired(reply);
+    let l1 = key(peer(1), 1, &first);
+    let txns = transactions(&port);
+    assert_eq!(
+        *lease_fact(&txns[1][0]),
+        LeaseFact::Leased {
+            lease: l1,
+            scope: first.scope,
+            target: chain[2],
+            common_ancestor: anchor,
+            capacity: CapacityClass::General,
+            continued_from: None,
+        }
+    );
+    assert!(matches!(txns[1][1], FactKind::Completed(_)));
+
+    complete(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    complete(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    let txns = transactions(&port);
+    assert_eq!(
+        *lease_fact(&txns[1][0]),
+        LeaseFact::WaiterSet(Waiter::Peer(l1))
+    );
+    assert_eq!(txns[1].len(), 2, "the first refusal sets the waiter");
+    assert_eq!(txns[4].len(), 1, "a repeat refusal finds it set");
+
+    complete(&port, port.release_header_path(first.clone()));
+    complete(&port, port.release_header_path(first));
+    let txns = transactions(&port);
+    assert_eq!(
+        txns[1][..3]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::CapabilityEnded {
+                lease: l1,
+                release: Release::LeaseReleased,
+            },
+            LeaseFact::WaiterFired(Waiter::Peer(l1)),
+            LeaseFact::RetentionEnded {
+                lease: l1,
+                why: RetentionEnd::WithCapability,
+            },
+        ]
+    );
+    assert_eq!(txns[4].len(), 1, "a stale release ends nothing");
+
+    // A partial page caches the path for continuation.
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(2), 1, chain[2])),
+    );
+    let second = acquired(reply);
+    let l2 = key(peer(2), 1, &second);
+    complete(&port, port.read_header_path(second, page_after(anchor, 1)));
+    let txns = transactions(&port);
+    assert_eq!(
+        txns[4][..2]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::CapabilityEnded {
+                lease: l2,
+                release: Release::LeaseConsumedByRead,
+            },
+            LeaseFact::RetentionCached {
+                lease: l2,
+                last_frontier: chain[0],
+            },
+        ]
+    );
+
+    // A scope that names another target is refused before the cache.
+    let mut wrong_scope = acquire(&port, peer(2), 1, chain[2]);
+    wrong_scope.scope = acquire(&port, peer(2), 1, chain[1]).scope;
+    let (_, busy) = run(&port, port.acquire_header_path(wrong_scope));
+    assert_eq!(busy.result, ResultIdentity::Busy);
+    assert_eq!(transactions(&port)[1].len(), 1);
+    assert_eq!(port.engine().continued_peers(), [peer(2)]);
+
+    // A matching acquire continues from the cached path.
+    let mut continued = acquire(&port, peer(2), 1, chain[2]);
+    continued.locator_hashes = vec![chain[0].hash];
+    let (reply, _) = run(&port, port.acquire_header_path(continued));
+    let third = acquired(reply);
+    let l3 = key(peer(2), 1, &third);
+    let txns = transactions(&port);
+    assert_eq!(
+        txns[1][..2]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::RetentionEnded {
+                lease: l2,
+                why: RetentionEnd::Continued { into: l3.lease_id },
+            },
+            LeaseFact::Leased {
+                lease: l3,
+                scope: third.scope,
+                target: chain[2],
+                common_ancestor: chain[0],
+                capacity: CapacityClass::General,
+                continued_from: Some(l2.lease_id),
+            },
+        ]
+    );
+
+    // A read with the wrong start leaves the live lease alone.
+    let (_, unavailable) = run(
+        &port,
+        port.read_header_path(third.clone(), page_after(anchor, 1)),
+    );
+    assert_eq!(unavailable.result, ResultIdentity::PageUnavailable);
+    assert_eq!(transactions(&port)[1].len(), 1);
+    assert_eq!(port.engine().live_leases(), 1);
+
+    // The final page ends retention with the capability.
+    complete(&port, port.read_header_path(third, page_after(chain[0], 2)));
+    let txns = transactions(&port);
+    assert_eq!(
+        *lease_fact(&txns[1][1]),
+        LeaseFact::RetentionEnded {
+            lease: l3,
+            why: RetentionEnd::WithCapability,
+        }
+    );
+
+    // A cached path the next acquire can't continue from is discarded.
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(3), 1, chain[2])),
+    );
+    let fourth = acquired(reply);
+    let l4 = key(peer(3), 1, &fourth);
+    complete(&port, port.read_header_path(fourth, page_after(anchor, 1)));
+    transactions(&port);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(3), 2, chain[2])),
+    );
+    let fifth = acquired(reply);
+    let txns = transactions(&port);
+    assert_eq!(
+        *lease_fact(&txns[1][0]),
+        LeaseFact::RetentionEnded {
+            lease: l4,
+            why: RetentionEnd::Discarded,
+        }
+    );
+    assert!(matches!(
+        lease_fact(&txns[1][1]),
+        LeaseFact::Leased { lease, continued_from: None, .. }
+            if *lease == key(peer(3), 2, &fifth)
+    ));
+}
+
+/// The idle sweep's facts come first in the sweeping acquire's
+/// transaction, and an acquire whose caller is gone abandons its new lease
+/// in its own completion's transaction.
+#[tokio::test(start_paused = true)]
+async fn sweeps_and_abandonment_belong_to_their_completion() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let l1 = key(peer(1), 1, &acquired(reply));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    transactions(&port);
+    complete(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(2), 1, chain[0])),
+    );
+    let txns = transactions(&port);
+    assert_eq!(
+        txns[1][..2]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::CapabilityEnded {
+                lease: l1,
+                release: Release::LeaseIdleExpired,
+            },
+            LeaseFact::RetentionEnded {
+                lease: l1,
+                why: RetentionEnd::WithCapability,
+            },
+        ]
+    );
+    assert!(matches!(lease_fact(&txns[1][2]), LeaseFact::Leased { .. }));
+
+    let mut gone = port.acquire_header_path(acquire(&port, peer(3), 1, chain[0]));
+    submit(&mut gone);
+    drop(gone);
+    let id = port.pending()[0].id;
+    port.complete(id, ENGINE).expect("the acquire completes");
+    let txns = transactions(&port);
+    let completion = txns.last().expect("the completion's transaction");
+    assert!(matches!(
+        completion.as_slice(),
+        [
+            FactKind::Lease(LeaseFact::Leased { .. }),
+            FactKind::Lease(LeaseFact::CapabilityEnded {
+                release: Release::LeaseAbandonedAcquire,
+                ..
+            }),
+            FactKind::Lease(LeaseFact::RetentionEnded {
+                why: RetentionEnd::WithCapability,
+                ..
+            }),
+            FactKind::Completed(done),
+        ] if !done.delivered
+    ));
+}
+
+/// A partial page into a full continuation cache evicts the lowest lease
+/// ID first, then caches the new path.
+#[test]
+fn a_full_continuation_cache_evicts_before_caching() {
+    let (port, chain) = chain(3);
+    let anchor = HeaderFixture::regtest().anchor();
+    let mut keys = Vec::new();
+    for n in 1..=u8::try_from(MAX_RETAINED_PATH_LEASES + 1).expect("17 fits u8") {
+        let (reply, _) = run(
+            &port,
+            port.acquire_header_path(acquire(&port, peer(n), 1, chain[2])),
+        );
+        let path = acquired(reply);
+        keys.push(key(peer(n), 1, &path));
+        complete(&port, port.read_header_path(path, page_after(anchor, 1)));
+    }
+    let txns = transactions(&port);
+    let last_read = &txns[txns.len() - 2];
+    let newest = *keys.last().expect("17 leases");
+    assert_eq!(
+        last_read[..3]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::CapabilityEnded {
+                lease: newest,
+                release: Release::LeaseConsumedByRead,
+            },
+            LeaseFact::RetentionEnded {
+                lease: keys[0],
+                why: RetentionEnd::Evicted,
+            },
+            LeaseFact::RetentionCached {
+                lease: newest,
+                last_frontier: chain[0],
+            },
+        ]
+    );
+}
+
+/// The class waiters: a path beyond the reserve slot sets the ordinary
+/// signal, a full registry sets the reserve one, and freeing a slot fires
+/// the class that now has room.
+#[test]
+fn class_waiters_are_set_and_fired_as_facts() {
+    let (port, chain) = long_chain(4_001);
+    let short = |n| {
+        let mut request = acquire(&port, peer(n), 1, chain[1]);
+        request.locator_hashes = vec![chain[0].hash];
+        request
+    };
+    let ordinary: Vec<_> = (1..u8::try_from(MAX_RETAINED_PATH_LEASES).expect("16 fits u8"))
+        .map(|n| acquired(run(&port, port.acquire_header_path(short(n))).0))
+        .collect();
+    transactions(&port);
+    complete(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(100), 1, chain[4_000])),
+    );
+    let reserve = acquired(
+        run(
+            &port,
+            port.acquire_header_path(acquire(&port, peer(101), 1, chain[3_999])),
+        )
+        .0,
+    );
+    complete(&port, port.acquire_header_path(short(102)));
+    let txns = transactions(&port);
+    assert_eq!(
+        *lease_fact(&txns[1][0]),
+        LeaseFact::WaiterSet(Waiter::General)
+    );
+    assert_eq!(
+        *lease_fact(&txns[7][0]),
+        LeaseFact::WaiterSet(Waiter::Fallback)
+    );
+
+    complete(&port, port.release_header_path(reserve));
+    let txns = transactions(&port);
+    assert!(matches!(
+        txns[1].as_slice(),
+        [
+            FactKind::Lease(LeaseFact::CapabilityEnded { .. }),
+            FactKind::Lease(LeaseFact::WaiterFired(Waiter::Fallback)),
+            FactKind::Lease(LeaseFact::RetentionEnded { .. }),
+            FactKind::Completed(_),
+        ]
+    ));
+    complete(&port, port.release_header_path(ordinary[0].clone()));
+    let txns = transactions(&port);
+    assert!(matches!(
+        txns[1].as_slice(),
+        [
+            FactKind::Lease(LeaseFact::CapabilityEnded { .. }),
+            FactKind::Lease(LeaseFact::WaiterFired(Waiter::General)),
+            FactKind::Lease(LeaseFact::RetentionEnded { .. }),
+            FactKind::Completed(_),
+        ]
+    ));
+}
+
+/// Shutdown drops permits first, then ends each live lease with its
+/// retention, then clears the continuation cache.
+#[test]
+fn shutdown_publishes_permits_leases_then_continuations() {
+    let (port, chain) = chain(3);
+    let anchor = HeaderFixture::regtest().anchor();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    let cached = acquired(reply);
+    let cached_key = key(peer(1), 1, &cached);
+    complete(&port, port.read_header_path(cached, page_after(anchor, 1)));
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(2), 1, chain[2])),
+    );
+    let live = key(peer(2), 1, &acquired(reply));
+    let mut locator = port.continuation_locator(permit(&semaphore));
+    submit(&mut locator);
+    let locator_id = port.pending()[0].id;
+    transactions(&port);
+
+    port.shut_down();
+    let txns = transactions(&port);
+    assert_eq!(txns.len(), 1);
+    assert_eq!(txns[0][0], FactKind::PermitDropped { id: locator_id });
+    assert_eq!(
+        txns[0][1..4]
+            .iter()
+            .map(lease_fact)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            LeaseFact::CapabilityEnded {
+                lease: live,
+                release: Release::Shutdown,
+            },
+            LeaseFact::RetentionEnded {
+                lease: live,
+                why: RetentionEnd::WithCapability,
+            },
+            LeaseFact::RetentionEnded {
+                lease: cached_key,
+                why: RetentionEnd::ShutdownCleared,
+            },
+        ]
+    );
+    assert!(matches!(txns[0][4], FactKind::ShutDown { .. }));
+    drop(locator);
+}
+
+/// A dropped unread `Acquired` reply whose lease has a waiter records the
+/// end, the fired waiter and the retention end before `ReplyDropped`.
+#[test]
+fn an_abandoned_reply_with_a_waiter_fires_it_in_its_transaction() {
+    let (port, chain) = chain(1);
+    let mut unread = port.acquire_header_path(acquire(&port, peer(1), 1, chain[0]));
+    submit(&mut unread);
+    port.complete(OpId(1), ENGINE)
+        .expect("the acquire completes");
+    let (_, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 2, chain[0])),
+    );
+    transactions(&port);
+    drop(unread);
+    assert!(matches!(
+        slices(&transactions(&port)).as_slice(),
+        [[
+            FactKind::Lease(LeaseFact::CapabilityEnded {
+                release: Release::LeaseAbandonedAcquire,
+                ..
+            }),
+            FactKind::Lease(LeaseFact::WaiterFired(Waiter::Peer(_))),
+            FactKind::Lease(LeaseFact::RetentionEnded {
+                why: RetentionEnd::WithCapability,
+                ..
+            }),
+            FactKind::ReplyDropped { id: OpId(1) },
+        ]]
+    ));
+}
+
 /// Two applies of the same headers with the same owner, supplier and
 /// auxiliary deliveries, sealed for different targets, have different
 /// request digests: one may commit while the other is stale.
@@ -1195,11 +1740,10 @@ fn apply_digests_cover_the_target() {
     for apply in &mut applies {
         submit(apply);
     }
-    let digests: Vec<_> = port
-        .take_events()
+    let digests: Vec<_> = kinds(&port)
         .into_iter()
-        .filter_map(|event| match event {
-            StorageEvent::Submitted { request_digest, .. } => Some(request_digest),
+        .filter_map(|kind| match kind {
+            FactKind::Submitted { request_digest, .. } => Some(request_digest),
             _ => None,
         })
         .collect();

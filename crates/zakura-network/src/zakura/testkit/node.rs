@@ -233,6 +233,8 @@ pub struct ZakuraTestNodeBuilder {
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
     block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
+    block_committed_views:
+        Option<tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,12 +294,22 @@ impl ZakuraTestNodeBuilder {
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
             block_range_source: None,
+            block_committed_views: None,
         }
     }
 
     /// Advertise these direct addresses in this node's discovery self-record.
     pub fn discovery_direct_addrs(mut self, direct_addrs: Vec<SocketAddr>) -> Self {
         self.discovery_direct_addrs = direct_addrs;
+        self
+    }
+
+    /// Follow the real state writer's body-work generations in integration tests.
+    pub fn block_committed_views(
+        mut self,
+        views: tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+    ) -> Self {
+        self.block_committed_views = Some(views);
         self
     }
 
@@ -545,6 +557,10 @@ impl ZakuraTestNodeBuilder {
                 handle.subscribe_tip(),
                 self.block_sync_config.clone(),
             );
+            if let Some(views) = self.block_committed_views {
+                startup.header_tip = None;
+                startup.committed_views = Some(views);
+            }
             if let Some(source) = self.block_range_source {
                 startup = startup.with_range_source(source);
             }

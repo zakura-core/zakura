@@ -67,6 +67,10 @@ pub struct SemanticBlockVerifier<S, V> {
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum VerifyBlockError {
+    /// The delivered authorizations do not match the requested header.
+    #[error("block authorizations do not match the header commitment")]
+    AuthDataMismatch,
+
     #[error("unable to verify depth for block {hash} from chain state during block verification")]
     Depth { source: BoxError, hash: block::Hash },
 
@@ -162,6 +166,9 @@ impl VerifyBlockError {
 
         let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
         match self {
+            Self::AuthDataMismatch => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            }
             Self::Depth { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
@@ -218,7 +225,8 @@ impl VerifyBlockError {
 
     /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
     pub fn is_auth_commitment_mismatch(&self) -> bool {
-        matches!(self, VerifyBlockError::Commit(error) if error.is_auth_commitment_mismatch())
+        matches!(self, VerifyBlockError::AuthDataMismatch)
+            || matches!(self, VerifyBlockError::Commit(error) if error.is_auth_commitment_mismatch())
     }
 
     /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
@@ -243,7 +251,7 @@ impl VerifyBlockError {
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } | Subsidy(_) | MissingTransparentInput { .. } => 100,
+            AuthDataMismatch | Equihash { .. } | Subsidy(_) | MissingTransparentInput { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
@@ -363,6 +371,9 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
+        let is_proposal = request.is_proposal();
+        let attribution_state = state_service.clone();
+        let attribution_block = block.clone();
         async move {
             // Keep this receipt registered until verification finishes or is cancelled.
             let _receipt = receipt;
@@ -747,8 +758,80 @@ where
 
             commit_prepared_block(state_service, prepared_block, mined).await
         }
+        .then(move |verification| async move {
+            match verification {
+                Err(error) if !is_proposal => {
+                    attribute_body_failure(attribution_state, attribution_block, error).await
+                }
+                // Proposals return a candidate verdict and never invalidate a stored header.
+                result => result,
+            }
+        })
         .instrument(span)
         .boxed()
+    }
+}
+
+/// Requires exact-body commitment evidence before a V5+ rejection can condemn a header.
+/// Successful verification retains its existing pipeline and commit-time checks.
+async fn attribute_body_failure<S>(
+    state: S,
+    block: Arc<block::Block>,
+    error: VerifyBlockError,
+) -> Result<block::Hash, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+{
+    if !matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    ) || !block.transactions.iter().any(|tx| tx.version() >= 5)
+    {
+        return Err(error);
+    }
+    // Early structure/height failures can precede the ordinary Merkle check.
+    // Neither a wrong transaction list nor its authorizations may condemn this header.
+    let delivered = block.clone();
+    let actual = tokio::task::spawn_blocking(move || {
+        delivered
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<block::merkle::Root>()
+    })
+    .await
+    .map_err(|source| VerifyBlockError::Depth {
+        source: source.into(),
+        hash: block.hash(),
+    })?;
+    if actual != block.header.merkle_root {
+        return Err(BlockError::BadMerkleRoot {
+            actual,
+            expected: block.header.merkle_root,
+        }
+        .into());
+    }
+    let hash = block.hash();
+    let result = tokio::time::timeout(
+        PARENT_INPUT_CHECK_TIMEOUT,
+        state.oneshot(zs::Request::CheckBlockAuthCommitment(block)),
+    )
+    .await;
+    match result {
+        Ok(Ok(zs::Response::BlockAuthCommitment(Some(true)))) => Err(error),
+        Ok(Ok(zs::Response::BlockAuthCommitment(Some(false)))) => {
+            Err(VerifyBlockError::AuthDataMismatch)
+        }
+        Ok(Ok(zs::Response::BlockAuthCommitment(None))) => Err(VerifyBlockError::Depth {
+            source: "body attribution requires committed parent history".into(),
+            hash,
+        }),
+        Ok(Ok(_)) => unreachable!("wrong response to CheckBlockAuthCommitment"),
+        Ok(Err(source)) => Err(VerifyBlockError::Depth { source, hash }),
+        Err(source) => Err(VerifyBlockError::Depth {
+            source: source.into(),
+            hash,
+        }),
     }
 }
 

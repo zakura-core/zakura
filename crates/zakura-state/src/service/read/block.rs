@@ -467,3 +467,71 @@ pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
         .find_map(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
 }
+
+/// Authenticate a NU5+ body only when the separately read history belongs to the resolved parent.
+/// A finalization race can replace the database tip tree between those reads.
+pub(crate) fn auth_commitment_for_parent(
+    block: &Block,
+    network: &zakura_chain::parameters::Network,
+    parent_height: Height,
+    history: &zakura_chain::history_tree::HistoryTree,
+) -> Option<bool> {
+    use zakura_chain::parameters::NetworkUpgrade;
+    if history
+        .as_ref()
+        .is_some_and(|tree| tree.current_height() != parent_height)
+    {
+        return None;
+    }
+    let height = parent_height.next().ok()?;
+    let history_root = history.hash().or_else(|| {
+        (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
+            .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+    })?;
+    let expected: [u8; 32] = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &history_root,
+        &block.auth_data_root(),
+    )
+    .into();
+    Some(expected == *block.header.commitment_bytes)
+}
+
+#[cfg(test)]
+mod auth_commitment_tests {
+    use super::*;
+
+    /// A newer finalized tip tree cannot authenticate a body using an earlier parent-height read.
+    #[test]
+    fn finalization_between_parent_and_history_reads_is_retryable() {
+        use zakura_chain::{history_tree::HistoryTree, ironwood, orchard, sapling};
+        let (network, prefix, honest, _) =
+            zakura_chain::block::tests::generate::authorization_substitution_fixture();
+        let parent_height = prefix.last().unwrap().coinbase_height().unwrap();
+        assert_eq!(
+            auth_commitment_for_parent(&honest, &network, parent_height, &HistoryTree::default()),
+            Some(true)
+        );
+        let advanced = HistoryTree::from_block(
+            &network,
+            Arc::new(honest.clone()),
+            &sapling::tree::NoteCommitmentTree::default().root(),
+            &orchard::tree::NoteCommitmentTree::default().root(),
+            &ironwood::tree::NoteCommitmentTree::default().root(),
+        )
+        .unwrap();
+        let mut forged = honest;
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &advanced.hash().unwrap(),
+            &forged.auth_data_root(),
+        );
+        Arc::make_mut(&mut forged.header).commitment_bytes = <[u8; 32]>::from(commitment).into();
+        assert_eq!(
+            auth_commitment_for_parent(&forged, &network, parent_height, &advanced),
+            None
+        );
+        assert_eq!(
+            auth_commitment_for_parent(&forged, &network, parent_height.next().unwrap(), &advanced),
+            Some(true)
+        );
+    }
+}

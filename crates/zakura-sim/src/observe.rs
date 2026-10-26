@@ -509,6 +509,31 @@ pub struct StorageContinuation {
     pub retained: u64,
 }
 
+/// The facts and states that storage `instance` of `service` logged in
+/// `observations`, in order.
+pub(crate) fn storage_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    service: &str,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| match obs {
+            Observation::Storage {
+                service: logged,
+                instance: index,
+                ..
+            }
+            | Observation::StorageState {
+                service: logged,
+                instance: index,
+                ..
+            } => logged == service && *index == instance,
+            _ => false,
+        })
+        .collect()
+}
+
 /// The sequence numbers of the facts that storage `instance` of `service`
 /// logged in `observations`, and its states' watermarks, in order.
 pub(crate) fn storage_delivery<'o>(
@@ -517,20 +542,10 @@ pub(crate) fn storage_delivery<'o>(
     instance: u64,
 ) -> (Vec<u64>, Vec<u64>) {
     let (mut facts, mut states) = (Vec::new(), Vec::new());
-    for obs in observations {
+    for obs in storage_entries(observations, service, instance) {
         match obs {
-            Observation::Storage {
-                service: logged,
-                instance: index,
-                seq,
-                ..
-            } if logged == service && *index == instance => facts.push(*seq),
-            Observation::StorageState {
-                service: logged,
-                instance: index,
-                through_seq,
-                ..
-            } if logged == service && *index == instance => states.push(*through_seq),
+            Observation::Storage { seq, .. } => facts.push(*seq),
+            Observation::StorageState { through_seq, .. } => states.push(*through_seq),
             _ => {}
         }
     }

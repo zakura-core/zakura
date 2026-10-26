@@ -22,7 +22,7 @@ use crate::{
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     evidence::{Checkpoint, Mark, StorageId},
-    observe::{storage_delivery, Exit, Observation},
+    observe::{storage_entries, Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
         ViolationRecord,
@@ -518,15 +518,23 @@ impl Sim {
                     delivered.step, st.step
                 ),
                 Mark::Observed(delivered) => {
-                    let (facts, states) =
-                        storage_delivery(st.log.of_step(st.step), service, instance);
-                    if facts == delivered.facts && states == delivered.states {
+                    // Exactly what storage delivered, payloads and order
+                    // included, so the checker reads what the model checked.
+                    let logged = storage_entries(st.log.of_step(st.step), service, instance);
+                    if logged.iter().copied().eq(&delivered.observations) {
                         continue;
                     }
+                    let differs = logged
+                        .iter()
+                        .zip(&delivered.observations)
+                        .position(|(logged, sent)| *logged != sent)
+                        .unwrap_or(logged.len().min(delivered.observations.len()));
                     format!(
-                        "Undelivered: at step {} the run log holds facts {facts:?} and states \
-                         {states:?}, but storage delivered facts {:?} and states {:?}",
-                        st.step, delivered.facts, delivered.states
+                        "Undelivered: at step {} the run log holds {} storage entries and \
+                         storage delivered {}, first differing at entry {differs}",
+                        st.step,
+                        logged.len(),
+                        delivered.observations.len()
                     )
                 }
             };

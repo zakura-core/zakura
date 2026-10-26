@@ -9,6 +9,8 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use crate::Observation;
+
 /// A storage source's identity: the run that registered it and its index
 /// among that run's storage sources. Only the index is ever serialized,
 /// since run IDs differ between processes.
@@ -39,10 +41,8 @@ pub(crate) enum Mark {
 pub(crate) struct Delivered {
     /// The step.
     pub(crate) step: u64,
-    /// The facts' sequence numbers, in order.
-    pub(crate) facts: Vec<u64>,
-    /// Each state's watermark, in order.
-    pub(crate) states: Vec<u64>,
+    /// Every fact and state it logged, exactly and in order.
+    pub(crate) observations: Vec<Observation>,
 }
 
 /// Where an evidence source records its [`Mark`], shared with the run.
@@ -50,21 +50,19 @@ pub(crate) struct Delivered {
 pub(crate) struct Checkpoint(Rc<RefCell<Mark>>);
 
 impl Checkpoint {
-    /// Records that an observation at `step` delivered `facts`, and a state
-    /// watermarked at `state` if it logged one. A second observation in the
-    /// same step adds to the first.
-    pub(crate) fn record(&self, step: u64, facts: &[u64], state: Option<u64>) {
+    /// Records that an observation at `step` delivered `observations`, the
+    /// facts and state it logged, in order. A second observation in the same
+    /// step adds to the first.
+    pub(crate) fn record(&self, step: u64, observations: &[Observation]) {
         let mut mark = self.0.borrow_mut();
         match &mut *mark {
             Mark::Observed(delivered) if delivered.step == step => {
-                delivered.facts.extend_from_slice(facts);
-                delivered.states.extend(state);
+                delivered.observations.extend_from_slice(observations);
             }
             _ => {
                 *mark = Mark::Observed(Delivered {
                     step,
-                    facts: facts.to_vec(),
-                    states: state.into_iter().collect(),
+                    observations: observations.to_vec(),
                 });
             }
         }

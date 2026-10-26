@@ -1165,6 +1165,117 @@ fn storage_the_run_never_observes_fails_at_setup() {
     assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
+/// A storage source that forwards everything to `inner`, but at step `at`
+/// observes into a copy of the log and logs what it delivered there after
+/// `edit` changes it, as a wrapper that normalizes or redacts might.
+struct Rewrite<S> {
+    inner: S,
+    at: u64,
+    edit: fn(&mut [Observation]),
+}
+
+impl<S: ActionSource> ActionSource for Rewrite<S> {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.inner.enabled(now, out);
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.inner.boundaries(now, out);
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if log.step() != self.at {
+            return self.inner.observe(log);
+        }
+        let mut copy = log.clone();
+        let cursor = copy.entries().len();
+        self.inner.observe(&mut copy)?;
+        let mut delivered: Vec<Observation> = copy.entries()[cursor..]
+            .iter()
+            .map(|entry| entry.obs.clone())
+            .collect();
+        (self.edit)(&mut delivered);
+        for obs in delivered {
+            log.push(obs);
+        }
+        Ok(())
+    }
+}
+
+/// Leaves the delivery as it was.
+fn unchanged(_: &mut [Observation]) {}
+
+/// Changes the first fact's payload, keeping its sequence number. A step
+/// observes twice when a task runs, and the second delivery may be empty.
+fn alter_fact(delivered: &mut [Observation]) {
+    if let Some(fact) = delivered.iter_mut().find_map(|obs| match obs {
+        Observation::Storage { fact, .. } => Some(fact),
+        _ => None,
+    }) {
+        *fact = StorageFact::CallerDropped { id: 999 };
+    }
+}
+
+/// Changes the state, keeping its watermark.
+fn alter_state(delivered: &mut [Observation]) {
+    if let Some(state) = delivered.iter_mut().find_map(|obs| match obs {
+        Observation::StorageState { state, .. } => Some(state),
+        _ => None,
+    }) {
+        state.last_lease_id += 1;
+    }
+}
+
+/// Moves the state ahead of the fact before it.
+fn swap_fact_and_state(delivered: &mut [Observation]) {
+    let state = delivered
+        .iter()
+        .position(|obs| matches!(obs, Observation::StorageState { .. }));
+    if let Some(state) = state.filter(|state| *state > 0) {
+        delivered.swap(state - 1, state);
+    }
+}
+
+/// The run log must hold exactly what storage delivered, so a wrapper that
+/// relogs a delivery with a fact's payload or the state changed, keeping
+/// their numbers, or with a fact and the state swapped, fails the run with
+/// `Undelivered`. Relogging it unchanged passes.
+#[test]
+fn storage_entries_must_reach_the_log_unchanged() {
+    let whole = skipping_run(None);
+    let at = whole
+        .log
+        .entries()
+        .iter()
+        .find(|entry| entry.step > 0 && matches!(entry.obs, Observation::Storage { .. }))
+        .expect("storage delivers a fact after setup")
+        .step;
+    let relogged = |edit| wrapped_run(move |inner| Box::new(Rewrite { inner, at, edit }));
+    assert_eq!(
+        relogged(unchanged).end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        }
+    );
+    for (name, edit) in [
+        ("fact", alter_fact as fn(&mut [Observation])),
+        ("state", alter_state),
+        ("order", swap_fact_and_state),
+    ] {
+        let report = relogged(edit);
+        assert_eq!(report.end.outcome, Outcome::Harness, "{name}");
+        assert_eq!(report.end.steps, at, "{name}");
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("Undelivered"), "{name}: {detail}");
+    }
+}
+
 /// Storage belongs to the run that created it. Storage made with a first
 /// run that's then dropped, and added to a second run, whether through a
 /// wrapper that skips its final observation or plainly, fails the second

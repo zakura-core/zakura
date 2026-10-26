@@ -627,17 +627,21 @@ impl ActionSource for HeaderStorage {
         // After setup, the state is logged only when it may have changed.
         let with_state = self.delivered.is_none() || !facts.is_empty();
         let drained: Vec<u64> = facts.iter().map(|fact| fact.seq).collect();
-        let cursor = log.entries().len();
-        for fact in facts {
-            log.push(observation(fact, self.id.index));
-        }
+        let mut sent: Vec<Observation> = facts
+            .into_iter()
+            .map(|fact| observation(fact, self.id.index))
+            .collect();
         if with_state {
-            log.push(Observation::StorageState {
+            sent.push(Observation::StorageState {
                 service: SERVICE.to_owned(),
                 instance: self.id.index,
                 through_seq: actual.through_seq,
                 state: state(&actual),
             });
+        }
+        let cursor = log.entries().len();
+        for obs in &sent {
+            log.push(obs.clone());
         }
         let last = check_delivery(
             &log.entries()[cursor..],
@@ -649,8 +653,7 @@ impl ActionSource for HeaderStorage {
         self.delivered = Some(last);
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
-        self.checkpoint
-            .record(log.step(), &drained, with_state.then_some(last));
+        self.checkpoint.record(log.step(), &sent);
         Ok(())
     }
 }

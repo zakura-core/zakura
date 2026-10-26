@@ -154,6 +154,18 @@ fn non_equivalent_build_refused() {
 }
 
 #[test]
+fn a_generator_bump_does_not_block_replay() {
+    // The generator only turns input bytes into a scenario, and `meta`
+    // records the scenario in full.
+    let dir = record_named("race/lost-update", &[]);
+    edit(dir.path(), |lines| {
+        lines[0]["meta"]["generator"] = json!(99)
+    });
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified(), "{report:?}");
+}
+
+#[test]
 fn allow_build_mismatch_never_succeeds() {
     let allow = ReplayOptions {
         allow_build_mismatch: true,

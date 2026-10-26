@@ -320,13 +320,14 @@ fn unsupported(error: HarnessError) -> ReplayError {
 /// The first `meta` field where the harness's description of the recorded
 /// scenario differs from the trace's. `build`, `input`, `fixtures` and
 /// `derived_from` describe the recording, not the scenario, so they're left
-/// out.
+/// out. So is `generator`, which only turns input bytes into a scenario: a
+/// trace replays without it (traces.md, Versions).
 fn meta_difference(recorded: &MetaRecord, rebuilt: &MetaRecord) -> Option<&'static str> {
     // Destructured, so a new field can't be left out of the comparison.
     let MetaRecord {
         format,
         contract,
-        generator,
+        generator: _,
         build: _,
         sim,
         scenario,
@@ -342,7 +343,6 @@ fn meta_difference(recorded: &MetaRecord, rebuilt: &MetaRecord) -> Option<&'stat
     [
         ("meta.format", *format == rebuilt.format),
         ("meta.contract", *contract == rebuilt.contract),
-        ("meta.generator", *generator == rebuilt.generator),
         ("meta.sim", *sim == rebuilt.sim),
         ("meta.scenario", *scenario == rebuilt.scenario),
         ("meta.assumptions", *assumptions == rebuilt.assumptions),

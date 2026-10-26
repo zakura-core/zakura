@@ -800,6 +800,22 @@ fn shutdown_ends_everything_without_running_work() {
     assert!(port.take_events().is_empty());
 }
 
+/// Shutdown closes the selected-chain watch, so a receiver taken before it
+/// sees the watch closed, and one taken after it starts closed.
+#[test]
+fn shutdown_closes_the_selected_chain_watch() {
+    let (port, _) = chain(1);
+    let before = port.selected_chain();
+    assert!(
+        before.has_changed().is_ok(),
+        "the watch is open until shutdown"
+    );
+
+    port.shut_down();
+    assert!(before.has_changed().is_err());
+    assert!(port.selected_chain().has_changed().is_err());
+}
+
 /// #1721 review P2 (Astra): two applies with the same owner, prepared from
 /// the same headers with different body sizes, carry different auxiliary
 /// deliveries, so their request digests differ. Apply records also name

@@ -429,8 +429,8 @@ impl ControlledPort {
 
     /// Shuts the service down, as the end of a run does. Drops every pending
     /// operation unrun, with its inputs, and every untaken reply, then ends
-    /// every lease. No caller is woken, and a call polled afterwards never
-    /// completes. A repeat does nothing.
+    /// every lease and closes the selected-chain watch. No caller is woken,
+    /// and a call polled afterwards never completes. A repeat does nothing.
     pub fn shut_down(&self) {
         let slots = {
             let mut ops = self.ops();
@@ -443,6 +443,7 @@ impl ControlledPort {
         // Dropped outside the lock, since a request's permit wakes waiters.
         drop(slots);
         let lease_ends = self.engine.shut_down_leases().fire();
+        self.engine.close_selected_chain();
         self.ops().events.push(StorageEvent::ShutDown {
             dropped,
             lease_ends,

@@ -43,6 +43,15 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
+    /// Each buffered body's height and wire bytes, read from the map.
+    #[cfg(test)]
+    pub(super) fn ownership(&self) -> Vec<(block::Height, u64)> {
+        self.blocks
+            .iter()
+            .map(|(height, buffered)| (*height, buffered.bytes))
+            .collect()
+    }
+
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }

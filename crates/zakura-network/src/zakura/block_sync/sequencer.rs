@@ -86,14 +86,16 @@ struct InFlightSubmission {
     detached: bool,
 }
 
-/// The bodies the sequencer holds past the reorder buffer, read from its maps
-/// rather than from its running totals.
+/// The bodies the sequencer holds, read from its maps rather than from its
+/// running totals.
 ///
 /// An attached submission and its `applying` entry share one body, so the two
 /// lists can name the same wire bytes. Sum each list on its own.
 #[cfg(test)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct SequencerOwnership {
+    /// Each reorder-buffer body's height and wire bytes.
+    pub(super) reorder: Vec<(block::Height, u64)>,
     /// Each `applying` body's height and wire bytes.
     pub(super) applying: Vec<(block::Height, u64)>,
     /// Each decoded submission the driver can still retain.
@@ -356,6 +358,7 @@ impl Sequencer {
     #[cfg(test)]
     pub(super) fn ownership_snapshot(&self) -> SequencerOwnership {
         SequencerOwnership {
+            reorder: self.reorder.ownership(),
             applying: self
                 .applying
                 .iter()

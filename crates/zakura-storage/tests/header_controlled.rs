@@ -400,3 +400,18 @@ async fn prepare_and_apply_never_time_out() {
         "a fault never runs the work"
     );
 }
+
+/// A caller that polls again with a different waker, as a task does when a
+/// `select!` moves the call, gets the completion's wake on the new waker.
+/// The old one is never woken.
+#[test]
+fn a_completion_wakes_the_latest_waker() {
+    let (port, chain) = chain(1);
+    let mut call = port.selected_chain_contains(chain[0].hash);
+    let (first, second) = (Arc::new(Wakes::default()), Arc::new(Wakes::default()));
+    assert!(poll(&mut call, &Waker::from(first.clone())).is_pending());
+    assert!(poll(&mut call, &Waker::from(second.clone())).is_pending());
+    port.complete(OpId(1), ENGINE)
+        .expect("membership completes");
+    assert_eq!((first.count(), second.count()), (0, 1));
+}

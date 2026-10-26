@@ -6,6 +6,7 @@ use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES};
 /// equal sums over the bodies the sequencer holds through acceptance,
 /// submission, detachment, completion, commit, and reset. The gauges are read
 /// before the view is published, so each must follow the sequencer on its own.
+/// Once the driver drops its submissions, no other holder keeps a body alive.
 #[tokio::test]
 async fn byte_gauges_and_view_follow_sequencer_owners() {
     let recorder = super::super::super::tests::gauge_recorder::GaugeRecorder::default();
@@ -61,17 +62,21 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         owners
     };
 
-    for (height, bytes) in [
+    let fixtures = [
         BLOCK_MAINNET_1_BYTES.as_slice(),
         BLOCK_MAINNET_2_BYTES.as_slice(),
         BLOCK_MAINNET_3_BYTES.as_slice(),
-    ]
-    .into_iter()
-    .zip(1..)
-    .map(|(bytes, height)| (block::Height(height), bytes))
+    ];
+    let mut bodies = Vec::new();
+    for (height, bytes) in fixtures
+        .into_iter()
+        .zip(1..)
+        .map(|(bytes, height)| (block::Height(height), bytes))
     {
         let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
         let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+        let wire_bytes = raw.len() as u64;
+        bodies.push((Arc::downgrade(&block), Arc::downgrade(&raw)));
         let mut body = SequencedBody::new_queued(
             super::super::test_work_owner(),
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -79,7 +84,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             block.hash(),
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
-            100 * u64::from(height.0),
+            wire_bytes,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             input_bytes.clone(),
@@ -88,7 +93,14 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         body.leave_queue();
         task.handle_accept_body(body);
     }
-    assert_eq!(check(&mut task, "acceptance").applying.len(), 3);
+    let owners = check(&mut task, "acceptance");
+    assert_eq!(owners.applying.len(), 3);
+    let fixture_bytes: usize = fixtures.iter().map(|bytes| bytes.len()).sum();
+    assert_eq!(
+        recorder.bytes("sync.block.applying.buffered_bytes"),
+        fixture_bytes as u64,
+        "the applying gauge counts the fixtures' wire bytes"
+    );
 
     // The two-body submission window submits heights 1 and 2.
     task.submit_pending_blocks().await;
@@ -130,11 +142,19 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     task.destructive_reset_to(block::Height(0), false);
     check(&mut task, "reset");
 
-    // Completing the remaining submission leaves no holder.
     let (owner, source, token, block) = &submitted[0];
     task.sequencer
         .finish_submission(*owner, *source, *token, block::Height(1), block.hash());
     let owners = check(&mut task, "final completion");
     assert!(owners.applying.is_empty());
     assert!(owners.submissions.is_empty());
+
+    // Once the driver drops its submissions, the sequencer holds no body.
+    drop(submitted);
+    for (height, (block, raw)) in (1..).zip(&bodies) {
+        assert!(
+            block.upgrade().is_none() && raw.upgrade().is_none(),
+            "a holder keeps the height {height} body alive"
+        );
+    }
 }

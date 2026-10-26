@@ -52,7 +52,8 @@ const OUTCOMES: [Outcome; 5] = [
 const CODES: u64 = 8;
 
 /// Header storage driven by the run. Dropping it shuts the port down, which
-/// a run does after its log is frozen, so nothing is logged.
+/// a run does after its log is frozen, so nothing is logged. A drop while
+/// the run is live fails the run, since that shutdown is never observed.
 pub struct HeaderStorage {
     port: Arc<ControlledPort>,
     max_latency: Option<Duration>,
@@ -656,6 +657,8 @@ impl ActionSource for HeaderStorage {
 
 impl Drop for HeaderStorage {
     fn drop(&mut self) {
+        // Its shutdown facts are never observed, so a run still live fails.
+        self.checkpoint.dropped();
         self.port.shut_down();
     }
 }

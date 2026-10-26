@@ -1146,15 +1146,17 @@ fn a_skipped_observation_ends_the_run_there() {
 /// leaving its evidence unchecked.
 #[test]
 fn storage_the_run_never_observes_fails_at_setup() {
+    let mut kept = None;
     let report = run(
         storage_config(100),
         PlanInput::Bytes(Vec::new()),
         |sim| {
             let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-            drop(zakura_sim::storage::HeaderStorage::new(sim, port));
+            kept = Some(zakura_sim::storage::HeaderStorage::new(sim, port));
         },
         &mut zakura_sim::NoChecks,
     );
+    drop(kept);
     assert_eq!(report.end.outcome, Outcome::Harness);
     let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
         panic!("expected a source evidence failure, got {:?}", report.end);
@@ -1258,6 +1260,75 @@ fn each_storage_instance_is_checked_on_its_own() {
         };
         assert_eq!(*source, format!("storage:header#{divert}"));
         assert!(detail.starts_with("Undelivered"), "{detail}");
+    }
+}
+
+/// A storage source that forwards everything to `inner`, then drops it
+/// right after its observation at step `at`, as a buggy wrapper might.
+struct DropAfter<S> {
+    inner: Option<S>,
+    at: u64,
+}
+
+impl<S: ActionSource> ActionSource for DropAfter<S> {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if let Some(inner) = &self.inner {
+            inner.enabled(now, out);
+        }
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(inner) = &self.inner {
+            inner.boundaries(now, out);
+        }
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner
+            .as_mut()
+            .expect("a dropped source offers no actions")
+            .execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let Some(inner) = &mut self.inner else {
+            return Ok(());
+        };
+        inner.observe(log)?;
+        if log.step() == self.at {
+            self.inner = None;
+        }
+        Ok(())
+    }
+}
+
+/// Storage dropped while the run is live, right after its final
+/// observation or at an interior step, fails the run, since its shutdown
+/// facts are never observed. The run's own shutdown, after the log
+/// freezes, still passes.
+#[test]
+fn storage_dropped_during_the_run_fails_it() {
+    let whole = skipping_run(None);
+    assert_eq!(
+        whole.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        }
+    );
+    let last = whole.end.steps;
+    for at in [last, 1] {
+        let report = wrapped_run(|inner| {
+            Box::new(DropAfter {
+                inner: Some(inner),
+                at,
+            })
+        });
+        assert_eq!(report.end.outcome, Outcome::Harness, "dropping at {at}");
+        assert_eq!(report.end.steps, at);
+        let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("Dropped"), "dropping at {at}: {detail}");
     }
 }
 

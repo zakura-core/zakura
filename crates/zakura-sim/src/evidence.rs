@@ -28,6 +28,10 @@ pub(crate) enum Mark {
     NotObserved,
     /// What the source delivered at its last observed step.
     Observed(Delivered),
+    /// The source was dropped. The run checks marks only while it's live,
+    /// so this fails a source dropped then, and not one dropped at the
+    /// run's own shutdown.
+    Dropped,
 }
 
 /// What a storage source delivered during one step.
@@ -64,6 +68,11 @@ impl Checkpoint {
                 });
             }
         }
+    }
+
+    /// Records that the source was dropped.
+    pub(crate) fn dropped(&self) {
+        *self.0.borrow_mut() = Mark::Dropped;
     }
 
     /// The last mark recorded.

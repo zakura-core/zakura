@@ -468,6 +468,7 @@ impl Sim {
                 Mark::NotObserved => {
                     "NotObserved: the setup observation never completed".to_owned()
                 }
+                Mark::Dropped => "Dropped: the storage was dropped during the run".to_owned(),
                 Mark::Observed(delivered) if delivered.step != st.step => format!(
                     "BoundarySkipped: the last observation was at step {}, not {}",
                     delivered.step, st.step

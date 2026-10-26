@@ -43,7 +43,7 @@
 //! discovery reads, aren't covered yet.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -116,7 +116,7 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 23] = [
+const ALLOWED: [(&str, &str, &str); 24] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -195,6 +195,11 @@ const ALLOWED: [(&str, &str, &str); 23] = [
     (
         "crates/zakura-quic/src/sim/seeded.rs",
         "std::sync::Arc::downgrade",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "Arc::downgrade",
         SIM_HARNESS,
     ),
     (
@@ -615,63 +620,25 @@ fn use_leaves(tree: &UseTree) -> Vec<UseLeaf> {
     leaves
 }
 
-/// How many `use` hops resolution follows from one path before it stops.
+/// How many `use` hops expansion follows from one path before it stops.
 const MAX_ALIAS_HOPS: usize = 8;
 
-/// The paths each name is bound to by `use` in one module or block.
-type Bindings = BTreeMap<String, Vec<Vec<String>>>;
+/// What a file that may name std's `Instant` uses instead of `.elapsed()`.
+const ELAPSED_IN_STD_INSTANT_FILE: &str = "`saturating_duration_since` against zakura_rt's \
+     clock, such as the driver's `now()`: this file may name std's Instant, so `.elapsed()` \
+     can read the host clock";
 
 struct PathVisitor<'a> {
     file: &'a str,
     rules: &'a Rules,
     findings: &'a mut Findings,
-    /// What each module in the file binds, by its path from the file's root
-    /// module.
-    modules: BTreeMap<Vec<String>, Bindings>,
-    /// The module being visited, from the file's root module.
-    module: Vec<String>,
-    /// What the blocks around the current item bind, innermost last.
-    blocks: Vec<Bindings>,
-}
-
-/// What the production `use` items among `items` bind. Globs and `_` bind
-/// nothing.
-fn bindings<'a>(items: impl IntoIterator<Item = &'a Item>) -> Bindings {
-    let mut names = Bindings::new();
-    let leaves = items
-        .into_iter()
-        .filter_map(|item| match item {
-            Item::Use(item) if !is_test_only(&item.attrs) => Some(use_leaves(&item.tree)),
-            _ => None,
-        })
-        .flatten();
-    for leaf in leaves {
-        if let Some(name) = leaf.name.filter(|name| name != "_") {
-            // Keep every binding: `cfg` alternatives can bind one name to
-            // different paths, and each one runs in some build.
-            names.entry(name).or_default().push(leaf.path);
-        }
-    }
-    names
-}
-
-/// Records what `items` and the inline modules under them bind, under
-/// `module`.
-fn collect_modules(
-    items: &[Item],
-    module: &mut Vec<String>,
-    modules: &mut BTreeMap<Vec<String>, Bindings>,
-) {
-    modules.insert(module.clone(), bindings(items));
-    for item in items {
-        if let Item::Mod(item) = item {
-            if let (Some((_, items)), false) = (&item.content, is_test_only(&item.attrs)) {
-                module.push(item.ident.to_string());
-                collect_modules(items, module, modules);
-                module.pop();
-            }
-        }
-    }
+    /// Every path each name is bound to by a production `use` anywhere in
+    /// the file: any module, block, `cfg` alternative or macro argument.
+    names: BTreeMap<String, BTreeSet<Vec<String>>>,
+    /// The names of the file's inline modules.
+    modules: BTreeSet<String>,
+    /// True on the first pass, which only records `names` and `modules`.
+    collecting: bool,
 }
 
 impl<'a> PathVisitor<'a> {
@@ -681,88 +648,70 @@ impl<'a> PathVisitor<'a> {
             file,
             rules,
             findings,
-            modules: BTreeMap::new(),
-            module: Vec::new(),
-            blocks: Vec::new(),
+            names: BTreeMap::new(),
+            modules: BTreeSet::new(),
+            collecting: false,
         }
     }
 
-    /// Visits a file's items, after recording what each of its modules
-    /// binds so paths through inline modules resolve.
+    /// Visits a file's items twice: first to record every name its `use`
+    /// items bind and its inline modules, then to check its paths.
     fn visit_file_items(&mut self, items: &[Item]) {
-        collect_modules(items, &mut Vec::new(), &mut self.modules);
-        for item in items {
-            self.visit_item(item);
-        }
-    }
-
-    /// The paths `name` is bound to in `module`. In the module being
-    /// visited, the enclosing blocks come first.
-    fn bound(&self, module: &[String], name: &str) -> Option<&Vec<Vec<String>>> {
-        let blocks = if module == self.module.as_slice() {
-            &self.blocks[..]
-        } else {
-            &[]
-        };
-        blocks
-            .iter()
-            .rev()
-            .chain(self.modules.get(module))
-            .find_map(|names| names.get(name))
-    }
-
-    /// Every path `segments` can name, following `use` bindings, `self`,
-    /// `super` and the file's inline modules, so `SystemTime::now` after
-    /// `use clocks::SystemTime`, with `clocks` re-exporting std's, reads as
-    /// `std::time::SystemTime::now`. A path that leaves the file, such as
-    /// one through `crate`, stays as far as it resolved.
-    fn resolve(&self, segments: &[String]) -> Vec<Vec<String>> {
-        let mut resolved = Vec::new();
-        let mut pending = vec![(segments.to_vec(), self.module.clone(), 0)];
-        while let Some((mut path, mut module, hops)) = pending.pop() {
-            loop {
-                let next = module
-                    .iter()
-                    .cloned()
-                    .chain([path[0].clone()])
-                    .collect::<Vec<_>>();
-                match path[0].as_str() {
-                    _ if path.len() == 1 => break,
-                    "self" => {}
-                    "super" if !module.is_empty() => {
-                        module.pop();
-                    }
-                    _ if self.modules.contains_key(&next) => module = next,
-                    _ => break,
-                }
-                path.remove(0);
-            }
-            match self.bound(&module, &path[0]) {
-                Some(targets) if hops < MAX_ALIAS_HOPS => {
-                    for target in targets {
-                        let target = target.iter().chain(&path[1..]).cloned().collect();
-                        pending.push((target, module.clone(), hops + 1));
-                    }
-                }
-                _ => resolved.push(path),
+        for collecting in [true, false] {
+            self.collecting = collecting;
+            for item in items {
+                self.visit_item(item);
             }
         }
-        resolved
     }
 
-    /// Checks the path written as `segments` against every path it can
-    /// name, and reports one violation if any of them is forbidden. When a
-    /// path resolves to something the rules don't know, outside `zakura_rt`,
-    /// the written spelling is checked too, so `SystemTime::now` through a
-    /// local re-export stays flagged.
+    /// `segments` and every path it can expand to, the most expanded first.
+    /// `self`, `super`, `crate` and the file's inline module names drop off
+    /// the front, and a bound first segment becomes each path the file
+    /// binds that name to, anywhere, so `SystemTime::now` after
+    /// `use clocks::SystemTime` also reads as std's when `clocks` re-exports
+    /// it. Scopes aren't tracked, so expansion can only add findings.
+    fn expansions(&self, segments: &[String]) -> Vec<Vec<String>> {
+        let mut seen = BTreeSet::from([segments.to_vec()]);
+        let mut layers = vec![vec![segments.to_vec()]];
+        for _ in 0..MAX_ALIAS_HOPS {
+            let mut next = Vec::new();
+            for path in layers.last().into_iter().flatten() {
+                let rest = &path[1..];
+                let first = path[0].as_str();
+                if !rest.is_empty()
+                    && (matches!(first, "self" | "super" | "crate") || self.modules.contains(first))
+                {
+                    next.push(rest.to_vec());
+                }
+                for target in self.names.get(first).into_iter().flatten() {
+                    next.push(target.iter().chain(rest).cloned().collect());
+                }
+            }
+            next.retain(|path| seen.insert(path.clone()));
+            if next.is_empty() {
+                break;
+            }
+            layers.push(next);
+        }
+        layers.into_iter().rev().flatten().collect()
+    }
+
+    /// Checks the path written as `segments` and each of its expansions, and
+    /// reports one violation if any of them is forbidden here.
     fn check_written(&mut self, segments: &[String], span: Span) {
-        for path in self.resolve(segments) {
-            let known = self.rules.replacement(&path).is_some() || path[0] == "zakura_rt";
-            let path = if known { path } else { segments.to_vec() };
+        for path in self.expansions(segments) {
             if self.check(&path, span) {
                 return;
             }
         }
+    }
+
+    /// Whether the allowlist lets this file name std's `Instant`.
+    fn names_std_instant(&self) -> bool {
+        ALLOWED
+            .iter()
+            .any(|(file, path, _)| *file == self.file && *path == "std::time::Instant")
     }
 
     /// Checks a path written as `segments`: as written if it starts with `::`,
@@ -778,6 +727,9 @@ impl<'a> PathVisitor<'a> {
     /// Reports `segments` if the rules forbid it and the allowlist doesn't
     /// allow it here. Returns whether it reported.
     fn check(&mut self, segments: &[String], span: Span) -> bool {
+        if self.collecting {
+            return false;
+        }
         let Some(replacement) = self.rules.replacement(segments) else {
             return false;
         };
@@ -788,18 +740,23 @@ impl<'a> PathVisitor<'a> {
             self.findings.allowances_used[allowance] = true;
             return false;
         }
-        let start = span.start();
-        self.findings.violations.push(Violation {
-            location: format!("{}:{}:{}", self.file, start.line, start.column + 1),
-            path: segments.join("::"),
-            replacement,
-        });
+        self.report(segments.join("::"), replacement, span);
         true
     }
 
+    /// Records a violation of `path` at `span`, suggesting `replacement`.
+    fn report(&mut self, path: String, replacement: String, span: Span) {
+        let start = span.start();
+        self.findings.violations.push(Violation {
+            location: format!("{}:{}:{}", self.file, start.line, start.column + 1),
+            path,
+            replacement,
+        });
+    }
+
     /// Checks written-out `a::b::c` paths inside macro arguments that don't
-    /// parse as code. Resolves them through the names in scope, but can't see
-    /// imports made inside the arguments.
+    /// parse as code, expanded through the file's names. Imports inside such
+    /// arguments aren't seen.
     fn check_tokens(&mut self, tokens: TokenStream) {
         let tokens: Vec<TokenTree> = tokens.into_iter().collect();
         let mut i = 0;
@@ -905,36 +862,23 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
     }
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        if let Some((_, items)) = &item.content {
-            // A module doesn't see the names its parent's blocks bind.
-            let blocks = std::mem::take(&mut self.blocks);
-            self.module.push(item.ident.to_string());
-            // A module inside a function body isn't in the file's table yet.
-            if !self.modules.contains_key(&self.module) {
-                collect_modules(items, &mut self.module.clone(), &mut self.modules);
-            }
-            for item in items {
-                self.visit_item(item);
-            }
-            self.module.pop();
-            self.blocks = blocks;
+        if self.collecting && item.content.is_some() {
+            self.modules.insert(item.ident.to_string());
         }
-    }
-
-    fn visit_block(&mut self, block: &'ast syn::Block) {
-        let items = block.stmts.iter().filter_map(|stmt| match stmt {
-            syn::Stmt::Item(item) => Some(item),
-            _ => None,
-        });
-        self.blocks.push(bindings(items));
-        visit::visit_block(self, block);
-        self.blocks.pop();
+        visit::visit_item_mod(self, item);
     }
 
     /// Checks `receiver.elapsed()` as the path `receiver::elapsed` when the
     /// receiver is a path, under any parentheses or `&`, so
-    /// `(&UNIX_EPOCH).elapsed()` meets the wall-clock rule.
+    /// `(&UNIX_EPOCH).elapsed()` meets the wall-clock rule. In a file that
+    /// may name std's `Instant`, every `.elapsed()` is flagged, since the
+    /// receiver's type isn't known.
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "elapsed" && !self.collecting && self.names_std_instant() {
+            let replacement = ELAPSED_IN_STD_INSTANT_FILE.to_owned();
+            self.report(".elapsed()".to_owned(), replacement, call.method.span());
+            return visit::visit_expr_method_call(self, call);
+        }
         let mut receiver = &*call.receiver;
         while let syn::Expr::Paren(syn::ExprParen { expr, .. })
         | syn::Expr::Reference(syn::ExprReference { expr, .. })
@@ -964,7 +908,11 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         for leaf in use_leaves(&item.tree) {
-            self.check(&leaf.path, leaf.span);
+            if !self.collecting {
+                self.check(&leaf.path, leaf.span);
+            } else if let Some(name) = leaf.name.filter(|name| name != "_") {
+                self.names.entry(name).or_default().insert(leaf.path);
+            }
         }
     }
 
@@ -1003,15 +951,9 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
                 Visit::visit_expr(self, arg);
             }
         } else if let Ok(stmts) = mac.parse_body_with(syn::Block::parse_within) {
-            let items = stmts.iter().filter_map(|stmt| match stmt {
-                syn::Stmt::Item(item) => Some(item),
-                _ => None,
-            });
-            self.blocks.push(bindings(items));
             for stmt in &stmts {
                 Visit::visit_stmt(self, stmt);
             }
-            self.blocks.pop();
         } else {
             self.check_tokens(mac.tokens.clone());
         }
@@ -1188,11 +1130,14 @@ mod tests {
                 info!(\"{:?}\", crate::tokio::spawn);
             }
         ";
+        // `crate::tokio` may be a local module, but expansion drops `crate`
+        // and can only add findings.
         assert_eq!(
             violations(source),
             [
                 "tokio::select -> zakura_rt::select",
                 "tokio::time::sleep -> zakura_rt::time::sleep",
+                "tokio::spawn -> zakura_rt::task::spawn",
             ]
         );
     }
@@ -1357,8 +1302,8 @@ mod tests {
         );
     }
 
-    /// Renamed imports resolve, in the module and in a block, but a module
-    /// doesn't see its parent's names.
+    /// Renamed imports resolve, in the module, in a block, and in a child
+    /// module, since the check doesn't track scopes.
     #[test]
     fn renamed_imports_are_flagged() {
         let source = "
@@ -1390,6 +1335,7 @@ mod tests {
                 "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
                 "std::time::Instant -> zakura_rt::time::Instant",
                 "std::time::Instant::now -> zakura_rt::time::Instant::now",
+                "std::time::SystemTime::now -> zakura_rt::time::utc_now",
             ]
         );
     }
@@ -1422,8 +1368,10 @@ mod tests {
     }
 
     /// Local re-exports, `self` and `super` paths and chained renames resolve
-    /// to std's clocks. A path that leaves the file keeps its written
-    /// spelling's check, and one that ends in `zakura_rt` passes.
+    /// to std's clocks, and a path that leaves the file keeps its written
+    /// spelling's check. A zakura_rt rename spelled `SystemTime` is flagged
+    /// too: the file also binds that name to std's clock, and the written
+    /// spelling is always checked.
     #[test]
     fn local_reexports_and_chained_aliases_resolve() {
         let source = "
@@ -1457,6 +1405,7 @@ mod tests {
                 format!("std::time::SystemTime::now -> {utc_now}"),
                 format!("chrono::Utc::now -> {utc_now}"),
                 format!("Utc::now -> {utc_now}"),
+                format!("std::time::SystemTime::now -> {utc_now}"),
             ]
         );
 
@@ -1524,8 +1473,9 @@ mod tests {
         );
     }
 
-    /// The epoch's `elapsed` is flagged through parentheses and references,
-    /// and an epoch that resolves into `zakura_rt` passes.
+    /// The epoch's `elapsed` is flagged through parentheses and references.
+    /// The `zakura_rt` epoch in `g` is flagged too, since the file also binds
+    /// `UNIX_EPOCH` to std's and the spelling is always checked.
     #[test]
     fn wrapped_epoch_receivers_are_flagged() {
         let source = "
@@ -1549,6 +1499,7 @@ mod tests {
                 format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
                 format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
                 format!("std::time::SystemTime::UNIX_EPOCH::elapsed -> {utc_now}"),
+                format!("std::time::UNIX_EPOCH::elapsed -> {utc_now}"),
             ]
         );
     }
@@ -1568,12 +1519,71 @@ mod tests {
                 let _ = vec![Instant::now(); 2];
             }
         ";
-        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
-        let epoch = "std::time::UNIX_EPOCH::elapsed -> zakura_rt::time::utc_now";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now".to_owned();
+        // The driver file may name std's Instant, so any `.elapsed()` is flagged.
+        let elapsed = format!(".elapsed() -> {ELAPSED_IN_STD_INSTANT_FILE}");
         assert_eq!(
             violations_in("crates/zakura-quic/src/driver/connection.rs", source),
-            [instant, epoch, instant, instant, epoch, instant]
+            [
+                instant.clone(),
+                elapsed.clone(),
+                instant.clone(),
+                instant.clone(),
+                elapsed,
+                instant
+            ]
         );
+    }
+
+    /// Same-named `cfg` modules can't hide each other's bindings: every
+    /// binding in the file counts.
+    #[test]
+    fn conditional_modules_cannot_hide_a_clock() {
+        let source = "
+            #[cfg(zakura_sim)]
+            mod clock {
+                use std::time::SystemTime as Clock;
+                pub fn read() { let _ = Clock::now(); }
+            }
+            #[cfg(not(zakura_sim))]
+            mod clock {
+                use zakura_rt::time::Instant as Clock;
+                pub fn read() { let _ = Clock::now(); }
+            }
+        ";
+        let system = "std::time::SystemTime::now -> zakura_rt::time::utc_now";
+        // The union rule flags both bodies, since either `Clock` may be std's.
+        assert_eq!(violations(source), [system, system]);
+    }
+
+    /// A `self::` path is checked against every binding of its name, so
+    /// shadowing can't hide a std read. The union rule also flags the
+    /// runtime-only order, which renaming one import fixes.
+    #[test]
+    fn self_paths_check_every_binding() {
+        let std_module = "use std::time::Instant; fn f() { use zakura_rt::time::Instant; let _ = self::Instant::now(); }";
+        let rt_module = "use zakura_rt::time::Instant; fn f() { use std::time::Instant; let _ = self::Instant::now(); }";
+        let instant = "std::time::Instant::now -> zakura_rt::time::Instant::now";
+        for source in [std_module, rt_module] {
+            assert_eq!(
+                violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+                [instant],
+                "{source}"
+            );
+        }
+    }
+
+    /// A file that may name std's `Instant` can't call `.elapsed()`, since
+    /// the check can't tell a std `Instant` receiver from another.
+    #[test]
+    fn std_instant_files_cannot_call_elapsed() {
+        let source = "fn age(start: std::time::Instant) { let _ = start.elapsed(); }";
+        assert_eq!(
+            violations_in("crates/zakura-quic/src/driver/connection.rs", source),
+            [format!(".elapsed() -> {ELAPSED_IN_STD_INSTANT_FILE}")]
+        );
+        let elsewhere = "fn age(start: Start) { let _ = start.elapsed(); }";
+        assert_eq!(violations(elsewhere), Vec::<String>::new());
     }
 
     /// M3.7's bypass inventory: every runtime path left in `zakura-network`'s

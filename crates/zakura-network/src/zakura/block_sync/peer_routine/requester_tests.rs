@@ -479,7 +479,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     assert!(!second_connection.is_cancelled());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let hash = block::Hash([1; 32]);
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(hash);
@@ -500,9 +500,12 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     assert!(routine
         .check_request_liveness(deadline - Duration::from_millis(1))
         .is_ok());
-    assert!(
-        routine.earliest_deadline_sleep(None).deadline() <= deadline + Duration::from_millis(1)
-    );
+    time::timeout_at(
+        deadline + Duration::from_millis(1),
+        routine.earliest_deadline_sleep(None),
+    )
+    .await
+    .expect("the abandoned request must wake by its retirement deadline");
     assert!(matches!(
         routine.handle_deadlines(deadline).await,
         Err(SinkReject::Local(_))
@@ -1452,4 +1455,103 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     assert!(fast.pending_status.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+}
+
+/// Retained wire authorization must not make a timed-out peer win the floor.
+#[tokio::test(start_paused = true)]
+async fn abandoned_range_releases_floor_preference_until_ending() {
+    let (mut fast, mut outbound, pool, _connection, _events) =
+        requester_routine(block::Hash([1; 32]));
+    fast.try_fill().await;
+    next_sent(&mut outbound).await;
+    let deadline = fast.window.outstanding.first().unwrap().deadline;
+    assert!(fast.expire_due_timeouts(deadline));
+    fast.retry_avoid.clear();
+    fast.window
+        .note_block_progress(Instant::now(), Duration::from_secs(30));
+    fast.publish_slot_diagnostics();
+    let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, block::Height(1));
+    // Give the blocked peer the better score without changing its wire blockers.
+    fast.registry.publish_slots(
+        &fast.peer,
+        fast.generation,
+        super::super::peer_registry::SlotDiagnostics {
+            available_slots: 4,
+            bbr_rtprop_ms: Some(1),
+            ..Default::default()
+        },
+    );
+    slow.try_fill().await;
+    assert_eq!(requested_heights(&mut slow_outbound), [block::Height(1)]);
+    assert!(fast.requester.blocks_retry(block::Height(1)));
+}
+
+/// A transient full result remains a reason to await a permit after capacity returns.
+#[tokio::test(start_paused = true)]
+async fn full_reservation_retains_transport_wait_after_queue_drains() {
+    let (mut routine, _old_outbound, _pool, _connection, _events) =
+        requester_routine(block::Hash([1; 32]));
+    let (sender, mut outbound) = crate::zakura::framed_channel(1);
+    routine.session = BlockSyncPeerSession::for_test(
+        routine.peer.clone(),
+        sender.clone(),
+        routine.cancel.clone(),
+    );
+    sender
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus::default())
+                .encode_frame()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    routine.try_fill().await;
+    outbound.try_recv().unwrap();
+    assert!(routine.session.outbound_capacity() > 0);
+    assert!(
+        routine.transport_waiting,
+        "a failed reservation still arms the transport wait"
+    );
+    let request_sender = routine.session.request_sender();
+    let slot = request_sender.reserve_guarded().await.unwrap();
+    routine.try_fill_with_slot(Some(slot)).await;
+    assert_eq!(requested_heights(&mut outbound), [block::Height(1)]);
+}
+
+/// A fill triggered by traffic at model expiry must not use yesterday's ranking.
+#[tokio::test(start_paused = true)]
+async fn expired_latency_is_published_before_floor_selection() {
+    let (mut fast, mut outbound, pool, _connection, _events) =
+        requester_routine(block::Hash([1; 32]));
+    fast.config.bbr_rtprop_window = Duration::from_secs(1);
+    fast.window = super::super::state::DownloadWindow::new(&fast.config);
+    let now = Instant::now();
+    let elapsed = Duration::from_millis(1);
+    let snapshot = fast.window.delivery_snapshot(now - elapsed);
+    fast.window.record_delivery(now, elapsed, 1, 1000, snapshot);
+    fast.publish_slot_diagnostics();
+    let (slow, _slow_outbound) = slower_floor_peer(&fast, pool, block::Height(1));
+    fast.registry.publish_slots(
+        &slow.peer,
+        slow.generation,
+        super::super::peer_registry::SlotDiagnostics {
+            available_slots: 4,
+            bbr_rtprop_ms: Some(150),
+            ..Default::default()
+        },
+    );
+    assert!(fast.registry.floor_has_preferred_unsaturated_server(
+        block::Height(1),
+        &slow.peer,
+        None,
+        false
+    ));
+    time::advance(Duration::from_secs(1) + Duration::from_nanos(1)).await;
+    assert_eq!(fast.window.bbr_rtprop_ms(Instant::now()), None);
+    fast.try_fill().await;
+    assert!(
+        requested_heights(&mut outbound).is_empty(),
+        "the stale fast score cannot win floor work"
+    );
+    assert!(fast.work.pending_contains(block::Height(1)));
 }

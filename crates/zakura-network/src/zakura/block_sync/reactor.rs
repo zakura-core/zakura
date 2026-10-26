@@ -367,9 +367,7 @@ pub(super) struct BlockSyncReactor {
     /// Keep the private driver-completion channel open while the reactor lives.
     _needed_query_failure_keepalive: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     actions: mpsc::Sender<BlockSyncAction>,
-    /// Shared routine→reactor channel: status advertisement (`StatusReceived`),
-    /// the producer re-query ping (`RequeryNeeded`), and misbehavior reports
-    /// (`Misbehavior`).
+    /// Shared routine-to-reactor channel for status and misbehavior reports.
     routine_to_reactor: mpsc::Receiver<RoutineToReactor>,
     /// A keep-alive sender clone so the receiver never resolves to `None` while
     /// the reactor lives, even before any peer connects or after all disconnect.
@@ -443,6 +441,7 @@ fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnaps
 
 impl BlockSyncReactor {
     async fn run(mut self) {
+        let refill_work = Arc::clone(&self.state.work_queue);
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
@@ -482,6 +481,7 @@ impl BlockSyncReactor {
             };
             zakura_rt::pin!(status_refresh);
             zakura_rt::select! {
+                _ = refill_work.subscribe_refill().notified() => { self.query_needed_blocks().await; },
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
@@ -1402,9 +1402,6 @@ impl BlockSyncReactor {
         match message {
             RoutineToReactor::StatusReceived { peer, send_reply } => {
                 self.handle_status_received(peer, send_reply);
-            }
-            RoutineToReactor::RequeryNeeded => {
-                self.query_needed_blocks().await;
             }
             RoutineToReactor::Misbehavior { peer, reason } => {
                 self.report_misbehavior(peer, reason).await;

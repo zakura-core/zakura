@@ -67,6 +67,9 @@ pub(super) struct Entry {
     pub(super) slots: SlotDiagnostics,
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
+    request_retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Inclusive ranges still authorized on the wire, including abandoned requests.
+    request_retry_blocked: BTreeMap<block::Height, block::Height>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -99,6 +102,8 @@ impl Entry {
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
+            request_retry_avoid: BTreeMap::new(),
+            request_retry_blocked: BTreeMap::new(),
             generation,
             conn_id: None,
             session_closed: false,
@@ -300,17 +305,23 @@ impl PeerRegistry {
         let key = BodyRetryKey::new(scope, hash);
         let sources: std::collections::BTreeSet<_> = sources.into_iter().collect();
         let mut retries = self.body_retry_lock();
+        let old_len = retries.entries.len();
         retries.entries.retain(|(source, candidate, reason), _| {
             *reason != BodyRetryReason::Unavailable || *candidate != key || sources.contains(source)
         });
+        let mut changed = retries.entries.len() != old_len;
         for source in sources {
             let entry = (source, key, BodyRetryReason::Unavailable);
             if retries.entries.contains_key(&entry) || retries.entries.len() < MAX_SUPPLIER_RETRIES
             {
-                retries.entries.insert(entry, until);
+                changed |= retries.entries.insert(entry, until) != Some(until);
             } else {
                 metrics::counter!("sync.block.body.unavailable_cooldown_skipped").increment(1);
             }
+        }
+        drop(retries);
+        if changed {
+            self.floor_ranking_changed.notify_waiters();
         }
     }
 
@@ -325,7 +336,9 @@ impl PeerRegistry {
         let bodies: Vec<_> = bodies.into_iter().collect();
         let mut retries = self.body_retry_lock();
         let now = Instant::now();
+        let old_len = retries.entries.len();
         retries.entries.retain(|_, deadline| *deadline > now);
+        let mut changed = retries.entries.len() != old_len;
         for (scope, hash) in bodies {
             let scope = match retries.current {
                 Some(current) if current.body_work_epoch == scope.body_work_epoch => current,
@@ -339,13 +352,19 @@ impl PeerRegistry {
                 BodyRetryReason::Incompatible,
             );
             if let Some(deadline) = retries.entries.get_mut(&key) {
+                changed |= *deadline < until;
                 *deadline = (*deadline).max(until);
             } else if retries.entries.len() < MAX_SUPPLIER_RETRIES {
                 retries.entries.insert(key, until);
+                changed = true;
             } else {
                 // The cooldown is advisory. Skipping it only allows an earlier retry.
                 metrics::counter!("sync.block.body.incompatible_cooldown_skipped").increment(1);
             }
+        }
+        drop(retries);
+        if changed {
+            self.floor_ranking_changed.notify_waiters();
         }
     }
 
@@ -354,10 +373,16 @@ impl PeerRegistry {
         alarm: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash, Instant)>,
     ) {
         let mut retries = self.body_retry_all_lock();
-        retries.clear();
-        if let Some((scope, hash, until)) = alarm {
-            retries.insert(BodyRetryKey::new(scope, hash), until);
+        let next: HashMap<_, _> = alarm
+            .into_iter()
+            .map(|(scope, hash, until)| (BodyRetryKey::new(scope, hash), until))
+            .collect();
+        if *retries == next {
+            return;
         }
+        *retries = next;
+        drop(retries);
+        self.floor_ranking_changed.notify_waiters();
     }
 
     pub(super) fn clear_body_retry(
@@ -366,10 +391,17 @@ impl PeerRegistry {
         hash: block::Hash,
     ) {
         let key = BodyRetryKey::new(scope, hash);
-        self.body_retry_lock()
+        let mut retries = self.body_retry_lock();
+        let old_len = retries.entries.len();
+        retries
             .entries
             .retain(|(_, candidate, _), _| *candidate != key);
-        self.body_retry_all_lock().remove(&key);
+        let changed = retries.entries.len() != old_len;
+        drop(retries);
+        let removed = self.body_retry_all_lock().remove(&key).is_some();
+        if changed || removed {
+            self.floor_ranking_changed.notify_waiters();
+        }
     }
 
     /// Retire old work while preserving alarms and incompatibility reports from newer work.
@@ -379,6 +411,8 @@ impl PeerRegistry {
     ) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
+        let changed = retries.current != current;
+        let old_len = retries.entries.len() + all_retries.len();
         retries.current = current;
         retries.entries =
             collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().filter_map(
@@ -412,6 +446,12 @@ impl PeerRegistry {
                 Some((key, deadline))
             })
             .collect();
+        let changed = changed || old_len != retries.entries.len() + all_retries.len();
+        drop(retries);
+        drop(all_retries);
+        if changed {
+            self.floor_ranking_changed.notify_waiters();
+        }
     }
 
     /// Carry suppression deadlines through a compatible authority refresh.
@@ -422,6 +462,8 @@ impl PeerRegistry {
     pub(super) fn refresh_body_retry_scope(&self, current: zakura_header_chain::BodyWorkAuthority) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
+        let changed = retries.current != Some(current);
+        let old_len = retries.entries.len() + all_retries.len();
         retries.current = Some(current);
         *all_retries = std::mem::take(&mut *all_retries)
             .into_iter()
@@ -444,6 +486,12 @@ impl PeerRegistry {
                     ((source, key, reason), deadline)
                 },
             ));
+        let changed = changed || old_len != retries.entries.len() + all_retries.len();
+        drop(retries);
+        drop(all_retries);
+        if changed {
+            self.floor_ranking_changed.notify_waiters();
+        }
     }
 
     /// Match supplier cooldowns using the registry's authority while work snapshots refresh.
@@ -630,6 +678,8 @@ impl PeerRegistry {
         if let Some(entry) = peers.get_mut(peer) {
             if entry.conn_id == Some(conn_id) {
                 entry.conn_id = None;
+                entry.slots.available_slots = 0;
+                self.floor_ranking_changed.notify_waiters();
             }
         }
         let Some(park) = session_parks.get_mut(peer) else {
@@ -778,7 +828,13 @@ impl PeerRegistry {
             }
             let eligibility_changed = !entry.received_status
                 || entry.servable_low != status.servable_low
-                || entry.servable_high != status.servable_high;
+                || entry.servable_high != status.servable_high
+                || entry.max_blocks_per_response
+                    != clamp_advertised_blocks(status.max_blocks_per_response)
+                || entry.max_inflight_requests
+                    != clamp_advertised_inflight(status.max_inflight_requests)
+                || entry.max_response_bytes
+                    != clamp_advertised_response_bytes(status.max_response_bytes);
             entry.servable_low = status.servable_low;
             entry.servable_high = status.servable_high;
             entry.max_blocks_per_response = clamp_advertised_blocks(status.max_blocks_per_response);
@@ -1077,12 +1133,30 @@ impl PeerRegistry {
     /// never preferred over (nothing beats it), and if every servable peer is
     /// saturated this returns false and the floor still moves. Unknown RTprop is
     /// treated as worst, so a measured peer is never deferred to an unmeasured one.
+    #[cfg(test)]
     pub(super) fn floor_has_preferred_unsaturated_server(
         &self,
         height: block::Height,
         self_peer: &ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
+    ) -> bool {
+        self.floor_has_preferred_eligible_server(
+            height,
+            self_peer,
+            self_rtprop_ms,
+            allow_equal_score,
+            |_| true,
+        )
+    }
+
+    pub(super) fn floor_has_preferred_eligible_server(
+        &self,
+        height: block::Height,
+        self_peer: &ZakuraPeerId,
+        self_rtprop_ms: Option<u64>,
+        allow_equal_score: bool,
+        eligible: impl Fn(&ZakuraPeerId) -> bool,
     ) -> bool {
         let peers = self.lock();
         // Rank registered peers from the same published snapshot. Mixing a fresh
@@ -1093,7 +1167,7 @@ impl PeerRegistry {
             .unwrap_or(self_rtprop_ms)
             .unwrap_or(u64::MAX);
         peers.iter().any(|(peer, entry)| {
-            if peer == self_peer || !entry.can_serve_with_room(height) {
+            if peer == self_peer || !entry.can_serve_with_room(height) || !eligible(peer) {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
@@ -1138,6 +1212,29 @@ impl PeerRegistry {
         true
     }
 
+    /// Publish routine-owned retry exclusions without changing watchdog exclusions.
+    pub(super) fn publish_retry_avoid(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        avoid: &BTreeMap<block::Height, Instant>,
+        blocked: BTreeMap<block::Height, block::Height>,
+    ) {
+        let mut peers = self.lock();
+        let Some(entry) = peers.get_mut(peer) else {
+            return;
+        };
+        if entry.generation != generation
+            || (entry.request_retry_avoid == *avoid && entry.request_retry_blocked == blocked)
+        {
+            return;
+        }
+        entry.request_retry_avoid.clone_from(avoid);
+        entry.request_retry_blocked = blocked;
+        drop(peers);
+        self.floor_ranking_changed.notify_waiters();
+    }
+
     /// Hard-exclude this peer from re-taking `height` until `until` after the
     /// floor watchdog force-cancels its stale claim.
     pub(super) fn avoid_floor_height_until(
@@ -1149,6 +1246,7 @@ impl PeerRegistry {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
             entry.floor_watchdog_avoid.insert(height, until);
+            self.floor_ranking_changed.notify_waiters();
         }
     }
 
@@ -1187,9 +1285,23 @@ impl PeerRegistry {
 impl Entry {
     fn can_serve_with_room(&self, height: block::Height) -> bool {
         self.received_status
+            && self.conn_id.is_some()
             && self.servable_low <= height
             && height <= self.servable_high
             && self.slots.available_slots > 0
+            && !self
+                .request_retry_blocked
+                .range(..=height)
+                .next_back()
+                .is_some_and(|(_, last)| height <= *last)
+            && !self
+                .request_retry_avoid
+                .get(&height)
+                .is_some_and(|until| *until > Instant::now())
+            && !self
+                .floor_watchdog_avoid
+                .get(&height)
+                .is_some_and(|until| *until > Instant::now())
     }
 }
 
@@ -1276,6 +1388,30 @@ mod floor_bias_tests {
         available: usize,
     ) {
         register_with_rtprop(reg, config, peer, low, high, available, None);
+    }
+
+    #[tokio::test]
+    async fn unchanged_body_alarm_does_not_wake_requesters() {
+        let registry = PeerRegistry::new();
+        let notification = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(notification);
+        assert!(futures::poll!(&mut notification).is_pending());
+        registry.set_persisted_body_alarm(None);
+        assert!(futures::poll!(&mut notification).is_pending());
+        let alarm = Some((
+            super::super::test_work_scope(),
+            block::Hash([1; 32]),
+            Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        registry.set_persisted_body_alarm(alarm);
+        assert!(futures::poll!(&mut notification).is_ready());
+        let notification = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(notification);
+        assert!(futures::poll!(&mut notification).is_pending());
+        registry.set_persisted_body_alarm(alarm);
+        assert!(futures::poll!(&mut notification).is_pending());
+        registry.set_persisted_body_alarm(None);
+        assert!(futures::poll!(&mut notification).is_ready());
     }
 
     #[test]

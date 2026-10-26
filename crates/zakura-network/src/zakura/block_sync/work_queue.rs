@@ -54,6 +54,8 @@ pub(super) struct WorkItem {
     pub(super) hash: block::Hash,
     /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
     pub(super) estimated_bytes: u64,
+    /// Supplier hint, independent of the scheduling reservation.
+    pub(super) size_hint: BlockSizeEstimate,
     /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
     observed_bytes: u64,
     /// Refreshed hint for a future retry while an issued reservation stays fixed.
@@ -178,6 +180,7 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     available: Notify,
+    refill: Notify,
     /// Counts events that take an unreceived height from its owner without that
     /// owner's routine retiring the request. Routines rescan their requests for
     /// lost ownership only after this changes.
@@ -198,6 +201,7 @@ impl WorkQueue {
                 request_writes: HashMap::new(),
             }),
             available: Notify::new(),
+            refill: Notify::new(),
             revocations: AtomicU64::new(0),
         }
     }
@@ -241,13 +245,14 @@ impl WorkQueue {
     /// Add scoped `(height, hash, size)` items to `pending`.
     /// Insert a height above `floor` only when no pending or in-flight item owns it.
     /// Return the number of inserted heights.
-    /// Wake waiters after inserting any height.
+    /// Wake waiters after inserting a height or changing a pending size estimate.
     pub(super) fn extend(
         &self,
         scope: zakura_header_chain::BodyWorkAuthority,
         items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
     ) -> usize {
         let mut inserted = 0usize;
+        let mut estimate_changed = false;
         {
             let mut inner = self.lock();
             inner.current_authority = Some(scope);
@@ -261,7 +266,10 @@ impl WorkQueue {
                         && item.scope == scope
                         && !matches!(size, BlockSizeEstimate::Unknown)
                     {
-                        item.estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        let estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        estimate_changed |= item.estimated_bytes != estimated_bytes;
+                        item.estimated_bytes = estimated_bytes;
+                        item.size_hint = size;
                     }
                     continue;
                 }
@@ -276,6 +284,7 @@ impl WorkQueue {
                         provisional: false,
                         hash,
                         estimated_bytes,
+                        size_hint: size,
                         observed_bytes: 0,
                         retry_estimated_bytes: None,
                         retry_after_tip: None,
@@ -286,7 +295,7 @@ impl WorkQueue {
                 inserted += 1;
             }
         }
-        if inserted > 0 {
+        if inserted > 0 || estimate_changed {
             self.available.notify_waiters();
         }
         inserted
@@ -310,10 +319,12 @@ impl WorkQueue {
                     let estimated = estimated.max(item.observed_bytes);
                     changed |= item.estimated_bytes != estimated;
                     item.estimated_bytes = estimated;
+                    item.size_hint = size;
                 }
             } else if let Some(item) = inner.in_flight.get_mut(&height) {
                 if item.scope.body_work_epoch == scope.body_work_epoch && item.hash == hash {
                     item.retry_estimated_bytes = Some(estimated.max(item.observed_bytes));
+                    item.size_hint = size;
                 }
             }
         }
@@ -1083,7 +1094,16 @@ impl WorkQueue {
         released
     }
 
-    /// The "work added" notifier (per-peer routines wake source).
+    /// One producer consumes refill requests. Notify retains a permit until it waits.
+    pub(super) fn request_refill(&self) {
+        self.refill.notify_one();
+    }
+
+    pub(super) fn subscribe_refill(&self) -> &Notify {
+        &self.refill
+    }
+
+    /// Workers register before checking the queue to avoid missed publications.
     pub(super) fn subscribe_available(&self) -> &Notify {
         &self.available
     }
@@ -1169,6 +1189,14 @@ impl WorkQueue {
 
     pub(super) fn min_pending(&self) -> Option<block::Height> {
         self.lock().pending.keys().next().copied()
+    }
+
+    pub(super) fn in_flight_item(&self, height: block::Height) -> Option<WorkItem> {
+        self.lock().in_flight.get(&height).copied()
+    }
+
+    pub(super) fn pending_item(&self, height: block::Height) -> Option<WorkItem> {
+        self.lock().pending.get(&height).copied()
     }
 
     pub(super) fn first_pending_in_range(

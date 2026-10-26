@@ -11083,6 +11083,58 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     reactor_task.abort();
 }
 
+/// A caught-up forward reset must not count obsolete queued heights against the next refill.
+#[tokio::test]
+async fn reactor_forward_reset_clears_obsolete_pending_before_refill() {
+    let blocks = mainnet_blocks_1_to_3();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_requests: 1,
+        ..immediate_body_download_config()
+    };
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(3), blocks[2].hash()),
+        tip_rx,
+        config,
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup).unwrap();
+    wait_for_query_needed_blocks(&mut actions, block::Height(1), block::Height(3)).await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[1]),
+            block_meta(&blocks[2]),
+        ]))
+        .await
+        .unwrap();
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(3),
+            verified_block_hash: blocks[2].hash(),
+        }))
+        .await
+        .unwrap();
+    await_until("reset reaches the reactor", Duration::from_secs(1), || {
+        handle.local_status().servable_high == block::Height(3)
+    })
+    .await
+    .unwrap();
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(4),
+            hash: block::Hash([4; 32]),
+        })
+        .await
+        .unwrap();
+    wait_for_query_needed_blocks(&mut actions, block::Height(3), block::Height(4)).await;
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {
@@ -11819,7 +11871,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         .expect("apply-finished event queues");
 
     // the apply-rejection `Misbehavior` is emitted by the Sequencer task while
-    // the routines independently ping `RequeryNeeded`, so one or more
+    // the routines independently request a refill, so one or more
     // `QueryNeededBlocks` can race ahead of the misbehavior report. Skip queries
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
     // fails the test (the peer was not scored).
@@ -14383,6 +14435,40 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         SessionDemand::OpenNow,
     ));
     reactor_task.abort();
+}
+
+#[tokio::test]
+async fn extending_existing_work_wakes_only_for_changed_size_estimates() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let available = queue.subscribe_available().notified();
+    tokio::pin!(available);
+    assert!(futures::poll!(&mut available).is_pending());
+    assert_eq!(
+        queue.extend(
+            test_work_scope(),
+            [needed(1, BlockSizeEstimate::Advertised(1024))]
+        ),
+        0
+    );
+    assert!(futures::poll!(&mut available).is_ready());
+    assert_eq!(
+        queue
+            .pending_item(block::Height(1))
+            .unwrap()
+            .estimated_bytes,
+        1024
+    );
+
+    let unchanged = queue.subscribe_available().notified();
+    tokio::pin!(unchanged);
+    assert!(futures::poll!(&mut unchanged).is_pending());
+    for estimate in [
+        BlockSizeEstimate::Advertised(1024),
+        BlockSizeEstimate::Unknown,
+    ] {
+        assert_eq!(queue.extend(test_work_scope(), [needed(1, estimate)]), 0);
+        assert!(futures::poll!(&mut unchanged).is_pending());
+    }
 }
 
 #[test]

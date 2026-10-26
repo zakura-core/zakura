@@ -120,6 +120,14 @@ impl Requester {
             .collect()
     }
 
+    /// Heights whose wire authorization still prevents another request.
+    pub(super) fn retry_blocked_ranges(&self) -> BTreeMap<Height, Height> {
+        self.ranges
+            .values()
+            .map(|pending| (pending.range.start(), pending.range.last()))
+            .collect()
+    }
+
     pub(super) fn len(&self) -> usize {
         self.reservations.len()
     }

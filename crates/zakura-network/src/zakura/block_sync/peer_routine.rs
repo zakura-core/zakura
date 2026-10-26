@@ -71,8 +71,6 @@ const OWNERSHIP_CHECK_CHUNK: usize = 1024;
 /// The delay lets another routine take the height first on the single-threaded
 /// test runtime. The queue keeps the height pending for every other peer.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
-/// Poll interval while this peer's outbound stream queue is full.
-const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`).
 /// The trace records controller state while a peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
@@ -116,6 +114,8 @@ enum FillStop {
     NoStatus,
     CwndSaturated,
     NoWork,
+    PreferredPeer,
+    Yield,
     /// The resident look-ahead gate refused an above-window take (either lane: the floor lane or the speculative lane / above floor lane).
     LookaheadCap,
     /// The gate has headroom but the in-flight byte budget funds zero bytes.
@@ -146,6 +146,8 @@ impl FillStop {
             FillStop::NoStatus => "no_status",
             FillStop::CwndSaturated => "cwnd_saturated",
             FillStop::NoWork => "no_work",
+            FillStop::PreferredPeer => "preferred_peer",
+            FillStop::Yield => "yield",
             FillStop::LookaheadCap => "lookahead_cap",
             FillStop::InflightBudget => "inflight_budget",
             FillStop::RetryAvoid => "retry_avoid",
@@ -339,6 +341,9 @@ pub(super) struct PeerRoutine {
     retry_avoid: BTreeMap<block::Height, Instant>,
     /// Last sampled fill-stop time for each bounded reason label.
     fill_stop_trace_at: BTreeMap<&'static str, Instant>,
+    fill_again: bool,
+    /// A guarded reservation failed; retain the wait even if capacity returns immediately.
+    transport_waiting: bool,
 
     // ---- shared primitives (clones) ----
     /// Generation this routine was spawned with; gates its registry writes (and
@@ -355,7 +360,7 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
-    /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
+    /// Shared routine-to-reactor channel for serving, status, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
     sequencer_view: watch::Receiver<SequencerView>,
@@ -449,6 +454,8 @@ impl PeerRoutine {
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
+            fill_again: false,
+            transport_waiting: false,
             generation,
             next_request_id: NonZeroU64::new(1),
             budget,
@@ -521,6 +528,9 @@ impl PeerRoutine {
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let request_sender = self.session.request_sender();
+        let mut transport_capacity = Box::pin(request_sender.reserve_guarded());
+        let mut transport_slot = None;
         loop {
             if self.cancel.is_cancelled() {
                 return Ok(());
@@ -540,6 +550,7 @@ impl PeerRoutine {
             Notified::enable(available.as_mut());
             Notified::enable(floor_ranking.as_mut());
 
+            zakura_rt::task::coop::consume_budget().await;
             // Check before the biased receive arm so incoming traffic cannot
             // keep abandoned authorization alive or postpone request timeouts.
             let now = Instant::now();
@@ -557,12 +568,16 @@ impl PeerRoutine {
                 self.handle_deadlines(now).await?;
             }
             self.flush_pending_status();
-            let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
-                self.try_fill().await
-            } else {
-                self.gc_skipped_outstanding();
-                None
-            };
+            let retry_filter_deadline =
+                if transport_slot.is_some() || self.session.outbound_capacity() > 0 {
+                    self.try_fill_with_slot(transport_slot.take()).await
+                } else {
+                    self.fill_again = false;
+                    self.transport_waiting = true;
+                    self.gc_skipped_outstanding();
+                    self.publish_slot_diagnostics();
+                    None
+                };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
@@ -577,49 +592,63 @@ impl PeerRoutine {
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep(retry_filter_deadline);
             zakura_rt::pin!(timeout);
-            let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
-            zakura_rt::pin!(outbound_queue_poll);
-
-            zakura_rt::select! {
-                biased;
-                _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv() => {
-                    match frame {
-                        // Decode the frame and run the download/serving dispatch
-                        // in this same task. A protocol reject propagates out so
-                        // the supervised pipe cancels the connection; the `Drop`
-                        // guard returns unreceived work on the way out.
-                        Some(frame) => self.handle_frame(guard, frame).await?,
-                        // Stream closed by the peer. With no outstanding work this
-                        // is a clean exit; with unanswered requests it is a
-                        // no-progress stall (park or disconnect). `Drop` returns
-                        // unreceived outstanding heights and releases their budget.
-                        None => return self.handle_stream_failure(
-                            Instant::now(),
-                            self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
-                        ),
+            loop {
+                zakura_rt::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Ok(()),
+                    frame = self.recv.recv() => {
+                        match frame {
+                            // Decode the frame and run the download/serving dispatch
+                            // in this same task. A protocol reject propagates out so
+                            // the supervised pipe cancels the connection; the `Drop`
+                            // guard returns unreceived work on the way out.
+                            Some(frame) => self.handle_frame(guard, frame).await?,
+                            // Stream closed by the peer. With no outstanding work this
+                            // is a clean exit; with unanswered requests it is a
+                            // no-progress stall (park or disconnect). `Drop` returns
+                            // unreceived outstanding heights and releases their budget.
+                            None => return self.handle_stream_failure(
+                                Instant::now(),
+                                self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
+                            ),
+                        }
+                    }
+                    changed = self.sequencer_view.changed() => {
+                        match changed {
+                            Ok(()) => self.on_view_changed(),
+                            // The Sequencer task ended (shutdown); the routine follows.
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                    _ = &mut timeout => {
+                        self.publish_slot_diagnostics();
+                        self.trace_wake("deadline");
+                        self.handle_deadlines(Instant::now()).await?;
+                    },
+                    _ = &mut capacity => {
+                        self.trace_wake("budget_capacity");
+                    }
+                    _ = &mut available => {
+                        self.trace_wake("work_added");
+                    }
+                    _ = &mut floor_ranking => {
+                        self.trace_wake("floor_ranking_changed");
+                    }
+                    _ = zakura_rt::task::yield_now(), if self.fill_again => {
+                        self.trace_wake("fill_continue");
+                    }
+                    entry = request_pool.entry(), if self.request_pool_waiting => { drop(entry); }
+                    _ = bbr_trace_ticks.tick() => {
+                        self.trace_bbr_sample();
+                        continue;
+                    },
+                    slot = &mut transport_capacity, if self.transport_waiting || !outbound_queue_has_capacity => {
+                        transport_slot = Some(slot.map_err(|error| SinkReject::local(format!("block request transport closed: {error:?}")))?);
+                        transport_capacity = Box::pin(request_sender.reserve_guarded());
+                        self.trace_wake("transport_capacity");
                     }
                 }
-                changed = self.sequencer_view.changed() => {
-                    match changed {
-                        Ok(()) => self.on_view_changed(),
-                        // The Sequencer task ended (shutdown); the routine follows.
-                        Err(_) => return Ok(()),
-                    }
-                }
-                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
-                _ = &mut capacity => {
-                    self.trace_wake("budget_capacity");
-                }
-                _ = &mut available => {
-                    self.trace_wake("work_added");
-                }
-                _ = &mut floor_ranking => {
-                    self.trace_wake("floor_ranking_changed");
-                }
-                entry = request_pool.entry(), if self.request_pool_waiting => { drop(entry); }
-                _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
-                _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
+                break;
             }
         }
     }
@@ -864,6 +893,7 @@ impl PeerRoutine {
         // registry so the reactor's candidate reads see them; generation-gated.
         self.registry
             .upsert_status(&self.peer, self.generation, status);
+        self.publish_slot_diagnostics();
         self.trace_status_received(status);
         // Ask the reactor to advertise our Status reply (if due) and republish the
         // candidate. Best-effort; a full channel just defers the candidate refresh
@@ -919,9 +949,7 @@ impl PeerRoutine {
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
         // sleeps on an empty deadline set would leave the pipeline dry.
-        let _ = self
-            .routine_to_reactor
-            .try_send(RoutineToReactor::RequeryNeeded);
+        self.work.request_refill();
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
     }
@@ -931,12 +959,20 @@ impl PeerRoutine {
     /// liveness deadline, pending status refresh, or the soonest retry-avoid expiry
     /// (local failure bias or registry-owned floor-watchdog hard exclude), so a routine that quiet-returned
     /// its only work re-runs want-work once the bias lifts even if no external event
-    /// arrives. Defaults to a long idle sleep when none exists.
-    fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
+    /// arrives. The deadline branch stays disabled when no deadline exists.
+    fn earliest_deadline_sleep(
+        &self,
+        retry_filter_deadline: Option<Instant>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
         let now = Instant::now();
         let earliest_deadline = self.window.outstanding.earliest_deadline();
         let liveness_deadline = self.window.block_liveness_deadline;
-        let local_retry_avoid = self.retry_avoid.values().min().copied();
+        let local_retry_avoid = self
+            .retry_avoid
+            .values()
+            .copied()
+            .filter(|until| *until > now)
+            .min();
         let floor_watchdog_avoid = self.registry.next_floor_avoid_deadline(&self.peer, now);
         let body_retry_avoid = self.registry.next_body_retry_deadline(&self.peer, now);
         let earliest = [
@@ -948,17 +984,18 @@ impl PeerRoutine {
             floor_watchdog_avoid,
             body_retry_avoid,
             retry_filter_deadline,
+            self.window.bbr_next_expiry(now),
             self.pending_status
                 .map(|_| self.inbound_status_meter.next_allowed),
         ]
         .into_iter()
         .flatten()
         .min();
-        match earliest {
-            // Floor the wait at the deadline so a far-future request still wakes
-            // promptly; an already-due deadline wakes immediately.
-            Some(deadline) => time::sleep(deadline.saturating_duration_since(now)),
-            None => time::sleep(Duration::from_secs(3600)),
+        async move {
+            match earliest {
+                Some(deadline) => time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
         }
     }
 
@@ -971,6 +1008,16 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) -> Option<Instant> {
+        self.try_fill_with_slot(None).await
+    }
+
+    /// Fill available request slots, using an already acquired transport permit first.
+    async fn try_fill_with_slot(
+        &mut self,
+        mut transport_slot: Option<crate::zakura::transport::GuardedFrameSlot<'_>>,
+    ) -> Option<Instant> {
+        self.fill_again = false;
+        self.transport_waiting = false;
         self.request_pool_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
@@ -989,6 +1036,8 @@ impl PeerRoutine {
         // routine again.
         let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
+        // Ranking must see current model freshness and wire authorization before taking work.
+        self.publish_slot_diagnostics();
         let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
         // trace can attribute carrier idle ("bubble") time to a cause. The loop yields a
@@ -1034,7 +1083,11 @@ impl PeerRoutine {
                 break FillStop::SendError;
             };
             // Reserve transport capacity before taking work or charging bytes.
-            let slot = match request_sender.try_reserve_guarded() {
+            let slot = match transport_slot
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| request_sender.try_reserve_guarded())
+            {
                 Ok(slot) => slot,
                 Err(crate::zakura::transport::GuardedReserveError::Full) => {
                     break FillStop::OutboundFull
@@ -1055,7 +1108,13 @@ impl PeerRoutine {
             };
             self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let in_bypass = normal_slots == 0;
-            let (servable_low, servable_high) = (self.servable_low, self.servable_high);
+            let view = *self.sequencer_view.borrow();
+            let Ok(first_needed) = view.download_floor.next() else {
+                break FillStop::NoWork;
+            };
+            // A forward reset can leave old pending entries at or below its floor.
+            let (servable_low, servable_high) =
+                (self.servable_low.max(first_needed), self.servable_high);
 
             // Compute this chunk's count and byte ceiling before taking any work.
             // The count cap is the peer/request cap; the byte cap is enforced by
@@ -1063,7 +1122,6 @@ impl PeerRoutine {
             let max_count = self.request_count_cap();
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
             // One snapshot per iteration: the floor and speculative lanes decide
             // against the same memory picture, and `admit` is the single authority
@@ -1074,14 +1132,33 @@ impl PeerRoutine {
             let floor_start = self
                 .work
                 .first_pending_in_range(servable_low, servable_high.min(floor_high));
-            // A preferred peer must serve the missing height. A peer that only
-            // serves the committed floor cannot take this request.
+            let floor_item = floor_start.and_then(|height| self.work.pending_item(height));
+            if let Some((height, item)) = floor_start.zip(floor_item.as_ref()) {
+                let timed_rejection = self.retry_avoid.contains_key(&height)
+                    || self
+                        .registry
+                        .is_floor_height_avoided(&self.peer, height, now)
+                    || self
+                        .registry
+                        .is_body_retry_avoided(&self.peer, item.scope, item.hash, now);
+                if self.requester.blocks_retry(height) || timed_rejection {
+                    retry_filter_deadline = self.retry_filter_wake_deadline(now, timed_rejection);
+                    break FillStop::RetryAvoid;
+                }
+            }
             let floor_arm_allowed = floor_start.is_some_and(|height| {
-                !self.registry.floor_has_preferred_unsaturated_server(
+                !self.registry.floor_has_preferred_eligible_server(
                     height,
                     &self.peer,
                     self.window.bbr_rtprop_ms(now),
                     in_bypass,
+                    |peer| {
+                        floor_item.is_none_or(|item| {
+                            !self
+                                .registry
+                                .is_body_retry_avoided(peer, item.scope, item.hash, now)
+                        })
+                    },
                 )
             });
             let mut items = Vec::new();
@@ -1165,10 +1242,10 @@ impl PeerRoutine {
                             request_id,
                         );
                     }
-                    // A floor-priority start while the floor arm deferred to a
-                    // preferred carrier: leave the take to that peer (falls through
-                    // to `no_work`, exactly as before).
-                    AdmissionOutcome::Admit(_) => {}
+                    // The preferred carrier owns this floor-priority opportunity.
+                    AdmissionOutcome::Admit(_) => {
+                        break FillStop::PreferredPeer;
+                    }
                     AdmissionOutcome::LookaheadAtCap => {
                         metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
                         break FillStop::LookaheadCap;
@@ -1419,7 +1496,15 @@ impl PeerRoutine {
                 in_bypass,
             );
             fill_sent = fill_sent.saturating_add(1);
+            if fill_sent == 32 {
+                // Re-enter select to service responses, cancellation, and deadlines.
+                // The continuation runs without waiting for new work.
+                self.fill_again = true;
+                break FillStop::Yield;
+            }
         };
+        self.transport_waiting = fill_stop == FillStop::OutboundFull;
+        self.publish_slot_diagnostics();
         // Attribute this pass's stop. A pass that issued nothing is a candidate bubble;
         // the reason + the live slot/budget/work snapshot let a trace tell a legitimate
         // stop (no_work with empty queue, cwnd_saturated) from a recoverable one (slots +
@@ -1436,9 +1521,7 @@ impl PeerRoutine {
         // If pending work is running low, ping the reactor to re-query (the
         // producer self-gates on low-water, so this is idempotent/cheap).
         if self.work.pending_len() < self.refill_low_water_blocks() {
-            let _ = self
-                .routine_to_reactor
-                .try_send(RoutineToReactor::RequeryNeeded);
+            self.work.request_refill();
         }
         retry_filter_deadline
     }
@@ -1605,10 +1688,9 @@ impl PeerRoutine {
         // out, so another peer can contest them (the peer-local timeout bias).
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
         self.note_retry_avoid(timed_out_heights);
-        if timed_out.is_empty() {
-            self.publish_slot_diagnostics();
-        } else {
-            // Trace the window and reliability this timeout cut; the sample also publishes.
+        self.publish_slot_diagnostics();
+        if !timed_out.is_empty() {
+            // Trace the window and reliability this timeout cut.
             self.trace_bbr_sample();
         }
         true
@@ -2471,9 +2553,18 @@ impl PeerRoutine {
     /// requester refuses new requests publishes no free slots, so no other
     /// routine defers the floor to it.
     fn publish_slot_diagnostics(&mut self) {
+        self.registry.publish_retry_avoid(
+            &self.peer,
+            self.generation,
+            &self.retry_avoid,
+            self.requester.retry_blocked_ranges(),
+        );
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.published_requester_stopped = self.requester_stop().is_some();
-        let available_slots = if self.published_requester_stopped {
+        let available_slots = if self.published_requester_stopped
+            || self.session.outbound_capacity() == 0
+            || self.window.requests_without_block_progress >= self.window.no_progress_request_cap()
+        {
             0
         } else {
             self.window.available_slots()
@@ -2577,6 +2668,11 @@ impl Drop for PeerRoutine {
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
         self.return_unreceived_requests("peer_routine_drop");
+        self.registry.publish_slots(
+            &self.peer,
+            self.generation,
+            super::peer_registry::SlotDiagnostics::default(),
+        );
     }
 }
 
@@ -2715,6 +2811,362 @@ mod tests {
         (routine, out_recv, routine_to_reactor_rx)
     }
 
+    /// A forward reset can retain old pending work, but only new heights may be requested.
+    #[tokio::test]
+    async fn fill_skips_pending_work_at_or_below_reset_floor() {
+        for floor in [block::Height(3), block::Height::MAX] {
+            let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+            routine.received_status = true;
+            routine.servable_low = block::Height(1);
+            routine.servable_high = block::Height::MAX;
+            routine.work.extend(
+                super::super::test_work_scope(),
+                (2..=3).map(|height| {
+                    (
+                        block::Height(height),
+                        block::Hash([u8::try_from(height).unwrap(); 32]),
+                        BlockSizeEstimate::Advertised(1_000),
+                    )
+                }),
+            );
+            routine.work.reset_above(floor);
+            assert!(routine.work.pending_contains(block::Height(2)));
+            assert!(routine.work.pending_contains(block::Height(3)));
+            let mut view = *routine.sequencer_view.borrow();
+            view.download_floor = floor;
+            view.reset_epoch += 1;
+            let (_view_tx, view_rx) = watch::channel(view);
+            routine.sequencer_view = view_rx;
+            routine.on_view_changed();
+            if floor == block::Height(3) {
+                routine.work.extend(
+                    super::super::test_work_scope(),
+                    [(
+                        block::Height(4),
+                        block::Hash([4; 32]),
+                        BlockSizeEstimate::Advertised(1_000),
+                    )],
+                );
+            }
+
+            routine.try_fill().await;
+
+            if floor == block::Height(3) {
+                let frame = outbound
+                    .try_recv()
+                    .expect("the next needed block is requested");
+                assert!(matches!(
+                    BlockSyncMessage::decode_frame(frame).unwrap(),
+                    BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(4),
+                        count: 1
+                    }
+                ));
+            }
+            assert!(outbound.try_recv().is_err(), "no obsolete request is sent");
+            assert!(!routine.work.in_flight_contains(block::Height(2)));
+            assert!(!routine.work.in_flight_contains(block::Height(3)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_fill_waits_for_transport_and_resumes_without_time() {
+        let (mut routine, _old_outbound, _reactor_events) = status_test_routine();
+        let (sender, mut outbound) = framed_channel(32);
+        routine.session =
+            BlockSyncPeerSession::for_test(routine.peer.clone(), sender, routine.cancel.clone());
+        routine.config.bbr_cwnd_unit = CwndUnit::Blocks;
+        routine.config.bbr_min_cwnd = 64;
+        routine.window = super::super::state::DownloadWindow::new(&routine.config);
+        routine
+            .window
+            .note_block_progress(Instant::now(), Duration::from_secs(30));
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(64),
+            ..BlockSyncStatus::default()
+        });
+        let (_in_send, in_recv) = framed_channel(16);
+        routine.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+        routine.sequencer_view = view_rx;
+        let work = Arc::clone(&routine.work);
+        work.extend(
+            super::super::test_work_scope(),
+            (1..=64).map(|height| {
+                (
+                    block::Height(height),
+                    block::Hash([u8::try_from(height).unwrap(); 32]),
+                    BlockSizeEstimate::Advertised(1_000),
+                )
+            }),
+        );
+        routine.try_fill().await;
+        assert!(routine.fill_again);
+        assert_eq!(routine.window.outstanding.len(), 32);
+        let cancel = routine.cancel.clone();
+        let before = tokio::time::Instant::now();
+        let mut running = Box::pin(routine.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        outbound.try_recv().unwrap();
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(work.in_flight_contains(block::Height(33)));
+        assert_eq!(tokio::time::Instant::now(), before);
+        cancel.cancel();
+        assert!(futures::poll!(running.as_mut()).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_heartbeat_does_not_refill_or_publish_eligibility() {
+        let (mut routine, _outbound, _reactor_events) = status_test_routine();
+        let (_in_send, in_recv) = framed_channel(16);
+        routine.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+        routine.sequencer_view = view_rx;
+        let work = Arc::clone(&routine.work);
+        let registry = Arc::clone(&routine.registry);
+        let cancel = routine.cancel.clone();
+        let mut running = Box::pin(routine.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        // Drain startup notifications before observing the heartbeat alone.
+        work.subscribe_refill().notified().await;
+        let refill = work.subscribe_refill().notified();
+        let ranking = registry.subscribe_floor_ranking().notified();
+        zakura_rt::pin!(refill, ranking);
+        assert!(futures::poll!(&mut refill).is_pending());
+        assert!(futures::poll!(&mut ranking).is_pending());
+        tokio::time::advance(super::BBR_TRACE_INTERVAL).await;
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(futures::poll!(&mut refill).is_pending());
+        assert!(futures::poll!(&mut ranking).is_pending());
+        cancel.cancel();
+        assert!(futures::poll!(running.as_mut()).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refill_survives_a_full_reactor_channel_and_late_subscription() {
+        let (mut routine, _outbound, _reactor_events) = status_test_routine();
+        while routine
+            .routine_to_reactor
+            .try_send(RoutineToReactor::StatusReceived {
+                peer: routine.peer.clone(),
+                send_reply: false,
+            })
+            .is_ok()
+        {}
+        routine.try_fill().await;
+        routine.try_fill().await;
+        let refill = routine.work.subscribe_refill().notified();
+        zakura_rt::pin!(refill);
+        assert!(futures::poll!(&mut refill).is_ready());
+        let duplicate = routine.work.subscribe_refill().notified();
+        zakura_rt::pin!(duplicate);
+        assert!(futures::poll!(&mut duplicate).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_capacity_wakes_without_a_poll_tick() {
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        let (_in_send, in_recv) = framed_channel(16);
+        routine.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+        routine.sequencer_view = view_rx;
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            ..BlockSyncStatus::default()
+        });
+        let sender = routine.session.request_sender();
+        let capacity = sender.capacity();
+        for _ in 0..capacity {
+            sender
+                .try_send(
+                    BlockSyncMessage::Status(BlockSyncStatus::default())
+                        .encode_frame()
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let work = Arc::clone(&routine.work);
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+        let budget = routine.budget.clone();
+        let cancel = routine.cancel.clone();
+        let before = tokio::time::Instant::now();
+        let mut running = Box::pin(routine.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(work.pending_contains(block::Height(1)));
+        outbound.try_recv().unwrap();
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        for _ in 1..capacity {
+            outbound.try_recv().unwrap();
+        }
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(outbound.try_recv().unwrap()).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
+        assert_eq!(tokio::time::Instant::now(), before);
+        cancel.cancel();
+        assert!(futures::poll!(running.as_mut()).is_ready());
+        drop(running);
+        assert_eq!(budget.reserved(), 0);
+        assert!(work.pending_contains(block::Height(1)));
+        assert_eq!(sender.capacity(), capacity);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn floor_ranking_change_wakes_a_deferred_routine() {
+        deferred_routine_resumes("ranking").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preferred_peer_removal_wakes_a_deferred_routine() {
+        deferred_routine_resumes("remove").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preferred_peer_range_change_wakes_a_deferred_routine() {
+        deferred_routine_resumes("status").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preferred_peer_retry_exclusion_wakes_a_deferred_routine() {
+        deferred_routine_resumes("retry").await;
+    }
+
+    async fn deferred_routine_resumes(event: &str) {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut slow, mut outbound, _reactor_events) = status_test_routine();
+        // Keep the input streams open while driving the real wait loop.
+        let (_in_send, in_recv) = framed_channel(16);
+        slow.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*slow.sequencer_view.borrow());
+        slow.sequencer_view = view_rx;
+        slow.received_status = true;
+        slow.servable_low = block::Height(1);
+        slow.servable_high = block::Height(10);
+
+        let registry = Arc::clone(&slow.registry);
+        let work = Arc::clone(&slow.work);
+        let slow_peer = slow.peer.clone();
+        let slow_generation = slow.generation;
+        let cancel = slow.cancel.clone();
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = registry
+            .admit_session(
+                &fast_peer,
+                slow.session.direction(),
+                &slow.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        for (peer, generation) in [(&slow_peer, slow_generation), (&fast_peer, fast_generation)] {
+            registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(10),
+                    ..BlockSyncStatus::default()
+                },
+            );
+        }
+
+        let mut running = Box::pin(slow.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        // Consume the initial heartbeat before publishing the two finite scores.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let before_refill = tokio::time::Instant::now();
+        let slots = SlotDiagnostics {
+            available_slots: 3,
+            bbr_rtprop_ms: Some(75),
+            ..SlotDiagnostics::default()
+        };
+        registry.publish_slots(&fast_peer, fast_generation, slots);
+        registry.publish_slots(
+            &slow_peer,
+            slow_generation,
+            SlotDiagnostics {
+                bbr_rtprop_ms: Some(145),
+                ..slots
+            },
+        );
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        // The slow worker sees the faster carrier and goes back to sleep.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(outbound.try_recv().is_err());
+        assert!(work.pending_contains(block::Height(1)));
+
+        match event {
+            "ranking" => registry.publish_slots(
+                &fast_peer,
+                fast_generation,
+                SlotDiagnostics {
+                    bbr_rtprop_ms: None,
+                    ..slots
+                },
+            ),
+            "remove" => registry.remove(&fast_peer),
+            "status" => registry.upsert_status(
+                &fast_peer,
+                fast_generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(5),
+                    servable_high: block::Height(10),
+                    ..BlockSyncStatus::default()
+                },
+            ),
+            "retry" => registry.avoid_floor_height_until(
+                &fast_peer,
+                block::Height(1),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            _ => unreachable!(),
+        }
+        // Only the ranking update can wake the worker: no work, capacity,
+        // view, or timer changed.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let frame = outbound
+            .try_recv()
+            .expect("a ranking change must wake the deferred worker");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
+        assert!(work.in_flight_contains(block::Height(1)));
+        assert!(!work.pending_contains(block::Height(1)));
+        assert_eq!(tokio::time::Instant::now(), before_refill);
+
+        cancel.cancel();
+        assert!(timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn floor_provider_does_not_defer_to_a_peer_behind_the_missing_block() {
         use super::super::peer_registry::SlotDiagnostics;
@@ -2778,120 +3230,6 @@ mod tests {
                 count: 1
             }
         ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn floor_ranking_change_wakes_a_deferred_routine() {
-        use super::super::peer_registry::SlotDiagnostics;
-
-        let (mut slow, mut outbound, _reactor_events) = status_test_routine();
-        // Keep the input streams open while driving the real wait loop.
-        let (_in_send, in_recv) = framed_channel(16);
-        slow.recv = in_recv;
-        let (_view_tx, view_rx) = watch::channel(*slow.sequencer_view.borrow());
-        slow.sequencer_view = view_rx;
-        slow.received_status = true;
-        slow.servable_low = block::Height(1);
-        slow.servable_high = block::Height(10);
-
-        let registry = Arc::clone(&slow.registry);
-        let work = Arc::clone(&slow.work);
-        let slow_peer = slow.peer.clone();
-        let slow_generation = slow.generation;
-        let cancel = slow.cancel.clone();
-        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
-        let fast_generation = registry
-            .admit_session(
-                &fast_peer,
-                slow.session.direction(),
-                &slow.config,
-                0,
-                Instant::now(),
-            )
-            .generation();
-        for (peer, generation) in [(&slow_peer, slow_generation), (&fast_peer, fast_generation)] {
-            registry.upsert_status(
-                peer,
-                generation,
-                BlockSyncStatus {
-                    servable_low: block::Height(0),
-                    servable_high: block::Height(10),
-                    ..BlockSyncStatus::default()
-                },
-            );
-        }
-
-        let mut running = Box::pin(slow.run());
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        // Consume the initial heartbeat before publishing the two finite scores.
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        let before_refill = Instant::now();
-        let slots = SlotDiagnostics {
-            available_slots: 3,
-            bbr_rtprop_ms: Some(75),
-            ..SlotDiagnostics::default()
-        };
-        registry.publish_slots(&fast_peer, fast_generation, slots);
-        registry.publish_slots(
-            &slow_peer,
-            slow_generation,
-            SlotDiagnostics {
-                bbr_rtprop_ms: Some(145),
-                ..slots
-            },
-        );
-        work.extend(
-            super::super::test_work_scope(),
-            [(
-                block::Height(1),
-                block::Hash([1; 32]),
-                BlockSizeEstimate::Advertised(1_000),
-            )],
-        );
-
-        // The slow worker sees the faster carrier and goes back to sleep.
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        assert!(outbound.try_recv().is_err());
-        assert!(work.pending_contains(block::Height(1)));
-
-        registry.publish_slots(
-            &fast_peer,
-            fast_generation,
-            SlotDiagnostics {
-                bbr_rtprop_ms: None,
-                ..slots
-            },
-        );
-        assert!(registry.floor_has_preferred_unsaturated_server(
-            block::Height(0),
-            &fast_peer,
-            None,
-            false
-        ));
-
-        // The fast worker now defers to the sleeping slow worker. Only the
-        // ranking update can wake it: no work, capacity, view, or timer changed.
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        let frame = outbound
-            .try_recv()
-            .expect("a ranking change must wake the deferred worker");
-        assert!(matches!(
-            BlockSyncMessage::decode_frame(frame).unwrap(),
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 1
-            }
-        ));
-        assert!(work.in_flight_contains(block::Height(1)));
-        assert!(!work.pending_contains(block::Height(1)));
-        assert_eq!(Instant::now(), before_refill);
-
-        cancel.cancel();
-        assert!(timeout(Duration::from_secs(1), running)
-            .await
-            .unwrap()
-            .is_ok());
     }
 
     #[tokio::test]
@@ -3813,7 +4151,7 @@ mod tests {
             assert_eq!(routine.window.outstanding.len(), 2);
         }
         let skipped = work.subscribe_available().notified();
-        tokio::pin!(skipped);
+        zakura_rt::pin!(skipped);
         skipped.as_mut().enable();
         // Another peer wins height 2 before this writer starts. Its body retains
         // this exact owner until the sequencer consumes it.
@@ -4600,7 +4938,7 @@ mod tests {
             .unwrap();
 
         let mut running = Box::pin(routine.run());
-        let sequenced = tokio::select! {
+        let sequenced = zakura_rt::select! {
             sequenced = sequencer_recv.recv() => sequenced,
             _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
         };

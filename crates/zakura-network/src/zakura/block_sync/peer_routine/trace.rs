@@ -13,6 +13,7 @@ impl PeerRoutine {
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
             row.reason = Some(reason);
         });
@@ -130,6 +131,19 @@ impl PeerRoutine {
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(count));
             row.estimated_bytes = Some(estimated_bytes);
+            self.insert_bbr_fields(row);
+            if let Some(item) = self.work.in_flight_item(start_height) {
+                row.estimate_source = Some(match item.size_hint {
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Confirmed(_) => {
+                        "confirmed"
+                    }
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Advertised(_) => {
+                        "advertised"
+                    }
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Unknown => "unknown",
+                });
+                row.request_owner = item.owner.map(|owner| format!("{owner:?}"));
+            }
             row.available_slots = Some(saturating_usize(self.window.available_slots()));
             row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));
             self.insert_no_progress_fields(row);
@@ -233,11 +247,6 @@ impl PeerRoutine {
             self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);
         });
-        // Refresh the published slot diagnostics on the same cadence so the cross-peer
-        // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_slot_diagnostics` re-reads `bbr_rtprop_ms(now)`, filtering out samples
-        // aged past the horizon (→ `None` = worst floor server).
-        self.publish_slot_diagnostics();
     }
 
     pub(super) fn trace_body_sequencer_sent(

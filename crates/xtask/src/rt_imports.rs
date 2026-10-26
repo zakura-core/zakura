@@ -684,31 +684,48 @@ impl<'a> PathVisitor<'a> {
     /// the front, and a bound first segment becomes each path the file
     /// binds that name to, anywhere, so `SystemTime::now` after
     /// `use clocks::SystemTime` also reads as std's when `clocks` re-exports
-    /// it. Scopes aren't tracked, so expansion can only add findings.
+    /// it. Only binding replacements count toward [`MAX_ALIAS_HOPS`].
+    /// Scopes aren't tracked, so expansion can only add findings.
     fn expansions(&self, segments: &[String]) -> Vec<Vec<String>> {
-        let mut seen = BTreeSet::from([segments.to_vec()]);
-        let mut layers = vec![vec![segments.to_vec()]];
+        let mut seen = BTreeSet::new();
+        let mut layers = vec![self.without_prefixes(segments.to_vec(), &mut seen)];
         for _ in 0..MAX_ALIAS_HOPS {
             let mut next = Vec::new();
             for path in layers.last().into_iter().flatten() {
-                let rest = &path[1..];
-                let first = path[0].as_str();
-                if !rest.is_empty()
-                    && (matches!(first, "self" | "super" | "crate") || self.modules.contains(first))
-                {
-                    next.push(rest.to_vec());
-                }
-                for target in self.names.get(first).into_iter().flatten() {
-                    next.push(target.iter().chain(rest).cloned().collect());
+                for target in self.names.get(&path[0]).into_iter().flatten() {
+                    let target = target.iter().chain(&path[1..]).cloned().collect();
+                    next.extend(self.without_prefixes(target, &mut seen));
                 }
             }
-            next.retain(|path| seen.insert(path.clone()));
             if next.is_empty() {
                 break;
             }
             layers.push(next);
         }
         layers.into_iter().rev().flatten().collect()
+    }
+
+    /// `path` and each shorter path left by dropping `self`, `super`,
+    /// `crate` or an inline module name off its front, skipping any in
+    /// `seen` and adding the rest to it.
+    fn without_prefixes(
+        &self,
+        mut path: Vec<String>,
+        seen: &mut BTreeSet<Vec<String>>,
+    ) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        loop {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+            let first = path[0].as_str();
+            if path.len() == 1
+                || !(matches!(first, "self" | "super" | "crate") || self.modules.contains(first))
+            {
+                return paths;
+            }
+            path.remove(0);
+        }
     }
 
     /// Checks the path written as `segments` and each of its expansions, and
@@ -1636,6 +1653,23 @@ mod tests {
         assert_eq!(
             violations_in("crates/zakura-quic/src/driver/connection.rs", source),
             ["std::time::Instant::now -> zakura_rt::time::Instant::now"]
+        );
+    }
+
+    /// Dropping module prefixes doesn't use up the hop budget, so a chain of
+    /// re-exports through sibling modules still reaches std's clock.
+    #[test]
+    fn module_prefixes_do_not_count_as_hops() {
+        let source = "
+            mod first { pub use std::time::SystemTime as Raw; }
+            mod second { pub use super::first::Raw as Middle; }
+            mod third { pub use super::second::Middle as Wall; }
+            use third::Wall as Clock;
+            fn read() -> Clock { Clock::now() }
+        ";
+        assert_eq!(
+            violations(source),
+            ["std::time::SystemTime::now -> zakura_rt::time::utc_now"]
         );
     }
 

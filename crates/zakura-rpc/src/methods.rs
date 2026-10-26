@@ -2703,38 +2703,41 @@ where
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
+        let response = match self
+            .read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if is_read_capacity_refusal(&*error) => {
+                // A capacity refusal says nothing about the block, so the caller can retry.
+                return Err(ErrorObject::new(
+                    server::error::LegacyCode::OutOfMemory,
+                    "state read capacity is temporarily exhausted, retry later",
+                ));
+            }
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
+                return Err("block height not in best chain").map_error(
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    if hash_or_height.hash().is_some() {
+                        server::error::LegacyCode::InvalidAddressOrKey
+                    } else {
+                        server::error::LegacyCode::InvalidParameter
+                    },
+                );
+            }
+            Err(error) => return Err(error).map_misc_error(),
+        };
         let zakura_state::ReadResponse::BlockHeader {
             header,
             hash,
             height,
             next_block_hash,
-        } = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
-            .await
-            .map_err(|error| {
-                if is_read_capacity_refusal(&*error) {
-                    // A capacity refusal says nothing about the block, so the caller can retry.
-                    ErrorObject::new(
-                        server::error::LegacyCode::OutOfMemory,
-                        "state read capacity is temporarily exhausted, retry later",
-                    )
-                } else {
-                    // ## Compatibility with `zcashd`.
-                    //
-                    // Since this function is reused by getblock(), we return the errors
-                    // expected by it (they differ whether a hash or a height was passed).
-                    ErrorObject::new(
-                        if hash_or_height.hash().is_some() {
-                            server::error::LegacyCode::InvalidAddressOrKey
-                        } else {
-                            server::error::LegacyCode::InvalidParameter
-                        },
-                        "block height not in best chain",
-                    )
-                }
-            })?
+        } = response
         else {
             panic!("unexpected response to BlockHeader request")
         };

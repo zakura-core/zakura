@@ -19,28 +19,39 @@
 //! `std::thread`. `Duration`, `UNIX_EPOCH`, the `SystemTime` type and
 //! `std::thread::panicking` stay allowed.
 //!
-//! Paths resolve through the names `use` items bind, renames included, and
-//! on through `self`, `super`, the file's inline modules and further `use`
-//! items, so `use std::time::SystemTime as Clock` or a local re-export doesn't
-//! hide `Clock::now()`. When a path resolves to something the rules don't
-//! know, such as a path through `crate`, a type alias or a glob, its written
-//! spelling is checked as well, so the bare spellings `SystemTime::now`,
-//! `Utc::now`, `Local::now` and `Arc::downgrade` stay flagged.
+//! Scopes aren't tracked. A first pass records every path each name is
+//! bound to by a production `use` anywhere in the file, in any module, block,
+//! `cfg` alternative or macro argument. A path is flagged if its written
+//! spelling, or any expansion of it, hits a rule: expansion drops `self`,
+//! `super`, `crate` and the file's inline module names from the front, and
+//! replaces a bound first segment with each path the file binds it to,
+//! renames and local re-exports included. Expansion can only add findings, so
+//! the bare spellings `SystemTime::now`, `Utc::now`, `Local::now` and
+//! `Arc::downgrade` stay flagged however they're imported. Qualified calls
+//! such as `<Instant>::now()` are checked as the plain path.
+//! `UNIX_EPOCH.elapsed()`, under any parentheses or `&`, and
+//! `SystemTime::elapsed` read the wall clock, so they're flagged. In a file
+//! allowed to name std's `Instant`, every `.elapsed()` call is flagged, since
+//! the receiver's type isn't known. Macro arguments that parse as expressions
+//! or statements, as `dbg!`, `assert!`, `assert_eq!` and `println!` take, are
+//! visited as code under the same rules.
 //!
-//! Every possible binding is checked, so `cfg` alternatives can't hide one
-//! another. Qualified calls such as `<Instant>::now()` are checked as the
-//! plain path. `UNIX_EPOCH.elapsed()`, under any parentheses or `&`, and
-//! `SystemTime::elapsed` read the wall clock, so they're flagged. Macro
-//! arguments that parse as expressions or statements, as `dbg!`, `assert!`,
-//! `assert_eq!` and `println!` take, are visited as code under the same rules.
+//! The trade-off is false positives on purpose. A file that binds one name to
+//! both a std clock and a zakura_rt one is flagged wherever it uses the name,
+//! even where Rust would pick the zakura_rt one, and renaming one import fixes
+//! it. Because `crate::` is dropped, a local shim module named like a runtime
+//! crate, such as `crate::tokio`, would be flagged too. Nothing in the tree
+//! trips either today.
 //!
 //! Limits: macros with syntax of their own, such as `tokio::select!` or a
-//! DSL, can't be parsed generically and only get a token scan, which sees
-//! written-out paths like `std::time::Instant::now` but not aliases.
-//! `.elapsed()` on a `SystemTime` value other than the epoch isn't flagged,
-//! since the check doesn't know a value's type. The timer adapters in
-//! `tokio_stream` and `std::thread::available_parallelism`, a host property
-//! discovery reads, aren't covered yet.
+//! DSL, can't be parsed generically and only get a token scan. It sees
+//! written-out paths like `std::time::Instant::now`, expanded through the
+//! file's names, but not imports made inside the macro. `.elapsed()` on a
+//! `SystemTime` value other than the epoch isn't flagged outside the files
+//! that may name std's `Instant`, since the check doesn't know a value's type.
+//! The timer adapters in `tokio_stream` and
+//! `std::thread::available_parallelism`, a host property discovery reads,
+//! aren't covered yet.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

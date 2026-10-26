@@ -8,7 +8,7 @@
 
 use std::{
     fmt,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{self, Write},
 };
 
@@ -207,6 +207,14 @@ fn replay_on<'h>(
     let script = TraceScript::new(trace, options.prefix && trace.end.is_none())
         .map_err(ReplayError::InvalidTrace)?;
 
+    // Created before the run, so an existing log fails the replay up front
+    // instead of hiding its result.
+    let observations = options
+        .observe
+        .then(|| create_observations(trace))
+        .transpose()
+        .map_err(ReplayError::Io)?;
+
     let mut sink = VerifySink::new(trace);
     let (report, failure) =
         match (harness.run)(&trace.meta.scenario, PlanInput::Trace(script), &mut sink) {
@@ -214,8 +222,8 @@ fn replay_on<'h>(
             Err(HarnessError::Run { failure, report }) => (*report, Some(failure)),
             Err(error) => return Err(unsupported(error)),
         };
-    if options.observe {
-        write_observations(trace, &report.log, report.end.steps).map_err(ReplayError::Io)?;
+    if let Some(file) = observations {
+        write_observations(file, &report.log, report.end.steps).map_err(ReplayError::Io)?;
     }
 
     let strict = !build_mismatch;
@@ -355,13 +363,18 @@ struct ObservationLine<'a> {
     obs: Vec<&'a Observation>,
 }
 
-/// Writes `log`'s observations for steps 0 to `steps`, one line per step,
-/// into `trace`'s directory. Fails if the file exists.
-fn write_observations(trace: &Trace, log: &ObservationLog, steps: u64) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+/// Creates [`OBSERVATIONS_FILE`] in `trace`'s directory. Fails if anything,
+/// a symlink included, is already there.
+fn create_observations(trace: &Trace) -> io::Result<File> {
+    OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(trace.dir.join(OBSERVATIONS_FILE))?;
+        .open(trace.dir.join(OBSERVATIONS_FILE))
+}
+
+/// Writes `log`'s observations for steps 0 to `steps` to `file`, one line
+/// per step.
+fn write_observations(mut file: File, log: &ObservationLog, steps: u64) -> io::Result<()> {
     let mut out = Vec::new();
     for step in 0..=steps {
         let line = ObservationLine {

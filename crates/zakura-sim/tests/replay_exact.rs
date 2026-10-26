@@ -762,6 +762,8 @@ thread_local! {
     /// The mutation [`Effects`] applies on this thread. Each test runs on its
     /// own thread, so tests don't see each other's.
     static MUTATION: Cell<Mutation> = const { Cell::new(Mutation::None) };
+    /// How many runs of [`EffectsHarness`] this thread has built.
+    static EFFECTS_BUILT: Cell<u32> = const { Cell::new(0) };
 }
 
 /// A source of storage-like operations. Step `n` runs operation `n`, which
@@ -875,6 +877,7 @@ impl Subsystem for EffectsHarness {
 
     /// Adds the source.
     fn build(sim: &mut Sim, _: &Fixed) -> Self {
+        EFFECTS_BUILT.set(EFFECTS_BUILT.get() + 1);
         sim.add_source(Box::new(Effects(Cell::new(0))));
         EffectsHarness
     }
@@ -1003,4 +1006,25 @@ fn changed_effects_are_nondeterministic() {
             other => panic!("{mutation:?}: expected Nondeterministic, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn observe_refuses_an_existing_log_before_running() {
+    let dir = record(&EFFECTS, &[]);
+    let log = dir.path().join(OBSERVATIONS_FILE);
+    std::fs::write(&log, "an earlier replay's log\n").unwrap();
+    let observe = ReplayOptions {
+        observe: true,
+        ..ReplayOptions::default()
+    };
+    let built = EFFECTS_BUILT.get();
+    match replay_with(&open(dir.path()), &EFFECTS, observe) {
+        Err(ReplayError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists),
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+    assert_eq!(EFFECTS_BUILT.get(), built, "the replay never ran");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "an earlier replay's log\n"
+    );
 }

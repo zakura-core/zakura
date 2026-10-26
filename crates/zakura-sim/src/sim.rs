@@ -16,7 +16,7 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
-    evidence::{Checkpoint, Evidence, Mark},
+    evidence::{Checkpoint, Mark},
     observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
@@ -95,8 +95,8 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
-    /// Each evidence source's index and the checkpoint it sets.
-    evidence: Vec<(usize, Checkpoint)>,
+    /// Each evidence checkpoint the run holds, by name.
+    evidence: Vec<(String, Checkpoint)>,
     config: RunConfig,
 }
 
@@ -136,15 +136,12 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
-    /// Adds a source whose observations are evidence, and keeps its
-    /// checkpoint. At setup and after every step, the run ends with
-    /// [`HarnessFailure::SourceEvidence`] unless the checkpoint names that
-    /// step.
-    pub fn add_evidence<S: ActionSource + 'static>(&mut self, evidence: Evidence<S>) -> SourceId {
-        let (source, checkpoint) = evidence.into_parts();
-        let id = self.add_source(Box::new(source));
-        self.evidence.push((id.0, checkpoint));
-        id
+    /// Holds `checkpoint`, named `name`, for an evidence source being
+    /// created. At setup and after every step, the run ends with
+    /// [`HarnessFailure::SourceEvidence`] unless it names that step, however
+    /// the source was wrapped or added, or if it never was.
+    pub(crate) fn register_evidence(&mut self, name: &str, checkpoint: Checkpoint) {
+        self.evidence.push((name.to_owned(), checkpoint));
     }
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
@@ -440,11 +437,11 @@ impl Sim {
             source
                 .observe(&mut st.log)
                 .map_err(|detail| HarnessFailure::SourceEvidence {
-                    source: index,
+                    source: format!("source {index}"),
                     detail,
                 })?;
         }
-        for (index, checkpoint) in &self.evidence {
+        for (name, checkpoint) in &self.evidence {
             let detail = match checkpoint.get() {
                 Mark::Observed(step) if step == st.step => continue,
                 Mark::NotObserved => {
@@ -456,7 +453,7 @@ impl Sim {
                 ),
             };
             return Err(HarnessFailure::SourceEvidence {
-                source: *index,
+                source: name.clone(),
                 detail,
             });
         }

@@ -57,8 +57,9 @@ pub enum HarnessFailure {
     /// A source's evidence was incomplete: its facts disagreed with its
     /// state, didn't reach the log, or it skipped a boundary.
     SourceEvidence {
-        /// The source's index in the run.
-        source: usize,
+        /// The source: `source <index>` for one whose `observe` failed, or
+        /// the name of a checkpoint the run holds, such as `storage:header`.
+        source: String,
         /// What was wrong, led by the failure's name, such as
         /// `BoundarySkipped`.
         detail: String,
@@ -101,7 +102,7 @@ impl fmt::Display for HarnessFailure {
                 )
             }
             HarnessFailure::SourceEvidence { source, detail } => {
-                write!(f, "source {source}'s evidence failed: {detail}")
+                write!(f, "{source}'s evidence failed: {detail}")
             }
         }
     }

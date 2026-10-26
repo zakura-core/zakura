@@ -27,13 +27,13 @@ use zakura_storage::header::{
 };
 
 use crate::{
-    evidence::{Checkpoint, Evidence, Mark},
+    evidence::{Checkpoint, Mark},
     observe::{
         Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
         WorkScope,
     },
-    ActionSource, Boundary, Identity, Observation, ObservationLog,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
 /// The service name in identities and observations.
@@ -65,14 +65,16 @@ pub struct HeaderStorage {
 
 impl HeaderStorage {
     /// A source for `port` with no latency bound: an operation can stay
-    /// pending for as long as the `Plan` leaves it.
+    /// pending for as long as the `Plan` leaves it. Its checkpoint is
+    /// registered with `sim` now, so the run fails unless the source
+    /// observes every boundary, however it's later wrapped or added.
     ///
     /// # Panics
     ///
     /// If `port` isn't pristine, since then the model can't know its owner
     /// state. That's a fixture bug.
-    pub fn new(port: Arc<ControlledPort>) -> Evidence<Self> {
-        Self::with_latency(port, None)
+    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>) -> Self {
+        Self::with_latency(sim, port, None)
     }
 
     /// A source for `port` that must complete each operation within
@@ -82,28 +84,30 @@ impl HeaderStorage {
     /// # Panics
     ///
     /// As [`HeaderStorage::new`] does.
-    pub fn bounded(port: Arc<ControlledPort>, max_latency: Duration) -> Evidence<Self> {
-        Self::with_latency(port, Some(max_latency))
+    pub fn bounded(sim: &mut Sim, port: Arc<ControlledPort>, max_latency: Duration) -> Self {
+        Self::with_latency(sim, port, Some(max_latency))
     }
 
-    /// The source both constructors build, with its checkpoint.
-    fn with_latency(port: Arc<ControlledPort>, max_latency: Option<Duration>) -> Evidence<Self> {
+    /// The source both constructors build, with its checkpoint registered.
+    fn with_latency(
+        sim: &mut Sim,
+        port: Arc<ControlledPort>,
+        max_latency: Option<Duration>,
+    ) -> Self {
         assert!(
             port.is_pristine(),
             "a storage source needs a pristine port: build it before the run and use it only \
              inside the run"
         );
         let checkpoint = Checkpoint::default();
-        Evidence::new(
-            HeaderStorage {
-                port,
-                max_latency,
-                model: OwnerModel::new(),
-                delivered: None,
-                checkpoint: checkpoint.clone(),
-            },
+        sim.register_evidence(&format!("storage:{SERVICE}"), checkpoint.clone());
+        HeaderStorage {
+            port,
+            max_latency,
+            model: OwnerModel::new(),
+            delivered: None,
             checkpoint,
-        )
+        }
     }
 }
 

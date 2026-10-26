@@ -258,9 +258,9 @@ fn spawn_locator(sim: &mut Sim, delivery: &Delivery) {
         drop(permit);
     });
 
-    sim.add_evidence(zakura_sim::storage::HeaderStorage::new(
-        delivery.port.clone(),
-    ));
+    let storage = zakura_sim::storage::HeaderStorage::new(sim, delivery.port.clone());
+
+    sim.add_source(Box::new(storage));
 }
 
 /// Checks the storage invariants after every step of a delivery run:
@@ -476,7 +476,8 @@ fn a_completion_wakes_a_task_the_scheduler_sees_as_deadlocked() {
                     .await
                     .expect("the engine outcome comes first");
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+            sim.add_source(Box::new(storage));
         },
         &mut checker,
     );
@@ -599,7 +600,8 @@ fn shutdown_releases_everything_and_logs_nothing() {
                 );
                 let _ = caller.continuation_locator(permit).await;
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port.clone()));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port.clone());
+            sim.add_source(Box::new(storage));
             held = Some((port, semaphore));
         },
         &mut zakura_sim::NoChecks,
@@ -662,10 +664,8 @@ fn bounded_storage_completes_within_its_latency() {
                 sim.scheduler().spawn_root("sleeper", async move {
                     zakura_rt::time::sleep(Duration::from_secs(60)).await;
                 });
-                sim.add_evidence(zakura_sim::storage::HeaderStorage::bounded(
-                    port.clone(),
-                    bound,
-                ));
+                let storage = zakura_sim::storage::HeaderStorage::bounded(sim, port.clone(), bound);
+                sim.add_source(Box::new(storage));
             },
             &mut checker,
         );
@@ -719,7 +719,8 @@ fn time_stops_where_a_timeout_opens() {
                 sim.scheduler().spawn_root("sleeper", async move {
                     zakura_rt::time::sleep(Duration::from_secs(60)).await;
                 });
-                sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+                let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+                sim.add_source(Box::new(storage));
             },
             &mut checker,
         );
@@ -835,7 +836,8 @@ fn abandonment_run(plan: PlanInput) -> (RunReport, Abandonment) {
                     let _ = call.await;
                 }
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port.clone()));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port.clone());
+            sim.add_source(Box::new(storage));
         },
         &mut checker,
     );
@@ -1012,10 +1014,13 @@ fn skipping_run(skip: Option<u64>) -> RunReport {
                 let anchor = HeaderFixture::regtest().anchor();
                 let _ = caller.selected_chain_contains(anchor.hash).await;
             });
-            let storage = zakura_sim::storage::HeaderStorage::new(port);
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
             match skip {
-                Some(skip) => sim.add_evidence(storage.map(|inner| SkipAt { inner, skip })),
-                None => sim.add_evidence(storage),
+                Some(skip) => sim.add_source(Box::new(SkipAt {
+                    inner: storage,
+                    skip,
+                })),
+                None => sim.add_source(Box::new(storage)),
             };
         },
         &mut zakura_sim::NoChecks,
@@ -1049,6 +1054,28 @@ fn a_skipped_observation_ends_the_run_there() {
         };
         assert!(detail.starts_with(failure), "skipping {skip}: {detail}");
     }
+}
+
+/// C1: storage registers its checkpoint when it's created, so one the run
+/// never gets as a source still fails the run at setup, rather than
+/// leaving its evidence unchecked.
+#[test]
+fn storage_the_run_never_observes_fails_at_setup() {
+    let report = run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            drop(zakura_sim::storage::HeaderStorage::new(sim, port));
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert_eq!(source, "storage:header");
+    assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
 /// The world the harness-failure scenario's property reads: nothing.
@@ -1108,7 +1135,8 @@ fn a_property_is_inconclusive_after_an_evidence_failure() {
                 thief.take_facts();
                 std::future::pending::<()>().await;
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+            sim.add_source(Box::new(storage));
         },
         &mut checker,
     );
@@ -1184,7 +1212,8 @@ fn a_tasks_storage_facts_precede_its_outcome() {
                 })
                 .await;
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+            sim.add_source(Box::new(storage));
         },
         &mut zakura_sim::NoChecks,
     );
@@ -1271,7 +1300,8 @@ fn a_completions_lease_facts_come_in_order() {
                 assert!(matches!(other, Ok(AcquirePathReply::Acquired(_))));
                 drop((held, refused, other));
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+            sim.add_source(Box::new(storage));
         },
         &mut zakura_sim::NoChecks,
     );
@@ -1338,7 +1368,8 @@ fn a_release_ends_its_live_lease() {
                     .await
                     .expect("the engine outcome comes first");
             });
-            sim.add_evidence(zakura_sim::storage::HeaderStorage::new(port));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, port);
+            sim.add_source(Box::new(storage));
         },
         &mut zakura_sim::NoChecks,
     );

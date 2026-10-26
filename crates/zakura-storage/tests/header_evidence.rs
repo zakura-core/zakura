@@ -292,3 +292,42 @@ fn a_lease_life_matches_the_model() {
     checked(&port, &mut model);
     assert_eq!(model.state(), port.owner_state());
 }
+
+/// A shutdown that drops an operation whose submission the model never
+/// saw names an unknown owner. Here the submission's transaction is
+/// deleted and the later facts and transactions renumbered, as a producer
+/// that kept the slot but skipped `Submitted` would publish them.
+#[test]
+fn a_shutdown_dropping_an_unseen_operation_is_an_unknown_owner() {
+    let (port, chain) = chain(1);
+    let mut call = port.selected_chain_contains(chain[0].hash);
+    assert!(pin!(&mut call)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let id = port.pending()[0].id;
+    port.shut_down();
+    drop(call);
+    let mut facts = port.take_facts();
+    let submitted = facts
+        .iter()
+        .position(|fact| matches!(fact.kind, FactKind::Submitted { .. }))
+        .expect("the call was submitted");
+    facts.remove(submitted);
+    for (n, fact) in (1..).zip(&mut facts) {
+        (fact.seq, fact.txn) = (n, n);
+    }
+    assert!(matches!(
+        facts.as_slice(),
+        [Fact {
+            kind: FactKind::ShutDown { .. },
+            ..
+        }]
+    ));
+    assert_eq!(
+        OwnerModel::new().apply(&facts),
+        Err(ModelFailure::UnknownOwner {
+            txn: Some(1),
+            owner: Owner::Operation(id),
+        })
+    );
+}

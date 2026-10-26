@@ -538,6 +538,9 @@ impl OwnerModel {
                 self.complete(txn, completion, &mut kinds, &mut lease_facts)?;
             }
             FactKind::ShutDown { dropped } => {
+                if let Some(id) = dropped.iter().find(|id| !self.ops.contains_key(id)) {
+                    return Err(HeadError::Unknown(Owner::Operation(*id)));
+                }
                 if self.shut_down || *dropped != self.ops.keys().copied().collect::<Vec<_>>() {
                     return Err(HeadError::Unexpected);
                 }

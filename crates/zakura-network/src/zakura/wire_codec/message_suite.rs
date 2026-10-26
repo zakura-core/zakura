@@ -12,7 +12,7 @@
 //! - **Header mutations.** Each flag bit, each undeclared message type, and a
 //!   payload one byte past the row's maximum fail to decode.
 //! - **Payload mutations.** Every short prefix and one trailing byte fail to
-//!   decode.
+//!   decode, unless an opaque row admits the changed length.
 //! - **Domain violations.** Each violation fails with the error it names.
 //! - **Hostile payloads.** Arbitrary payloads within each row's bounds, and
 //!   valid payloads with one byte changed, decode without panicking. Whatever
@@ -54,6 +54,13 @@ where
 
     /// Frames that pass their row's header checks but break a domain rule.
     fn violations() -> Vec<Violation<Self>>;
+
+    /// Message types whose payload ends in bytes the family does not parse,
+    /// such as block sync's `Block` body. Such a row decodes every length
+    /// within its bounds, so the payload mutations skip those lengths.
+    fn opaque_types() -> &'static [u16] {
+        &[]
+    }
 }
 
 /// Run every deterministic check for `M`.
@@ -147,7 +154,10 @@ where
     M::Error: Debug,
 {
     let len = frame.payload.len();
-    for prefix in prefixes(len) {
+    let rule = MessageRule::find(M::RULES, frame.message_type).expect("samples use rows");
+    let admitted =
+        |len: usize| M::opaque_types().contains(&rule.message_type) && rule.payload.contains(len);
+    for prefix in prefixes(len).filter(|prefix| !admitted(*prefix)) {
         let truncated = Frame {
             payload: frame.payload[..prefix].to_vec(),
             ..frame.clone()
@@ -159,12 +169,14 @@ where
         );
     }
 
-    let mut trailing = frame.clone();
-    trailing.payload.push(0);
-    assert!(
-        decode_checked::<M>(&trailing).is_err(),
-        "a trailing byte was accepted"
-    );
+    if !admitted(len + 1) {
+        let mut trailing = frame.clone();
+        trailing.payload.push(0);
+        assert!(
+            decode_checked::<M>(&trailing).is_err(),
+            "a trailing byte was accepted"
+        );
+    }
 
     for bit in 0..u16::BITS {
         let flagged = Frame {
@@ -177,7 +189,6 @@ where
         );
     }
 
-    let rule = MessageRule::find(M::RULES, frame.message_type).expect("samples use rows");
     let mut oversized = frame.clone();
     oversized.payload.resize(rule.payload.max() + 1, 0);
     assert!(

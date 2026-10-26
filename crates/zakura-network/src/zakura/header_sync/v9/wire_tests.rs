@@ -31,7 +31,9 @@ use crate::zakura::{
     wire_codec::{
         encode_frame,
         item_suite::item_suite,
-        message_suite::{decode_checked, message_suite, MessageSample, Violation},
+        message_suite::{
+            check_layout_carries_family, decode_checked, message_suite, MessageSample, Violation,
+        },
         sample::WireSample,
         BlockHash, HeightLe, WireError,
     },
@@ -804,6 +806,13 @@ fn violations<const HEADER_BYTES: usize>() -> Vec<Violation<Message<HEADER_BYTES
 
 message_suite!(mainnet_and_testnet_family, CommonMessage);
 message_suite!(regtest_family, RegtestMessage);
+
+/// Each layout carries exactly its family's rows.
+#[test]
+fn both_layouts_carry_exactly_their_family_rows() {
+    check_layout_carries_family::<CommonMessage>(&CommonMessage::LAYOUT);
+    check_layout_carries_family::<RegtestMessage>(&RegtestMessage::LAYOUT);
+}
 
 /// The frame suite: every reader of both layouts follows its rows.
 #[test]

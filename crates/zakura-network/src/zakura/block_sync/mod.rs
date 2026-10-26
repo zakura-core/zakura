@@ -4,12 +4,7 @@
 //! peer's stream-6 frames flow through the per-peer routine, the work queue, the
 //! commit pipeline, the registry, and the reactor.
 
-use std::{
-    collections::BTreeMap,
-    io,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
@@ -22,7 +17,7 @@ use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
     task::JoinHandle,
-    time,
+    time::{self, Instant},
 };
 
 use super::{
@@ -89,6 +84,24 @@ pub use wire::{
     ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     ZAKURA_STREAM_BLOCK_SYNC,
 };
+
+/// The current UTC time as chrono's type. Reads `zakura_rt::time::utc_now`,
+/// so a simulated run sees the scenario clock.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    time::utc_now().into()
+}
+
+/// A header-chain [`Clock`](zakura_header_chain::Clock) that reads [`utc_now`], so
+/// body-retry deadlines and their conversion to `Instant`s share one clock.
+#[derive(Copy, Clone, Debug, Default)]
+struct BlockSyncClock;
+
+impl zakura_header_chain::Clock for BlockSyncClock {
+    /// Returns [`utc_now`].
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        utc_now()
+    }
+}
 
 #[cfg(test)]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {

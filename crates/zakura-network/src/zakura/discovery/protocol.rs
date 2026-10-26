@@ -1948,7 +1948,7 @@ impl ZakuraDiscoveryHandle {
         let slot = self.verify_slots.reserve().await;
         let context = self.import_validation.context(current_unix_secs());
         crate::zakura::resume_task_panic(
-            zakura_rt::task::spawn_blocking(move || {
+            zakura_rt::task::spawn_blocking_named("discovery_verify", move || {
                 let _slot = slot;
                 verify(&context)
             })

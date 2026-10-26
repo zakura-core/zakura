@@ -33,12 +33,6 @@ SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 # Make the build platform available as a variable
 ARG BUILDPLATFORM
 
-# Install zebra build deps
-RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
 # Build arguments and variables
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
@@ -161,8 +155,10 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
     --mount=type=bind,source=crates/zakura-scheduler,target=crates/zakura-scheduler \
+    --mount=type=bind,source=crates/zakura-sim,target=crates/zakura-sim \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-storage,target=crates/zakura-storage \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \

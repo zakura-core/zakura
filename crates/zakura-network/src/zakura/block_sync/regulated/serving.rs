@@ -93,7 +93,7 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         // Await the actual job, even after session cancellation, and keep the
         // source's lease with its retained blocks.
         resume_task_panic(
-            zakura_rt::task::spawn_blocking(move || {
+            zakura_rt::task::spawn_blocking_named("block_sync_serve_encode", move || {
                 encode_response(requested, read_range.count(), max_body_bytes, result, sink)
             })
             .await,

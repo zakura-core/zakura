@@ -253,7 +253,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -309,7 +309,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -352,7 +352,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -413,7 +413,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -442,7 +442,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -467,18 +467,19 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
       - name: Check no git dependencies
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
 
-  # `zakura-rt` and `zakura-scheduler` have a simulator build behind
-  # `--cfg zakura_sim` that no other job compiles. Changing RUSTFLAGS rebuilds
-  # every crate, so this job uses its own target directory and cache key.
-  # `zakura-network`'s library and its scheduler tests build under the flag
-  # too. Its unit tests still name tokio's types, so they don't.
+  # `zakura-rt`, `zakura-scheduler`, `zakura-sim` and `zakura-quic` have a
+  # simulator build behind `--cfg zakura_sim` that no other job compiles.
+  # `zakura-storage` serves the simulator, so it runs here too. Changing RUSTFLAGS
+  # rebuilds every crate, so this job uses its own target directory and cache
+  # key. `zakura-network`'s library and its scheduler tests build under the
+  # flag too. Its unit tests still name tokio's types, so they don't.
   sim-build:
     name: zakura_sim build
     needs: changes
@@ -502,14 +503,25 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint the simulator build
         run: |
-          cargo clippy --locked -p zakura-rt -p zakura-scheduler --all-targets -- -D warnings
-          cargo clippy --locked -p zakura-network --lib --test sim_header_sync -- -D warnings
+          cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets -- -D warnings
+          cargo clippy --locked -p zakura-network --lib --test sim_header_sync --test sim_block_sync -- -D warnings
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build
         run: |
-          cargo test --locked -p zakura-rt -p zakura-scheduler
-          cargo test --locked -p zakura-network --test sim_header_sync
+          cargo test --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic
+          cargo test --locked -p zakura-network --test sim_header_sync --test sim_block_sync
+          # Rustdoc needs the flag too, or the crate has no doc tests to run.
+          RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+      # S4.7: the discovery regression must still find the bug it guards.
+      # The patch reverts the wait_complete fix in this disposable checkout,
+      # so this step runs last. A patch that no longer applies fails here.
+      - name: Check the discovery regression against the reverted fix
+        run: |
+          git apply crates/zakura-sim/tests/fixtures/discovery-wait-complete-revert.patch
+          cargo test --locked -p zakura-sim --test discovery -- --ignored --exact reverted_fix_misses_the_wakeup
         env:
           RUSTFLAGS: --cfg zakura_sim
 

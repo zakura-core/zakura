@@ -2,10 +2,12 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use eyre::Report;
-use once_cell::sync::Lazy;
 use tower::{layer::Layer, timeout::TimeoutLayer};
 
 use zakura_chain::{
@@ -288,9 +290,9 @@ async fn verifiers_from_network(
     (block_verifier_router, state_service)
 }
 
-static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
     Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -300,9 +302,9 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<
     vec![(Request::Commit(block), hash)]
 });
 
-static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: Lazy<
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
     Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -311,19 +313,20 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: Lazy<
     vec![(Request::Commit(block), Err(ExpectedTranscriptError::Any))]
 });
 
-static NO_COINBASE_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
-    Lazy::new(|| {
-        let block = block_no_transactions();
+static NO_COINBASE_TRANSCRIPT: LazyLock<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = LazyLock::new(|| {
+    let block = block_no_transactions();
 
-        vec![(
-            Request::Commit(Arc::new(block)),
-            Err(ExpectedTranscriptError::Any),
-        )]
-    });
+    vec![(
+        Request::Commit(Arc::new(block)),
+        Err(ExpectedTranscriptError::Any),
+    )]
+});
 
-static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
+static NO_COINBASE_STATE_TRANSCRIPT: LazyLock<
     Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block = block_no_transactions();
     let hash = block.hash();
 
@@ -333,9 +336,9 @@ static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
     )]
 });
 
-static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+static STATE_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
     Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()

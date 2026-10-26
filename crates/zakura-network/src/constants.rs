@@ -5,9 +5,7 @@
 //! - peer connection limits, and
 //! - peer connection timeouts.
 
-use std::{collections::HashMap, time::Duration};
-
-use lazy_static::lazy_static;
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 // TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
@@ -419,31 +417,39 @@ pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 
-lazy_static! {
-    /// The minimum network protocol version accepted by this crate for each network,
-    /// represented as a network upgrade.
-    ///
-    /// The minimum protocol version is used to check the protocol versions of our
-    /// peers during the initial block download. After the initial block download,
-    /// we use the current block height to select the minimum network protocol
-    /// version.
-    ///
-    /// If peer versions are too old, we will disconnect from them.
-    ///
-    /// The minimum network protocol version typically changes after Mainnet and
-    /// Testnet network upgrades.
-    // TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
-    // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
-    pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
+/// The minimum network protocol version accepted by this crate for each network,
+/// represented as a network upgrade.
+///
+/// The minimum protocol version is used to check the protocol versions of our
+/// peers during the initial block download. After the initial block download,
+/// we use the current block height to select the minimum network protocol
+/// version.
+///
+/// If peer versions are too old, we will disconnect from them.
+///
+/// The minimum network protocol version typically changes after Mainnet and
+/// Testnet network upgrades.
+// TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
+// TODO: Move the value here to a field on `testnet::Parameters` (#8367)
+pub static INITIAL_MIN_NETWORK_PROTOCOL_VERSION: LazyLock<HashMap<NetworkKind, Version>> =
+    LazyLock::new(|| {
         let mut hash_map = HashMap::new();
 
-        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu6_2));
-        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2));
-        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2));
+        hash_map.insert(
+            NetworkKind::Mainnet,
+            Version::min_specified_for_upgrade(&Mainnet, Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Testnet,
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2),
+        );
+        hash_map.insert(
+            NetworkKind::Regtest,
+            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2),
+        );
 
         hash_map
-    };
-}
+    });
 
 /// The timeout for DNS lookups.
 ///

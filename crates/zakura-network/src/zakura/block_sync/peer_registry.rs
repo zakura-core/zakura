@@ -23,7 +23,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use zakura_chain::block;
@@ -33,7 +33,7 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
-    time,
+    time::Instant,
 };
 
 use super::{
@@ -200,10 +200,15 @@ impl BodyRetryKey {
     }
 }
 
-pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+/// The monotonic instant at which UTC `deadline` arrives by `clock`, or now if
+/// it has passed. `clock` must be the one that dated `deadline`.
+pub(super) fn retry_deadline_instant(
+    deadline: chrono::DateTime<chrono::Utc>,
+    clock: &dyn zakura_header_chain::Clock,
+) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(clock.now())
         .to_std()
         .unwrap_or(Duration::ZERO);
     monotonic_now
@@ -1292,11 +1297,11 @@ impl Entry {
             && !self
                 .request_retry_avoid
                 .get(&height)
-                .is_some_and(|until| *until > time::Instant::now().into_std())
+                .is_some_and(|until| *until > Instant::now())
             && !self
                 .floor_watchdog_avoid
                 .get(&height)
-                .is_some_and(|until| *until > time::Instant::now().into_std())
+                .is_some_and(|until| *until > Instant::now())
     }
 }
 

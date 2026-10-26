@@ -48,7 +48,7 @@ jobs:
         run: python3 .github/scripts/release_state.py candidate --state "$RUNNER_TEMP/release-state"
 
       - name: Preserve the verified candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
@@ -72,7 +72,7 @@ jobs:
           toolchain: stable
           cache-save-if: false
       - uses: ./.github/actions/setup-zakura-build
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
         with:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
@@ -112,7 +112,7 @@ jobs:
           cache: false
 
       - name: Restore the exact validated candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
         with:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
@@ -161,7 +161,7 @@ jobs:
           cache: false
       - name: Install the pinned storage client
         run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-state.txt
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
         with:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
@@ -170,7 +170,7 @@ jobs:
           RELEASE_STATE_R2_ACCESS_KEY_ID: ${{ secrets.RELEASE_STATE_R2_ACCESS_KEY_ID }}
           RELEASE_STATE_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_STATE_R2_SECRET_ACCESS_KEY }}
         run: python3 .github/scripts/release_state.py promote --state "$RUNNER_TEMP/release-state"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: published-release-state
           path: ${{ runner.temp }}/release-state/promoted-ready.json

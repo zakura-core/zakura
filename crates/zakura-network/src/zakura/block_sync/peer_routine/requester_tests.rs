@@ -501,7 +501,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         .check_request_liveness(deadline - Duration::from_millis(1))
         .is_ok());
     time::timeout_at(
-        (deadline + Duration::from_millis(1)).into(),
+        deadline + Duration::from_millis(1),
         routine.earliest_deadline_sleep(None),
     )
     .await
@@ -610,9 +610,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         1,
         "the ending still owns authorization after all bodies arrive"
     );
-    assert!(routine
-        .check_request_liveness(time::Instant::now().into_std())
-        .is_ok());
+    assert!(routine.check_request_liveness(time::Instant::now()).is_ok());
     assert!(!connection.is_cancelled());
     routine
         .handle_frame(&mut block_sync_guard(), buffered.recv().await.unwrap())
@@ -808,7 +806,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
     routine.window.block_liveness_deadline = None;
-    time::advance(retirement.saturating_duration_since(time::Instant::now().into_std())).await;
+    time::advance(retirement.saturating_duration_since(time::Instant::now())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
         servable_low: block::Height(1),
@@ -1384,10 +1382,7 @@ async fn fast_peer_holding_one_exchange() -> (
     };
     let index = usize::try_from(first.0 - 1).unwrap();
     deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
-    assert!(fast
-        .window
-        .bbr_rtprop_ms(time::Instant::now().into_std())
-        .is_some());
+    assert!(fast.window.bbr_rtprop_ms(time::Instant::now()).is_some());
     assert_eq!(fast.requester.occupancy().len, 1);
     let floor = fast
         .work
@@ -1473,7 +1468,7 @@ async fn abandoned_range_releases_floor_preference_until_ending() {
     assert!(fast.expire_due_timeouts(deadline));
     fast.retry_avoid.clear();
     fast.window
-        .note_block_progress(time::Instant::now().into_std(), Duration::from_secs(30));
+        .note_block_progress(Instant::now(), Duration::from_secs(30));
     fast.publish_slot_diagnostics();
     let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, block::Height(1));
     // Give the blocked peer the better score without changing its wire blockers.
@@ -1530,7 +1525,7 @@ async fn expired_latency_is_published_before_floor_selection() {
         requester_routine(block::Hash([1; 32]));
     fast.config.bbr_rtprop_window = Duration::from_secs(1);
     fast.window = super::super::state::DownloadWindow::new(&fast.config);
-    let now = time::Instant::now().into_std();
+    let now = Instant::now();
     let elapsed = Duration::from_millis(1);
     let snapshot = fast.window.delivery_snapshot(now - elapsed);
     fast.window.record_delivery(now, elapsed, 1, 1000, snapshot);
@@ -1552,10 +1547,7 @@ async fn expired_latency_is_published_before_floor_selection() {
         false
     ));
     time::advance(Duration::from_secs(1) + Duration::from_nanos(1)).await;
-    assert_eq!(
-        fast.window.bbr_rtprop_ms(time::Instant::now().into_std()),
-        None
-    );
+    assert_eq!(fast.window.bbr_rtprop_ms(Instant::now()), None);
     fast.try_fill().await;
     assert!(
         requested_heights(&mut outbound).is_empty(),

@@ -2,7 +2,7 @@
 //! `zakura-rt`.
 //!
 //! The check parses every production module under `zakura-network`'s
-//! `zakura` module and flags paths to tokio, the std mutex and atomics, std's
+//! `zakura` module and in `zakura-quic`, and flags paths to tokio, the std mutex and atomics, std's
 //! hashed collections, and the thread RNG. It also flags the std blocking
 //! primitives and channels, `futures::select!` and `tokio_util::time`, which
 //! `zakura-rt` has no names for: under the simulator a blocking wait hangs the
@@ -31,12 +31,17 @@ use syn::{
 
 use crate::BoxError;
 
-const ROOT_MODULE: &str = "crates/zakura-network/src/zakura.rs";
+/// The root modules the check walks, each with the child modules under it
+/// that are not v2 production code.
+const ROOTS: [(&str, &[&str]); 2] = [
+    (
+        "crates/zakura-network/src/zakura.rs",
+        &["legacy_gossip", "testkit"],
+    ),
+    ("crates/zakura-quic/src/lib.rs", &[]),
+];
 
 const RT_LIB: &str = "crates/zakura-rt/src/lib.rs";
-
-/// Modules under `zakura` that are not v2 production code.
-const EXCLUDED_MODULES: [&str; 2] = ["legacy_gossip", "testkit"];
 
 /// Other spellings of the paths `zakura-rt` re-exports, rewritten in order.
 const ALIASES: [(&str, &str); 3] = [
@@ -60,7 +65,16 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 ];
 
 /// Direct runtime paths the v2 code may keep, with the reason for each.
-const ALLOWED: [(&str, &str, &str); 2] = [
+///
+/// For `zakura-quic` this is the bypass inventory M3.7 asks for. Two more
+/// pieces of state outlive a simulated run without a runtime path to flag:
+/// the Linux GSO probe's `OnceLock`, which only the production socket
+/// reaches, and `ConnShared`'s connection counter, a trace ID that numbers
+/// connections process-wide and never reaches the wire or a decision. The
+/// interface watcher reads the host's interfaces through `getifaddrs`, but it
+/// starts only for a wildcard socket, and `bind_with` refuses one inside a
+/// simulated run.
+const ALLOWED: [(&str, &str, &str); 12] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -71,7 +85,64 @@ const ALLOWED: [(&str, &str, &str); 2] = [
         "tokio::sync::mpsc::Sender",
         "the legacy address book's updater, and legacy code stays on tokio",
     ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::net::UdpSocket",
+        "the production socket and its Linux fast path, which a simulated run \
+         replaces with an injected socket through the socket factory",
+    ),
+    (
+        "crates/zakura-quic/src/socket.rs",
+        "tokio::io::Interest",
+        "readiness for the production socket, which a simulated run never binds",
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::Mutex",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::MutexGuard",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::PoisonError",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Mutex",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::MutexGuard",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::PoisonError",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Weak",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "Arc::downgrade",
+        SIM_HARNESS,
+    ),
 ];
+
+/// Why `zakura-quic`'s `sim` module may use std's runtime names. It compiles
+/// only under `cfg(any(test, zakura_sim))`, which the check doesn't treat as
+/// test-only, and it's harness infrastructure, not code under test.
+const SIM_HARNESS: &str = "harness infrastructure for simulated runs: the fake \
+     network and the process-wide seed pool, not code under test";
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 
@@ -80,13 +151,15 @@ const MODULE_IMPORT: &str = "zakura_rt names, imported by item";
 pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     let rules = Rules::load(repo_root)?;
     let mut findings = Findings::default();
-    check_file(
-        repo_root,
-        &rules,
-        &repo_root.join(ROOT_MODULE),
-        true,
-        &mut findings,
-    )?;
+    for (root, excluded) in ROOTS {
+        check_file(
+            repo_root,
+            &rules,
+            &repo_root.join(root),
+            excluded,
+            &mut findings,
+        )?;
+    }
 
     for (used, (file, prefix, _)) in findings.allowances_used.iter().zip(ALLOWED) {
         if !used {
@@ -140,11 +213,13 @@ fn relative_path(repo_root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
+/// Checks the module in `path` and its child modules, skipping the children
+/// named in `excluded`.
 fn check_file(
     repo_root: &Path,
     rules: &Rules,
     path: &Path,
-    is_root: bool,
+    excluded: &[&str],
     findings: &mut Findings,
 ) -> Result<(), BoxError> {
     let file = parse_file(repo_root, path)?;
@@ -163,29 +238,42 @@ fn check_file(
         visitor.visit_item(item);
     }
 
-    // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`.
-    let child_dir = if path.file_name().is_some_and(|name| name == "mod.rs") {
+    // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`, and
+    // a crate's `lib.rs` keeps them beside it.
+    let child_dir = if path
+        .file_name()
+        .is_some_and(|name| name == "mod.rs" || name == "lib.rs")
+    {
         path.parent()
             .ok_or_else(|| format!("{relative} has no parent directory"))?
             .to_path_buf()
     } else {
         path.with_extension("")
     };
-    check_child_modules(repo_root, rules, &child_dir, &file.items, is_root, findings)
+    check_child_modules(
+        repo_root,
+        rules,
+        &child_dir,
+        &file.items,
+        excluded,
+        findings,
+    )
 }
 
+/// Checks the child modules declared in `items`, whose files are in `dir`,
+/// skipping the ones named in `excluded`.
 fn check_child_modules(
     repo_root: &Path,
     rules: &Rules,
     dir: &Path,
     items: &[Item],
-    is_root: bool,
+    excluded: &[&str],
     findings: &mut Findings,
 ) -> Result<(), BoxError> {
     for item in items {
         let Item::Mod(module) = item else { continue };
         let name = module.ident.to_string();
-        if is_test_only(&module.attrs) || (is_root && EXCLUDED_MODULES.contains(&name.as_str())) {
+        if is_test_only(&module.attrs) || excluded.contains(&name.as_str()) {
             continue;
         }
         if module.attrs.iter().any(|attr| attr.path().is_ident("path")) {
@@ -198,11 +286,11 @@ fn check_child_modules(
         match &module.content {
             // The visitor already walked the inline module's items.
             Some((_, items)) => {
-                check_child_modules(repo_root, rules, &dir.join(&name), items, false, findings)?
+                check_child_modules(repo_root, rules, &dir.join(&name), items, &[], findings)?
             }
             None => {
                 let path = module_file(repo_root, dir, &name)?;
-                check_file(repo_root, rules, &path, false, findings)?;
+                check_file(repo_root, rules, &path, &[], findings)?;
             }
         }
     }
@@ -299,6 +387,12 @@ impl Rules {
             | ["std", "sync", "RwLock" | "RwLockReadGuard" | "RwLockWriteGuard" | "Condvar" | "Barrier"
             | "BarrierWaitResult" | "mpsc", ..]
             | ["futures" | "futures_util", "select"] => Some(MISSING_NAME.to_owned()),
+            // `Arc::downgrade` makes std's `Weak`, whose reads have no
+            // preemption points. Matched by spelling, so a renamed `Arc`
+            // import slips through.
+            ["Arc", "downgrade"] | ["std" | "alloc", "sync", "Arc", "downgrade"] => {
+                Some("zakura_rt::sync::downgrade".to_owned())
+            }
             _ => None,
         }
     }
@@ -749,6 +843,67 @@ mod tests {
                 format!("tokio_util::time::DelayQueue -> {missing}"),
                 format!("core::sync::Barrier -> {missing}"),
                 format!("futures::select -> {missing}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn std_downgrades_are_flagged() {
+        let source = "
+            fn f(a: &Arc<u8>, r: &Rc<u8>) {
+                let _ = Arc::downgrade(a);
+                let _ = std::sync::Arc::downgrade(a);
+                let _ = core::sync::Arc::downgrade(a);
+                let _ = Rc::downgrade(r);
+                let _ = zakura_rt::sync::downgrade(a);
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "Arc::downgrade -> zakura_rt::sync::downgrade",
+                "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+                "core::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+            ]
+        );
+    }
+
+    /// M3.7's bypass inventory: every runtime path left in `zakura-network`'s
+    /// v2 code and in `zakura-quic` has an allowlist entry with its reason,
+    /// and every `zakura-quic` entry says why a simulated run never reaches
+    /// that path or why it's harness code.
+    #[test]
+    fn the_repository_inventories_every_runtime_bypass() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("xtask lives at crates/xtask");
+        check(repo_root).expect("every runtime path is on the allowlist");
+        for (file, path, reason) in ALLOWED {
+            if file.starts_with("crates/zakura-quic/") {
+                assert!(reason.contains("simulated run"), "{file} {path}: {reason}");
+            }
+        }
+    }
+
+    /// A `test` or `zakura_sim` gate compiles the code in simulated runs, so
+    /// the check covers it. Harness modules under that gate need allowlist
+    /// entries.
+    #[test]
+    fn simulator_gated_code_is_checked() {
+        let source = "
+            #[cfg(any(test, zakura_sim))]
+            mod sim {
+                use std::sync::Mutex;
+            }
+            #[cfg(zakura_sim)]
+            fn f() { tokio::task::yield_now(); }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::sync::Mutex -> zakura_rt::sync::Mutex",
+                "tokio::task::yield_now -> zakura_rt::task::yield_now",
             ]
         );
     }

@@ -162,24 +162,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex 1.3.0",
- "syn",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -304,16 +286,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex 2.0.1",
-]
-
-[[package]]
-name = "cexpr"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
-dependencies = [
- "nom",
+ "shlex",
 ]
 
 [[package]]
@@ -395,17 +368,6 @@ dependencies = [
  "crypto-common 0.2.2",
  "inout",
  "zeroize",
-]
-
-[[package]]
-name = "clang-sys"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
-dependencies = [
- "glob",
- "libc",
- "libloading",
 ]
 
 [[package]]
@@ -598,9 +560,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
 ]
@@ -954,12 +916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
 name = "group"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1278,16 +1234,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
-
-[[package]]
 name = "libz-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1374,12 +1320,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1395,16 +1335,6 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
-
-[[package]]
-name = "nom"
-version = "7.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
-dependencies = [
- "memchr",
- "minimal-lexical",
-]
 
 [[package]]
 name = "nonempty"
@@ -1917,9 +1847,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -2081,12 +2011,6 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
-
-[[package]]
-name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
@@ -2255,9 +2179,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -2485,18 +2409,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
 ]
 
 [[package]]
@@ -2514,7 +2426,6 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -2574,12 +2485,6 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -2871,9 +2776,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
- "log",
  "metrics",
  "pin-project",
  "proptest",
@@ -2907,6 +2810,7 @@ dependencies = [
  "zakura-rpc",
  "zakura-script",
  "zakura-state",
+ "zakura-storage",
  "zakura-test",
  "zakura-utils",
  "zcash_script",
@@ -2962,13 +2866,11 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "bech32",
  "bitflags",
- "bitvec",
  "blake2b_simd",
- "blake2s_simd",
  "bounded-vec",
  "bs58",
  "byteorder",
@@ -2982,7 +2884,6 @@ dependencies = [
  "hex",
  "incrementalmerkletree",
  "itertools 0.14.0",
- "lazy_static",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3021,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3033,9 +2934,7 @@ dependencies = [
  "futures-util",
  "getset",
  "hex",
- "lazy_static",
  "metrics",
- "once_cell",
  "pin-project",
  "proptest",
  "proptest-derive",
@@ -3122,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3164,11 +3063,10 @@ dependencies = [
 
 [[package]]
 name = "zakura-librocksdb-sys"
-version = "0.17.5+10.4.2"
+version = "0.17.7+10.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "934b82275f5c6f06c2cf84417e1ed4e2426eac9dcc7cdfc9b0386ec221efb789"
+checksum = "f5cd1d4800d313a2141553906abc9292fc9b5a93c60c3b5740bee81e5885da15"
 dependencies = [
- "bindgen",
  "bzip2-sys",
  "cc",
  "libc",
@@ -3188,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -3201,7 +3099,6 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.14.0",
- "lazy_static",
  "metrics",
  "pin-project",
  "proptest",
@@ -3232,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3385,6 +3282,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zakura-rt",
+ "zakura-scheduler",
  "zeroize",
 ]
 
@@ -3417,9 +3316,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-rocksdb"
-version = "0.24.2"
+version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8733046b8357e7ab47aaa2abe9b55074c1f8d7d143d238ce081d8824d8a14e06"
+checksum = "662d3cb40b2838d016cc24389b14a4cbb250110796a3756cbb71a4edbd10daf5"
 dependencies = [
  "libc",
  "zakura-librocksdb-sys",
@@ -3427,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "13.0.0"
+version = "13.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3445,7 +3344,6 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
  "metrics",
  "proptest",
@@ -3537,10 +3435,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "hex",
- "lazy_static",
  "ripemd",
  "secp256k1",
  "sha2",
@@ -3549,6 +3446,28 @@ dependencies = [
  "zakura-primitives",
  "zakura-test",
  "zcash_script",
+]
+
+[[package]]
+name = "zakura-sim"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio-stream",
+ "zakura-chain",
+ "zakura-header-chain",
+ "zakura-network",
+ "zakura-node-services",
+ "zakura-quic",
+ "zakura-rt",
+ "zakura-scheduler",
+ "zakura-storage",
 ]
 
 [[package]]
@@ -3565,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3578,7 +3497,6 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "metrics",
- "once_cell",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3605,8 +3523,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-storage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sha2",
+ "tokio",
+ "zakura-chain",
+ "zakura-header-chain",
+ "zakura-node-services",
+ "zakura-rt",
+ "zakura-test",
+]
+
+[[package]]
 name = "zakura-test"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "eyre",
  "futures",
@@ -3614,8 +3546,6 @@ dependencies = [
  "indexmap",
  "insta",
  "itertools 0.14.0",
- "lazy_static",
- "once_cell",
  "proptest",
  "rand 0.10.2",
  "regex",
@@ -3649,7 +3579,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.7"
+version = "2.2.8"
 dependencies = [
  "clap",
  "eyre",

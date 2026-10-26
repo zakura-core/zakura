@@ -104,7 +104,7 @@ fn synchronize_persisted_body_alarm(
                 (
                     zakura_header_chain::BodyWorkAuthority::for_view(view),
                     view.frontiers.header_best.hash,
-                    retry_deadline_instant(summary.next_probe_at),
+                    retry_deadline_instant(summary.next_probe_at, &BlockSyncClock),
                 )
             })
     });
@@ -240,6 +240,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         initial_body_scope,
         crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
+        Arc::new(BlockSyncClock),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -474,7 +475,7 @@ impl BlockSyncReactor {
             let status_refresh_at = self.status_refresh_at;
             let status_refresh = async move {
                 match status_refresh_at {
-                    Some(deadline) => time::sleep_until(deadline.into()).await,
+                    Some(deadline) => time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
             };
@@ -598,7 +599,7 @@ impl BlockSyncReactor {
 
     fn needed_query_retry_sleep(&self) -> time::Sleep {
         match self.needed_query_retry_at {
-            Some(deadline) => time::sleep_until(deadline.into()),
+            Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }
@@ -1450,7 +1451,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: previous.started_at,
             attempts: previous.attempts,
@@ -1514,7 +1515,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: now,
             attempts: 0,
@@ -2077,7 +2078,7 @@ impl BlockSyncReactor {
         if let Some((frontier, summary)) = current {
             let hash = format!("{:?}", frontier.hash);
             let height = frontier.height.0.to_string();
-            let age_seconds = chrono::Utc::now()
+            let age_seconds = utc_now()
                 .signed_duration_since(summary.started_at)
                 .num_milliseconds()
                 .max(0) as f64
@@ -2257,7 +2258,7 @@ mod refill_target_tests {
                     ServicePeerDirection::Inbound,
                     config,
                     0,
-                    std::time::Instant::now(),
+                    Instant::now(),
                 )
                 .generation();
             registry.upsert_status(

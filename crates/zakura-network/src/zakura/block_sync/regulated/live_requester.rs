@@ -1,13 +1,10 @@
 //! Production request authorization, kept separate from the download scheduler.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use zakura_chain::{block, serialization::ZcashDeserialize};
 use zakura_rt::{
     sync::{Mutex, MutexGuard, PoisonError},
-    time,
+    time::{self, Instant},
 };
 
 use super::{

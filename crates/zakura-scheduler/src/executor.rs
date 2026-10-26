@@ -51,6 +51,11 @@ impl rt::Executor for SchedulerExecutor {
         hooks::try_spawn_boxed(label, task).map(task_to_rt)
     }
 
+    /// Spawns `task` as a blocking job, which holds no simulated worker.
+    fn spawn_blocking(&self, label: &'static str, task: rt::BoxTask) -> rt::TaskId {
+        task_to_rt(hooks::spawn_blocking_boxed(label, task))
+    }
+
     fn abort(&self, task: rt::TaskId) {
         hooks::request_abort(task_from_rt(task));
     }
@@ -115,6 +120,30 @@ impl rt::Executor for SchedulerExecutor {
     fn draw(&self, site: rt::DrawSite, bound: u64) -> u64 {
         hooks::draw(draw_kind_from_rt(site.kind), site.site, bound)
     }
+
+    /// The run's configured origin, or `zakura-rt`'s default.
+    fn utc_origin(&self) -> std::time::SystemTime {
+        with_run(|s| s.utc_origin)
+            .expect("zakura-rt calls the executor only while it's installed for a run")
+            .unwrap_or_else(default_utc_origin)
+    }
+}
+
+/// `zakura-rt`'s default UTC origin.
+fn default_utc_origin() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + rt::DEFAULT_UTC_ORIGIN_SINCE_EPOCH
+}
+
+/// Panics, in harness code, if UTC at virtual time `t` doesn't fit in a
+/// `SystemTime`, which `Executor::utc_origin` requires the executor to
+/// prevent.
+pub(crate) fn assert_utc_in_range(origin: Option<std::time::SystemTime>, t: SimInstant) {
+    let origin = origin.unwrap_or_else(default_utc_origin);
+    assert!(
+        origin.checked_add(t.since_start()).is_some(),
+        "virtual time {t:?} is past the latest SystemTime above \
+         SchedulerConfig::utc_origin {origin:?}"
+    );
 }
 
 /// The scheduler's draw kind for a `zakura-rt` one.

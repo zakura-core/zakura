@@ -866,6 +866,49 @@ fn apply_digests_cover_the_sealed_insertion() {
     assert_ne!(submitted[0].1, submitted[1].1);
 }
 
+/// Two applies of the same headers with the same owner, supplier and
+/// auxiliary deliveries, sealed for different targets, have different
+/// request digests: one may commit while the other is stale.
+#[test]
+fn apply_digests_cover_the_target() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let targets: Vec<_> = [None, Some(block::Hash([0xee; 32]))]
+        .into_iter()
+        .map(|target_hash| {
+            let mut request = HeaderFixture::regtest().target_request(
+                &port.engine().snapshot(),
+                chain[0],
+                &next,
+                2,
+            );
+            if let Some(hash) = target_hash {
+                request.target.hash = hash;
+            }
+            ready(port.engine().prepare_header_target(request)).expect("fixture headers prepare")
+        })
+        .collect();
+    assert_eq!(targets[0].owner(), targets[1].owner());
+    assert_ne!(targets[0].target_tip_hash(), targets[1].target_tip_hash());
+    let mut applies: Vec<_> = targets
+        .into_iter()
+        .map(|target| port.apply_header_target(target))
+        .collect();
+    for apply in &mut applies {
+        submit(apply);
+    }
+    let digests: Vec<_> = port
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            StorageEvent::Submitted { request_digest, .. } => Some(request_digest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(digests.len(), 2);
+    assert_ne!(digests[0], digests[1]);
+}
+
 /// A caller that polls again with a different waker, as a task does when a
 /// `select!` moves the call, gets the completion's wake on the new waker.
 /// The old one is never woken.

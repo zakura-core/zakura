@@ -146,11 +146,6 @@ jobs:
 
   docs:
     name: docs
-    # rust-cache fingerprints RUST* variables. Match the unit workflow's
-    # logging settings so its PR docs job can restore this nightly cache.
-    env:
-      RUST_LIB_BACKTRACE: 1
-      RUST_LOG: info
     # A full `--all-features --document-private-items` doc build is expensive and
     # not a correctness gate. Run it nightly / on demand only, keeping it off the
     # PR critical path.
@@ -246,10 +241,6 @@ jobs:
       - name: Affected semver package tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
-
-      - name: Affected documentation tests
-        if: ${{ !cancelled() }}
-        run: python3 .github/workflows/scripts/test_check_pr_docs.py
 
       - name: CI alert tests
         if: ${{ !cancelled() }}

@@ -81,7 +81,6 @@ jobs:
       publish_graph: ${{ steps.filter.outputs.publish_graph }}
       cluster: ${{ steps.filter.outputs.cluster }}
       scheduler: ${{ steps.filter.outputs.scheduler }}
-      docs: ${{ steps.filter.outputs.docs }}
     steps:
       - id: filter
         env:
@@ -105,7 +104,6 @@ jobs:
                  (( TOTAL_CHANGED_FILES >= 3000 )); then
                 echo "config=true" >> "$GITHUB_OUTPUT"
                 echo "rust=true" >> "$GITHUB_OUTPUT"
-                echo "docs=true" >> "$GITHUB_OUTPUT"
                 echo "cluster=true" >> "$GITHUB_OUTPUT"
                 echo "publish_graph=true" >> "$GITHUB_OUTPUT"
                 echo "scheduler=true" >> "$GITHUB_OUTPUT"
@@ -139,7 +137,6 @@ jobs:
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
               echo "rust=true" >> "$GITHUB_OUTPUT"
-              echo "docs=true" >> "$GITHUB_OUTPUT"
               echo "cluster=true" >> "$GITHUB_OUTPUT"
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               echo "scheduler=true" >> "$GITHUB_OUTPUT"
@@ -148,7 +145,6 @@ jobs:
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
               echo "rust=false" >> "$GITHUB_OUTPUT"
-              echo "docs=false" >> "$GITHUB_OUTPUT"
               echo "cluster=true" >> "$GITHUB_OUTPUT"
               # Nightly re-checks the live index so main cannot silently
               # accumulate a skipped-dependent pin after a crates.io publish.
@@ -217,12 +213,6 @@ jobs:
           else
             scheduler=false
           fi
-
-          docs=$rust
-          if grep -qE '^\.github/workflows/(lint\.yml|scripts/(check_pr_docs|test_check_pr_docs|affected_semver_packages)\.py)$' <<< "$changed"; then
-            docs=true
-          fi
-          echo "docs=$docs" >> "$GITHUB_OUTPUT"
 
           echo "config=$config" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
@@ -657,33 +647,6 @@ jobs:
       statuses: write
     uses: ./.github/workflows/zakura-cluster.yml
 
-  docs:
-    name: affected crate docs
-    needs: changes
-    if: >-
-      needs.changes.outputs.docs == 'true' &&
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
-        with:
-          # Match lint.yml's daily docs job, including its job ID and target
-          # directory, to reuse its main-branch cache without PR cache writes.
-          toolchain: nightly-2026-09-06
-          cache-save-if: false
-      - uses: ./.github/actions/setup-zakura-build
-      - name: Check affected crate documentation
-        env:
-          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          DIFF_HEAD: ${{ github.sha }}
-          RUSTDOCFLAGS: -A rustdoc::private_intra_doc_links -D warnings
-        run: python3 .github/workflows/scripts/check_pr_docs.py --base "$DIFF_BASE" --head "$DIFF_HEAD"
-
   test-success:
     name: test success
     runs-on: ubuntu-latest
@@ -692,7 +655,6 @@ jobs:
     if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - changes
-      - docs
       - build-tests
       - unit-tests
       - zakura-config
@@ -719,10 +681,8 @@ jobs:
           # sim-build skips with the same test-relevant filter as build-tests,
           # and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
           # their build inputs change.
-          # docs checks affected crates on relevant PRs and merge groups;
-          # lint.yml retains the full nightly documentation build.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: docs, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

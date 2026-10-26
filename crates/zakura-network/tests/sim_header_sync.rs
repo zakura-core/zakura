@@ -99,6 +99,21 @@ fn run_until_idle(sched: &mut Scheduler, plan: &RefCell<Plan>, steps: &mut Vec<S
     }
 }
 
+/// Runs ready tasks, picked by `plan`, advancing time whenever they only
+/// wait on it, until the run stops for any other reason.
+fn run_to_end(sched: &mut Scheduler, plan: &RefCell<Plan>, steps: &mut Vec<String>) -> Status {
+    loop {
+        match run_until_idle(sched, plan, steps) {
+            Status::WaitingOnTime => {
+                let next = sched.next_deadline().expect("WaitingOnTime has a timer");
+                sched.advance_to(next);
+                steps.push("advance-time".to_owned());
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Starts the reactor, runs it until it only waits on time, then shuts it
 /// down and runs it to the end.
 fn run(seed: u64) -> Observations {
@@ -134,16 +149,7 @@ fn run(seed: u64) -> Observations {
 
     steps.push("shutdown".to_owned());
     shutdown.cancel();
-    let end = loop {
-        match run_until_idle(&mut sched, &plan, &mut steps) {
-            Status::WaitingOnTime => {
-                let next = sched.next_deadline().expect("WaitingOnTime has a timer");
-                sched.advance_to(next);
-                steps.push("advance-time".to_owned());
-            }
-            other => break other,
-        }
-    };
+    let end = run_to_end(&mut sched, &plan, &mut steps);
     assert_eq!(end, Status::Quiescent, "every task ends after shutdown");
     // The reactor's inputs stay alive until it has ended on its own.
     drop((handle, actions));
@@ -288,19 +294,94 @@ fn two_reactors_meet_over_memory_streams() {
     for connection in &connections {
         connection.cancel();
     }
-    let end = loop {
-        match run_until_idle(&mut sched, &plan, &mut steps) {
-            Status::WaitingOnTime => {
-                let next = sched.next_deadline().expect("WaitingOnTime has a timer");
-                sched.advance_to(next);
-            }
-            other => break other,
-        }
-    };
+    let end = run_to_end(&mut sched, &plan, &mut steps);
     assert_eq!(end, Status::Quiescent, "every task ends after shutdown");
     drop(nodes);
     assert_eq!(sched.shutdown(), Default::default(), "no task was left");
     assert_eq!(*exits.borrow(), ["completed", "completed"]);
+    assert!(
+        !steps.iter().any(|step| step.starts_with("panicked")),
+        "{steps:?}"
+    );
+}
+
+/// Nora's session with Mira is replaced while its pipe still runs. The
+/// reactor matches a disconnect by peer and session ID alone, so the
+/// replacement's fresh session ID is what keeps the old session's late
+/// teardown from removing it.
+#[test]
+fn a_replacement_session_outlives_the_old_teardown() {
+    let plan = Rc::new(RefCell::new(Plan(5)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+
+    let shutdown = CancellationToken::new();
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+    sched.spawn_root("nora", async move {
+        reactor.await.expect("the reactor ends on shutdown");
+    });
+    let service = HeaderSyncService::new(handle.clone());
+
+    // Opens a session on a new connection, and returns the connection and a
+    // flag set once the service drops the session's send half.
+    let connect = |sched: &mut Scheduler, conn_id, session_id| {
+        let (send, mut far_recv) = framed_channel(8);
+        let (far_send, recv) = framed_channel(8);
+        let connection = CancellationToken::new();
+        service.add_peer(Peer::new_versioned(
+            conn_id,
+            peer_id(2),
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+            ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            session_id,
+            (recv, send),
+            connection.clone(),
+        ));
+        let ended = Rc::new(RefCell::new(false));
+        let flag = Rc::clone(&ended);
+        sched.spawn_root("mira", async move {
+            // Keeps Nora's reader open until the run ends.
+            let _far_send = far_send;
+            while far_recv.recv().await.is_some() {}
+            *flag.borrow_mut() = true;
+        });
+        (connection, ended)
+    };
+
+    let mut steps = Vec::new();
+    let old = connect(&mut sched, 1, 1);
+    assert_eq!(
+        run_until_idle(&mut sched, &plan, &mut steps),
+        Status::WaitingOnTime
+    );
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1, "{steps:?}");
+
+    let replacement = connect(&mut sched, 2, 2);
+    assert_eq!(
+        run_until_idle(&mut sched, &plan, &mut steps),
+        Status::WaitingOnTime
+    );
+    assert!(*old.1.borrow(), "the old session tore down: {steps:?}");
+    assert_eq!(
+        handle.peer_snapshot().outbound_peers,
+        1,
+        "the replacement is still admitted"
+    );
+    assert!(!*replacement.1.borrow(), "the replacement still runs");
+
+    shutdown.cancel();
+    old.0.cancel();
+    replacement.0.cancel();
+    let end = run_to_end(&mut sched, &plan, &mut steps);
+    assert_eq!(end, Status::Quiescent, "every task ends after shutdown");
+    drop((service, handle, actions));
+    assert_eq!(sched.shutdown(), Default::default(), "no task was left");
     assert!(
         !steps.iter().any(|step| step.starts_with("panicked")),
         "{steps:?}"

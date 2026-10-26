@@ -53,7 +53,7 @@ use zakura_rt::{sync::watch, time::Instant};
 use super::{
     adapter::{EnginePort, Executed},
     evidence::LeaseFact,
-    evidence::{RequestIdentity, ResultIdentity},
+    evidence::{OperationStage, OperationState, OwnerState, RequestIdentity, ResultIdentity},
     fixture::HeaderFixture,
     lease::{Effects, LeaseEnd},
     FaultGate, FromReply, HeaderOp, HeaderReply, HeaderRequest, IllegalOutcome, Outcome,
@@ -185,6 +185,30 @@ impl FactKind {
     }
 }
 
+/// Why [`ControlledPort::bind_to_run`] refused.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BindError {
+    /// No simulator run is active on this thread.
+    NotInRun,
+    /// The port already published a fact or holds owner state, so some of
+    /// it may carry instants from outside the run.
+    NotPristine,
+    /// The port is already bound.
+    AlreadyBound,
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BindError::NotInRun => "no simulator run is active",
+            BindError::NotPristine => "the port has activity from before the run",
+            BindError::AlreadyBound => "the port is already bound to a run",
+        })
+    }
+}
+
+impl std::error::Error for BindError {}
+
 /// Why [`ControlledPort::complete`] refused a completion. A refusal changes
 /// nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,6 +265,8 @@ struct Ops {
     facts: Vec<Fact>,
     /// Set by shutdown, after which nothing is submitted.
     shut_down: bool,
+    /// Set once the port is bound to a run.
+    bound: bool,
 }
 
 /// One submitted operation.
@@ -262,8 +288,14 @@ enum Stage {
     },
     /// Taken by `complete`, which is running it.
     Running,
-    /// Completed, with the reply its caller hasn't polled yet.
-    Replied { reply: HeaderReply },
+    /// Completed, with the reply its caller hasn't polled yet and that
+    /// reply's identity, captured when it was made. A later read of the
+    /// registry can't rebuild it: a refusal's signal or a locator's
+    /// generation may have changed since.
+    Replied {
+        reply: HeaderReply,
+        result: ResultIdentity,
+    },
 }
 
 impl Ops {
@@ -313,8 +345,84 @@ impl ControlledPort {
     /// suits setting up a chain before the run starts. A task in the run
     /// must not call them: an apply can suspend under the engine lock, which
     /// the run takes to complete operations.
+    ///
+    /// Setup before the run may only commit headers with fixed historical
+    /// timestamps, as [`HeaderFixture::extend`] builds them. Validation reads
+    /// [`ScenarioClock`](super::fixture::ScenarioClock), which reads the host
+    /// clock outside a run, and only times far in the past validate the same
+    /// in every process. Setup leaves no owner state, or the port can't bind
+    /// to its run ([`Self::bind_to_run`]).
     pub fn engine(&self) -> &EnginePort {
         &self.engine
+    }
+
+    /// The port's actual owner state, read fresh from its bookkeeping and the
+    /// lease registry, with the registry locked first, as every path that
+    /// takes both does. Every fact up to `through_seq` is reflected and none
+    /// after, since each transaction publishes under these locks or where no
+    /// task can run.
+    pub fn owner_state(&self) -> OwnerState {
+        self.engine.with_registry(|registry| {
+            let ops = self.ops();
+            let mut state = OwnerState {
+                through_seq: ops.last_seq,
+                operations: ops
+                    .slots
+                    .iter()
+                    .map(|(id, slot)| OperationState {
+                        id: *id,
+                        request: slot.identity.clone(),
+                        stage: match &slot.stage {
+                            Stage::Pending { .. } => OperationStage::Pending {
+                                caller_waiting: slot.caller.is_some(),
+                            },
+                            Stage::Running => OperationStage::Running,
+                            Stage::Replied { result, .. } => OperationStage::Replied {
+                                result: result.clone(),
+                            },
+                        },
+                    })
+                    .collect(),
+                permits: ops.permits.keys().copied().collect(),
+                ..OwnerState::default()
+            };
+            registry.fill(&mut state);
+            state
+        })
+    }
+
+    /// Whether the port has never published a fact and holds no owner state:
+    /// no operation, permit, lease, continuation, waiter or lease counter.
+    /// Its committed chain may hold anything.
+    pub fn is_pristine(&self) -> bool {
+        self.engine.with_registry(|registry| {
+            let ops = self.ops();
+            registry.is_pristine()
+                && ops.last_seq == 0
+                && ops.last == 0
+                && ops.slots.is_empty()
+                && ops.permits.is_empty()
+        })
+    }
+
+    /// Binds the port to the active simulator run, so every later fact is
+    /// stamped with the run's virtual time. Refuses if no run is active, if
+    /// the port isn't pristine, since earlier activity would carry instants
+    /// from outside the run, or if it's already bound. Outside the
+    /// simulator build there's no run to check, so only pristineness counts.
+    pub fn bind_to_run(&self) -> Result<(), BindError> {
+        #[cfg(zakura_sim)]
+        if zakura_rt::sim::executor().is_none() {
+            return Err(BindError::NotInRun);
+        }
+        if self.ops().bound {
+            return Err(BindError::AlreadyBound);
+        }
+        if !self.is_pristine() {
+            return Err(BindError::NotPristine);
+        }
+        self.ops().bound = true;
+        Ok(())
     }
 
     /// Locks the bookkeeping. Every change to it completes under the lock, so
@@ -461,7 +569,10 @@ impl ControlledPort {
             let (identity, request_digest) = (slot.identity.clone(), slot.request_digest);
             match slot.caller.take() {
                 Some(waker) => {
-                    slot.stage = Stage::Replied { reply };
+                    slot.stage = Stage::Replied {
+                        reply,
+                        result: result.clone(),
+                    };
                     (Some(waker), None, identity, request_digest)
                 }
                 None => {
@@ -715,6 +826,7 @@ impl<T> Drop for Call<'_, T> {
         let acquired = match &slot.stage {
             Stage::Replied {
                 reply: HeaderReply::AcquireHeaderPath(Ok(AcquirePathReply::Acquired(path))),
+                ..
             } => Some((**path).clone()),
             Stage::Replied { .. } => None,
             Stage::Pending { .. } | Stage::Running => {

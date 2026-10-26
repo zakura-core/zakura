@@ -906,6 +906,12 @@ impl EnginePort {
         leases.take_effects()
     }
 
+    /// Runs `read` with the lease registry locked. The caller may take the
+    /// port's bookkeeping lock inside it, never the other way round.
+    pub(super) fn with_registry<R>(&self, read: impl FnOnce(&Registry) -> R) -> R {
+        read(&self.leases())
+    }
+
     /// A digest of the committed snapshot, the live leases and the
     /// continuation cache. Equal histories give equal digests, in any
     /// process.

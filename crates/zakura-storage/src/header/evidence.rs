@@ -15,7 +15,7 @@ use zakura_node_services::header_chain::{
     SelectedChainMembership, VctRepairContextReply,
 };
 
-use super::{Fault, HeaderOp, HeaderReply, HeaderRequest};
+use super::{controlled::OpId, Fault, HeaderOp, HeaderReply, HeaderRequest};
 
 /// One retained-path lease: the peer holding it, that peer's session, and
 /// the lease ID the registry issued.
@@ -445,4 +445,96 @@ pub enum LeaseFact {
     WaiterSet(Waiter),
     /// A capacity signal fired and was cleared.
     WaiterFired(Waiter),
+}
+
+/// The port's actual owner state, read fresh from the containers that hold
+/// it: the operation slots and permit container in the port's bookkeeping,
+/// and the lease registry. Collections are in key order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OwnerState {
+    /// The last fact published when this state was read. The state reflects
+    /// every fact up to it and none after.
+    pub through_seq: u64,
+    /// Every operation not yet taken or dropped by its caller.
+    pub operations: Vec<OperationState>,
+    /// The operations whose permit is in storage's container.
+    pub permits: Vec<OpId>,
+    /// Every live lease.
+    pub leases: Vec<LeaseState>,
+    /// Every cached continuation.
+    pub continuations: Vec<ContinuationState>,
+    /// Whether each capacity class has a waiting signal.
+    pub class_waiters: ClassWaiters,
+    /// The last lease ID the registry issued.
+    pub last_lease_id: u64,
+    /// How many acquires continued from a cached path.
+    pub continuation_hits: u64,
+}
+
+/// One operation in the port's bookkeeping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationState {
+    /// Its ID.
+    pub id: OpId,
+    /// What it asked for.
+    pub request: RequestIdentity,
+    /// Where it is.
+    pub stage: OperationStage,
+}
+
+/// Where an operation is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationStage {
+    /// Waiting for the run to complete it.
+    Pending {
+        /// Whether the port still holds the caller's waker.
+        caller_waiting: bool,
+    },
+    /// Being completed by the run. Never seen at a step boundary.
+    Running,
+    /// Completed, with a reply its caller hasn't taken, and that reply's
+    /// identity as captured when it was made.
+    Replied {
+        /// The stored reply's identity.
+        result: ResultIdentity,
+    },
+}
+
+/// One live lease in the registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseState {
+    /// Its key.
+    pub lease: LeaseKey,
+    /// Its work scope.
+    pub scope: HeaderWorkAuthority,
+    /// Its target.
+    pub target: Frontier,
+    /// The last header served, or where the path starts.
+    pub last_frontier: Frontier,
+    /// Its slot class.
+    pub capacity: CapacityClass,
+    /// Whether its peer has a refused acquire waiting on it.
+    pub waiter: bool,
+}
+
+/// One consumed lease's path, cached for its peer's next page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuationState {
+    /// The consumed lease's key.
+    pub lease: LeaseKey,
+    /// Its work scope.
+    pub scope: HeaderWorkAuthority,
+    /// Its target.
+    pub target: Frontier,
+    /// The last header served.
+    pub last_frontier: Frontier,
+}
+
+/// Whether each capacity class has a waiting signal.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClassWaiters {
+    /// The ordinary class.
+    pub general: bool,
+    /// The reserve class.
+    pub fallback: bool,
 }

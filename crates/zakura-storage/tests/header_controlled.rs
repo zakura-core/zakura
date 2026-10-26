@@ -22,10 +22,10 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
-    controlled::{CompleteError, Completion, ControlledPort, FactKind, OpId},
+    controlled::{BindError, CompleteError, Completion, ControlledPort, FactKind, OpId},
     evidence::{
-        CapacityClass, LeaseFact, LeaseKey, RequestIdentity, ResultIdentity, RetentionEnd,
-        SignalClass, Waiter,
+        CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey, LeaseState,
+        OperationStage, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
     },
     fixture::HeaderFixture,
     lease::{LeaseEnd, MAX_RETAINED_PATH_LEASES},
@@ -457,6 +457,12 @@ fn run<F: Future + Unpin>(port: &ControlledPort, mut call: F) -> (F::Output, Com
         .complete(id, ENGINE)
         .expect("the engine outcome is legal");
     (ready(call), completion)
+}
+
+/// Submits `call` and completes it with the engine outcome, for a call
+/// whose reply doesn't matter. Returns the completion.
+fn complete<F: Future + Unpin>(port: &ControlledPort, call: F) -> Completion {
+    run(port, call).1
 }
 
 /// The leased path in `reply`.
@@ -1243,11 +1249,11 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
     );
     assert!(matches!(txns[1][1], FactKind::Completed(_)));
 
-    run(
+    complete(
         &port,
         port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
     );
-    run(
+    complete(
         &port,
         port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
     );
@@ -1259,8 +1265,8 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
     assert_eq!(txns[1].len(), 2, "the first refusal sets the waiter");
     assert_eq!(txns[4].len(), 1, "a repeat refusal finds it set");
 
-    run(&port, port.release_header_path(first.clone()));
-    run(&port, port.release_header_path(first));
+    complete(&port, port.release_header_path(first.clone()));
+    complete(&port, port.release_header_path(first));
     let txns = transactions(&port);
     assert_eq!(
         txns[1][..3]
@@ -1289,7 +1295,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
     );
     let second = acquired(reply);
     let l2 = key(peer(2), 1, &second);
-    run(&port, port.read_header_path(second, page_after(anchor, 1)));
+    complete(&port, port.read_header_path(second, page_after(anchor, 1)));
     let txns = transactions(&port);
     assert_eq!(
         txns[4][..2]
@@ -1356,7 +1362,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
     assert_eq!(port.engine().live_leases(), 1);
 
     // The final page ends retention with the capability.
-    run(&port, port.read_header_path(third, page_after(chain[0], 2)));
+    complete(&port, port.read_header_path(third, page_after(chain[0], 2)));
     let txns = transactions(&port);
     assert_eq!(
         *lease_fact(&txns[1][1]),
@@ -1373,7 +1379,7 @@ fn acquire_read_and_release_paths_publish_their_lease_facts() {
     );
     let fourth = acquired(reply);
     let l4 = key(peer(3), 1, &fourth);
-    run(&port, port.read_header_path(fourth, page_after(anchor, 1)));
+    complete(&port, port.read_header_path(fourth, page_after(anchor, 1)));
     transactions(&port);
     let (reply, _) = run(
         &port,
@@ -1408,7 +1414,7 @@ async fn sweeps_and_abandonment_belong_to_their_completion() {
     let l1 = key(peer(1), 1, &acquired(reply));
     tokio::time::advance(Duration::from_secs(30)).await;
     transactions(&port);
-    run(
+    complete(
         &port,
         port.acquire_header_path(acquire(&port, peer(2), 1, chain[0])),
     );
@@ -1470,7 +1476,7 @@ fn a_full_continuation_cache_evicts_before_caching() {
         );
         let path = acquired(reply);
         keys.push(key(peer(n), 1, &path));
-        run(&port, port.read_header_path(path, page_after(anchor, 1)));
+        complete(&port, port.read_header_path(path, page_after(anchor, 1)));
     }
     let txns = transactions(&port);
     let last_read = &txns[txns.len() - 2];
@@ -1513,7 +1519,7 @@ fn class_waiters_are_set_and_fired_as_facts() {
         .map(|n| acquired(run(&port, port.acquire_header_path(short(n))).0))
         .collect();
     transactions(&port);
-    run(
+    complete(
         &port,
         port.acquire_header_path(acquire(&port, peer(100), 1, chain[4_000])),
     );
@@ -1524,7 +1530,7 @@ fn class_waiters_are_set_and_fired_as_facts() {
         )
         .0,
     );
-    run(&port, port.acquire_header_path(short(102)));
+    complete(&port, port.acquire_header_path(short(102)));
     let txns = transactions(&port);
     assert_eq!(
         *lease_fact(&txns[1][0]),
@@ -1535,7 +1541,7 @@ fn class_waiters_are_set_and_fired_as_facts() {
         LeaseFact::WaiterSet(Waiter::Fallback)
     );
 
-    run(&port, port.release_header_path(reserve));
+    complete(&port, port.release_header_path(reserve));
     let txns = transactions(&port);
     assert!(matches!(
         txns[1].as_slice(),
@@ -1546,7 +1552,7 @@ fn class_waiters_are_set_and_fired_as_facts() {
             FactKind::Completed(_),
         ]
     ));
-    run(&port, port.release_header_path(ordinary[0].clone()));
+    complete(&port, port.release_header_path(ordinary[0].clone()));
     let txns = transactions(&port);
     assert!(matches!(
         txns[1].as_slice(),
@@ -1572,7 +1578,7 @@ fn shutdown_publishes_permits_leases_then_continuations() {
     );
     let cached = acquired(reply);
     let cached_key = key(peer(1), 1, &cached);
-    run(&port, port.read_header_path(cached, page_after(anchor, 1)));
+    complete(&port, port.read_header_path(cached, page_after(anchor, 1)));
     let (reply, _) = run(
         &port,
         port.acquire_header_path(acquire(&port, peer(2), 1, chain[2])),
@@ -1642,4 +1648,222 @@ fn an_abandoned_reply_with_a_waiter_fires_it_in_its_transaction() {
             FactKind::ReplyDropped { id: OpId(1) },
         ]]
     ));
+}
+
+/// B3 and B6: the snapshot reads each container. Here that's a pending
+/// locator holding its permit, an unread refusal, a pending read whose
+/// caller left, a live lease with a waiter, a cached continuation, and the
+/// counters. A stored reply keeps the identity captured when it was made,
+/// even after the registry changes (C4).
+#[test]
+fn owner_state_reads_every_container() {
+    let (port, chain) = chain(3);
+    let anchor = HeaderFixture::regtest().anchor();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[2])),
+    );
+    let live = acquired(reply);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(2), 1, chain[2])),
+    );
+    let cached = acquired(reply);
+    complete(
+        &port,
+        port.read_header_path(cached.clone(), page_after(anchor, 1)),
+    );
+    let mut refused = port.acquire_header_path(acquire(&port, peer(1), 1, chain[2]));
+    submit(&mut refused);
+    let refused_id = port.pending()[0].id;
+    port.complete(refused_id, ENGINE)
+        .expect("the refusal completes");
+    let mut locator = port.continuation_locator(permit(&semaphore));
+    submit(&mut locator);
+    let mut left = port.selected_chain_contains(chain[0].hash);
+    submit(&mut left);
+    drop(left);
+    let last_seq = port.take_facts().last().expect("facts were published").seq;
+
+    let state = port.owner_state();
+    assert_eq!(state.through_seq, last_seq);
+    let (locator_id, left_id) = (OpId(refused_id.0 + 1), OpId(refused_id.0 + 2));
+    assert_eq!(
+        state
+            .operations
+            .iter()
+            .map(|op| (op.id, op.stage.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                refused_id,
+                OperationStage::Replied {
+                    result: ResultIdentity::CapacityBusy(SignalClass::Peer),
+                }
+            ),
+            (
+                locator_id,
+                OperationStage::Pending {
+                    caller_waiting: true
+                }
+            ),
+            (
+                left_id,
+                OperationStage::Pending {
+                    caller_waiting: false
+                }
+            ),
+        ]
+    );
+    assert_eq!(state.permits, [locator_id]);
+    assert_eq!(
+        state.leases,
+        [LeaseState {
+            lease: key(peer(1), 1, &live),
+            scope: live.scope,
+            target: chain[2],
+            last_frontier: anchor,
+            capacity: CapacityClass::General,
+            waiter: true,
+        }]
+    );
+    assert_eq!(
+        state.continuations,
+        [ContinuationState {
+            lease: key(peer(2), 1, &cached),
+            scope: cached.scope,
+            target: chain[2],
+            last_frontier: chain[0],
+        }]
+    );
+    assert_eq!(state.class_waiters, ClassWaiters::default());
+    assert_eq!((state.last_lease_id, state.continuation_hits), (2, 0));
+
+    complete(&port, port.release_header_path(live));
+    let state = port.owner_state();
+    assert!(state.leases.is_empty());
+    assert_eq!(
+        state.operations[0].stage,
+        OperationStage::Replied {
+            result: ResultIdentity::CapacityBusy(SignalClass::Peer),
+        },
+        "the stored refusal keeps the signal it handed out"
+    );
+    drop((refused, locator));
+}
+
+/// C4: an unread locator reply keeps the generation it was read at, after
+/// an apply moves the engine on.
+#[test]
+fn a_stored_locator_reply_keeps_its_generation() {
+    let (port, chain) = chain(1);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let before = port.engine().snapshot().header_generation;
+    let mut locator = port.continuation_locator(permit(&semaphore));
+    submit(&mut locator);
+    port.complete(OpId(1), ENGINE)
+        .expect("the locator completes");
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    complete(
+        &port,
+        port.apply_header_target(prepared(&port, chain[0], &next, 2)),
+    );
+    assert_ne!(port.engine().snapshot().header_generation, before);
+    let state = port.owner_state();
+    assert!(matches!(
+        &state.operations[0].stage,
+        OperationStage::Replied {
+            result: ResultIdentity::Locator { header_generation, .. },
+        } if *header_generation == before
+    ));
+    drop(locator);
+}
+
+/// B-acc1: a replaced lease leaves exactly the replacement in the
+/// snapshot, with its own session and lease ID.
+#[test]
+fn a_replacement_lease_keeps_its_exact_identity() {
+    let (port, chain) = chain(1);
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 1, chain[0])),
+    );
+    let old = acquired(reply);
+    complete(&port, port.release_header_path(old.clone()));
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 2, chain[0])),
+    );
+    let new = acquired(reply);
+    let leases: Vec<_> = port
+        .owner_state()
+        .leases
+        .into_iter()
+        .map(|lease| lease.lease)
+        .collect();
+    assert_eq!(leases, [key(peer(1), 2, &new)]);
+    assert_ne!(old.handle_id(), new.handle_id());
+}
+
+/// B-acc2: an old session's unread `Acquired` reply, dropped after its
+/// lease expired and the peer's new session took a lease, ends nothing:
+/// its transaction is the bare `ReplyDropped`, and the snapshot keeps the
+/// replacement lease.
+#[tokio::test(start_paused = true)]
+async fn a_stale_abandoned_acquire_leaves_the_replacement_lease() {
+    let (port, chain) = chain(1);
+    let mut old = port.acquire_header_path(acquire(&port, peer(1), 1, chain[0]));
+    submit(&mut old);
+    port.complete(OpId(1), ENGINE)
+        .expect("the old acquire completes");
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let (reply, _) = run(
+        &port,
+        port.acquire_header_path(acquire(&port, peer(1), 2, chain[0])),
+    );
+    let replacement = key(peer(1), 2, &acquired(reply));
+    transactions(&port);
+    drop(old);
+    assert!(matches!(
+        slices(&transactions(&port)).as_slice(),
+        [[FactKind::ReplyDropped { id: OpId(1) }]]
+    ));
+    let state = port.owner_state();
+    assert!(state.operations.is_empty());
+    assert_eq!(
+        state
+            .leases
+            .iter()
+            .map(|lease| lease.lease)
+            .collect::<Vec<_>>(),
+        [replacement]
+    );
+}
+
+/// C2: a port binds to its run only while pristine. A committed setup
+/// chain is fine, any operation or lease isn't, and a second bind is
+/// refused.
+#[test]
+fn only_a_pristine_port_binds() {
+    let (port, headers) = chain(1);
+    assert!(port.is_pristine(), "a committed chain isn't owner state");
+    assert_eq!(port.bind_to_run(), Ok(()));
+    assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
+
+    let (used, _) = chain(1);
+    let mut call = used.selected_chain_contains(headers[0].hash);
+    submit(&mut call);
+    assert!(!used.is_pristine());
+    assert_eq!(used.bind_to_run(), Err(BindError::NotPristine));
+
+    let (leased, leased_headers) = chain(1);
+    acquired(ready(leased.engine().acquire_header_path(acquire(
+        &leased,
+        peer(1),
+        1,
+        leased_headers[0],
+    ))));
+    assert!(!leased.is_pristine(), "a setup lease is owner state");
+    assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
 }

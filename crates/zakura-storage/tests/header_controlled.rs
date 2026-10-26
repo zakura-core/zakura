@@ -415,3 +415,25 @@ fn a_completion_wakes_the_latest_waker() {
         .expect("membership completes");
     assert_eq!((first.count(), second.count()), (0, 1));
 }
+
+/// A completion with nobody waiting drops its reply rather than keeping
+/// it in the port. A prepared target holds its headers, so once the
+/// prepare completes for a caller that's gone, the test's copy is the only
+/// one left.
+#[test]
+fn a_reply_nobody_waits_for_is_dropped() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let request =
+        HeaderFixture::regtest().target_request(&port.engine().snapshot(), chain[0], &next, 2);
+    let mut prepare = port.prepare_header_target(request);
+    submit(&mut prepare);
+    drop(prepare);
+    assert!(
+        Arc::strong_count(&next[0]) > 1,
+        "the pending request holds it"
+    );
+    let completion = port.complete(OpId(1), ENGINE).expect("prepare completes");
+    assert!(!completion.delivered);
+    assert_eq!(Arc::strong_count(&next[0]), 1, "the reply was dropped");
+}

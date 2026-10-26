@@ -182,6 +182,30 @@ fn allow_build_mismatch_never_succeeds() {
 }
 
 #[test]
+fn allow_build_mismatch_counts_what_differs() {
+    let dir = violating_race();
+    other_build(dir.path(), "dirty", json!(true));
+    edit(dir.path(), |lines| {
+        step(lines, 2)["obs"] = json!("0000000000000000");
+        lines.last_mut().unwrap()["end"]["violation"]["actual"] = json!("something else");
+    });
+    let allow = ReplayOptions {
+        allow_build_mismatch: true,
+        ..ReplayOptions::default()
+    };
+    let report = replayed(dir.path(), allow).unwrap();
+    assert!(report.build_mismatch && !report.verified(), "{report:?}");
+    assert_eq!(
+        (
+            report.obs_mismatches,
+            report.first_obs_mismatch,
+            report.end_mismatch
+        ),
+        (1, Some((2, "obs")), Some("end.violation"))
+    );
+}
+
+#[test]
 fn diagnostic_flags_never_verify() {
     // The recording executable, so the build is equivalent: only the flags
     // differ from a plain replay.

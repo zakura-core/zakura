@@ -237,3 +237,46 @@ fn control_closes_and_relinks_a_mirror() {
     }
     assert!(over_relink > 0, "no plan synced over the new session");
 }
+
+/// A `Control` close takes effect, not just its pick. With no relink to
+/// retire the session, only the close can end it, so both sides' session
+/// pipes must exit, and only after the close.
+#[test]
+fn control_close_ends_both_sides_of_the_session() {
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "mira".to_owned(),
+            action: ControlAction::Close,
+        }],
+        ..StorageScenario::default()
+    };
+    for input in inputs(8, 256) {
+        let (report, _) = run(&scenario, input);
+        let close = report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == "peer:mira:close")
+            .expect("the close is picked")
+            .step;
+        let pipes: Vec<(u64, &str)> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::TaskExited { task, .. } if task.starts_with("header_sync_pipe") => {
+                    Some((entry.step, task.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pipes.len(),
+            2,
+            "Nora's and Mira's pipes both end: {pipes:?}"
+        );
+        assert!(
+            pipes.iter().all(|(step, _)| *step > close),
+            "after the close at step {close}: {pipes:?}"
+        );
+    }
+}

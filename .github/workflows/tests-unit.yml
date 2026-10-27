@@ -17,6 +17,8 @@ on:
       - "**/Cargo.lock"
       # Include non-Rust inputs compiled or exercised by workspace crates.
       - crates/**
+      # Planted bypass patches and their case files, which sim-build applies.
+      - qa/planted/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
@@ -187,11 +189,12 @@ jobs:
           done <<< "$changed"
 
           # Broad test-relevant filter (the paths that formerly gated the whole
-          # workflow on pull_request). Every config-relevant change also needs
-          # the build archive consumed by zakura-config, so `config` implies
-          # `rust` even for paths outside the old workflow-level filter.
+          # workflow on pull_request, plus qa/planted/, whose patches sim-build
+          # applies). Every config-relevant change also needs the build archive
+          # consumed by zakura-config, so `config` implies `rust` even for paths
+          # outside the old workflow-level filter.
           if [[ "$config" == "true" ]] || \
-             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+             grep -qE '(^crates/|^qa/planted/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
             rust=true
           else
             rust=false

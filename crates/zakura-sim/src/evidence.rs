@@ -16,7 +16,7 @@ use zakura_storage::{
 };
 
 use crate::{
-    observe::{reactor_entries, storage_entries},
+    observe::{block_sync_entries, reactor_entries, storage_entries},
     Observation,
 };
 
@@ -98,6 +98,11 @@ pub(crate) enum EvidenceKind {
         /// The node's name.
         node: String,
     },
+    /// A block-sync tap on the node named `node`, a display label only.
+    BlockSync {
+        /// The node's name.
+        node: String,
+    },
 }
 
 impl EvidenceKind {
@@ -123,6 +128,7 @@ impl EvidenceKind {
         match self {
             EvidenceKind::Storage { service } => storage_entries(observations, service, instance),
             EvidenceKind::Reactor { .. } => reactor_entries(observations, instance),
+            EvidenceKind::BlockSync { .. } => block_sync_entries(observations, instance),
         }
     }
 
@@ -131,6 +137,7 @@ impl EvidenceKind {
         match self {
             EvidenceKind::Storage { service } => format!("storage:{service}#{instance}"),
             EvidenceKind::Reactor { node } => format!("reactor:{node}#{instance}"),
+            EvidenceKind::BlockSync { node } => format!("block-sync:{node}#{instance}"),
         }
     }
 
@@ -143,7 +150,7 @@ impl EvidenceKind {
                 entries: "facts",
                 refused: "the port refused use outside its run",
             },
-            EvidenceKind::Reactor { .. } => Words {
+            EvidenceKind::Reactor { .. } | EvidenceKind::BlockSync { .. } => Words {
                 source: "tap",
                 publisher: "tap",
                 entries: "events",

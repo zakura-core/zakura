@@ -74,3 +74,12 @@ pub(crate) fn body_owner(owner: BodyWorkOwner) -> WorkOwner {
         request_id: owner.request_id.get(),
     }
 }
+
+/// A block-sync body owner in plain fields. Block sync's body owners do body
+/// work, not header repair.
+pub(crate) fn block_owner(owner: BodyWorkOwner) -> WorkOwner {
+    WorkOwner {
+        kind: "body".to_owned(),
+        ..body_owner(owner)
+    }
+}

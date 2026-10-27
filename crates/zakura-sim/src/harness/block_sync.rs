@@ -15,7 +15,7 @@
 //! durable, the 30 s timeouts on state calls, and the tampered-body
 //! disconnect. No block property covers them.
 
-use std::{rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SchedulerConfig;
@@ -32,6 +32,8 @@ use super::{
         control::{Control, ControlStep},
         default_limits, preload,
         probe::ProbeLog,
+        tap::BlockTap,
+        view::BlockSyncView,
         BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
         NodeStorage, Policy, PolicySource, Topology,
     },
@@ -39,7 +41,9 @@ use super::{
     Subsystem,
 };
 use crate::{
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
+    property::{
+        Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
+    },
     storage::BLOCK_SERVICE,
     RunConfig, Sim,
 };
@@ -130,18 +134,32 @@ pub struct Ports {
 }
 
 /// The node under test, named `node`, on a controlled block service with
-/// mirror peers, checked by [`storage_properties`].
+/// mirror peers, checked by [`storage_properties`]. Only the node's block
+/// sync is tapped.
 pub struct Storage {
+    /// The node's owner state, as its tap folds it.
+    view: Rc<RefCell<BlockSyncView>>,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     _topology: Rc<Topology>,
 }
 
 impl HasView for Storage {
-    type View = ();
+    type View = BlockSyncView;
 
-    /// Nothing, since no property reads it.
-    fn view(&self) {}
+    /// The node's owner state as of the tap's last observation.
+    fn view(&self) -> BlockSyncView {
+        self.view.borrow().clone()
+    }
+
+    /// The step of the tap's last observation, or `Missing` before its
+    /// first.
+    fn captured(&self) -> Capture {
+        self.view
+            .borrow()
+            .step
+            .map_or(Capture::Missing, Capture::AfterStep)
+    }
 }
 
 impl Subsystem for Storage {
@@ -214,7 +232,7 @@ impl Subsystem for Storage {
     }
 
     /// Spawns the node on its controlled service under the scenario's
-    /// policy, then each mirror, links each mirror to the node once, then
+    /// policy, with its block sync tapped, then each mirror, links each mirror to the node once, then
     /// the probe if the scenario has one, and offers the scenario's control
     /// steps.
     fn build(sim: &mut Sim, scenario: &BlockScenario, ports: Ports) -> Self {
@@ -224,6 +242,9 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             ports.effects.clone(),
         );
+        let (observer, tap) = BlockTap::new(sim, &ports.service, "node");
+        let view = tap.view();
+        let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
         sim.add_source(Box::new(MirrorReadSource::new(
@@ -239,6 +260,7 @@ impl Subsystem for Storage {
                 service: ports.service,
                 replies: ports.replies,
             },
+            Some(observer),
         )];
         for ((index, engine), seed) in ports.mirrors.iter().enumerate().zip(2..) {
             let name = format!("mirror-{index}");
@@ -252,6 +274,7 @@ impl Subsystem for Storage {
                     engine.clone(),
                     ports.reads.clone(),
                 )),
+                None,
             ));
         }
         let topology = Rc::new(Topology::new(nodes, ports.effects, ports.live));
@@ -267,6 +290,7 @@ impl Subsystem for Storage {
         let control = Control::new(sim, topology.clone(), scenario.control.clone(), predicates);
         sim.add_source(Box::new(control));
         Storage {
+            view,
             _topology: topology,
         }
     }

@@ -17,10 +17,16 @@
 //!
 //! Mirrors hold every body, so they never ask the node for one. Only the
 //! probe exercises the node's serving.
+//!
+//! [`tap::BlockTap`] logs the node's block-sync events beside its storage
+//! facts, pairs them, and folds them into a [`view::BlockSyncView`].
 
 pub mod control;
+mod pair;
 pub mod policy;
 pub mod probe;
+pub mod tap;
+pub mod view;
 
 use std::{
     cell::{Cell, RefCell},
@@ -38,11 +44,12 @@ use serde::{Deserialize, Serialize};
 use zakura_header_chain::Frontier;
 use zakura_network::{
     zakura::{
-        framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
-        BlockRangeSource, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService,
-        BlockSyncStartup, CloseCauseReader, FramedSend, Peer, Service, ServicePeerDirection,
-        ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+        block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
+        BlockRangeRead, BlockRangeReadResult, BlockRangeSource, BlockSyncAction,
+        BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, CloseCauseReader,
+        FramedSend, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig, ZakuraPeerId,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
 };
@@ -63,6 +70,7 @@ use zakura_storage::{
 use self::{
     policy::{BlockKey, Hold, MirrorEvent, Predicates},
     probe::ProbeLog,
+    tap::BlockTap,
 };
 use super::header_node::LINK_DEPTH;
 use crate::{
@@ -222,9 +230,11 @@ impl Stages {
 
 /// A [`BlockStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
-/// pure.
+/// pure. With a [`BlockTap`], it logs the node's block-sync events after its
+/// storage facts.
 pub struct PolicySource {
     storage: BlockStorage,
+    tap: Option<BlockTap>,
     service: Arc<ControlledBlockService>,
     base: Base,
     bound: Option<Duration>,
@@ -250,6 +260,7 @@ impl PolicySource {
     ) -> Self {
         PolicySource {
             storage: BlockStorage::new(sim, service.clone()),
+            tap: None,
             service,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
@@ -266,6 +277,16 @@ impl PolicySource {
     /// gated by the same counts.
     pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
         self.predicates.clone()
+    }
+
+    /// This source, draining `tap` at each observation, after storage, so
+    /// each event's storage watermark is already logged and the tap pairs
+    /// the node's operations with its events.
+    pub fn with_tap(self, tap: BlockTap) -> Self {
+        PolicySource {
+            tap: Some(tap),
+            ..self
+        }
     }
 }
 
@@ -299,9 +320,29 @@ impl ActionSource for PolicySource {
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let before = log.entries().len();
-        self.storage.observe(log)?;
+        let stored = self.storage.observe(log);
+        // Drained even when storage failed, so the tap's evidence still
+        // reaches the log.
+        let tapped = match &mut self.tap {
+            Some(tap) => {
+                // The storage source appends only its own service's facts,
+                // but a run may hold other services' storage too.
+                tap.storage_facts(log.entries()[before..].iter().filter_map(
+                    |entry| match &entry.obs {
+                        Observation::Storage {
+                            service, seq, fact, ..
+                        } if service == BLOCK_SERVICE => Some((*seq, fact)),
+                        _ => None,
+                    },
+                ));
+                tap.observe(log)
+            }
+            None => Ok(()),
+        };
+        stored?;
+        tapped?;
         let mut predicates = self.predicates.borrow_mut();
-        // Only this source's storage appends here.
+        // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             if let Observation::Storage { service, fact, .. } = &entry.obs {
                 if service != BLOCK_SERVICE {
@@ -683,13 +724,15 @@ impl BlockNode {
     /// from `seed`.
     ///
     /// Unlike zakurad, it supplies no retention, so every actor serves as
-    /// archive storage: no fixture chain is long enough to prune.
+    /// archive storage: no fixture chain is long enough to prune. An
+    /// `observer`, such as a [`BlockTap`]'s, receives its block-sync events.
     pub fn spawn(
         sim: &mut Sim,
         name: &str,
         seed: u8,
         engine: &Arc<EnginePort>,
         storage: NodeStorage,
+        observer: Option<Arc<dyn BlockSyncObserver>>,
     ) -> Self {
         let view = engine.view();
         let frontiers = &view.frontiers;
@@ -704,6 +747,7 @@ impl BlockNode {
             ZakuraBlockSyncConfig::default(),
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
+        startup.observer.0 = observer;
         let source: Arc<dyn BlockRangeSource> = match &storage {
             NodeStorage::Controlled { service, .. } => Arc::new(service.range_source()),
             NodeStorage::Mirror(mirror) => Arc::new(mirror.clone()),

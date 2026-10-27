@@ -92,6 +92,22 @@ pub enum Observation {
         /// What happened.
         event: ReactorFact,
     },
+    /// One event a block-sync node reported through its tap, in the order
+    /// block sync reported it.
+    BlockSync {
+        /// The tap's registration index among the run's block-sync taps, an
+        /// index space apart from storage's and header reactors'.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The last fact the node's block storage had published when the
+        /// event happened, 0 before any.
+        storage_seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened.
+        event: BlockSyncFact,
+    },
     /// A peer sent a frame on a tabled stream. The peer's role models
     /// labelled it when it was sent.
     PeerFrame {
@@ -918,6 +934,292 @@ pub enum ReactorPurpose {
         /// The repair-signal generation that owns the attempt.
         repair_generation: u64,
     },
+}
+
+/// A block-sync event in plain fields: peers and hashes in hex, owners as
+/// storage writes them, and names for every enum. A body allocation is the
+/// tap's number for it, since addresses differ between processes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum BlockSyncFact {
+    /// The service admitted a session and is about to spawn its routine.
+    SessionAdmitted {
+        /// The remote peer.
+        peer: String,
+        /// The transport connection.
+        connection: u64,
+        /// The service's ID for the session.
+        session_id: u64,
+        /// The routine generation the registry assigned.
+        generation: u64,
+        /// `inbound` or `outbound`.
+        direction: String,
+    },
+    /// A routine took frame `seq` from its stream and is about to judge it.
+    FrameJudged {
+        /// The sending peer.
+        peer: String,
+        /// The connection the frame arrived on.
+        connection: u64,
+        /// The routine's generation.
+        generation: u64,
+        /// The frame's position on the routine's stream, from 1.
+        seq: u64,
+        /// The frame header's message type.
+        message_type: u16,
+        /// The frame header's flags.
+        flags: u16,
+        /// The payload length in bytes.
+        payload_len: u64,
+    },
+    /// A request's write moved one step.
+    Request {
+        /// The request.
+        owner: WorkOwner,
+        /// Its heights, in order.
+        heights: Vec<u32>,
+        /// The size estimate it reserved for all of its heights.
+        estimated_bytes: u64,
+        /// The step, such as `published`, `expired` or `dropped-queued`.
+        step: String,
+    },
+    /// The shared byte budget's counter changed.
+    Budget {
+        /// `reserved`, `charged` for a floor overdraft, or `released`.
+        change: String,
+        /// The counter before the change.
+        before: u64,
+        /// The counter after it.
+        after: u64,
+    },
+    /// A routine handed a body to the sequencer, keeping its charge.
+    HandoffStarted {
+        /// The delivering peer.
+        peer: String,
+        /// The request the body answered.
+        owner: WorkOwner,
+        /// The body's height.
+        height: u32,
+        /// The budget bytes released when the handoff ends.
+        charge: u64,
+    },
+    /// The routine released the charge of the body it handed off.
+    HandoffEnded {
+        /// The delivering peer.
+        peer: String,
+        /// The request the body answered.
+        owner: WorkOwner,
+        /// The body's height.
+        height: u32,
+        /// The budget bytes released.
+        charge: u64,
+    },
+    /// A retained body entered or left one of its holders.
+    Holder {
+        /// The body.
+        body: BlockSyncBody,
+        /// The holder.
+        holder: BlockSyncHolder,
+        /// `retained` or `released`.
+        change: String,
+    },
+    /// A serving response took its execution lease, or released it.
+    ServingLease {
+        /// The requesting peer.
+        peer: String,
+        /// The range's first height.
+        start: u32,
+        /// The range's requested count.
+        count: u32,
+        /// `acquired` or `released`.
+        step: String,
+    },
+    /// Serving queued one response frame.
+    ServingFrame {
+        /// The requesting peer.
+        peer: String,
+        /// The range's first height.
+        start: u32,
+        /// The frame's message type.
+        message_type: u8,
+        /// The block bytes the frame carries, or 0 for an ending.
+        body_bytes: u64,
+    },
+    /// A routine's owner state after it handled an input.
+    Routine {
+        /// The routine's peer.
+        peer: String,
+        /// Its connection.
+        connection: u64,
+        /// Its generation.
+        generation: u64,
+        /// Its outstanding requests.
+        requests: Vec<BlockSyncRequest>,
+        /// The claims it published to the peer registry.
+        claims: Vec<BlockSyncClaim>,
+        /// The ranges its serving session records.
+        serving: Vec<BlockSyncRange>,
+    },
+    /// The work queue's items.
+    WorkQueue {
+        /// Each item, in the queue's order.
+        items: Vec<BlockSyncWorkItem>,
+    },
+    /// The sequencer's retained bodies.
+    Sequencer {
+        /// Each reorder-buffer body.
+        reorder: Vec<BlockSyncRetained>,
+        /// Each `applying` body.
+        applying: Vec<BlockSyncRetained>,
+        /// Each submission the driver can still retain.
+        submissions: Vec<BlockSyncSubmission>,
+    },
+    /// The sequencer task is dropping and takes no more bodies.
+    SequencerClosed,
+}
+
+/// A body one or more sequencer holders retain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncBody {
+    /// The body's height.
+    pub height: u32,
+    /// The request the body answered.
+    pub owner: WorkOwner,
+    /// Wire bytes.
+    pub bytes: u64,
+}
+
+/// One holder of a retained body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum BlockSyncHolder {
+    /// The sequencer's input queue.
+    Queued {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+    },
+    /// The reorder buffer.
+    Reorder {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+    },
+    /// `applying`.
+    Applying {
+        /// The tap's number for the body's allocation.
+        allocation: u64,
+    },
+    /// The verifier driver, through a submission attached to `applying`.
+    Submitted {
+        /// The submission's token.
+        token: u64,
+    },
+    /// The verifier driver, through a detached submission.
+    Detached {
+        /// The submission's token.
+        token: u64,
+    },
+}
+
+/// An outstanding request in a routine's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRequest {
+    /// The request.
+    pub owner: WorkOwner,
+    /// Its write phase, such as `queued` or `written`.
+    pub write: String,
+    /// Each requested height, in order.
+    pub heights: Vec<BlockSyncRequestedHeight>,
+}
+
+/// One height of an outstanding request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRequestedHeight {
+    /// The height.
+    pub height: u32,
+    /// The size estimate the request reserved for it.
+    pub estimated_bytes: u64,
+    /// Whether its body arrived.
+    pub received: bool,
+}
+
+/// One unreceived height a routine published to the peer registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncClaim {
+    /// The height.
+    pub height: u32,
+    /// The request that claims it.
+    pub owner: WorkOwner,
+    /// The size estimate the request reserved for it.
+    pub estimated_bytes: u64,
+}
+
+/// A range a routine's serving session records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRange {
+    /// The first height.
+    pub first: u32,
+    /// The last height.
+    pub last: u32,
+    /// Whether its completion is recorded.
+    pub completed: bool,
+}
+
+/// One work-queue item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncWorkItem {
+    /// The item's height.
+    pub height: u32,
+    /// The request that took it, if one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<WorkOwner>,
+    /// `pending`, `provisional` or `in-flight`.
+    pub place: String,
+    /// The size estimate a request for it reserves.
+    pub estimated_bytes: u64,
+    /// The estimate bytes it charges to the queue's tally.
+    pub reserved_bytes: u64,
+}
+
+/// A reorder-buffer or `applying` body in the sequencer's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncRetained {
+    /// The body.
+    #[serde(flatten)]
+    pub body: BlockSyncBody,
+    /// The size estimate its request reserved at admission, if it had one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_estimate_bytes: Option<u64>,
+    /// The tap's number for its allocation.
+    pub allocation: u64,
+}
+
+/// A submission in the sequencer's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockSyncSubmission {
+    /// The submitted body.
+    #[serde(flatten)]
+    pub body: BlockSyncBody,
+    /// Its token.
+    pub token: u64,
+    /// Whether it left `applying` while the driver can still retain it.
+    pub detached: bool,
+}
+
+/// The events that block-sync tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn block_sync_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::BlockSync { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
 }
 
 /// The events that reactor tap `instance` logged in `observations`, in

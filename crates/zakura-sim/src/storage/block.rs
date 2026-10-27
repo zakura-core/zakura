@@ -24,12 +24,11 @@ use zakura_storage::block::{
     ApplyClass, BlockOutcome, Commitment, RetryKind, Stage, Verdict,
 };
 
-use super::{body_owner, hash, hex, peer, point};
+use super::{block_owner, hash, hex, peer, point};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        BlockOperation, BlockStorageState, StorageFact, StorageRequest, StorageResult,
-        StorageState, WorkOwner,
+        BlockOperation, BlockStorageState, StorageFact, StorageRequest, StorageResult, StorageState,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -226,11 +225,7 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             parent,
             class: applied,
         } => StorageRequest::SubmitBlock {
-            // Block sync's body owners do body work, not header repair.
-            owner: WorkOwner {
-                kind: "body".to_owned(),
-                ..body_owner(*owner)
-            },
+            owner: block_owner(*owner),
             source: peer(*source),
             token: *token,
             height: height.map(|height| height.0),

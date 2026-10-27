@@ -991,9 +991,6 @@ impl ZakuraEndpoint {
     ///
     /// It doesn't serve inbound connections itself. Pass `handler` to
     /// `quic.serve` for those, and dial with [`Self::dial`].
-    // Inlined into its callers, so production builds of this crate, which
-    // don't call it, emit no code for it.
-    #[inline]
     pub fn new(
         quic: QuicEndpoint,
         supervisor: ZakuraSupervisorHandle,

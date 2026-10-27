@@ -266,8 +266,6 @@ pub const fn rows(header_bytes: usize) -> &'static [MessageRule] {
 }
 
 /// The version 9 layout for `network`, chosen by its header size.
-// Inlined into its callers, as it was while crate-private.
-#[inline]
 pub fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
     if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
         &RegtestMessage::LAYOUT

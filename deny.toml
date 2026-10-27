@@ -173,7 +173,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # These prototype sources are pinned to exact revisions in Cargo.toml.
 allow-git = [
     "https://github.com/zakura-core/common",
-    "https://github.com/p0mvn/wots-plus",
+    "https://github.com/p0mvn/pq-crypto",
 ]
 
 [sources.allow-org]

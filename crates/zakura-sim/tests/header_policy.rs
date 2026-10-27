@@ -152,6 +152,60 @@ fn virtual_time_trigger_opens_on_time() {
     assert_eq!(boundaries(&predicates, &open, at(2 * HOUR)), []);
 }
 
+/// The same hold with a 3 h `deadline_ms` also stops time at its
+/// submission plus 3 h, both before and after it opens.
+#[test]
+fn deadline_stops_time_at_submission_plus_its_bound() {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap();
+    let mut predicates = Predicates::new(vec![Hold {
+        deadline_ms: Some(ms(3 * HOUR)),
+        ..hold(
+            Select::nth(OpKind::Locator, 1),
+            Trigger::VirtualTime(ms(2 * HOUR)),
+        )
+    }]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    // Submitted at 10 s, as above.
+    let at = |d: Duration| SimInstant::from_start(Duration::from_secs(10) + d);
+
+    let early = pending(1, OpKind::Locator, HOUR);
+    assert_eq!(
+        boundaries(&predicates, &early, at(HOUR)),
+        [
+            Boundary::Opens(at(2 * HOUR)),
+            Boundary::Deadline(at(3 * HOUR))
+        ]
+    );
+    let open = pending(1, OpKind::Locator, 2 * HOUR);
+    assert_eq!(offered(&predicates, Base::Any, &open), [Outcome::Engine]);
+    assert_eq!(
+        boundaries(&predicates, &open, at(2 * HOUR)),
+        [Boundary::Deadline(at(3 * HOUR))]
+    );
+}
+
+/// A hold until `CallerDropped(held)` waits for its own operation's caller.
+/// Another operation's caller dropping first doesn't open it.
+#[test]
+fn caller_dropped_held_waits_for_its_own_drop() {
+    let mut predicates = Predicates::new(vec![hold(
+        Select::nth(OpKind::Locator, 1),
+        Trigger::CallerDropped(Select::held()),
+    )]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    predicates.record(&submitted(2, OpKind::Locator, 0));
+    let held = pending(1, OpKind::Locator, Duration::ZERO);
+
+    predicates.record(&StorageFact::CallerDropped { id: 2 });
+    assert_eq!(
+        offered(&predicates, Base::Any, &held),
+        [],
+        "operation 2's drop leaves the hold on operation 1 closed"
+    );
+    predicates.record(&StorageFact::CallerDropped { id: 1 });
+    assert_eq!(offered(&predicates, Base::Any, &held), [Outcome::Engine]);
+}
+
 /// `Count(16, ...)` stays closed after 15 caller drops and opens on the
 /// 16th. `All` opens only once each part holds, in either order.
 #[test]

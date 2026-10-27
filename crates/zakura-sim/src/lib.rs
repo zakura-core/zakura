@@ -21,6 +21,7 @@ pub mod fake;
 pub mod harness;
 pub mod identity;
 pub mod model;
+pub mod net;
 pub mod observe;
 pub mod plan;
 pub mod property;

@@ -270,6 +270,21 @@ pub enum Observation {
         /// True if the row ends the exchange.
         ends: bool,
     },
+    /// A datagram on the simulated network was sent, or left it. Each
+    /// datagram logs `sent`, then at most one of the others.
+    Datagram {
+        /// Its place in `link`'s sends, from 0, as `deliver:<link>:<id>`
+        /// names it.
+        id: u64,
+        /// Its directed link, as `<src>-><dst>`.
+        link: String,
+        /// Its length in bytes.
+        len: u64,
+        /// What happened to it.
+        outcome: DatagramOutcome,
+        /// When it was sent, in nanoseconds since the run's start.
+        sent_at: u64,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -936,6 +951,20 @@ impl std::fmt::Display for RowAt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.stream, self.row)
     }
+}
+
+/// What happened to a datagram, in [`Observation::Datagram`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatagramOutcome {
+    /// It went in flight.
+    Sent,
+    /// It reached its destination's receive queue.
+    Delivered,
+    /// The plan dropped it within its link's loss budget.
+    Lost,
+    /// Nothing was bound at its destination when it arrived.
+    Unbound,
 }
 
 /// How a task ended.

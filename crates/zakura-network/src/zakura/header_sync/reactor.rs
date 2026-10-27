@@ -4542,10 +4542,12 @@ impl HeaderSyncReactor {
                     }) as HeaderSyncPortCompletion
                 }),
             };
-        let operation =
-            AssertUnwindSafe(operation)
-                .catch_unwind()
-                .map(move |result| match result {
+        let operation = AssertUnwindSafe(operation)
+            .catch_unwind()
+            .map(move |result| {
+                #[cfg(any(test, zakura_sim))]
+                let result = observe::rethrow_observer_panic(result);
+                match result {
                     Ok(completion) => PortOperationResult::Completed(Box::new(move |reactor| {
                         completion(reactor);
                         drop(capacity);
@@ -4561,7 +4563,8 @@ impl HeaderSyncReactor {
                         panic_tap.end(observe::CallEnd::PortPanicked);
                         PortOperationResult::Panicked(Box::new(panic_context))
                     }
-                });
+                }
+            });
         if let Some(operation) = vct_local_operation {
             self.vct_local_operation = Some(operation);
         }

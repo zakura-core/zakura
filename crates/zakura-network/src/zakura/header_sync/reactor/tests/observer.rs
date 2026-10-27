@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore as TokioSemaphore;
 use zakura_node_services::header_chain as port;
 
@@ -815,6 +815,69 @@ async fn port_panic_before_and_after_submission() {
             "{panic:?}"
         );
     }
+}
+
+/// Records every event, and panics once just after recording the first
+/// `CallEnded`.
+#[derive(Debug, Default)]
+struct PanicsAfterCallEnded {
+    recorder: Recorder,
+    panicked: std::sync::atomic::AtomicBool,
+}
+
+impl HeaderSyncObserver for PanicsAfterCallEnded {
+    fn observe(&self, event: ReactorEvent) {
+        let ended = matches!(event, ReactorEvent::CallEnded { .. });
+        self.recorder.observe(event);
+        if ended && !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("the observer panics after recording a call end");
+        }
+    }
+}
+
+/// An observer that panics inside a port future, after recording the call's
+/// end, unwinds the reactor rather than having the panic reported as the
+/// port's. The call never gets a second `CallEnded` or a `Handled`.
+#[tokio::test]
+async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
+    let observer = Arc::new(PanicsAfterCallEnded::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        None,
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    reactor.startup.observer = ObserverSlot(Some(observer.clone()));
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    observer.recorder.take();
+
+    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
+        .catch_unwind()
+        .await;
+
+    let payload = polled
+        .err()
+        .expect("the observer panic unwinds out of the reactor's poll");
+    assert!(payload.is::<observe::ObserverPanicked>());
+    assert_eq!(
+        observer.recorder.take(),
+        vec![
+            ReactorEvent::Dispatched {
+                call: 1,
+                op: PortCall::Apply {
+                    peer: peer.clone(),
+                    source,
+                    owner,
+                },
+            },
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied,
+            },
+        ]
+    );
 }
 
 /// An offer refused because staging is full, or because every locator permit

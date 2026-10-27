@@ -5,7 +5,7 @@
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
-use std::{fmt, sync::Arc};
+use std::{any::Any, fmt, panic::AssertUnwindSafe, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
@@ -18,7 +18,8 @@ use crate::zakura::ZakuraPeerId;
 ///
 /// Called synchronously on the reactor task, never while the reactor holds a
 /// lock. An implementation must not block, yield, take a `zakura_rt` lock, or
-/// call into the reactor.
+/// call into the reactor. A panic in `observe` unwinds the reactor task, even
+/// when it is called inside a port future.
 pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: ReactorEvent);
@@ -40,7 +41,8 @@ impl fmt::Debug for ObserverSlot {
 /// One reactor event.
 ///
 /// Every `Dispatched { call }` is followed by exactly one `CallEnded { call }`
-/// and then one `Handled { call }`, unless the reactor task unwinds. The events
+/// and then one `Handled { call }`, unless the reactor task unwinds or stops
+/// with the call still pending. The events
 /// strictly between `CallEnded { call }` and `Handled { call }` ran while the
 /// reactor processed that completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,12 +280,35 @@ impl PortTap {
     }
 
     /// Reports that the call ended with `end`.
+    ///
+    /// The port future's panic catch would otherwise report an observer panic
+    /// here as the port's own, after the observer may have recorded this end.
+    /// So the panic is rethrown as [`ObserverPanicked`], which
+    /// [`rethrow_observer_panic`] passes through the catch.
     pub(crate) fn end(&self, end: CallEnd) {
         if let Some(observer) = &self.observer {
-            observer.observe(ReactorEvent::CallEnded {
+            let event = ReactorEvent::CallEnded {
                 call: self.call,
                 end,
-            });
+            };
+            if std::panic::catch_unwind(AssertUnwindSafe(|| observer.observe(event))).is_err() {
+                std::panic::resume_unwind(Box::new(ObserverPanicked));
+            }
         }
+    }
+}
+
+/// The payload rethrown for an observer panic inside a port future. The panic
+/// hook already reported the original. See [`PortTap::end`].
+pub(crate) struct ObserverPanicked;
+
+/// Rethrows `result`'s panic if a port future's observer raised it, so it
+/// unwinds the reactor instead of being reported as a port panic.
+pub(crate) fn rethrow_observer_panic<T>(
+    result: Result<T, Box<dyn Any + Send>>,
+) -> Result<T, Box<dyn Any + Send>> {
+    match result {
+        Err(payload) if payload.is::<ObserverPanicked>() => std::panic::resume_unwind(payload),
+        result => result,
     }
 }

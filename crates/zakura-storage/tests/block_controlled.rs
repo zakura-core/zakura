@@ -1482,3 +1482,37 @@ fn a_record_the_driver_would_fail_closed_on_panics() {
     let record = harness.record_invalid(&unknown);
     harness.service.complete(record, BlockOutcome::Apply).ok();
 }
+
+/// ST4.4: the engine refuses to commit a body block sync recorded invalid.
+/// zakura-state reports the refusal as `HeaderChainError`, so the verdict
+/// completes as a `Storage` retry and commits nothing.
+#[test]
+fn a_commit_of_a_body_recorded_invalid_reports_a_storage_retry() {
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+    let id = harness.submit(&blocks[0]);
+    harness.complete(id, BlockOutcome::Admit);
+    let record = harness.record_invalid(&blocks[0]);
+    harness.complete(record, BlockOutcome::Apply);
+    harness.replies.take();
+    let before = (harness.engine.snapshot(), harness.engine.view());
+
+    let completion = harness.complete(id, COMMITTED);
+    assert_eq!(
+        completion.result,
+        ResultIdentity::Verdict {
+            verdict: Verdict::Retryable(RetryKind::Storage),
+            result: BlockApplyResult::Unavailable,
+        }
+    );
+    assert_eq!(
+        before,
+        (harness.engine.snapshot(), harness.engine.view()),
+        "the refused commit changes no state"
+    );
+    assert!(harness.service.owner_state().operations.is_empty());
+    assert!(matches!(
+        harness.replies.take().as_slice(),
+        [HandleEvent::ApplyFinished { .. }]
+    ));
+}

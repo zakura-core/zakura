@@ -333,8 +333,11 @@ impl Drop for SequencerTask {
     fn drop(&mut self) {
         self.body_input_rx.close();
         #[cfg(any(test, zakura_sim))]
-        while let Ok(body) = self.body_input_rx.try_recv() {
-            self.observe_dequeued(&body);
+        {
+            while let Ok(body) = self.body_input_rx.try_recv() {
+                self.observe_dequeued(&body);
+            }
+            self.observe_teardown();
         }
         while self.body_input_rx.try_recv().is_ok() {}
 
@@ -466,6 +469,33 @@ impl SequencerTask {
         }
         self.observed_holders = current;
         observe!(self.observer, BlockEvent::Sequencer(ownership));
+    }
+
+    /// Reports every holder's release and an empty snapshot, because the
+    /// sequencer's ledgers drop with the task. A driver that still runs a
+    /// submission keeps its own copy of the decoded block; the block service
+    /// reports that copy, not the sequencer.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_teardown(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        self.observe_holders();
+        for (holder, body) in std::mem::take(&mut self.observed_holders) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change: HolderChange::Released,
+                }
+            );
+        }
+        observe!(
+            self.observer,
+            BlockEvent::Sequencer(super::block_sync_observe::SequencerOwnership::default())
+        );
     }
 
     pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {

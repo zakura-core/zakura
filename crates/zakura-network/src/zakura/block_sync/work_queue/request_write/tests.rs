@@ -11,7 +11,7 @@ use std::{num::NonZeroU64, time::Duration};
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
+        Self(Arc::new(AtomicU8::new(WRITTEN)), None)
     }
 }
 
@@ -929,6 +929,17 @@ fn each_write_outcome_reports_its_steps() {
     assert!(claim.publish(|| {}));
     f.expire(claim.owner());
     assert!(!claim.try_start());
+    drop(claim);
+    assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
+
+    // A routine expires a queued request through the status it kept, as its
+    // timeout and retirement paths do.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    assert!(claim.publish(|| {}));
+    let status = claim.status();
+    assert!(status.expire_unwritten());
+    assert!(!status.expire_unwritten(), "only the transition reports");
     drop(claim);
     assert_eq!(log.take(), [Published, Expired, Dropped(Phase::Skipped)]);
 

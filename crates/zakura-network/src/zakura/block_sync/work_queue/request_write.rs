@@ -24,8 +24,14 @@ mod tests;
 
 /// Observes whether transport skipped an attempt without retaining its work or
 /// byte reservation. The routine can keep this after the writer drops its claim.
+///
+/// In test and simulator builds it also carries its request's reporter, so
+/// every expiry reports its step, whichever owner expires the request.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::block_sync) struct RequestWriteStatus(Arc<AtomicU8>);
+pub(in crate::zakura::block_sync) struct RequestWriteStatus(
+    Arc<AtomicU8>,
+    #[cfg(any(test, zakura_sim))] Option<Arc<RequestReporter>>,
+);
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn was_skipped(&self) -> bool {
@@ -52,10 +58,51 @@ impl RequestWriteStatus {
 
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
         self.0
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// Retire a queued attempt atomically against writer startup. Returns true
+    /// only for the transition, which it reports as [`RequestStep::Expired`];
+    /// a started frame remains the transport's owner.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
+        let expired = self
+            .0
+            .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if let (true, Some(reporter)) = (expired, &self.1) {
+            reporter.report(RequestStep::Expired);
+        }
+        expired
+    }
+}
+
+/// Reports one request's steps to the queue's observer.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+pub(in crate::zakura::block_sync) struct RequestReporter {
+    observer: crate::zakura::block_sync::block_sync_observe::ObserverSlot,
+    owner: BodyWorkOwner,
+    heights: Vec<block::Height>,
+    estimated_bytes: u64,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl RequestReporter {
+    fn report(&self, step: RequestStep) {
+        observe!(
+            self.observer,
+            BlockEvent::Request {
+                owner: self.owner,
+                heights: self.heights.clone(),
+                estimated_bytes: self.estimated_bytes,
+                step,
+            }
+        );
     }
 }
 
@@ -81,27 +128,6 @@ pub enum RequestWritePhase {
 pub(super) struct RequestWriteRegistration {
     pub(super) claim: Weak<RequestWrite>,
     pub(super) status: RequestWriteStatus,
-    /// The request's heights and estimate, so an expiry reports its step even
-    /// while the last owner is being dropped.
-    #[cfg(any(test, zakura_sim))]
-    pub(super) request: (Vec<block::Height>, u64),
-}
-
-#[cfg(any(test, zakura_sim))]
-impl RequestWriteRegistration {
-    /// Reports that the queue expired `owner`'s unwritten request.
-    pub(super) fn observe_expired(&self, work: &WorkQueue, owner: BodyWorkOwner) {
-        let (heights, estimated_bytes) = &self.request;
-        observe!(
-            work.observer,
-            BlockEvent::Request {
-                owner,
-                heights: heights.clone(),
-                estimated_bytes: *estimated_bytes,
-                step: RequestStep::Expired,
-            }
-        );
-    }
 }
 
 /// One exact attempt owns its provisional budget until publication. Afterwards
@@ -115,6 +141,9 @@ pub(crate) struct RequestWrite {
     budget: ByteBudget,
     cancel: CancellationToken,
     state: Arc<AtomicU8>,
+    /// Reports this request's steps, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    reporter: Arc<RequestReporter>,
 }
 
 impl RequestWrite {
@@ -127,6 +156,13 @@ impl RequestWrite {
     ) -> Arc<Self> {
         let estimated_bytes = items.iter().map(|(_, item)| item.estimated_bytes).sum();
         Arc::new(Self {
+            #[cfg(any(test, zakura_sim))]
+            reporter: Arc::new(RequestReporter {
+                observer: work.observer.clone(),
+                owner,
+                heights: items.iter().map(|(height, _)| *height).collect(),
+                estimated_bytes,
+            }),
             owner,
             items,
             estimated_bytes,
@@ -137,8 +173,14 @@ impl RequestWrite {
         })
     }
 
+    #[cfg(not(any(test, zakura_sim)))]
     pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
         RequestWriteStatus(self.state.clone())
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
+        RequestWriteStatus(self.state.clone(), Some(self.reporter.clone()))
     }
 
     /// Record outstanding state and enqueue into already-reserved capacity under
@@ -177,8 +219,6 @@ impl RequestWrite {
             RequestWriteRegistration {
                 claim: downgrade(self),
                 status: self.status(),
-                #[cfg(any(test, zakura_sim))]
-                request: (self.heights().collect(), self.estimated_bytes),
             },
         );
         self.state.store(QUEUED, Ordering::Release);
@@ -191,15 +231,7 @@ impl RequestWrite {
     /// Reports `step` to the queue's observer, if one is installed.
     #[cfg(any(test, zakura_sim))]
     fn observe(&self, step: RequestStep) {
-        observe!(
-            self.work.observer,
-            BlockEvent::Request {
-                owner: self.owner,
-                heights: self.heights().collect(),
-                estimated_bytes: self.estimated_bytes,
-                step,
-            }
-        );
+        self.reporter.report(step);
     }
 
     pub(super) fn owner(&self) -> BodyWorkOwner {
@@ -234,8 +266,6 @@ impl RequestWrite {
 
     pub(super) fn expire_unwritten(&self) {
         if self.status().expire_unwritten() {
-            #[cfg(any(test, zakura_sim))]
-            self.observe(RequestStep::Expired);
             // A competing body can settle every byte without returning work.
             // Wake the routine even when claim cleanup has no budget to release.
             self.work.available.notify_waiters();
@@ -289,8 +319,6 @@ impl FrameWriteClaim for RequestWrite {
 
 impl Drop for RequestWrite {
     fn drop(&mut self) {
-        #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::Dropped(self.status().phase()));
         match self.state.load(Ordering::Acquire) {
             UNPUBLISHED => {
                 self.work.return_unpublished(&self.items);
@@ -314,5 +342,7 @@ impl Drop for RequestWrite {
                 self.work.lock().request_writes.remove(&self.owner);
             }
         }
+        #[cfg(any(test, zakura_sim))]
+        self.observe(RequestStep::Dropped(self.status().phase()));
     }
 }

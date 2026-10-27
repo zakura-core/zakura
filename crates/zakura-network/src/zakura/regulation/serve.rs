@@ -145,6 +145,21 @@ pub(crate) trait Produce: Send + Sync + 'static {
     /// It must be a legal ending for `request` after `sent`. Serve reserves
     /// room for the largest ending, so it always fits.
     fn local_failure(&self, request: &Self::Request, sent: SinkProgress) -> Self::Message;
+
+    /// Reports one serving step for `request`, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, _request: &Self::Request, _step: ServeStep<'_, Self::Message>) {}
+}
+
+/// One step of a response's task, as [`Produce::observe`] sees it.
+#[cfg(any(test, zakura_sim))]
+pub(crate) enum ServeStep<'a, M> {
+    /// The task holds the response's execution slots.
+    LeaseAcquired,
+    /// The task dropped its last execution lease.
+    LeaseReleased,
+    /// Serve queued `ending` after a local failure cut the response short.
+    FailureEnding(&'a M),
 }
 
 /// Why `produce` returned without an ending.
@@ -657,6 +672,8 @@ struct Task<P> {
 
 impl<P: Produce> Task<P> {
     async fn run(self, request: P::Request, core: SinkCore, slots: ExecutionSlots) {
+        #[cfg(any(test, zakura_sim))]
+        self.produce.observe(&request, ServeStep::LeaseAcquired);
         let active = self.metrics.active();
         let lease = WorkLease::new(slots);
         let core = Arc::new(Mutex::new(core));
@@ -675,6 +692,8 @@ impl<P: Produce> Task<P> {
         };
         // Execution ends when the last lease clone drops.
         drop(lease);
+        #[cfg(any(test, zakura_sim))]
+        self.produce.observe(&request, ServeStep::LeaseReleased);
         drop(active);
         let outcome = match produced {
             Ok(Responded { .. }) => "ending",
@@ -694,6 +713,12 @@ impl<P: Produce> Task<P> {
             // The exchange cannot end, so the session cannot stay usable.
             tracing::warn!(%error, "serving could not queue a failure ending; retiring the session");
             self.cancel.cancel();
+        }
+        // Only a queued ending ends the sink.
+        #[cfg(any(test, zakura_sim))]
+        if core.ended() {
+            self.produce
+                .observe(&request, ServeStep::FailureEnding(&ending));
         }
     }
 }

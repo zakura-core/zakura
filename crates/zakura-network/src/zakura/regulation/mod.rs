@@ -33,6 +33,8 @@ pub(crate) use request::{
 };
 
 mod serve;
+#[cfg(any(test, zakura_sim))]
+pub(crate) use serve::ServeStep;
 pub(crate) use serve::{
     Completion, CompletionId, Completions, ExecutionSlots, OutputOrder, Produce, Push, PushPermit,
     PushSend, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,

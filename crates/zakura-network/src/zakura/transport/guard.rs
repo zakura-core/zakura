@@ -195,6 +195,35 @@ impl ByteBudget {
         self.inner.capacity.notify_waiters();
     }
 
+    /// [`Self::release`] that calls `released` after the counter changes and
+    /// before waking waiters, so an observer sees the release before any task
+    /// it wakes runs. Does nothing for 0 bytes.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn release_then(&mut self, bytes: u64, released: impl FnOnce()) {
+        if bytes == 0 {
+            return;
+        }
+        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
+        loop {
+            let next = reserved.saturating_sub(bytes);
+            match self.inner.reserved_bytes.compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    self.observe(BudgetChangeKind::Released, reserved, next);
+                    break;
+                }
+                Err(observed) => reserved = observed,
+            }
+        }
+        released();
+        self.inner.capacity.notify_waiters();
+    }
+
     /// Add `bytes` to the shared counter without applying the admission gate.
     ///
     /// Used for the single floor-priority request allowed to overdraft a full

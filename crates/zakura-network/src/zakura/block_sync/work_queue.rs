@@ -997,10 +997,6 @@ impl WorkQueue {
             // The writer claims under this same lock. Expiry skips an
             // unwritten frame even while its last owner is being dropped.
             if registration.status.expire_unwritten() {
-                #[cfg(any(test, zakura_sim))]
-                if let Some(owner) = owner {
-                    registration.observe_expired(self, owner);
-                }
                 self.available.notify_waiters();
             }
             outcome.request_was_unwritten = registration.status.was_skipped();

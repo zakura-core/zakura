@@ -19,7 +19,10 @@ pub(super) use super::super::source::{
     BlockRangeRead as Read, BlockRangeReadResult as ReadResult, BlockRangeSource as Source,
 };
 #[cfg(any(test, zakura_sim))]
-use crate::zakura::block_sync::block_sync_observe::{ObservedLease, ObserverSlot};
+use crate::zakura::{
+    block_sync::block_sync_observe::{LeaseStep, ObserverSlot, ServingReporter},
+    regulation::ServeStep,
+};
 
 #[derive(Debug)]
 pub(super) struct Server<S: ?Sized> {
@@ -27,9 +30,9 @@ pub(super) struct Server<S: ?Sized> {
     session: Option<crate::zakura::FramedSend>,
     max_blocks: u32,
     max_body_bytes: u32,
-    /// The observer that serving reports to, and the peer it serves.
+    /// Reports this session's leases and frames, in test and simulator builds.
     #[cfg(any(test, zakura_sim))]
-    observed: Option<(ObserverSlot, crate::zakura::ZakuraPeerId)>,
+    observed: Option<ServingReporter>,
 }
 
 impl<S: ?Sized> Server<S> {
@@ -61,7 +64,7 @@ impl<S: ?Sized> Server<S> {
         peer: crate::zakura::ZakuraPeerId,
     ) -> Self {
         Self {
-            observed: Some((observer, peer)),
+            observed: Some(ServingReporter::new(observer, peer)),
             ..self
         }
     }
@@ -90,10 +93,6 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         lease: WorkLease,
         sink: ResponseSink<Message>,
     ) -> Result<Responded, ServeEnd> {
-        #[cfg(any(test, zakura_sim))]
-        let observed = self.observed.clone().map(|(observer, peer)| {
-            ObservedLease::acquire(observer, peer, range.start(), range.count())
-        });
         if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
@@ -108,7 +107,7 @@ impl<S: Source + ?Sized> Produce for Server<S> {
                     work: lease,
                     _session: self.session.clone(),
                     #[cfg(any(test, zakura_sim))]
-                    observed,
+                    observed: self.observed.clone(),
                 },
             })
             .await
@@ -129,6 +128,22 @@ impl<S: Source + ?Sized> Produce for Server<S> {
 
     fn local_failure(&self, range: &Range, sent: SinkProgress) -> Message {
         ending(*range, sent.frames)
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, range: &Range, step: ServeStep<'_, Message>) {
+        let Some(reporter) = &self.observed else {
+            return;
+        };
+        match step {
+            ServeStep::LeaseAcquired => {
+                reporter.lease(range.start(), range.count(), LeaseStep::Acquired)
+            }
+            ServeStep::LeaseReleased => {
+                reporter.lease(range.start(), range.count(), LeaseStep::Released)
+            }
+            ServeStep::FailureEnding(end) => reporter.frame(range.start(), ending_type(end), 0),
+        }
     }
 }
 
@@ -168,7 +183,11 @@ fn encode_response(
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
         #[cfg(any(test, zakura_sim))]
         if let Some(observed) = &lease.observed {
-            observed.frame(crate::zakura::block_sync::MSG_BS_BLOCK, len);
+            observed.frame(
+                requested.start(),
+                crate::zakura::block_sync::MSG_BS_BLOCK,
+                len,
+            );
         }
         metrics::counter!("sync.block.body.served").increment(1);
         body_bytes += len;
@@ -178,30 +197,36 @@ fn encode_response(
         return Err(ServeEnd::Cancelled);
     }
     #[cfg(any(test, zakura_sim))]
-    return finish_observed(sink, ending(requested, returned), &lease);
+    return finish_observed(sink, requested, ending(requested, returned), &lease);
     sink.finish(&ending(requested, returned))
         .map_err(|error| ServeEnd::LocalFault(error.to_string()))
 }
 
-/// Queues `end` as `encode_response` does, then reports the ending frame to
-/// the lease's observer if the sink took it.
+/// Queues `end` for `requested` as `encode_response` does, then reports the
+/// ending frame to the lease's reporter if the sink took it.
 #[cfg(any(test, zakura_sim))]
 fn finish_observed(
     sink: ResponseSink<Message>,
+    requested: Range,
     end: Message,
     lease: &BlockRangeReadLease,
 ) -> Result<Responded, ServeEnd> {
-    let end_type = match &end {
-        Message::End(range_ending) => range_ending.message_type(),
-        _ => unreachable!("`ending` builds an ending"),
-    };
     let finished = sink
         .finish(&end)
         .map_err(|error| ServeEnd::LocalFault(error.to_string()));
     if let (Ok(_), Some(observed)) = (&finished, &lease.observed) {
-        observed.frame(end_type, 0);
+        observed.frame(requested.start(), ending_type(&end), 0);
     }
     finished
+}
+
+/// The message type of an ending that [`ending`] built.
+#[cfg(any(test, zakura_sim))]
+fn ending_type(end: &Message) -> u8 {
+    match end {
+        Message::End(range_ending) => range_ending.message_type(),
+        _ => unreachable!("`ending` builds an ending"),
+    }
 }
 
 fn ending(range: Range, returned: u32) -> Message {

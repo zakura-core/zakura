@@ -321,64 +321,46 @@ impl SequencerOwnership {
     }
 }
 
-/// Reports a serving read's lease when built and when dropped, and each
-/// frame the read's response queues. Lives inside the read's lease, after the
-/// execution lease, so it drops just after the lease is released.
-#[derive(Debug)]
-pub(crate) struct ObservedLease {
+/// Reports one serving session's lease and frame events for its peer. Serve's
+/// task reports each response's lease when it takes the execution slots and
+/// after it drops its last execution lease, and each failure ending. The
+/// encoder reports each block frame and each ending it queues.
+#[derive(Clone, Debug)]
+pub(crate) struct ServingReporter {
     observer: ObserverSlot,
     peer: ZakuraPeerId,
-    start: block::Height,
-    count: u32,
 }
 
-impl ObservedLease {
-    /// Reports that `peer`'s read of `count` heights from `start` holds its
-    /// lease.
-    pub(crate) fn acquire(
-        observer: ObserverSlot,
-        peer: ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-    ) -> Self {
-        let lease = Self {
-            observer,
-            peer,
-            start,
-            count,
-        };
-        lease.observe_lease(LeaseStep::Acquired);
-        lease
+impl ServingReporter {
+    /// A reporter for `peer`'s session.
+    pub(crate) fn new(observer: ObserverSlot, peer: ZakuraPeerId) -> Self {
+        Self { observer, peer }
     }
 
-    /// Reports one queued response frame.
-    pub(crate) fn frame(&self, message_type: u8, body_bytes: u64) {
-        observe!(
-            self.observer,
-            BlockEvent::ServingFrame {
-                peer: self.peer.clone(),
-                start: self.start,
-                message_type,
-                body_bytes,
-            }
-        );
-    }
-
-    fn observe_lease(&self, step: LeaseStep) {
+    /// Reports that the response for `count` heights from `start` took or
+    /// released its lease.
+    pub(crate) fn lease(&self, start: block::Height, count: u32, step: LeaseStep) {
         observe!(
             self.observer,
             BlockEvent::ServingLease {
                 peer: self.peer.clone(),
-                start: self.start,
-                count: self.count,
+                start,
+                count,
                 step,
             }
         );
     }
-}
 
-impl Drop for ObservedLease {
-    fn drop(&mut self) {
-        self.observe_lease(LeaseStep::Released);
+    /// Reports one queued frame of the response from `start`.
+    pub(crate) fn frame(&self, start: block::Height, message_type: u8, body_bytes: u64) {
+        observe!(
+            self.observer,
+            BlockEvent::ServingFrame {
+                peer: self.peer.clone(),
+                start,
+                message_type,
+                body_bytes,
+            }
+        );
     }
 }

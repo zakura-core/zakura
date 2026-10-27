@@ -1,17 +1,17 @@
 //! Outcome predicates (M4-B2): which storage operations a hold picks, what
 //! it waits for, and what it offers once it opens.
 //!
-//! [`Predicates`] counts the storage facts and link effects the run has
-//! observed. Only [`Predicates::record`] and [`Predicates::record_link`]
-//! change it, and the run calls them from `observe`. Everything else reads
-//! those counts and the time a caller passes in, so the sources built on it
-//! keep `enabled` and `boundaries` pure, as replay needs.
+//! [`Predicates`] counts the storage facts, reactor events and link effects
+//! the run has observed. Only [`Predicates::record`],
+//! [`Predicates::record_reactor`] and [`Predicates::record_link`] change it,
+//! and the run calls them from `observe`. Everything else reads those counts
+//! and the time a caller passes in, so the sources built on it keep
+//! `enabled` and `boundaries` pure, as replay needs.
 //!
 //! A trigger counts effects, never picks: a `Control` pick only queues its
-//! action, so [`Trigger::Closed`] counts connections that actually closed. No
-//! trigger shows that a caller has handled a reply, only that it took it
-//! ([`Trigger::ReplyTaken`]), since that needs a witness from the reactor
-//! itself.
+//! action, so [`Trigger::Closed`] counts connections that actually closed.
+//! Only [`Trigger::Handled`] shows that the reactor has handled a reply, as
+//! its tap witnesses. [`Trigger::ReplyTaken`] shows only that it took it.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -21,7 +21,7 @@ use zakura_storage::header::{controlled::PendingOp, Fault, Outcome};
 
 use super::{after, Base};
 use crate::{
-    observe::{StorageFact, StorageRequest},
+    observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest},
     Boundary,
 };
 
@@ -132,8 +132,15 @@ pub enum Trigger {
     /// the caller has acted on it: a caller can reach a scheduling point
     /// between taking a reply and handling it, as the reactor does when it
     /// drops a locator's permit before finishing the query. So this isn't
-    /// a callback-handled witness, and none of these triggers is one.
+    /// a callback-handled witness. [`Trigger::Handled`] is.
     ReplyTaken(Select),
+    /// The reactor finished handling a selected port call's completion, as
+    /// its tap reports. A call paired with an operation is selected through
+    /// that operation. One paired with none, such as a preparation the
+    /// reactor never submitted, is selected by the call's own kind and
+    /// session, and never by `nth` or `held`, which name operations. Never
+    /// holds without a tap.
+    Handled(Select),
     /// A connection to this peer closed, counted once per connection,
     /// whether a `Control` close or a service tearing it down closed it.
     Closed(String),
@@ -207,6 +214,8 @@ enum Event {
     CallerDropped,
     Completed,
     ReplyTaken,
+    /// Counted by call, not operation.
+    Handled,
 }
 
 /// A link effect a task made, as [`Trigger::Closed`] and
@@ -231,6 +240,17 @@ struct Op {
     hold: Option<usize>,
 }
 
+/// What [`Predicates`] knows about one port call from its dispatch and end.
+#[derive(Clone, Copy, Debug)]
+struct Call {
+    kind: OpKind,
+    /// The session its work belongs to. A locator's is the offering
+    /// session's.
+    session: u64,
+    /// The operation it's paired with.
+    op: Option<u64>,
+}
+
 /// The time a trigger is judged at, and the operation it's judged for.
 #[derive(Clone, Copy, Debug)]
 struct Context {
@@ -245,7 +265,9 @@ struct Context {
 pub struct Predicates {
     holds: Vec<Hold>,
     ops: BTreeMap<u64, Op>,
+    calls: BTreeMap<u64, Call>,
     submitted: BTreeMap<OpKind, u32>,
+    /// Each event with its operation, or its call for [`Event::Handled`].
     events: Vec<(Event, u64)>,
     links: Vec<(LinkEffect, String)>,
 }
@@ -287,6 +309,36 @@ impl Predicates {
         self.events.push((event, id));
     }
 
+    /// Counts one event of the node's reactor, as its tap logged it, with
+    /// each `CallEnded`'s paired operation.
+    pub fn record_reactor(&mut self, event: &ReactorFact) {
+        match event {
+            ReactorFact::Dispatched { call, port } => {
+                let (kind, session) = match port {
+                    ReactorCall::Locator { session_id, .. } => (OpKind::Locator, *session_id),
+                    ReactorCall::VctContext { owner, .. } => (OpKind::VctContext, owner.session_id),
+                    ReactorCall::Prepare { owner, .. } => (OpKind::Prepare, owner.session_id),
+                    ReactorCall::Apply { owner, .. } => (OpKind::Apply, owner.session_id),
+                };
+                self.calls.insert(
+                    *call,
+                    Call {
+                        kind,
+                        session,
+                        op: None,
+                    },
+                );
+            }
+            ReactorFact::CallEnded { call, op, .. } => {
+                if let Some(ended) = self.calls.get_mut(call) {
+                    ended.op = *op;
+                }
+            }
+            ReactorFact::Handled { call, .. } => self.events.push((Event::Handled, *call)),
+            _ => {}
+        }
+    }
+
     /// Counts one link effect on the link to `peer`.
     pub fn record_link(&mut self, effect: LinkEffect, peer: &str) {
         self.links.push((effect, peer.to_owned()));
@@ -300,12 +352,37 @@ impl Predicates {
         self.ops.get(&id).is_some_and(|op| op.matches(select))
     }
 
+    /// Whether port call `call` matches `select` in `cx`: through its paired
+    /// operation, or else by its own kind and session.
+    fn selects_call(&self, select: &Select, call: u64, cx: Context) -> bool {
+        let Some(handled) = self.calls.get(&call) else {
+            return false;
+        };
+        match handled.op {
+            Some(op) => self.selects(select, op, cx),
+            None => {
+                !select.held
+                    && select.nth.is_none()
+                    && select.kind.is_none_or(|kind| kind == handled.kind)
+                    && select
+                        .session
+                        .is_none_or(|session| session == handled.session)
+            }
+        }
+    }
+
     /// How many times `trigger` has happened in `cx`.
     fn count(&self, trigger: &Trigger, cx: Context) -> usize {
         let events = |kind: Event, select: &Select| {
             self.events
                 .iter()
-                .filter(|(event, id)| *event == kind && self.selects(select, *id, cx))
+                .filter(|(event, id)| {
+                    *event == kind
+                        && match kind {
+                            Event::Handled => self.selects_call(select, *id, cx),
+                            _ => self.selects(select, *id, cx),
+                        }
+                })
                 .count()
         };
         let links = |kind: LinkEffect, peer: &str| {
@@ -319,6 +396,7 @@ impl Predicates {
             Trigger::CallerDropped(select) => events(Event::CallerDropped, select),
             Trigger::Completed(select) => events(Event::Completed, select),
             Trigger::ReplyTaken(select) => events(Event::ReplyTaken, select),
+            Trigger::Handled(select) => events(Event::Handled, select),
             Trigger::Closed(peer) => links(LinkEffect::Closed, peer),
             Trigger::Linked(peer) => links(LinkEffect::Linked, peer),
             Trigger::Grown(peer) => links(LinkEffect::Grown, peer),

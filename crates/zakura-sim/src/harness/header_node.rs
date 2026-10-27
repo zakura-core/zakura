@@ -215,7 +215,7 @@ fn after(t: SimInstant, d: Duration) -> SimInstant {
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
 /// pure. With a [`ReactorTap`], it logs the node's reactor events after its
-/// storage facts, paired with them, which its predicates don't read.
+/// storage facts, paired with them, and its predicates count both.
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
@@ -307,10 +307,12 @@ impl ActionSource for PolicySource {
             tap.observe(log)?;
         }
         let mut predicates = self.predicates.borrow_mut();
-        // The storage source appends only its own port's facts.
+        // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
-            if let Observation::Storage { fact, .. } = &entry.obs {
-                predicates.record(fact);
+            match &entry.obs {
+                Observation::Storage { fact, .. } => predicates.record(fact),
+                Observation::Reactor { event, .. } => predicates.record_reactor(event),
+                _ => {}
             }
         }
         let links = self.effects.links.borrow();

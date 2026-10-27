@@ -1,5 +1,5 @@
-//! Outcome predicates (M4-B2), driven by scripted storage facts and pending
-//! operations, without a node.
+//! Outcome predicates (M4-B2), driven by scripted storage facts, reactor
+//! events and pending operations, without a node.
 #![cfg(zakura_sim)]
 
 use std::time::Duration;
@@ -10,7 +10,9 @@ use zakura_sim::{
         policy::{Allow, Hold, LinkEffect, OpKind, Predicates, Select, Trigger},
         Base,
     },
-    observe::{StorageBranch, StorageFact, StorageRequest, WorkOwner, WorkScope},
+    observe::{
+        ReactorCall, ReactorFact, StorageBranch, StorageFact, StorageRequest, WorkOwner, WorkScope,
+    },
     Boundary,
 };
 use zakura_storage::header::{
@@ -258,6 +260,147 @@ fn unpicked_ops_follow_the_base() {
         );
         assert_eq!(boundaries(&predicates, &op, now), bounds, "op {id}");
     }
+}
+
+/// Call `call` of `kind` was dispatched for `session`.
+fn dispatched(call: u64, kind: OpKind, session: u64) -> ReactorFact {
+    let port = match kind {
+        OpKind::Locator => ReactorCall::Locator {
+            peer: "aa".to_owned(),
+            session_id: session,
+            target: "11".to_owned(),
+            scope: owner(session).scope,
+        },
+        OpKind::Prepare => ReactorCall::Prepare {
+            peer: "aa".to_owned(),
+            source: "aa".to_owned(),
+            owner: owner(session),
+        },
+        OpKind::Apply => ReactorCall::Apply {
+            peer: "aa".to_owned(),
+            source: "aa".to_owned(),
+            owner: owner(session),
+        },
+        other => panic!("these tests don't dispatch {other:?}"),
+    };
+    ReactorFact::Dispatched { call, port }
+}
+
+/// Call `call` ended `end`, paired with `op`.
+fn call_ended(call: u64, end: &str, op: Option<u64>) -> ReactorFact {
+    ReactorFact::CallEnded {
+        call,
+        end: end.to_owned(),
+        op,
+    }
+}
+
+/// The reactor handled call `call`.
+fn handled(call: u64) -> ReactorFact {
+    ReactorFact::Handled {
+        call,
+        panicked: false,
+    }
+}
+
+/// A `Handled` trigger selects a call through its paired operation, by
+/// kind, ordinal, session or as the held operation, and only once the
+/// reactor has handled it: a reply taken or a call ended isn't enough.
+#[test]
+fn handled_selects_through_the_paired_operation() {
+    let apply = |select: Select| Trigger::Handled(select);
+    let session = |session: u64| Select {
+        kind: Some(OpKind::Apply),
+        session: Some(session),
+        ..Select::default()
+    };
+    let holds = vec![
+        hold(
+            Select::nth(OpKind::Locator, 1),
+            apply(Select::nth(OpKind::Apply, 1)),
+        ),
+        hold(Select::nth(OpKind::Locator, 2), apply(session(1))),
+        hold(Select::nth(OpKind::Locator, 3), apply(session(2))),
+        hold(
+            Select::nth(OpKind::Locator, 4),
+            apply(Select::nth(OpKind::Apply, 2)),
+        ),
+        hold(Select::nth(OpKind::Apply, 1), apply(Select::held())),
+    ];
+    let mut predicates = Predicates::new(holds);
+    for id in 1..=4 {
+        predicates.record(&submitted(id, OpKind::Locator, 0));
+    }
+    predicates.record(&submitted(5, OpKind::Apply, 1));
+    let ops = |predicates: &Predicates| {
+        [1, 2, 3, 4]
+            .map(|id| pending(id, OpKind::Locator, Duration::ZERO))
+            .into_iter()
+            .chain([pending(5, OpKind::Apply, Duration::ZERO)])
+            .map(|op| !offered(predicates, Base::Any, &op).is_empty())
+            .collect::<Vec<_>>()
+    };
+    predicates.record_reactor(&dispatched(1, OpKind::Apply, 1));
+    predicates.record(&StorageFact::ReplyTaken { id: 5 });
+    predicates.record_reactor(&call_ended(1, "replied", Some(5)));
+    assert_eq!(ops(&predicates), [false; 5]);
+    predicates.record_reactor(&handled(1));
+    assert_eq!(ops(&predicates), [true, true, false, false, true]);
+}
+
+/// A call paired with no operation, here a preparation the reactor never
+/// submitted, is selected by its own kind and session, never by an
+/// ordinal or as the held operation, which name operations.
+#[test]
+fn handled_without_an_operation_selects_by_the_calls_kind_and_session() {
+    let prepare = |session: Option<u64>| Select {
+        kind: Some(OpKind::Prepare),
+        session,
+        ..Select::default()
+    };
+    let holds = vec![
+        hold(
+            Select::nth(OpKind::Locator, 1),
+            Trigger::Handled(prepare(Some(3))),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 2),
+            Trigger::Handled(prepare(None)),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 3),
+            Trigger::Handled(prepare(Some(4))),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 4),
+            Trigger::Handled(Select::nth(OpKind::Prepare, 1)),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 5),
+            Trigger::Handled(Select {
+                kind: Some(OpKind::Apply),
+                ..Select::default()
+            }),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 6),
+            Trigger::Handled(Select::held()),
+        ),
+    ];
+    let mut predicates = Predicates::new(holds);
+    for id in 1..=6 {
+        predicates.record(&submitted(id, OpKind::Locator, 0));
+    }
+    predicates.record_reactor(&dispatched(1, OpKind::Prepare, 3));
+    predicates.record_reactor(&call_ended(1, "not-submitted", None));
+    predicates.record_reactor(&handled(1));
+    let open: Vec<bool> = (1..=6)
+        .map(|id| {
+            let op = pending(id, OpKind::Locator, Duration::ZERO);
+            !offered(&predicates, Base::Any, &op).is_empty()
+        })
+        .collect();
+    assert_eq!(open, [true, true, false, false, false, false]);
 }
 
 /// Everything the predicates answer, for a fixed set of questions.

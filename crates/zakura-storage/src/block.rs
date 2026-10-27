@@ -131,6 +131,10 @@
 //! * A commit visible before its reply. Full state commits and publishes the
 //!   new view, then the driver sends `BlockApplyFinished`. Here both happen in
 //!   one completion.
+//! * A commit while the driver awaits a query or record. Production's
+//!   verifier can commit then, and the driver replies once it's free. Here
+//!   a verdict commits and replies at once, so it waits for a free driver
+//!   ([`Stage::needs_free_driver`]).
 //! * Chunks of one query reading different states. The driver reads up to
 //!   4,000 heights per state read, and fails the query if the anchor moves
 //!   between reads. Here every chunk reads one state, so that failure only
@@ -149,14 +153,10 @@
 //! * the driver's shutdown when a `record_body_invalid` isn't durable;
 //! * the driver's 30 s deadlines on state calls;
 //! * the checkpoint verifier holding a body until its checkpoint range is
-//!   complete. Regtest's only checkpoint is genesis, so every fixture body
-//!   is full-class.
-//!
-//! One history is wider than production. The driver doesn't poll its
-//! in-flight applies while it awaits a query or record, so it sends no
-//! `BlockApplyFinished` then. Here a verdict is legal at any time after
-//! admission. Block sync must handle every order anyway, since its own
-//! channel can deliver them in any order.
+//!   complete. A body at or below [`ApplyLimits::max_checkpoint_height`] is
+//!   checkpoint-class: it counts against the checkpoint limits and has the
+//!   checkpoint verifier's retry kinds, but its verdict never waits for the
+//!   rest of its range.
 
 use std::{fmt, num::NonZeroU64};
 

@@ -307,12 +307,11 @@ fn every_harness_names_its_statuses() {
 
 #[test]
 fn the_coverage_manifest_lists_every_reported_property() {
-    let mut reported: BTreeSet<String> = HARNESSES
+    let reported: BTreeSet<String> = HARNESSES
         .iter()
         .flat_map(|entry| (entry.properties)())
         .map(|property| property.id)
         .collect();
-    reported.insert(NO_LIVELOCK.to_owned());
     let listed: BTreeSet<String> = COVERAGE.iter().map(|row| row.property.to_owned()).collect();
     assert_eq!(listed.len(), COVERAGE.len(), "one row per property");
     assert_eq!(listed, reported);

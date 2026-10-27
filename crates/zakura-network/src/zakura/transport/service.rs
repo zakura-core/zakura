@@ -202,15 +202,15 @@ impl ServiceStream {
     }
 }
 
-/// Reads the first reason recorded for a connection's close, such as
+/// Reads the first cause recorded for a connection's close, such as
 /// `service_protocol_reject`.
 #[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug)]
-pub struct CloseReason(CloseCause);
+pub struct CloseCauseReader(CloseCause);
 
 #[cfg(any(test, zakura_sim))]
-impl CloseReason {
-    /// The first recorded reason, or `None` while no path recorded one.
+impl CloseCauseReader {
+    /// The first recorded cause, or `None` while no path recorded one.
     pub fn get(&self) -> Option<&'static str> {
         self.0.get()
     }
@@ -477,13 +477,13 @@ impl Peer {
         self.close_cause.clone()
     }
 
-    /// Return a reader for the reason this peer's connection closes.
+    /// Return a reader for the cause of this peer's connection close.
     ///
     /// A service takes the peer by value, so the simulator keeps this reader
     /// from before [`Service::add_peer`] to see why the connection closed.
     #[cfg(any(test, zakura_sim))]
-    pub fn close_reason(&self) -> CloseReason {
-        CloseReason(self.close_cause.clone())
+    pub fn close_cause_reader(&self) -> CloseCauseReader {
+        CloseCauseReader(self.close_cause.clone())
     }
 
     /// Split this peer into fields so the registry can fan streams out by owner.

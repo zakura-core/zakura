@@ -2,10 +2,11 @@
 //! only build with `RUSTFLAGS="--cfg zakura_sim"`, in a separate
 //! `CARGO_TARGET_DIR`.
 //!
-//! Block sync runs with no peers and the default empty block source, fed one
-//! committed header-chain view. A small seeded `Plan` stands in for
-//! `zakura-sim`: it picks which ready task runs and answers every random
-//! draw.
+//! Each node runs block sync fed one committed header-chain view, with a
+//! fixture block source and an action task that answers block queries and
+//! records submissions. Linked nodes talk over in-memory streams. A small
+//! seeded `Plan` stands in for `zakura-sim`: it picks which ready task runs
+//! and answers every random draw.
 #![cfg(zakura_sim)]
 
 use std::{
@@ -38,7 +39,7 @@ use zakura_network::{
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStartup,
-        CloseReason, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
+        CloseCauseReader, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
         ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
     },
@@ -674,8 +675,8 @@ struct Net {
     shutdown: CancellationToken,
     nodes: Vec<Node>,
     exits: Rc<RefCell<Vec<String>>>,
-    /// Each linked connection's token and close reason.
-    connections: Vec<(CancellationToken, CloseReason)>,
+    /// Each linked connection's token and close-cause reader.
+    connections: Vec<(CancellationToken, CloseCauseReader)>,
 }
 
 impl Net {
@@ -743,7 +744,9 @@ impl Net {
             .collect();
         {
             let (handle, submitted) = (Rc::clone(&handle), Rc::clone(&submitted));
-            self.sched.spawn_root("actions", async move {
+            // The scheduler takes a `'static` label; the test leaks one per node.
+            let label: &'static str = Box::leak(format!("{name}-actions").into_boxed_str());
+            self.sched.spawn_root(label, async move {
                 while let Some(action) = actions.recv().await {
                     match action {
                         BlockSyncAction::QueryNeededBlocks {
@@ -811,7 +814,8 @@ impl Net {
             streams,
             connection.clone(),
         );
-        self.connections.push((connection, peer.close_reason()));
+        self.connections
+            .push((connection, peer.close_cause_reader()));
         self.nodes[node].service.add_peer(peer);
     }
 
@@ -949,6 +953,9 @@ fn download(seed: u64) -> Net {
         "`a` submits every body in height order: {:?}",
         net.nodes[a].submitted.borrow()
     );
+    // Let `a` handle every frame still in flight, including `b`'s last
+    // ending, before the caller checks the run.
+    net.settle_until(|_| false);
     net
 }
 
@@ -960,12 +967,12 @@ fn block_sync_serves_a_range_over_memory_streams() {
         net.nodes[1].submitted.borrow().is_empty(),
         "`b` already had every body"
     );
-    for (connection, reason) in &net.connections {
+    for (connection, cause) in &net.connections {
         assert!(
             !connection.is_cancelled(),
             "neither service closed its connection"
         );
-        assert_eq!(reason.get(), None);
+        assert_eq!(cause.get(), None, "no path recorded a close cause");
     }
     assert_eq!(net.finish(), ["completed", "completed"]);
 }
@@ -1004,10 +1011,10 @@ fn an_unsolicited_ending_closes_the_connection_with_its_cause() {
         while probe_recv.recv().await.is_some() {}
     });
 
-    let (connection, reason) = net.connections[0].clone();
+    let (connection, cause) = net.connections[0].clone();
     net.run_until(|_| connection.is_cancelled());
     assert!(connection.is_cancelled(), "{:?}", net.steps);
-    assert_eq!(reason.get(), Some("service_protocol_reject"));
+    assert_eq!(cause.get(), Some("service_protocol_reject"));
     assert_eq!(net.finish(), ["completed"]);
 }
 

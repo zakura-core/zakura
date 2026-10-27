@@ -3454,6 +3454,7 @@ dependencies = [
  "libc",
  "proptest",
  "rand 0.10.2",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

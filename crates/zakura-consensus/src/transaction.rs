@@ -618,9 +618,9 @@ where
                 // scriptSigs, and high-sigop P2SH redeem scripts) *before*
                 // doing expensive script verification, to avoid DoS attacks on
                 // the script interpreter.
-                #[cfg(feature = "experimental-wots")]
+                #[cfg(feature = "experimental-pq-transparent")]
                 let experimental = zakura_script::wots::active(&network, req.height());
-                #[cfg(not(feature = "experimental-wots"))]
+                #[cfg(not(feature = "experimental-pq-transparent"))]
                 let experimental = false;
                 check::mempool_standard_input_scripts_with_wots(tx.as_ref(), &spent_outputs, experimental)?;
             }
@@ -642,7 +642,7 @@ where
             let cached_ffi_transaction =
                 {
                     let cached = CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?;
-                    #[cfg(feature = "experimental-wots")]
+                    #[cfg(feature = "experimental-pq-transparent")]
                     let cached = cached.with_wots_context(&network, req.height());
                     Arc::new(cached)
                 };

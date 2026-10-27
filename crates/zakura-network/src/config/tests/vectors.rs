@@ -6,7 +6,7 @@ fn experimental_wots_configuration_is_explicit_and_regtest_only() {
     let configured =
         "network = 'Regtest'\n[testnet_parameters]\nexperimental_wots_activation_height = 200\n";
     let parsed = toml::from_str::<Config>(configured);
-    if cfg!(feature = "experimental-wots") {
+    if cfg!(feature = "experimental-pq-transparent") {
         let parsed = parsed.expect("the experimental build accepts explicit Regtest activation");
         let serialized = toml::to_string(&parsed).expect("the configuration serializes");
         let restored: Config =
@@ -22,7 +22,7 @@ fn experimental_wots_configuration_is_explicit_and_regtest_only() {
         assert!(parsed
             .unwrap_err()
             .to_string()
-            .contains("requires the experimental-wots build feature"));
+            .contains("requires the experimental-pq-transparent build feature"));
     }
     for network in ["Mainnet", "Testnet"] {
         let public = configured.replace("Regtest", network);

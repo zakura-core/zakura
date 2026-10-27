@@ -29,7 +29,7 @@ encodings, the scriptSig is 2,226 bytes; the complete input is 2,269 bytes.
 This requires 16 transparent input actions and an 80,000-zatoshi fee in the
 scenario.
 
-Both the `experimental-wots` build feature and an explicit regtest activation
+Both the `experimental-pq-transparent` build feature and an explicit regtest activation
 height are required. Public-network configuration is rejected. Verification
 cost is charged per potential WOTS instruction, including unselected branches;
 the experimental cost is not a measured production cost model.

@@ -69,7 +69,7 @@ features = [
 
 [features]
 # Local regtest prototype; never enabled by default.
-experimental-wots = ["zakura-consensus/experimental-wots", "zakura-network/experimental-wots", "zakura-script/experimental-wots"]
+experimental-pq-transparent = ["zakura-consensus/experimental-pq-transparent", "zakura-network/experimental-pq-transparent", "zakura-script/experimental-pq-transparent"]
 # In release builds, don't compile debug logging code, to improve performance.
 default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc"]
 

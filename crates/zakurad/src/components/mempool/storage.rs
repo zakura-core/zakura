@@ -323,11 +323,11 @@ impl Storage {
 
             // Rule: scriptSig size must be within the standard limit.
             // This transaction has already passed contextual consensus verification.
-            #[cfg(feature = "experimental-wots")]
+            #[cfg(feature = "experimental-pq-transparent")]
             let allowed = spent_outputs
                 .get(input_index)
                 .is_some_and(|output| zakura_script::wots::standard_input(input, output));
-            #[cfg(not(feature = "experimental-wots"))]
+            #[cfg(not(feature = "experimental-pq-transparent"))]
             let allowed = {
                 let _ = input_index;
                 false
@@ -363,7 +363,7 @@ impl Storage {
             if !zakura_consensus::transaction::check::are_inputs_standard_with_wots(
                 transaction,
                 spent_outputs,
-                cfg!(feature = "experimental-wots"),
+                cfg!(feature = "experimental-pq-transparent"),
             ) {
                 return self
                     .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);

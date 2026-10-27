@@ -1648,9 +1648,9 @@ where
         ..
     } = params;
 
-    if experimental_wots_activation_height.is_some() && !cfg!(feature = "experimental-wots") {
+    if experimental_wots_activation_height.is_some() && !cfg!(feature = "experimental-pq-transparent") {
         return Err(de::Error::custom(
-            "experimental WOTS requires the experimental-wots build feature",
+            "experimental WOTS requires the experimental-pq-transparent build feature",
         ));
     }
     if inherit_activation_heights.is_some() {

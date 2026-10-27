@@ -226,19 +226,64 @@ fn transactions_match_header(block: &block::Block) -> bool {
     root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
 
-/// Whether a routine accepts a decoded body for `requested` at `height`: the
-/// coinbase height check and the transaction check on frame receipt, then the
-/// requested-hash check in `handle_body`. Controlled storage runs fixture
-/// bodies through these checks.
+/// Why a routine rejects a decoded body when its frame arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameBodyReject {
+    /// Its coinbase height isn't the height its frame was authorized for.
+    CoinbaseHeight,
+    /// Its transactions aren't the ones its header commits to.
+    Transactions,
+}
+
+/// The checks a routine runs, in order, on a body decoded from a frame
+/// authorized for `height`.
+#[inline]
+fn check_frame_body(block: &block::Block, height: block::Height) -> Result<(), FrameBodyReject> {
+    if block.coinbase_height() != Some(height) {
+        return Err(FrameBodyReject::CoinbaseHeight);
+    }
+    if !transactions_match_header(block) {
+        return Err(FrameBodyReject::Transactions);
+    }
+    Ok(())
+}
+
+/// Why a routine rejects a body whose hash isn't the one its outstanding
+/// request expects at the body's height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestedHashReject {
+    /// The request expects this other hash.
+    Mismatch(block::Hash),
+    /// The request expects no body at that height.
+    Unrequested,
+}
+
+/// Checks a body's hash `delivered` against `expected`, the hash its
+/// outstanding request expects at the body's height, if any.
+#[inline]
+fn check_requested_hash(
+    expected: Option<block::Hash>,
+    delivered: block::Hash,
+) -> Result<(), RequestedHashReject> {
+    match expected {
+        Some(requested) if requested != delivered => Err(RequestedHashReject::Mismatch(requested)),
+        Some(_) => Ok(()),
+        None => Err(RequestedHashReject::Unrequested),
+    }
+}
+
+/// Whether a routine accepts a decoded body from a frame authorized for
+/// `height`, when its outstanding request expects `expected` there: the
+/// checks on frame receipt, then the requested-hash check in
+/// `handle_body`. Controlled storage runs fixture bodies through these
+/// checks.
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub fn routine_accepts_body(
     block: &block::Block,
     height: block::Height,
-    requested: block::Hash,
+    expected: Option<block::Hash>,
 ) -> bool {
-    block.coinbase_height() == Some(height)
-        && transactions_match_header(block)
-        && block.hash() == requested
+    check_frame_body(block, height).is_ok() && check_requested_hash(expected, block.hash()).is_ok()
 }
 
 fn header_hash_payload_mismatch(
@@ -829,21 +874,24 @@ impl PeerRoutine {
             }
         };
         self.trace_message_received("block");
-        if block.coinbase_height() != Some(height) {
-            return Err(SinkReject::protocol(
-                "authorized block has a different coinbase height",
-            ));
-        }
-        if !transactions_match_header(&block) {
-            let _ = self
-                .routine_to_reactor
-                .try_send(RoutineToReactor::Misbehavior {
-                    peer: self.peer.clone(),
-                    reason: BlockSyncMisbehavior::InvalidBlock,
-                });
-            return Err(SinkReject::protocol(
-                "authorized block's transactions do not match its header",
-            ));
+        match check_frame_body(&block, height) {
+            Ok(()) => {}
+            Err(FrameBodyReject::CoinbaseHeight) => {
+                return Err(SinkReject::protocol(
+                    "authorized block has a different coinbase height",
+                ));
+            }
+            Err(FrameBodyReject::Transactions) => {
+                let _ = self
+                    .routine_to_reactor
+                    .try_send(RoutineToReactor::Misbehavior {
+                        peer: self.peer.clone(),
+                        reason: BlockSyncMisbehavior::InvalidBlock,
+                    });
+                return Err(SinkReject::protocol(
+                    "authorized block's transactions do not match its header",
+                ));
+            }
         }
         self.trace_wake("own_body");
         self.handle_body(
@@ -1957,8 +2005,9 @@ impl PeerRoutine {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
         }
-        match outstanding.request.expected_hash(height) {
-            Some(requested) if requested != hash => {
+        match check_requested_hash(outstanding.request.expected_hash(height), hash) {
+            Ok(()) => {}
+            Err(RequestedHashReject::Mismatch(requested)) => {
                 let mismatch = header_hash_payload_mismatch(
                     outstanding.request.owner,
                     self.source,
@@ -1969,8 +2018,7 @@ impl PeerRoutine {
                     .await;
                 return;
             }
-            Some(_) => {}
-            None => {
+            Err(RequestedHashReject::Unrequested) => {
                 self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
                     .await;
                 return;

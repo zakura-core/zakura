@@ -32,7 +32,7 @@ use zakura_storage::{
             ResultIdentity, ViewModel, ViewViolation,
         },
         fixture::{BlockFixture, BodySpec, FixtureBlock},
-        ApplyLimits, BlockOutcome, HandleEvent, RetryKind, Verdict,
+        ApplyClass, ApplyLimits, BlockOutcome, HandleEvent, RetryKind, Verdict,
     },
     header::adapter::EnginePort,
 };
@@ -156,7 +156,7 @@ impl Harness {
             expected_version: version,
             invalid: ConsensusBodyInvalid {
                 hash: block.hash(),
-                evidence: EvidenceId::from_digest([9; 32]),
+                evidence: EvidenceId::from_digest(block.hash().0),
                 rule: BodyRuleId::new("block.subsidy"),
                 source: SourceId::from_digest([7; 32]),
             },
@@ -417,6 +417,7 @@ fn the_driver_takes_nothing_while_it_awaits_a_record() {
     let record = harness.record_invalid(&blocks[1]);
     let submission = harness.submit_action(&blocks[1].block);
     let query = harness.query_action(1, 16);
+    let query_identity = RequestIdentity::of_action(&query, ApplyClass::Full);
     harness.inbox.extend([submission, query]);
     let model = harness.model.clone();
     let facts = harness.service.take_facts();
@@ -437,11 +438,7 @@ fn the_driver_takes_nothing_while_it_awaits_a_record() {
         at: last.at,
         kind: FactKind::Submitted {
             id: OpId(3),
-            request: RequestIdentity::Query {
-                query_id: query_id(1),
-                from: block::Height(1),
-                limit: 16,
-            },
+            request: query_identity,
             stage: Some(zakura_storage::block::Stage::Pending),
         },
     };
@@ -491,8 +488,14 @@ fn a_blocked_driver_takes_the_later_record_before_the_coalesced_query() {
             facts.as_slice(),
             [
                 FactKind::Coalesced { query_id: coalesced },
+                FactKind::Deferred { queue },
                 FactKind::Submitted { request: RequestIdentity::Record { hash, .. }, .. },
-            ] if *coalesced == query_id(1) && *hash == blocks[2].hash()
+            ] if *coalesced == query_id(1)
+                && *hash == blocks[2].hash()
+                && matches!(
+                    queue.as_slice(),
+                    [RequestIdentity::Query { query_id: deferred, .. }] if *deferred == query_id(2)
+                )
         ),
         "{facts:?}"
     );
@@ -503,14 +506,15 @@ fn a_blocked_driver_takes_the_later_record_before_the_coalesced_query() {
     let Taken::Op(query) = harness.take() else {
         panic!("the driver takes the deferred query");
     };
-    assert_eq!(
+    assert!(matches!(
         harness.request(query),
         RequestIdentity::Query {
-            query_id: query_id(2),
+            query_id,
             from: block::Height(1),
             limit: 16,
-        }
-    );
+            ..
+        } if query_id == self::query_id(2)
+    ));
     harness.complete(query, BlockOutcome::Answer);
     let replies = harness.replies.take();
     let [HandleEvent::NeededBlocks {
@@ -549,8 +553,14 @@ fn a_taken_query_folds_in_a_later_query_and_defers_a_record() {
             facts.as_slice(),
             [
                 FactKind::Coalesced { query_id: coalesced },
+                FactKind::Deferred { queue },
                 FactKind::Submitted { request: RequestIdentity::Query { query_id: taken, .. }, .. },
-            ] if *coalesced == query_id(1) && *taken == query_id(2)
+            ] if *coalesced == query_id(1)
+                && *taken == query_id(2)
+                && matches!(
+                    queue.as_slice(),
+                    [RequestIdentity::Record { hash, .. }] if *hash == blocks[1].hash()
+                )
         ),
         "{facts:?}"
     );
@@ -986,7 +996,7 @@ fn a_query_reply_for_a_closed_handle_ends_the_driver() {
     assert!(
         matches!(
             facts.last(),
-            Some(FactKind::DriverExited { dropped }) if *dropped == [queued]
+            Some(FactKind::DriverExited { dropped, deferred }) if *dropped == [queued] && deferred.is_empty()
         ),
         "{facts:?}"
     );
@@ -1114,7 +1124,7 @@ fn shutdown_drops_everything_and_the_model_catches_a_gap() {
     let facts = harness.facts();
     assert!(matches!(
         facts.last(),
-        Some(FactKind::ShutDown { dropped }) if dropped.len() == 2
+        Some(FactKind::ShutDown { dropped, deferred }) if dropped.len() == 2 && deferred.is_empty()
     ));
     assert!(harness.service.owner_state().operations.is_empty());
     assert_eq!(Arc::strong_count(&block), 2, "shutdown released the block");
@@ -1244,4 +1254,231 @@ async fn the_intake_task_drops_its_channel_when_the_driver_exits() {
         .expect("the task doesn't panic");
     let late = harness.query_action(1, 4);
     assert!(sender.send(late).await.is_err(), "the channel is closed");
+}
+
+/// ST4.3: a reset the engine stalls on its resource limits installs only
+/// the stall alarm, reports no verified-chain change, keeps the body-work
+/// epoch, and replies with a `Storage` retry, which the owner model
+/// accepts.
+#[test]
+fn a_stalled_reset_completes_as_a_storage_retry() {
+    let fixture = BlockFixture::regtest();
+    let engine = EnginePort::new(fixture.headers())
+        .with_max_non_finalized_nodes(NonZeroUsize::new(1).expect("1 is nonzero"));
+    let mut harness = Harness::over(fixture, engine);
+    let anchor = harness.fixture.anchor();
+    // A's header goes to the engine with its commit, past a one-node graph.
+    let a = harness.fixture.block(anchor, 0, BodySpec::exact(900));
+    let b = harness.chain(anchor, &[BodySpec::exact(900)], 1).remove(0);
+    let first = harness.submit(&a);
+    let second = harness.submit(&b);
+    harness.complete(first, BlockOutcome::Admit);
+    harness.complete(second, BlockOutcome::Admit);
+    harness.complete(second, COMMITTED);
+    let epoch = harness.engine.view().body_work_epoch;
+
+    // A was received first, so its commit would reset to it.
+    let completion = harness
+        .service
+        .complete(first, COMMITTED)
+        .expect("a stall is a verdict");
+    assert!(matches!(
+        completion.result,
+        ResultIdentity::Verdict {
+            verdict: Verdict::Retryable(RetryKind::Storage),
+            ..
+        }
+    ));
+    let facts = harness.facts();
+    assert!(
+        facts.iter().any(|kind| matches!(
+            kind,
+            FactKind::TransitionInstalled {
+                cause: None,
+                invalidates_body_work: false,
+                ..
+            }
+        )),
+        "{facts:?}"
+    );
+    assert_eq!(harness.engine.view().body_work_epoch, epoch);
+    assert_eq!(
+        harness.engine.snapshot().frontiers.verified_best,
+        b.frontier()
+    );
+}
+
+/// ST4.3: overlapping admissions of one body share the first one's
+/// receipt, as zakura-consensus's receipt registry does. A was admitted
+/// before B, so A's second delivery, admitted after B committed, still wins
+/// the equal-work tie and resets the verified chain to A.
+#[test]
+fn overlapping_admissions_of_a_body_share_its_receipt() {
+    let mut harness = Harness::new();
+    let anchor = harness.fixture.anchor();
+    let a = harness.chain(anchor, &[BodySpec::exact(900)], 0).remove(0);
+    let b = harness.chain(anchor, &[BodySpec::exact(900)], 1).remove(0);
+    let first = harness.submit(&a);
+    let other = harness.submit(&b);
+    let again = harness.submit(&a);
+    harness.complete(first, BlockOutcome::Admit);
+    harness.complete(other, BlockOutcome::Admit);
+    harness.complete(other, COMMITTED);
+    assert_eq!(
+        harness.engine.snapshot().frontiers.verified_best,
+        b.frontier()
+    );
+    // The first delivery is still at the verifier.
+    harness.complete(again, BlockOutcome::Admit);
+    harness
+        .service
+        .complete(again, COMMITTED)
+        .expect("the parent is committed");
+    assert!(harness.facts().iter().any(|kind| matches!(
+        kind,
+        FactKind::TransitionInstalled {
+            cause: Some(VerifiedChangeCause::Reset),
+            ..
+        }
+    )));
+    assert_eq!(
+        harness.engine.snapshot().frontiers.verified_best,
+        a.frontier()
+    );
+}
+
+/// ST4.3: the actions the driver defers hold their blocks, so the owner
+/// state lists them, a step that changes them publishes them, and the
+/// driver's exit drops them. The owner model rejects a deferred queue that
+/// differs from the service's.
+#[test]
+fn deferred_actions_are_owner_state() {
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+    let block = blocks[0].block.clone();
+    let query = harness.query_action(1, 4);
+    let submission = harness.submit_action(&block);
+    let deferred = vec![RequestIdentity::of_action(&submission, ApplyClass::Full)];
+    // The driver received the query from an empty channel, and the
+    // submission arrived behind it.
+    harness.inbox.push_back(submission);
+    let Taken::Op(query) = harness.service.take_received(query, &mut harness.inbox) else {
+        panic!("the driver takes the query");
+    };
+    assert_eq!(harness.service.owner_state().deferred, deferred);
+    assert_eq!(
+        Arc::strong_count(&block),
+        3,
+        "the deferred action holds the block"
+    );
+    let facts = harness.service.take_facts();
+    assert!(facts.iter().any(|fact| fact.kind
+        == FactKind::Deferred {
+            queue: deferred.clone()
+        }));
+    let mut forged = facts.clone();
+    for fact in &mut forged {
+        if let FactKind::Deferred { queue } = &mut fact.kind {
+            queue.clear();
+        }
+    }
+    assert_eq!(
+        harness
+            .model
+            .clone()
+            .check_boundary(&forged, &harness.service.owner_state()),
+        Err(ModelFailure::Mismatch)
+    );
+    harness
+        .model
+        .check_boundary(&facts, &harness.service.owner_state())
+        .expect("the model follows the real facts");
+
+    harness.replies.close();
+    harness
+        .service
+        .complete(query, BlockOutcome::Answer)
+        .expect("the query is pending");
+    let facts = harness.facts();
+    assert!(
+        matches!(
+            facts.last(),
+            Some(FactKind::DriverExited { deferred: dropped, .. }) if *dropped == deferred
+        ),
+        "{facts:?}"
+    );
+    assert!(harness.service.owner_state().deferred.is_empty());
+    assert_eq!(Arc::strong_count(&block), 2, "the exit released the block");
+}
+
+/// ST4.3: the driver takes no verdict while it awaits a query, so the
+/// service refuses one then, and the owner model rejects a verdict
+/// published then.
+#[test]
+fn no_verdict_completes_while_the_driver_awaits() {
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+    let id = harness.submit(&blocks[0]);
+    harness.complete(id, BlockOutcome::Admit);
+    harness.query(1, 4);
+    let facts = harness.service.take_facts();
+    harness
+        .model
+        .check_boundary(&facts, &harness.service.owner_state())
+        .expect("the model follows the real facts");
+    let last = facts.last().expect("taking the query publishes").clone();
+    assert!(harness.enabled(id).is_empty());
+    assert!(matches!(
+        harness.service.complete(id, COMMITTED),
+        Err(CompleteError::Illegal(_))
+    ));
+
+    let invalid = BlockOutcome::Verdict(Verdict::ConsensusInvalid);
+    let state_version = harness.engine.snapshot().state_version;
+    let (seq, last_txn) = (last.seq, last.txn);
+    let completion = Completion {
+        txn: last_txn + 1,
+        id,
+        op: zakura_storage::block::BlockOp::SubmitBlock,
+        request: harness.request(id),
+        outcome: invalid,
+        result: ResultIdentity::Verdict {
+            verdict: Verdict::ConsensusInvalid,
+            result: BlockApplyResult::Rejected,
+        },
+        delivered: true,
+        state_version,
+    };
+    let at = last.at;
+    let published = [
+        Fact {
+            seq: seq + 1,
+            txn: last_txn + 1,
+            at,
+            kind: FactKind::ReplyDelivered { id },
+        },
+        Fact {
+            seq: seq + 2,
+            txn: last_txn + 1,
+            at,
+            kind: FactKind::Completed(Box::new(completion)),
+        },
+    ];
+    assert_eq!(
+        harness.model.clone().apply(&published),
+        Err(ModelFailure::UnexpectedHead { txn: last_txn + 1 })
+    );
+}
+
+/// ST4.5: a `record_body_invalid` that isn't durable is where the driver
+/// fails closed, which the contract excludes, so the service panics.
+#[test]
+#[should_panic(expected = "where the driver fails closed")]
+fn a_record_the_driver_would_fail_closed_on_panics() {
+    let mut harness = Harness::new();
+    let anchor = harness.fixture.anchor();
+    // The engine has no header for this body.
+    let unknown = harness.fixture.block(anchor, 3, BodySpec::exact(900));
+    let record = harness.record_invalid(&unknown);
+    harness.service.complete(record, BlockOutcome::Apply).ok();
 }

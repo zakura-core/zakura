@@ -16,7 +16,9 @@
 //! step waits for the channel. When the step takes a query,
 //! `coalesce_stale_needed_block_queries` drains the channel: a later query
 //! replaces it, and every other action is deferred. A replaced query gets no
-//! reply, and the step publishes a [`FactKind::Coalesced`] fact for it.
+//! reply, and the step publishes a [`FactKind::Coalesced`] fact for it. A
+//! step that changes the deferred actions publishes them in a
+//! [`FactKind::Deferred`] fact.
 //!
 //! The driver awaits each query and record before it takes its next action,
 //! so the service takes no action while one is pending, and the action
@@ -36,7 +38,9 @@
 //! transaction. It's the operation's linearization point, as the contract in
 //! [`super`] says. Only the verifier is modeled: the run picks each verdict.
 //! The verifier receives a body when the run admits it, which fixes the
-//! body's receipt order. A commit the engine finds stale or stalls on its
+//! body's receipt order. Overlapping admissions of the same body share the
+//! first one's receipt, as zakura-consensus's `ReceiptRegistry` does. A
+//! commit the engine finds stale or stalls on its
 //! resource limits commits nothing, and its reply reports a `Storage` retry,
 //! as zakura-state's `HeaderChainError` does.
 //!
@@ -57,6 +61,16 @@
 //! way, and keeps serving range reads, which zakura-state serves without the
 //! driver. [`ControlledBlockService::shut_down`] ends the run: it drops
 //! every operation, reads included, and closes the view watch.
+//!
+//! The driver's exit drops its admitted bodies here, so none of them
+//! commits. Production's verifier keeps each apply it received and may
+//! still commit it after the driver returns; the contract leaves that
+//! commit out.
+//!
+//! A `record_body_invalid` that isn't durable after its stale refreshes,
+//! because the engine stalls it, refuses it, or still finds it stale, is
+//! where the driver fails closed and shuts down. The contract excludes
+//! that shutdown, so the service panics there.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -158,6 +172,12 @@ pub enum FactKind {
         /// The dropped query.
         query_id: NonZeroU64,
     },
+    /// The step that took an action left these deferred actions, oldest
+    /// first, in place of the ones before it.
+    Deferred {
+        /// The deferred actions.
+        queue: Vec<RequestIdentity>,
+    },
     /// The engine installed a transition. Read from the engine, apart from
     /// the view.
     TransitionInstalled {
@@ -219,15 +239,19 @@ pub enum FactKind {
         id: OpId,
     },
     /// Head: a query's reply found the handle closed, so the driver
-    /// returned, dropping every action operation.
+    /// returned, dropping every action operation and deferred action.
     DriverExited {
         /// The operations it dropped.
         dropped: Vec<OpId>,
+        /// The deferred actions it dropped, oldest first.
+        deferred: Vec<RequestIdentity>,
     },
     /// Head: the service shut down.
     ShutDown {
         /// The operations it dropped.
         dropped: Vec<OpId>,
+        /// The deferred actions it dropped, oldest first.
+        deferred: Vec<RequestIdentity>,
     },
 }
 
@@ -237,6 +261,7 @@ impl FactKind {
         !matches!(
             self,
             FactKind::Coalesced { .. }
+                | FactKind::Deferred { .. }
                 | FactKind::TransitionInstalled { .. }
                 | FactKind::ViewPublished(_)
                 | FactKind::ReplyDelivered { .. }
@@ -496,15 +521,20 @@ impl Slot {
         )
     }
 
-    /// The block this slot's request holds.
-    fn held_block(&self) -> Option<block::Hash> {
+    /// The submitted block this slot's request holds.
+    fn submitted_block(&self) -> Option<&Arc<block::Block>> {
         match &self.stage {
             SlotStage::Waiting {
                 request: BlockRequest::Action(BlockSyncAction::SubmitBlock { block, .. }),
                 ..
-            } => Some(block.hash()),
+            } => Some(block),
             _ => None,
         }
+    }
+
+    /// The hash of the block this slot's request holds.
+    fn held_block(&self) -> Option<block::Hash> {
+        self.submitted_block().map(|block| block.hash())
     }
 }
 
@@ -801,6 +831,7 @@ impl ControlledBlockService {
             }
             mem::take(&mut ops.deferred)
         };
+        let before = deferred_identities(&deferred, &self.inner.limits);
         // The channel is read outside the lock, since a channel operation
         // can be a scheduling point.
         let mut coalesced = Vec::new();
@@ -810,7 +841,7 @@ impl ControlledBlockService {
         };
         let action =
             action.map(|action| coalesce_stale(action, &mut deferred, inbox, &mut coalesced));
-        self.take(action, deferred, coalesced)
+        self.take(action, before, deferred, coalesced)
     }
 
     /// Runs the driver's receive branch: the driver waited on an empty
@@ -825,15 +856,18 @@ impl ControlledBlockService {
             }
             mem::take(&mut ops.deferred)
         };
+        let before = deferred_identities(&deferred, &self.inner.limits);
         let mut coalesced = Vec::new();
         let action = coalesce_stale(action, &mut deferred, inbox, &mut coalesced);
-        self.take(Some(action), deferred, coalesced)
+        self.take(Some(action), before, deferred, coalesced)
     }
 
-    /// Records the action a step took, with what it deferred and coalesced.
+    /// Records the action a step took, with what it coalesced and the
+    /// deferred actions it left, which were `before` until the step.
     fn take(
         &self,
         action: Option<BlockSyncAction>,
+        before: Vec<RequestIdentity>,
         deferred: VecDeque<BlockSyncAction>,
         coalesced: Vec<NonZeroU64>,
     ) -> Taken {
@@ -844,18 +878,22 @@ impl ControlledBlockService {
             drop((action, deferred));
             return Taken::Stopped;
         }
+        let queue = deferred_identities(&deferred, &self.inner.limits);
         ops.deferred = deferred;
         let Some(action) = action else {
             debug_assert!(
-                coalesced.is_empty(),
-                "a step coalesces only behind an action"
+                coalesced.is_empty() && queue == before,
+                "a step coalesces and defers only behind an action"
             );
             return Taken::Idle;
         };
-        let kinds = coalesced
+        let mut kinds: Vec<FactKind> = coalesced
             .into_iter()
             .map(|query_id| FactKind::Coalesced { query_id })
             .collect();
+        if queue != before {
+            kinds.push(FactKind::Deferred { queue });
+        }
         Taken::Op(self.insert(&mut ops, BlockRequest::Action(action), None, kinds))
     }
 
@@ -978,7 +1016,18 @@ impl ControlledBlockService {
             op.check(stage, class, &conditions, outcome)
                 .map_err(CompleteError::Illegal)?;
             if outcome == BlockOutcome::Admit {
-                return Ok(self.admit(&mut ops, id, now));
+                let (txn, request) = self.admit(&mut ops, id, now);
+                drop(ops);
+                return Ok(Completion {
+                    txn,
+                    id,
+                    op: BlockOp::SubmitBlock,
+                    request,
+                    outcome,
+                    result: ResultIdentity::Admitted,
+                    delivered: false,
+                    state_version: self.inner.engine.snapshot().state_version,
+                });
             }
             let slot = ops.slots.get_mut(&id).expect("the stage was read above");
             let SlotStage::Waiting { request, .. } =
@@ -1038,7 +1087,7 @@ impl ControlledBlockService {
             completion.txn = txn;
             FactKind::Completed(Box::new(completion.clone()))
         });
-        let exited = exits.then(|| exit_driver(&mut ops, now));
+        let exited = exits.then(|| exit_driver(&mut ops, &self.inner.limits, now));
         // The driver takes its next action once it stops awaiting this one.
         let intake = op.awaited().then(|| ops.intake.take()).flatten();
         drop(ops);
@@ -1055,19 +1104,32 @@ impl ControlledBlockService {
     /// Admits queued submission `id`, which the verifier receives now, and
     /// publishes its transaction, marking each older admitted submission of
     /// the same hash replaced, as full state's queue replaces a queued block
-    /// with a newer copy.
-    fn admit(&self, ops: &mut Ops, id: OpId, now: Instant) -> Completion {
+    /// with a newer copy. Returns the transaction and the submission's
+    /// identity.
+    fn admit(&self, ops: &mut Ops, id: OpId, now: Instant) -> (u64, RequestIdentity) {
         let hash = ops.slots[&id].identity.submitted_hash();
+        let block = ops.slots[&id].submitted_block().cloned();
+        // An admitted body still at the verifier lends its receipt to
+        // another delivery of the same body.
+        let mut shared = None;
         for (_, other) in ops.slots.range_mut(..id) {
             if other.admitted() && other.identity.submitted_hash() == hash {
                 other.replaced = true;
+                if shared.is_none() && other.submitted_block() == block.as_ref() {
+                    shared = other.receipt;
+                }
             }
         }
-        ops.last_receipt = ops
-            .last_receipt
-            .checked_add(1)
-            .expect("a run admits fewer than 2^64 bodies");
-        let receipt = ops.last_receipt;
+        let receipt = match shared {
+            Some(receipt) => receipt,
+            None => {
+                ops.last_receipt = ops
+                    .last_receipt
+                    .checked_add(1)
+                    .expect("a run admits fewer than 2^64 bodies");
+                ops.last_receipt
+            }
+        };
         let slot = ops.slots.get_mut(&id).expect("the stage was read above");
         if let SlotStage::Waiting { stage, .. } = &mut slot.stage {
             *stage = Stage::Admitted;
@@ -1075,16 +1137,7 @@ impl ControlledBlockService {
         slot.receipt = Some(receipt);
         let request = slot.identity.clone();
         let txn = ops.publish(now, Vec::new(), |_| FactKind::Admitted { id });
-        Completion {
-            txn,
-            id,
-            op: BlockOp::SubmitBlock,
-            request,
-            outcome: BlockOutcome::Admit,
-            result: ResultIdentity::Admitted,
-            delivered: false,
-            state_version: self.inner.engine.snapshot().state_version,
-        }
+        (txn, request)
     }
 
     /// Runs one completion against full state and the engine, adding its
@@ -1286,7 +1339,18 @@ impl ControlledBlockService {
                 {
                     request.expected_version = current;
                 }
-                _ => return ResultIdentity::Recorded(attempts),
+                _ => {
+                    let durable = matches!(
+                        attempts.last(),
+                        Some(RecordResult::Committed | RecordResult::NoChange)
+                    );
+                    assert!(
+                        !retries_stale || durable,
+                        "record_body_invalid ended {attempts:?}, where the driver fails closed, \
+                         which the block contract excludes"
+                    );
+                    return ResultIdentity::Recorded(attempts);
+                }
             }
         }
     }
@@ -1367,6 +1431,7 @@ impl ControlledBlockService {
                     retained: slot.held_block(),
                 })
                 .collect(),
+            deferred: deferred_identities(&ops.deferred, &self.inner.limits),
         }
     }
 
@@ -1436,7 +1501,11 @@ impl ControlledBlockService {
             }
             let slots = mem::take(&mut ops.slots);
             let dropped = slots.keys().copied().collect();
-            ops.publish(now, Vec::new(), |_| FactKind::ShutDown { dropped });
+            let deferred = deferred_identities(&ops.deferred, &self.inner.limits);
+            ops.publish(now, Vec::new(), |_| FactKind::ShutDown {
+                dropped,
+                deferred,
+            });
             (slots, mem::take(&mut ops.deferred), ops.intake.take())
         };
         // Dropped outside the lock, since a lease's drop wakes serving.
@@ -1507,7 +1576,11 @@ impl ControlledBlockService {
 /// reads, and publishes the exit. Returns what it dropped, for the caller to
 /// drop outside the lock, and leaves the intake's waker for the caller to
 /// wake.
-fn exit_driver(ops: &mut Ops, now: Instant) -> (Vec<Slot>, VecDeque<BlockSyncAction>) {
+fn exit_driver(
+    ops: &mut Ops,
+    limits: &ApplyLimits,
+    now: Instant,
+) -> (Vec<Slot>, VecDeque<BlockSyncAction>) {
     ops.exited = true;
     let dropped: Vec<OpId> = ops
         .slots
@@ -1519,8 +1592,33 @@ fn exit_driver(ops: &mut Ops, now: Instant) -> (Vec<Slot>, VecDeque<BlockSyncAct
         .iter()
         .filter_map(|id| ops.slots.remove(id))
         .collect();
-    ops.publish(now, Vec::new(), |_| FactKind::DriverExited { dropped });
+    let deferred = deferred_identities(&ops.deferred, limits);
+    ops.publish(now, Vec::new(), |_| FactKind::DriverExited {
+        dropped,
+        deferred,
+    });
     (slots, mem::take(&mut ops.deferred))
+}
+
+/// The identities of the deferred actions, oldest first.
+fn deferred_identities(
+    deferred: &VecDeque<BlockSyncAction>,
+    limits: &ApplyLimits,
+) -> Vec<RequestIdentity> {
+    deferred
+        .iter()
+        .map(|action| {
+            let class = match action {
+                BlockSyncAction::SubmitBlock { block, .. } => {
+                    block.coinbase_height().map_or(ApplyClass::Full, |height| {
+                        ApplyClass::of(height, limits.max_checkpoint_height)
+                    })
+                }
+                _ => ApplyClass::Full,
+            };
+            RequestIdentity::of_action(action, class)
+        })
+        .collect()
 }
 
 /// Resolves once the driver stops awaiting a query or record, with `true`,

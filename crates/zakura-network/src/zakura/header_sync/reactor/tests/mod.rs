@@ -3,6 +3,7 @@ mod aux_fallback;
 mod closing;
 mod completion;
 mod eviction;
+mod observer;
 mod peer_faults;
 mod port_panics;
 mod status_offers;

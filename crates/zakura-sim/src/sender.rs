@@ -41,7 +41,7 @@ pub(crate) fn frame(template: Template, obs: &Observation, row: &RowAt) -> Found
     }
     let what = format!("connection {connection}'s {row} frame {seq} from the node");
     let actual = match template {
-        Template::SenderCadence => "it emptied the peer's cadence bucket".to_owned(),
+        Template::SenderCadence => "the peer charged it to an empty cadence bucket".to_owned(),
         _ => format!("the peer's models labelled it {label}"),
     };
     Some(Err(Failure::new(

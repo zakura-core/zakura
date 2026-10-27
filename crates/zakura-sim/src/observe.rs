@@ -97,8 +97,10 @@ pub enum Observation {
         rule_stream: StreamId,
         /// The frame's label.
         label: Label,
-        /// True if the frame emptied its row's cadence bucket. Such a frame
-        /// is still conformant.
+        /// True if charging the frame to its row's cadence bucket found it
+        /// empty: [`crate::model::CadenceModel`]'s charge returned
+        /// [`crate::model::Charge::Exhausted`]. Such a frame is still
+        /// conformant.
         exhausted: bool,
         /// The exchange or subscription the frame belongs to, as the peer's
         /// role models key it: a request's own key, or the key a response,
@@ -129,8 +131,9 @@ pub enum Observation {
         rule_stream: StreamId,
         /// The frame's label.
         label: Label,
-        /// True if the frame emptied its row's cadence bucket in the peer's
-        /// [`crate::model::CadenceModel`].
+        /// True if the peer's [`crate::model::CadenceModel`] charged the
+        /// frame to an empty bucket: its charge returned
+        /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
     },
     /// The node's reader reached the bytes it needs to judge the peer's

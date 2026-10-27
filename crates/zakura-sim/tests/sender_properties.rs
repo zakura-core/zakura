@@ -69,7 +69,7 @@ fn sent(stream: Stream, seq: u64, row: &str, label: Label) -> Observation {
     node_frame(stream, seq, row, label, false)
 }
 
-/// A conformant frame of `row` that emptied its cadence bucket.
+/// A conformant frame of `row` charged to an empty cadence bucket.
 fn exhausting(stream: Stream, seq: u64, row: &str) -> Observation {
     node_frame(stream, seq, row, Label::Conformant, true)
 }
@@ -234,8 +234,9 @@ fn subscription_frames_fail_under_their_subscription_row() {
     assert!(held(&credit, LIVE));
 }
 
-/// A frame that empties the peer's cadence bucket breaks `sender-cadence`
-/// for its row only, though the peer still labels it conformant.
+/// A frame charged to the peer's empty cadence bucket breaks
+/// `sender-cadence` for its row only, though the peer still labels it
+/// conformant.
 #[test]
 fn emptying_the_cadence_bucket_fails() {
     let report = run_script(vec![

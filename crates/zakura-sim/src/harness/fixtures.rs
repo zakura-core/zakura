@@ -14,7 +14,7 @@
 
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::{poll_fn, Future},
     pin::pin,
     rc::Rc,
@@ -216,6 +216,9 @@ struct Ran<'a> {
     from: Option<&'a str>,
     /// The point each live task last stopped at before the step, by task.
     stopped: &'a BTreeMap<String, String>,
+    /// The live tasks whose last poll returned `Pending`, so their next run
+    /// starts a new poll.
+    waiting: &'a BTreeSet<String>,
 }
 
 impl Ran<'_> {
@@ -227,6 +230,11 @@ impl Ran<'_> {
     /// The point `task` last stopped at before the step, if it is live.
     fn stopped_at(&self, task: &str) -> Option<&str> {
         self.stopped.get(task).map(String::as_str)
+    }
+
+    /// True if `task`'s last poll returned `Pending` before the step.
+    fn waiting(&self, task: &str) -> bool {
+        self.waiting.contains(task)
     }
 }
 
@@ -240,6 +248,7 @@ fn some_step(log: &ObservationLog, mut trigger: impl FnMut(&Ran<'_>) -> bool) ->
     let entries = log.entries();
     let start = entries.partition_point(|e| e.step == 0);
     let mut stopped = BTreeMap::new();
+    let mut waiting = BTreeSet::new();
     for step in entries[start..].chunk_by(|a, b| a.step == b.step) {
         let Some(task) = step.iter().find_map(|e| e.obs.ran_task()) else {
             continue;
@@ -249,6 +258,7 @@ fn some_step(log: &ObservationLog, mut trigger: impl FnMut(&Ran<'_>) -> bool) ->
             task,
             from: stopped.get(task).map(String::as_str),
             stopped: &stopped,
+            waiting: &waiting,
         };
         if trigger(&ran) {
             return true;
@@ -257,9 +267,14 @@ fn some_step(log: &ObservationLog, mut trigger: impl FnMut(&Ran<'_>) -> bool) ->
             match &entry.obs {
                 Observation::TaskReached { at, .. } => {
                     stopped.insert(task.to_owned(), at.clone());
+                    waiting.remove(task);
+                }
+                Observation::TaskWaiting { .. } => {
+                    waiting.insert(task.to_owned());
                 }
                 Observation::TaskExited { .. } => {
                     stopped.remove(task);
+                    waiting.remove(task);
                 }
                 _ => {}
             }
@@ -384,13 +399,17 @@ impl Fixture for SnapshotReserve {
         (left < 0).then(|| format!("over-committed: available = {left}"))
     }
 
-    /// One task takes its first lock while the other has taken its own and
-    /// hasn't finished: with the race, it checks the capacity before the
-    /// other reserves; with the fix, it waits for the other's reservation.
+    /// One task takes its first lock right after the other's first critical
+    /// section, before the other's second. A critical section runs whole in
+    /// the step that takes its lock, and the task stops at its release
+    /// after unlocking. With the race, the other passed its check and hasn't
+    /// reserved, so this check sees capacity the other will take. With the
+    /// fix, the other's one critical section checked and reserved.
     fn trigger_history(log: &ObservationLog) -> bool {
         some_step(log, |ran| {
             let other = other(ran.task, ("res_a", "res_b"));
-            ran.from == Some("lock#1") && ran.stopped_at(other).is_some_and(|at| at != "lock#1")
+            ran.from == Some("lock#1")
+                && matches!(ran.stopped_at(other), Some("release#1" | "lock#2"))
         })
     }
 }
@@ -448,17 +467,20 @@ impl Fixture for MissedNotify {
         timed_out.then(|| "the waiter missed the notification".to_owned())
     }
 
-    /// The marker notifies while the waiter has run one of its flag check
-    /// and its `notified`, but not the other: with the race, between the
-    /// check and the registration; with the fix, between the registration
-    /// and the check.
+    /// The marker notifies while the waiter is live and has run one of its
+    /// flag check and its `notified`, but not the other: with the race,
+    /// between a failed check and the registration; with the fix, between
+    /// the registration and the check. A waiter whose check sees the flag
+    /// exits in the same step, so a live waiter's check failed.
     fn trigger_history(log: &ObservationLog) -> bool {
         let (mut checked, mut registered) = (false, false);
         some_step(log, |ran| {
             match ran.task {
                 "waiter" if ran.ran_kind("load") => checked = true,
                 "waiter" if ran.ran_kind("notified") => registered = true,
-                "marker" if ran.ran_kind("notify") => return checked != registered,
+                "marker" if ran.ran_kind("notify") => {
+                    return checked != registered && ran.stopped_at("waiter").is_some()
+                }
                 _ => {}
             }
             false
@@ -549,11 +571,13 @@ impl Fixture for TimerCancel {
         bad.then(|| "timeout chosen after cancel".to_owned())
     }
 
-    /// The closer cancels before the timer's select decides. The timer
-    /// exits in the step that decides, so it is live until then.
+    /// The closer cancels while the timer waits between polls of its
+    /// select, so the timer's next poll starts after the cancel and reads it
+    /// as first. Both are due at 10 ms, so that poll decides. A cancel
+    /// inside a poll, or before the timer's first poll, misses the window.
     fn trigger_history(log: &ObservationLog) -> bool {
         some_step(log, |ran| {
-            ran.task == "closer" && ran.ran_kind("cancel") && ran.stopped_at("timer").is_some()
+            ran.task == "closer" && ran.ran_kind("cancel") && ran.waiting("timer")
         })
     }
 }
@@ -668,11 +692,21 @@ impl Fixture for AbortWithoutJoin {
         bad.then(|| "the aborted task still held its resource".to_owned())
     }
 
-    /// The aborter aborts the worker while the worker still holds its
-    /// resource.
+    /// The aborter's first run after its abort finds the worker live, or
+    /// follows a join that waited for the worker to unwind: with the race,
+    /// it checks the resource before the worker unwinds; with the fix, its
+    /// join waits for the unwind.
     fn trigger_history(log: &ObservationLog) -> bool {
+        let mut aborted = false;
         some_step(log, |ran| {
-            ran.task == "aborter" && ran.ran_kind("abort") && ran.stopped_at("worker").is_some()
+            if ran.task != "aborter" {
+                return false;
+            }
+            if aborted {
+                return ran.stopped_at("worker").is_some() || ran.waiting("aborter");
+            }
+            aborted = ran.ran_kind("abort");
+            false
         })
     }
 }

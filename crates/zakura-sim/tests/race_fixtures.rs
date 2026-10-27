@@ -202,3 +202,60 @@ fn serialized_increments_lose_the_trigger_history() {
         Err(WitnessError::LostTriggerHistory)
     );
 }
+
+/// `F` under the planted race on `plan` holds without reaching the trigger
+/// history, so its witness test fails.
+fn harmless_history<F: Fixture>(plan: PlanInput) {
+    let report = run::<F>(Variant::Base, 2, plan.clone());
+    assert_eq!(report.end.violation, None, "{}", F::NAME);
+    let scenario: WitnessScenario<Race<F>> = WitnessScenario {
+        scenario: Scenario {
+            variant: Variant::Base,
+            workers: 2,
+        },
+        input: plan,
+    };
+    assert_eq!(
+        witness(scenario, F::NAME, Expect::Holds),
+        Err(WitnessError::LostTriggerHistory),
+        "{}",
+        F::NAME
+    );
+}
+
+/// The marker stores the flag before the waiter checks it, so the waiter
+/// exits before the notification.
+#[test]
+fn a_waiter_that_saw_the_flag_misses_the_trigger() {
+    harmless_history::<MissedNotify>(Plan::from_fuzz(&[]));
+}
+
+/// One task reserves before the other checks, so the check sees no
+/// capacity.
+#[test]
+fn a_check_after_the_reservation_misses_the_trigger() {
+    let plan = inputs(5, 64).pop().expect("five inputs");
+    harmless_history::<SnapshotReserve>(plan);
+}
+
+/// The cancel lands inside the timer's deciding poll, after the poll read
+/// the token.
+#[test]
+fn a_cancel_inside_the_deciding_poll_misses_the_trigger() {
+    harmless_history::<TimerCancel>(Plan::from_fuzz(&[]));
+}
+
+/// The worker unwinds before the aborter checks the resource.
+#[test]
+fn an_unwind_before_the_check_misses_the_trigger() {
+    let plan = inputs(20, 64)
+        .into_iter()
+        .find(|plan| {
+            run::<AbortWithoutJoin>(Variant::Base, 2, plan.clone())
+                .end
+                .violation
+                .is_none()
+        })
+        .expect("some input unwinds the worker first");
+    harmless_history::<AbortWithoutJoin>(plan);
+}

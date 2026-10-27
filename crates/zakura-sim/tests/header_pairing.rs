@@ -6,7 +6,13 @@
 
 mod support;
 
-use std::{rc::Rc, sync::Arc};
+use std::{
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use support::{inputs, run};
 use zakura_chain::block;
@@ -16,6 +22,7 @@ use zakura_node_services::header_chain::{
     Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
     ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
+use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -29,7 +36,8 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest},
-    HarnessFailure, MemorySink, Observation, PlanInput, RunReport,
+    ActionSource, Boundary, HarnessFailure, Identity, MemorySink, Observation, ObservationLog,
+    PlanInput, RunReport,
 };
 use zakura_storage::header::{
     adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture,
@@ -149,6 +157,8 @@ enum PanicAt {
 struct PanickingPort {
     inner: Arc<ControlledPort>,
     at: PanicAt,
+    /// Set just before an apply panics.
+    panicking: Arc<AtomicBool>,
 }
 
 impl Port for PanickingPort {
@@ -204,9 +214,11 @@ impl Port for PanickingPort {
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
         Box::pin(async move {
             if self.at == PanicAt::BeforeDelegating {
+                self.panicking.store(true, Ordering::Relaxed);
                 panic!("the test port panics before delegating its apply");
             }
             let _reply = self.inner.apply_header_target(target).await;
+            self.panicking.store(true, Ordering::Relaxed);
             panic!("the test port panics after taking its apply's reply");
         })
     }
@@ -223,11 +235,33 @@ impl Port for PanickingPort {
     }
 }
 
+/// A source, added before Nora's, whose observation fails from the step an
+/// apply panics on.
+struct FailsOnPanic(Arc<AtomicBool>);
+
+impl ActionSource for FailsOnPanic {
+    fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        unreachable!("it offers no actions");
+    }
+
+    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
+        match self.0.load(Ordering::Relaxed) {
+            true => Err("EarlierFailure: a source before Nora's failed".to_owned()),
+            false => Ok(()),
+        }
+    }
+}
+
 /// Nora at genesis, tapped, syncing from Mira at A5 through a
 /// [`PanickingPort`] that panics `at`, converging. With `close`, Nora's
 /// first apply is held until Mira's link has closed and a second has
 /// passed, and the `Plan` may close the link once that apply is submitted.
-fn panic_run(at: PanicAt, close: bool, input: PlanInput) -> RunReport {
+/// With `fail_first`, a [`FailsOnPanic`] source comes before Nora's.
+fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> RunReport {
     let fixture = HeaderFixture::regtest();
     let node = Arc::new(ControlledPort::new(&fixture));
     let mirror = Arc::new(EnginePort::new(&fixture));
@@ -255,11 +289,15 @@ fn panic_run(at: PanicAt, close: bool, input: PlanInput) -> RunReport {
     } else {
         (Vec::new(), Vec::new())
     };
+    let panicking = Arc::new(AtomicBool::new(false));
     let mut topology = None;
     let report = run(
         storage_config(),
         input,
         |sim| {
+            if fail_first {
+                sim.add_source(Box::new(FailsOnPanic(panicking.clone())));
+            }
             let dispatch = DispatchFlag::default();
             let effects = Effects::default();
             let policy = Policy {
@@ -274,6 +312,7 @@ fn panic_run(at: PanicAt, close: bool, input: PlanInput) -> RunReport {
             let port: Arc<dyn Port> = Arc::new(PanickingPort {
                 inner: node.clone(),
                 at,
+                panicking,
             });
             let nodes = vec![
                 HeaderNode::spawn(
@@ -412,15 +451,27 @@ fn panicked(report: &RunReport, submitted: bool) -> Panicked {
 #[test]
 fn port_panic_is_a_harness_failure() {
     for input in inputs(8, 256) {
-        let report = panic_run(PanicAt::BeforeDelegating, false, input.clone());
+        let report = panic_run(PanicAt::BeforeDelegating, false, false, input.clone());
         assert_eq!(panicked(&report, false).owner_retired, None);
-        panicked(&panic_run(PanicAt::AfterReply, false, input), true);
+        panicked(&panic_run(PanicAt::AfterReply, false, false, input), true);
     }
     for input in inputs(32, 256) {
-        let report = panic_run(PanicAt::AfterReply, true, input);
+        let report = panic_run(PanicAt::AfterReply, true, false, input);
         let seen = panicked(&report, true);
         assert!(seen.call > 0);
         assert_eq!(seen.owner_retired.as_deref(), Some("disconnected"));
+    }
+}
+
+/// A port panic outranks another source's observation failure in the same
+/// step, even one that observes before Nora's tap.
+#[test]
+fn port_panic_outranks_an_earlier_sources_failure() {
+    for input in inputs(8, 256) {
+        let report = panic_run(PanicAt::AfterReply, false, true, input.clone());
+        panicked(&report, true);
+        let report = panic_run(PanicAt::BeforeDelegating, false, true, input);
+        panicked(&report, false);
     }
 }
 

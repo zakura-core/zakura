@@ -295,17 +295,24 @@ impl ActionSource for PolicySource {
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let before = log.entries().len();
-        self.storage.observe(log)?;
-        if let Some(tap) = &mut self.tap {
-            // The storage source appends only its own port's facts.
-            tap.storage_facts(log.entries()[before..].iter().filter_map(
-                |entry| match &entry.obs {
-                    Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
-                    _ => None,
-                },
-            ));
-            tap.observe(log)?;
-        }
+        let stored = self.storage.observe(log);
+        // Drained even when storage failed, so a port panic the tap holds
+        // still reaches the run's failure cell and outranks that failure.
+        let tapped = match &mut self.tap {
+            Some(tap) => {
+                // The storage source appends only its own port's facts.
+                tap.storage_facts(log.entries()[before..].iter().filter_map(
+                    |entry| match &entry.obs {
+                        Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
+                        _ => None,
+                    },
+                ));
+                tap.observe(log)
+            }
+            None => Ok(()),
+        };
+        stored?;
+        tapped?;
         let mut predicates = self.predicates.borrow_mut();
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {

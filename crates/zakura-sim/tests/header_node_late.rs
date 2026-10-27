@@ -1,6 +1,7 @@
-//! Late completions for a header-sync node on controlled storage (M4-D):
-//! late and stale replies after a timeout, a session close or a
-//! replacement (M4.3).
+//! Late completions and deadlines for a header-sync node on controlled
+//! storage (M4-D): late and stale replies after a timeout, a session close
+//! or a replacement (M4.3), locator permits held by accepted work (M4.4),
+//! and which calls time out and which wait (M4.5).
 //!
 //! A storage `Completed` only queues a reply, so callback isolation is read
 //! from Nora's reactor tap: the events between a call's `CallEnded` and its
@@ -17,16 +18,25 @@
 
 mod support;
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use support::inputs;
-use zakura_header_chain::Frontier;
+use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
 use zakura_sim::{
     check::after_step,
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
-            Chain, ControlAction, ControlStep, Policy,
+            preload,
+            tap::ReactorTap,
+            Chain, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode, Policy,
+            PolicySource, Topology,
         },
         header_sync::{storage_config, Dialer, MirrorSpec, Ports, Storage, StorageScenario},
         run_prepared, Subsystem,
@@ -34,7 +44,7 @@ use zakura_sim::{
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, StorageResult, WorkOwner},
     Checker, MemorySink, Observation, PlanInput, RunConfig, RunReport, Sim,
 };
-use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
+use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture, Fault, Outcome};
 
 // Harness.
 
@@ -137,10 +147,11 @@ struct Seen {
     leases: usize,
 }
 
-/// Records [`Seen`] for `port` after every step, and the first step each
-/// `Control` action was offered at.
+/// Records [`Seen`] for `port` after every step, each of its pending
+/// operations, and the first step each `Control` action was offered at.
 struct Watch {
     seen: Rc<RefCell<Vec<Seen>>>,
+    pending: Rc<RefCell<Vec<(u64, Duration, zakura_storage::header::controlled::PendingOp)>>>,
     offered: Rc<RefCell<BTreeMap<String, u64>>>,
 }
 
@@ -153,9 +164,14 @@ impl Watch {
         };
         let watch = Watch {
             seen: Rc::new(RefCell::new(vec![seen(&port)])),
+            pending: Rc::default(),
             offered: Rc::default(),
         };
-        let (all, offered) = (watch.seen.clone(), watch.offered.clone());
+        let (all, pending, offered) = (
+            watch.seen.clone(),
+            watch.pending.clone(),
+            watch.offered.clone(),
+        );
         let checker = after_step(move |cx| {
             all.borrow_mut().push(seen(&port));
             for enabled in cx.enabled {
@@ -164,6 +180,10 @@ impl Watch {
                     offered.borrow_mut().entry(identity).or_insert(cx.step);
                 }
             }
+            let at = cx.now.since_start();
+            pending
+                .borrow_mut()
+                .extend(port.pending().into_iter().map(|op| (cx.step, at, op)));
             None
         });
         (watch, checker)
@@ -178,6 +198,17 @@ impl Watch {
     /// `identity`.
     fn first_offered(&self, identity: &str) -> Option<u64> {
         self.offered.borrow().get(identity).copied()
+    }
+
+    /// Operation `id` as each step left it pending, with that step and the
+    /// time then.
+    fn pending(&self, id: u64) -> Vec<(u64, Duration, Vec<Outcome>, bool)> {
+        self.pending
+            .borrow()
+            .iter()
+            .filter(|(_, _, op)| op.id.0 == id)
+            .map(|(step, at, op)| (*step, *at, op.enabled.clone(), op.caller_waiting))
+            .collect()
     }
 }
 
@@ -208,6 +239,14 @@ fn of(kind: OpKind, session: u64) -> Select {
     Select {
         kind: Some(kind),
         session: Some(session),
+        ..Select::default()
+    }
+}
+
+/// Every operation of `kind`.
+fn every(kind: OpKind) -> Select {
+    Select {
+        kind: Some(kind),
         ..Select::default()
     }
 }
@@ -318,6 +357,7 @@ struct Op<'r> {
 struct Done<'r> {
     step: u64,
     seq: u64,
+    at: Duration,
     outcome: &'r str,
     result: &'r StorageResult,
     delivered: bool,
@@ -329,6 +369,7 @@ struct Done<'r> {
 struct Call<'r> {
     kind: OpKind,
     session: u64,
+    port: &'r ReactorCall,
     /// Its `CallEnded`: the index, the storage watermark, how it ended and
     /// its paired operation.
     ended: Option<(usize, u64, &'r str, Option<u64>)>,
@@ -339,6 +380,7 @@ struct Call<'r> {
 #[derive(Clone, Copy, Debug)]
 struct Retirement<'r> {
     index: usize,
+    at: Duration,
     storage_seq: u64,
     session: u64,
     owner: &'r WorkOwner,
@@ -444,6 +486,7 @@ impl<'r> History<'r> {
                     Done {
                         step: line.step,
                         seq,
+                        at: line.at,
                         outcome,
                         result,
                         delivered: *delivered,
@@ -474,6 +517,7 @@ impl<'r> History<'r> {
                         Call {
                             kind,
                             session,
+                            port,
                             ended: None,
                             handled: None,
                         },
@@ -534,7 +578,7 @@ impl<'r> History<'r> {
     /// Every `Retired` event.
     fn retirements(&self) -> Vec<Retirement<'r>> {
         self.events()
-            .filter_map(|(index, _, storage_seq, event)| match event {
+            .filter_map(|(index, line, storage_seq, event)| match event {
                 ReactorFact::Retired {
                     request,
                     phase,
@@ -542,6 +586,7 @@ impl<'r> History<'r> {
                     ..
                 } => Some(Retirement {
                     index,
+                    at: line.at,
                     storage_seq,
                     session: request.session_id,
                     owner: &request.owner,
@@ -597,6 +642,15 @@ fn call_kind(port: &ReactorCall) -> (OpKind, u64) {
         ReactorCall::VctContext { owner, .. } => (OpKind::VctContext, owner.session_id),
         ReactorCall::Prepare { owner, .. } => (OpKind::Prepare, owner.session_id),
         ReactorCall::Apply { owner, .. } => (OpKind::Apply, owner.session_id),
+    }
+}
+
+/// The owner of a prepare or apply request.
+fn owner_of(request: &StorageRequest) -> &WorkOwner {
+    match request {
+        StorageRequest::PrepareHeaderTarget { owner, .. }
+        | StorageRequest::ApplyHeaderTarget { owner, .. } => owner,
+        other => panic!("{other:?} has no header work owner"),
     }
 }
 
@@ -1368,5 +1422,456 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
             .map(|(id, _)| *id)
             .expect("Leo read L2");
         assert!(completions[&read].seq > stale.seq, "L2's read waited");
+    }
+}
+
+// M4.4: locator permits.
+
+/// Seventeen mirrors at distinct height-1 tips give Nora 17 targets, and
+/// every locator is held until its caller has dropped it and 1 ms more, so
+/// the reactor handles every timeout while storage still holds each
+/// permit. Accepted work keeps its permit: some step has 16 locators whose
+/// permits storage holds and whose callers all dropped, and after every
+/// step, the locators submitted after the first caller drop never
+/// outnumber the late completions so far. Some waiting peer's offer is
+/// refused for capacity before the first late completion, and that peer's
+/// later locator is submitted after it, then paired at its own receipt.
+#[test]
+fn locator_permits_wait_for_accepted_work() {
+    let scenario = Budgeted {
+        storage: StorageScenario {
+            node: Chain::default(),
+            mirrors: (1..=17)
+                .map(|branch| MirrorSpec {
+                    name: format!("m{branch}"),
+                    chain: Chain {
+                        main: 0,
+                        fork: Some(Fork { branch, len: 1 }),
+                    },
+                    dialer: Dialer::Mirror,
+                })
+                .collect(),
+            policy: Policy {
+                holds: vec![hold(
+                    every(OpKind::Locator),
+                    // Time moves only once no task is ready, so every timeout
+                    // is handled before the hold opens.
+                    Trigger::All(vec![
+                        Trigger::CallerDropped(Select::held()),
+                        Trigger::VirtualTime(30_001),
+                    ]),
+                    Allow::Engine,
+                    31_000,
+                )],
+                ..Policy::converging()
+            },
+            controls: Vec::new(),
+        },
+        // Two 30 s waves of held locators.
+        budget: 10_000,
+        workers: storage_config().scheduler.workers,
+    };
+    for input in inputs(8, 256) {
+        let (report, ports) = run(&scenario, input);
+        let history = History::new(&report, initial_generation(&ports));
+        let ops = history.ops();
+        let is_locator = |id: &u64| ops.get(id).is_some_and(|op| op.kind == OpKind::Locator);
+
+        // Storage's view, step by step.
+        let (mut held, mut dropped) = (BTreeSet::new(), BTreeSet::new());
+        let (mut first_drop, mut late, mut after_drop) = (None, 0, 0);
+        let mut first_late = None;
+        let mut saturated = false;
+        let facts: Vec<_> = history.facts().collect();
+        for (index, (line, seq, fact)) in facts.iter().enumerate() {
+            match fact {
+                StorageFact::PermitTaken { id } => {
+                    held.insert(*id);
+                }
+                StorageFact::PermitDropped { id } => {
+                    held.remove(id);
+                }
+                StorageFact::CallerDropped { id } if is_locator(id) => {
+                    dropped.insert(*id);
+                    first_drop.get_or_insert(*seq);
+                }
+                StorageFact::Completed {
+                    id,
+                    delivered: false,
+                    ..
+                } if is_locator(id) => {
+                    late += 1;
+                    first_late.get_or_insert(*seq);
+                }
+                StorageFact::Submitted { id, .. } if is_locator(id) && first_drop.is_some() => {
+                    after_drop += 1;
+                }
+                _ => {}
+            }
+            let step_ends = facts
+                .get(index + 1)
+                .is_none_or(|(next, ..)| next.step != line.step);
+            if step_ends {
+                saturated |= held.len() == 16 && held.is_subset(&dropped);
+                assert!(
+                    after_drop <= late,
+                    "step {}: {after_drop} locators submitted after the first timeout, \
+                     {late} late completions",
+                    line.step
+                );
+            }
+        }
+        assert!(saturated, "no step had 16 permits held for dropped callers");
+        let first_late = first_late.expect("a locator completed late");
+
+        let waiting: BTreeSet<&str> = history
+            .events()
+            .filter_map(|(_, _, storage_seq, event)| match event {
+                ReactorFact::OfferWaiting { peer, cause, .. }
+                    if storage_seq < first_late
+                        && matches!(cause.as_str(), "staging-full" | "locator-capacity") =>
+                {
+                    Some(peer.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !waiting.is_empty(),
+            "no offer waited before the first late completion"
+        );
+        let resumed = history.calls().into_values().any(|call| match call {
+            Call {
+                port: ReactorCall::Locator { peer, .. },
+                ended: Some((.., Some(op))),
+                ..
+            } => waiting.contains(peer.as_str()) && ops[&op].seq > first_late,
+            _ => false,
+        });
+        assert!(
+            resumed,
+            "no waiting peer's locator was submitted after the first late completion"
+        );
+    }
+}
+
+// M4.5: which calls time out.
+
+/// Checks that pending operation `id`, submitted at `submitted`, first
+/// offers `timeout` at `dropped`, when its caller dropped it: never before,
+/// and at that step.
+fn timeout_enabled_from(watch: &Watch, id: u64, submitted: Duration, dropped: (u64, Duration)) {
+    let pending = watch.pending(id);
+    let timeout = Outcome::Fault(Fault::Timeout);
+    for (step, at, enabled, _) in &pending {
+        if *at < dropped.1 {
+            assert!(
+                !enabled.contains(&timeout),
+                "timeout offered at step {step}, {:?} after submission",
+                *at - submitted
+            );
+        }
+    }
+    let (.., enabled, waiting) = pending
+        .iter()
+        .find(|(step, ..)| *step == dropped.0)
+        .expect("the operation is still pending when its caller drops");
+    assert!(enabled.contains(&timeout), "{enabled:?}");
+    assert!(!waiting, "and its caller no longer waits");
+}
+
+/// Nora's first locator is held until its caller drops it. The call ends
+/// `timed-out` exactly the startup's 30 s request timeout after the
+/// submission, paired with that `CallerDropped`, and the port offers
+/// `timeout` from that instant, since the adapter's deadline is 30 s too.
+#[test]
+fn locator_times_out_at_the_reactors_30_seconds() {
+    let timeout = request_timeout();
+    assert_eq!(timeout, Duration::from_secs(30));
+    let scenario = nora_and_mira(
+        vec![hold(
+            Select::nth(OpKind::Locator, 1),
+            Trigger::CallerDropped(Select::held()),
+            Allow::Engine,
+            31_000,
+        )],
+        Vec::new(),
+        4_000,
+    );
+    for input in inputs(8, 256) {
+        let ports = Late::prepare(&scenario);
+        let (watch, mut checker) = Watch::new(ports.node.clone());
+        let report = run_on(&scenario, &ports, input, &mut checker);
+        drop(checker);
+        let history = History::new(&report, initial_generation(&ports));
+        let ops = history.ops();
+        let first = nth(&ops, OpKind::Locator, 1).expect("Nora submitted a locator");
+        timed_out_at(&history, &watch, first, ops[&first].at, timeout);
+    }
+}
+
+/// Checks that operation `id`, submitted at `submitted`, ended its call
+/// `timed-out` at its `CallerDropped`, `timeout` after its submission, and
+/// that the port first offered `timeout` then.
+fn timed_out_at(
+    history: &History<'_>,
+    watch: &Watch,
+    id: u64,
+    submitted: Duration,
+    timeout: Duration,
+) {
+    let (_, call) = history.call_of(id).expect("the held call is paired");
+    let (_, storage_seq, end, _) = call.ended.expect("a paired call ended");
+    assert_eq!(end, "timed-out");
+    let (dropped, seq) = history
+        .fact(|fact| matches!(fact, StorageFact::CallerDropped { id: dropped } if *dropped == id))
+        .expect("the caller dropped the call");
+    assert_eq!(storage_seq, seq, "paired with the drop");
+    assert_eq!(dropped.at - submitted, timeout);
+    timeout_enabled_from(watch, id, submitted, (dropped.step, dropped.at));
+}
+
+/// Nora preloaded at A3 needs a VCT repair at height 2, so her reactor asks
+/// storage for its context, and that call is held until its caller drops
+/// it. It ends `timed-out` 30 s after its submission, paired with that
+/// drop, and the port offers `timeout` from then.
+#[test]
+fn vct_context_times_out_at_30_seconds() {
+    let timeout = request_timeout();
+    for input in inputs(8, 256) {
+        let fixture = HeaderFixture::regtest();
+        let node = Arc::new(ControlledPort::new(&fixture));
+        preload(node.engine(), &fixture, &Chain::main(3));
+        let initial = node.engine().snapshot().header_generation.get();
+        let (watch, mut checker) = Watch::new(node.clone());
+        let mut topology = None;
+        let report = support::run(
+            storage_config(),
+            input,
+            |sim| {
+                let effects = Effects::default();
+                let policy = Policy {
+                    holds: vec![hold(
+                        Select::nth(OpKind::VctContext, 1),
+                        Trigger::CallerDropped(Select::held()),
+                        Allow::Engine,
+                        31_000,
+                    )],
+                    ..Policy::converging()
+                };
+                let storage = PolicySource::new(sim, node.clone(), policy, effects.clone());
+                let (observer, tap) = ReactorTap::new(sim, &node, "nora");
+                sim.add_source(Box::new(storage.with_tap(tap)));
+                let nora = HeaderNode::spawn(
+                    sim,
+                    "nora",
+                    1,
+                    node.clone(),
+                    &fixture,
+                    Chain::main(3).tip(&fixture),
+                    DispatchFlag::default(),
+                    Some(observer),
+                );
+                nora.vct_repairs
+                    .send(VctRootRepairStatus {
+                        state: VctRootRepairState::Unavailable {
+                            height: zakura_chain::block::Height(2),
+                        },
+                        generation: 0,
+                    })
+                    .expect("the reactor holds the repair receiver");
+                topology = Some(Topology::new(vec![nora], effects));
+            },
+            &mut checker,
+        );
+        drop(checker);
+        drop(topology);
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let history = History::new(&report, initial);
+        let ops = history.ops();
+        let context = nth(&ops, OpKind::VctContext, 1).expect("Nora asked for a repair context");
+        timed_out_at(&history, &watch, context, ops[&context].at, timeout);
+    }
+}
+
+/// Checks that the prepare or apply `id` stayed pending with its caller
+/// waiting and only `engine` and `local-resource` offered, and that its
+/// caller never dropped it.
+fn waited_without_timeout(history: &History<'_>, watch: &Watch, id: u64) {
+    let pending = watch.pending(id);
+    assert!(!pending.is_empty());
+    for (step, _, enabled, waiting) in pending {
+        assert_eq!(
+            enabled,
+            [Outcome::Engine, Outcome::Fault(Fault::LocalResource)],
+            "step {step}"
+        );
+        assert!(waiting, "its caller still waits at step {step}");
+    }
+    assert!(
+        history
+            .fact(
+                |fact| matches!(fact, StorageFact::CallerDropped { id: dropped } if *dropped == id)
+            )
+            .is_none(),
+        "nothing drops it"
+    );
+}
+
+/// Steps enough to idle past two hours of virtual time on Nora's timers.
+const TWO_HOUR_BUDGET: u64 = 40_000;
+
+/// Two hours, in milliseconds.
+const TWO_HOURS_MS: u64 = 7_200_000;
+
+/// Nora's first prepare is held for two hours. The request deadline retires
+/// its owner `timed_out` while it's preparing, 30 s after its pages, and
+/// Nora syncs through a new request. The prepare never times out: its
+/// caller keeps waiting with only `engine` and `local-resource` offered.
+/// Its late completion is handled with no apply dispatched, and no apply
+/// ever carries the retired owner.
+#[test]
+fn held_prepare_outlives_its_retired_owner() {
+    let timeout = request_timeout();
+    let scenario = nora_and_mira(
+        vec![hold(
+            Select::nth(OpKind::Prepare, 1),
+            Trigger::VirtualTime(TWO_HOURS_MS),
+            Allow::Engine,
+            TWO_HOURS_MS + 1_000,
+        )],
+        Vec::new(),
+        TWO_HOUR_BUDGET,
+    );
+    for input in inputs(4, 256) {
+        let ports = Late::prepare(&scenario);
+        let (watch, mut checker) = Watch::new(ports.node.clone());
+        let report = run_on(&scenario, &ports, input, &mut checker);
+        drop(checker);
+        let history = History::new(&report, initial_generation(&ports));
+        let ops = history.ops();
+        let prepare = nth(&ops, OpKind::Prepare, 1).expect("Nora prepared");
+        let owner = owner_of(ops[&prepare].request);
+        let retired: Vec<_> = history
+            .retirements()
+            .into_iter()
+            .filter(|retired| retired.owner == owner)
+            .collect();
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(
+            (retired[0].reason, retired[0].phase),
+            ("timed_out", "preparing")
+        );
+        assert_eq!(
+            retired[0].at - ops[&prepare].at,
+            timeout,
+            "30 s after its pages"
+        );
+        waited_without_timeout(&history, &watch, prepare);
+
+        let done = history.completions()[&prepare];
+        assert!(done.at >= Duration::from_millis(TWO_HOURS_MS), "{done:?}");
+        let (_, call) = history
+            .call_of(prepare)
+            .expect("the late prepare's call is paired");
+        let bracket = history.bracket(&call);
+        assert!(
+            !bracket.iter().any(|event| matches!(
+                event,
+                ReactorFact::Dispatched {
+                    port: ReactorCall::Apply { .. },
+                    ..
+                }
+            )),
+            "{bracket:?}"
+        );
+        assert!(
+            !ops.values()
+                .any(|op| op.kind == OpKind::Apply && owner_of(op.request) == owner),
+            "no apply carries the retired owner"
+        );
+        assert_eq!(
+            ports.node.engine().snapshot().frontiers.header_best,
+            main_tip(5)
+        );
+    }
+}
+
+/// Nora's first apply is held for two hours, and every later apply until
+/// it completes, so nothing commits first. Mira's link closes once a later
+/// apply is submitted, which stops Nora's new requests. The request
+/// deadline retires the apply's owner `timed_out` 30 s after its
+/// submission, but the apply never times out: its caller keeps waiting
+/// with only `engine` and `local-resource` offered. At its late completion
+/// the generation is the one it was submitted under, and it commits: the
+/// generation rises by one and Nora's tip is the target. The reactor
+/// handles it with no second retirement of its owner.
+#[test]
+fn held_apply_commits_late() {
+    let timeout = request_timeout();
+    let scenario = nora_and_mira(
+        vec![
+            hold(
+                Select::nth(OpKind::Apply, 1),
+                Trigger::VirtualTime(TWO_HOURS_MS),
+                Allow::Engine,
+                TWO_HOURS_MS + 1_000,
+            ),
+            hold(
+                every(OpKind::Apply),
+                Trigger::Completed(Select::nth(OpKind::Apply, 1)),
+                Allow::Engine,
+                // Submitted after the first, which completes within two
+                // hours and a second of its own submission.
+                TWO_HOURS_MS + 1_000,
+            ),
+        ],
+        vec![control(
+            "mira",
+            ControlAction::Close,
+            Trigger::Submitted(Select::nth(OpKind::Apply, 2)),
+        )],
+        TWO_HOUR_BUDGET,
+    );
+    for input in inputs(4, 256) {
+        let ports = Late::prepare(&scenario);
+        let (watch, mut checker) = Watch::new(ports.node.clone());
+        let report = run_on(&scenario, &ports, input, &mut checker);
+        drop(checker);
+        let history = History::new(&report, initial_generation(&ports));
+        let ops = history.ops();
+        let apply = nth(&ops, OpKind::Apply, 1).expect("Nora applied");
+        let owner = owner_of(ops[&apply].request);
+        let retired: Vec<_> = history
+            .retirements()
+            .into_iter()
+            .filter(|retired| retired.owner == owner)
+            .collect();
+        assert_eq!(retired.len(), 1, "one retirement of its owner: {retired:?}");
+        assert_eq!(
+            (retired[0].reason, retired[0].phase),
+            ("timed_out", "applying")
+        );
+        assert_eq!(retired[0].at - ops[&apply].at, timeout);
+        waited_without_timeout(&history, &watch, apply);
+
+        let done = history.completions()[&apply];
+        assert!(done.at >= Duration::from_millis(TWO_HOURS_MS), "{done:?}");
+        assert_eq!(
+            history.generation_before(done.seq),
+            history.generation_before(ops[&apply].seq),
+            "the generation it was submitted under"
+        );
+        assert!(committed(&history, &done), "{done:?}");
+        assert_eq!(watch.at(done.step).tip, main_tip(5));
+        let (_, call) = history
+            .call_of(apply)
+            .expect("the late apply's call is paired");
+        assert!(call.handled.is_some(), "the reactor handled it");
+        assert!(
+            nth(&ops, OpKind::Apply, 2).is_some(),
+            "a later apply was held behind it"
+        );
     }
 }

@@ -61,12 +61,13 @@ use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
 
-/// What every case runs on, relative to the repository root: this runner,
-/// the simulator that records each run and judges it with the property
-/// engine, the scheduler and runtime it runs on, and the build
-/// configuration. A change to any of them affects every case.
+/// What every case runs on, relative to the repository root: xtask, which
+/// holds this runner and the flags and arguments it runs with, the
+/// simulator that records each run and judges it with the property engine,
+/// the scheduler and runtime it runs on, and the build configuration. A
+/// change to any of them affects every case.
 const SHARED: &[&str] = &[
-    "crates/xtask/src/planted.rs",
+    "crates/xtask",
     "crates/zakura-sim",
     "crates/zakura-scheduler",
     "crates/zakura-rt",
@@ -1013,7 +1014,7 @@ mod tests {
         let affected = |path: &str| is_affected(&watched, &[PathBuf::from(path)]);
         assert!(affected("crates/x/src/lib.rs"));
         assert!(affected("crates/zakura-sim/src/domain/discovery.rs"));
-        assert!(affected(SHARED[0]));
+        assert!(affected("crates/xtask/src/planted.rs"));
         assert!(!affected("crates/x/src/other.rs"));
         assert!(!affected("crates/zakura-sim/src/domainx.rs"));
         assert!(!is_affected(&watched, &[]));
@@ -1028,12 +1029,22 @@ mod tests {
         let case = cases.first().expect("a committed case");
         let watched = watched(&repo_root, case).expect("the case's files exist");
         for path in [
+            "crates/xtask/src/sim.rs",
+            "crates/xtask/src/main.rs",
             "crates/zakura-sim/src/property/registry.rs",
             "crates/zakura-sim/src/sim.rs",
             "crates/zakura-scheduler/src/lib.rs",
             "crates/zakura-rt/src/sim/sync/notify.rs",
             "Cargo.lock",
             ".cargo/config.toml",
+        ] {
+            assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
+        }
+        // The harness also drives the transport under discovery, which the
+        // case's checks cover.
+        for path in [
+            "crates/zakura-network/src/zakura/transport/io.rs",
+            "crates/zakura-network/src/zakura/wire_codec/message.rs",
         ] {
             assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
         }

@@ -17,6 +17,7 @@ use std::{
 use support::{inputs, run};
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, HeaderLocator};
+use zakura_network::zakura::observe::{CallEnd, HeaderSyncObserver, ReactorEvent};
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, ApplyHeaderTargetReply, HeaderChainFuture, LocatorReadPermit,
     Port, PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
@@ -472,6 +473,94 @@ fn port_panic_outranks_an_earlier_sources_failure() {
         panicked(&report, true);
         let report = panic_run(PanicAt::BeforeDelegating, false, true, input);
         panicked(&report, false);
+    }
+}
+
+/// An observer that forwards to the tap's, except that it panics on the
+/// first replied call end instead of recording it, as an observer bug would.
+#[derive(Debug)]
+struct PanicsOnReply(Arc<dyn HeaderSyncObserver>);
+
+impl HeaderSyncObserver for PanicsOnReply {
+    /// Panics on a replied `CallEnded`, which unwinds the reactor, and
+    /// forwards anything else.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::CallEnded {
+                end: CallEnd::Replied,
+                ..
+            }
+        ) {
+            panic!("the test observer panics on a replied call end");
+        }
+        self.0.observe(event);
+    }
+}
+
+/// The node at genesis, tapped through [`PanicsOnReply`], syncing from
+/// `mirror-0` at A5, converging.
+fn observer_panic_run(input: PlanInput) -> RunReport {
+    let fixture = HeaderFixture::regtest();
+    let node = Arc::new(ControlledPort::new(&fixture));
+    let mirror = Arc::new(EnginePort::new(&fixture));
+    preload(&mirror, &fixture, &Chain::main(5));
+    let mut topology = None;
+    let report = run(
+        storage_config(),
+        input,
+        |sim| {
+            let dispatch = DispatchFlag::default();
+            let effects = Effects::default();
+            let storage =
+                PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
+            let (observer, tap) = ReactorTap::new(sim, &node, "node");
+            sim.add_source(Box::new(storage.with_tap(tap)));
+            let nodes = vec![
+                HeaderNode::spawn(
+                    sim,
+                    "node",
+                    1,
+                    node.clone(),
+                    &fixture,
+                    Chain::default().tip(&fixture),
+                    dispatch.clone(),
+                    Some(Arc::new(PanicsOnReply(observer))),
+                ),
+                HeaderNode::spawn(
+                    sim,
+                    "mirror-0",
+                    2,
+                    mirror.clone(),
+                    &fixture,
+                    Chain::main(5).tip(&fixture),
+                    dispatch,
+                    None,
+                ),
+            ];
+            let linked = Rc::new(Topology::new(nodes, effects));
+            linked.link(1, 0);
+            topology = Some(linked);
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    drop(topology);
+    report
+}
+
+/// A reactor that unwinds from an observer panic ends the run as
+/// `ReactorGone` on the node's tap. The call whose end panicked took its
+/// storage receipt, which no `CallEnded` pairs with, but the tap reports
+/// the reactor crash rather than that unpaired receipt.
+#[test]
+fn an_observer_panic_ends_the_run_reactor_gone() {
+    for input in inputs(8, 256) {
+        let report = observer_panic_run(input);
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("ReactorGone"), "{source}: {detail}");
+        assert_eq!(source, "reactor:node#0");
     }
 }
 

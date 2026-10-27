@@ -326,7 +326,7 @@ impl Storage {
             #[cfg(feature = "experimental-pq-transparent")]
             let allowed = spent_outputs
                 .get(input_index)
-                .is_some_and(|output| zakura_script::wots::standard_input(input, output));
+                .is_some_and(|output| zakura_script::pq::standard_input(input, output));
             #[cfg(not(feature = "experimental-pq-transparent"))]
             let allowed = {
                 let _ = input_index;
@@ -360,7 +360,7 @@ impl Storage {
 
             // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
             // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-            if !zakura_consensus::transaction::check::are_inputs_standard_with_wots(
+            if !zakura_consensus::transaction::check::are_inputs_standard_with_pq(
                 transaction,
                 spent_outputs,
                 cfg!(feature = "experimental-pq-transparent"),
@@ -394,11 +394,11 @@ impl Storage {
             .inputs()
             .iter()
             .zip(spent_outputs.iter())
-            .any(|(input, output)| zakura_script::wots::standard_input(input, output));
+            .any(|(input, output)| zakura_script::pq::standard_input(input, output));
 
         for output in transaction.outputs() {
             #[cfg(feature = "experimental-pq-transparent")]
-            if spends_account && zakura_script::wots::is_control_output(output) {
+            if spends_account && zakura_script::pq::is_control_output(output) {
                 continue;
             }
             let lock_script = &output.lock_script;

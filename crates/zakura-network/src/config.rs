@@ -968,7 +968,7 @@ where
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
-    experimental_wots_activation_height: Option<u32>,
+    experimental_pq_transparent_activation_height: Option<u32>,
     network_name: Option<String>,
     network_magic: Option<[u8; 4]>,
     slow_start_interval: Option<u32>,
@@ -1194,8 +1194,8 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
                 },
             ),
-            experimental_wots_activation_height: params
-                .experimental_wots_activation_height()
+            experimental_pq_transparent_activation_height: params
+                .experimental_pq_transparent_activation_height()
                 .map(|h| h.0),
             params: None,
             regtest: None,
@@ -1470,7 +1470,7 @@ where
     D: Deserializer<'de>,
 {
     let DTestnetParameters {
-        experimental_wots_activation_height,
+        experimental_pq_transparent_activation_height,
         network_name,
         network_magic,
         slow_start_interval,
@@ -1494,9 +1494,9 @@ where
         regtest: _,
     } = params;
 
-    if experimental_wots_activation_height.is_some() {
+    if experimental_pq_transparent_activation_height.is_some() {
         return Err(de::Error::custom(
-            "experimental WOTS activation is only valid on Regtest",
+            "experimental PQ transparent activation is only valid on Regtest",
         ));
     }
     let mut params_builder = testnet::Parameters::build();
@@ -1634,7 +1634,7 @@ where
     D: Deserializer<'de>,
 {
     let DTestnetParameters {
-        experimental_wots_activation_height,
+        experimental_pq_transparent_activation_height,
         activation_heights,
         inherit_activation_heights,
         pre_nu6_funding_streams,
@@ -1648,11 +1648,11 @@ where
         ..
     } = params;
 
-    if experimental_wots_activation_height.is_some()
+    if experimental_pq_transparent_activation_height.is_some()
         && !cfg!(feature = "experimental-pq-transparent")
     {
         return Err(de::Error::custom(
-            "experimental WOTS requires the experimental-pq-transparent build feature",
+            "experimental PQ transparent activation requires the experimental-pq-transparent build feature",
         ));
     }
     if inherit_activation_heights.is_some() {
@@ -1686,8 +1686,8 @@ where
         reason = "test-only fields depend on feature unification"
     )]
     let params = RegtestParameters {
-        experimental_wots_activation_height: experimental_wots_activation_height
-            .map(zakura_chain::block::Height),
+        experimental_pq_transparent_activation_height:
+            experimental_pq_transparent_activation_height.map(zakura_chain::block::Height),
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,

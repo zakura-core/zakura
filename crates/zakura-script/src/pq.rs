@@ -6,13 +6,13 @@ use zakura_chain::{
     transaction::{HashType, Transaction},
     transparent,
 };
-use zcash_transparent::wots::{self, AccountCheck, AccountError, ControlOutput};
+use zcash_transparent::pq::{self, AccountCheck, AccountError, ControlOutput};
 
 /// Checks both network identity and the configured candidate-block activation height.
 pub fn active(network: &Network, height: Height) -> bool {
     match network {
         Network::Testnet(params) if network.is_regtest() => params
-            .experimental_wots_activation_height()
+            .experimental_pq_transparent_activation_height()
             .is_some_and(|activation| height >= activation),
         _ => false,
     }
@@ -49,7 +49,7 @@ pub(super) fn check(
         .map(|output| output.lock_script.as_raw_bytes())
         .collect();
     let signable = tx.version() == 5 && !tx.has_shielded_inputs() && !tx.has_shielded_outputs();
-    wots::check_accounts(&inputs, &outputs, |index| {
+    pq::check_accounts(&inputs, &outputs, |index| {
         signable.then(|| {
             sighasher
                 .sighash(HashType::ALL, Some((index, Vec::new())))
@@ -64,7 +64,7 @@ pub fn standard_input(input: &transparent::Input, output: &transparent::Output) 
     let transparent::Input::PrevOut { unlock_script, .. } = input else {
         return false;
     };
-    wots::classify(
+    pq::classify(
         unlock_script.as_raw_bytes(),
         output.lock_script.as_raw_bytes(),
     )

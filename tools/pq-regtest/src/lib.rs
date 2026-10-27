@@ -13,8 +13,8 @@ use zcash_script::script::{Code, Evaluable};
 use zcash_transparent::{
     address::Script,
     bundle::{self, OutPoint, TxIn, TxOut},
+    pq::{self, AccountScript, Authorization, ControlOutput, KeySet},
     sighash::{SighashType, TransparentAuthorizingContext},
-    wots::{self, AccountScript, Authorization, ControlOutput, KeySet},
 };
 
 /// The prototype network activates NU5 at height one and no later upgrade.
@@ -38,7 +38,7 @@ pub struct Account {
 
 impl Account {
     pub fn new(seed: &[u8], index: u32) -> Self {
-        let master = wots::master_from_seed(seed);
+        let master = pq::master_from_seed(seed);
         let script = AccountScript::derive(&master, index).expect("derived seeds are valid");
         Self {
             master,
@@ -63,7 +63,7 @@ impl Account {
 
     fn sign(&self, step: u32, spare: u8, digest: [u8; 32]) -> Authorization {
         let keys = KeySet::derive(&self.master, self.index, step).expect("derived seeds are valid");
-        let key = wots::signing_key(&self.master, self.index, step, spare)
+        let key = pq::signing_key(&self.master, self.index, step, spare)
             .expect("derived seeds are valid");
         Authorization::sign(key, &keys, spare, digest).expect("the key is that spare")
     }
@@ -96,9 +96,9 @@ impl Unlock<'_> {
     fn script_sig_size(&self, spent: &TxOut) -> usize {
         match self {
             Unlock::Bootstrap => 2,
-            Unlock::Covered(_) => wots::COVERED_DEPOSIT_SCRIPT_SIG_SIZE,
-            Unlock::Authorize { .. } if is_control(spent) => wots::CONTROL_SCRIPT_SIG_SIZE,
-            Unlock::Authorize { .. } => wots::SIGNING_DEPOSIT_SCRIPT_SIG_SIZE,
+            Unlock::Covered(_) => pq::COVERED_DEPOSIT_SCRIPT_SIG_SIZE,
+            Unlock::Authorize { .. } if is_control(spent) => pq::CONTROL_SCRIPT_SIG_SIZE,
+            Unlock::Authorize { .. } => pq::SIGNING_DEPOSIT_SCRIPT_SIG_SIZE,
             Unlock::Ec(_) => 1 + 73 + 1 + 33,
         }
     }
@@ -121,7 +121,7 @@ pub fn build(
     if let Some(change) = change {
         let input_bytes = inputs
             .iter()
-            .map(|(coin, unlock)| wots::input_size(unlock.script_sig_size(&coin.output)))
+            .map(|(coin, unlock)| pq::input_size(unlock.script_sig_size(&coin.output)))
             .sum();
         let output_bytes =
             outputs.iter().map(output_size).sum::<usize>() + 8 + 1 + change.0.0.len();
@@ -302,11 +302,8 @@ mod tests {
         let control = account.control(1);
         assert!(is_control(&control));
         assert!(!is_control(&output(0, account.address_script())));
-        assert_eq!(output_size(&control), wots::CONTROL_OUTPUT_SIZE);
+        assert_eq!(output_size(&control), pq::CONTROL_OUTPUT_SIZE);
         // A control input alone costs sixteen 150-byte actions.
-        assert_eq!(
-            fee(wots::input_size(wots::CONTROL_SCRIPT_SIG_SIZE), 0),
-            80_000
-        );
+        assert_eq!(fee(pq::input_size(pq::CONTROL_SCRIPT_SIG_SIZE), 0), 80_000);
     }
 }

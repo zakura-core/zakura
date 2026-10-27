@@ -1,10 +1,10 @@
 //! Fixed test vectors for zakura-network configuration.
 
 #[test]
-fn experimental_wots_configuration_is_explicit_and_regtest_only() {
+fn experimental_pq_transparent_configuration_is_explicit_and_regtest_only() {
     use crate::config::Config;
     let configured =
-        "network = 'Regtest'\n[testnet_parameters]\nexperimental_wots_activation_height = 200\n";
+        "network = 'Regtest'\n[testnet_parameters]\nexperimental_pq_transparent_activation_height = 200\n";
     let parsed = toml::from_str::<Config>(configured);
     if cfg!(feature = "experimental-pq-transparent") {
         let parsed = parsed.expect("the experimental build accepts explicit Regtest activation");
@@ -15,7 +15,7 @@ fn experimental_wots_configuration_is_explicit_and_regtest_only() {
             panic!("Regtest uses test parameters")
         };
         assert_eq!(
-            params.experimental_wots_activation_height(),
+            params.experimental_pq_transparent_activation_height(),
             Some(zakura_chain::block::Height(200))
         );
     } else {
@@ -29,7 +29,7 @@ fn experimental_wots_configuration_is_explicit_and_regtest_only() {
         assert!(toml::from_str::<Config>(&public).is_err());
     }
     let public =
-        "[network]\nnetwork_name = 'WotsPublic'\nexperimental_wots_activation_height = 200\n";
+        "[network]\nnetwork_name = 'PqPublic'\nexperimental_pq_transparent_activation_height = 200\n";
     assert!(toml::from_str::<Config>(public)
         .unwrap_err()
         .to_string()
@@ -38,7 +38,7 @@ fn experimental_wots_configuration_is_explicit_and_regtest_only() {
     let zakura_chain::parameters::Network::Testnet(params) = default.network else {
         panic!("Regtest uses test parameters")
     };
-    assert_eq!(params.experimental_wots_activation_height(), None);
+    assert_eq!(params.experimental_pq_transparent_activation_height(), None);
 }
 
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};

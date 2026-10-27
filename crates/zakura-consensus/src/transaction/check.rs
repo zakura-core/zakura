@@ -782,11 +782,11 @@ pub(super) fn count_script_push_ops(script_bytes: &[u8]) -> usize {
 /// Callers must ensure `spent_outputs.len()` matches the number of transparent inputs.
 /// If the lengths differ, `false` is returned.
 pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Output]) -> bool {
-    are_inputs_standard_with_wots(tx, spent_outputs, false)
+    are_inputs_standard_with_pq(tx, spent_outputs, false)
 }
 
-/// Applies the narrowly scoped WOTS policy exception only after explicit activation.
-pub fn are_inputs_standard_with_wots(
+/// Applies the narrowly scoped post-quantum account policy exception only after explicit activation.
+pub fn are_inputs_standard_with_pq(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
     experimental: bool,
@@ -796,7 +796,7 @@ pub fn are_inputs_standard_with_wots(
     }
     for (input, spent_output) in tx.inputs().iter().zip(spent_outputs.iter()) {
         #[cfg(feature = "experimental-pq-transparent")]
-        if experimental && zakura_script::wots::standard_input(input, spent_output) {
+        if experimental && zakura_script::pq::standard_input(input, spent_output) {
             continue;
         }
         #[cfg(not(feature = "experimental-pq-transparent"))]
@@ -888,11 +888,11 @@ pub fn mempool_standard_input_scripts(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
 ) -> Result<(), TransactionError> {
-    mempool_standard_input_scripts_with_wots(tx, spent_outputs, false)
+    mempool_standard_input_scripts_with_pq(tx, spent_outputs, false)
 }
 
-/// Checks input policy with an explicitly activated WOTS exception.
-pub fn mempool_standard_input_scripts_with_wots(
+/// Checks input policy with an explicitly activated post-quantum account exception.
+pub fn mempool_standard_input_scripts_with_pq(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
     experimental: bool,
@@ -915,7 +915,7 @@ pub fn mempool_standard_input_scripts_with_wots(
         let size = unlock_script.as_raw_bytes().len();
         #[cfg(feature = "experimental-pq-transparent")]
         let allowed =
-            experimental && zakura_script::wots::standard_input(input, &spent_outputs[input_index]);
+            experimental && zakura_script::pq::standard_input(input, &spent_outputs[input_index]);
         #[cfg(not(feature = "experimental-pq-transparent"))]
         let allowed = false;
         if size > MAX_STANDARD_SCRIPTSIG_SIZE && !allowed {
@@ -930,7 +930,7 @@ pub fn mempool_standard_input_scripts_with_wots(
 
     // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
     // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-    if !are_inputs_standard_with_wots(tx, spent_outputs, experimental) {
+    if !are_inputs_standard_with_pq(tx, spent_outputs, experimental) {
         return Err(TransactionError::NonStandardInputs);
     }
 

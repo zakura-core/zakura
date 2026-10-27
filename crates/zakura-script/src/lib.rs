@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 mod encoding_tests;
+#[cfg(feature = "experimental-pq-transparent")]
+pub mod pq;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "experimental-pq-transparent")]
-pub mod wots;
 
 use core::fmt;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ pub enum Error {
     TxInvalid(#[from] zakura_chain::Error),
     /// The transaction breaks the post-quantum account rules.
     #[cfg(feature = "experimental-pq-transparent")]
-    Accounts(zcash_transparent::wots::AccountError),
+    Accounts(zcash_transparent::pq::AccountError),
 }
 
 impl fmt::Display for Error {
@@ -114,9 +114,8 @@ pub struct CachedFfiTransaction {
 
     /// The account rules' result for the whole transaction, or `None` before they activate.
     #[cfg(feature = "experimental-pq-transparent")]
-    accounts: Option<
-        Result<zcash_transparent::wots::AccountCheck, zcash_transparent::wots::AccountError>,
-    >,
+    accounts:
+        Option<Result<zcash_transparent::pq::AccountCheck, zcash_transparent::pq::AccountError>>,
 }
 
 impl CachedFfiTransaction {
@@ -141,13 +140,13 @@ impl CachedFfiTransaction {
     /// Applies the immutable network and candidate-block height to experimental verification,
     /// running the account rules once if they are active.
     #[cfg(feature = "experimental-pq-transparent")]
-    pub fn with_wots_context(
+    pub fn with_pq_context(
         mut self,
         network: &zakura_chain::parameters::Network,
         height: zakura_chain::block::Height,
     ) -> Self {
-        self.accounts = wots::active(network, height).then(|| {
-            wots::check(
+        self.accounts = pq::active(network, height).then(|| {
+            pq::check(
                 &self.transaction,
                 &self.all_previous_outputs,
                 &self.sighasher,
@@ -161,7 +160,7 @@ impl CachedFfiTransaction {
     /// This covers what per-input verification cannot see, such as a transaction with no
     /// account inputs creating a control output, so it must run for every transaction.
     #[cfg(feature = "experimental-pq-transparent")]
-    pub fn wots_accounts(&self) -> Result<(), Error> {
+    pub fn pq_accounts(&self) -> Result<(), Error> {
         match &self.accounts {
             Some(Err(error)) => Err(Error::Accounts(*error)),
             _ => Ok(()),
@@ -200,11 +199,7 @@ impl CachedFfiTransaction {
         let count = p2sh_sigop_count(&self.transaction, &self.all_previous_outputs);
         #[cfg(feature = "experimental-pq-transparent")]
         let count = match &self.accounts {
-            Some(Ok(check)) => count.saturating_add(
-                check
-                    .authorizations
-                    .saturating_mul(zcash_transparent::wots::WOTS_SIGOP_COST),
-            ),
+            Some(Ok(check)) => count.saturating_add(check.sigops()),
             _ => count,
         };
         count
@@ -223,7 +218,7 @@ impl CachedFfiTransaction {
         // The account rules fully verify account inputs; the interpreter would reject them.
         #[cfg(feature = "experimental-pq-transparent")]
         match &self.accounts {
-            Some(Ok(check)) if check.wots_inputs.contains(&input_index) => return Ok(()),
+            Some(Ok(check)) if check.account_inputs.contains(&input_index) => return Ok(()),
             Some(Err(error)) => return Err(Error::Accounts(*error)),
             _ => {}
         }

@@ -1,7 +1,7 @@
 # Post-quantum account regtest demo
 
 This demo spends from a post-quantum transparent account on an isolated regtest
-node. An account has one fixed P2SH address. The WOTS+ key allowed to spend
+node. An account has one fixed P2SH address. The one-time key (WOTS+ today) allowed to spend
 from it changes on every spend: a zero-value control output names the current
 step's four keys, each spend is signed by one of them, and each spend creates
 the control output for the next step. Other payments to the address are spent
@@ -10,7 +10,7 @@ alongside without signatures of their own.
 From the Zakura checkout, run:
 
 ```sh
-python3 tools/wots-regtest/run.py
+python3 tools/pq-regtest/run.py
 ```
 
 The runner verifies the pinned Git dependencies for the node and harness,

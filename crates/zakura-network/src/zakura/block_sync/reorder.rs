@@ -43,12 +43,18 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
-    /// Each buffered body's height and wire bytes, read from the map.
+    /// Each buffered body, read from the map.
     #[cfg(test)]
-    pub(super) fn ownership(&self) -> Vec<(block::Height, u64)> {
+    pub(super) fn ownership(&self) -> Vec<RetainedBody> {
         self.blocks
             .iter()
-            .map(|(height, buffered)| (*height, buffered.bytes))
+            .map(|(height, buffered)| RetainedBody {
+                height: *height,
+                owner: buffered.owner,
+                bytes: buffered.bytes,
+                admitted_estimate_bytes: buffered.admitted_estimate_bytes,
+                allocation: buffered.body.allocation(),
+            })
             .collect()
     }
 
@@ -85,6 +91,7 @@ impl ReorderBuffer {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             bytes,
+            None,
             source_peer,
         )
     }
@@ -101,6 +108,7 @@ impl ReorderBuffer {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         source_peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
         if self.blocks.contains_key(&height) {
@@ -117,6 +125,7 @@ impl ReorderBuffer {
                 previous_block_hash,
                 body,
                 bytes,
+                admitted_estimate_bytes,
                 source_peer,
             },
         );
@@ -150,6 +159,7 @@ impl ReorderBuffer {
                 previous_block_hash: buffered.previous_block_hash,
                 body: buffered.body,
                 bytes: buffered.bytes,
+                admitted_estimate_bytes: buffered.admitted_estimate_bytes,
                 source_peer: buffered.source_peer,
             });
             let Some(after) = next_height(next) else {
@@ -226,7 +236,22 @@ pub(super) struct DrainedBlock {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) source_peer: ZakuraPeerId,
+}
+
+/// One retained body, as the owner snapshots read it.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct RetainedBody {
+    pub(super) height: block::Height,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
+    /// Wire bytes.
+    pub(super) bytes: u64,
+    /// See [`BufferedBlock::admitted_estimate_bytes`].
+    pub(super) admitted_estimate_bytes: Option<u64>,
+    /// See [`BufferedBlockBody::allocation`].
+    pub(super) allocation: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +262,10 @@ struct BufferedBlock {
     previous_block_hash: block::Hash,
     body: BufferedBlockBody,
     bytes: u64,
+    /// The size estimate the body's request reserved at admission. `None` for a
+    /// body admitted on its wire size with no request estimate. Wire bytes minus
+    /// this is the hint's error, which the look-ahead bound accounts for.
+    admitted_estimate_bytes: Option<u64>,
     /// The peer that delivered this body, so an apply rejection can be attributed
     /// back to it for misbehavior scoring.
     source_peer: ZakuraPeerId,
@@ -324,6 +353,21 @@ impl BufferedBlockBody {
         } = self
         {
             *self = BufferedBlockBody::RawFramePayload(raw_frame_payload.clone());
+        }
+    }
+
+    /// The address of the allocation that identifies this body: its raw frame
+    /// payload when one is kept, else its decoded block. Demoting a body to its
+    /// raw payload, or caching a decode, keeps the address, and two holders
+    /// that share one allocation report the same address.
+    #[cfg(test)]
+    pub(super) fn allocation(&self) -> usize {
+        match self {
+            BufferedBlockBody::RawFramePayload(raw_frame_payload)
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                raw_frame_payload, ..
+            } => Arc::as_ptr(raw_frame_payload).cast::<u8>().addr(),
+            BufferedBlockBody::Decoded { block, .. } => Arc::as_ptr(block).addr(),
         }
     }
 

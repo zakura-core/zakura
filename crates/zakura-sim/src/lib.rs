@@ -12,18 +12,21 @@
 
 pub mod action;
 pub mod check;
+pub mod domain;
 mod draws;
 pub mod end;
 mod evidence;
 pub mod fake;
 pub mod harness;
 pub mod identity;
+pub mod model;
 pub mod observe;
 pub mod plan;
 pub mod property;
 pub mod record;
 pub mod sim;
 pub mod storage;
+pub mod table;
 pub mod trace;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};

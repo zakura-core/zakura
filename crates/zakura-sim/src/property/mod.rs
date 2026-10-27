@@ -15,10 +15,12 @@ mod verdict;
 use serde::{Deserialize, Serialize};
 
 pub use assume::{Assume, AssumeRecord, Assumptions};
-pub use cx::{CheckCtx, HasView};
+pub use cx::{Capture, CheckCtx, HasView};
 pub use id::{BadId, PropertyId};
-pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Tee};
-pub use verdict::{Inconclusive, LivenessBound, Obligation, ObligationKey, Subject, Verdict};
+pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
+pub use verdict::{
+    Cardinality, Inconclusive, LivenessBound, Obligation, ObligationKey, Subject, Verdict,
+};
 
 use crate::ObservationLog;
 
@@ -79,8 +81,10 @@ pub enum Unit {
 }
 
 /// An observation source a check reads (properties.md, Tiers). A harness
-/// names the sources it observes, and a property that needs one it lacks is
-/// `NotApplicable`.
+/// names the sources it observes and the ones its tier excludes, as
+/// [`Sources`]. A property that needs an excluded source is `NotApplicable`,
+/// and its report names the exclusion. One that needs a source the harness
+/// neither observes nor excludes fails the run as a harness failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Source {

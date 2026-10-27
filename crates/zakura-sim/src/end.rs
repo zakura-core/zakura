@@ -54,6 +54,35 @@ pub enum HarnessFailure {
         /// The step it names.
         step: u64,
     },
+    /// A property needs a source that the harness neither observes nor
+    /// excludes.
+    MissingSource {
+        /// The property.
+        property: String,
+        /// The source, such as `Frames`.
+        source: String,
+    },
+    /// A property's check found its declared source missing evidence it
+    /// requires.
+    MissingEvidence {
+        /// The property.
+        property: String,
+        /// The step whose boundary the check ran at.
+        step: u64,
+        /// What was missing.
+        detail: String,
+    },
+    /// A property that reads the view would have read state captured before
+    /// the step's boundary.
+    StaleView {
+        /// The property.
+        property: String,
+        /// The step whose boundary the check needed.
+        step: u64,
+        /// The step whose boundary the view showed, or `None` if it had no
+        /// snapshot.
+        captured: Option<u64>,
+    },
     /// A source's evidence was incomplete: its facts disagreed with its
     /// state, didn't reach the log, or it skipped a boundary.
     SourceEvidence {
@@ -101,6 +130,31 @@ impl fmt::Display for HarnessFailure {
                     "{property} holds since step {step}, which the run didn't take"
                 )
             }
+            HarnessFailure::MissingSource { property, source } => write!(
+                f,
+                "{property} needs {source}, which the harness neither observes nor excludes"
+            ),
+            HarnessFailure::MissingEvidence {
+                property,
+                step,
+                detail,
+            } => write!(f, "{property} lacks evidence after step {step}: {detail}"),
+            HarnessFailure::StaleView {
+                property,
+                step,
+                captured: Some(captured),
+            } => write!(
+                f,
+                "{property} needs the view after step {step}, but it shows step {captured}"
+            ),
+            HarnessFailure::StaleView {
+                property,
+                step,
+                captured: None,
+            } => write!(
+                f,
+                "{property} needs the view after step {step}, but it has no snapshot"
+            ),
             HarnessFailure::SourceEvidence { source, detail } => {
                 write!(f, "{source}'s evidence failed: {detail}")
             }

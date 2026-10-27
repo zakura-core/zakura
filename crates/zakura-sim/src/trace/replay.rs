@@ -19,6 +19,7 @@ use super::{
     BuildInfo, Invalid, MetaRecord, Trace,
 };
 use crate::{
+    check::PropertyReport,
     harness::{self, HarnessEntry, HarnessError},
     plan::TraceScript,
     record::EndRecord,
@@ -51,6 +52,9 @@ pub struct ReplayReport {
     /// The replay's `end` record. `None` when a prefix stopped at its last
     /// step.
     pub end: Option<EndRecord>,
+    /// The rerun's property reports with every violation, which `end`
+    /// leaves out.
+    pub properties: Vec<PropertyReport>,
     /// True if the trace had its `end` record.
     pub complete: bool,
     /// True if the build isn't equivalent to the recording build, which only
@@ -247,7 +251,15 @@ fn replay_on<'h>(
             });
         }
         Some(HarnessFailure::Plan(PlanError::PrefixEnd { .. })) => {
-            return finish(strict, &sink, None, false, build_mismatch, options);
+            return finish(
+                strict,
+                &sink,
+                None,
+                report.properties,
+                false,
+                build_mismatch,
+                options,
+            );
         }
         _ => {}
     }
@@ -261,6 +273,7 @@ fn replay_on<'h>(
             strict,
             &sink,
             Some(produced),
+            report.properties,
             false,
             build_mismatch,
             options,
@@ -272,7 +285,15 @@ fn replay_on<'h>(
             return Err(ReplayError::Harness(failure));
         }
     }
-    let mut report = finish(strict, &sink, Some(produced), true, build_mismatch, options)?;
+    let mut report = finish(
+        strict,
+        &sink,
+        Some(produced),
+        report.properties,
+        true,
+        build_mismatch,
+        options,
+    )?;
     match end_mismatch {
         Some(field) if strict => Err(ReplayError::Nondeterministic {
             step: report.end.as_ref().map_or(0, |end| end.steps),
@@ -292,6 +313,7 @@ fn finish(
     strict: bool,
     sink: &VerifySink<'_>,
     end: Option<EndRecord>,
+    properties: Vec<PropertyReport>,
     complete: bool,
     build_mismatch: bool,
     options: ReplayOptions,
@@ -301,6 +323,7 @@ fn finish(
     }
     Ok(ReplayReport {
         end,
+        properties,
         complete,
         build_mismatch,
         obs_mismatches: sink.mismatches,

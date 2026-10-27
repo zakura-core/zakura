@@ -242,8 +242,18 @@ fn a_row_name_appears_once_per_layout() {
 }
 
 #[test]
-fn a_row_name_is_lowercase_letters_digits_and_hyphens() {
-    for name in ["", "Get", "get blocks", "get_blocks", "gét"] {
+fn a_row_name_is_hyphenated_lowercase_words() {
+    for name in [
+        "",
+        "Get",
+        "get blocks",
+        "get_blocks",
+        "gét",
+        "-get",
+        "get-",
+        "get--blocks",
+        "-",
+    ] {
         assert_eq!(
             check(&[persistent(
                 64,
@@ -256,7 +266,7 @@ fn a_row_name_is_lowercase_letters_digits_and_hyphens() {
     assert_eq!(
         check(&[persistent(
             64,
-            leak(&[STATUS, request("get-2", 2), PART, DONE])
+            leak(&[STATUS, request("get-2-blocks", 2), PART, DONE])
         )]),
         Ok(())
     );

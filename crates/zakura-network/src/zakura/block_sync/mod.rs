@@ -70,7 +70,7 @@ pub use events::{
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) use service::block_sync_streams;
 pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;

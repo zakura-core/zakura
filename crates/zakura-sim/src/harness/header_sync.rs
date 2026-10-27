@@ -26,12 +26,9 @@ use super::{
     Subsystem,
 };
 use crate::{
-    check::StepCtx,
     observe::StorageFact,
-    property::{HasView, Status as PropertyStatus},
-    trace::meta::PropertyRef,
-    Checker, NoChecks, Observation, ObservationLog, PropertyOutcome, PropertyReport, RunConfig,
-    RunEnd, Sim, Violation,
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
+    Observation, RunConfig, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -40,8 +37,8 @@ use crate::{
 pub struct Scenario {}
 
 /// The header-sync reactor at Regtest genesis, with inert storage and no
-/// peers. It checks nothing, so a run shows only that the reactor runs on a
-/// `Plan` and shuts down.
+/// peers. It checks only the step loop's properties, so a run shows that the
+/// reactor runs on a `Plan` and shuts down.
 pub struct Smoke {
     /// The reactor's handle and action channel. They live until the run
     /// ends, so the reactor doesn't see its inputs close.
@@ -51,7 +48,7 @@ pub struct Smoke {
 impl HasView for Smoke {
     type View = ();
 
-    /// Nothing, since the run checks nothing.
+    /// Nothing, since no property reads it.
     fn view(&self) {}
 }
 
@@ -91,16 +88,6 @@ impl Subsystem for Smoke {
         Smoke {
             _inputs: Box::new((handle, actions)),
         }
-    }
-
-    /// Checks nothing.
-    fn checker(_: &Rc<Self>, _: &Scenario) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// None.
-    fn properties(_: &Scenario) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The only scenario.
@@ -201,7 +188,7 @@ pub struct Ports {
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
-/// peers, checked by [`NodeChecks`].
+/// peers, checked by [`storage_properties`].
 pub struct Storage {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
@@ -329,20 +316,14 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`NodeChecks`] on the guard's flag.
-    fn checker(this: &Rc<Self>, _: &StorageScenario) -> Box<dyn Checker> {
-        Box::new(NodeChecks::new(this.dispatch.clone()))
+    /// [`storage_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        storage_properties()
     }
 
-    /// [`OPERATION_IDS`] and [`DIRECT_DISPATCH`], active.
-    fn properties(_: &StorageScenario) -> Vec<PropertyRef> {
-        [OPERATION_IDS, DIRECT_DISPATCH]
-            .into_iter()
-            .map(|id| PropertyRef {
-                id: id.to_owned(),
-                status: PropertyStatus::Active,
-            })
-            .collect()
+    /// [`storage_sources`].
+    fn sources() -> Sources {
+        storage_sources()
     }
 
     /// The default scenario.
@@ -365,31 +346,101 @@ pub fn storage_config() -> RunConfig {
     }
 }
 
-/// Checks [`OPERATION_IDS`] on the node's storage facts, instance 0, after
-/// every step, and reports [`DIRECT_DISPATCH`] on the step the guard's
-/// flag is set.
-pub struct NodeChecks {
-    dispatch: DispatchFlag,
+/// The storage harness's properties, [`OPERATION_IDS`] then
+/// [`DIRECT_DISPATCH`], both active. A test harness that wraps
+/// [`Storage`] with its view registers them too.
+pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
+    vec![
+        Property {
+            id: PropertyId::new(OPERATION_IDS),
+            claim: "the node's storage operations get rising IDs, and each completes at most \
+                    once, after its submission",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Storage],
+            status: Status::Active,
+            check: check_operation_ids::<S>,
+            witness: None,
+        },
+        Property {
+            id: PropertyId::new(DIRECT_DISPATCH),
+            claim: "every storage call goes to the node's port",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status: Status::Active,
+            check: check_direct_dispatch::<S>,
+            witness: None,
+        },
+    ]
+}
+
+/// What [`storage_properties`] read: the node's storage facts and the
+/// harness's view, plus the step loop's task observations.
+pub fn storage_sources() -> Sources {
+    Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+}
+
+/// A submission or completion on the node's storage, instance 0.
+fn operation_fact(obs: &Observation) -> Option<&StorageFact> {
+    match obs {
+        Observation::Storage {
+            instance: 0,
+            fact: fact @ (StorageFact::Submitted { .. } | StorageFact::Completed { .. }),
+            ..
+        } => Some(fact),
+        _ => None,
+    }
+}
+
+/// Checks [`OPERATION_IDS`] at each step that logs a submission or
+/// completion on the node's storage. A check keeps no state between steps,
+/// so it replays the node's facts from the run's start, and reports the
+/// first finding among this step's.
+fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    if !cx.observations().any(|obs| operation_fact(obs).is_some()) {
+        return Verdict::NotApplicable;
+    }
+    let mut ids = OperationIds::default();
+    for entry in cx.log.entries() {
+        let Some(fact) = operation_fact(&entry.obs) else {
+            continue;
+        };
+        if let Some((expected, actual)) = ids.check(fact) {
+            if entry.step == cx.step {
+                return cx.violated(expected, actual);
+            }
+        }
+    }
+    Verdict::Holds
+}
+
+/// Checks [`DIRECT_DISPATCH`]: violated once the dispatch guard's flag is
+/// set.
+fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    if cx.view().direct_dispatch_broken {
+        cx.violated(
+            "every storage call goes to the node's port",
+            "a reactor sent a call to its action channel",
+        )
+    } else {
+        Verdict::Holds
+    }
+}
+
+/// The node's operation IDs so far, which [`check_operation_ids`] replays
+/// its facts into.
+#[derive(Debug, Default)]
+struct OperationIds {
     /// The last submitted ID.
     submitted: u64,
     /// Every completed ID.
     completed: BTreeSet<u64>,
-    /// Steps that delivered a submission or completion.
-    applicable: u32,
 }
 
-impl NodeChecks {
-    /// Checks that read `dispatch`.
-    pub fn new(dispatch: DispatchFlag) -> Self {
-        NodeChecks {
-            dispatch,
-            submitted: 0,
-            completed: BTreeSet::new(),
-            applicable: 0,
-        }
-    }
-
-    /// What's wrong with `fact`, if anything.
+impl OperationIds {
+    /// Records `fact`, and returns what's wrong with it, if anything, as
+    /// (expected, actual).
     fn check(&mut self, fact: &StorageFact) -> Option<(String, String)> {
         match *fact {
             StorageFact::Submitted { id, .. } => {
@@ -425,67 +476,6 @@ impl NodeChecks {
     }
 }
 
-impl Checker for NodeChecks {
-    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        if self.dispatch.get() {
-            return Some(Violation {
-                property: DIRECT_DISPATCH.to_owned(),
-                step: cx.step,
-                witness: vec![cx.step],
-                expected: "every storage call goes to the node's port".to_owned(),
-                actual: "a reactor sent a call to its action channel".to_owned(),
-            });
-        }
-        let mut applied = false;
-        for obs in cx.observations() {
-            if let Observation::Storage {
-                instance: 0, fact, ..
-            } = obs
-            {
-                applied |= matches!(
-                    fact,
-                    StorageFact::Submitted { .. } | StorageFact::Completed { .. }
-                );
-                if let Some((expected, actual)) = self.check(fact) {
-                    return Some(Violation {
-                        property: OPERATION_IDS.to_owned(),
-                        step: cx.step,
-                        witness: vec![cx.step],
-                        expected,
-                        actual,
-                    });
-                }
-            }
-        }
-        self.applicable += u32::from(applied);
-        None
-    }
-
-    /// Each property's outcome: violated if the run ended on it, else held
-    /// where it applied.
-    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
-        [(OPERATION_IDS, self.applicable), (DIRECT_DISPATCH, 1)]
-            .into_iter()
-            .map(|(property, applicable)| {
-                let outcome = match &end.violation {
-                    Some(violation) if violation.property == property => {
-                        PropertyOutcome::Violated {
-                            witness: violation.witness.clone(),
-                        }
-                    }
-                    _ if applicable > 0 => PropertyOutcome::Held { applicable },
-                    _ => PropertyOutcome::NotApplicable,
-                };
-                PropertyReport {
-                    property: property.to_owned(),
-                    outcome,
-                    holds_since: None,
-                }
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,8 +504,8 @@ mod tests {
 
     /// `check` on `facts` in order, with each fact's finding.
     fn check_all(facts: &[StorageFact]) -> Vec<Option<(String, String)>> {
-        let mut checks = NodeChecks::new(DispatchFlag::default());
-        facts.iter().map(|fact| checks.check(fact)).collect()
+        let mut ids = OperationIds::default();
+        facts.iter().map(|fact| ids.check(fact)).collect()
     }
 
     /// The finding `check` reports.

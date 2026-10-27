@@ -37,6 +37,10 @@ pub(super) struct ApplyingBlock {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate the body's request reserved at admission, carried from
+    /// the reorder buffer. `None` for a body admitted on its wire size.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the owner snapshot tests
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) submitted: bool,
     /// The peer that delivered this body, used to attribute an apply rejection
     /// for misbehavior scoring.
@@ -94,10 +98,10 @@ struct InFlightSubmission {
 #[cfg(test)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct SequencerOwnership {
-    /// Each reorder-buffer body's height and wire bytes.
-    pub(super) reorder: Vec<(block::Height, u64)>,
-    /// Each `applying` body's height and wire bytes.
-    pub(super) applying: Vec<(block::Height, u64)>,
+    /// Each reorder-buffer body.
+    pub(super) reorder: Vec<RetainedBody>,
+    /// Each `applying` body.
+    pub(super) applying: Vec<RetainedBody>,
     /// Each decoded submission the driver can still retain.
     pub(super) submissions: Vec<SubmissionOwnership>,
 }
@@ -362,7 +366,13 @@ impl Sequencer {
             applying: self
                 .applying
                 .iter()
-                .map(|(height, applying)| (*height, applying.bytes))
+                .map(|(height, applying)| RetainedBody {
+                    height: *height,
+                    owner: applying.owner,
+                    bytes: applying.bytes,
+                    admitted_estimate_bytes: applying.admitted_estimate_bytes,
+                    allocation: applying.body.allocation(),
+                })
                 .collect(),
             submissions: self
                 .in_flight_submissions
@@ -453,6 +463,7 @@ impl Sequencer {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             bytes,
+            None,
             source_peer,
         )
     }
@@ -475,6 +486,7 @@ impl Sequencer {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
         if self.already_retains(height, hash) {
@@ -501,6 +513,7 @@ impl Sequencer {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             source_peer,
         ) {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
@@ -559,6 +572,7 @@ impl Sequencer {
                     previous_block_hash: drained.previous_block_hash,
                     body,
                     bytes: drained.bytes,
+                    admitted_estimate_bytes: drained.admitted_estimate_bytes,
                     submitted: false,
                     source_peer: drained.source_peer,
                 },

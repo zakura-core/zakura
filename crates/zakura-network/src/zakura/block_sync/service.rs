@@ -53,7 +53,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// The block-sync stream layout.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
 }

@@ -152,12 +152,12 @@ impl PendingSessions {
         let kind = layout.primary().kind;
         // Remove first so every invalid continuation releases the existing offer.
         let pending = self.sessions.remove(&kind);
-        if (layout.is_multi_stream() && id == 0) || !layout.streams.contains(&incoming.stream) {
+        if (layout.is_multi_stream() && id == 0) || !layout.streams().contains(&incoming.stream) {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         let mut pending = pending.unwrap_or_else(|| PendingSession {
             id,
-            streams: Vec::with_capacity(layout.streams.len()),
+            streams: Vec::with_capacity(layout.streams().len()),
             deadline: Instant::now() + incoming.context.limits.prelude_timeout,
         });
         if pending.id != id {
@@ -171,13 +171,13 @@ impl PendingSessions {
         }
         if Instant::now() >= pending.deadline
             || pending.streams.iter().any(|s| {
-                s.stream.kind == incoming.stream.kind || !layout.streams.contains(&s.stream)
+                s.stream.kind == incoming.stream.kind || !layout.streams().contains(&s.stream)
             })
         {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
         pending.streams.push(incoming);
-        if pending.streams.len() == layout.streams.len() {
+        if pending.streams.len() == layout.streams().len() {
             pending.streams.sort_unstable_by_key(|s| s.stream.kind);
             Ok(Some(pending.streams))
         } else {
@@ -251,13 +251,16 @@ pub(super) fn spawn_service_session(
             .await;
         });
     }
-    workers.spawn(erased(async move {
-        let _cancel_on_exit = cancel.clone().drop_guard();
-        while running.next().await.is_some() {
-            cancel.cancel();
-        }
-        let _ = exits.send(exit);
-    }));
+    workers.spawn_named(
+        "service_session",
+        erased(async move {
+            let _cancel_on_exit = cancel.clone().drop_guard();
+            while running.next().await.is_some() {
+                cancel.cancel();
+            }
+            let _ = exits.send(exit);
+        }),
+    );
     admitted
 }
 

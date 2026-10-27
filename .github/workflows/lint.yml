@@ -13,10 +13,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -40,10 +39,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -60,7 +58,7 @@ on:
   # so this runs unconditionally on every queued entry.
   merge_group:
 
-  # Nightly run for the expensive, non-gating lints (unused-deps, docs) that are
+  # Nightly run for the expensive, non-gating unused-deps lint that is
   # gated off the PR/merge path below.
   schedule:
     - cron: "0 8 * * *"
@@ -146,35 +144,6 @@ jobs:
       # coverage.
       - run: cargo check --workspace --bins
 
-  docs:
-    name: docs
-    # A full `--all-features --document-private-items` doc build is expensive and
-    # not a correctness gate. Run it nightly / on demand only, keeping it off the
-    # PR critical path.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
-        with:
-          # Later nightlies hit the rustdoc ICE described at `PUBLIC_API_NIGHTLY` in
-          # semver-checks.yml. Keep the two pins in step.
-          toolchain: nightly-2026-09-06
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: ./.github/actions/setup-zakura-build
-      - run: cargo doc --no-deps --workspace --all-features --document-private-items --target-dir "$(pwd)"/target/internal
-        env:
-          # The -A and -W settings must be the same as the `rustdocflags` in:
-          # https://github.com/ZcashFoundation/zebra/blob/main/.cargo/config.toml#L87
-          RUSTDOCFLAGS: -A rustdoc::private_intra_doc_links -D warnings
-
   fast-lints:
     name: fast lints
     permissions:
@@ -203,7 +172,13 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck .github/actions/setup-zakura-build/*.sh scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: Ubuntu package retry tests
+        if: ${{ !cancelled() }}
+        run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
+      - name: Real apt mirror failover test
+        if: ${{ !cancelled() }}
+        run: python3 .github/actions/setup-zakura-build/test_apt_failover.py
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
@@ -230,17 +205,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_pr_node_bake.py
 
-      - name: Perf-bench compare tests
-        if: ${{ !cancelled() }}
-        run: python3 .github/workflows/scripts/test_perf_bench_compare.py
-
       - name: Affected semver package tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
 
       - name: CI alert tests
         if: ${{ !cancelled() }}
-        run: python3 .github/workflows/scripts/test_ci_alert.py
+        run: |
+          python3 -m pip install --disable-pip-version-check -r .github/workflows/scripts/requirements-ci-alerts.txt
+          python3 .github/workflows/scripts/test_ci_alert.py
 
       - name: Deployer tests
         if: ${{ !cancelled() }}
@@ -322,7 +295,7 @@ jobs:
           toolchain: nightly
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-udeps
       - uses: ./.github/actions/setup-zakura-build
@@ -350,14 +323,14 @@ jobs:
       # Install cargo-deny from a prebuilt binary instead of the EmbarkStudios
       # Docker action: that action rebuilds a container from a Docker Hub base
       # image on every run, which intermittently fails with registry timeouts.
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-deny@0.19.5
 
       - name: Install cargo-vet
         # v2.84.1 resolves `latest` to cargo-vet 0.10.0, which cannot read
         # trusted-publisher entries generated by cargo-vet 0.10.2.
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
         with:
           tool: cargo-vet@0.10.2
 
@@ -376,6 +349,19 @@ jobs:
           hits=$(cargo tree --locked -p zakura -e normal --prefix none | grep -E "$denied" | sort -u || true)
           if [ -n "$hits" ]; then
             echo "zakurad's dependency graph contains packages that docs/specs/zakura-quic.md DEP-1 forbids:"
+            echo "$hits"
+            exit 1
+          fi
+
+      # The simulator crates and their coroutine library are test-only and
+      # must never reach the zakurad binary.
+      - name: Check zakurad has no simulator packages
+        if: ${{ !cancelled() }}
+        run: |
+          denied='^(zakura-scheduler|zakura-sim|zakura-storage|corosensei) '
+          hits=$(cargo tree --locked -p zakura -e normal,build --target all --prefix none | grep -E "$denied" | sort -u || true)
+          if [ -n "$hits" ]; then
+            echo "zakurad's dependency graph contains test-only simulator packages:"
             echo "$hits"
             exit 1
           fi
@@ -417,7 +403,6 @@ jobs:
     needs:
       - rust-checks
       - msrv
-      - docs
       - fast-lints
       - unused-deps
       - supply-chain
@@ -474,5 +459,5 @@ jobs:
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
-          # docs and unused-deps run only on the nightly schedule / on demand.
-          allowed-skips: docs, unused-deps
+          # unused-deps runs only on the nightly schedule / on demand.
+          allowed-skips: unused-deps

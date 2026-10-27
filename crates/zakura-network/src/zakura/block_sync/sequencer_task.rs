@@ -47,6 +47,9 @@ pub(super) struct SequencedBody {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate this body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
     queue_accounting: SequencerInputAccounting,
@@ -62,6 +65,7 @@ impl SequencedBody {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
         received_at: Instant,
         input_bytes: Arc<AtomicU64>,
@@ -76,6 +80,7 @@ impl SequencedBody {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             peer,
             received_at,
             queue_accounting: SequencerInputAccounting::new(
@@ -90,6 +95,17 @@ impl SequencedBody {
     /// Transfer this body out of queue ownership before processing it.
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
+    }
+
+    /// The wire bytes this body charges to the input-queue counter: its size
+    /// while queued, zero once it left the queue.
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> u64 {
+        if self.queue_accounting.active {
+            self.queue_accounting.bytes
+        } else {
+            0
+        }
     }
 }
 
@@ -110,6 +126,9 @@ impl SequencerInputAccounting {
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
+        // Gauge increments commute, so concurrent charges and releases leave the
+        // gauge equal to the counter. This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
         add_atomic_bytes(
             &input_decoded_attributed_memory_bytes,
             decoded_attributed_memory_size_bytes,
@@ -128,6 +147,8 @@ impl SequencerInputAccounting {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
+        // This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").decrement(self.bytes as f64);
         release_atomic_bytes(
             &self.input_decoded_attributed_memory_bytes,
             self.decoded_attributed_memory_size_bytes,
@@ -283,6 +304,10 @@ pub(super) struct SequencerTask {
     current_state_version: Option<zakura_header_chain::StateVersion>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
+    /// Dates body-retry episodes and converts their deadlines to `Instant`s.
+    /// Production passes [`BlockSyncClock`], so both
+    /// sides read the run's UTC.
+    retry_clock: Arc<dyn zakura_header_chain::Clock>,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     _body_input_bytes: Arc<AtomicU64>,
@@ -321,6 +346,7 @@ impl SequencerTask {
         frontiers: BlockSyncFrontiers,
         current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
         retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
+        retry_clock: Arc<dyn zakura_header_chain::Clock>,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<AtomicU64>,
@@ -347,6 +373,7 @@ impl SequencerTask {
                 .map(|_| zakura_header_chain::StateVersion::default()),
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
             retry_jitter,
+            retry_clock,
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
@@ -580,6 +607,7 @@ impl SequencerTask {
             body.previous_block_hash,
             body.body,
             body.bytes,
+            body.admitted_estimate_bytes,
             body.peer,
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
@@ -938,7 +966,7 @@ impl SequencerTask {
                         owner.header_generation,
                         header,
                         eligible_sources.clone(),
-                        &zakura_header_chain::SystemClock,
+                        self.retry_clock.as_ref(),
                     )
                 });
             self.body_retries.insert(episode);
@@ -948,11 +976,7 @@ impl SequencerTask {
             .get_mut(owner.header_generation, owner.branch, hash)
             .expect("the exact retry episode exists because it was inserted above");
         episode.refresh_suppliers(eligible_sources.clone());
-        let update = episode.record_failure(
-            source,
-            &zakura_header_chain::SystemClock,
-            &self.retry_jitter,
-        );
+        let update = episode.record_failure(source, self.retry_clock.as_ref(), &self.retry_jitter);
         let deferred_sources = if episode.alarmed {
             eligible_sources.clone()
         } else {
@@ -975,7 +999,7 @@ impl SequencerTask {
             deferred_sources,
             owner.authority(),
             hash,
-            retry_deadline_instant(retry_at),
+            retry_deadline_instant(retry_at, self.retry_clock.as_ref()),
         );
     }
 
@@ -1306,6 +1330,7 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod ownership;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
@@ -1374,6 +1399,7 @@ mod tests {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             123,
+            None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
@@ -1481,6 +1507,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1538,6 +1565,7 @@ mod tests {
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
             bytes,
+            None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             task._body_input_bytes.clone(),
@@ -1632,6 +1660,7 @@ mod tests {
             frontiers,
             Some(scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1676,6 +1705,7 @@ mod tests {
             frontiers,
             Some(old_scope),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1737,6 +1767,7 @@ mod tests {
             frontiers,
             Some(old_authority),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1789,6 +1820,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1881,6 +1913,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1994,6 +2027,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -2083,6 +2117,99 @@ mod tests {
         );
     }
 
+    /// A wall clock a fixed offset from the host's, standing in for a
+    /// simulated run whose scenario UTC differs from the host.
+    struct OffsetClock(chrono::Duration);
+
+    impl zakura_header_chain::Clock for OffsetClock {
+        /// The host's UTC plus the offset.
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now() + self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_follows_the_sequencer_clock() {
+        let frontiers = genesis_frontiers();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let registry = Arc::new(PeerRegistry::new());
+        // A day ahead, so an episode or failure dated by the host clock lands a
+        // day early: the deadline collapses to now, or the episode alarms.
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            registry.clone(),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            Arc::new(OffsetClock(chrono::Duration::days(1))),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let mut outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xa3; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+            availability: zakura_header_chain::BodyUnavailableSummary::default(),
+        });
+
+        let before = Instant::now();
+        task.handle_apply_finished(
+            owner,
+            source,
+            token,
+            height,
+            hash,
+            &mut outcome,
+            BTreeSet::new(),
+            None,
+            Some((owner, zakura_header_chain::StateVersion::new(8))),
+        )
+        .await;
+        let after = Instant::now();
+
+        // The first retry backs off one second, give or take 10% jitter.
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid");
+        let deadline = registry
+            .next_body_retry_deadline(&peer, before)
+            .expect("the failed supplier is deferred");
+        assert!(
+            deadline >= before + Duration::from_millis(900)
+                && deadline <= after + Duration::from_millis(1_100),
+            "the retry is one backoff out, not {:?} after the failure",
+            deadline.saturating_duration_since(before),
+        );
+    }
+
     #[tokio::test]
     async fn closed_action_receiver_retains_exact_required_evidence() {
         let frontiers = genesis_frontiers();
@@ -2101,6 +2228,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2173,6 +2301,7 @@ mod tests {
                     frontiers,
                     Some(super::test_work_scope()),
                     crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                    std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                     body_rx,
                     control_rx,
                     input_bytes.clone(),
@@ -2273,6 +2402,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -2380,6 +2510,7 @@ mod tests {
                 frontiers,
                 Some(super::test_work_scope()),
                 crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                 body_rx,
                 control_rx,
                 input_bytes.clone(),
@@ -2502,6 +2633,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -2574,6 +2706,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes,
@@ -2630,6 +2763,7 @@ mod tests {
             frontiers,
             Some(super::test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),

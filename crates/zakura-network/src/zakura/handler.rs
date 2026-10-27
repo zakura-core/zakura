@@ -25,7 +25,7 @@ use zakura_chain::{
     transaction::Transaction,
 };
 use zakura_jsonl_trace::{JsonlTraceTables, JsonlTracer};
-use zakura_node_services::task::{erased, spawn_erased};
+use zakura_node_services::task::{erased, spawn_erased_named};
 use zakura_quic::{
     Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, NodeId, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt,
@@ -38,7 +38,7 @@ use zakura_rt::{
         broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
         MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
     },
-    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet},
+    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
     time::{timeout, Instant},
 };
 
@@ -880,7 +880,10 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        spawn_erased(native_dial_supervised(endpoint, node_addr, limits, policy))
+        spawn_erased_named(
+            "native_dial",
+            native_dial_supervised(endpoint, node_addr, limits, policy),
+        )
     }
 
     /// Start one maintained native dial for a legacy handoff.
@@ -919,7 +922,7 @@ impl ZakuraEndpoint {
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
-        let dial = spawn_erased(async move {
+        let dial = spawn_erased_named("upgrade_dial", async move {
             let _lifetime_guard = task_lifetime.drop_guard();
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
             endpoint
@@ -1323,7 +1326,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
-        started: Option<oneshot::Sender<()>>,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1362,7 +1365,10 @@ pub enum ZakuraOutboundFrame {
         payload: Vec<u8>,
         /// Fired when the connection takes this request off its queue and
         /// starts the exchange, since it serves one request at a time.
-        started: Option<oneshot::Sender<()>>,
+        ///
+        /// Only legacy gossip sets it, and legacy code stays on tokio, so this
+        /// is tokio's sender in both builds.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },
@@ -1835,11 +1841,9 @@ impl Drop for RegisteredPeerCleanupGuard {
         let supervisor = self.supervisor.clone();
         let peer_id = self.peer_id.clone();
         let conn_id = self.conn_id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _task = handle.spawn(erased(async move {
-                supervisor.deregister(&peer_id, conn_id).await;
-            }));
-        }
+        let _task = zakura_rt::task::try_spawn(erased(async move {
+            supervisor.deregister(&peer_id, conn_id).await;
+        }));
     }
 }
 
@@ -2062,7 +2066,7 @@ impl ServiceSessionState {
                 self.install_demand_wait(
                     waits,
                     Box::pin(async move {
-                        zakura_rt::time::sleep_until(at.into()).await;
+                        zakura_rt::time::sleep_until(at).await;
                     }),
                 );
             }
@@ -2767,7 +2771,7 @@ impl ZakuraProtocolHandler {
             .map(|stream| {
                 self.registry
                     .session_layout(*stream)
-                    .map_or(1, |layout| layout.streams.len())
+                    .map_or(1, |layout| layout.streams().len())
             })
             .sum();
         if opening_stream_count > usize::from(limits.max_open_streams) {
@@ -3338,8 +3342,8 @@ impl ZakuraProtocolHandler {
             .reserve_session(direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
         let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
-        let mut prepared = Vec::with_capacity(layout.streams.len());
-        for member in layout.streams.iter().copied() {
+        let mut prepared = Vec::with_capacity(layout.streams().len());
+        for member in layout.streams().iter().copied() {
             let mut member = self
                 .prepare_ordered_stream(
                     connection,
@@ -3640,13 +3644,10 @@ impl ZakuraProtocolHandler {
                 }
             };
         }
-        admission.workers.spawn(request_stream_worker(
-            send,
-            recv,
-            prelude,
-            context,
-            self.registry.clone(),
-        ));
+        admission.workers.spawn_named(
+            "request_stream_worker",
+            request_stream_worker(send, recv, prelude, context, self.registry.clone()),
+        );
         None
     }
 
@@ -4290,12 +4291,15 @@ async fn spawn_zakura_endpoint_inner(
     let header_sync_actions = if block_sync_driver_enabled {
         Some(Arc::new(AsyncMutex::new(Some(header_sync_actions))))
     } else {
-        let action_driver_task = zakura_rt::task::spawn(drive_header_sync_actions(
-            header_sync_actions,
-            header_sync.clone(),
-            supervisor.clone(),
-            header_sync_shutdown.clone(),
-        ));
+        let action_driver_task = zakura_rt::task::spawn_named(
+            "header_sync_actions",
+            drive_header_sync_actions(
+                header_sync_actions,
+                header_sync.clone(),
+                supervisor.clone(),
+                header_sync_shutdown.clone(),
+            ),
+        );
         tasks.push(action_driver_task);
         None
     };
@@ -4351,7 +4355,7 @@ async fn spawn_zakura_endpoint_inner(
         let capability_handler = endpoint.handler.clone();
         let capability_supervisor = endpoint.supervisor.clone();
         let shutdown = endpoint.background_shutdown_token();
-        let task = spawn_erased(async move {
+        let task = spawn_erased_named("header_capabilities", async move {
             let mut epochs = HeaderCapabilityEpochs::from_initial(&service_demand.borrow());
             loop {
                 let ready_epoch = epochs.observe(&service_demand.borrow());
@@ -4384,7 +4388,7 @@ async fn spawn_zakura_endpoint_inner(
     {
         let shutdown = endpoint.background_shutdown_token();
         let log_endpoint = endpoint.clone();
-        let task = spawn_erased(async move {
+        let task = spawn_erased_named("dial_address_log", async move {
             zakura_rt::select! {
                 biased;
                 _ = shutdown.cancelled() => {}
@@ -4756,7 +4760,7 @@ async fn persistent_stream_worker_with_policy(
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
-    let reader = AbortOnDropHandle::new(spawn_erased(async move {
+    let reader = AbortOnDropHandle::new(spawn_erased_named("stream_reader", async move {
         // Session teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
@@ -4846,11 +4850,12 @@ async fn persistent_stream_worker_with_policy(
                 }
             };
             // Any error is terminal. `Closed` is a clean peer-initiated close;
-            // every other error is a protocol/limit violation that must
-            // disconnect the peer. Forward the error first so the main loop can
-            // map it to a reset code, then cancel the connection ourselves so
-            // the disconnect is guaranteed even if the main loop tore the worker
-            // down for a stopped outbound write before processing it.
+            // every other error must disconnect the peer, under the cause
+            // `read_close_cause` gives it. Forward the error first so the main
+            // loop can map it to a reset code, then cancel the connection
+            // ourselves so the disconnect is guaranteed even if the main loop
+            // tore the worker down for a stopped outbound write before
+            // processing it.
             let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
             if !must_disconnect && !reader_context.stream_token.is_cancelled() {
                 if let Some(cause) = &reader_failure_cause {
@@ -4859,9 +4864,10 @@ async fn persistent_stream_worker_with_policy(
                     cause.record(OrderedStreamFailure::RemoteClose);
                 }
             }
+            let cause = read_close_cause(ReadPath::Ordered, &error);
             let _ = error_tx.send(error).await;
             if must_disconnect {
-                reader_context.close_cause.record("ordered_read_error");
+                reader_context.close_cause.record(cause);
                 reader_context.connection_token.cancel();
             }
             break;
@@ -4944,31 +4950,18 @@ async fn persistent_stream_worker_with_policy(
                 }
             }
             error = error_rx.recv() => {
-                match error {
-                    Some(ZakuraHandlerError::Oversize) => {
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-                        context.close_cause.record("ordered_oversize");
+                if let Some(error) = error {
+                    if let Some((code, cause)) = ordered_read_close(&error) {
+                        // The reader already emitted any oversize-desync diagnostic.
+                        if code == ZAKURA_CLOSE_BAD_PRELUDE {
+                            debug!(?error, "closing Zakura stream worker");
+                        }
+                        let _ = send.reset(VarInt::from_u32(code));
+                        context.close_cause.record(cause);
                         context.connection_token.cancel();
-                        break;
-                    }
-                    Some(ZakuraHandlerError::RateLimited) => {
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-                        context.close_cause.record("ordered_rate_limited");
-                        context.connection_token.cancel();
-                        break;
-                    }
-                    Some(ZakuraHandlerError::Closed) | None => {
-                        break;
-                    }
-                    // The reader already emitted any oversize-desync diagnostic.
-                    Some(error) => {
-                        debug!(?error, "closing Zakura stream worker");
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                        context.close_cause.record("ordered_read_error");
-                        context.connection_token.cancel();
-                        break;
                     }
                 }
+                break;
             }
         }
     }
@@ -4984,6 +4977,59 @@ async fn persistent_stream_worker_with_policy(
     reader.abort();
     // Keep the stream permit until the reader has actually dropped its buffers.
     let _ = reader.await;
+}
+
+/// How the ordered worker closes on an error its reader forwarded: the
+/// stream's reset code and the close cause to record. `None` is a clean
+/// close, which resets and records nothing.
+fn ordered_read_close(error: &ZakuraHandlerError) -> Option<(u32, &'static str)> {
+    let code = match error {
+        ZakuraHandlerError::Closed => return None,
+        ZakuraHandlerError::Oversize => ZAKURA_CLOSE_OVERSIZE,
+        ZakuraHandlerError::RateLimited => ZAKURA_CLOSE_RATE_LIMIT,
+        _ => ZAKURA_CLOSE_BAD_PRELUDE,
+    };
+    Some((code, read_close_cause(ReadPath::Ordered, error)))
+}
+
+/// The frame reader that hit a read error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadPath {
+    /// The reader of a persistent ordered stream.
+    Ordered,
+    /// The responder reading a request stream's one request frame.
+    Request,
+}
+
+/// The close cause for a frame-read error on `path`.
+///
+/// Only the `*_read_rejected` causes are peer faults: the frame broke its
+/// stream's table or frame cap, or ended before its declared length. Timeout
+/// and transport causes are neutral, and every unlisted error (such as `Io`)
+/// is transport. A request stream that closes before its request frame ends is
+/// transport too. The ordered path never records `Closed`, which is a clean close.
+///
+/// The ordered reader and its worker race to record one error, and
+/// [`CloseCause`] keeps the first writer, so both record through this. That
+/// includes the reader's admission failures, which keep their own causes.
+fn read_close_cause(path: ReadPath, error: &ZakuraHandlerError) -> &'static str {
+    use zakura_quic::ReadExactError::FinishedEarly;
+    use ZakuraHandlerError::*;
+
+    let rejected = matches!(
+        error,
+        RejectedFrame { .. } | OversizeFrame { .. } | QuicRead(FinishedEarly(_))
+    );
+    match (path, error) {
+        (ReadPath::Ordered, Oversize) => "ordered_oversize",
+        (ReadPath::Ordered, RateLimited) => "ordered_rate_limited",
+        (ReadPath::Ordered, _) if rejected => "ordered_read_rejected",
+        (ReadPath::Request, _) if rejected => "request_read_rejected",
+        (ReadPath::Ordered, Timeout(_)) => "ordered_read_timeout",
+        (ReadPath::Request, Timeout(_)) => "request_read_timeout",
+        (ReadPath::Ordered, _) => "ordered_read_transport",
+        (ReadPath::Request, _) => "request_read_transport",
+    }
 }
 
 fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
@@ -5030,7 +5076,9 @@ async fn request_stream_worker(
                 "closing Zakura request stream with invalid request frame"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.close_cause.record("request_read_error");
+            context
+                .close_cause
+                .record(read_close_cause(ReadPath::Request, &error));
             context.connection_token.cancel();
             return;
         }
@@ -6474,6 +6522,7 @@ mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
+    mod read_close_cause;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;
     use crate::{
@@ -8988,7 +9037,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(waits.len(), 1);
@@ -9015,7 +9064,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.reopen_attempts, 1);
@@ -9034,7 +9083,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.schedule_transport_backoff(&mut waits), None);
@@ -9054,7 +9103,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         session.schedule_demand(&mut waits, SessionDemand::Retire);
 
@@ -9112,7 +9161,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         tokio::time::advance(Duration::from_secs(60)).await;
         let (kind, ()) = waits
@@ -10480,6 +10529,7 @@ mod tests {
         use crate::zakura::{block_sync_streams, MessageRole, PayloadLen};
 
         const REQUEST: MessageRule = MessageRule {
+            name: "request",
             message_type: 2,
             payload: PayloadLen::exact(9),
             role: MessageRole::Request {
@@ -10488,6 +10538,7 @@ mod tests {
             },
         };
         const RESPONSE: MessageRule = MessageRule {
+            name: "response",
             message_type: 3,
             payload: PayloadLen::between(1, 99),
             role: MessageRole::Response {

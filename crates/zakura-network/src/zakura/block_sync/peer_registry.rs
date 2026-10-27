@@ -23,7 +23,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use zakura_chain::block;
@@ -33,6 +33,7 @@ use zakura_rt::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
+    time::Instant,
 };
 
 use super::{
@@ -194,10 +195,15 @@ impl BodyRetryKey {
     }
 }
 
-pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+/// The monotonic instant at which UTC `deadline` arrives by `clock`, or now if
+/// it has passed. `clock` must be the one that dated `deadline`.
+pub(super) fn retry_deadline_instant(
+    deadline: chrono::DateTime<chrono::Utc>,
+    clock: &dyn zakura_header_chain::Clock,
+) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(clock.now())
         .to_std()
         .unwrap_or(Duration::ZERO);
     monotonic_now
@@ -1096,6 +1102,22 @@ impl PeerRegistry {
             } else {
                 other_score < self_score
             }
+        })
+    }
+
+    /// `peer`'s published outstanding claims, by height, read from its entry.
+    /// Empty for a peer with no entry.
+    #[cfg(test)]
+    pub(super) fn outstanding_snapshot(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Vec<(block::Height, OutstandingMeta)> {
+        self.lock().get(peer).map_or_else(Vec::new, |entry| {
+            entry
+                .outstanding
+                .iter()
+                .map(|(height, meta)| (*height, *meta))
+                .collect()
         })
     }
 

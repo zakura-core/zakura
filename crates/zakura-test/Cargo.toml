@@ -1,6 +1,6 @@
 [package]
 name = "zakura-test"
-version = "3.0.0"
+version = "4.0.0"
 authors.workspace = true
 description = "Test harnesses and test vectors for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -17,11 +17,9 @@ categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 [dependencies]
 hex = { workspace = true }
 indexmap = { workspace = true }
-lazy_static = { workspace = true }
 insta = { workspace = true }
 itertools = { workspace = true }
 proptest = { workspace = true }
-once_cell = { workspace = true }
 regex = { workspace = true }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }

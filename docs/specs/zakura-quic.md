@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-17. Version 0.10.
+Status: draft for review, 2026-10-23. Version 0.14.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -22,7 +22,15 @@ connections, and ADM-13, which releases a closed connection's stream buffers
 and gives closed connections their own allowance, and makes CTRL-26 fund
 both; §17g lists each change. Version 0.10 limits discovery dials below
 inbound refusal while keeping the full dial reserve for maintained connections;
-§17h explains it.
+§17h explains it. Version 0.11 adds the socket seam: a socket factory binds
+every socket, so a simulation can inject sockets that never reach the OS. It
+changes SOCK-3 to SOCK-5, SOCK-7, SOCK-9 and SOCK-13, and adds a §16 row;
+§17i lists each change. Version 0.12 adds `bind_with`, which takes the socket
+factory and the endpoint inputs, so a simulation can replay a handshake byte
+for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
+each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
+come from the runtime a simulation controls; §17k explains it. Version 0.14
+adds the §16 row for byte-identical replay; §17l explains it.
 
 ## 0. Conventions
 
@@ -42,6 +50,13 @@ Terms:
   reach the tasks only through messages.
 - **Iroh backend**: the transport before `zakura-quic`, Zakura's fork of Iroh 1.1.
 - **Direct backend**: `zakura-quic`.
+- **Socket factory**: what binds an endpoint's sockets, at bind and for each
+  SOCK-9 rebind. The production factory binds OS UDP sockets. A simulation
+  injects its own factory, whose sockets are **injected sockets**.
+- **Endpoint inputs**: the randomness `bind_with` takes in place of the
+  production sources: the endpoint RNG seed, the stateless-reset and Retry
+  token keys, the connection ID generator, the client's initial destination
+  connection ID, and the TLS random source and key-exchange groups (API-2).
 - **Admitted IP**: the source IP of the `Incoming` that `admit` accepted, or the
   IP a dial connected to. It never changes for the life of the connection.
 
@@ -68,7 +83,7 @@ Terms:
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
   `bytes`, `curve25519-dalek`, `ed25519-zebra`, `futures`, `hex`, `libc`,
   `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
-  `socket2`, `thiserror`, `tokio`, `tracing` and `zeroize`.
+  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -150,7 +165,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
   `Conn::remote_id()` MUST return only a key proven this way.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
-  TLS 1.3 cipher suites.
+  TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
+  `bind_with` MAY replace the provider's random source and key-exchange
+  groups, and nothing else.
 - **TLS-10.** The server MUST refuse 0-RTT (`max_early_data_size = 0`). The
   client MUST NOT send 0-RTT data. Session tickets MAY be issued; they don't
   affect 1-RTT compatibility.
@@ -201,14 +218,17 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   socket that created it for its whole life. Only an unset `listen_addr` binds
   more than one socket.
 - **SOCK-2.** IPv6 sockets MUST set `IPV6_V6ONLY`.
-- **SOCK-3.** At bind, the endpoint MUST request `recv_buffer_bytes` and
-  `send_buffer_bytes` through `socket2`'s `set_recv_buffer_size` and
-  `set_send_buffer_size`. It MUST read both sizes back.
+- **SOCK-3.** When the production factory binds a socket, it MUST request
+  `recv_buffer_bytes` and `send_buffer_bytes` through `socket2`'s
+  `set_recv_buffer_size` and `set_send_buffer_size`. It MUST read both sizes
+  back. SOCK-3 to SOCK-5 apply only to those sockets.
 - **SOCK-4.** If a read-back size is below the request, the endpoint MUST log
   one `warn` line that names the requested size, the effective size and the
   sysctl to raise (`net.core.rmem_max` or `wmem_max`). Linux reports double the
   granted size; the comparison MUST account for that.
-- **SOCK-5.** The effective sizes MUST be exported as gauges (OBS-1).
+- **SOCK-5.** The effective sizes MUST be exported as gauges (OBS-1). An
+  injected socket reports no buffer sizes: its `SocketStats::buffers` is all
+  zeros, and it sets no gauge.
 - **SOCK-6.** The send path MUST NOT drop a connection's packet because the
   socket returned `WouldBlock`. The connection task keeps the blocked transmit,
   waits until the socket is writable, and sends it before it polls
@@ -218,16 +238,20 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **SOCK-7.** On Linux, the endpoint MUST read the per-socket `drops` column from
   `/proc/net/udp` or `/proc/net/udp6`, matching the socket's inode. It reads
   every `kernel_drop_poll_secs` and exports the value as a counter (OBS-1). On
-  other platforms the metric is absent.
+  other platforms the metric is absent. Only production sockets have an
+  inode. An injected socket has none, so the endpoint doesn't start the poller
+  for it.
 - **SOCK-8.** GSO and GRO follow `gso` (CTRL-12) and SOCK-13. The endpoint sends
   no ECN marks and reads none, so `quinn-proto` reacts to loss only.
 - **SOCK-9.** On a fatal socket error (not `WouldBlock` or `Interrupted`), the
   endpoint task MUST replace the socket once with a new socket on the same
-  address. It closes the old socket and waits up to 1 s for in-flight sends to
+  address, which the socket factory builds. It closes the old socket and waits up to 1 s for in-flight sends to
   release it, so the new bind doesn't fail with `EADDRINUSE`. Connection tasks
   drop what they would send while the rebind runs; `quinn-proto` counts it as
   loss and retransmits. If the rebind fails or the error repeats within 60 s,
-  the endpoint MUST log the error and stop that socket's endpoint task.
+  the endpoint MUST log the error and stop that socket's endpoint task. The
+  60 s window MUST be measured on the runtime's monotonic clock, the one that
+  drives `quinn-proto` timers, not on `std::time::Instant`.
 - **SOCK-10.** `local_addrs()` returns the bound addresses. For an unspecified
   bind, the advertised-address logic in `zakura-network` lists interfaces itself
   through `libc::getifaddrs` (DEP-7), replacing netwatch.
@@ -241,7 +265,8 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   `quinn_proto::Connection::local_address_changed`. Each connection then
   forgets the local address it sends from, and the kernel picks a new one. The
   endpoint MUST NOT rebind a socket for a network change.
-- **SOCK-13.** On Linux, the socket layer MUST use its own fast path (DEP-7):
+- **SOCK-13.** On Linux, the production socket type MUST use its own fast
+  path (DEP-7):
   - `sendmsg` with a `UDP_SEGMENT` control message for GSO, probed once per
     process, at most 10 segments per send;
   - an `EIO` on a segmented send disables GSO on that socket for good;
@@ -256,6 +281,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 
   Other platforms use plain tokio `send_to` and `recv_from` without offloads.
   A receive loop MUST NOT spin on a persistent error (GHSA-6pp4).
+
+  An injected socket reports no GSO, sends one datagram per transmit and
+  doesn't allow MTU discovery. The GSO probe never runs for it.
 
 ## 6a. Driver
 
@@ -409,7 +437,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
   `ring::hmac::Key` for resets. Each key is random per startup and never
-  persists. Iroh's BLAKE3 keys go away.
+  persists. `bind` keeps these defaults. `bind_with` MAY take both keys as
+  endpoint inputs. Iroh's BLAKE3 keys go away.
 - **ADM-11.** The endpoint task MUST remove a connection from its table only
   when `quinn-proto` reports the connection drained, and MUST NOT pass
   `quinn-proto` an event for a connection it already removed. A connection
@@ -732,6 +761,16 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
+  - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
+    which binds every socket through the factory and takes its randomness
+    from the endpoint inputs. An input left unset keeps its production
+    source, so `bind` is `bind_with` with the production factory and
+    `EndpointInputs::default()`. The public types it takes are the socket
+    trait `UdpIo`, its receive metadata `RecvMeta`, `SocketFactory` and its
+    `BoundSocket`, and `EndpointInputs`. The crate re-exports the
+    `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
+    `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
+    and `SupportedKxGroup`;
   - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
     and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
     `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
@@ -933,6 +972,9 @@ this release tolerates, and keep each hard change explicit.
 | A changed interface list notifies connections once, each connection moves to a fresh remote connection ID, and an open connection keeps working | SOCK-12 |
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
+| An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
+| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's default, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
@@ -1185,3 +1227,74 @@ Changed:
   could hold 32 live slots and refuse inbound peers until the dials timed out.
   Bootstrap and maintained dials retain access to the full connection cap.
 - **API-2.** Adds `connect_discovery` and `has_discovery_capacity`.
+
+## 17i. Changes in version 0.11
+
+The driver now reaches sockets through a socket seam, so deterministic
+simulation can run the real driver over an in-memory network. A socket
+factory binds every socket, and the production factory keeps today's
+behavior. Nothing new is public in this version.
+
+Changed:
+
+- **SOCK-3 to SOCK-5.** Buffer sizing, the clamp warning and the gauges apply
+  only to sockets the production factory binds. An injected socket reports
+  all-zero buffer sizes and sets no gauge.
+- **SOCK-7.** The endpoint starts the kernel drop poller only for a socket
+  with an inode, which an injected socket doesn't have.
+- **SOCK-9.** The socket factory builds the replacement socket, so a rebind
+  of an injected socket never reaches the OS. The 60 s window is measured on
+  the runtime's monotonic clock instead of `std::time::Instant`, so virtual
+  time decides it in a simulation.
+- **SOCK-13.** The fast path belongs to the production socket type. An
+  injected socket reports no GSO, sends one datagram per transmit, doesn't
+  allow MTU discovery and never triggers the GSO probe.
+- **§16.** Adds a test that runs an endpoint on injected sockets without any
+  OS access.
+
+## 17j. Changes in version 0.12
+
+`QuicEndpoint::bind_with` takes a socket factory and the endpoint inputs, so
+a deterministic simulation can give two runs the same randomness and get the
+same datagrams. `bind` keeps every production source. The Retry token time
+and the TLS certificate-check time aren't endpoint inputs. They come from the
+runtime's UTC clock in a later version.
+
+Changed:
+
+- **API-2.** Adds `bind_with`, `EndpointInputs`, the socket seam types and
+  the re-exports they need. The seam was crate-private in version 0.11.
+- **TLS-9.** `bind_with` may replace the provider's random source and
+  key-exchange groups. The cipher suites stay ring's defaults. ring's own
+  key-exchange groups draw from `SystemRandom` directly, so a seeded random
+  source alone doesn't fix the key shares.
+- **ADM-10.** `bind_with` may take the Retry token key and the
+  stateless-reset key as inputs. `bind` keeps random keys per startup.
+- **§16.** Adds a test that `bind` injects nothing and that `bind_with` uses
+  every input it takes.
+
+## 17k. Changes in version 0.13
+
+The driver reads its clocks through `zakura-rt`, the runtime layer that a
+deterministic simulation controls. In production each `zakura-rt` name is the
+tokio or std item the code used before, so behavior doesn't change.
+
+Changed:
+
+- **DEP-2.** Adds `zakura-rt`. The driver's monotonic clock and timers, the
+  Retry token time and the TLS certificate-check time come from it. In a
+  simulated run the two UTC readings follow the scenario clock, so Retry
+  tokens and certificate checks never read the host clock. Tasks, channels
+  and locks move onto `zakura-rt` in later changes.
+
+## 17l. Changes in version 0.14
+
+The replay tests for deterministic simulation are in place, so §16 records
+them.
+
+Changed:
+
+- **§16.** Adds a test that a simulated Retry handshake and stream exchange
+  replay byte for byte, in one process and across processes, and that each
+  seeded input, the seed and the UTC origin change the bytes while host time
+  doesn't.

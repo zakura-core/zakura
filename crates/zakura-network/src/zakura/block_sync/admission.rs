@@ -1,6 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::{
     config::{ZakuraBlockSyncConfig, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},

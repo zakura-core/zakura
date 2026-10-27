@@ -9,11 +9,13 @@
 
 pub mod client;
 pub mod config;
+#[cfg(feature = "indexer-rpc")]
 pub mod indexer;
 pub mod methods;
 pub mod node;
 pub mod queue;
 pub mod server;
+#[cfg(feature = "indexer-rpc")]
 pub mod sync;
 
 #[cfg(test)]

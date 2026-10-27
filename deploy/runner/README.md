@@ -231,6 +231,17 @@ During restart deploys, the workflows write a Unix timestamp 20 minutes in the
 future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. While that marker
 is active, new failure alerts are logged locally but not posted to Slack.
 
+## Release-State Availability
+
+Release-state pointer and metadata requests wait three minutes from the first
+observed timeout or HTTP 5xx response before alerting. Consecutive timeouts and
+5xx responses share the same timer, which survives watchdog restarts. A successful,
+valid check resets the timer. Recovery is posted only if a failure alert was sent.
+An active alert stays latched through transient fetch failures, so the next valid
+check can send its recovery without losing or duplicating the original alert.
+Other request failures and malformed, incomplete, or stale bundles still alert
+immediately. The freshness limit remains 48 hours.
+
 ## NU7 Dashboard Availability
 
 The existing fleet watchdog also checks

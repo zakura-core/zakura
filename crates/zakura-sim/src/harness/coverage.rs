@@ -93,10 +93,10 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/header_node.rs",
             "node_syncs_from_a_mirror_on_controlled_storage",
         ),
-        bypass: sim_test(
+        bypass: Bypass::Test(sim_test(
             "tests/header_node.rs",
             "planted_operation_ids_violate_the_property",
-        ),
+        )),
     },
     Coverage {
         property: super::header_sync::DIRECT_DISPATCH,
@@ -104,9 +104,9 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/header_node.rs",
             "node_syncs_from_a_mirror_on_controlled_storage",
         ),
-        bypass: sim_test(
+        bypass: Bypass::Test(sim_test(
             "tests/header_node.rs",
             "direct_dispatch_guard_reports_a_violation",
-        ),
+        )),
     },
 ];

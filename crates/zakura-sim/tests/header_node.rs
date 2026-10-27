@@ -411,8 +411,7 @@ fn planted_operation_ids_violate_the_property() {
         let last = report
             .picks
             .iter()
-            .filter(|pick| pick.identity == "peer:storage:fact")
-            .last()
+            .rfind(|pick| pick.identity == "peer:storage:fact")
             .expect("the plant logs its facts");
         assert_eq!(violation.step, last.step, "at the last fact");
         assert!(matches!(

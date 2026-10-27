@@ -5,7 +5,10 @@
 //! the `SubmitBlock` action, and block storage logs the `submit_block`
 //! operation once its intake takes the action. So each such operation
 //! follows the holder of its token, which stays retained, `Submitted` or
-//! `Detached`, until the driver replies or the sequencer closes. Serving
+//! `Detached`, until the driver replies or the sequencer closes. Storage may
+//! take the action off the channel early and defer it behind a query, which
+//! it logs as a `Deferred` fact, so that fact must follow the holder too.
+//! Serving
 //! reports a response's lease once it takes the execution slots, before the
 //! response's task reads storage, and the release once the slots return,
 //! after the task ends. So each `read_range` operation falls inside a held
@@ -112,8 +115,12 @@ impl Pairer {
         }
     }
 
-    /// Pairs `fact`'s operation, if it's a submission or a read.
+    /// Pairs `fact`'s operation, if it's a submission or a read, and checks
+    /// that each submission storage defers has a holder.
     fn fact(&mut self, fact: &StorageFact) -> Result<Option<Paired>, String> {
+        if let StorageFact::Deferred { queue } = fact {
+            return self.deferred(queue).map(|()| None);
+        }
         let StorageFact::BlockSubmitted { id, request, .. } = fact else {
             return Ok(None);
         };
@@ -170,6 +177,22 @@ impl Pairer {
             self.submissions.remove(&token);
         }
         Ok(Paired::Submission { token, op })
+    }
+
+    /// Checks that a sequencer submission retained each submission in
+    /// `queue`, the actions storage took off the channel and deferred.
+    fn deferred(&self, queue: &[StorageRequest]) -> Result<(), String> {
+        for request in queue {
+            if let StorageRequest::SubmitBlock { token, .. } = request {
+                if !self.submissions.contains_key(token) {
+                    return Err(format!(
+                        "Unpaired: block storage deferred a submission of token {token}, which \
+                         no sequencer submission retained before it"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pairs read operation `op`, of `count` heights from `start`, with the
@@ -370,6 +393,34 @@ mod tests {
         let result = drain(
             &mut pairer,
             &[(1, submit(1, 7, 3))],
+            &[(1, holder(7, 3, "retained"))],
+        );
+        assert!(result.unwrap_err().starts_with("Unpaired"));
+    }
+
+    /// Token `token`'s submission at `height`, as a deferred action.
+    fn deferred(token: u64, height: u32) -> StorageFact {
+        let StorageFact::BlockSubmitted { request, .. } = submit(0, token, height) else {
+            unreachable!("`submit` makes a submission");
+        };
+        StorageFact::Deferred {
+            queue: vec![request],
+        }
+    }
+
+    #[test]
+    fn a_deferred_submission_needs_an_earlier_holder() {
+        let mut pairer = Pairer::default();
+        let result = drain(
+            &mut pairer,
+            &[(1, deferred(7, 3)), (2, submit(2, 7, 3))],
+            &[(0, holder(7, 3, "retained"))],
+        );
+        assert_eq!(result, Ok(vec![Paired::Submission { token: 7, op: 2 }]));
+        let mut pairer = Pairer::default();
+        let result = drain(
+            &mut pairer,
+            &[(1, deferred(7, 3))],
             &[(1, holder(7, 3, "retained"))],
         );
         assert!(result.unwrap_err().starts_with("Unpaired"));

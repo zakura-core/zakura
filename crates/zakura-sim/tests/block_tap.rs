@@ -19,8 +19,10 @@ use zakura_network::zakura::{
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     harness::{
+        block_node::Policy,
         block_node::{
             control::{ControlAction, ControlStep},
+            policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
             probe::ProbeFrame,
             tap::BlockTap,
             view::BlockSyncView,
@@ -606,6 +608,55 @@ fn an_honest_serve_pairs_every_read() {
         assert_eq!(starts, BTreeSet::from([1, 2]));
         assert_settled(&view);
     }
+}
+
+/// Whether `report`'s block storage deferred a body submission behind a
+/// query.
+fn deferred_a_submission(report: &RunReport) -> bool {
+    report.log.entries().iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::Storage { service, fact: StorageFact::Deferred { queue }, .. }
+                if service == "block"
+                    && queue
+                        .iter()
+                        .any(|request| matches!(request, StorageRequest::SubmitBlock { .. }))
+        )
+    })
+}
+
+/// While the driver awaits a held query, it takes no action, so the
+/// sequencer's submissions back up in the action channel, and storage later
+/// takes them off it behind a query and defers them. Every submission still
+/// pairs, each deferral comes after its holder, and the view ends settled.
+#[test]
+fn backed_up_submissions_pair_after_their_holders() {
+    let scenario = BlockScenario {
+        blocks: 16,
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(BlockKind::Query, 2),
+                until: Trigger::VirtualTime(1_000),
+                then: vec![BlockAllow::Answer],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..BlockScenario::default()
+    };
+    let mut deferred = 0;
+    for input in inputs(16, 256) {
+        let (report, ports) = node_run(&scenario, input);
+        assert_numbered(&report);
+        deferred += usize::from(deferred_a_submission(&report));
+        let (submits, _) = operations(&report);
+        assert_eq!(submits.len(), 16, "one submission per block");
+        let view = ports.view.borrow();
+        let paired: BTreeSet<u64> = view.submissions.values().copied().collect();
+        assert_eq!(paired, submits, "every submission pairs once");
+        assert_settled(&view);
+    }
+    assert!(deferred > 0, "some plan defers a submission");
 }
 
 /// The tapped run replays: the same input makes the same picks and the same

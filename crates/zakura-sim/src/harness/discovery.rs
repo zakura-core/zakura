@@ -3,10 +3,7 @@
 //! GetServices over an in-memory stream, on 2 workers.
 
 use std::{
-    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    ops::RangeInclusive,
-    rc::Rc,
     time::UNIX_EPOCH,
 };
 
@@ -26,15 +23,13 @@ use zakura_rt::{
     sync::{watch, CancellationToken},
     time::utc_now,
 };
-use zakura_scheduler::{SchedulerConfig, Status};
+use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
 use crate::{
-    check::StepCtx,
-    property::{HasView, Status as PropertyStatus},
-    trace::meta::PropertyRef,
-    Checker, Observation, ObservationLog, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Sim,
-    Violation,
+    domain::discovery::wait_complete_wakes,
+    property::{HasView, Property},
+    RunConfig, Sim,
 };
 
 /// The `wait_complete` scenario. It has no knobs, so its fuzz input is all
@@ -44,13 +39,13 @@ use crate::{
 pub struct Scenario {}
 
 /// Discovery with one inbound peer that answers the initial exchange,
-/// checked by [`WaitCompleteWakes`].
+/// checked by [`wait_complete_wakes`].
 pub struct WaitComplete;
 
 impl HasView for WaitComplete {
     type View = ();
 
-    /// Nothing. The checker reads the observations.
+    /// Nothing. The property reads the observations.
     fn view(&self) {}
 }
 
@@ -75,17 +70,9 @@ impl Subsystem for WaitComplete {
         WaitComplete
     }
 
-    /// [`WaitCompleteWakes`].
-    fn checker(_: &Rc<Self>, _: &Scenario) -> Box<dyn Checker> {
-        Box::new(WaitCompleteWakes::new())
-    }
-
-    /// [`PROPERTY`], active.
-    fn properties(_: &Scenario) -> Vec<PropertyRef> {
-        vec![PropertyRef {
-            id: PROPERTY.to_owned(),
-            status: PropertyStatus::Active,
-        }]
+    /// [`wait_complete_wakes`].
+    fn properties() -> Vec<Property<Self>> {
+        vec![wait_complete_wakes()]
     }
 
     /// The only scenario.
@@ -93,9 +80,6 @@ impl Subsystem for WaitComplete {
         Scenario {}
     }
 }
-
-/// The property this harness checks (properties.md, Discovery).
-pub const PROPERTY: &str = "discovery/wait-complete-wakes";
 
 /// A signed record for `secret`, valid for ten minutes of the run's UTC, which
 /// is the clock discovery validates it against.
@@ -224,236 +208,6 @@ pub fn spawn(sim: &mut Sim) -> Spawned {
     spawned
 }
 
-/// Where `DiscoveryExchangeProgress` lives, and the lines of its
-/// `complete` and `wait_complete` bodies and of the three `mark_*` notifies.
-#[derive(Debug, PartialEq, Eq)]
-struct Sites {
-    file: &'static str,
-    /// `complete` through the end of `wait_complete`, the code a waiter runs
-    /// between checking for completion and waiting.
-    waiting: RangeInclusive<u32>,
-    marks: Vec<u32>,
-}
-
-/// The discovery service's source, as the binary was built from it. The
-/// observations carry the line numbers compiled into the binary, so the
-/// sites must come from the same text, never from the checkout at run time.
-const SERVICE_RS: &str = include_str!("../../../zakura-network/src/zakura/discovery/service.rs");
-
-impl Sites {
-    /// The sites in [`SERVICE_RS`], so the check follows the code as it
-    /// moves.
-    fn find() -> Sites {
-        Sites::parse(SERVICE_RS)
-    }
-
-    /// The sites in `source`, the text of the discovery service's file.
-    fn parse(source: &str) -> Sites {
-        let file = "crates/zakura-network/src/zakura/discovery/service.rs";
-        let lines: Vec<&str> = source.lines().collect();
-        let find = |from: usize, needle: &str| {
-            from + lines[from..]
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("service.rs has `{needle}`"))
-        };
-        // Lines are 1-based, and the file has far fewer than 2^32 of them.
-        let line = |i: usize| (i + 1) as u32;
-        let progress = find(0, "impl DiscoveryExchangeProgress");
-        let complete = find(progress, "fn complete(&self)");
-        let wait_complete = find(complete, "async fn wait_complete(&self)");
-        let end = wait_complete
-            + lines[wait_complete..]
-                .iter()
-                .position(|l| *l == "    }")
-                .expect("wait_complete's body closes");
-        let marks = ["fn mark_hello", "fn mark_peers", "fn mark_services"]
-            .iter()
-            .map(|mark| line(find(find(progress, mark), "notify_waiters()")))
-            .collect();
-        Sites {
-            file,
-            waiting: line(complete)..=line(end),
-            marks,
-        }
-    }
-
-    /// The line of `site` if it's in the discovery service's file.
-    fn line(&self, site: &Option<String>) -> Option<u32> {
-        let (file, line) = site.as_deref()?.rsplit_once(':')?;
-        if file.ends_with(self.file) {
-            line.parse().ok()
-        } else {
-            None
-        }
-    }
-}
-
-/// The source task's name, which `spawn_supervised_peer_task` labels.
-fn is_source(task: &str) -> bool {
-    task.ends_with("/discovery_source.1")
-}
-
-/// The task an identity runs, if it runs one.
-fn task_of(identity: &str) -> Option<&str> {
-    let rest = identity.strip_prefix("task:")?;
-    Some(&rest[..rest.rfind(':')?])
-}
-
-/// Checks `discovery/wait-complete-wakes`, which properties.md's P6 will
-/// formalize: at the first step with no ready task after the sink has run
-/// all three `mark_*` notifies, the source must not be waiting after a point
-/// in `complete` or `wait_complete`.
-pub struct WaitCompleteWakes {
-    sites: Sites,
-    /// Each task's next point, as (kind, line), from its last stop.
-    next: BTreeMap<String, (String, Option<u32>)>,
-    /// The step that ran each mark's notify.
-    marked: Vec<Option<u64>>,
-    /// The source's last load and `notified` steps in the waiting code.
-    last_load: Option<u64>,
-    last_notified: Option<u64>,
-    /// True once the source has created its `Notified` in the waiting code
-    /// and hasn't checked for completion since, so it can only go on when
-    /// woken.
-    in_wait: bool,
-    /// For building inputs: each step's enabled set, the index it picked,
-    /// and the index that holds the source back at its `notified`.
-    trace: Vec<(Vec<String>, usize, Option<usize>)>,
-    /// Steps where the check applied: no ready task, every mark run.
-    applicable: u32,
-}
-
-impl WaitCompleteWakes {
-    /// A checker that hasn't seen a step.
-    pub fn new() -> Self {
-        let sites = Sites::find();
-        let marks = sites.marks.len();
-        WaitCompleteWakes {
-            sites,
-            next: Default::default(),
-            marked: vec![None; marks],
-            last_load: None,
-            last_notified: None,
-            in_wait: false,
-            trace: Vec::new(),
-            applicable: 0,
-        }
-    }
-
-    /// Each step's enabled set, the index it picked, and the index that
-    /// would hold the source back at its `notified`, for building inputs by
-    /// hand.
-    pub fn choices(&self) -> &[(Vec<String>, usize, Option<usize>)] {
-        &self.trace
-    }
-
-    /// True if every mark's notify has run.
-    fn all_marked(&self) -> bool {
-        self.marked.iter().all(Option::is_some)
-    }
-
-    /// An enabled action other than the source, when the source's next
-    /// point is its `notified` in the waiting code and a mark is still to
-    /// come.
-    fn hold_source(&self, enabled: &[String]) -> Option<usize> {
-        let source_at_notified = enabled.iter().filter_map(|e| task_of(e)).any(|task| {
-            is_source(task)
-                && matches!(self.next.get(task), Some((at, Some(line)))
-                    if at.starts_with("notified") && self.sites.waiting.contains(line))
-        });
-        if !source_at_notified || self.all_marked() {
-            return None;
-        }
-        enabled
-            .iter()
-            .position(|e| !task_of(e).is_some_and(is_source))
-    }
-}
-
-impl Default for WaitCompleteWakes {
-    /// [`WaitCompleteWakes::new`].
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Checker for WaitCompleteWakes {
-    /// Tracks each task's next point and the marks, and checks the source at
-    /// each step with no ready task once every mark has run.
-    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        let enabled: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
-        let pick = cx.pick.to_string();
-        // The loop picks from the enabled set, so the pick is always in it.
-        let index = enabled.iter().position(|e| *e == pick).unwrap_or_default();
-        let hold = self.hold_source(&enabled);
-        self.trace.push((enabled, index, hold));
-
-        // What the pick just ran.
-        if let Some(task) = task_of(&pick) {
-            let ran = self.next.get(task).cloned();
-            if let Some((at, Some(line))) = &ran {
-                if let Some(i) = self.sites.marks.iter().position(|m| m == line) {
-                    self.marked[i] = Some(cx.step);
-                }
-                if is_source(task) && self.sites.waiting.contains(line) {
-                    if at.starts_with("load") {
-                        self.last_load = Some(cx.step);
-                        self.in_wait = false;
-                    } else if at.starts_with("notified") {
-                        self.last_notified = Some(cx.step);
-                        self.in_wait = true;
-                    }
-                }
-            }
-        }
-        for obs in cx.observations() {
-            if let Observation::TaskReached { task, at, site } = obs {
-                self.next
-                    .insert(task.clone(), (at.clone(), self.sites.line(site)));
-            }
-        }
-
-        if !self.all_marked() || cx.status == Status::Running {
-            return None;
-        }
-        self.applicable += 1;
-        if !self.in_wait {
-            return None;
-        }
-        let final_notify = self.marked.iter().flatten().copied().max()?;
-        Some(Violation {
-            property: PROPERTY.into(),
-            step: cx.step,
-            witness: [self.last_load, Some(final_notify), self.last_notified]
-                .into_iter()
-                .flatten()
-                .collect(),
-            expected: "the source wakes once Hello, Peers and Services are marked".into(),
-            actual: "the source still waits in wait_complete".into(),
-        })
-    }
-
-    /// Reports the property: violated, held at every applicable step, or
-    /// never applicable.
-    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
-        let outcome = match &end.violation {
-            Some(violation) => PropertyOutcome::Violated {
-                witness: violation.witness.clone(),
-            },
-            None if self.applicable > 0 => PropertyOutcome::Held {
-                applicable: self.applicable,
-            },
-            None => PropertyOutcome::NotApplicable,
-        };
-        vec![PropertyReport {
-            property: PROPERTY.into(),
-            outcome,
-            holds_since: None,
-        }]
-    }
-}
-
 /// The run config: 2 workers, a budget well past the exchange, and tokio's
 /// worker stack, since record verification runs deep in a debug build.
 pub fn run_config() -> RunConfig {
@@ -465,36 +219,5 @@ pub fn run_config() -> RunConfig {
         budget: 3_000,
         drain_bound: 1_000,
         ..RunConfig::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The checker's sites come from the embedded source, and only from the
-    /// text it's given: a copy shifted down by 100 lines moves every site by
-    /// 100, while the checker's own sites stay put.
-    #[test]
-    fn sites_come_from_the_embedded_source() {
-        let built = Sites::find();
-        assert_eq!(built, Sites::parse(SERVICE_RS));
-        assert!(built.waiting.start() < built.waiting.end());
-        assert_eq!(built.marks.len(), 3);
-
-        let shifted = Sites::parse(&format!("{}{SERVICE_RS}", "\n".repeat(100)));
-        assert_eq!(
-            shifted.waiting,
-            built.waiting.start() + 100..=built.waiting.end() + 100
-        );
-        assert_eq!(
-            shifted.marks,
-            built
-                .marks
-                .iter()
-                .map(|line| line + 100)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(Sites::find(), built);
     }
 }

@@ -35,6 +35,8 @@ use zakura_rt::{
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 mod request_write;
+#[cfg(test)]
+pub(super) use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
 pub(super) use request_write::{RequestWrite, RequestWriteStatus};
 
@@ -88,6 +90,16 @@ pub(super) struct WorkItemOwnership {
     pub(super) estimated_bytes: u64,
     /// The estimate bytes this item currently charges to the queue's tally.
     pub(super) reserved_bytes: u64,
+}
+
+/// A request reservation that a received body ended.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct EndedReservation {
+    /// The height's own charge: the estimate its request reserved for it.
+    pub(super) charge: u64,
+    /// Every byte released: the charge, plus the unsent heights of a queued
+    /// request the release retired.
+    pub(super) released: u64,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -669,6 +681,7 @@ impl WorkQueue {
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
         self.release_active_reserved_height_matching(None, height, false)
+            .map(|ended| ended.released)
     }
 
     /// End the receipt reservation and retire any queued request it invalidates.
@@ -679,15 +692,17 @@ impl WorkQueue {
         height: block::Height,
     ) -> Option<u64> {
         self.release_active_reserved_height_matching(Some(owner), height, false)
+            .map(|ended| ended.released)
     }
 
     /// Like [`Self::release_active_reserved_height_for_owner`], for a body that
-    /// another attempt received.
+    /// another attempt received. Returns the height's own charge with the
+    /// released total, both read under the lock that checks `owner`.
     pub(super) fn release_answered_elsewhere(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> Option<u64> {
+    ) -> Option<EndedReservation> {
         self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
@@ -696,8 +711,8 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
         answered_elsewhere: bool,
-    ) -> Option<u64> {
-        let (released, claim) = {
+    ) -> Option<EndedReservation> {
+        let (ended, claim) = {
             let mut inner = self.lock();
             let (released, owner) = {
                 let item = inner.in_flight.get_mut(&height)?;
@@ -713,10 +728,14 @@ impl WorkQueue {
             inner.sub_reserved_bytes(released);
             inner.in_flight_reserved.sub(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
-            (released.saturating_add(outcome.released_bytes), claim)
+            let ended = EndedReservation {
+                charge: released,
+                released: released.saturating_add(outcome.released_bytes),
+            };
+            (ended, claim)
         };
         drop(claim);
-        Some(released)
+        Some(ended)
     }
 
     /// Claim a received height and end any request reservation it owned.

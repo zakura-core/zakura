@@ -18,7 +18,10 @@ use zakura_sim::{
     check::after_step,
     harness::{
         header_node::{Base, Chain, Fork, Policy},
-        header_sync::{Dialer, MirrorSpec, Ports, Storage, StorageScenario, OPERATION_IDS},
+        header_sync::{
+            storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
+            StorageScenario, OPERATION_IDS,
+        },
         run_prepared, Subsystem,
     },
     observe::{Exit, ReactorFact, StorageFact, StorageRequest},
@@ -123,7 +126,7 @@ fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
 
 /// Under every outcome and no bound, the node's operation IDs rise by one per
 /// submission, and each completes at most once, after its submission.
-/// `NodeChecks` checks that after every step, and some plan completes an
+/// The harness checks that after every step, and some plan completes an
 /// operation with a fault, so faults are exercised. The harness taps the
 /// node's reactor, so every run also logs its calls, paired with its storage
 /// receipts, and some plan pairs a call that ended with a port error.
@@ -599,14 +602,14 @@ impl Subsystem for Probing {
         Probing(std::rc::Rc::new(storage))
     }
 
-    /// The storage harness's checker.
-    fn checker(this: &std::rc::Rc<Self>, scenario: &Probed) -> Box<dyn Checker> {
-        Storage::checker(&this.0, &scenario.storage)
+    /// The storage harness's properties.
+    fn properties() -> Vec<zakura_sim::property::Property<Self>> {
+        storage_properties()
     }
 
-    /// The storage harness's properties.
-    fn properties(scenario: &Probed) -> Vec<zakura_sim::trace::meta::PropertyRef> {
-        Storage::properties(&scenario.storage)
+    /// The storage harness's sources.
+    fn sources() -> zakura_sim::property::Sources {
+        storage_sources()
     }
 
     /// Unused: probes are only built by hand.

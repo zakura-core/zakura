@@ -85,8 +85,10 @@ pub enum LayoutError {
         /// The repeated row name.
         name: &'static str,
     },
-    /// A row name is empty, or holds a byte other than a lowercase ASCII
-    /// letter, a digit, or a hyphen.
+    /// A row name is empty, holds a byte other than a lowercase ASCII
+    /// letter, a digit, or a hyphen, or has an empty word: a leading or
+    /// trailing hyphen, or two in a row. Property IDs use the same grammar
+    /// for each segment.
     ///
     /// This row's name has a space and capitals:
     ///
@@ -379,7 +381,7 @@ impl LayoutError {
             }
             Self::DuplicateName { .. } => "each row name appears in exactly one row of its layout",
             Self::MalformedName { .. } => {
-                "each row name is lowercase ASCII letters, digits, and hyphens"
+                "each row name is hyphen-separated words of lowercase ASCII letters and digits"
             }
             Self::PayloadAboveFrameCap { .. } => "each row's largest frame fits its stream's cap",
             Self::AnnouncementOnRequestResponse { .. } => {
@@ -777,20 +779,23 @@ const fn count_names(layout: &[Stream], name: &str) -> usize {
     count
 }
 
-/// Whether `name` is nonempty lowercase ASCII letters, digits, and hyphens.
+/// Whether `name` is nonempty words of lowercase ASCII letters and digits,
+/// joined by single hyphens.
 const fn well_formed_name(name: &str) -> bool {
     let name = name.as_bytes();
-    if name.is_empty() {
-        return false;
-    }
+    // Starts as if after a hyphen, so a leading hyphen fails.
+    let mut previous = b'-';
     let mut index = 0;
     while index < name.len() {
-        if !matches!(name[index], b'a'..=b'z' | b'0'..=b'9' | b'-') {
-            return false;
+        match name[index] {
+            b'a'..=b'z' | b'0'..=b'9' => {}
+            b'-' if previous != b'-' => {}
+            _ => return false,
         }
+        previous = name[index];
         index += 1;
     }
-    true
+    previous != b'-'
 }
 
 /// Whether `a` and `b` are the same name. `str` equality is not `const`.

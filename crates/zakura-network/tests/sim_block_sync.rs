@@ -1217,6 +1217,11 @@ fn phase_after(step: RequestStep) -> Option<RequestWritePhase> {
 /// the routine reads each phase before it reports the snapshot, but it can
 /// never lead them: a phase no step reported means a missed step. Each
 /// `Dropped` step reports the last phase the steps reached.
+///
+/// The check relies on the sim's single thread. The status reports
+/// `Expired` after its compare-exchange, so on a multi-threaded runtime the
+/// handle's drop on another thread can read the expired phase and report
+/// `Dropped(Skipped)` first. This check would then fail a correct run.
 fn check_request_snapshots(events: &[BlockEvent]) -> Result<(), String> {
     let mut reached: Vec<(_, Vec<RequestWritePhase>)> = Vec::new();
     for event in events {
@@ -1261,9 +1266,11 @@ fn check_request_snapshots(events: &[BlockEvent]) -> Result<(), String> {
 
 /// Folds the holder events. At each sequencer snapshot, the fold's reorder,
 /// `applying` and submission holders equal the snapshot's. Every queued
-/// body leaves the queue, and every body that leaves it enters a sequencer
-/// holder by the same allocation. Returns the heights the sequencer held, in
-/// the order they arrived.
+/// body leaves the queue, and every body that leaves it before the
+/// sequencer closes enters a sequencer holder by the same allocation. After
+/// [`BlockEvent::SequencerClosed`], a queued body's release has no next
+/// holder. Returns the heights the sequencer held, in the order they
+/// arrived.
 ///
 /// The sequencer reports its `Reorder`, `Applying`, `Submitted` and
 /// `Detached` holders by diffing its own snapshots, so the fold can't
@@ -1275,6 +1282,7 @@ fn check_holders(events: &[BlockEvent]) -> Result<Vec<block::Height>, String> {
     let mut held: Vec<(Holder, HeldBody)> = Vec::new();
     let mut dequeued = Vec::new();
     let mut heights = Vec::new();
+    let mut closed = false;
     for event in events {
         match event {
             BlockEvent::Holder {
@@ -1300,10 +1308,12 @@ fn check_holders(events: &[BlockEvent]) -> Result<Vec<block::Height>, String> {
                     return Err(format!("{holder:?} released {body:?} it never held"));
                 };
                 held.remove(position);
-                if let Holder::Queued { allocation } = holder {
-                    dequeued.push(*allocation);
+                match holder {
+                    Holder::Queued { allocation } if !closed => dequeued.push(*allocation),
+                    _ => {}
                 }
             }
+            BlockEvent::SequencerClosed => closed = true,
             BlockEvent::Sequencer(snapshot) => {
                 let mut expected = snapshot.holders();
                 for entry in held

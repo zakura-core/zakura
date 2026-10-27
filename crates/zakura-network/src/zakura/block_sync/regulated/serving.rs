@@ -21,7 +21,7 @@ pub(super) use super::super::source::{
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::{
     block_sync::block_sync_observe::{LeaseStep, ObserverSlot, ServingReporter},
-    regulation::ServeStep,
+    regulation::{ReleaseReport, ServeStep},
 };
 
 #[derive(Debug)]
@@ -135,15 +135,18 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         let Some(reporter) = &self.observed else {
             return;
         };
-        match step {
-            ServeStep::LeaseAcquired => {
-                reporter.lease(range.start(), range.count(), LeaseStep::Acquired)
-            }
-            ServeStep::LeaseReleased => {
-                reporter.lease(range.start(), range.count(), LeaseStep::Released)
-            }
-            ServeStep::FailureEnding(end) => reporter.frame(range.start(), ending_type(end), 0),
-        }
+        let ServeStep::FailureEnding(end) = step;
+        reporter.frame(range.start(), ending_type(end), 0);
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn observe_lease(&self, range: &Range) -> Option<ReleaseReport> {
+        let reporter = self.observed.clone()?;
+        let (start, count) = (range.start(), range.count());
+        reporter.lease(start, count, LeaseStep::Acquired);
+        Some(ReleaseReport::new(move || {
+            reporter.lease(start, count, LeaseStep::Released)
+        }))
     }
 }
 

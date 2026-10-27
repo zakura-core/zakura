@@ -166,6 +166,10 @@ pub enum BlockEvent {
     WorkQueue(Vec<WorkItemOwnership>),
     /// The sequencer's retained bodies, read by the sequencer task.
     Sequencer(SequencerOwnership),
+    /// The sequencer task is dropping and takes no more bodies. Each queued
+    /// body released after this has no next holder: the task's drop
+    /// releases the bodies left in its input, and a routine's send fails.
+    SequencerClosed,
 }
 
 /// One step of a request's frame write.
@@ -322,9 +326,11 @@ impl SequencerOwnership {
 }
 
 /// Reports one serving session's lease and frame events for its peer. Serve's
-/// task reports each response's lease when it takes the execution slots and
-/// after it drops its last execution lease, and each failure ending. The
-/// encoder reports each block frame and each ending it queues.
+/// dispatch reports each response's lease once it takes the execution slots,
+/// before it spawns the response's task. The slots report the release once
+/// they return, after the last lease clone drops. Serve's task reports each
+/// failure ending, and the encoder reports each block frame and each ending
+/// it queues.
 #[derive(Clone, Debug)]
 pub(crate) struct ServingReporter {
     observer: ObserverSlot,

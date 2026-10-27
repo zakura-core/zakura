@@ -331,9 +331,15 @@ pub(super) struct SequencerTask {
 
 impl Drop for SequencerTask {
     fn drop(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::SequencerClosed
+        );
         self.body_input_rx.close();
         #[cfg(any(test, zakura_sim))]
         {
+            // Each body left in the input drops here, with no next holder.
             while let Ok(body) = self.body_input_rx.try_recv() {
                 self.observe_dequeued(&body);
             }

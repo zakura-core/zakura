@@ -170,6 +170,7 @@ impl ByteBudget {
 
     /// Release `bytes` back to the shared counter (saturating at zero) and wake
     /// any consumer blocked on capacity.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn release(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
@@ -185,14 +186,20 @@ impl ByteBudget {
             ) {
                 Ok(_) => {
                     publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Released, reserved, next);
                     break;
                 }
                 Err(observed) => reserved = observed,
             }
         }
         self.inner.capacity.notify_waiters();
+    }
+
+    /// Release `bytes` back to the shared counter (saturating at zero) and wake
+    /// any consumer blocked on capacity. Observer builds share
+    /// [`Self::release_then`]'s loop, so the two can't drift.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.release_then(bytes, || {});
     }
 
     /// [`Self::release`] that calls `released` after the counter changes and

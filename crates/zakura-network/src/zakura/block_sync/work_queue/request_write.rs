@@ -68,6 +68,10 @@ impl RequestWriteStatus {
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition, which it reports as [`RequestStep::Expired`];
     /// a started frame remains the transport's owner.
+    ///
+    /// The report follows the compare-exchange, so on a multi-threaded
+    /// runtime the handle's drop on another thread can report
+    /// `Dropped(Skipped)` before this reports `Expired`.
     #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
         let expired = self

@@ -106,6 +106,8 @@ use zakura_rt::sync::{
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
+#[cfg(any(test, zakura_sim))]
+pub(crate) use lease::ReleaseReport;
 pub(crate) use lease::{ExecutionSlots, WorkLease};
 pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
@@ -149,15 +151,20 @@ pub(crate) trait Produce: Send + Sync + 'static {
     /// Reports one serving step for `request`, in test and simulator builds.
     #[cfg(any(test, zakura_sim))]
     fn observe(&self, _request: &Self::Request, _step: ServeStep<'_, Self::Message>) {}
+
+    /// Reports that `request` holds its execution slots, in test and
+    /// simulator builds. Dispatch calls this once it took the slots and
+    /// before it spawns the request's task. The returned report runs once the
+    /// slots return, after the last lease clone drops.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_lease(&self, _request: &Self::Request) -> Option<ReleaseReport> {
+        None
+    }
 }
 
 /// One step of a response's task, as [`Produce::observe`] sees it.
 #[cfg(any(test, zakura_sim))]
 pub(crate) enum ServeStep<'a, M> {
-    /// The task holds the response's execution slots.
-    LeaseAcquired,
-    /// The task dropped its last execution lease.
-    LeaseReleased,
     /// Serve queued `ending` after a local failure cut the response short.
     FailureEnding(&'a M),
 }
@@ -604,6 +611,8 @@ impl<P: Produce> Dispatch<P> {
                 Arc::new(grants),
                 job.commitment,
             );
+            #[cfg(any(test, zakura_sim))]
+            let slots = slots.reporting_release(self.produce.observe_lease(&job.request));
             self.tasks.spawn(task.run(job.request, core, slots));
         }
     }
@@ -672,8 +681,6 @@ struct Task<P> {
 
 impl<P: Produce> Task<P> {
     async fn run(self, request: P::Request, core: SinkCore, slots: ExecutionSlots) {
-        #[cfg(any(test, zakura_sim))]
-        self.produce.observe(&request, ServeStep::LeaseAcquired);
         let active = self.metrics.active();
         let lease = WorkLease::new(slots);
         let core = Arc::new(Mutex::new(core));
@@ -692,8 +699,6 @@ impl<P: Produce> Task<P> {
         };
         // Execution ends when the last lease clone drops.
         drop(lease);
-        #[cfg(any(test, zakura_sim))]
-        self.produce.observe(&request, ServeStep::LeaseReleased);
         drop(active);
         let outcome = match produced {
             Ok(Responded { .. }) => "ending",

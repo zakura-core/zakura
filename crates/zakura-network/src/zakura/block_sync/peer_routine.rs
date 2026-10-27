@@ -2214,6 +2214,10 @@ impl PeerRoutine {
             let send_result = self.sequencer_input.send(body).await;
             send_result.is_ok()
         };
+        // Only the `None`-permit path can fail, and production always passes a
+        // permit, so this branch is unreachable today. A cancelled
+        // `send().await` on that path would also leave the `Queued` retain
+        // above without its release.
         #[cfg(any(test, zakura_sim))]
         if !ok {
             let (body, holder) = queued;

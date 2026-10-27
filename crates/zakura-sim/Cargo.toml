@@ -39,6 +39,8 @@ rand_10 = { workspace = true }
 # to check that equal records still write equal bytes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
+# A runtime for the serving tool in the model agreement tests.
+tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = { workspace = true }
 
 # build.rs hashes the source for trace `meta` records.

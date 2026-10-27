@@ -326,11 +326,10 @@ mod tests {
                 drain: None,
                 harness: None,
                 cleanup: CleanupRecord::default(),
-                properties: vec![PropertyReport {
-                    property: "sim/no-livelock".into(),
-                    outcome: PropertyOutcome::Held { applicable: 3 },
-                    holds_since: None,
-                }],
+                properties: vec![PropertyReport::new(
+                    "sim/no-livelock",
+                    PropertyOutcome::Held { applicable: 3 },
+                )],
             }),
         ]
     }

@@ -7,7 +7,6 @@ use std::{
     cell::Cell,
     path::Path,
     process::Command,
-    rc::Rc,
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -20,17 +19,14 @@ use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
-    property::{
-        Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
-        Status, Verdict,
-    },
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, Verdict},
     record::OutcomeKind,
     trace::{
-        meta::PropertyRef, replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport,
-        Trace, TraceReader, OBSERVATIONS_FILE, TRACE_FILE,
+        replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader,
+        OBSERVATIONS_FILE, TRACE_FILE,
     },
-    ActionSource, Checker, Divergence, HarnessFailure, Identity, NoChecks, Observation,
-    ObservationLog, PlanInput, PropertyOutcome, RunConfig, Sim,
+    ActionSource, Divergence, HarnessFailure, Identity, Observation, ObservationLog, PlanInput,
+    PropertyOutcome, RunConfig, Sim,
 };
 use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
@@ -576,16 +572,6 @@ impl Subsystem for Spinners {
         Spinners
     }
 
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
-    }
-
     /// The fixed scenario.
     fn draw(_: &[u8]) -> Fixed {
         Fixed {}
@@ -669,16 +655,6 @@ impl Subsystem for DuplicateIdentity {
     fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         sim.add_source(Box::new(Duplicates(Cell::new(false))));
         DuplicateIdentity
-    }
-
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The fixed scenario.
@@ -781,16 +757,6 @@ impl Subsystem for PlantedClock {
     fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         sim.add_source(Box::new(Clock(Cell::new(0))));
         PlantedClock
-    }
-
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The fixed scenario.
@@ -953,26 +919,9 @@ impl Subsystem for EffectsHarness {
         EffectsHarness
     }
 
-    /// The registry of both properties.
-    fn checker(this: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        let registry = Registry::new(effects_properties()).expect("the two IDs differ");
-        Box::new(RegistryChecker::new(
-            registry,
-            Rc::clone(this),
-            Assumptions::none(),
-            &[],
-        ))
-    }
-
     /// Both properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
+    fn properties() -> Vec<Property<Self>> {
         effects_properties()
-            .into_iter()
-            .map(|p| PropertyRef {
-                id: p.id.to_string(),
-                status: p.status,
-            })
-            .collect()
     }
 
     /// The fixed scenario.
@@ -1063,6 +1012,30 @@ fn effects_replay_in_a_fresh_process() {
     );
 }
 
+/// The `end` record leaves violations out, and a replay gives them back.
+#[test]
+fn replay_returns_the_violations_end_leaves_out() {
+    let dir = record(&EFFECTS, &[]);
+    let trace = open(dir.path());
+    let end = trace.end.as_ref().unwrap();
+    assert!(end.properties.iter().all(|r| r.violations.is_empty()));
+    let report = replay_with(&trace, &EFFECTS, ReplayOptions::default()).unwrap();
+    assert!(report.verified(), "{report:?}");
+    let steps: Vec<(&str, Vec<u64>)> = report
+        .properties
+        .iter()
+        .filter(|r| !r.violations.is_empty())
+        .map(|r| {
+            let steps = r.violations.iter().map(|v| v.step).collect();
+            (r.property.as_str(), steps)
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [(KNOWN.as_str(), vec![2]), (ACTIVE.as_str(), vec![2])]
+    );
+}
+
 #[test]
 fn changed_effects_are_nondeterministic() {
     let dir = record(&EFFECTS, &[]);
@@ -1148,16 +1121,6 @@ impl Subsystem for ForeignStorage {
             .expect("the test staged storage");
         sim.add_source(Box::new(storage));
         ForeignStorage
-    }
-
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The fixed scenario.

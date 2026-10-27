@@ -51,6 +51,12 @@ const OUTCOMES: [Outcome; 5] = [
 /// Action indices hold the operation ID times this, plus the outcome code.
 const CODES: u64 = 8;
 
+/// The operation and outcome that action index `local` names.
+pub(crate) fn decode(local: u64) -> (OpId, Outcome) {
+    // Indices come from `enabled`, so the code is in range.
+    (OpId(local / CODES), OUTCOMES[(local % CODES) as usize])
+}
+
 /// Header storage driven by the run. Dropping it shuts the port down, which
 /// a run does after its log is frozen, so nothing is logged. A drop while
 /// the run is live fails the run, since that shutdown is never observed.
@@ -564,10 +570,9 @@ impl ActionSource for HeaderStorage {
     }
 
     fn execute(&mut self, local: u64, _: &mut ObservationLog) {
-        // `local` came from `enabled` at this step, so the code is in range.
-        let outcome = OUTCOMES[(local % CODES) as usize];
+        let (id, outcome) = decode(local);
         self.port
-            .complete(OpId(local / CODES), outcome)
+            .complete(id, outcome)
             .expect("`enabled` offered this completion at this step");
     }
 

@@ -25,10 +25,26 @@ use super::{
     ZakuraPeerId, ZakuraTrace,
 };
 
+/// Reports the event that `$event` builds to the observer in `$slot`, an
+/// [`ObserverSlot`](block_sync_observe::ObserverSlot), if one is installed.
+/// `$event` is evaluated only then.
+///
+/// Every call site is itself compiled only in test and simulator builds.
+#[cfg(any(test, zakura_sim))]
+macro_rules! observe {
+    ($slot:expr, $event:expr) => {
+        if let Some(observer) = &$slot.0 {
+            observer.observe($event)
+        }
+    };
+}
+
 mod admission;
 mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
+#[cfg(any(test, zakura_sim))]
+pub mod block_sync_observe;
 mod config;
 mod error;
 mod events;

@@ -12,7 +12,10 @@ use std::num::NonZeroU64;
 
 mod outstanding;
 
-pub(super) use outstanding::{OutstandingRequests, RequestKey};
+pub(super) use outstanding::OutstandingRequests;
+pub use outstanding::RequestKey;
+#[cfg(any(test, zakura_sim))]
+pub use outstanding::{RequestOwnership, RequestedHeight};
 
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
 ///
@@ -66,6 +69,9 @@ pub struct BlockSyncStartup {
     /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
     /// decoded blocks. `None` keeps the count-only window.
     pub max_checkpoint_height: Option<block::Height>,
+    /// Receives block sync's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncStartup {
@@ -90,6 +96,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -114,6 +122,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -158,6 +168,8 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 }
@@ -222,6 +234,8 @@ pub(super) struct RoutineWiring {
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncHandle {
@@ -374,8 +388,18 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
+            #[cfg(not(any(test, zakura_sim)))]
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
+            #[cfg(not(any(test, zakura_sim)))]
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
+            #[cfg(any(test, zakura_sim))]
+            work_queue: Arc::new(
+                WorkQueue::new(startup.frontiers.verified_block_tip)
+                    .with_observer(startup.observer.clone()),
+            ),
+            #[cfg(any(test, zakura_sim))]
+            budget: ByteBudget::new(startup.config.max_inflight_block_bytes)
+                .with_observer(startup.observer.budget_observer()),
             needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }

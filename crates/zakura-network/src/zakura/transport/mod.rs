@@ -18,8 +18,12 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.
+#[cfg(any(test, zakura_sim))]
+pub(crate) use guard::BudgetObserver;
 #[allow(unused_imports)]
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
+#[cfg(any(test, zakura_sim))]
+pub use guard::{BudgetChange, BudgetChangeKind};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{

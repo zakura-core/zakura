@@ -819,6 +819,19 @@ impl Service for BlockSyncService {
                 .lock()
                 .expect("block-sync gap-claim mutex is never poisoned")
                 .remove(&peer_id);
+            #[cfg(any(test, zakura_sim))]
+            if let Some((wiring, generation, _)) = &routine {
+                observe!(
+                    wiring.observer,
+                    super::block_sync_observe::BlockEvent::SessionAdmitted {
+                        peer: peer_id.clone(),
+                        conn_id,
+                        session_id,
+                        generation: *generation,
+                        direction: peer.direction,
+                    }
+                );
+            }
             // Queue the connect under the peer-map lock and before spawning. The
             // reactor then sees it after the disconnect of any session that ended
             // before this admission, and before this session's own disconnect.
@@ -897,6 +910,8 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
+                        #[cfg(any(test, zakura_sim))]
+                        let routine = routine.with_observer(wiring.observer);
                         zakura_rt::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),

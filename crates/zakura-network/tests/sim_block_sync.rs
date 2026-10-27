@@ -31,6 +31,10 @@ use zakura_header_chain::{
 };
 use zakura_network::{
     zakura::{
+        block_sync_observe::{
+            BlockEvent, BlockSyncObserver, BudgetChange, BudgetChangeKind, HeldBody, Holder,
+            HolderChange, LeaseStep, ObserverSlot, RequestStep,
+        },
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStartup,
@@ -659,6 +663,7 @@ struct Node {
     _views: watch::Sender<Option<CommittedHeaderChainView>>,
     service: BlockSyncService,
     submitted: Rc<RefCell<Vec<block::Height>>>,
+    events: Recorder,
 }
 
 /// Block-sync nodes on one scheduler, linked by in-memory streams.
@@ -705,10 +710,12 @@ impl Net {
         let verified = view.frontiers.verified_best.height.0 as usize;
         let (views, views_rx) = watch::channel(Some(view.clone()));
         let source = FixtureSource(chain[..verified].to_vec());
-        let (handle, mut actions, reactor) = spawn_block_sync_reactor(
-            startup(&view, views_rx, self.shutdown.clone()).with_range_source(Arc::new(source)),
-        )
-        .expect("block sync starts");
+        let events = Recorder::default();
+        let mut startup =
+            startup(&view, views_rx, self.shutdown.clone()).with_range_source(Arc::new(source));
+        startup.observer = ObserverSlot(Some(Arc::new(events.clone())));
+        let (handle, mut actions, reactor) =
+            spawn_block_sync_reactor(startup).expect("block sync starts");
         let service = BlockSyncService::new_with_handle(handle.clone());
 
         let exits = Rc::clone(&self.exits);
@@ -777,6 +784,7 @@ impl Net {
             _views: views,
             service,
             submitted,
+            events,
         });
         self.nodes.len() - 1
     }
@@ -894,15 +902,20 @@ fn fixture_chain(count: u32) -> Vec<Arc<block::Block>> {
     (1..=count).map(fixture_block).collect()
 }
 
-/// Node `b` stores the whole fixture chain. Node `a` has its headers but no
-/// bodies, so it downloads them from `b` over a pair of in-memory streams,
-/// one each way, and submits each body in height order.
-#[test]
-fn block_sync_serves_a_range_over_memory_streams() {
-    const HEIGHTS: u32 = 4;
-    let chain = fixture_chain(HEIGHTS);
-    let tip = Frontier::new(block::Height(HEIGHTS), chain[chain.len() - 1].hash());
-    let mut net = Net::new(3);
+/// The heights the download fixture serves.
+const DOWNLOAD_HEIGHTS: u32 = 4;
+
+/// Node `b` stores the fixture chain. Node `a` has its headers but no bodies,
+/// so it downloads them from `b` over a pair of in-memory streams, one each
+/// way. Runs until `a` submitted every height, and returns the net with `a`
+/// at index 0 and `b` at index 1.
+fn download(seed: u64) -> Net {
+    let chain = fixture_chain(DOWNLOAD_HEIGHTS);
+    let tip = Frontier::new(
+        block::Height(DOWNLOAD_HEIGHTS),
+        chain[chain.len() - 1].hash(),
+    );
+    let mut net = Net::new(seed);
     let a = net.spawn(
         "a",
         committed_view(genesis(), tip, AlarmSet::default()),
@@ -928,7 +941,7 @@ fn block_sync_serves_a_range_over_memory_streams() {
         (b_recv, b_send),
     );
 
-    let expected: Vec<_> = (1..=HEIGHTS).map(block::Height).collect();
+    let expected: Vec<_> = (1..=DOWNLOAD_HEIGHTS).map(block::Height).collect();
     let done = |net: &Net| *net.nodes[a].submitted.borrow() == expected;
     net.run_until(done);
     assert!(
@@ -936,8 +949,15 @@ fn block_sync_serves_a_range_over_memory_streams() {
         "`a` submits every body in height order: {:?}",
         net.nodes[a].submitted.borrow()
     );
+    net
+}
+
+/// `a` downloads every body from `b` and submits each in height order.
+#[test]
+fn block_sync_serves_a_range_over_memory_streams() {
+    let net = download(3);
     assert!(
-        net.nodes[b].submitted.borrow().is_empty(),
+        net.nodes[1].submitted.borrow().is_empty(),
         "`b` already had every body"
     );
     for (connection, reason) in &net.connections {
@@ -989,4 +1009,433 @@ fn an_unsolicited_ending_closes_the_connection_with_its_cause() {
     assert!(connection.is_cancelled(), "{:?}", net.steps);
     assert_eq!(reason.get(), Some("service_protocol_reject"));
     assert_eq!(net.finish(), ["completed"]);
+}
+
+/// A node's block-sync events, in the order its tasks reported them.
+#[derive(Clone, Debug, Default)]
+struct Recorder(Arc<Mutex<Vec<BlockEvent>>>);
+
+impl Recorder {
+    fn events(&self) -> Vec<BlockEvent> {
+        self.0
+            .lock()
+            .expect("no observer call panics while it holds the log")
+            .clone()
+    }
+}
+
+impl BlockSyncObserver for Recorder {
+    fn observe(&self, event: BlockEvent) {
+        self.0
+            .lock()
+            .expect("no observer call panics while it holds the log")
+            .push(event);
+    }
+}
+
+/// Each routine's judged frames count up from 1 with no gap.
+fn check_frame_sequence(events: &[BlockEvent]) -> Result<(), String> {
+    let mut last = std::collections::HashMap::new();
+    for event in events {
+        if let BlockEvent::FrameJudged {
+            peer,
+            conn_id,
+            generation,
+            seq,
+            ..
+        } = event
+        {
+            let previous = last.insert((peer.clone(), *conn_id, *generation), *seq);
+            if *seq != previous.unwrap_or(0) + 1 {
+                return Err(format!("frame {seq} after {previous:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Each budget change starts where the previous one ended, from an empty
+/// budget, and the budget ends empty.
+fn check_budget_chain(events: &[BlockEvent]) -> Result<(), String> {
+    let mut reserved = 0;
+    for event in events {
+        if let BlockEvent::Budget(BudgetChange {
+            kind,
+            before,
+            after,
+        }) = event
+        {
+            if *before != reserved {
+                return Err(format!("{kind:?} from {before}, but {reserved} reserved"));
+            }
+            reserved = *after;
+        }
+    }
+    match reserved {
+        0 => Ok(()),
+        left => Err(format!("{left} bytes left reserved")),
+    }
+}
+
+/// Every published request reaches `Written`, after `Started`.
+fn check_request_steps(events: &[BlockEvent]) -> Result<(), String> {
+    let mut steps: Vec<(_, Vec<RequestStep>)> = Vec::new();
+    for event in events {
+        if let BlockEvent::Request { owner, step, .. } = event {
+            match steps.iter_mut().find(|(known, _)| known == owner) {
+                Some((_, list)) => list.push(*step),
+                None => steps.push((*owner, vec![*step])),
+            }
+        }
+    }
+    for (owner, list) in &steps {
+        let position = |wanted| list.iter().position(|step| *step == wanted);
+        match (
+            position(RequestStep::Published),
+            position(RequestStep::Started),
+            position(RequestStep::Written),
+        ) {
+            (Some(0), Some(started), Some(written)) if started < written => {}
+            _ => return Err(format!("{owner:?} took {list:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// Each handoff ends with the same body and charge, and the budget releases
+/// exactly that charge between the handoff's start and end. Another task can
+/// run between the release and the end, because the release wakes budget
+/// waiters.
+fn check_handoffs(events: &[BlockEvent]) -> Result<usize, String> {
+    let mut open = Vec::new();
+    let mut claimed = Vec::new();
+    let mut ended = 0;
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            BlockEvent::HandoffStarted {
+                peer,
+                owner,
+                height,
+                charge,
+            } => open.push(((peer.clone(), *owner, *height, *charge), index)),
+            BlockEvent::HandoffEnded {
+                peer,
+                owner,
+                height,
+                charge,
+            } => {
+                let key = (peer.clone(), *owner, *height, *charge);
+                let Some(position) = open.iter().position(|(started, _)| *started == key) else {
+                    return Err(format!("{height:?} ended a handoff it never started"));
+                };
+                let (_, started) = open.remove(position);
+                let release = (started..index).find(|candidate| {
+                    !claimed.contains(candidate)
+                        && matches!(
+                            events[*candidate],
+                            BlockEvent::Budget(BudgetChange {
+                                kind: BudgetChangeKind::Released,
+                                before,
+                                after,
+                            }) if before - after == *charge
+                        )
+                });
+                match release {
+                    Some(release) => claimed.push(release),
+                    None => return Err(format!("{height:?} ended with no release of {charge}")),
+                }
+                ended += 1;
+            }
+            _ => {}
+        }
+    }
+    match open.as_slice() {
+        [] => Ok(ended),
+        unended => Err(format!("{unended:?} never ended")),
+    }
+}
+
+/// Folds the holder events. At each sequencer snapshot, the fold's reorder,
+/// `applying` and submission holders equal the snapshot's. Every queued
+/// body leaves the queue, and every body that leaves it enters a sequencer
+/// holder by the same allocation. Returns the heights the sequencer held, in
+/// the order they arrived.
+fn check_holders(events: &[BlockEvent]) -> Result<Vec<block::Height>, String> {
+    let mut held: Vec<(Holder, HeldBody)> = Vec::new();
+    let mut dequeued = Vec::new();
+    let mut heights = Vec::new();
+    for event in events {
+        match event {
+            BlockEvent::Holder {
+                body,
+                holder,
+                change: HolderChange::Retained,
+            } => {
+                if let Holder::Reorder { allocation } | Holder::Applying { allocation } = holder {
+                    dequeued.retain(|queued| queued != allocation);
+                    if !heights.contains(&body.height) {
+                        heights.push(body.height);
+                    }
+                }
+                held.push((*holder, *body));
+            }
+            BlockEvent::Holder {
+                body,
+                holder,
+                change: HolderChange::Released,
+            } => {
+                let Some(position) = held.iter().position(|entry| *entry == (*holder, *body))
+                else {
+                    return Err(format!("{holder:?} released {body:?} it never held"));
+                };
+                held.remove(position);
+                if let Holder::Queued { allocation } = holder {
+                    dequeued.push(*allocation);
+                }
+            }
+            BlockEvent::Sequencer(snapshot) => {
+                let mut expected = snapshot.holders();
+                for entry in held
+                    .iter()
+                    .filter(|(holder, _)| !matches!(holder, Holder::Queued { .. }))
+                {
+                    let Some(position) = expected.iter().position(|other| other == entry) else {
+                        return Err(format!("{entry:?} folded but not in {snapshot:?}"));
+                    };
+                    expected.remove(position);
+                }
+                if !expected.is_empty() {
+                    return Err(format!("{expected:?} in the snapshot but not folded"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(queued) = held
+        .iter()
+        .find(|(holder, _)| matches!(holder, Holder::Queued { .. }))
+    {
+        return Err(format!("{queued:?} never left the queue"));
+    }
+    match dequeued.as_slice() {
+        [] => Ok(heights),
+        lost => Err(format!("allocations {lost:?} left the queue to no holder")),
+    }
+}
+
+/// Each serving lease is released after its frames: one block frame per
+/// height it returns, then one ending. Returns the heights served.
+fn check_serving(events: &[BlockEvent]) -> Result<u32, String> {
+    let mut leases: Vec<(ZakuraPeerId, block::Height, u32, Vec<u64>)> = Vec::new();
+    let mut served = 0;
+    for event in events {
+        match event {
+            BlockEvent::ServingLease {
+                peer,
+                start,
+                count,
+                step: LeaseStep::Acquired,
+            } => leases.push((peer.clone(), *start, *count, Vec::new())),
+            BlockEvent::ServingFrame {
+                peer,
+                start,
+                body_bytes,
+                ..
+            } => {
+                let Some(lease) = leases
+                    .iter_mut()
+                    .find(|lease| lease.0 == *peer && lease.1 == *start)
+                else {
+                    return Err(format!("frame for {start:?} outside a lease"));
+                };
+                lease.3.push(*body_bytes);
+            }
+            BlockEvent::ServingLease {
+                peer,
+                start,
+                count,
+                step: LeaseStep::Released,
+            } => {
+                let Some(position) = leases
+                    .iter()
+                    .position(|lease| lease.0 == *peer && lease.1 == *start && lease.2 == *count)
+                else {
+                    return Err(format!("{start:?} released a lease it never acquired"));
+                };
+                let (.., frames) = leases.remove(position);
+                let Some((0, blocks)) = frames.split_last() else {
+                    return Err(format!("{start:?} ended with frames {frames:?}"));
+                };
+                if blocks.contains(&0) || blocks.len() > *count as usize {
+                    return Err(format!("{start:?} of {count} sent {frames:?}"));
+                }
+                served += blocks.len() as u32; // at most `count`, a u32
+            }
+            _ => {}
+        }
+    }
+    match leases.as_slice() {
+        [] => Ok(served),
+        held => Err(format!("{held:?} never released")),
+    }
+}
+
+/// Block sync reports each effect of a download in an order that agrees
+/// with its owners' snapshots, under each of 16 plans.
+#[test]
+fn block_sync_reports_each_effect_of_a_download() {
+    for seed in 0..16 {
+        check_download_events(seed);
+    }
+}
+
+/// Runs the download under plan `seed` and checks both nodes' events.
+fn check_download_events(seed: u64) {
+    let net = download(seed);
+    let (a, b) = (net.nodes[0].events.events(), net.nodes[1].events.events());
+
+    let admitted = |events: &[BlockEvent]| -> Vec<_> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BlockEvent::SessionAdmitted {
+                    peer,
+                    conn_id,
+                    direction,
+                    ..
+                } => Some((peer.clone(), *conn_id, *direction)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        admitted(&a),
+        [(peer_id(2), 1, ServicePeerDirection::Outbound)]
+    );
+    assert_eq!(
+        admitted(&b),
+        [(peer_id(1), 1, ServicePeerDirection::Inbound)]
+    );
+
+    for events in [&a, &b] {
+        check_frame_sequence(events).unwrap();
+        check_budget_chain(events).unwrap();
+        check_request_steps(events).unwrap();
+    }
+    let judged = |events: &[BlockEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(event, BlockEvent::FrameJudged { .. }))
+            .count()
+    };
+    assert!(
+        judged(&a) > DOWNLOAD_HEIGHTS as usize,
+        "`a` judged each body and ending"
+    );
+    assert!(judged(&b) > 0, "`b` judged `a`'s requests");
+    assert!(
+        a.iter().any(|event| matches!(
+            event,
+            BlockEvent::Request {
+                step: RequestStep::Written,
+                ..
+            }
+        )),
+        "`a` wrote its requests"
+    );
+
+    assert_eq!(check_handoffs(&a), Ok(DOWNLOAD_HEIGHTS as usize));
+    let mut held = check_holders(&a).unwrap();
+    held.sort();
+    assert_eq!(
+        held,
+        (1..=DOWNLOAD_HEIGHTS)
+            .map(block::Height)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(check_serving(&b), Ok(DOWNLOAD_HEIGHTS));
+    assert_eq!(check_serving(&a), Ok(0), "`a` serves nothing");
+
+    for events in [&a, &b] {
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BlockEvent::Routine(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BlockEvent::WorkQueue(_))));
+    }
+    assert!(
+        a.iter()
+            .any(|event| matches!(event, BlockEvent::Sequencer(_))),
+        "`a`'s sequencer held bodies"
+    );
+    assert_eq!(net.finish(), ["completed", "completed"]);
+}
+
+/// Removing any one event a check reads from a download's log makes that
+/// check fail.
+#[test]
+fn each_check_catches_a_suppressed_event() {
+    let net = download(5);
+    let (a, b) = (net.nodes[0].events.events(), net.nodes[1].events.events());
+    assert_eq!(net.finish(), ["completed", "completed"]);
+
+    let without = |events: &[BlockEvent], suppressed: fn(&BlockEvent) -> bool| {
+        let index = events
+            .iter()
+            .position(suppressed)
+            .expect("the download reports the event");
+        let mut events = events.to_vec();
+        events.remove(index);
+        events
+    };
+
+    let first_frame = without(&a, |event| matches!(event, BlockEvent::FrameJudged { .. }));
+    assert!(check_frame_sequence(&first_frame).is_err());
+    let first_budget = without(&a, |event| matches!(event, BlockEvent::Budget(_)));
+    assert!(check_budget_chain(&first_budget).is_err());
+    let first_written = without(&a, |event| {
+        matches!(
+            event,
+            BlockEvent::Request {
+                step: RequestStep::Written,
+                ..
+            }
+        )
+    });
+    assert!(check_request_steps(&first_written).is_err());
+    let first_ended = without(&a, |event| matches!(event, BlockEvent::HandoffEnded { .. }));
+    assert!(check_handoffs(&first_ended).is_err());
+    let first_retained = without(&a, |event| {
+        matches!(
+            event,
+            BlockEvent::Holder {
+                holder: Holder::Reorder { .. } | Holder::Applying { .. },
+                change: HolderChange::Retained,
+                ..
+            }
+        )
+    });
+    assert!(check_holders(&first_retained).is_err());
+    let first_dequeue = without(&a, |event| {
+        matches!(
+            event,
+            BlockEvent::Holder {
+                holder: Holder::Queued { .. },
+                change: HolderChange::Released,
+                ..
+            }
+        )
+    });
+    assert!(check_holders(&first_dequeue).is_err());
+    let first_lease_end = without(&b, |event| {
+        matches!(
+            event,
+            BlockEvent::ServingLease {
+                step: LeaseStep::Released,
+                ..
+            }
+        )
+    });
+    assert!(check_serving(&first_lease_end).is_err());
 }

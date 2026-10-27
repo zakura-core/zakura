@@ -1107,7 +1107,7 @@ impl PeerRegistry {
 
     /// `peer`'s published outstanding claims, by height, read from its entry.
     /// Empty for a peer with no entry.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn outstanding_snapshot(
         &self,
         peer: &ZakuraPeerId,

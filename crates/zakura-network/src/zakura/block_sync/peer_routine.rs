@@ -374,6 +374,13 @@ pub(super) struct PeerRoutine {
     /// The routine then exits and its `Drop` guard returns work.
     cancel: CancellationToken,
     trace: ZakuraTrace,
+    /// Receives the routine's events and snapshots, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: super::block_sync_observe::ObserverSlot,
+    /// Frames taken from `recv` so far.
+    #[cfg(any(test, zakura_sim))]
+    frames_judged: u64,
 }
 
 impl PeerRoutine {
@@ -465,7 +472,49 @@ impl PeerRoutine {
             outbound_full_since: None,
             cancel,
             trace,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
+            #[cfg(any(test, zakura_sim))]
+            frames_judged: 0,
         }
+    }
+
+    /// This routine, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports the routine's owner state and the work queue's items, if an
+    /// observer is installed.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_owners(&self) {
+        use super::block_sync_observe::{BlockEvent, RegistryClaim, RoutineSnapshot};
+        observe!(
+            self.observer,
+            BlockEvent::Routine(RoutineSnapshot {
+                peer: self.peer.clone(),
+                conn_id: self.conn_id,
+                generation: self.generation,
+                requests: self.window.outstanding.ownership(),
+                claims: self
+                    .registry
+                    .outstanding_snapshot(&self.peer)
+                    .into_iter()
+                    .map(|(height, meta)| RegistryClaim {
+                        height,
+                        owner: meta.owner,
+                        estimated_bytes: meta.estimated_bytes,
+                    })
+                    .collect(),
+                serving: self.serving.admitted_ranges(),
+            })
+        );
+        self.work.observe_items();
     }
 
     /// Run the pipe-routine until stream close, cancellation, or a protocol
@@ -522,6 +571,8 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
+            #[cfg(any(test, zakura_sim))]
+            self.observe_owners();
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
@@ -635,6 +686,22 @@ impl PeerRoutine {
         guard: &mut crate::zakura::SessionGuard,
         frame: crate::zakura::Frame,
     ) -> Result<(), SinkReject> {
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.frames_judged += 1;
+            observe!(
+                self.observer,
+                super::block_sync_observe::BlockEvent::FrameJudged {
+                    peer: self.peer.clone(),
+                    conn_id: self.conn_id,
+                    generation: self.generation,
+                    seq: self.frames_judged,
+                    message_type: frame.message_type,
+                    flags: frame.flags,
+                    payload_len: frame.payload.len(),
+                }
+            );
+        }
         self.gc_skipped_outstanding();
         match guard.admit(&frame) {
             Admit::Pass => {}
@@ -2034,9 +2101,44 @@ impl PeerRoutine {
             body_permit,
         )
         .await;
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff(true, outstanding_owner, height, reserved_estimate);
         self.budget.release(reserved_estimate);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff(false, outstanding_owner, height, reserved_estimate);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
+    }
+
+    /// Reports that the body at `height` entered the handoff, with `started`,
+    /// or left it, with the release of its `charge`.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_handoff(
+        &self,
+        started: bool,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        charge: u64,
+    ) {
+        use super::block_sync_observe::BlockEvent;
+        observe!(self.observer, {
+            let peer = self.peer.clone();
+            if started {
+                BlockEvent::HandoffStarted {
+                    peer,
+                    owner,
+                    height,
+                    charge,
+                }
+            } else {
+                BlockEvent::HandoffEnded {
+                    peer,
+                    owner,
+                    height,
+                    charge,
+                }
+            }
+        });
     }
 
     // ===================== unmatched fallthroughs (ported) ==================
@@ -2070,6 +2172,18 @@ impl PeerRoutine {
             self.sequencer_input_decoded_attributed_memory_bytes.clone(),
         );
 
+        #[cfg(any(test, zakura_sim))]
+        let queued = super::block_sync_observe::BlockEvent::Holder {
+            body: super::block_sync_observe::HeldBody {
+                height,
+                owner,
+                bytes: serialized_bytes,
+            },
+            holder: super::block_sync_observe::Holder::Queued {
+                allocation: body.body.allocation(),
+            },
+            change: super::block_sync_observe::HolderChange::Retained,
+        };
         let ok = if let Some(permit) = body_permit {
             permit.send(body);
             true
@@ -2078,6 +2192,10 @@ impl PeerRoutine {
             let send_result = self.sequencer_input.send(body).await;
             send_result.is_ok()
         };
+        #[cfg(any(test, zakura_sim))]
+        if ok {
+            observe!(self.observer, queued);
+        }
 
         self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
     }
@@ -2222,7 +2340,11 @@ impl PeerRoutine {
         // `sequencer_input_bytes`, mirroring the matched receipt path above, so
         // the bytes are never invisible to both the limiter and the resident
         // snapshot.
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff(true, owner, height, ended_reservation);
         self.budget.release(ended_reservation);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff(false, owner, height, ended_reservation);
         true
     }
 

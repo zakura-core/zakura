@@ -47,6 +47,46 @@ struct ByteBudgetInner {
     /// permit), so a waiter must register `subscribe_capacity().notified()`
     /// before re-reading the budget.
     capacity: Notify,
+    /// Receives each counter change, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: Option<BudgetObserver>,
+}
+
+/// One change of a [`ByteBudget`]'s counter, as a test or simulator observer
+/// sees it.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BudgetChange {
+    /// Which operation changed the counter.
+    pub kind: BudgetChangeKind,
+    /// The counter before the change.
+    pub before: u64,
+    /// The counter after the change.
+    pub after: u64,
+}
+
+/// Which [`ByteBudget`] operation changed its counter.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BudgetChangeKind {
+    /// A reservation within the budget's maximum.
+    Reserved,
+    /// A charge that skipped the admission gate: a floor overdraft.
+    Charged,
+    /// A release.
+    Released,
+}
+
+/// The callback a [`ByteBudget`] reports each counter change to.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone)]
+pub(crate) struct BudgetObserver(pub(crate) Arc<dyn Fn(BudgetChange) + Send + Sync>);
+
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for BudgetObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BudgetObserver")
+    }
 }
 
 impl ByteBudget {
@@ -56,7 +96,30 @@ impl ByteBudget {
                 max_bytes,
                 reserved_bytes: AtomicU64::new(0),
                 capacity: Notify::new(),
+                #[cfg(any(test, zakura_sim))]
+                observer: None,
             }),
+        }
+    }
+
+    /// This new budget, reporting each counter change to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_observer(mut self, observer: Option<BudgetObserver>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("a budget gets its observer before anything clones it")
+            .observer = observer;
+        self
+    }
+
+    /// Reports one counter change to the observer, if one is installed.
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, kind: BudgetChangeKind, before: u64, after: u64) {
+        if let Some(observer) = &self.inner.observer {
+            (observer.0)(BudgetChange {
+                kind,
+                before,
+                after,
+            });
         }
     }
 
@@ -96,6 +159,8 @@ impl ByteBudget {
             ) {
                 Ok(_) => {
                     publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe(BudgetChangeKind::Reserved, reserved, next);
                     return true;
                 }
                 Err(observed) => reserved = observed,
@@ -120,6 +185,8 @@ impl ByteBudget {
             ) {
                 Ok(_) => {
                     publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe(BudgetChangeKind::Released, reserved, next);
                     break;
                 }
                 Err(observed) => reserved = observed,
@@ -148,6 +215,8 @@ impl ByteBudget {
             ) {
                 Ok(_) => {
                     publish_reserved_change(reserved, next);
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe(BudgetChangeKind::Charged, reserved, next);
                     break;
                 }
                 Err(observed) => reserved = observed,

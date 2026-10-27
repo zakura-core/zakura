@@ -68,6 +68,10 @@ pub struct BlockRangeReadResult {
 pub struct BlockRangeReadLease {
     pub(super) work: WorkLease,
     pub(super) _session: Option<FramedSend>,
+    /// Reports the lease's release once `work` dropped, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observed: Option<super::block_sync_observe::ObservedLease>,
 }
 
 impl BlockRangeReadLease {

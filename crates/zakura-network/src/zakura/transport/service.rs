@@ -261,6 +261,52 @@ impl Peer {
         )
     }
 
+    /// Build a peer that carries one persistent stream of kind `stream_kind`
+    /// at `version`, in service session `session_id`, as the transport hands
+    /// it to a service after admitting that session.
+    ///
+    /// [`Peer::new`] and [`Peer::new_with_direction`] leave every stream at
+    /// version 0, which a service that checks its stream version refuses.
+    /// This is the in-memory way to open a versioned session, such as a
+    /// simulator linking two nodes with [`framed_channel`](super::framed_channel)s.
+    ///
+    /// The peer has no remote IP and a fresh close cause. Its stream's
+    /// cancellation token is a child of `cancel_token`, so cancelling
+    /// `cancel_token` closes the connection and the session with it.
+    ///
+    /// A session that replaces another needs a `conn_id` greater than the
+    /// current connection's for that peer, since [`ZakuraConnId`]s only
+    /// increase and header sync refuses a session from an older connection.
+    /// It also needs a new token and a `session_id` never used before for
+    /// the same peer. Header sync matches a session's teardown by peer and
+    /// session ID alone, so a reused ID would let the replaced session's
+    /// late teardown remove its replacement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_versioned(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        stream_kind: u16,
+        version: u16,
+        session_id: u64,
+        (recv, send): (FramedRecv, FramedSend),
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let stream =
+            ServiceStream::new(session_id, version, recv, send, cancel_token.child_token());
+        Self::new_with_service_streams(
+            conn_id,
+            id,
+            None,
+            negotiated,
+            direction,
+            HashMap::from([(stream_kind, stream)]),
+            cancel_token,
+            CloseCause::new(),
+        )
+    }
+
     /// Build a peer from transport streams, connection id, and direction.
     pub(crate) fn new_with_conn_id_and_direction(
         conn_id: ZakuraConnId,

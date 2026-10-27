@@ -21,7 +21,7 @@ use std::{fmt, rc::Rc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
-pub use record::{record, RecordError, RecordInput};
+pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE};
 
 use crate::{
     check::{Checker, Phase, PropertyReport, StepCtx, Violation},
@@ -37,6 +37,7 @@ use crate::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
         BuildInfo, MetaRecord,
     },
+    witness::{witness_into, Expect, WitnessError},
     Observation, ObservationLog, PlanInput, RecordSink, RunConfig, RunReport, Sim,
 };
 
@@ -318,7 +319,14 @@ pub struct HarnessEntry {
     pub draw: fn(&[u8]) -> Value,
     /// Every property the harness checks in any scenario, with its status.
     pub properties: fn() -> Vec<PropertyRef>,
+    /// [`witness_into`] on a serialized scenario.
+    pub witness: WitnessFn,
 }
+
+/// [`HarnessEntry::witness`]: the serialized scenario, the input, the
+/// property, the expectation and the sink.
+pub type WitnessFn =
+    fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
     /// Property `id`'s status in this harness, as the explorer's classifier
@@ -353,6 +361,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         config: config_value::<S>,
         draw: draw_value::<S>,
         properties: registered::<S>,
+        witness: witness_value::<S>,
     }
 }
 
@@ -398,6 +407,19 @@ fn meta_value<S: Subsystem>(value: &Value) -> Result<MetaRecord, HarnessError> {
 /// [`HarnessEntry::config`] for `S`.
 fn config_value<S: Subsystem>(value: &Value) -> Result<RunConfig, HarnessError> {
     Ok(run_config::<S>(&scenario::<S>(value)?))
+}
+
+/// [`HarnessEntry::witness`] for `S`.
+fn witness_value<S: Subsystem>(
+    value: &Value,
+    input: PlanInput,
+    property: &str,
+    expect: Expect,
+    sink: &mut dyn RecordSink,
+) -> Result<(), WitnessError> {
+    let scenario = scenario::<S>(value)
+        .map_err(|error| WitnessError::UnsupportedScenario(error.to_string()))?;
+    witness_into::<S>(&scenario, input, property, expect, sink)
 }
 
 /// [`HarnessEntry::draw`] for `S`.

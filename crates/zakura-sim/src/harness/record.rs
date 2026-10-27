@@ -17,8 +17,13 @@ use crate::{
         read::refuse_symlinked_dir,
         FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, TRACE_FILE,
     },
-    Plan,
+    witness::{Expect, WitnessError},
+    Plan, PlanInput, RecordSink,
 };
+
+/// The file beside a trace that [`record_witness`]'s callers write its
+/// witness test's result to.
+pub const WITNESS_FILE: &str = "witness.json";
 
 /// What [`record`] runs.
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +58,9 @@ pub enum RecordError {
     Io(io::Error),
     /// The written trace didn't read back.
     Read(ReadError),
+    /// The witness test couldn't run: the harness doesn't register the
+    /// property, or the property has no trigger-history check.
+    Witness(WitnessError),
 }
 
 impl fmt::Display for RecordError {
@@ -67,6 +75,7 @@ impl fmt::Display for RecordError {
             RecordError::Refused(error) => write!(f, "the trace can't go there: {error}"),
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
+            RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
         }
     }
 }
@@ -93,6 +102,45 @@ pub fn record(
     what: RecordInput<'_>,
     out: &Path,
 ) -> Result<Trace, RecordError> {
+    let (trace, ()) = record_with(harness, what, out, |scenario, plan, sink| {
+        match (harness.run)(scenario, plan, sink) {
+            Ok(_) | Err(HarnessError::Run { .. }) => Ok(()),
+            Err(error) => Err(RecordError::Harness(error)),
+        }
+    })?;
+    Ok(trace)
+}
+
+/// [`record`], judging the run as a witness test of `property` that
+/// expects `expect`, with the rule [`crate::witness::witness`] applies.
+/// Returns the trace and the test's result. A run the test fails still
+/// writes its trace, as evidence.
+pub fn record_witness(
+    harness: &HarnessEntry,
+    what: RecordInput<'_>,
+    out: &Path,
+    property: &str,
+    expect: Expect,
+) -> Result<(Trace, Result<(), WitnessError>), RecordError> {
+    if harness.status(property).is_none() {
+        return Err(RecordError::Witness(WitnessError::Unregistered));
+    }
+    record_with(harness, what, out, |scenario, plan, sink| {
+        match (harness.witness)(scenario, plan, property, expect, sink) {
+            Err(error @ WitnessError::NoTriggerHistory) => Err(RecordError::Witness(error)),
+            result => Ok(result),
+        }
+    })
+}
+
+/// Writes the trace of `run` on `what`'s scenario and Plan to `out`, as
+/// [`record`] describes, and returns it with `run`'s result.
+fn record_with<T>(
+    harness: &HarnessEntry,
+    what: RecordInput<'_>,
+    out: &Path,
+    run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
+) -> Result<(Trace, T), RecordError> {
     let (scenario, plan, input) = match what {
         RecordInput::Input(input) => {
             let split = harness.scenario_bytes.min(input.len());
@@ -123,12 +171,10 @@ pub fn record(
         write_input(out, input).map_err(RecordError::Io)?;
     }
     let mut sink = FileSink::create(out, &meta).map_err(RecordError::Io)?;
-    match (harness.run)(&meta.scenario, Plan::from_fuzz(plan), &mut sink) {
-        Ok(_) | Err(HarnessError::Run { .. }) => {}
-        Err(error) => return Err(RecordError::Harness(error)),
-    }
+    let result = run(&meta.scenario, Plan::from_fuzz(plan), &mut sink)?;
     sink.finish().map_err(RecordError::Io)?;
-    TraceReader::open(out).map_err(RecordError::Read)
+    let trace = TraceReader::open(out).map_err(RecordError::Read)?;
+    Ok((trace, result))
 }
 
 /// Writes `input` to `out`'s `input.bin`, creating `out` if needed. Fails if

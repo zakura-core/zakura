@@ -78,7 +78,7 @@ pub struct PropertyReport {
     ///
     /// The trace's `end` record leaves them out: their number grows with the
     /// run, and a record has a size limit. A replay of the trace finds every
-    /// one again.
+    /// one again, in `ReplayReport::properties`.
     #[serde(skip)]
     pub violations: Vec<Violation>,
 }

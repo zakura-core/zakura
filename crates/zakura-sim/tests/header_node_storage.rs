@@ -847,37 +847,53 @@ fn run_end_returns_every_permit_and_lease() {
     }
 }
 
-/// The peak number of Nora's locators pending at once, before and after
-/// her first 16 locators completed.
-fn locator_waves(report: &RunReport) -> [usize; 2] {
-    let mut locators = std::collections::BTreeSet::new();
-    let (mut pending, mut completed, mut peaks) = (0, 0, [0; 2]);
-    for (_, fact) in facts(report) {
+/// The peak number of Nora's locators pending at once in each wave: the
+/// first, before her first 16 locators completed, and the second, among
+/// locators submitted after step `grown`, when every mirror's new tip was
+/// committed. A locator submitted before then, such as a retry toward an
+/// old tip, never counts toward the second wave.
+fn locator_waves(report: &RunReport, grown: u64) -> [usize; 2] {
+    let mut waves = std::collections::BTreeMap::new();
+    let (mut pending, mut completed, mut peaks) = ([0; 2], 0, [0; 2]);
+    for (step, fact) in facts(report) {
         match fact {
             StorageFact::Submitted {
                 id,
                 request: StorageRequest::ContinuationLocator,
                 ..
             } => {
-                locators.insert(*id);
-                pending += 1;
+                let wave = if step > grown {
+                    Some(1)
+                } else {
+                    (completed < 16).then_some(0)
+                };
+                if let Some(wave) = wave {
+                    waves.insert(*id, wave);
+                    pending[wave] += 1;
+                }
             }
-            StorageFact::Completed { id, .. } if locators.contains(id) => {
-                pending -= 1;
-                completed += 1;
+            StorageFact::Completed { id, .. } => {
+                if let Some(wave) = waves.get(id) {
+                    pending[*wave] -= 1;
+                    completed += usize::from(*wave == 0);
+                }
             }
             _ => {}
         }
-        let wave = usize::from(completed >= 16);
-        peaks[wave] = peaks[wave].max(pending);
+        for wave in 0..2 {
+            peaks[wave] = peaks[wave].max(pending[wave]);
+        }
     }
     peaks
 }
 
 /// Locator capacity is 16, and it all comes back. Sixteen mirrors at
 /// distinct height-1 tips draw 16 locators, each held until all 16 are
-/// pending. Once they complete, each mirror grows a new tip, and the next
-/// 16 locators are again held until all 16 are pending at once. A permit
+/// pending. Once they complete, each mirror grows a new tip. Locators
+/// carry no target, so the second wave counts only locators submitted after
+/// every mirror's own watch has published its new tip, when no mirror still
+/// advertises an old one. Those are again held until all 16 are pending at
+/// once. A permit
 /// leaked by the first wave would cap the second below 16. The first wave
 /// completes with `engine`, then, in a second variant, with `unavailable`.
 #[test]
@@ -935,14 +951,41 @@ fn locator_capacity_recovers_after_success_and_failure() {
             budget: Some(30_000),
         };
         for input in inputs(8, 256) {
-            let (report, _) = run_probed(&scenario, input, &mut zakura_sim::NoChecks);
-            let grown = report
-                .picks
+            // A pick only queues a growth, so the witness is each mirror's
+            // own watch publishing its new height-2 tip.
+            let ready = Probing::prepare(&scenario);
+            let tips: Vec<_> = ready
+                .ports
+                .mirrors
                 .iter()
-                .filter(|pick| pick.identity.ends_with(":grow"))
-                .count();
-            assert_eq!(grown, 16, "{first:?}: every mirror grew");
-            assert_eq!(locator_waves(&report), [16, 16], "{first:?}");
+                .map(|port| {
+                    use zakura_node_services::header_chain::Port;
+                    port.selected_chain()
+                })
+                .collect();
+            let grown = std::cell::Cell::new(None);
+            let mut witness = after_step(|cx| {
+                let all = tips.iter().all(|tip| {
+                    tip.borrow()
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.frontiers.header_best.height.0 == 2)
+                });
+                if all && grown.get().is_none() {
+                    grown.set(Some(cx.step));
+                }
+                None
+            });
+            let report = run_prepared::<Probing>(
+                &scenario,
+                ready.clone(),
+                input,
+                &mut MemorySink::default(),
+                Some(&mut witness),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            drop(witness);
+            let grown = grown.get().expect("every mirror's growth committed");
+            assert_eq!(locator_waves(&report, grown), [16, 16], "{first:?}");
         }
     }
 }

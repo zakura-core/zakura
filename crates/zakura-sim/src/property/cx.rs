@@ -65,7 +65,21 @@ pub struct CheckCtx<'a, S: HasView> {
     handle: &'a S,
     property: &'a Property<S>,
     obliged: Vec<Obligation>,
+    recorded: Vec<Violation>,
+    missing: Option<String>,
     labelled: Vec<LabelledFrame>,
+}
+
+/// What a check left behind besides its verdict.
+pub(crate) struct CheckParts {
+    /// The obligations it opened, in order.
+    pub(crate) obliged: Vec<Obligation>,
+    /// The violations it recorded, in order.
+    pub(crate) recorded: Vec<Violation>,
+    /// The first evidence it found missing.
+    pub(crate) missing: Option<String>,
+    /// The frames it labelled, in order.
+    pub(crate) labelled: Vec<LabelledFrame>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -76,14 +90,20 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             handle,
             property,
             obliged: Vec::new(),
+            recorded: Vec::new(),
+            missing: None,
             labelled: Vec::new(),
         }
     }
 
-    /// The obligations the check opened and the frames it labelled, each in
-    /// order.
-    pub(crate) fn into_parts(self) -> (Vec<Obligation>, Vec<LabelledFrame>) {
-        (self.obliged, self.labelled)
+    /// What the check left behind besides its verdict.
+    pub(crate) fn into_parts(self) -> CheckParts {
+        CheckParts {
+            obliged: self.obliged,
+            recorded: self.recorded,
+            missing: self.missing,
+            labelled: self.labelled,
+        }
     }
 
     /// The property being checked.
@@ -177,13 +197,35 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// A violation of the property at this step, with this step as its
     /// witness.
     pub fn violated(&self, expected: impl Into<String>, actual: impl Into<String>) -> Verdict {
-        Verdict::Violated(Violation {
+        Verdict::Violated(self.violation(expected.into(), actual.into()))
+    }
+
+    /// Records one more violation at this step, after the one a `Violated`
+    /// verdict carries, so a check that finds several at one boundary, such
+    /// as two punished connections, reports each. The registry treats a
+    /// recorded violation as the check's even if the verdict is `Holds`.
+    pub fn record_violation(&mut self, expected: impl Into<String>, actual: impl Into<String>) {
+        let violation = self.violation(expected.into(), actual.into());
+        self.recorded.push(violation);
+    }
+
+    /// Records that a source the property needs lacks evidence the check
+    /// requires, such as a judged frame with no label. The registry fails
+    /// the run as a harness failure, because a check that skipped the
+    /// evidence would read as `Held`.
+    pub fn missing_evidence(&mut self, detail: impl Into<String>) {
+        self.missing.get_or_insert_with(|| detail.into());
+    }
+
+    /// A violation at this step, with this step as its witness.
+    fn violation(&self, expected: String, actual: String) -> Violation {
+        Violation {
             property: self.id().to_string(),
             step: self.step.step,
             witness: vec![self.step.step],
-            expected: expected.into(),
-            actual: actual.into(),
-        })
+            expected,
+            actual,
+        }
     }
 }
 

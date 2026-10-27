@@ -1512,9 +1512,10 @@ fn known_and_active_failures_at_one_boundary() {
     }
 }
 
-/// P1 follow-up: a `Known` property that fails, recovers, and fails again
-/// keeps both violations. Consecutive failing evaluations keep only their
-/// first, so a state that stays broken doesn't grow the report every step.
+/// P1 follow-up: a `Known` property that keeps failing keeps every
+/// violation, not only its first, in the run's report. The trace's `end`
+/// record leaves them out, so a long run's record stays small, and a replay
+/// finds them again.
 #[test]
 fn every_violation_retained() {
     let world = honest();
@@ -1532,19 +1533,97 @@ fn every_violation_retained() {
                 task_world.level.set(0);
                 task::yield_now().await;
                 bump(&task_world);
-                task::yield_now().await;
+            });
+        },
+    );
+    let property = property_report(&report, &LEVEL);
+    let actual: Vec<&str> = property
+        .violations
+        .iter()
+        .map(|v| v.actual.as_str())
+        .collect();
+    assert_eq!(actual, ["level 1", "level 2", "level 1"]);
+    assert_eq!(
+        outcome(&report, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: property.violations[0].witness.clone()
+        }
+    );
+    let recorded = serde_json::to_value(property).expect("a report serializes");
+    assert_eq!(recorded.get("violations"), None, "{recorded}");
+}
+
+/// Fails twice at every step where the counter is odd.
+fn twice_when_odd(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    let level = cx.view();
+    if level.is_multiple_of(2) {
+        return Verdict::Holds;
+    }
+    cx.record_violation("an even level", format!("second look at level {level}"));
+    cx.violated("an even level", format!("level {level}"))
+}
+
+/// P1 follow-up: one check can report several violations at one boundary,
+/// such as two punished connections. The verdict's comes first.
+#[test]
+fn one_check_reports_several_violations() {
+    let world = honest();
+    let task_world = world.clone();
+    let report = report(
+        world,
+        vec![Property {
+            check: twice_when_odd,
+            ..level(Status::Known { issue: 1523 })
+        }],
+        Assumptions::none(),
+        |sim| {
+            sim.scheduler().spawn_root("bump", async move {
                 bump(&task_world);
             });
         },
     );
     let violations = &property_report(&report, &LEVEL).violations;
     let actual: Vec<&str> = violations.iter().map(|v| v.actual.as_str()).collect();
-    assert_eq!(actual, ["level 1", "level 1"]);
+    assert_eq!(actual, ["level 1", "second look at level 1"]);
+    assert!(violations.iter().all(|v| v.step == violations[0].step));
+}
+
+/// Reports missing evidence once the counter is set.
+fn evidence_when_set(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    if cx.view() == 0 {
+        return Verdict::Holds;
+    }
+    cx.missing_evidence("no label for the judged frame");
+    Verdict::NotApplicable
+}
+
+/// P1 follow-up: evidence a declared source lacks fails the run as a
+/// harness failure, never `Held` or a silent `NotApplicable`.
+#[test]
+fn missing_evidence_fails_the_harness() {
+    let world = honest();
+    let task_world = world.clone();
+    let report = report(
+        world,
+        vec![Property {
+            check: evidence_when_set,
+            ..level(Status::Active)
+        }],
+        Assumptions::none(),
+        |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+            });
+        },
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
     assert_eq!(
-        outcome(&report, &LEVEL),
-        PropertyOutcome::Violated {
-            witness: violations[0].witness.clone()
-        }
+        report.end.harness,
+        Some(HarnessFailure::MissingEvidence {
+            property: LEVEL.to_string(),
+            step: 1,
+            detail: "no label for the judged frame".to_owned(),
+        })
     );
 }
 

@@ -62,6 +62,16 @@ pub enum HarnessFailure {
         /// The source, such as `Frames`.
         source: String,
     },
+    /// A property's check found its declared source missing evidence it
+    /// requires.
+    MissingEvidence {
+        /// The property.
+        property: String,
+        /// The step whose boundary the check ran at.
+        step: u64,
+        /// What was missing.
+        detail: String,
+    },
     /// A property that reads the view would have read state captured before
     /// the step's boundary.
     StaleView {
@@ -114,6 +124,11 @@ impl fmt::Display for HarnessFailure {
                 f,
                 "{property} needs {source}, which the harness neither observes nor excludes"
             ),
+            HarnessFailure::MissingEvidence {
+                property,
+                step,
+                detail,
+            } => write!(f, "{property} lacks evidence after step {step}: {detail}"),
             HarnessFailure::StaleView {
                 property,
                 step,

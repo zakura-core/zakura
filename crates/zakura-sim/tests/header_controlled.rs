@@ -26,7 +26,11 @@ use zakura_sim::{
     check::after_step, observe::StorageEvent, IdleStatus, Observation, Outcome, PlanInput,
     RunConfig, RunReport, Sim, Violation,
 };
-use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture, HeaderOp};
+use zakura_storage::header::{
+    controlled::{ControlledPort, FactKind},
+    fixture::HeaderFixture,
+    HeaderOp,
+};
 
 /// A run config with 2 workers and `budget` steps. Tasks keep the default
 /// stack, as the engine-backed scenario does.
@@ -583,11 +587,17 @@ fn shutdown_releases_everything_and_logs_nothing() {
     assert_eq!(port.engine().live_leases(), 0);
     // The caller's cancellation and the shutdown happened after the log
     // froze, so they're still queued and were never logged.
+    let kinds: Vec<_> = port
+        .take_facts()
+        .into_iter()
+        .map(|fact| fact.kind)
+        .collect();
     assert!(matches!(
-        port.take_events().as_slice(),
+        kinds.as_slice(),
         [
-            zakura_storage::header::controlled::StorageEvent::CallerDropped { .. },
-            zakura_storage::header::controlled::StorageEvent::ShutDown { .. },
+            FactKind::CallerDropped { .. },
+            FactKind::PermitDropped { .. },
+            FactKind::ShutDown { .. },
         ]
     ));
 }

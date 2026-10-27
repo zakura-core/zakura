@@ -1,7 +1,8 @@
 //! Lifecycle sweeps for a header-sync node on controlled storage (M4-C):
 //! operation identity and order (M4.1), one committed state for requester
 //! and publisher (M4.2), permit and lease reclamation (M4.4), and
-//! preparation on the run's thread and clock (M4.6).
+//! preparation under the scenario clock (M4.6), with a smoke test of a
+//! large preparation. Thread confinement isn't proven here.
 //!
 //! Fresh-process replay (M4.6) is `cli.rs`'s
 //! `every_harness_replays_byte_for_byte_in_a_fresh_process`, which covers
@@ -330,11 +331,17 @@ fn requester_and_publisher_share_committed_state() {
     }
 }
 
-/// Nora prepares a 160-header batch from Mira, and no task panics: the
-/// simulator build prepares on the caller's thread, so nothing wakes a
-/// task from another OS thread.
+/// A smoke test: Nora prepares a 160-header batch from Mira, and no task
+/// panics.
+///
+/// It doesn't prove that preparation stays on the run's thread. Waking a
+/// completion's caller from another OS thread passes it, because the
+/// reactor polls its port futures with `now_or_never`, which registers a
+/// no-op waker, so the wake never reaches the scheduler's thread
+/// assertion. Thread confinement rests on the simulator build's `Each` in
+/// the preparation pipeline, which iterates on the caller's thread.
 #[test]
-fn preparation_stays_on_the_run_thread() {
+fn a_160_header_preparation_panics_no_task() {
     let scenario = StorageScenario {
         mirrors: vec![mirror("mira", Chain::main(160), Dialer::Mirror)],
         ..StorageScenario::default()

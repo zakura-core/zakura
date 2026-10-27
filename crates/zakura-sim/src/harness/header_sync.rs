@@ -275,7 +275,7 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             effects.clone(),
         );
-        let (observer, tap) = ReactorTap::new(sim, &ports.node, "nora");
+        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));

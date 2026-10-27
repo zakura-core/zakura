@@ -124,8 +124,8 @@ fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
 /// Under every outcome and no bound, the node's operation IDs rise by one per
 /// submission, and each completes at most once, after its submission.
 /// `NodeChecks` checks that after every step, and some plan completes an
-/// operation with a fault, so faults are exercised. The harness taps Nora's
-/// reactor, so every run also logs her calls, paired with her storage
+/// operation with a fault, so faults are exercised. The harness taps the
+/// node's reactor, so every run also logs its calls, paired with its storage
 /// receipts, and some plan pairs a call that ended with a port error.
 #[test]
 fn operation_ids_are_unique_and_complete_once() {
@@ -157,7 +157,7 @@ fn operation_ids_are_unique_and_complete_once() {
                 _ => None,
             })
             .collect();
-        assert!(!ends.is_empty(), "Nora's tap logs her calls");
+        assert!(!ends.is_empty(), "the node's tap logs its calls");
         paired_error |= ends
             .iter()
             .any(|(end, op)| *end == "port-error" && op.is_some());

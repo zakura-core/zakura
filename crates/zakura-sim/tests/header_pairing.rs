@@ -1,4 +1,4 @@
-//! Nora's reactor calls paired with her storage receipts (M4-B3b): a
+//! The node's reactor calls paired with its storage receipts (M4-B3b): a
 //! timed-out locator pairs with whichever drop its caller made, a port
 //! future caught panicking fails the run as `ReactorPortPanicked`, and a
 //! hold can wait for the reactor to handle a call.
@@ -54,8 +54,8 @@ fn storage_run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Arc<
     (report, node)
 }
 
-/// The default scenario, Nora at genesis and Mira at A5, converging, with
-/// `holds`.
+/// The default scenario, the node at genesis and `mirror-0` at A5,
+/// converging, with `holds`.
 fn holding(holds: Vec<Hold>) -> StorageScenario {
     StorageScenario {
         policy: Policy {
@@ -66,7 +66,7 @@ fn holding(holds: Vec<Hold>) -> StorageScenario {
     }
 }
 
-/// Nora's reactor events, with their storage watermarks, in log order.
+/// The node's reactor events, with their storage watermarks, in log order.
 fn events(report: &RunReport) -> Vec<(u64, &ReactorFact)> {
     report
         .log
@@ -81,7 +81,7 @@ fn events(report: &RunReport) -> Vec<(u64, &ReactorFact)> {
         .collect()
 }
 
-/// Nora's storage fact numbered `seq`.
+/// The node's storage fact numbered `seq`.
 fn fact_at(report: &RunReport, seq: u64) -> &StorageFact {
     report
         .log
@@ -96,10 +96,10 @@ fn fact_at(report: &RunReport, seq: u64) -> &StorageFact {
             } if *logged == seq => Some(fact),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("Nora's storage logged fact {seq}"))
+        .unwrap_or_else(|| panic!("the node's storage logged fact {seq}"))
 }
 
-/// With Nora's first locator held until 30 s after its submission, the
+/// With the node's first locator held until 30 s after its submission, the
 /// reactor's timeout and the completion share an instant. The caller drops
 /// its call either before the completion, leaving `CallerDropped`, or after
 /// it, leaving `ReplyDropped`. Both histories happen, and each run's
@@ -153,7 +153,7 @@ enum PanicAt {
     AfterReply,
 }
 
-/// Nora's controlled port, except that every apply panics.
+/// The node's controlled port, except that every apply panics.
 struct PanickingPort {
     inner: Arc<ControlledPort>,
     at: PanicAt,
@@ -235,8 +235,8 @@ impl Port for PanickingPort {
     }
 }
 
-/// A source, added before Nora's, whose observation fails from the step an
-/// apply panics on.
+/// A source, added before the node's tap, whose observation fails from the
+/// step an apply panics on.
 struct FailsOnPanic(Arc<AtomicBool>);
 
 impl ActionSource for FailsOnPanic {
@@ -250,17 +250,17 @@ impl ActionSource for FailsOnPanic {
 
     fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
         match self.0.load(Ordering::Relaxed) {
-            true => Err("EarlierFailure: a source before Nora's failed".to_owned()),
+            true => Err("EarlierFailure: a source before the node's failed".to_owned()),
             false => Ok(()),
         }
     }
 }
 
-/// Nora at genesis, tapped, syncing from Mira at A5 through a
-/// [`PanickingPort`] that panics `at`, converging. With `close`, Nora's
-/// first apply is held until Mira's link has closed and a second has
+/// The node at genesis, tapped, syncing from `mirror-0` at A5 through a
+/// [`PanickingPort`] that panics `at`, converging. With `close`, the node's
+/// first apply is held until `mirror-0`'s link has closed and a second has
 /// passed, and the `Plan` may close the link once that apply is submitted.
-/// With `fail_first`, a [`FailsOnPanic`] source comes before Nora's.
+/// With `fail_first`, a [`FailsOnPanic`] source comes before the node's.
 fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> RunReport {
     let fixture = HeaderFixture::regtest();
     let node = Arc::new(ControlledPort::new(&fixture));
@@ -274,14 +274,14 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
                 // Time moves only once no task is ready, so a close before
                 // then is handled, and the apply's owner retired, first.
                 until: Trigger::All(vec![
-                    Trigger::Closed("mira".to_owned()),
+                    Trigger::Closed("mirror-0".to_owned()),
                     Trigger::VirtualTime(1_000),
                 ]),
                 then: vec![Allow::Engine],
                 deadline_ms: None,
             }],
             vec![ControlStep {
-                peer: "mira".to_owned(),
+                peer: "mirror-0".to_owned(),
                 action: ControlAction::Close,
                 when: Some(Trigger::Submitted(first_apply)),
             }],
@@ -305,7 +305,7 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
                 ..Policy::converging()
             };
             let storage = PolicySource::new(sim, node.clone(), policy, effects.clone());
-            let (observer, tap) = ReactorTap::new(sim, &node, "nora");
+            let (observer, tap) = ReactorTap::new(sim, &node, "node");
             let storage = storage.with_tap(tap);
             let predicates = storage.predicates();
             sim.add_source(Box::new(storage));
@@ -317,7 +317,7 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
             let nodes = vec![
                 HeaderNode::spawn(
                     sim,
-                    "nora",
+                    "node",
                     1,
                     port,
                     &fixture,
@@ -327,7 +327,7 @@ fn panic_run(at: PanicAt, close: bool, fail_first: bool, input: PlanInput) -> Ru
                 ),
                 HeaderNode::spawn(
                     sim,
-                    "mira",
+                    "mirror-0",
                     2,
                     mirror.clone(),
                     &fixture,
@@ -358,7 +358,7 @@ struct Panicked {
     owner_retired: Option<String>,
 }
 
-/// Checks that `report` ended with `ReactorPortPanicked` for Nora's first
+/// Checks that `report` ended with `ReactorPortPanicked` for the node's first
 /// apply call, logged as `port-panicked` with no operation, and that no
 /// call is paired with any apply operation. With `submitted`, the apply's
 /// operation must have taken its reply.
@@ -366,7 +366,7 @@ fn panicked(report: &RunReport, submitted: bool) -> Panicked {
     let Some(HarnessFailure::ReactorPortPanicked { source, call }) = &report.end.harness else {
         panic!("expected a reactor port panic, got {:?}", report.end);
     };
-    assert_eq!(source, "reactor:nora#0");
+    assert_eq!(source, "reactor:node#0");
     let events = events(report);
     let dispatched = events
         .iter()
@@ -377,7 +377,7 @@ fn panicked(report: &RunReport, submitted: bool) -> Panicked {
             } => Some((*call, owner.clone())),
             _ => None,
         })
-        .expect("Nora dispatched an apply");
+        .expect("the node dispatched an apply");
     assert_eq!(*call, dispatched.0);
     let ended = events
         .iter()
@@ -441,7 +441,7 @@ fn panicked(report: &RunReport, submitted: bool) -> Panicked {
 /// `ReactorPortPanicked`, logged first with `op: null`, whether it panicked
 /// before submitting its apply or after taking the apply's reply, which
 /// stays unpaired. The third variant retires the apply's owner first, by
-/// closing Mira's link while the apply is held, so the call holds the
+/// closing `mirror-0`'s link while the apply is held, so the call holds the
 /// owner's last header capacity lease. Releasing that lease reaches a
 /// scheduling point, which the panic's end comes before, so its receipt
 /// and its end share a drain and the panic outranks the unpaired receipt.
@@ -464,7 +464,7 @@ fn port_panic_is_a_harness_failure() {
 }
 
 /// A port panic outranks another source's observation failure in the same
-/// step, even one that observes before Nora's tap.
+/// step, even one that observes before the node's tap.
 #[test]
 fn port_panic_outranks_an_earlier_sources_failure() {
     for input in inputs(8, 256) {
@@ -475,9 +475,9 @@ fn port_panic_outranks_an_earlier_sources_failure() {
     }
 }
 
-/// A hold on Nora's applies until `Handled` opens once her reactor has
-/// handled her first prepare, so the tap's events reach the policy's
-/// predicates. Held until a VCT context call she never makes, no apply
+/// A hold on the node's applies until `Handled` opens once its reactor has
+/// handled its first prepare, so the tap's events reach the policy's
+/// predicates. Held until a VCT context call it never makes, no apply
 /// completes.
 #[test]
 fn a_hold_waits_for_the_reactor_to_handle_a_call() {
@@ -509,7 +509,7 @@ fn a_hold_waits_for_the_reactor_to_handle_a_call() {
                 } => Some(*call),
                 _ => None,
             })
-            .expect("Nora prepares");
+            .expect("the node prepares");
         assert!(events.iter().any(|(_, event)| matches!(
             event,
             ReactorFact::Handled { call, .. } if *call == prepare

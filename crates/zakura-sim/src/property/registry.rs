@@ -243,7 +243,8 @@ impl Sources {
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
 /// `Draft` violation is only recorded, so the run goes on. Each report
-/// keeps every violation its property had.
+/// keeps every expired obligation, and the check's first violation of each
+/// run of consecutive failing evaluations.
 pub struct RegistryChecker<S: HasView> {
     properties: Vec<Property<S>>,
     state: Vec<PropertyState>,
@@ -267,8 +268,12 @@ struct PropertyState {
     /// True once an evaluation returned `Holds` or `Violated`, and the
     /// `Applicable` event went out.
     announced: bool,
-    /// Every violation, in order.
+    /// Every violation, in order: each expired obligation, and the check's
+    /// first violation of each run of consecutive failing evaluations.
     violations: Vec<Violation>,
+    /// True if the check's last evaluation other than `NotApplicable`
+    /// returned `Violated`.
+    failing: bool,
     /// Open obligations, oldest first.
     open: Vec<Open>,
     /// The step and time after which all the property's assumptions have
@@ -438,7 +443,8 @@ impl<S: HasView> Checker for RegistryChecker<S> {
 }
 
 /// Steps one declared property, and returns its violations this step: the
-/// check's, then each expired obligation's.
+/// check's if the previous evaluation didn't fail, then each expired
+/// obligation's.
 fn step_property<S: HasView>(
     property: &Property<S>,
     state: &mut PropertyState,
@@ -482,9 +488,18 @@ fn step_property<S: HasView>(
         events.push(event(Lifecycle::Applicable));
     }
     match verdict {
-        Verdict::Holds => state.applicable = state.applicable.saturating_add(1),
+        Verdict::Holds => {
+            state.applicable = state.applicable.saturating_add(1);
+            state.failing = false;
+        }
         Verdict::NotApplicable => {}
-        Verdict::Violated(v) => violations.push(v),
+        // A state that stays broken fails every step. Its first violation
+        // stands for the rest, so a long run's report stays bounded.
+        Verdict::Violated(v) => {
+            if !std::mem::replace(&mut state.failing, true) {
+                violations.push(v);
+            }
+        }
     }
     let (obligations, labelled) = ccx.into_parts();
     events.extend(labelled.into_iter().map(|frame| CheckEvent::Label {

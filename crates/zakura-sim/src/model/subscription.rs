@@ -350,13 +350,8 @@ impl SubscriptionModel {
     /// The node opens `key` on `session` with `credit`. False if the session
     /// holds `max_live` subscriptions, the key is live or among the last
     /// `max_live` ended, or the credit lacks a unit or exceeds the row's.
-    pub fn subscribe(
-        &mut self,
-        session: SessionId,
-        key: ExchangeKey,
-        credit: Credit,
-        _start: Cursor,
-    ) -> bool {
+    /// The start cursor decides nothing, so the model doesn't take it.
+    pub fn subscribe(&mut self, session: SessionId, key: ExchangeKey, credit: Credit) -> bool {
         let empty_unit = credit.objects == 0 || credit.bytes == 0;
         let above = credit.objects > self.credit.objects || credit.bytes > self.credit.bytes;
         let subscriber = self.subscribers.entry(session).or_default();

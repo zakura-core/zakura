@@ -14,21 +14,28 @@
 //! when the run completes them instead. `vct_repair_context` is
 //! narrower than production: it always answers `Stale`, since a simulation
 //! has no repair to resolve. Retained paths follow [`super::lease`].
+//!
+//! The port also holds full state, the committed blocks, and publishes a
+//! `CommittedHeaderChainView` after every engine commit, as zakura-state
+//! does. Its full-state operations, in [`full_state`], run zakura-state's
+//! glue from [`crate::full_state`]. A run without block sync commits no
+//! bodies, so full state stays at genesis and nothing changes for headers.
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
 use sha2::{Digest, Sha256};
 use zakura_chain::block;
 use zakura_header_chain::{
-    AlarmSet, AuxDelivery, BodySizeHint, BodyWorkOwner, CheckpointSet, CommittedStallReceipt,
-    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, ErrorSubject, EvidenceId,
-    FinalityEpoch, FrontierSet, FullStateEvidenceAuthority, HeaderBatchInput,
+    AlarmSet, AuxDelivery, BodySizeHint, BodyWorkOwner, CheckpointSet, CommittedHeaderChainView,
+    CommittedStallReceipt, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, ErrorSubject,
+    EvidenceId, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority, HeaderBatchInput,
     HeaderChainDiskVersion, HeaderChainEngine, HeaderChainError, HeaderContextFact, HeaderFailure,
     HeaderGeneration, HeaderId, HeaderInsertionFacts, HeaderLocator, HeaderRule, HeaderRules,
     HeaderSyncWorkOwner, HeaderValidationCheck, HeaderValidationFacts, HeaderValidationSource,
     HeaderViolation, InsertHeaders, InvalidTransitionEvidence, MemHeaderStore, RuleId, SourceId,
-    StateVersion, StoreError, TargetCompletion, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionInput, TrustedAnchor, ValidationLease, VerifiedGeneration,
+    StateVersion, StoreError, TargetCompletion, TransitionContext, TransitionEffect,
+    TransitionEvent, TransitionFailure, TransitionInput, TrustedAnchor, ValidationLease,
+    VerifiedGeneration,
 };
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetOutcome, ApplyHeaderTargetReply,
@@ -40,6 +47,13 @@ use zakura_rt::{
     sync::{watch, Mutex, MutexGuard, PoisonError},
     time::Instant,
 };
+
+use crate::full_state::{
+    hint_hashes, hint_updates, StateIssuedAuthority, VerifiedChain, ViewPublisher,
+};
+
+mod full_state;
+pub use full_state::{Applied, Installed};
 
 use super::{
     evidence::{LeaseFact, LeaseKey, ResultIdentity, SignalClass},
@@ -63,6 +77,13 @@ pub struct EnginePort {
     /// sending and subscribing are scheduling points in a simulator run, so
     /// they use a clone after the lock is released.
     selected: StdMutex<Option<watch::Sender<Option<EngineSnapshot>>>>,
+    /// Full state's committed blocks. A std lock, taken only under the engine
+    /// lock and never held across a scheduling point, so full state and the
+    /// engine change together.
+    full_state: StdMutex<VerifiedChain>,
+    /// The committed-view publisher, locked as `full_state` is. Its watch
+    /// sends under the engine lock, as the selected watch does.
+    views: StdMutex<ViewPublisher>,
 }
 
 impl EnginePort {
@@ -121,12 +142,15 @@ impl EnginePort {
                 .expect("a one-node engine is coherent");
         // Production mirrors the current snapshot as soon as it attaches.
         let (selected, _) = watch::channel(Some(engine.snapshot()));
+        let views = ViewPublisher::new(engine.snapshot());
         EnginePort {
             key: AdapterKey::new(),
             config,
             engine: Mutex::new(engine),
             leases: Mutex::new(Registry::default()),
             selected: StdMutex::new(Some(selected)),
+            full_state: StdMutex::new(VerifiedChain::new(fixture.genesis_block())),
+            views: StdMutex::new(views),
         }
     }
 
@@ -146,6 +170,21 @@ impl EnginePort {
     /// leaves the engine unchanged on error.
     fn engine(&self) -> MutexGuard<'_, HeaderChainEngine> {
         self.engine.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks full state. Only a holder of the engine lock may take it.
+    fn full_state(&self) -> StdMutexGuard<'_, VerifiedChain> {
+        self.full_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Locks the view publisher. Only a holder of the engine lock may take
+    /// it.
+    fn views(&self) -> StdMutexGuard<'_, ViewPublisher> {
+        self.views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Locks the lease registry, always after the engine when both are
@@ -729,15 +768,20 @@ impl EnginePort {
         }
         validation_leases.dedup_by_key(|lease| lease.parent());
         let completion = CompletionAuthority(insert.as_ref().clone());
-        let authority = IssuedAuthority {
-            completion: &completion,
+        // Full state's chain tips protect their branches, as zakura-state's
+        // active retention references do.
+        let tips = self.full_state().tips();
+        let authority = StateIssuedAuthority {
+            inner: Some(&completion),
             validation_leases: &validation_leases,
+            active_retention_references: &tips,
+            full_state_authorization_version: Some(before.state_version),
         };
         let context = TransitionContext {
             config: &self.config,
             clock: &ScenarioClock,
             full_state_authority: Some(&authority),
-            retention_references: &[],
+            retention_references: &tips,
         };
         let input = TransitionInput::InsertHeaders {
             event: insert,
@@ -775,21 +819,17 @@ impl EnginePort {
             });
         }
         let after = transition.snapshot_after_commit().clone();
+        // A stalled transition publishes no hint changes.
+        let hints = if stalled.is_none() {
+            hint_hashes(&engine, transition.change_set())
+        } else {
+            Vec::new()
+        };
         engine
             .install_committed_transition(transition)
             .map_err(|error| local_resource(owner, Some(Box::new(error))))?;
-        // Published after the install, so a receiver never sees an
-        // uncommitted snapshot, and still under the engine lock, as
-        // production publishes under its writer lock. Dropping the lock first
-        // would let a later commit publish before this one, leaving the watch
-        // behind the engine for good. Publishing is a scheduling point under
-        // a lock a `ControlledPort`'s run takes, which is safe only because
-        // that run applies outside any task, where points do nothing. Tasks
-        // may apply through this port directly only when no `ControlledPort`
-        // drives it, so they meet only each other here, and park.
-        if let Some(selected) = self.selected_sender() {
-            selected.send_replace(Some(after));
-        }
+        let updates = hint_updates(&engine, hints);
+        self.publish_locked(after, effect, updates);
         drop(engine);
         Ok(match stalled {
             Some(receipt) => ApplyHeaderTargetOutcome::ResourceStalled(receipt),
@@ -927,6 +967,42 @@ impl EnginePort {
     /// port's bookkeeping lock inside it, never the other way round.
     pub(super) fn with_registry<R>(&self, read: impl FnOnce(&Registry) -> R) -> R {
         read(&self.leases())
+    }
+
+    /// Publishes a committed `snapshot` on the selected-chain watch, and its
+    /// view on the view watch, as `Publisher::publish_with_hint_changes`
+    /// does, and returns the view. `effect` is its transition's effect and
+    /// `updates` its size-hint changes.
+    ///
+    /// Call after the install, so a receiver never sees an uncommitted
+    /// snapshot, and still under the engine lock, as production publishes
+    /// under its writer lock. Dropping the lock first would let a later
+    /// commit publish before this one, leaving the watches behind the engine
+    /// for good. Publishing is a scheduling point under a lock a controlled
+    /// service's run takes, which is safe only because that run commits
+    /// outside any task, where points do nothing. Tasks may commit through
+    /// this port directly only when no controlled service drives it, so they
+    /// meet only each other here, and park.
+    fn publish_locked(
+        &self,
+        snapshot: EngineSnapshot,
+        effect: TransitionEffect,
+        updates: Vec<(block::Height, block::Hash, BodySizeHint)>,
+    ) -> CommittedHeaderChainView {
+        let (view, views) = {
+            let mut publisher = self.views();
+            (
+                publisher.next(snapshot.clone(), effect, updates),
+                publisher.sender(),
+            )
+        };
+        if let Some(selected) = self.selected_sender() {
+            selected.send_replace(Some(snapshot));
+        }
+        if let Some(views) = views {
+            views.send_replace(Some(view.clone()));
+        }
+        view
     }
 
     /// A clone of the selected-chain watch's sender, or `None` once
@@ -1112,28 +1188,6 @@ impl FullStateEvidenceAuthority for CompletionAuthority {
 
     fn authorizes_header_completion(&self, insert: &InsertHeaders) -> bool {
         *insert == self.0
-    }
-}
-
-/// Adds the validation leases this adapter issued for one apply to
-/// `completion`, as zakura-state's `StateIssuedAuthority` does. With no block
-/// bodies, full state holds no retention references.
-struct IssuedAuthority<'a> {
-    completion: &'a CompletionAuthority,
-    validation_leases: &'a [ValidationLease],
-}
-
-impl FullStateEvidenceAuthority for IssuedAuthority<'_> {
-    fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
-        self.completion.authorizes_full_state(event)
-    }
-
-    fn authorizes_header_completion(&self, insert: &InsertHeaders) -> bool {
-        self.completion.authorizes_header_completion(insert)
-    }
-
-    fn authorizes_validation_lease(&self, lease: &ValidationLease) -> bool {
-        self.validation_leases.contains(lease)
     }
 }
 

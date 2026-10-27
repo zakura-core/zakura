@@ -830,7 +830,7 @@ impl HeaderSyncObserver for PanicsAfterCallEnded {
         let ended = matches!(event, ReactorEvent::CallEnded { .. });
         self.recorder.observe(event);
         if ended && !self.panicked.swap(true, Ordering::SeqCst) {
-            panic!("the observer panics after recording a call end");
+            panic!("observer boom");
         }
     }
 }
@@ -857,10 +857,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
         .catch_unwind()
         .await;
 
-    let payload = polled
-        .err()
-        .expect("the observer panic unwinds out of the reactor's poll");
-    assert!(payload.is::<observe::ObserverPanicked>());
+    assert!(
+        polled.is_err(),
+        "the observer panic unwinds out of the reactor's poll"
+    );
     assert_eq!(
         observer.recorder.take(),
         vec![
@@ -878,6 +878,41 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
             },
         ]
     );
+}
+
+/// An observer panic unwinds the reactor with the observer's own payload,
+/// whether it panics on a `Replied` end inside the port future or on a
+/// `PortPanicked` end after the future's catch.
+#[tokio::test]
+async fn observer_panic_unwinds_with_its_own_payload() {
+    for panic in [None, Some(PanicAt::Future)] {
+        let observer = Arc::new(PanicsAfterCallEnded::default());
+        let (mut reactor, snapshot) = observed_reactor(
+            Arc::new(ScriptedPort {
+                panic,
+                ..ScriptedPort::default()
+            }),
+            None,
+            crate::zakura::ZakuraTrace::noop(),
+        );
+        reactor.startup.observer = ObserverSlot(Some(observer.clone()));
+        let peer = peer();
+        let _outbound = connect(&mut reactor, &peer, 7);
+        seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+
+        assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
+            .catch_unwind()
+            .await
+            .err()
+            .expect("the observer panic unwinds out of the reactor's poll");
+
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"observer boom"),
+            "{panic:?}"
+        );
+    }
 }
 
 /// An offer refused because staging is full, or because every locator permit

@@ -31,7 +31,7 @@ fn registration_and_runtime_run_ids_can_differ() {
         "the runtime counter is ahead of the registration counter"
     );
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let (observer, tap) = ReactorTap::new(&mut sim, &port, "nora");
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let emitter = observer.clone();
     sim.scheduler().spawn_root("reactor", async move {
         emitter.observe(ReactorEvent::Handled {
@@ -62,7 +62,7 @@ fn registration_and_runtime_run_ids_can_differ() {
     );
 
     let mut first = Sim::new(config(2, 100), PlanInput::Bytes(Vec::new()));
-    let (_observer, tap) = ReactorTap::new(&mut first, &port, "nora");
+    let (_observer, tap) = ReactorTap::new(&mut first, &port, "node");
     drop(first);
     let mut second = Sim::new(config(2, 100), PlanInput::Bytes(Vec::new()));
     second.add_source(Box::new(tap));

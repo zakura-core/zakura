@@ -154,6 +154,60 @@ fn virtual_time_trigger_opens_on_time() {
     assert_eq!(boundaries(&predicates, &open, at(2 * HOUR)), []);
 }
 
+/// The same hold with a 3 h `deadline_ms` also stops time at its
+/// submission plus 3 h, both before and after it opens.
+#[test]
+fn deadline_stops_time_at_submission_plus_its_bound() {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap();
+    let mut predicates = Predicates::new(vec![Hold {
+        deadline_ms: Some(ms(3 * HOUR)),
+        ..hold(
+            Select::nth(OpKind::Locator, 1),
+            Trigger::VirtualTime(ms(2 * HOUR)),
+        )
+    }]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    // Submitted at 10 s, as above.
+    let at = |d: Duration| SimInstant::from_start(Duration::from_secs(10) + d);
+
+    let early = pending(1, OpKind::Locator, HOUR);
+    assert_eq!(
+        boundaries(&predicates, &early, at(HOUR)),
+        [
+            Boundary::Opens(at(2 * HOUR)),
+            Boundary::Deadline(at(3 * HOUR))
+        ]
+    );
+    let open = pending(1, OpKind::Locator, 2 * HOUR);
+    assert_eq!(offered(&predicates, Base::Any, &open), [Outcome::Engine]);
+    assert_eq!(
+        boundaries(&predicates, &open, at(2 * HOUR)),
+        [Boundary::Deadline(at(3 * HOUR))]
+    );
+}
+
+/// A hold until `CallerDropped(held)` waits for its own operation's caller.
+/// Another operation's caller dropping first doesn't open it.
+#[test]
+fn caller_dropped_held_waits_for_its_own_drop() {
+    let mut predicates = Predicates::new(vec![hold(
+        Select::nth(OpKind::Locator, 1),
+        Trigger::CallerDropped(Select::held()),
+    )]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    predicates.record(&submitted(2, OpKind::Locator, 0));
+    let held = pending(1, OpKind::Locator, Duration::ZERO);
+
+    predicates.record(&StorageFact::CallerDropped { id: 2 });
+    assert_eq!(
+        offered(&predicates, Base::Any, &held),
+        [],
+        "operation 2's drop leaves the hold on operation 1 closed"
+    );
+    predicates.record(&StorageFact::CallerDropped { id: 1 });
+    assert_eq!(offered(&predicates, Base::Any, &held), [Outcome::Engine]);
+}
+
 /// `Count(16, ...)` stays closed after 15 caller drops and opens on the
 /// 16th. `All` opens only once each part holds, in either order.
 #[test]
@@ -184,7 +238,7 @@ fn count_and_all_wait_for_every_part() {
 
     let both = Trigger::All(vec![
         Trigger::ReplyTaken(Select::nth(OpKind::Membership, 1)),
-        Trigger::Closed("mira".to_owned()),
+        Trigger::Closed("mirror-0".to_owned()),
     ]);
     for link_first in [false, true] {
         let mut predicates =
@@ -194,7 +248,7 @@ fn count_and_all_wait_for_every_part() {
         let prepare = pending(1, OpKind::Prepare, Duration::ZERO);
         let parts: [&dyn Fn(&mut Predicates); 2] =
             [&|p| p.record(&StorageFact::ReplyTaken { id: 2 }), &|p| {
-                p.record_link(LinkEffect::Closed, "mira")
+                p.record_link(LinkEffect::Closed, "mirror-0")
             }];
         let (first, second) = if link_first {
             (parts[1], parts[0])
@@ -204,7 +258,7 @@ fn count_and_all_wait_for_every_part() {
         first(&mut predicates);
         assert_eq!(offered(&predicates, Base::Any, &prepare), []);
         // A link that was only made doesn't count as closed.
-        predicates.record_link(LinkEffect::Linked, "mira");
+        predicates.record_link(LinkEffect::Linked, "mirror-0");
         assert_eq!(offered(&predicates, Base::Any, &prepare), []);
         second(&mut predicates);
         assert_eq!(offered(&predicates, Base::Any, &prepare), [Outcome::Engine]);
@@ -417,7 +471,7 @@ fn answers(predicates: &Predicates) -> String {
             ));
         }
     }
-    let gate = Trigger::Count(2, Box::new(Trigger::Linked("mira".to_owned())));
+    let gate = Trigger::Count(2, Box::new(Trigger::Linked("mirror-0".to_owned())));
     let mut gate_bounds = Vec::new();
     predicates.control_boundaries(&Trigger::VirtualTime(7_200_000), now, &mut gate_bounds);
     out.push(format!(
@@ -450,9 +504,9 @@ fn policy_is_pure_between_steps() {
     let script: Vec<Record> = vec![
         Box::new(|p| p.record(&submitted(1, OpKind::Locator, 0))),
         Box::new(|p| p.record(&submitted(2, OpKind::Apply, 1))),
-        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mirror-0")),
         Box::new(|p| p.record(&StorageFact::CallerDropped { id: 1 })),
-        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mirror-0")),
     ];
     let mut predicates = Predicates::new(holds.clone());
     let mut seen = vec![answers(&predicates)];

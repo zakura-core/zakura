@@ -409,8 +409,9 @@ pub enum CompleteError {
     /// commit. The service logs a [`FactKind::CommitRefused`] fact.
     RecordedInvalid(block::Hash),
     /// Full state or the engine refused the commit for another reason,
-    /// which leaves both unchanged. A run never offers such a commit, so
-    /// this is a service or fixture bug.
+    /// such as a body without a coinbase height, which leaves both
+    /// unchanged. Fixture chains give every body its height, so a run
+    /// that meets this has a fixture or service bug.
     State(StateError),
     /// The service is bound to another run.
     OutsideRun,

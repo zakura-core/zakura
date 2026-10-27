@@ -411,6 +411,9 @@ fn a_head_without_its_lease_end_is_an_unexpected_effect() {
     );
 }
 
+/// A change to one field of an owner state, and the field it changes.
+type FieldChange = (StateField, fn(&mut OwnerState));
+
 /// Each field of a real owner state, changed alone without naming an
 /// unknown owner, is a mismatch in that field. Dropping an operation is
 /// the slot vanishing without a fact.
@@ -445,7 +448,7 @@ fn each_changed_state_field_is_a_mismatch() {
             && !actual.continuations.is_empty(),
         "every owner kind is present: {actual:?}"
     );
-    let changes: [(StateField, fn(&mut OwnerState)); 7] = [
+    let changes: [FieldChange; 7] = [
         (StateField::Operations, |state| state.operations.clear()),
         (StateField::Permits, |state| state.permits.clear()),
         (StateField::Leases, |state| state.leases.clear()),

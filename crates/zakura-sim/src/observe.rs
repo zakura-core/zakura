@@ -395,6 +395,24 @@ pub struct WorkOwner {
     pub request_id: u64,
 }
 
+/// A body retry episode's summary, `BodyUnavailableSummary` in plain
+/// fields. Times are milliseconds since the Unix epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BodyAvailability {
+    /// When the episode started.
+    pub started_at: i64,
+    /// Its failed delivery attempts.
+    pub attempts: u32,
+    /// Its known eligible suppliers.
+    pub suppliers: u32,
+    /// The digest of the eligible-supplier set.
+    pub supplier_set_digest: String,
+    /// Whether its alarm has fired.
+    pub alarmed: bool,
+    /// The earliest time of its next attempt or probe.
+    pub next_probe_at: i64,
+}
+
 /// A body work scope: a header scope, with the verified generation and
 /// body work epoch that scheduled the work.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -565,10 +583,13 @@ pub enum StorageRequest {
         /// The supplier, for an invalid body.
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-        /// The failure kind, for an unavailable body or an availability
-        /// retry.
+        /// The failure kind, for an unavailable body.
         #[serde(skip_serializing_if = "Option::is_none")]
         failure: Option<String>,
+        /// The retry episode's summary, for every record but an invalid
+        /// body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        availability: Option<BodyAvailability>,
     },
     /// `Misbehavior`.
     Misbehavior {

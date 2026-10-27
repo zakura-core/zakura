@@ -29,8 +29,8 @@ use super::{body_owner, hash, hex, peer, point, scope};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        BlockOperation, BlockStorageState, BodyScope, StorageFact, StorageRequest, StorageResult,
-        StorageState, WorkOwner,
+        BlockOperation, BlockStorageState, BodyAvailability, BodyScope, StorageFact,
+        StorageRequest, StorageResult, StorageState, WorkOwner,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -268,6 +268,7 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             rule,
             source,
             failure: kind,
+            availability,
         } => StorageRequest::RecordBody {
             record: op.name().to_owned(),
             expected_version: expected_version.get(),
@@ -276,6 +277,14 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             rule: rule.as_ref().map(|rule| rule.as_str().to_owned()),
             source: source.map(peer),
             failure: kind.map(failure),
+            availability: availability.map(|summary| BodyAvailability {
+                started_at: summary.started_at.timestamp_millis(),
+                attempts: summary.attempts,
+                suppliers: summary.suppliers,
+                supplier_set_digest: hex(&summary.supplier_set_digest),
+                alarmed: summary.alarmed,
+                next_probe_at: summary.next_probe_at.timestamp_millis(),
+            }),
         },
         RequestIdentity::Misbehavior {
             peer: reported,

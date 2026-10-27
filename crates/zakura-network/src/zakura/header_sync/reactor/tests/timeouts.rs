@@ -154,7 +154,7 @@ impl port::Port for PendingVctLocalPort {
     }
 }
 
-fn seed_vct_active_request(
+pub(super) fn seed_vct_active_request(
     reactor: &mut HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
     peer: ZakuraPeerId,

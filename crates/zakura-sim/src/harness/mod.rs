@@ -13,6 +13,7 @@
 pub mod coverage;
 pub mod discovery;
 pub mod fixtures;
+pub mod header_node;
 pub mod header_sync;
 mod record;
 
@@ -68,12 +69,22 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// to `meta.scenario`. It must hold no floats.
     type Scenario: Serialize + DeserializeOwned + Clone;
 
+    /// What [`Subsystem::prepare`] sets up before the run, such as storage
+    /// with its chains committed. `()` for a harness with nothing to set up.
+    type Prepared;
+
     /// The run's limits for `scenario`. [`run_config`] adds the livelock
     /// limit.
     fn config(scenario: &Self::Scenario) -> RunConfig;
 
-    /// Spawns the production tasks and adds the action sources.
-    fn build(sim: &mut Sim, scenario: &Self::Scenario) -> Self;
+    /// Sets up what must exist before `Sim::new`, outside any run, such as
+    /// committed fixture chains, which validate against the host clock only
+    /// there. [`run_harness`] calls it, then hands the result to `build`.
+    fn prepare(scenario: &Self::Scenario) -> Self::Prepared;
+
+    /// Spawns the production tasks and adds the action sources, using only
+    /// the `prepared` state it's handed.
+    fn build(sim: &mut Sim, scenario: &Self::Scenario, prepared: Self::Prepared) -> Self;
 
     /// The harness's own properties, in report order. None by default.
     fn properties() -> Vec<Property<Self>> {
@@ -141,12 +152,24 @@ pub fn run_harness<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
+    run_prepared::<S>(scenario, S::prepare(scenario), input, sink, extra)
+}
+
+/// [`run_harness`] with state `prepared` by the caller, who may keep a
+/// clone of it, such as a port handle, to inspect after the run.
+pub fn run_prepared<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+) -> Result<RunReport, HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
     let mut sim = Sim::new(config, input);
-    let this = Rc::new(S::build(&mut sim, scenario));
+    let this = Rc::new(S::build(&mut sim, scenario, prepared));
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
@@ -366,6 +389,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<fixtures::Race<fixtures::AbortWithoutJoin>>(),
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
+    entry::<header_sync::Storage>(),
 ];
 
 /// The harness named `name`.

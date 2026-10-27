@@ -130,6 +130,7 @@ impl<F: Fixture> Subsystem for Race<F> {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 2;
     type Scenario = Scenario;
+    type Prepared = ();
 
     /// The scenario's workers, small stacks, and a budget far past any
     /// fixture's end.
@@ -148,9 +149,12 @@ impl<F: Fixture> Subsystem for Race<F> {
         }
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Scenario) {}
+
     /// Spawns an unrelated task first for [`Variant::UnrelatedTask`], then
     /// the fixture.
-    fn build(sim: &mut Sim, scenario: &Scenario) -> Self {
+    fn build(sim: &mut Sim, scenario: &Scenario, (): ()) -> Self {
         if scenario.variant == Variant::UnrelatedTask {
             sim.scheduler().spawn_root("unrelated", async {
                 sleep(Duration::from_millis(3)).await;

@@ -37,6 +37,8 @@ exclude = [
 ]
 
 [features]
+# Local regtest prototype; never enabled by default.
+experimental-wots = []
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

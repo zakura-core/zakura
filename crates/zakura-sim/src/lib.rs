@@ -24,6 +24,7 @@ pub mod property;
 pub mod record;
 pub mod sim;
 pub mod storage;
+pub mod table;
 pub mod trace;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};

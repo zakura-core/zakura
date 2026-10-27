@@ -1,0 +1,402 @@
+//! P3b: the consequence table and the generated receiver properties
+//! (properties.md, Consequence table and Generated properties), checked on
+//! scripted observations.
+#![cfg(zakura_sim)]
+
+mod support;
+
+use std::{cell::RefCell, collections::BTreeSet, collections::VecDeque, rc::Rc};
+
+use support::{
+    config,
+    feed::{FEED, ITEM},
+    run,
+};
+use zakura_network::zakura::{
+    testkit::regulation::{production_tables, TEST_FAMILY},
+    MessageRole, MessageRule, Stream,
+};
+use zakura_rt::task::yield_now;
+use zakura_scheduler::SimInstant;
+use zakura_sim::{
+    model::{consequence, is_fault_cause, Consequence, Label},
+    observe::StreamId,
+    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
+    table::{rule_row, table_properties, GeneratedId, Template},
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Plan, PropertyOutcome,
+    RunReport,
+};
+
+/// The node, which the scripted observations stand for.
+struct Node;
+
+impl HasView for Node {
+    type View = ();
+
+    /// Nothing. Generated properties read observations.
+    fn view(&self) {}
+}
+
+/// The `feed` stream: a subscription with its page and terminal outcome.
+const FEED_STREAM: Stream = Stream {
+    kind: 64,
+    version: 1,
+    frame_cap: 1024,
+    capability: 1 << 16,
+    messages: Some(FEED),
+    ..Stream::PERSISTENT
+};
+
+/// The regulation test family, whose `status` announcement has a cadence.
+const TEST_STREAM: Stream = Stream {
+    kind: 65,
+    version: 2,
+    frame_cap: 1024,
+    capability: 1 << 17,
+    messages: Some(TEST_FAMILY),
+    ..Stream::PERSISTENT
+};
+
+/// The ID of `stream`.
+fn id(stream: Stream) -> StreamId {
+    StreamId {
+        kind: stream.kind,
+        version: stream.version,
+    }
+}
+
+/// Emits one batch of observations per step.
+struct Script(Rc<RefCell<VecDeque<Vec<Observation>>>>);
+
+impl ActionSource for Script {
+    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if !self.0.borrow().is_empty() {
+            out.push((Identity::peer("script", "next"), 0));
+        }
+    }
+
+    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+    fn execute(&mut self, _: u64, log: &mut ObservationLog) {
+        for obs in self.0.borrow_mut().pop_front().unwrap_or_default() {
+            log.push(obs);
+        }
+    }
+}
+
+/// Runs `script`, one batch per step, under the generated properties of
+/// `feed` on `FEED_STREAM` and `test` on `TEST_STREAM`. A `node` task stays
+/// ready until the script ends, so the run reaches quiescence only after the
+/// last batch.
+fn run_script(script: Vec<Vec<Observation>>) -> RunReport {
+    let mut properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
+    properties.extend(table_properties("test", &[TEST_STREAM]));
+    let mut checker = RegistryChecker::new(
+        Registry::new(properties).expect("generated IDs are unique"),
+        Rc::new(Node),
+        Assumptions::none(),
+        &Sources::observed(&[Source::Frames, Source::Closes, Source::Schedule]),
+    );
+    let batches = Rc::new(RefCell::new(VecDeque::from(script)));
+    // Each step offers the task first, then the script: byte 1 picks the
+    // script while it lasts.
+    run(
+        config(1, 1_000),
+        Plan::from_fuzz(&[1; 64]),
+        |sim| {
+            let left = Rc::clone(&batches);
+            sim.scheduler().spawn_root("node", async move {
+                while !left.borrow().is_empty() {
+                    yield_now().await;
+                }
+            });
+            sim.add_source(Box::new(Script(batches)));
+        },
+        &mut checker,
+    )
+}
+
+/// A frame the peer sent on `stream`, labelled `label` under `row`.
+fn frame(stream: Stream, seq: u64, row: Option<&str>, label: Label) -> Observation {
+    Observation::PeerFrame {
+        connection: 1,
+        stream: id(stream),
+        seq,
+        row: row.map(str::to_owned),
+        label,
+        exhausted: false,
+    }
+}
+
+/// The node's reader reaching frame `seq` on `stream`.
+fn judged(stream: Stream, seq: u64) -> Observation {
+    Observation::FrameJudged {
+        connection: 1,
+        stream: id(stream),
+        seq,
+    }
+}
+
+/// The node closing connection 1 with `cause`.
+fn closed(cause: &str) -> Observation {
+    Observation::ConnectionClosed {
+        connection: 1,
+        cause: cause.to_owned(),
+    }
+}
+
+/// The outcome the run reports for the generated property `id`.
+fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
+    &report
+        .properties
+        .iter()
+        .find(|r| r.property == id)
+        .unwrap_or_else(|| panic!("{id} is registered"))
+        .outcome
+}
+
+/// True if `outcome` is `Held`.
+fn held(outcome: &PropertyOutcome) -> bool {
+    matches!(outcome, PropertyOutcome::Held { .. })
+}
+
+#[test]
+fn every_row_yields_its_templates() {
+    for table in production_tables()
+        .into_iter()
+        .map(|t| (t.family, t.stream))
+    {
+        let (family, stream) = table;
+        let rules = stream.messages.expect("production streams have tables");
+        let per_row: usize = rules
+            .iter()
+            .map(|rule| match rule.role {
+                MessageRole::Announcement { .. } => 3 + 1,
+                MessageRole::Request { cadence, .. } => 3 + 1 + usize::from(cadence.is_some()),
+                MessageRole::Response { .. } => 3 + 2,
+                MessageRole::Subscription { cadence, .. } => 3 + 4 + usize::from(cadence.is_some()),
+            })
+            .sum();
+        let properties: Vec<Property<Node>> = table_properties(family, &[stream]);
+        assert_eq!(properties.len(), 2 + per_row, "{family}");
+        let prefix = format!("{family}/s{}v{}/", stream.kind, stream.version);
+        assert!(properties
+            .iter()
+            .all(|p| p.id.as_str().starts_with(&prefix)));
+    }
+}
+
+#[test]
+fn generated_ids_are_unique_and_parse_back() {
+    let mut all: Vec<Property<Node>> = Vec::new();
+    for table in production_tables() {
+        all.extend(table_properties(table.family, &[table.stream]));
+    }
+    all.extend(table_properties("feed", &[FEED_STREAM]));
+    all.extend(table_properties("test", &[TEST_STREAM]));
+    let ids: BTreeSet<&str> = all.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids.len(), all.len(), "no two generated IDs collide");
+    for id in ids {
+        let parsed = GeneratedId::parse(id).unwrap_or_else(|| panic!("{id} parses"));
+        assert_eq!(parsed.to_string(), id);
+    }
+    assert_eq!(
+        GeneratedId::parse("feed/s64v1/watch/over-live-closes"),
+        Some(GeneratedId {
+            family: "feed",
+            stream: id(FEED_STREAM),
+            row: Some("watch"),
+            template: Template::Closes(Label::OverLive),
+        })
+    );
+    // Conformant frames and content faults have no `-closes` template.
+    assert_eq!(Template::parse("conformant-closes"), None);
+    assert_eq!(Template::parse("bad-content-closes"), None);
+}
+
+#[test]
+fn consequences_follow_the_table() {
+    for label in Label::ALL {
+        let expected = match label {
+            Label::Conformant => Consequence::NoPunishment,
+            Label::BadContent => Consequence::FamilyContent,
+            _ => Consequence::FaultClose,
+        };
+        assert_eq!(consequence(label), expected, "{label}");
+    }
+    assert!(is_fault_cause("service_protocol_reject"));
+    assert!(is_fault_cause("ordered_read_rejected"));
+    for neutral in [
+        "idle_timeout",
+        "ordered_read_timeout",
+        "ordered_read_transport",
+        "unfinished_exchange",
+    ] {
+        assert!(!is_fault_cause(neutral), "{neutral}");
+    }
+}
+
+#[test]
+fn a_pages_over_credit_belongs_to_its_subscription_row() {
+    let item = MessageRule::find(FEED, ITEM).unwrap();
+    assert_eq!(rule_row(FEED, item, Label::OverCredit).name, "watch");
+    assert_eq!(rule_row(FEED, item, Label::Unsolicited).name, "item");
+    assert_eq!(rule_row(FEED, item, Label::Conformant).name, "item");
+}
+
+/// A conformant `feed` stream and a faulty `test` stream share one
+/// connection. The node closes the connection for the fault, so the `feed`
+/// stream's `conformant-never-closes` holds (review P-07).
+#[test]
+fn sibling_stream_fault_closes_without_violation() {
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![
+            frame(TEST_STREAM, 0, Some("ping"), Label::ReservedFlags),
+            judged(TEST_STREAM, 0),
+        ],
+        vec![closed("service_protocol_reject")],
+    ]);
+    assert_eq!(report.end.violation, None);
+    assert!(held(outcome(&report, "feed/s64v1/conformant-never-closes")));
+    assert!(held(outcome(
+        &report,
+        "test/s65v2/ping/reserved-flags-closes"
+    )));
+}
+
+/// The node records the fault cause in a step after the one that judged the
+/// frame, still before quiescence, so `<label>-closes` holds. A faulty frame
+/// the reader never reached opens no obligation (review P-02).
+#[test]
+fn close_cause_recorded_before_quiescence() {
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::OverLive),
+            judged(FEED_STREAM, 0),
+            frame(FEED_STREAM, 1, Some("item"), Label::Unsolicited),
+        ],
+        vec![],
+        vec![closed("service_protocol_reject")],
+    ]);
+    assert_eq!(report.end.violation, None);
+    assert!(held(outcome(&report, "feed/s64v1/watch/over-live-closes")));
+    assert_eq!(
+        *outcome(&report, "feed/s64v1/item/unsolicited-closes"),
+        PropertyOutcome::NotApplicable
+    );
+}
+
+#[test]
+fn a_fault_without_a_fault_close_is_a_violation() {
+    // A neutral close doesn't discharge the obligation.
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, None, Label::UndeclaredType),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![closed("idle_timeout")],
+    ]);
+    let violation = report.end.violation.expect("the fault went unpunished");
+    assert_eq!(violation.property, "feed/s64v1/undeclared-type-closes");
+
+    // Nor does a close of another connection.
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("ended"), Label::OverOwed),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![Observation::ConnectionClosed {
+            connection: 2,
+            cause: "service_protocol_reject".to_owned(),
+        }],
+    ]);
+    let violation = report.end.violation.expect("the fault went unpunished");
+    assert_eq!(violation.property, "feed/s64v1/ended/over-owed-closes");
+}
+
+#[test]
+fn punishing_a_conformant_peer_is_a_violation() {
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![closed("header_peer_fault")],
+    ]);
+    let violation = report.end.violation.expect("the close is unjustified");
+    assert_eq!(violation.property, "feed/s64v1/conformant-never-closes");
+
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("item"), Label::Conformant),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![Observation::Misbehavior { connection: 1 }],
+    ]);
+    let violation = report
+        .end
+        .violation
+        .expect("the Misbehavior is unjustified");
+    assert_eq!(violation.property, "feed/s64v1/conformant-never-closes");
+
+    // A neutral close is no punishment.
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![closed("idle_timeout")],
+    ]);
+    assert_eq!(report.end.violation, None);
+    assert!(held(outcome(&report, "feed/s64v1/conformant-never-closes")));
+}
+
+/// A fault the node judges after its close can't justify the close, even
+/// within one step.
+#[test]
+fn a_later_fault_does_not_justify_an_earlier_close() {
+    let report = run_script(vec![vec![
+        frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+        judged(FEED_STREAM, 0),
+        frame(TEST_STREAM, 0, Some("ping"), Label::ReservedFlags),
+        closed("service_protocol_reject"),
+        judged(TEST_STREAM, 0),
+    ]]);
+    let violation = report.end.violation.expect("the close came first");
+    assert_eq!(violation.property, "feed/s64v1/conformant-never-closes");
+}
+
+#[test]
+fn emptying_a_cadence_bucket_is_never_punished() {
+    let exhausting = Observation::PeerFrame {
+        connection: 1,
+        stream: id(TEST_STREAM),
+        seq: 0,
+        row: Some("status".to_owned()),
+        label: Label::Conformant,
+        exhausted: true,
+    };
+    let report = run_script(vec![
+        vec![exhausting, judged(TEST_STREAM, 0)],
+        vec![closed("request_protocol_reject")],
+    ]);
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("the close is unjustified");
+    // Both claims cover the close; the registry reports the first.
+    assert!(
+        violation.property == "test/s65v2/conformant-never-closes"
+            || violation.property == "test/s65v2/status/cadence-never-closes",
+        "{violation:?}"
+    );
+    assert!(matches!(
+        outcome(&report, "test/s65v2/status/cadence-never-closes"),
+        PropertyOutcome::Violated { .. }
+    ));
+}

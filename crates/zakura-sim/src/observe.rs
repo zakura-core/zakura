@@ -5,6 +5,8 @@
 
 use serde::Serialize;
 
+use crate::model::Label;
+
 /// One thing a step made happen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "obs", rename_all = "kebab-case")]
@@ -58,6 +60,48 @@ pub enum Observation {
         id: u64,
         /// What happened.
         event: StorageEvent,
+    },
+    /// A peer sent a frame on a tabled stream. The peer's role models
+    /// labelled it when it was sent.
+    PeerFrame {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame's position among the peer's frames on this stream,
+        /// from 0.
+        seq: u64,
+        /// The row whose rule `label` enforces, as [`crate::table::rule_row`]
+        /// picks it. `None` for a type the stream doesn't declare.
+        row: Option<String>,
+        /// The frame's label.
+        label: Label,
+        /// True if the frame emptied its row's cadence bucket. Such a frame
+        /// is still conformant.
+        exhausted: bool,
+    },
+    /// The node's reader reached the bytes it needs to judge the peer's
+    /// frame `seq`. A frame the reader hasn't reached has no judgement.
+    FrameJudged {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame, as its [`Observation::PeerFrame`] numbers it.
+        seq: u64,
+    },
+    /// The node decided to close a connection.
+    ConnectionClosed {
+        /// The connection.
+        connection: u64,
+        /// The first cause the node recorded, such as
+        /// `service_protocol_reject`.
+        cause: String,
+    },
+    /// The node asked storage to punish the peer on a connection.
+    Misbehavior {
+        /// The connection.
+        connection: u64,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -122,6 +166,22 @@ pub struct LeaseEnd {
     pub lease: u64,
     /// Why it ended, such as `lease-released`.
     pub release: String,
+}
+
+/// A stream kind at one version, as property IDs write it: `s5v9`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct StreamId {
+    /// The stream kind.
+    pub kind: u16,
+    /// The stream version.
+    pub version: u16,
+}
+
+impl std::fmt::Display for StreamId {
+    /// Writes `s<kind>v<version>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "s{}v{}", self.kind, self.version)
+    }
 }
 
 /// How a task ended.

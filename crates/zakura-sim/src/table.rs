@@ -1,0 +1,398 @@
+//! Generated properties (properties.md, Generated properties): each tabled
+//! stream's rows become receiver properties, with no check written per row.
+//!
+//! A generated property's ID names everything its check needs:
+//! `<family>/s<kind>v<version>[/<row>]/<claim>`. The check parses its own ID
+//! back, so the ID is the one record of the stream, row and template a
+//! property covers.
+//!
+//! The checks read four observations: [`Observation::PeerFrame`], which a
+//! peer's role models label at send time; [`Observation::FrameJudged`], the
+//! node's reader reaching the bytes that decide the label;
+//! [`Observation::ConnectionClosed`]; and [`Observation::Misbehavior`].
+
+use std::fmt;
+
+use zakura_network::zakura::{MessageRole, MessageRule, Stream};
+
+use crate::{
+    model::{consequence, is_fault_cause, Consequence, Label},
+    observe::{Entry, StreamId},
+    property::{
+        Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
+        Source, Status, Subject, Verdict,
+    },
+    Observation,
+};
+
+/// What a generated property claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Template {
+    /// Per stream: a peer whose judged frames on every stream of the
+    /// connection are all `Conformant` is never punished.
+    ConformantNeverCloses,
+    /// A judged frame with this label gets a fault close before quiescence.
+    /// `UndeclaredType` is per stream; the others are per row.
+    Closes(Label),
+    /// Per row with a cadence: emptying the row's bucket never gets a
+    /// conformant peer punished.
+    CadenceNeverCloses,
+}
+
+impl Template {
+    /// The ID's last segment, such as `reserved-flags-closes`.
+    pub fn claim(self) -> String {
+        match self {
+            Template::ConformantNeverCloses => "conformant-never-closes".to_owned(),
+            Template::Closes(label) => format!("{}-closes", label.name()),
+            Template::CadenceNeverCloses => "cadence-never-closes".to_owned(),
+        }
+    }
+
+    /// The template whose [`Template::claim`] is `claim`.
+    pub fn parse(claim: &str) -> Option<Template> {
+        match claim {
+            "conformant-never-closes" => Some(Template::ConformantNeverCloses),
+            "cadence-never-closes" => Some(Template::CadenceNeverCloses),
+            _ => {
+                let name = claim.strip_suffix("-closes")?;
+                let label = Label::ALL.into_iter().find(|l| l.name() == name)?;
+                (consequence(label) == Consequence::FaultClose).then_some(Template::Closes(label))
+            }
+        }
+    }
+
+    /// The claim, in one sentence.
+    fn sentence(self) -> &'static str {
+        match self {
+            Template::ConformantNeverCloses => "a conformant peer is never punished",
+            Template::Closes(_) => "a frame with this label gets a fault close",
+            Template::CadenceNeverCloses => "exhausting a cadence bucket is never punished",
+        }
+    }
+
+    /// The property's kind: a fault close is an obligation, and the rest
+    /// hold at every step.
+    fn kind(self) -> Kind {
+        match self {
+            Template::Closes(_) => Kind::Liveness {
+                bound: LivenessBound::BeforeQuiescence,
+            },
+            Template::ConformantNeverCloses | Template::CadenceNeverCloses => Kind::Safety,
+        }
+    }
+}
+
+/// A generated property's ID, in parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedId<'a> {
+    /// The family, such as `header-sync`.
+    pub family: &'a str,
+    /// The stream.
+    pub stream: StreamId,
+    /// The row's name, or `None` for a per-stream template.
+    pub row: Option<&'a str>,
+    /// The template.
+    pub template: Template,
+}
+
+impl<'a> GeneratedId<'a> {
+    /// The parts of `id`, if it has a generated property's shape.
+    pub fn parse(id: &'a str) -> Option<Self> {
+        let parts: Vec<&str> = id.split('/').collect();
+        let (family, stream, row, claim) = match parts[..] {
+            [family, stream, claim] => (family, stream, None, claim),
+            [family, stream, row, claim] => (family, stream, Some(row), claim),
+            _ => return None,
+        };
+        let (kind, version) = stream.strip_prefix('s')?.split_once('v')?;
+        Some(GeneratedId {
+            family,
+            stream: StreamId {
+                kind: kind.parse().ok()?,
+                version: version.parse().ok()?,
+            },
+            row,
+            template: Template::parse(claim)?,
+        })
+    }
+}
+
+impl fmt::Display for GeneratedId<'_> {
+    /// Writes the ID.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/", self.family, self.stream)?;
+        if let Some(row) = self.row {
+            write!(f, "{row}/")?;
+        }
+        f.write_str(&self.template.claim())
+    }
+}
+
+/// The receiver properties of `family`'s tabled `streams`: per stream,
+/// `conformant-never-closes` and `undeclared-type-closes`; per row, the
+/// `<label>-closes` of each label the row's role can commit, and
+/// `cadence-never-closes` for a row with a cadence. A stream with no table
+/// yields none.
+///
+/// # Panics
+///
+/// If `family` breaks the ID grammar. Row names follow it, because
+/// `Stream::check_layout` refuses one that doesn't.
+pub fn table_properties<S: HasView>(family: &'static str, streams: &[Stream]) -> Vec<Property<S>> {
+    let mut properties = Vec::new();
+    for stream in streams {
+        let Some(rules) = stream.messages else {
+            continue;
+        };
+        let id = |row, template| GeneratedId {
+            family,
+            stream: StreamId {
+                kind: stream.kind,
+                version: stream.version,
+            },
+            row,
+            template,
+        };
+        properties.push(generated(id(None, Template::ConformantNeverCloses)));
+        properties.push(generated(id(None, Template::Closes(Label::UndeclaredType))));
+        for rule in rules {
+            for template in row_templates(rule) {
+                properties.push(generated(id(Some(rule.name), template)));
+            }
+        }
+    }
+    properties
+}
+
+/// The per-row templates of `rule`, in label order.
+fn row_templates(rule: &MessageRule) -> Vec<Template> {
+    let mut labels = vec![
+        Label::ReservedFlags,
+        Label::ShortPayload,
+        Label::LongPayload,
+    ];
+    let cadence = match rule.role {
+        MessageRole::Announcement { .. } => true,
+        MessageRole::Request { cadence, .. } => {
+            labels.push(Label::OverMargin);
+            cadence.is_some()
+        }
+        MessageRole::Response { .. } => {
+            labels.extend([Label::Unsolicited, Label::OverOwed]);
+            false
+        }
+        MessageRole::Subscription { cadence, .. } => {
+            labels.extend([
+                Label::OverLive,
+                Label::OverCredit,
+                Label::AfterClose,
+                Label::BadCursor,
+            ]);
+            cadence.is_some()
+        }
+    };
+    let mut templates: Vec<Template> = labels.into_iter().map(Template::Closes).collect();
+    if cadence {
+        templates.push(Template::CadenceNeverCloses);
+    }
+    templates
+}
+
+/// The property `id` names.
+fn generated<S: HasView>(id: GeneratedId<'_>) -> Property<S> {
+    Property {
+        id: PropertyId::generated(id.to_string())
+            .unwrap_or_else(|error| panic!("a generated ID breaks the grammar: {error:?}")),
+        claim: id.template.sentence(),
+        kind: id.template.kind(),
+        assumes: &[],
+        needs: &[Source::Frames, Source::Closes],
+        status: Status::Active,
+        check: check_generated::<S>,
+        witness: None,
+    }
+}
+
+/// The row whose rule `label` enforces on a frame of `frame_row`, for
+/// [`Observation::PeerFrame::row`]: the frame's own row, except a page's
+/// `OverCredit`, which its subscription row enforces.
+pub fn rule_row<'a>(
+    rules: &'a [MessageRule],
+    frame_row: &'a MessageRule,
+    label: Label,
+) -> &'a MessageRule {
+    match frame_row.role {
+        MessageRole::Response { request, .. } if label == Label::OverCredit => {
+            MessageRule::find(rules, request).unwrap_or(frame_row)
+        }
+        _ => frame_row,
+    }
+}
+
+/// Checks a generated property, from the template its ID names.
+fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let id = cx.id().clone();
+    let id = GeneratedId::parse(id.as_str()).expect("table_properties wrote this ID");
+    match id.template {
+        Template::Closes(label) => check_closes(cx, &id, label),
+        Template::ConformantNeverCloses => check_never_closes(cx, &id, |_| true),
+        Template::CadenceNeverCloses => {
+            check_never_closes(cx, &id, |frame| frame.exhausted && frame.row == id.row)
+        }
+    }
+}
+
+/// One frame a peer sent.
+#[derive(Clone, Copy, Debug)]
+struct Sent<'a> {
+    stream: StreamId,
+    row: Option<&'a str>,
+    label: Label,
+    exhausted: bool,
+}
+
+/// The frame `seq` the peer sent on `connection` and `stream`, from
+/// `entries`.
+fn sent(entries: &[Entry], connection: u64, stream: StreamId, seq: u64) -> Option<Sent<'_>> {
+    entries.iter().rev().find_map(|entry| match &entry.obs {
+        Observation::PeerFrame {
+            connection: c,
+            stream: s,
+            seq: q,
+            row,
+            label,
+            exhausted,
+        } if (*c, *s, *q) == (connection, stream, seq) => Some(Sent {
+            stream,
+            row: row.as_deref(),
+            label: *label,
+            exhausted: *exhausted,
+        }),
+        _ => None,
+    })
+}
+
+/// Every frame the node judged on `connection` in `entries`, in order.
+fn judged(entries: &[Entry], connection: u64) -> Vec<Sent<'_>> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| match entry.obs {
+            Observation::FrameJudged {
+                connection: c,
+                stream,
+                seq,
+            } if c == connection => sent(&entries[..at], connection, stream, seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// True if `entries` hold a close of `connection`, with any cause.
+fn closed(entries: &[Entry], connection: u64) -> bool {
+    entries.iter().any(|entry| {
+        matches!(entry.obs, Observation::ConnectionClosed { connection: c, .. } if c == connection)
+    })
+}
+
+/// The subject of an obligation on `connection`.
+fn session(connection: u64) -> Subject {
+    Subject::Session(connection.to_string())
+}
+
+/// True if `obs` closes the obligation's connection with a fault cause.
+fn fault_close(key: &ObligationKey, obs: &Observation) -> bool {
+    matches!(obs, Observation::ConnectionClosed { connection, cause }
+        if is_fault_cause(cause) && key.subject == session(*connection))
+}
+
+/// `<label>-closes`: each frame with `label` on the ID's stream and row that
+/// the node judges this step, on a connection still open, opens an
+/// obligation that a fault close of the connection discharges. One close
+/// discharges every obligation on its connection.
+fn check_closes<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    id: &GeneratedId<'_>,
+    label: Label,
+) -> Verdict {
+    let entries = cx.log.entries();
+    let start = entries.partition_point(|e| e.step < cx.step);
+    let mut obliged = Vec::new();
+    for (at, entry) in entries[start..].iter().enumerate() {
+        let Observation::FrameJudged {
+            connection,
+            stream,
+            seq,
+        } = entry.obs
+        else {
+            continue;
+        };
+        let before = &entries[..start + at];
+        let matches = stream == id.stream
+            && sent(before, connection, stream, seq)
+                .is_some_and(|frame| frame.label == label && frame.row == id.row);
+        if matches && !closed(before, connection) {
+            obliged.push((at, connection));
+        }
+    }
+    if obliged.is_empty() {
+        return Verdict::NotApplicable;
+    }
+    for (at, connection) in obliged {
+        let mut obligation = cx.obligation(Some(at), session(connection), fault_close);
+        obligation.cardinality = Cardinality::Every;
+        cx.oblige(obligation);
+    }
+    Verdict::Holds
+}
+
+/// `conformant-never-closes` and `cadence-never-closes`. The property
+/// applies at each step where the node judges a frame on the ID's stream
+/// for which `applies` holds. At each fault close or `Misbehavior` on a
+/// connection with such a frame, if every frame the node judged on that
+/// connection before the punishment, on any stream, is `Conformant`, the
+/// punishment is a violation. A fault on a sibling stream justifies it, but
+/// only one judged before it.
+fn check_never_closes<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    id: &GeneratedId<'_>,
+    applies: impl Fn(&Sent<'_>) -> bool,
+) -> Verdict {
+    let entries = cx.log.entries();
+    let start = entries.partition_point(|e| e.step < cx.step);
+    let mut verdict = Verdict::NotApplicable;
+    for (at, entry) in entries[start..].iter().enumerate() {
+        let before = &entries[..start + at];
+        let (connection, punishment) = match &entry.obs {
+            Observation::FrameJudged {
+                connection,
+                stream,
+                seq,
+            } => {
+                if *stream == id.stream
+                    && sent(before, *connection, *stream, *seq).is_some_and(|f| applies(&f))
+                {
+                    verdict = Verdict::Holds;
+                }
+                continue;
+            }
+            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+                (*connection, format!("a close with cause {cause}"))
+            }
+            Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),
+            _ => continue,
+        };
+        let judged = judged(before, connection);
+        let covered = judged.iter().any(|f| f.stream == id.stream && applies(f));
+        if covered && judged.iter().all(|f| f.label == Label::Conformant) {
+            return cx.violated(
+                format!(
+                    "connection {connection}'s judged frames are all conformant, so no punishment"
+                ),
+                punishment,
+            );
+        }
+    }
+    verdict
+}

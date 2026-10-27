@@ -187,6 +187,36 @@ impl EnginePort {
         state::read_block_range(&engine, &chain, start, count, max_body_bytes, cancelled)
     }
 
+    /// [`Self::commit_block`], for zakurad's driver fidelity test, whose
+    /// verifier fake commits outside a simulator run. A run commits only
+    /// through the block service, which publishes each commit's facts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit_block`] does.
+    #[cfg(feature = "driver-fidelity")]
+    pub fn commit_block_for_driver_test(
+        &self,
+        block: Arc<block::Block>,
+        receipt: u64,
+    ) -> Result<Applied, StateError> {
+        self.commit_block(block, receipt)
+    }
+
+    /// [`Self::record_body_evidence`], for zakurad's driver fidelity test,
+    /// whose state-writer fake records outside a simulator run.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_body_evidence`] does.
+    #[cfg(feature = "driver-fidelity")]
+    pub fn record_body_evidence_for_driver_test(
+        &self,
+        request: TransitionRequest,
+    ) -> Result<Applied, StateError> {
+        self.record_body_evidence(request)
+    }
+
     /// Closes the view watch, as service shutdown does.
     pub(crate) fn close_views(&self) {
         let sender = {

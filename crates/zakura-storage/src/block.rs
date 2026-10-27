@@ -17,7 +17,8 @@
 //! [`controlled`] holds the block service that keeps this contract,
 //! [`evidence`] the facts it publishes and the models that check them, and
 //! [`range`] the range source serving reads through. [`fixture`] builds the
-//! blocks it serves.
+//! blocks it serves, and [`cases`] holds the cases that zakurad's real
+//! driver and the service both pass.
 //!
 //! # Operations
 //!
@@ -174,6 +175,7 @@ use zakura_network::zakura::{
 };
 use zakura_node_services::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 
+pub mod cases;
 pub mod controlled;
 pub mod evidence;
 pub mod fixture;

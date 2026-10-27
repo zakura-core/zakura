@@ -12,6 +12,11 @@ categories = ["development-tools::testing"]
 # Only the simulator will depend on it, and no published crate does.
 publish = false
 
+[features]
+# Direct full-state writes for zakurad's driver fidelity test, whose fakes
+# stand in for zakura-state's writer and verifier.
+driver-fidelity = []
+
 [dependencies]
 chrono = { workspace = true }
 futures = { workspace = true }

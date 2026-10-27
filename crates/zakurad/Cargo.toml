@@ -240,7 +240,7 @@ zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # The simulator's engine-backed header port, compared against
 # HeaderChainServicePort in its tests. Path-only, with no version, because
 # zakura-storage is never published, so packaging drops it.
-zakura-storage = { path = "../zakura-storage" }
+zakura-storage = { path = "../zakura-storage", features = ["driver-fidelity"] }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["rpc-client"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature

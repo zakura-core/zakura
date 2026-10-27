@@ -18,7 +18,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use bincode::Options;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -41,7 +40,7 @@ use super::commitment_aux::FinalFrontiers;
 /// a decode failure, which is right for the node's own database and wrong here: an artifact is
 /// untrusted input, and a hostile one must be rejected rather than crash the node.
 fn decode_tree<T: serde::de::DeserializeOwned>(blob: &[u8]) -> Option<T> {
-    bincode::DefaultOptions::new().deserialize(blob).ok()
+    zakura_chain::serialization::bincode_format::deserialize(blob).ok()
 }
 
 /// Magic bytes identifying a frontier artifact.

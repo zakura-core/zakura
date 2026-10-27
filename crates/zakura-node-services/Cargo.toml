@@ -1,6 +1,6 @@
 [package]
 name = "zakura-node-services"
-version = "5.0.0-rc0"
+version = "5.0.1"
 authors.workspace = true
 description = "The interfaces of some Zakura node services. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -26,40 +26,47 @@ color-eyre = []
 
 rpc-client = [
     "color-eyre",
-    "jsonrpsee-types",
-    "reqwest",
-    "dep:rustls",
-    "dep:webpki-roots",
+    "dep:base64",
+    "dep:bytes",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
     "serde",
     "serde_json",
+    "tokio/net",
 ]
 
+# Retain the published feature name after removing its dependency.
+reqwest = []
+
 [dependencies]
-zakura-chain = { path = "../zakura-chain" , version = "10.0.0-rc0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0" }
-tower = { workspace = true }
+zakura-chain = { path = "../zakura-chain" , version = "11.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
+zakura-rt = { path = "../zakura-rt", version = "0.1.0-rc0" }
+tower = { workspace = true, features = ["buffer"] }
 
 # Optional dependencies
 
 # Tool and test feature rpc-client
-jsonrpsee-types = { workspace = true, optional = true }
-# Security: avoid default dependency on openssl
-reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-webpki-roots = { version = "1", optional = true }
+base64 = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, features = ["client", "http1"], optional = true }
+hyper-util = { workspace = true, features = ["tokio"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
 
 [dev-dependencies]
 
-reqwest = { workspace = true, features = ["rustls-no-provider"] }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
+base64 = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee-types = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [lints]
 workspace = true

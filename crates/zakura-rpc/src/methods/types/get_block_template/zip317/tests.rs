@@ -2,7 +2,6 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use zcash_keys::address::Address;
 use zcash_transparent::address::TransparentAddress;
 
 use zakura_chain::{
@@ -16,7 +15,10 @@ use zakura_chain::{
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
-use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
+use crate::methods::types::{
+    get_block_template::{MinerAddress, MinerParams},
+    transaction::TransactionTemplate,
+};
 
 use super::{block_template_overhead_bytes, select_mempool_transactions};
 
@@ -85,8 +87,9 @@ fn selects_transaction_at_400_zatoshis_per_action() {
     assert!(verified_tx.pays_conventional_fee());
     assert_eq!(verified_tx.unpaid_actions, 0);
 
-    let miner_params =
-        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+    let miner_params = MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
+        [0x7e; 20],
+    )));
     let selected = select_mempool_transactions(
         &network,
         Height(1_000_000),
@@ -104,8 +107,9 @@ fn selects_transaction_at_400_zatoshis_per_action() {
 fn reserves_serialized_block_and_pool_tag_overhead() {
     let network = Network::Mainnet;
     let height = Height(1_000_000);
-    let miner_params =
-        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+    let miner_params = MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
+        [0x7e; 20],
+    )));
     let coinbase_resources =
         TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None)
             .expect("test coinbase resource usage is valid");
@@ -185,7 +189,9 @@ fn excludes_tx_with_unselected_dependencies() {
         select_mempool_transactions(
             &network,
             Height(1_000_000),
-            &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
+            &MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
+                [0x7e; 20]
+            ))),
             None,
             vec![unmined_tx],
             mempool_tx_deps,
@@ -226,7 +232,9 @@ fn includes_tx_with_selected_dependencies() {
     let selected_txs = select_mempool_transactions(
         &network,
         Height(1_000_000),
-        &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
+        &MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
+            [0x7e; 20],
+        ))),
         None,
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
@@ -282,8 +290,9 @@ mod zip218_template_limits {
         },
     };
 
-    use zcash_keys::address::Address;
     use zcash_transparent::address::TransparentAddress;
+
+    use crate::methods::types::get_block_template::MinerAddress;
 
     use super::{
         super::{BlockTemplateLimits, MinerParams},
@@ -433,8 +442,9 @@ mod zip218_template_limits {
     }
 
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
-        let miner_params =
-            MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+        let miner_params = MinerParams::from(MinerAddress::from(
+            TransparentAddress::PublicKeyHash([0x7e; 20]),
+        ));
         let coinbase_resources =
             TransactionTemplate::coinbase_resource_usage(network, height, &miner_params, None)
                 .expect("valid coinbase resource usage");

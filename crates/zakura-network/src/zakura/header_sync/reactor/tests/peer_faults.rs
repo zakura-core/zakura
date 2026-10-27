@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::{CloseCause, FramedRecv, SinkReject};
 
 #[test]
 fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
@@ -17,11 +18,11 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.common_ancestor = None;
     active.entries.clear();
     let wrong_ancestor_response = Headers {
-        request_id: owner.request_id().get(),
-        target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: wrong_ancestor.height,
         common_ancestor_hash: wrong_ancestor.hash,
-        complete: false,
+        reaches_initial_target: false,
         tree_aux_schema: AuxSchema::None,
         entries: vec![HeaderEntry {
             header: Arc::new(wrong_ancestor_header),
@@ -30,18 +31,13 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
         }],
     };
     assert!(
-        reactor
-            .codec
-            .encode(&HeaderSyncMessage::Headers(wrong_ancestor_response.clone()))
-            .is_ok(),
+        encode_frame(&v9::RegtestMessage::Headers(
+            wrong_ancestor_response.clone()
+        ))
+        .is_ok(),
         "the wrong locator member is otherwise wire-valid"
     );
-    reactor.handle_headers(
-        peer.clone(),
-        0,
-        owner.header_authority(),
-        wrong_ancestor_response,
-    );
+    reactor.deliver_page(peer.clone(), 0, wrong_ancestor_response);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
 
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
@@ -57,16 +53,15 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.entries.clear();
     let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
-    reactor.handle_headers(
+    reactor.deliver_page(
         peer.clone(),
         0,
-        owner.header_authority(),
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
             entries: vec![HeaderEntry {
                 header: Arc::new(wrong_target_header),
@@ -115,7 +110,7 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
             zakura_header_chain::Attribution::HeaderPeer(source),
             None,
         );
-        reactor.handle_typed_failure(peer.clone(), source, &error);
+        reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
         assert_peer_violation(&mut actions, expected);
     }
 
@@ -137,7 +132,7 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
             zakura_header_chain::Attribution::HeaderPeer(source),
             None,
         );
-        reactor.handle_typed_failure(peer.clone(), source, &error);
+        reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
         assert!(
             actions.try_recv().is_err(),
             "{category:?} cannot cross the header-peer scoring boundary"
@@ -163,7 +158,7 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
                 attribution,
                 None,
             );
-            reactor.handle_typed_failure(peer.clone(), source, &error);
+            reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
             assert!(
                 actions.try_recv().is_err(),
                 "{category:?} with {attribution:?} cannot score this header peer"
@@ -172,64 +167,165 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
     }
 }
 
+/// Connect `peer` with a session `session_id` whose connection the test
+/// watches, and keep its outbound queue open.
+fn connect(
+    reactor: &mut HeaderSyncReactor,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+) -> (PeerSession, FramedRecv, CancellationToken, CloseCause) {
+    let (send, outbound) = framed_channel(8);
+    let (connection, close_cause) = (CancellationToken::new(), CloseCause::new());
+    let session = PeerSession::from_parts_with_connection(
+        peer.clone(),
+        session_id,
+        send,
+        CancellationToken::new(),
+        connection.clone(),
+        close_cause.clone(),
+    );
+    reactor.handle_peer_connected(session.clone());
+    (session, outbound, connection, close_cause)
+}
+
+type FailureFixture = fn(
+    zakura_header_chain::SourceId,
+    zakura_header_chain::HeaderSyncWorkOwner,
+) -> Arc<zakura_header_chain::HeaderChainError>;
+
+/// An invalid header from preparation or admission disconnects the session
+/// that sent it and holds back the peer's readmission, and its subscription
+/// never acknowledges its cursor. A local or stale failure keeps the
+/// connection, and so does a fault in the work of a session that a
+/// replacement superseded.
 #[test]
-fn response_completion_requires_the_reserved_branch_scope() {
+fn header_peer_faults_disconnect_only_the_sending_session() {
+    let cases: [(FailureFixture, bool); 3] = [
+        (invalid_header_failure, true),
+        (|_, owner| local_failure(owner), false),
+        (|_, owner| stale_failure(owner), false),
+    ];
+    for (failure, faulted) in cases {
+        for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+            let (mut reactor, mut actions, snapshot, peer, source, owner) =
+                peer_violation_fixture();
+            let (session, _outbound, connection, close_cause) =
+                connect(&mut reactor, &peer, owner.session_id());
+            // Bind the seeded work to a live subscription of the session.
+            let anchor = snapshot.frontiers.finalized;
+            let target = zakura_header_chain::Frontier::new(
+                block::Height(1),
+                owner.header_authority().branch.target_tip_hash,
+            );
+            let status = v9::test_support::status::<
+                { crate::zakura::header_sync::config::REGTEST_HEADER_BYTES },
+            >(target);
+            let id = session
+                .try_open(&status, &[anchor], AuxSchema::None, 1)
+                .expect("the session opens a subscription");
+            let owner: zakura_header_chain::HeaderSyncWorkOwner =
+                zakura_header_chain::HeaderWorkOwner {
+                    request_id: NonZeroU64::new(id.get()).expect("subscription IDs are nonzero"),
+                    ..owner
+                        .header_owner()
+                        .expect("the fixture is ordinary header work")
+                }
+                .into();
+            let active = reactor
+                .peer_work_queue
+                .active_mut(&peer)
+                .expect("the fixture has active work");
+            (active.request_id, active.owner, active.phase) = (id, owner, phase);
+
+            let failure = failure(source, owner);
+            if phase == HeaderTargetPhase::Preparing {
+                let failed = HeaderTargetPreparationResult::Failed(failure);
+                reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
+            } else {
+                let failed = HeaderTargetAdmissionResult::Failed(failure);
+                reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);
+            }
+
+            assert_eq!(connection.is_cancelled(), faulted);
+            assert_eq!(
+                reactor.unproductive_peer_cooldowns.contains_key(&peer),
+                faulted
+            );
+            if !faulted {
+                assert!(
+                    actions.try_recv().is_err(),
+                    "a local failure is no violation"
+                );
+                continue;
+            }
+            assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+            assert_eq!(close_cause.get_or("missing"), "header_peer_fault");
+            let start = v9::Cursor {
+                height: anchor.height,
+                hash: anchor.hash,
+                headers: 0,
+                bytes: 0,
+            };
+            assert_eq!(
+                session.subscriber().accept_through(id.get(), &start, 0),
+                Err(v9::SubscribeError::Failed),
+                "the failed subscription acknowledges no cursor",
+            );
+        }
+    }
+
+    let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+    let (_replacement, _outbound, connection, _) =
+        connect(&mut reactor, &peer, owner.session_id() + 1);
+    let failure = invalid_header_failure(source, owner);
+    reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
+    assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    assert!(!reactor.unproductive_peer_cooldowns.contains_key(&peer));
+    assert!(
+        !connection.is_cancelled(),
+        "the replacement stays connected"
+    );
+}
+
+/// A page or outcome for another subscription leaves the active request,
+/// the peer, and the scheduler untouched.
+#[test]
+fn pages_and_outcomes_of_another_subscription_have_no_effect() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
-    let expected = reactor
+    let active = reactor
         .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has active work")
-        .clone();
-    let mut wrong_scope = owner.header_authority();
-    wrong_scope.header_generation = wrong_scope
-        .header_generation
-        .checked_next()
-        .expect("the fixture generation has a successor");
-    reactor.handle_headers(
+        .active_mut(&peer)
+        .expect("the fixture has active work");
+    active.phase = HeaderTargetPhase::Receiving;
+    let entry = active.entries[0].clone();
+    let expected = active.clone();
+    let other = owner.request_id().get() + 1;
+    reactor.deliver_page(
         peer.clone(),
         0,
-        wrong_scope,
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: other,
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
-            entries: Vec::new(),
+            entries: vec![entry],
         },
     );
-    assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
-    assert!(
-        actions.try_recv().is_err(),
-        "a scope-mismatched page has no peer or scheduling effect"
-    );
-
-    let (mut reactor, mut actions, _snapshot, peer, _source, owner) = peer_violation_fixture();
-    let expected = reactor
-        .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has active work")
-        .clone();
-    let mut wrong_scope = owner.header_authority();
-    wrong_scope.branch = zakura_header_chain::BranchId::new(
-        owner.header_authority().branch.anchor_hash,
-        block::Hash([0x73; 32]),
-    );
-    reactor.handle_headers_outcome(
+    reactor.deliver_outcome(
         peer.clone(),
         0,
-        wrong_scope,
         HeadersOutcome {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
-            outcome: HeadersOutcomeCode::Busy,
+            subscription_id: other,
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            outcome: HeadersOutcomeCode::TargetNotRetained,
         },
     );
     assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
     assert!(
         actions.try_recv().is_err(),
-        "a scope-mismatched outcome has no peer or scheduling effect"
+        "a page or outcome of another subscription has no peer or scheduling effect"
     );
 }
 
@@ -247,15 +343,15 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
-        request_id: owner.request_id().get(),
-        target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: returned_ancestor.height,
         common_ancestor_hash: returned_ancestor.hash,
-        complete: false,
+        reaches_initial_target: false,
         tree_aux_schema: AuxSchema::None,
         entries: vec![entry; 2],
     };
-    reactor.handle_headers(peer.clone(), 0, owner.header_authority(), response);
+    reactor.deliver_page(peer.clone(), 0, response);
 
     assert!(
         reactor.peer_work_queue.active(&peer).is_none(),
@@ -265,5 +361,109 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     assert_eq!(
         reactor.peer_work_queue.unowned_chunk_capacity(),
         crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1,
+    );
+}
+
+/// Run the session reader on one page from `parent`, then on the inbound
+/// stream's end, for a session subscribed to `target` from `locators`.
+async fn read_page(
+    tree: &v9::test_support::HeaderTree,
+    target: zakura_header_chain::Frontier,
+    locators: &[zakura_header_chain::Frontier],
+    parent: zakura_header_chain::Frontier,
+    headers: &[zakura_header_chain::Frontier],
+    marker: bool,
+) -> Result<(), SinkReject> {
+    use crate::zakura::header_sync::{
+        config::REGTEST_HEADER_BYTES,
+        pipe::run_peer,
+        v9::{LeaseOwner, Publisher},
+    };
+
+    let (handle, _actions, _reactor) = build_header_sync_reactor(startup(CancellationToken::new()))
+        .expect("the session reader fixture starts");
+    let peer = peer();
+    let cancel = CancellationToken::new();
+    let (send, _outbound) = framed_channel(8);
+    let session = PeerSession::from_parts(peer.clone(), send.clone(), cancel.clone());
+    let status = Status {
+        max_headers_per_response: 2,
+        max_message_bytes: 2_000_000,
+        ..v9::test_support::status::<REGTEST_HEADER_BYTES>(target)
+    };
+    let (open, _) = session
+        .subscriber()
+        .open(&status, locators, AuxSchema::None, 100)
+        .expect("the first Open is recorded");
+    let (publisher, publishing) = Publisher::spawn::<REGTEST_HEADER_BYTES>(
+        handle.port.clone(),
+        handle.serving.push(&peer),
+        send,
+        LeaseOwner {
+            peer: zakura_header_chain::SourceId::from_digest(peer.digest()),
+            session_id: session.session_id(),
+        },
+        handle.page_limits,
+        cancel.clone(),
+    );
+    let page = encode_frame(&v9::RegtestMessage::Headers(Headers {
+        subscription_id: open.subscription_id,
+        initial_target_tip_hash: target.hash,
+        common_ancestor_height: parent.height,
+        common_ancestor_hash: parent.hash,
+        reaches_initial_target: marker,
+        tree_aux_schema: AuxSchema::None,
+        entries: headers
+            .iter()
+            .map(|at| HeaderEntry {
+                header: tree.nodes[&at.hash].1.clone(),
+                body_size: 0,
+                tree_aux: None,
+            })
+            .collect(),
+    }))
+    .expect("the page is wire-valid");
+    let (inbound, recv) = framed_channel(1);
+    inbound.try_send(page).expect("the inbound queue has room");
+    drop(inbound);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_peer::<REGTEST_HEADER_BYTES>(handle, session, publisher, publishing, recv, cancel),
+    )
+    .await
+    .expect("the reader ends once the inbound stream ends")
+}
+
+/// The session reader ends the session as a protocol violation when a page
+/// claims a sent locator but its headers do not link, before the reactor or
+/// preparation sees the page. The same subscription admits the linked page.
+#[tokio::test]
+async fn unlinked_page_ends_the_session_in_the_reader() {
+    let mut tree = v9::test_support::HeaderTree::new();
+    let mut chain = vec![tree.genesis];
+    chain.extend(tree.extend(tree.genesis, 7));
+    let (target, locators) = (chain[7], [chain[5], chain[0]]);
+
+    read_page(&tree, target, &locators, chain[5], &chain[6..8], true)
+        .await
+        .expect("the reader admits a linked page and ends with the stream");
+
+    let rejected = read_page(
+        &tree,
+        target,
+        &locators,
+        chain[5],
+        &[chain[2], chain[7]],
+        true,
+    )
+    .await
+    .expect_err("an unlinked page ends the session");
+    let SinkReject::Protocol(error) = rejected else {
+        panic!("an unlinked page is a protocol violation, got {rejected:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "the headers do not link from the page parent",
+        "the reader rejects the page for its linkage, not another rule"
     );
 }

@@ -5,16 +5,16 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
 };
 
+use super::batch_control::{Batch, BatchControl, RequestWeight};
+use super::fallback::Fallback;
 use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
 use rand_10::rng as thread_rng;
 use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
 
 use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
 use zakura_chain::transaction::{SigHash, UnminedTxId};
@@ -274,8 +274,8 @@ type VerifierService = Cached<BatchFallbackService>;
 /// gossiped into the mempool does not have to be verified again when the block that mines it
 /// arrives. One cache covers all of Sapling: its spend and output verifying keys have never
 /// changed, so unlike Orchard there are no circuit eras to keep apart.
-pub static VERIFIER: Lazy<VerifierService> =
-    Lazy::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
+pub static VERIFIER: LazyLock<VerifierService> =
+    LazyLock::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
 
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {

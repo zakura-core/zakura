@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-10. Version 0.6.
+Status: draft for review, 2026-10-23. Version 0.14.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -15,7 +15,22 @@ CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
 explains it. Version 0.6 moves the crate from the noq fork to upstream
 `quinn-proto` with a Zakura-owned driver and drops Iroh compatibility; §17d
 lists each change. Version 0.5 was the draft in #1296. This version doesn't
-include it.
+include it. Version 0.7 removes qlog output (CTRL-25); §17e explains it.
+Version 0.8 adds CTRL-26, which ties the connection count to a memory budget;
+§17f explains it. Version 0.9 adds ADM-12, a transport cap on live QUIC
+connections, and ADM-13, which releases a closed connection's stream buffers
+and gives closed connections their own allowance, and makes CTRL-26 fund
+both; §17g lists each change. Version 0.10 limits discovery dials below
+inbound refusal while keeping the full dial reserve for maintained connections;
+§17h explains it. Version 0.11 adds the socket seam: a socket factory binds
+every socket, so a simulation can inject sockets that never reach the OS. It
+changes SOCK-3 to SOCK-5, SOCK-7, SOCK-9 and SOCK-13, and adds a §16 row;
+§17i lists each change. Version 0.12 adds `bind_with`, which takes the socket
+factory and the endpoint inputs, so a simulation can replay a handshake byte
+for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
+each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
+come from the runtime a simulation controls; §17k explains it. Version 0.14
+adds the §16 row for byte-identical replay; §17l explains it.
 
 ## 0. Conventions
 
@@ -35,6 +50,13 @@ Terms:
   reach the tasks only through messages.
 - **Iroh backend**: the transport before `zakura-quic`, Zakura's fork of Iroh 1.1.
 - **Direct backend**: `zakura-quic`.
+- **Socket factory**: what binds an endpoint's sockets, at bind and for each
+  SOCK-9 rebind. The production factory binds OS UDP sockets. A simulation
+  injects its own factory, whose sockets are **injected sockets**.
+- **Endpoint inputs**: the randomness `bind_with` takes in place of the
+  production sources: the endpoint RNG seed, the stateless-reset and Retry
+  token keys, the connection ID generator, the client's initial destination
+  connection ID, and the TLS random source and key-exchange groups (API-2).
 - **Admitted IP**: the source IP of the `Incoming` that `admit` accepted, or the
   IP a dial connected to. It never changes for the life of the connection.
 
@@ -61,12 +83,11 @@ Terms:
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
   `bytes`, `curve25519-dalek`, `ed25519-zebra`, `futures`, `hex`, `libc`,
   `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
-  `socket2`, `thiserror`, `tokio`, `tracing` and `zeroize`.
+  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
-  and no others, with default features off. The `qlog` feature MAY be enabled
-  behind a `zakura-quic` cargo feature that release builds leave off.
+  and no others, with default features off.
 - **DEP-4.** The workspace MUST take `quinn-proto` from crates.io at version
   0.11.19 or later, the first release with the GHSA-4w2j/qfwj and GHSA-hmxj
   fixes. A git source or a `[patch]` entry for `quinn-proto` MUST NOT appear.
@@ -144,7 +165,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
   `Conn::remote_id()` MUST return only a key proven this way.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
-  TLS 1.3 cipher suites.
+  TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
+  `bind_with` MAY replace the provider's random source and key-exchange
+  groups, and nothing else.
 - **TLS-10.** The server MUST refuse 0-RTT (`max_early_data_size = 0`). The
   client MUST NOT send 0-RTT data. Session tickets MAY be issued; they don't
   affect 1-RTT compatibility.
@@ -195,14 +218,17 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   socket that created it for its whole life. Only an unset `listen_addr` binds
   more than one socket.
 - **SOCK-2.** IPv6 sockets MUST set `IPV6_V6ONLY`.
-- **SOCK-3.** At bind, the endpoint MUST request `recv_buffer_bytes` and
-  `send_buffer_bytes` through `socket2`'s `set_recv_buffer_size` and
-  `set_send_buffer_size`. It MUST read both sizes back.
+- **SOCK-3.** When the production factory binds a socket, it MUST request
+  `recv_buffer_bytes` and `send_buffer_bytes` through `socket2`'s
+  `set_recv_buffer_size` and `set_send_buffer_size`. It MUST read both sizes
+  back. SOCK-3 to SOCK-5 apply only to those sockets.
 - **SOCK-4.** If a read-back size is below the request, the endpoint MUST log
   one `warn` line that names the requested size, the effective size and the
   sysctl to raise (`net.core.rmem_max` or `wmem_max`). Linux reports double the
   granted size; the comparison MUST account for that.
-- **SOCK-5.** The effective sizes MUST be exported as gauges (OBS-1).
+- **SOCK-5.** The effective sizes MUST be exported as gauges (OBS-1). An
+  injected socket reports no buffer sizes: its `SocketStats::buffers` is all
+  zeros, and it sets no gauge.
 - **SOCK-6.** The send path MUST NOT drop a connection's packet because the
   socket returned `WouldBlock`. The connection task keeps the blocked transmit,
   waits until the socket is writable, and sends it before it polls
@@ -212,16 +238,20 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **SOCK-7.** On Linux, the endpoint MUST read the per-socket `drops` column from
   `/proc/net/udp` or `/proc/net/udp6`, matching the socket's inode. It reads
   every `kernel_drop_poll_secs` and exports the value as a counter (OBS-1). On
-  other platforms the metric is absent.
+  other platforms the metric is absent. Only production sockets have an
+  inode. An injected socket has none, so the endpoint doesn't start the poller
+  for it.
 - **SOCK-8.** GSO and GRO follow `gso` (CTRL-12) and SOCK-13. The endpoint sends
   no ECN marks and reads none, so `quinn-proto` reacts to loss only.
 - **SOCK-9.** On a fatal socket error (not `WouldBlock` or `Interrupted`), the
   endpoint task MUST replace the socket once with a new socket on the same
-  address. It closes the old socket and waits up to 1 s for in-flight sends to
+  address, which the socket factory builds. It closes the old socket and waits up to 1 s for in-flight sends to
   release it, so the new bind doesn't fail with `EADDRINUSE`. Connection tasks
   drop what they would send while the rebind runs; `quinn-proto` counts it as
   loss and retransmits. If the rebind fails or the error repeats within 60 s,
-  the endpoint MUST log the error and stop that socket's endpoint task.
+  the endpoint MUST log the error and stop that socket's endpoint task. The
+  60 s window MUST be measured on the runtime's monotonic clock, the one that
+  drives `quinn-proto` timers, not on `std::time::Instant`.
 - **SOCK-10.** `local_addrs()` returns the bound addresses. For an unspecified
   bind, the advertised-address logic in `zakura-network` lists interfaces itself
   through `libc::getifaddrs` (DEP-7), replacing netwatch.
@@ -235,7 +265,8 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   `quinn_proto::Connection::local_address_changed`. Each connection then
   forgets the local address it sends from, and the kernel picks a new one. The
   endpoint MUST NOT rebind a socket for a network change.
-- **SOCK-13.** On Linux, the socket layer MUST use its own fast path (DEP-7):
+- **SOCK-13.** On Linux, the production socket type MUST use its own fast
+  path (DEP-7):
   - `sendmsg` with a `UDP_SEGMENT` control message for GSO, probed once per
     process, at most 10 segments per send;
   - an `EIO` on a segmented send disables GSO on that socket for good;
@@ -250,6 +281,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 
   Other platforms use plain tokio `send_to` and `recv_from` without offloads.
   A receive loop MUST NOT spin on a persistent error (GHSA-6pp4).
+
+  An injected socket reports no GSO, sends one datagram per transmit and
+  doesn't allow MTU discovery. The GSO probe never runs for it.
 
 ## 6a. Driver
 
@@ -357,7 +391,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   connections, and counts
   `pending_total` with the control handshakes holding `max_pending_handshakes`
   permits. The endpoint applies rules 3 and 5 after the acceptor returns
-  `Accept`. Rules 3 and 4 both refuse, so their order doesn't change the result.
+  `Accept`, then its connection cap (ADM-12). Rules 3 and 4 both refuse, so
+  their order doesn't change the result.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
   ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
   rule 1 never fires.
@@ -402,11 +437,95 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
   `ring::hmac::Key` for resets. Each key is random per startup and never
-  persists. Iroh's BLAKE3 keys go away.
+  persists. `bind` keeps these defaults. `bind_with` MAY take both keys as
+  endpoint inputs. Iroh's BLAKE3 keys go away.
 - **ADM-11.** The endpoint task MUST remove a connection from its table only
   when `quinn-proto` reports the connection drained, and MUST NOT pass
   `quinn-proto` an event for a connection it already removed. A connection
   task that exits without a drained event reports one when it drops.
+- **ADM-12.** The endpoint MUST hold at most `QuicBindConfig::max_connections`
+  live QUIC connections across all its sockets. `bind` MUST refuse a cap of
+  zero, since that endpoint could neither dial nor accept. A connection is live from
+  `accept` or `connect` until it closes, so handshakes, dial attempts and
+  established connections count. Each address attempt of a dial (DIAL-3)
+  counts on its own. Closed connections move to ADM-13's allowance.
+  - An attempt the acceptor and rules 3 and 5 accept MUST be refused while
+    `max_connections - dial_reserve` live connections are held. Refusing
+    creates no connection state (SEC-3). Inbound attempts therefore never take
+    the last `dial_reserve` slots, and peers that churn inbound connections
+    can't stop this node's dials.
+  - A dial MUST claim a live slot for every address it will try (DIAL-3)
+    before its first attempt. The complete reservation MUST be atomic across
+    concurrent dials and inbound accepts. It tries at most the first
+    `max_connections` addresses, so an idle endpoint can fit it. When the cap
+    can't fit them all right now, it fails with `ConnectFailed(ConnectionLimit)`
+    before sending any packet. A dial therefore never mixes this node's
+    limit with the peer's results. Skipping
+    a later address at the cap would either blame the peer for an address it
+    never got to answer, since a signed record proves the node key and not
+    that the node owns every address it lists, or call a dial that contacted
+    the peer a local limit and retry it without backoff.
+  - Discovery dials MUST leave one live slot below the inbound refusal
+    threshold. Their ceiling is
+    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 107 at
+    the defaults. `connect_discovery` caps its address list to this ceiling
+    and atomically claims every attempt under it. A zero ceiling disables
+    discovery dials and returns `ConnectionLimit`. Bootstrap and maintained
+    dials use `connect` and may use the full transport cap. This prevents
+    discovery records with unanswered addresses from consuming the last
+    capacity available to inbound peers.
+  - `QuicEndpoint::has_dial_capacity()` reports whether an ordinary dial would
+    get a slot, and `has_discovery_capacity()` checks discovery's lower ceiling.
+    `zakura-network` treats `ConnectionLimit` as its own resource limit,
+    not the peer's fault. Its discovery dialer starts a dial only while both
+    the admission semaphore and discovery's transport ceiling have room, and
+    waits one tick after a dial hits a local limit. Its supervised redials retry a limit hit
+    before any packet was sent (admission or this cap) after the initial
+    backoff, without counting an attempt or growing the backoff. A limit hit
+    after the QUIC handshake, such as the pending control handshakes, counts
+    as a failed attempt, so it can't make a bounded redial handshake with the
+    peer forever. Without these, a full transport with free admission permits
+    made the dialer spin.
+
+  Zakura sets `max_connections` to its admitted cap plus
+  `max_pending_handshakes`, and `dial_reserve` to half of
+  `max_pending_handshakes` rounded up, so at least one slot: 124 and 16 at
+  the defaults (CTRL-26).
+- **ADM-13.** When a connection closes, its connection task MUST release the
+  stream payload `quinn-proto` still holds, then move its slot from ADM-12's
+  live count to `QuicBindConfig::max_closing_connections`.
+  - `quinn-proto` keeps every stream's buffers until the connection drains,
+    three PTOs after close, and the PTO adds the peer's advertised
+    `max_ack_delay` (up to 2^14 ms). A closed connection neither sends nor
+    receives stream data, so the task stops every receive half that may still
+    buffer data, streams the application never accepted included, and resets
+    every send half that may still hold unacknowledged data. It tracks which
+    streams those are as they open, end, stop and reset, so the work is
+    bounded by the open streams.
+  - The endpoint queues at most 64 KiB of datagrams for a closed connection
+    (`CLOSING_QUEUE_BYTES`) instead of DRV-3's 16 MiB. A closed connection
+    only answers with CONNECTION_CLOSE. When the slot moves, the endpoint
+    switches to that limit first, then the task drops and refunds the
+    datagrams already queued at the switch, and only then does the live slot
+    free. Datagrams that arrive later sit under the closing limit and are
+    handled as usual, so concurrent arrivals can't extend that work. An
+    endpoint send racing the switch can add one datagram. That queue counts
+    against its socket's `SOCKET_DATAGRAM_QUEUE_BYTES`, so beyond bookkeeping
+    a closed connection costs the CTRL-26 budget nothing.
+  - If `max_closing_connections` are already held, the task MUST drop the
+    connection's state at once instead of draining it. A late packet for it
+    gets at most a stateless reset. Admission never counts closed
+    connections, so draining can't refuse an inbound peer. Handshakes still
+    count as live, and ADM-3's per-IP and pending-handshake rules bound
+    those.
+
+  Zakura sets `max_closing_connections` to twice ADM-12's
+  `max_connections`, 248 at the defaults. A peer that completes handshakes and
+  gets rejected over and over can fill that allowance. Later closes then skip
+  their drain, but the closed connections take no live slot, so admission
+  and dials are unaffected by them. This replaces a table in which each closed
+  connection kept its stream buffers, up to 64 MiB of window credit, for up
+  to three PTOs.
 
 ## 8. Dialing
 
@@ -471,12 +590,46 @@ Rules for every key:
 | CTRL-22 | `retry_threshold` | optional u32 | 8 | 0 – CTRL-18 | endpoint (ADM-3); 0 = always Retry unvalidated sources; CTRL-18 = never | **New**. Iroh never sent Retry. With 8, spoofed sources hold at most 8 of the `max_pending_handshakes` slots, and honest peers pay one extra round trip only while 8 handshakes are pending. |
 | CTRL-23 | `dial_stagger_ms` | u32 | 250 | 0 – 5,000 | dialer (DIAL-3) | **New** |
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
-| CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_stream`, one file per connection | Only with the `qlog` cargo feature; startup MUST fail if set without it. Every admitted attempt gets a file, including one that fails before TLS, and the node never deletes them, so set it only while debugging (V12 F-64) |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (256), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
+`peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
+
+- **CTRL-26.** One live QUIC connection can make the node hold
+  `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
+  at the defaults, whether or not the application reads. Per-stream receive
+  windows sit inside the connection window and add nothing.
+  `zakura_quic::connection_memory_bytes` is the only implementation of this
+  formula. Queued datagrams are bounded per socket instead: each bound socket
+  queues at most `SOCKET_DATAGRAM_QUEUE_BYTES` (256 MiB, DRV-3) however many
+  connections it serves, closed ones included, and connection tasks drain it
+  whether or not the application reads. A closed connection holds no stream
+  data once ADM-13 releases it. The node reserves one socket queue per bound
+  socket from `[network.zakura] peer_memory_budget_bytes`, and the rest
+  divided by the per-connection cost is the number of live connections it
+  funds, 124 at the defaults, which bind one socket. `max_pending_handshakes`
+  of them are headroom for handshakes not yet admitted and extra address
+  attempts of one dial, and the node admits the rest, 92 at the defaults.
+  ADM-12 holds the transport to the admitted cap plus that headroom, so every
+  live connection the node holds is funded. Startup lowers a larger
+  `max_connections` to the admitted count with a warning. It fails, naming
+  `peer_memory_budget_bytes`, when the budget admits fewer than 16
+  connections or twice the discovery headroom plus one (19 with Mainnet's 9
+  bootstrap peers), so discovery keeps a dial slot when only the bootstrap
+  peers are connected. Inbound and other connections still share that slot,
+  as at any cap. A smaller `max_connections` lowers that floor to match.
+  Config load can't see the node key yet, so it counts one bootstrap identity
+  fewer in case one is this node's own, and the endpoint applies the exact
+  floor. The budget never shrinks the windows, so it costs no per-connection
+  throughput.
+
+  The budget counts flow-control credit and the socket datagram queues, not
+  resident memory. Connection and stream bookkeeping, including that of the
+  closed connections ADM-13 keeps, reassembly bookkeeping and allocator
+  overhead come on top, as do our writes still waiting for send credit
+  (DRV-4).
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -484,7 +637,8 @@ that adds the direct backend deletes the Iroh backend (PLAN step 10).
 `[network.zakura] nat_traversal = true` MUST fail at startup. The error MUST say that hole punching was removed and name this spec.
 
 Version 0.6 removed `bbr3`, `max_send_rate_bytes_per_second`,
-`path_keep_alive_interval_secs` and `path_idle_timeout_secs`. A config that
+`path_keep_alive_interval_secs` and `path_idle_timeout_secs`. Version 0.7
+removed `qlog_dir`. A config that
 sets a removed key MUST fail at startup with an unknown-key error.
 
 ### 9.2 Fixed settings
@@ -541,6 +695,9 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
 | `zakura.quic.connections` | gauge | Open connections |
+| `zakura.quic.connections.held` | gauge | ADM-12 live slots held: handshakes, dial attempts and open connections |
+| `zakura.quic.connections.closing` | gauge | ADM-13 closed connections not yet drained |
+| `zakura.quic.connections.closing_full` | counter | Closes that skipped their drain because the ADM-13 allowance was full |
 | `zakura.quic.dial.attempts` / `.alpn_mismatch` | counter | DIAL-3, DIAL-5 |
 | `zakura.quic.paths.closed_banned` | counter | PATH-3 closes |
 | `zakura.quic.packets.lost` | counter | Sum of `PathStats::lost_packets` deltas |
@@ -604,8 +761,22 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
-  - `local_id()`, `local_addrs()`, `socket_stats()`, `network_changes()` and `config()`;
+  - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
+    which binds every socket through the factory and takes its randomness
+    from the endpoint inputs. An input left unset keeps its production
+    source, so `bind` is `bind_with` with the production factory and
+    `EndpointInputs::default()`. The public types it takes are the socket
+    trait `UdpIo`, its receive metadata `RecvMeta`, `SocketFactory` and its
+    `BoundSocket`, and `EndpointInputs`. The crate re-exports the
+    `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
+    `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
+    and `SupportedKxGroup`;
+  - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
+    and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
+    `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
+  - `connect_discovery(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`
+    uses ADM-12's discovery ceiling and otherwise follows `connect`.
   - `connect(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`, which
     offers `alpns` in order; an empty list fails with
     `ConnectFailed(AlpnMismatch)`;
@@ -640,7 +811,7 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   `FrameStats`.
 - **API-6.** Errors: `ConnectError` has the variants `SelfDial`,
   `NoUsableAddress`, `AlpnMismatch`, `HandshakeTimeout`, `Refused`, `WrongIdentity`,
-  `Endpoint(quinn_proto::ConnectError)`, `Tls` and
+  `ConnectionLimit` (ADM-12), `Endpoint(quinn_proto::ConnectError)`, `Tls` and
   `Transport(quinn_proto::ConnectionError)`.
   `Endpoint` covers local endpoint failures such as a stopping endpoint; `Tls`
   covers other TLS alerts. `BindError` and `ConfigError` name the failing key
@@ -681,7 +852,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     send errors.
   - `quinn-proto` 0.11 exposes neither the unread bytes in its receive
     buffers nor a runtime per-stream receive window. The receive windows bound
-    both: a peer holds at most `receive_window` of unread data per connection.
+    both: a peer holds at most `receive_window` of unread data per connection,
+    and CTRL-26 bounds the sum across admitted connections.
 
 ## 13. Compatibility
 
@@ -721,13 +893,12 @@ this release tolerates, and keep each hard change explicit.
   opaque extension area, signed with the body and kept verbatim, so a node
   verifies and relays a record whose extensions it doesn't understand. New
   record contents, new address kinds included, MUST go in that area as TLVs
-  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV. A
-  relayed record whose body doesn't decode MUST be skipped and counted in
-  `zakura.p2p.discovery.records.undecodable`, without failing the message or
-  penalizing the relaying peer. A framing error (a truncated record, an
-  oversize body length or a count over the cap) still fails the message.
-  The record format version in the signature pre-image changes only when the
-  fixed fields change, which is a hard break.
+  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV.
+  Because new contents go only in that area, every record a conformant relay
+  sends decodes. A record whose body doesn't decode therefore fails its
+  message, as a framing error does. The record format version in the
+  signature pre-image changes only when the fixed fields change, which is a
+  hard break.
 - **COMPAT-11.** Control hello and ack fields are append-only. A later release
   appends fields after the ones this release knows and raises
   `control_version`. This release accepts a `control_version` at or above its
@@ -801,6 +972,9 @@ this release tolerates, and keep each hard change explicit.
 | A changed interface list notifies connections once, each connection moves to a fresh remote connection ID, and an open connection keeps working | SOCK-12 |
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
+| An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
+| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's default, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
@@ -808,9 +982,17 @@ this release tolerates, and keep each hard change explicit.
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
+| Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
+| Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
+| A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
+| Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
+| Cancelling discovery before or after its second address attempt starts returns all slots, sends no packet to an unstarted address, and lets a subsequent whole dial reserve capacity | ADM-12, ADM-13 |
+| Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
+| Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
+| Behind a relay that makes three PTOs last seconds, a draining connection leaves the live count so a new inbound peer connects, and with the allowance full it drops its state at once | ADM-13 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
-| Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-25 |
+| Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-24 |
 | Congestion controller is Cubic when unset | CTRL-3 |
 | Stats report the controller, driver and socket counters | OBS-4, OBS-12 |
 | Metrics presence and no per-peer labels | OBS-1, OBS-2 |
@@ -825,7 +1007,7 @@ this release tolerates, and keep each hard change explicit.
 Every requirement above is P0 except these:
 
 - **P1** (after the default flips, each gated by a measurement): changing the
-  CTRL-3 default, CTRL-9, CTRL-40 and the CTRL-25 qlog feature. The keys and
+  CTRL-3 default, CTRL-9 and CTRL-40. The keys and
   their mappings ship in P0; only their use waits for the measurement.
 - **P2** (on demand only): several `SO_REUSEPORT` sockets, rebinding a socket
   on a network change (SOCK-12 only notifies connections), multipath, BBR,
@@ -980,3 +1162,139 @@ Changed:
 - **COMPAT-4.** Names `quinn-proto` codepoints.
 - **SEC-1, SEC-3, SEC-6, SEC-8, PLAT-2.** Follow the identity, driver and
   socket changes.
+
+## 17e. Changes in version 0.7
+
+Deleted:
+
+- **CTRL-25.** The `qlog_dir` key and the `zakura-quic` `qlog` cargo feature.
+  Nothing used them, and the feature kept `qlog` and its dependencies in the
+  lockfile. A config that sets `qlog_dir` now fails with an unknown-key error.
+
+Changed:
+
+- **DEP-3.** No longer allows the `quinn-proto` `qlog` feature.
+
+## 17f. Changes in version 0.8
+
+Added:
+
+- **CTRL-26.** No setting tied the connection count to the transport memory
+  that peers can fill, so 256 connections could hold 16 GiB of window credit
+  at the defaults (V12 F-69). `peer_memory_budget_bytes` now caps the count,
+  and the default `max_connections` drops from 256 to the 124 that the default
+  budget admits.
+
+## 17g. Changes in version 0.9
+
+Added:
+
+- **ADM-12.** The connection table had no cap. Handshakes and extra dial
+  attempts sat outside Zakura's admission cap, and closed connections kept
+  their stream buffers until `quinn-proto` drained them. A peer could fill a
+  stream, fail the control handshake, free its admission slot and reconnect
+  while the old buffers drained. In a test, 12 peers doing that left 66
+  connections in the table. The endpoint now caps live connections across
+  sockets, keeps a dial reserve inbound attempts can't take, and fails a dial
+  at the cap with the new `ConnectError` variant `ConnectionLimit`.
+  `QuicBindConfig` gains `max_connections`, `dial_reserve` and
+  `max_closing_connections`, and `QuicEndpoint` gains `connection_count()`,
+  `closing_connection_count()` and `has_dial_capacity()`.
+- **ADM-13.** A closed connection releases its stream buffers, queues at most
+  64 KiB of datagrams and moves to its own allowance, so draining never
+  refuses an inbound peer. A full allowance makes later closes skip their
+  drain. The noq-era draft of this cap proposed a separate draining
+  allowance on the assumption that draining was cheap. `quinn-proto` keeps
+  stream buffers through the drain, so the release is what makes it cheap
+  here.
+
+Changed:
+
+- **ADM-3.** The endpoint applies ADM-12 after rules 3 and 5.
+- **CTRL-26.** The budget now funds every live QUIC connection the transport
+  may hold, `max_pending_handshakes` of headroom included, and closed
+  connections hold no stream data. The default `max_connections` drops from
+  124 to 92, and the exclusion list keeps only bookkeeping, allocator
+  overhead and pending writes.
+
+## 17h. Changes in version 0.10
+
+Changed:
+
+- **ADM-12.** Discovery dials reserve all their address attempts atomically
+  below the inbound refusal threshold, leaving one inbound slot available.
+  Previously four discovery records with eight unanswered addresses each
+  could hold 32 live slots and refuse inbound peers until the dials timed out.
+  Bootstrap and maintained dials retain access to the full connection cap.
+- **API-2.** Adds `connect_discovery` and `has_discovery_capacity`.
+
+## 17i. Changes in version 0.11
+
+The driver now reaches sockets through a socket seam, so deterministic
+simulation can run the real driver over an in-memory network. A socket
+factory binds every socket, and the production factory keeps today's
+behavior. Nothing new is public in this version.
+
+Changed:
+
+- **SOCK-3 to SOCK-5.** Buffer sizing, the clamp warning and the gauges apply
+  only to sockets the production factory binds. An injected socket reports
+  all-zero buffer sizes and sets no gauge.
+- **SOCK-7.** The endpoint starts the kernel drop poller only for a socket
+  with an inode, which an injected socket doesn't have.
+- **SOCK-9.** The socket factory builds the replacement socket, so a rebind
+  of an injected socket never reaches the OS. The 60 s window is measured on
+  the runtime's monotonic clock instead of `std::time::Instant`, so virtual
+  time decides it in a simulation.
+- **SOCK-13.** The fast path belongs to the production socket type. An
+  injected socket reports no GSO, sends one datagram per transmit, doesn't
+  allow MTU discovery and never triggers the GSO probe.
+- **§16.** Adds a test that runs an endpoint on injected sockets without any
+  OS access.
+
+## 17j. Changes in version 0.12
+
+`QuicEndpoint::bind_with` takes a socket factory and the endpoint inputs, so
+a deterministic simulation can give two runs the same randomness and get the
+same datagrams. `bind` keeps every production source. The Retry token time
+and the TLS certificate-check time aren't endpoint inputs. They come from the
+runtime's UTC clock in a later version.
+
+Changed:
+
+- **API-2.** Adds `bind_with`, `EndpointInputs`, the socket seam types and
+  the re-exports they need. The seam was crate-private in version 0.11.
+- **TLS-9.** `bind_with` may replace the provider's random source and
+  key-exchange groups. The cipher suites stay ring's defaults. ring's own
+  key-exchange groups draw from `SystemRandom` directly, so a seeded random
+  source alone doesn't fix the key shares.
+- **ADM-10.** `bind_with` may take the Retry token key and the
+  stateless-reset key as inputs. `bind` keeps random keys per startup.
+- **§16.** Adds a test that `bind` injects nothing and that `bind_with` uses
+  every input it takes.
+
+## 17k. Changes in version 0.13
+
+The driver reads its clocks through `zakura-rt`, the runtime layer that a
+deterministic simulation controls. In production each `zakura-rt` name is the
+tokio or std item the code used before, so behavior doesn't change.
+
+Changed:
+
+- **DEP-2.** Adds `zakura-rt`. The driver's monotonic clock and timers, the
+  Retry token time and the TLS certificate-check time come from it. In a
+  simulated run the two UTC readings follow the scenario clock, so Retry
+  tokens and certificate checks never read the host clock. Tasks, channels
+  and locks move onto `zakura-rt` in later changes.
+
+## 17l. Changes in version 0.14
+
+The replay tests for deterministic simulation are in place, so §16 records
+them.
+
+Changed:
+
+- **§16.** Adds a test that a simulated Retry handshake and stream exchange
+  replay byte for byte, in one process and across processes, and that each
+  seeded input, the seed and the UTC origin change the bytes while host time
+  doesn't.

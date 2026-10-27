@@ -1,11 +1,7 @@
 //! Tests for TLS PEM parsing and listener connection lifetimes.
 
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, io::ErrorKind, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
-use jsonrpsee::{
-    server::{stop_channel, Server, ServerHandle},
-    RpcModule,
-};
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -13,20 +9,55 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
+use tokio_rustls::{client::TlsStream, TlsAcceptor};
+use tower::BoxError;
 
 use super::super::{
-    certificate_validity, parse_tls_cert_chain, parse_tls_private_key, run_tls_listener,
-    serve_tls_connection, CertificateValidity, MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS,
-    TLS_HANDSHAKE_TIMEOUT, TLS_HEADER_READ_TIMEOUT,
+    certificate_validity,
+    http::JsonRpcHttpService,
+    jsonrpc::{Id, MethodResponse, Params},
+    parse_tls_cert_chain, parse_tls_private_key,
+    rpc_service::{RpcMethods, RpcService},
+    run_tls_listener, serve_tls_connection, stop_channel, CertificateValidity, ServerHandle,
+    MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS, TLS_HANDSHAKE_TIMEOUT,
+    TLS_HEADER_READ_TIMEOUT,
 };
+use super::http_client::{tls_connector, tls_stream, HttpConnection};
 
 // This self-signed localhost certificate and key are exclusively test fixtures.
-const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
+pub(super) const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
 const HANDSHAKE_KEY: &str = include_str!("handshake-key.pem");
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the `slow` test method takes to respond.
 const SLOW_METHOD_DELAY: Duration = Duration::from_secs(2);
+
+/// A `ping` method that returns `pong`, and a `slow` method that returns `done` after
+/// [`SLOW_METHOD_DELAY`].
+#[derive(Clone)]
+struct TestMethods;
+
+impl RpcMethods for TestMethods {
+    const METHOD_NAMES: &'static [&'static str] = &["ping", "slow"];
+
+    fn call<'a>(
+        &'a self,
+        method: &str,
+        _params: Params<'a>,
+        id: Id<'a>,
+        max_response_size: usize,
+    ) -> Option<Pin<Box<dyn Future<Output = MethodResponse> + Send + 'a>>> {
+        match method {
+            "ping" => Some(Box::pin(async move {
+                MethodResponse::response(id, &Ok("pong"), max_response_size)
+            })),
+            "slow" => Some(Box::pin(async move {
+                sleep(SLOW_METHOD_DELAY).await;
+                MethodResponse::response(id, &Ok("done"), max_response_size)
+            })),
+            _ => None,
+        }
+    }
+}
 
 struct TestTlsListener {
     address: SocketAddr,
@@ -66,15 +97,15 @@ impl TestTlsListener {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop_handle, handle) = stop_channel();
-        let mut methods = RpcModule::new(());
-        methods.register_method("ping", |_, _, _| "pong").unwrap();
-        methods
-            .register_async_method("slow", |_, _, _| async {
-                sleep(SLOW_METHOD_DELAY).await;
-                "done"
-            })
-            .unwrap();
-        let services = Server::builder().http_only().to_service_builder();
+        let service = JsonRpcHttpService::new(
+            RpcService::new(
+                TestMethods,
+                TestMethods::METHOD_NAMES.iter().copied(),
+                usize::MAX,
+            ),
+            1_000,
+            usize::MAX,
+        );
         let task = tokio::spawn(run_tls_listener(
             listener,
             TlsAcceptor::from(Arc::new(config)),
@@ -84,7 +115,7 @@ impl TestTlsListener {
             handshake_timeout,
             max_connections,
             move |stream, _, stop_handle| {
-                let service = services.clone().build(methods.clone(), stop_handle.clone());
+                let service = service.clone();
                 async move {
                     let _ = serve_tls_connection(
                         stream,
@@ -103,10 +134,10 @@ impl TestTlsListener {
         }
     }
 
-    async fn ping(&self) -> reqwest::Client {
-        let (client, result) = self.call("ping").await.unwrap();
+    async fn ping(&self) -> HttpConnection {
+        let (connection, result) = self.call("ping").await.unwrap();
         assert_eq!(result, "pong");
-        client
+        connection
     }
 
     /// Pings until the listener frees the capacity of a closed connection.
@@ -120,44 +151,31 @@ impl TestTlsListener {
         .unwrap();
     }
 
-    async fn call(&self, method: &str) -> reqwest::Result<(reqwest::Client, serde_json::Value)> {
-        crate::indexer::server::install_tls_crypto_provider();
-        let client = reqwest::Client::builder()
-            .tls_certs_only([reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap()])
-            .resolve("localhost", self.address)
-            .no_proxy()
-            .timeout(TEST_TIMEOUT)
-            .build()
-            .unwrap();
-        let response = client
-            .post(format!("https://localhost:{}/", self.address.port()))
-            .header("content-type", "application/json")
-            .body(format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1}}"#))
-            .send()
-            .await?;
-        assert!(response.status().is_success());
-        let mut body: serde_json::Value = serde_json::from_str(&response.text().await?).unwrap();
-        Ok((client, body["result"].take()))
+    /// Calls `method` on a new connection, and returns the connection, which stays open, and
+    /// the method's result.
+    async fn call(&self, method: &str) -> Result<(HttpConnection, serde_json::Value), BoxError> {
+        timeout(TEST_TIMEOUT, async {
+            let stream = TcpStream::connect(self.address).await?;
+            let stream = tls_connector()
+                .connect(ServerName::try_from("localhost").unwrap(), stream)
+                .await?;
+            let mut connection = HttpConnection::new(stream, "localhost").await?;
+            let (status, body) = connection
+                .post_json(
+                    format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1}}"#),
+                    None,
+                )
+                .await?;
+            assert!(status.is_success());
+            let mut body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            Ok((connection, body["result"].take()))
+        })
+        .await?
     }
 
     /// Completes a TLS handshake without sending an HTTP request.
     async fn connect_tls(&self) -> TlsStream<TcpStream> {
-        let mut roots = rustls::RootCertStore::empty();
-        for certificate in parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap() {
-            roots.add(certificate).unwrap();
-        }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let socket = TcpStream::connect(self.address).await.unwrap();
-        TlsConnector::from(Arc::new(config))
-            .connect(ServerName::try_from("localhost").unwrap(), socket)
-            .await
-            .unwrap()
+        tls_stream(self.address).await
     }
 
     async fn stop(self) {
@@ -485,4 +503,39 @@ fn ignores_certificates_that_are_not_valid_der() {
     let certificate = CertificateDer::from(vec![1, 2, 3]);
 
     assert!(certificate_validity(&certificate, NOT_BEFORE).is_err());
+}
+
+#[test]
+fn rejects_non_der_lengths() {
+    // Both test certificates start with a two-byte long-form length: `30 82 xx xx`.
+    let certificate = certificate(UTC_TIME_CERT).as_ref().to_vec();
+    assert_eq!(certificate[..2], [0x30, 0x82]);
+    let contents = &certificate[4..];
+
+    let with_header = |header: &[u8]| CertificateDer::from([header, contents].concat());
+    let length = u16::try_from(contents.len()).expect("test certificate is under 64 KiB");
+    let [high, low] = length.to_be_bytes();
+
+    assert_eq!(
+        certificate_validity(&with_header(&[0x30, 0x82, high, low]), NOT_BEFORE),
+        Ok(CertificateValidity::Current),
+        "the minimal encoding is accepted",
+    );
+    assert!(
+        certificate_validity(&with_header(&[0x30, 0x83, 0, high, low]), NOT_BEFORE).is_err(),
+        "a length with a leading zero byte is not DER",
+    );
+    assert!(
+        certificate_validity(&with_header(&[0x30, 0x80]), NOT_BEFORE).is_err(),
+        "an indefinite length is not DER",
+    );
+    let [high_past_end, low_past_end] = (length + 1).to_be_bytes();
+    assert!(
+        certificate_validity(
+            &with_header(&[0x30, 0x82, high_past_end, low_past_end]),
+            NOT_BEFORE
+        )
+        .is_err(),
+        "a length past the end of the input is truncated",
+    );
 }

@@ -952,8 +952,10 @@ wait_for_node2_exact_reopen() {
 
   while (( SECONDS < deadline )); do
     logs=$(node2_logs_after "${lines_before}")
+    # Drop later fields such as `finalized_tip_height=` so only the tip is compared.
     loaded_tip=$(printf '%s\n' "${logs}" \
       | sed -n 's/.*loaded Zakura state cache chain_tip=\(.*\)$/\1/p' \
+      | sed 's/ [a-z_]*=.*$//' \
       | sed -n '1p')
     if [[ -n "${loaded_tip}" ]]; then
       if printf '%s\n' "${logs}" \

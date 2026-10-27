@@ -6,17 +6,18 @@
 //! as bootstrap peers. Discovery success is the peer appearing in the supervisor
 //! registration watch, not the dial future completing.
 
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-    panic::AssertUnwindSafe,
-    time::Duration,
-};
+use std::{net::IpAddr, panic::AssertUnwindSafe, time::Duration};
 
 use futures::FutureExt;
-use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
+use zakura_node_services::task::{erased, spawn_erased_named};
 use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{oneshot, watch},
+    task::{JoinHandle, JoinSet},
+    time::Instant,
+};
 
 use super::dialer::native_discovery_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
@@ -86,13 +87,11 @@ pub(crate) fn spawn_native_discovery_dialer(
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_native_discovery_dialer(
-        endpoint,
-        discovery,
-        limits,
-        sought_services,
-    ))
+) -> JoinHandle<()> {
+    spawn_erased_named(
+        "discovery_dialer",
+        run_native_discovery_dialer(endpoint, discovery, limits, sought_services),
+    )
 }
 
 /// Seed the discovery book with the configured bootstrap peers as trusted static
@@ -130,6 +129,10 @@ pub(crate) async fn run_native_discovery_dialer(
     let mut dial_backoff_by_node_ip = HashMap::new();
     let dial_backoff = discovery.dial_backoff().await;
     let mut workers = JoinSet::new();
+    // After a dial hits a local limit, wait one tick before the next round:
+    // the limit doesn't back off the candidate, so an immediate retry would
+    // spin while the node stays full.
+    let mut paused_until: Option<Instant> = None;
 
     loop {
         if shutdown.is_cancelled() {
@@ -137,19 +140,22 @@ pub(crate) async fn run_native_discovery_dialer(
         }
         prune_discovery_ip_backoff(&mut dial_backoff_by_node_ip, dial_backoff.1, Instant::now());
 
-        spawn_discovery_dial_candidates(
-            &endpoint,
-            &discovery,
-            &limits,
-            &mut in_flight,
-            &mut in_flight_by_ip,
-            &dial_backoff_by_node_ip,
-            &mut workers,
-            &sought_services,
-        )
-        .await;
+        if paused_until.is_none_or(|until| Instant::now() >= until) {
+            paused_until = None;
+            spawn_discovery_dial_candidates(
+                &endpoint,
+                &discovery,
+                &limits,
+                &mut in_flight,
+                &mut in_flight_by_ip,
+                &dial_backoff_by_node_ip,
+                &mut workers,
+                &sought_services,
+            )
+            .await;
+        }
 
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             // Endpoint shutdown cancels this token. The dialer holds an endpoint
             // clone, so the supervisor registration watch never closes on its
@@ -158,6 +164,9 @@ pub(crate) async fn run_native_discovery_dialer(
             joined = workers.join_next(), if !workers.is_empty() => {
                 match joined {
                     Some(Ok(worker_result)) => {
+                        if worker_result.result == DiscoveryDialResult::LocalResourceLimit {
+                            paused_until = Some(Instant::now() + ZAKURA_DISCOVERY_DIAL_INTERVAL);
+                        }
                         in_flight.remove(&worker_result.node_id);
                         release_discovery_in_flight_ips(
                             &mut in_flight_by_ip,
@@ -191,7 +200,7 @@ pub(crate) async fn run_native_discovery_dialer(
                     return;
                 }
             }
-            _ = tokio::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
+            _ = zakura_rt::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
         }
     }
 }
@@ -207,7 +216,7 @@ async fn spawn_discovery_dial_candidates(
     workers: &mut JoinSet<DiscoveryDialWorkerResult>,
     sought_services: &[ZakuraServiceId],
 ) {
-    if !endpoint.has_native_admission_capacity() {
+    if !endpoint.has_discovery_admission_capacity() {
         return;
     }
 
@@ -217,7 +226,7 @@ async fn spawn_discovery_dial_candidates(
         .await;
 
     for candidate in candidates {
-        if !endpoint.has_native_admission_capacity() {
+        if !endpoint.has_discovery_admission_capacity() {
             return;
         }
         let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
@@ -239,7 +248,7 @@ async fn spawn_discovery_dial_candidates(
 
         discovery.mark_dial_attempt(&node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-        workers.spawn({
+        workers.spawn(erased({
             let reserved_ips_on_panic = reserved_ips.clone();
             AssertUnwindSafe(run_discovery_dial_once(
                 endpoint.clone(),
@@ -252,7 +261,7 @@ async fn spawn_discovery_dial_candidates(
             .map(move |result| {
                 recover_discovery_dial_worker_panic(node_id, reserved_ips_on_panic, result)
             })
-        });
+        }));
     }
 }
 
@@ -440,12 +449,12 @@ async fn run_discovery_dial_once(
         };
     }
 
-    let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
-    let dial = tokio::spawn({
+    let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
+    let dial = spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     });
-    tokio::pin!(dial);
+    zakura_rt::pin!(dial);
 
     let result = loop {
         if registered
@@ -457,7 +466,7 @@ async fn run_discovery_dial_once(
                 .await;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             dial_result = &mut dial => {
                 break match dial_result {
                     // `native_bootstrap_dial` returns `Ok(())` only after the connection
@@ -505,14 +514,12 @@ async fn run_discovery_dial_once(
 }
 
 async fn wait_for_discovery_registration_to_settle(
-    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
-    dial: &mut std::pin::Pin<
-        &mut tokio::task::JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
-    >,
+    dial: &mut std::pin::Pin<&mut JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>>,
 ) -> DiscoveryDialResult {
-    let healthy = tokio::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
-    tokio::pin!(healthy);
+    let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
+    zakura_rt::pin!(healthy);
 
     loop {
         if !registered
@@ -523,7 +530,7 @@ async fn wait_for_discovery_registration_to_settle(
             return DiscoveryDialResult::ShortLivedRegistered;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             _dial_result = &mut *dial => {
                 let still_registered = registered
                     .borrow_and_update()

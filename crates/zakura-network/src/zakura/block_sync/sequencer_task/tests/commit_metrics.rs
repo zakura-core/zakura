@@ -114,6 +114,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         frontiers,
                         Some(super::super::test_work_scope()),
                         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
                         body_rx,
                         control_rx,
                         input_bytes.clone(),

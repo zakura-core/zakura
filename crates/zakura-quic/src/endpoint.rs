@@ -1,19 +1,23 @@
 //! The endpoint: bind, serve, dial and shut down (API-2, SPEC §6 to §8).
 
 use std::{
-    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError, Weak,
-    },
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
-use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use quinn_proto::{ClientConfig, TransportConfig, VarInt};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        counter, downgrade, mpsc, oneshot, watch, Mutex, PoisonError, Weak,
+    },
+    task::{spawn_named, JoinHandle},
+    time::Instant,
+};
 
 use crate::{
     config::{QuicBindConfig, QuicConfig},
@@ -24,11 +28,21 @@ use crate::{
         ConnRef, Connecting, Handshake,
     },
     error::{BindError, ConnectError},
+    inputs::EndpointInputs,
     key::{NodeAddr, NodeId, NodeSecretKey},
-    socket::{bind_udp, SocketBuffers, UdpIo},
+    socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
-    tls::TlsConfig,
+    tls::{RuntimeUtc, TlsConfig},
 };
+
+/// Whether a `zakura_sim` run is active on this thread. Always false in a
+/// production build.
+fn in_simulated_run() -> bool {
+    #[cfg(zakura_sim)]
+    return zakura_rt::sim::executor().is_some();
+    #[cfg(not(zakura_sim))]
+    false
+}
 
 /// How often a wildcard-bound endpoint lists the host's interface addresses to
 /// notice a network change (SOCK-12).
@@ -112,13 +126,13 @@ pub(crate) struct SocketSlot {
     pub(crate) local_addr: SocketAddr,
     pub(crate) buffers: SocketBuffers,
     pub(crate) gso: bool,
-    pub(crate) rebinds: AtomicU64,
+    pub(crate) rebinds: counter::AtomicU64,
     pub(crate) inode: AtomicU64,
-    pub(crate) recv_calls: AtomicU64,
-    pub(crate) datagrams_received: AtomicU64,
-    pub(crate) queue_drops: AtomicU64,
-    pub(crate) oversize_drops: AtomicU64,
-    pub(crate) stopped: std::sync::atomic::AtomicBool,
+    pub(crate) recv_calls: counter::AtomicU64,
+    pub(crate) datagrams_received: counter::AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
+    pub(crate) oversize_drops: counter::AtomicU64,
+    pub(crate) stopped: AtomicBool,
 }
 
 /// State the handles and every endpoint task share. It holds no command
@@ -129,15 +143,27 @@ pub(crate) struct Shared {
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
+    pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
-    pub(crate) network_changes: AtomicU64,
+    pub(crate) network_changes: counter::AtomicU64,
+    /// The injected randomness. Applied where each config is built: socket
+    /// endpoint configs, `serve` and every dial.
+    pub(crate) inputs: EndpointInputs,
 }
 
 impl Shared {
+    /// One socket's endpoint config, with the injected seed, reset key and
+    /// CID generator.
+    pub(crate) fn endpoint_config(&self) -> quinn_proto::EndpointConfig {
+        let mut config = self.config.endpoint_config();
+        self.inputs.apply_endpoint(&mut config);
+        config
+    }
+
     /// A connection's transport config, with its own instrumented controller
-    /// (OBS-12) and, with the `qlog` feature, its own qlog file (CTRL-25).
+    /// (OBS-12).
     pub(crate) fn connection_transport(
         &self,
         probe: Arc<CongestionProbe>,
@@ -148,35 +174,8 @@ impl Shared {
             self.config.congestion_factory(),
             probe,
         )));
-        #[cfg(feature = "qlog")]
-        if let Some(dir) = &self.config.qlog_dir {
-            transport.qlog_stream(qlog_stream(dir));
-        }
         Arc::new(transport)
     }
-}
-
-/// Opens a fresh qlog file in `dir` (CTRL-25).
-#[cfg(feature = "qlog")]
-fn qlog_stream(dir: &std::path::Path) -> Option<quinn_proto::QlogStream> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis());
-    let path = dir.join(format!(
-        "zakura-{millis}-{}.qlog",
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = std::fs::File::create(&path)
-        .inspect_err(
-            |error| tracing::warn!(target: "zakura_quic", ?path, %error, "can't create qlog file"),
-        )
-        .ok()?;
-    let mut config = quinn_proto::QlogConfig::default();
-    config
-        .writer(Box::new(std::io::BufWriter::new(file)))
-        .title(Some("zakura".into()));
-    config.into_stream()
 }
 
 /// A QUIC endpoint: one endpoint task per bound socket (SOCK-1).
@@ -197,7 +196,7 @@ struct SocketHandle {
     cmds: mpsc::UnboundedSender<EndpointCmd>,
     slot: Arc<SocketSlot>,
     /// The endpoint task, so `shutdown` can abort one that doesn't stop.
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for QuicEndpoint {
@@ -216,67 +215,122 @@ impl QuicEndpoint {
         bind: &QuicBindConfig,
         config: &QuicConfig,
     ) -> Result<Self, BindError> {
+        // A `u32` fits in `usize` on every supported target.
+        let factory = UdpFactory {
+            recv_buffer_bytes: config.recv_buffer_bytes as usize,
+            send_buffer_bytes: config.send_buffer_bytes as usize,
+            offload: config.gso,
+        };
+        Self::bind_with(secret, bind, config, factory, EndpointInputs::default())
+    }
+
+    /// Binds one socket per address in `bind` through `factory`, with the
+    /// randomness in `inputs` (API-2).
+    ///
+    /// `factory` also builds every SOCK-9 replacement. Only a socket with an
+    /// inode gets the SOCK-7 poller, and only one with buffer sizes gets the
+    /// SOCK-5 gauges. [`Self::bind`] is this with OS sockets and
+    /// `EndpointInputs::default()`, so production nodes use `bind`.
+    pub fn bind_with<F: SocketFactory>(
+        secret: NodeSecretKey,
+        bind: &QuicBindConfig,
+        config: &QuicConfig,
+        factory: F,
+        inputs: EndpointInputs,
+    ) -> Result<Self, BindError> {
         config.validate()?;
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
+        }
+        // ADM-12: with no slot, every dial and accept would fail, and a dial
+        // capped at zero addresses would have nothing to try.
+        if bind.max_connections == 0 {
+            return Err(BindError::NoConnectionSlots);
         }
         let shared = Arc::new(Shared {
             id: secret.public(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
-            tls: TlsConfig::new(&secret),
+            tls: TlsConfig::with_inputs(&secret, &inputs)?,
             pending: PendingTable::default(),
+            connections: ConnectionSlots::new(
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_closing_connections,
+            ),
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
-            network_changes: AtomicU64::new(0),
+            network_changes: counter::AtomicU64::new(0),
+            inputs,
         });
+        let factory = Arc::new(factory);
         let mut bound = Vec::with_capacity(bind.addrs.len());
         for addr in &bind.addrs {
-            let socket_error = |source| BindError::Socket {
+            let socket = factory.bind(*addr).map_err(|source| BindError::Socket {
                 addr: *addr,
                 source,
-            };
-            let socket = bind_udp(
-                *addr,
-                config.recv_buffer_bytes as usize,
-                config.send_buffer_bytes as usize,
-            )
-            .map_err(socket_error)?;
-            let io = UdpIo::new(socket.socket, config.gso).map_err(socket_error)?;
-            bound.push((socket.local_addr, socket.buffers, socket.inode, io));
+            })?;
+            // SOCK-12: a wildcard socket starts the interface watcher, which
+            // reads the host's interfaces. Inside a simulated run that would
+            // let the host change the run.
+            if in_simulated_run() && socket.local_addr.ip().is_unspecified() {
+                return Err(BindError::Socket {
+                    addr: *addr,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a simulated run can't bind a wildcard address, whose interface \
+                         watcher would read the host's interfaces",
+                    ),
+                });
+            }
+            bound.push(socket);
         }
         let mut sockets = Vec::with_capacity(bound.len());
-        for (local_addr, buffers, inode, io) in bound {
+        for socket in bound {
             // SOCK-5.
-            metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
-                .set(buffers.recv_effective as f64);
-            metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
-                .set(buffers.send_effective as f64);
+            if let Some(buffers) = socket.buffers {
+                metrics::gauge!("zakura.quic.socket.recv_buffer_bytes")
+                    .set(buffers.recv_effective as f64);
+                metrics::gauge!("zakura.quic.socket.send_buffer_bytes")
+                    .set(buffers.send_effective as f64);
+            }
             let slot = Arc::new(SocketSlot {
-                local_addr,
-                buffers,
-                gso: io.gso(),
-                rebinds: AtomicU64::new(0),
-                inode: AtomicU64::new(inode.unwrap_or(0)),
-                recv_calls: AtomicU64::new(0),
-                datagrams_received: AtomicU64::new(0),
-                queue_drops: AtomicU64::new(0),
-                oversize_drops: AtomicU64::new(0),
-                stopped: std::sync::atomic::AtomicBool::new(false),
+                local_addr: socket.local_addr,
+                buffers: socket.buffers.unwrap_or_default(),
+                gso: socket.io.gso(),
+                rebinds: counter::AtomicU64::new(0),
+                inode: AtomicU64::new(socket.inode.unwrap_or(0)),
+                recv_calls: counter::AtomicU64::new(0),
+                datagrams_received: counter::AtomicU64::new(0),
+                queue_drops: counter::AtomicU64::new(0),
+                oversize_drops: counter::AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
-            let task =
-                tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
+            let task = spawn_named(
+                "quic.endpoint",
+                EndpointTask::new(
+                    shared.clone(),
+                    slot.clone(),
+                    factory.clone(),
+                    socket.io,
+                    cmds_rx,
+                )
+                .run(),
+            );
+            // SOCK-7: an injected socket has no inode to poll.
             #[cfg(target_os = "linux")]
-            tokio::spawn(kernel_drop_poller(
-                Arc::downgrade(&slot),
-                config.kernel_drop_poll_interval(),
-            ));
+            if socket.inode.is_some() {
+                spawn_named(
+                    "quic.kernel_drop_poller",
+                    kernel_drop_poller(downgrade(&slot), config.kernel_drop_poll_interval()),
+                );
+            }
             sockets.push(SocketHandle {
                 cmds,
                 slot,
-                task: std::sync::Mutex::new(Some(task)),
+                task: Mutex::new(Some(task)),
             });
         }
         // SOCK-12: a socket bound to a specific address keeps sending from it,
@@ -285,11 +339,10 @@ impl QuicEndpoint {
             .iter()
             .any(|socket| socket.slot.local_addr.ip().is_unspecified())
         {
-            tokio::spawn(watch_interfaces(
-                Arc::downgrade(&shared),
-                local_interface_ips,
-                INTERFACE_POLL,
-            ));
+            spawn_named(
+                "quic.interface_watcher",
+                watch_interfaces(downgrade(&shared), local_interface_ips, INTERFACE_POLL),
+            );
         }
         Ok(Self {
             inner: Arc::new(Inner { shared, sockets }),
@@ -332,6 +385,31 @@ impl QuicEndpoint {
             .collect()
     }
 
+    /// Live QUIC connections the endpoint holds across its sockets:
+    /// handshakes, dial attempts and established connections (ADM-12).
+    pub fn connection_count(&self) -> usize {
+        self.inner.shared.connections.live()
+    }
+
+    /// Closed connections the endpoint keeps until they drain (ADM-13).
+    pub fn closing_connection_count(&self) -> usize {
+        self.inner.shared.connections.closing()
+    }
+
+    /// Whether the table has a free live connection slot right now (ADM-12).
+    /// Callers that dial in a loop check this first, so a full table doesn't
+    /// make them spin on `ConnectionLimit`. A dial needs one slot per address
+    /// it tries, so a multi-address dial can still fail with that error.
+    pub fn has_dial_capacity(&self) -> bool {
+        self.inner.shared.connections.can_dial()
+    }
+
+    /// Whether discovery can reserve an address attempt while leaving one
+    /// live slot below the inbound refusal threshold (ADM-12).
+    pub fn has_discovery_capacity(&self) -> bool {
+        self.inner.shared.connections.live() < self.inner.shared.connections.discovery_limit()
+    }
+
     /// Network changes the endpoint has passed to its connections (SOCK-12).
     pub fn network_changes(&self) -> u64 {
         self.inner.shared.network_changes.load(Ordering::Relaxed)
@@ -355,8 +433,10 @@ impl QuicEndpoint {
         let acceptor: Arc<dyn Acceptor> = Arc::new(acceptor);
         let alpns = acceptor.alpns();
         let crypto = self.inner.shared.tls.server_config(alpns.clone())?;
-        let mut server = ServerConfig::with_crypto(Arc::new(crypto));
+        let mut server = self.inner.shared.inputs.server_config(Arc::new(crypto));
         self.inner.shared.config.apply_server_limits(&mut server);
+        // Retry tokens carry their issue time, so they read the runtime's UTC.
+        server.time_source(Arc::new(RuntimeUtc));
         let server = Arc::new(server);
 
         let ban = acceptor.clone();
@@ -390,6 +470,32 @@ impl QuicEndpoint {
     /// of a protocol lets a node reach peers on older versions in one
     /// handshake. An empty list fails with [`ConnectError::AlpnMismatch`].
     pub async fn connect(&self, addr: NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.max())
+            .await
+    }
+
+    /// Dials a discovery candidate without taking the dial reserve or the
+    /// last slot available to inbound connections (ADM-12).
+    ///
+    /// Like [`Self::connect`], but reserves all address attempts below this
+    /// lower ceiling before sending any packet. A ceiling of zero disables
+    /// discovery dials and returns [`ConnectError::ConnectionLimit`].
+    pub async fn connect_discovery(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+    ) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.discovery_limit())
+            .await
+    }
+
+    /// Reserves a dial's address attempts together under `limit` before any packet.
+    async fn connect_with_limit(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+        limit: usize,
+    ) -> Result<Conn, ConnectError> {
         let shared = &self.inner.shared;
         if alpns.is_empty() {
             return Err(ConnectError::AlpnMismatch);
@@ -419,23 +525,35 @@ impl QuicEndpoint {
             return Err(ConnectError::NoUsableAddress);
         }
 
+        // ADM-12: either every address fits before the first packet, or none
+        // is tried. Bound the target set by this dial's ceiling so an idle
+        // endpoint can fit it whenever that ceiling is nonzero.
+        targets.truncate(limit);
+        if targets.is_empty() {
+            return Err(ConnectError::ConnectionLimit);
+        }
+        let slots = shared
+            .connections
+            .claim_dial_slots(targets.len(), limit)
+            .ok_or(ConnectError::ConnectionLimit)?;
+
         let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();
         let deadline = shared.config.handshake_timeout();
         let mut attempts = FuturesUnordered::new();
-        for (index, (target, socket)) in targets.into_iter().enumerate() {
+        for (index, ((target, socket), slot)) in targets.into_iter().zip(slots).enumerate() {
             let crypto = crypto.clone();
             // Bounded by the 8 addresses discovery admits per record; the cast can't truncate.
             let delay = stagger * index as u32;
             attempts.push(async move {
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    zakura_rt::time::sleep(delay).await;
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = self.dial_once(socket, crypto, target, deadline).await;
+                let result = self.dial_once(socket, crypto, target, deadline, slot).await;
                 record_handshake(&result, started);
                 (target, result)
             });
@@ -457,7 +575,8 @@ impl QuicEndpoint {
                 }
             }
         }
-        let error = best.expect("at least one attempt ran because targets was non-empty");
+        let error =
+            best.expect("at least one attempt ran because the capped targets were non-empty");
         if matches!(error, ConnectError::AlpnMismatch) {
             metrics::counter!("zakura.quic.dial.alpn_mismatch").increment(1);
         }
@@ -470,9 +589,11 @@ impl QuicEndpoint {
         crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
         target: SocketAddr,
         deadline: Option<Duration>,
+        slot: Arc<ConnectionSlot>,
     ) -> Result<(ConnRef, Handshake), ConnectError> {
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
+        self.inner.shared.inputs.apply_client(&mut client);
         client.transport_config(
             self.inner
                 .shared
@@ -485,6 +606,7 @@ impl QuicEndpoint {
                 config: client,
                 remote: target,
                 probe,
+                slot,
                 reply,
             })
             .map_err(|_| ConnectError::Endpoint(quinn_proto::ConnectError::EndpointStopping))?;
@@ -510,7 +632,7 @@ impl QuicEndpoint {
         // The endpoint tasks enforce the 3 s drain; the extra second covers
         // their exit.
         let all = futures::future::join_all(done);
-        if tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
+        if zakura_rt::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
             .await
             .is_ok()
         {
@@ -527,7 +649,7 @@ impl QuicEndpoint {
                 .take();
             if let Some(task) = task {
                 task.abort();
-                let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+                let _ = zakura_rt::time::timeout(Duration::from_secs(1), task).await;
             }
         }
     }
@@ -543,7 +665,13 @@ impl QuicEndpoint {
             .socket_for(target)
             .expect("tests dial an address family the endpoint bound");
         let deadline = self.inner.shared.config.handshake_timeout();
-        self.dial_once(socket, Arc::new(crypto), target, deadline)
+        let slot = self
+            .inner
+            .shared
+            .connections
+            .claim_dial()
+            .ok_or(ConnectError::ConnectionLimit)?;
+        self.dial_once(socket, Arc::new(crypto), target, deadline, slot)
             .await
     }
 
@@ -606,7 +734,7 @@ async fn establish(
     let established = connecting.established();
     match deadline {
         // Dropping the attempt at the deadline closes the connection.
-        Some(deadline) => match tokio::time::timeout(deadline, established).await {
+        Some(deadline) => match zakura_rt::time::timeout(deadline, established).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
             Err(_) => Err(ConnectError::HandshakeTimeout),
         },
@@ -653,7 +781,7 @@ pub(crate) async fn inbound_handshake(
 /// shutdown drain bound in case the task is gone.
 async fn wait_closed(shared: &crate::driver::ConnShared) {
     let mut closed = shared.closed.subscribe();
-    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
+    let _ = zakura_rt::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
 }
 
 /// Applies the acceptor's rules, then this crate's optional limits (ADM-3).
@@ -683,17 +811,27 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
     Admit::Accept
 }
 
+/// Counts a handshake result, and records its duration when it completed.
 fn record_handshake<T>(result: &Result<T, ConnectError>, started: Instant) {
+    let Some(counter) = handshake_counter(result) else {
+        return;
+    };
+    metrics::counter!(counter).increment(1);
+    if result.is_ok() {
+        metrics::histogram!("zakura.quic.handshake.duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+    }
+}
+
+/// The handshake counter a dial or accept result belongs to, or `None` when
+/// no handshake happened: `ConnectionLimit` is this node's own cap refusing
+/// the attempt before any packet (ADM-12), so it isn't a failed handshake.
+fn handshake_counter<T>(result: &Result<T, ConnectError>) -> Option<&'static str> {
     match result {
-        Ok(_) => {
-            metrics::counter!("zakura.quic.handshake.completed").increment(1);
-            metrics::histogram!("zakura.quic.handshake.duration_seconds")
-                .record(started.elapsed().as_secs_f64());
-        }
-        Err(ConnectError::HandshakeTimeout) => {
-            metrics::counter!("zakura.quic.handshake.timed_out").increment(1);
-        }
-        Err(_) => metrics::counter!("zakura.quic.handshake.failed").increment(1),
+        Ok(_) => Some("zakura.quic.handshake.completed"),
+        Err(ConnectError::HandshakeTimeout) => Some("zakura.quic.handshake.timed_out"),
+        Err(ConnectError::ConnectionLimit) => None,
+        Err(_) => Some("zakura.quic.handshake.failed"),
     }
 }
 
@@ -709,8 +847,8 @@ pub(crate) async fn watch_interfaces(
     interval: Duration,
 ) {
     let mut known = list_ips();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticker = zakura_rt::time::interval(interval);
+    ticker.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
@@ -735,7 +873,7 @@ pub(crate) async fn watch_interfaces(
 /// Exports the socket's `/proc/net/udp` drop count as a counter (SOCK-7).
 #[cfg(target_os = "linux")]
 async fn kernel_drop_poller(slot: Weak<SocketSlot>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = zakura_rt::time::interval(interval);
     let mut baseline: Option<(u64, u64)> = None;
     loop {
         ticker.tick().await;
@@ -811,5 +949,241 @@ impl Drop for PendingGuard {
                 counts.by_ip.remove(&self.ip);
             }
         }
+    }
+}
+
+/// QUIC connections held across every socket of one endpoint: live ones
+/// (ADM-12) and closed ones still draining (ADM-13).
+pub(crate) struct ConnectionSlots {
+    counts: Arc<SlotCounts>,
+    max: usize,
+    max_inbound: usize,
+    max_closing: usize,
+}
+
+#[derive(Default)]
+struct SlotCounts {
+    live: AtomicUsize,
+    closing: AtomicUsize,
+}
+
+impl ConnectionSlots {
+    /// Allows `max` live connections, of which inbound attempts may take all
+    /// but `dial_reserve`, and `max_closing` closed ones.
+    pub(crate) fn new(max: usize, dial_reserve: usize, max_closing: usize) -> Self {
+        Self {
+            counts: Arc::default(),
+            max,
+            max_inbound: max.saturating_sub(dial_reserve),
+            max_closing,
+        }
+    }
+
+    /// Live connections held right now, dial attempts in flight included.
+    pub(crate) fn live(&self) -> usize {
+        self.counts.live.load(Ordering::Acquire)
+    }
+
+    /// Closed connections held right now.
+    pub(crate) fn closing(&self) -> usize {
+        self.counts.closing.load(Ordering::Acquire)
+    }
+
+    /// The most live connections the table ever holds, so the most addresses
+    /// one dial can claim slots for.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    /// The discovery ceiling leaves the dial reserve and one inbound slot free.
+    fn discovery_limit(&self) -> usize {
+        self.max_inbound.saturating_sub(1)
+    }
+
+    /// Whether a dial attempt would get a slot right now.
+    pub(crate) fn can_dial(&self) -> bool {
+        self.live() < self.max
+    }
+
+    /// Claims a live slot for an inbound attempt, or `None` when only the dial
+    /// reserve is left. Closed connections don't count (ADM-13).
+    pub(crate) fn claim_inbound(&self) -> Option<Arc<ConnectionSlot>> {
+        self.claim(self.max_inbound)
+    }
+
+    /// Claims a live slot for one dial attempt, or `None` at the cap.
+    #[cfg(test)]
+    pub(crate) fn claim_dial(&self) -> Option<Arc<ConnectionSlot>> {
+        self.claim(self.max)
+    }
+
+    /// Reserves every address attempt atomically, or leaves the count unchanged.
+    fn claim_dial_slots(&self, attempts: usize, limit: usize) -> Option<Vec<Arc<ConnectionSlot>>> {
+        if !try_add(&self.counts.live, attempts, limit) {
+            return None;
+        }
+        Some((0..attempts).map(|_| self.new_slot()).collect())
+    }
+
+    /// Claims a live slot while fewer than `limit` are held.
+    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
+        if !try_add(&self.counts.live, 1, limit) {
+            return None;
+        }
+        Some(self.new_slot())
+    }
+
+    /// Tracks one already reserved live slot until its connection drains.
+    fn new_slot(&self) -> Arc<ConnectionSlot> {
+        metrics::gauge!("zakura.quic.connections.held").increment(1.0);
+        Arc::new(ConnectionSlot {
+            counts: self.counts.clone(),
+            max_closing: self.max_closing,
+            closing: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Adds `additional` to `count` only if the result fits `limit`. Concurrent
+/// dials and endpoint tasks reserve their slots in one atomic step. A plain
+/// CAS loop: `fetch_update` is deprecated on newer toolchains and `try_update`
+/// doesn't exist on older ones.
+fn try_add(count: &AtomicUsize, additional: usize, limit: usize) -> bool {
+    let mut held = count.load(Ordering::Acquire);
+    loop {
+        let Some(next) = held.checked_add(additional).filter(|next| *next <= limit) else {
+            return false;
+        };
+        match count.compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => held = current,
+        }
+    }
+}
+
+/// One connection's slot, shared by its table entry and its connection task.
+/// It counts as live until the connection closes, then as closing, and frees
+/// when the last holder drops it: the table entry leaves only once
+/// `quinn-proto` reports the connection drained (ADM-11).
+pub(crate) struct ConnectionSlot {
+    counts: Arc<SlotCounts>,
+    max_closing: usize,
+    closing: AtomicBool,
+}
+
+impl ConnectionSlot {
+    /// Moves the slot from live to closing. Returns `false`, leaving it live,
+    /// when the closing allowance is full: the caller then drops the
+    /// connection's state at once instead of draining it (ADM-13). Only the
+    /// connection task calls this, once.
+    ///
+    /// `shrink` runs after the endpoint switches to the closing queue limit
+    /// and before the live slot frees, so the caller can drop the datagrams
+    /// queued under the live limit before the cheaper charge applies.
+    pub(crate) fn begin_closing(&self, shrink: impl FnOnce()) -> bool {
+        if self.is_closing() {
+            return true;
+        }
+        if !try_add(&self.counts.closing, 1, self.max_closing) {
+            return false;
+        }
+        self.closing.store(true, Ordering::Release);
+        shrink();
+        self.counts.live.fetch_sub(1, Ordering::AcqRel);
+        metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        metrics::gauge!("zakura.quic.connections.closing").increment(1.0);
+        true
+    }
+
+    /// Whether the connection has closed and moved to the closing allowance.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        if self.is_closing() {
+            self.counts.closing.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.closing").decrement(1.0);
+        } else {
+            self.counts.live.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concurrent address batches cannot cross the discovery ceiling, and a
+    /// refused batch leaves no partial claim. Inbound and maintained dials
+    /// retain their separate capacity, and dropping every claim refunds it.
+    #[test]
+    fn concurrent_discovery_reservations_preserve_inbound_capacity() {
+        let slots = ConnectionSlots::new(8, 2, 0);
+        let barrier = std::sync::Barrier::new(9);
+        let observed = std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (slots, barrier) = (&slots, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let held = slots.claim_dial_slots(2, slots.discovery_limit());
+                    barrier.wait();
+                    barrier.wait();
+                    drop(held);
+                });
+            }
+            barrier.wait();
+            barrier.wait();
+            let live = slots.live();
+            let overflow_refused = slots.claim_dial_slots(usize::MAX, usize::MAX).is_none();
+            let inbound = [
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+            ];
+            let maintained = slots.claim_dial_slots(2, slots.max());
+            let observed = (
+                live,
+                overflow_refused,
+                inbound.iter().flatten().count(),
+                maintained.as_ref().map_or(0, Vec::len),
+                slots.live(),
+            );
+            drop((inbound, maintained));
+            // Release workers before asserting, so a regression cannot leave
+            // the test blocked at a barrier.
+            barrier.wait();
+            observed
+        });
+        // Two whole batches fit under the ceiling of five. A third
+        // batch must fail without retaining even its first slot.
+        let (discovery_slots, overflow_refused, inbound_slots, maintained_slots, full_count) =
+            observed;
+        assert_eq!(discovery_slots, 4);
+        assert!(overflow_refused);
+        assert_eq!(inbound_slots, 2);
+        assert_eq!(maintained_slots, 2);
+        assert_eq!(full_count, 8);
+        assert_eq!(slots.live(), 0);
+    }
+
+    /// A dial refused at this node's own cap never reached the peer, so it
+    /// isn't counted as a failed handshake (ADM-12).
+    #[test]
+    fn a_local_cap_refusal_is_not_a_handshake_result() {
+        let counter = |result: Result<(), ConnectError>| handshake_counter(&result);
+        assert_eq!(counter(Err(ConnectError::ConnectionLimit)), None);
+        assert_eq!(counter(Ok(())), Some("zakura.quic.handshake.completed"));
+        assert_eq!(
+            counter(Err(ConnectError::HandshakeTimeout)),
+            Some("zakura.quic.handshake.timed_out")
+        );
+        assert_eq!(
+            counter(Err(ConnectError::Refused)),
+            Some("zakura.quic.handshake.failed")
+        );
     }
 }

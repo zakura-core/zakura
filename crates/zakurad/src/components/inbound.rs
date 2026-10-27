@@ -20,7 +20,7 @@ use futures::{
     Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, timeout::Timeout, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
@@ -101,12 +101,16 @@ pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
      archive storage on Zakura side https://zakura.com/snapshots/ .";
 
 type BlockDownloadPeerSet =
-    Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
-type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
-type Mempool = Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type State =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
+type Mempool = Buffer<
+    mempool::Request,
+    futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+>;
 type SemanticBlockVerifier = Buffer<
-    BoxService<zakura_consensus::Request, block::Hash, RouterError>,
     zakura_consensus::Request,
+    futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>,
 >;
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;

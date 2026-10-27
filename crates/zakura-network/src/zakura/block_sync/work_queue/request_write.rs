@@ -1,12 +1,12 @@
 //! Ownership from provisional download reservation through the request write.
 
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc, Weak,
-};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use zakura_header_chain::BodyWorkOwner;
+use zakura_rt::sync::{
+    atomic::{AtomicU8, Ordering},
+    downgrade, CancellationToken, Weak,
+};
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
@@ -30,6 +30,24 @@ impl RequestWriteStatus {
         self.0.load(Ordering::Acquire) == EXPIRED
     }
 
+    /// Whether transport started writing the frame, after which it cannot skip it.
+    pub(in crate::zakura::block_sync) fn has_started(&self) -> bool {
+        matches!(self.0.load(Ordering::Acquire), STARTED | WRITTEN)
+    }
+
+    /// Where the frame write stands now.
+    #[cfg(test)]
+    pub(in crate::zakura::block_sync) fn phase(&self) -> RequestWritePhase {
+        match self.0.load(Ordering::Acquire) {
+            UNPUBLISHED => RequestWritePhase::Unpublished,
+            QUEUED => RequestWritePhase::Queued,
+            STARTED => RequestWritePhase::Started,
+            WRITTEN => RequestWritePhase::Written,
+            EXPIRED => RequestWritePhase::Skipped,
+            state => unreachable!("request write state {state} is one of the five constants"),
+        }
+    }
+
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
@@ -37,6 +55,23 @@ impl RequestWriteStatus {
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+}
+
+/// Where a request's frame write stands. A queued request is published but
+/// not yet sent: transport can still skip it.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) enum RequestWritePhase {
+    /// The attempt holds its items provisionally and hasn't published them.
+    Unpublished,
+    /// Published and queued for transport.
+    Queued,
+    /// Transport started writing the frame.
+    Started,
+    /// Transport wrote the frame.
+    Written,
+    /// Transport skipped the frame before writing it.
+    Skipped,
 }
 
 /// Keep the write disposition readable while the last owner is being dropped.
@@ -110,12 +145,14 @@ impl RequestWrite {
                 .expect("every provisional item was checked under this lock");
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
+            let charge = item.estimated_bytes;
+            inner.in_flight_reserved.add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
+        inner.add_reserved_bytes(self.estimated_bytes);
         inner.request_writes.insert(
             self.owner,
             RequestWriteRegistration {
-                claim: Arc::downgrade(self),
+                claim: downgrade(self),
                 status: self.status(),
             },
         );

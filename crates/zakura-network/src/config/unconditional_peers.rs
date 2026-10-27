@@ -64,6 +64,7 @@ fn parse_entry(entry: &str) -> Option<IpNet> {
         .parse::<IpNet>()
         .ok()
         .or_else(|| entry.parse::<IpAddr>().ok().map(IpNet::from))
+        .filter(|net| *net == net.trunc())
 }
 
 /// Formats a range, writing a full-length range as a plain IP address.
@@ -95,7 +96,7 @@ impl<'de> Deserialize<'de> for UnconditionalPeers {
                 parse_entry(entry).ok_or_else(|| {
                     de::Error::custom(format!(
                         "invalid network.unconditional_peers entry {entry:?}: expected an IP \
-                         address or CIDR range, such as 192.0.2.1 or 2001:db8::/32"
+                         address or canonical CIDR range without host bits, such as 192.0.2.1 or 2001:db8::/32"
                     ))
                 })
             })

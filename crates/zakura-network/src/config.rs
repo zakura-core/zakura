@@ -12,7 +12,10 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, value::MapAccessDeserializer, IntoDeserializer, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use tokio::fs;
 use zakura_quic::NodeSecretKey;
 
@@ -357,13 +360,15 @@ pub struct Config {
     /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
     ///
     /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
-    /// `"2001:db8::/32"`. Zakura ignores misbehavior reports for these peers, so their
+    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Zakura ignores misbehavior reports for these peers, so their
     /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
     /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
     /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
     ///
-    /// This setting only exempts peers from misbehavior scores and bans. Zakura still
-    /// applies connection limits to these peers, and still disconnects them on protocol
+    /// This setting exempts peers from misbehavior scores, bans, and mempool
+    /// cooldowns and their disconnects. Zakura still applies connection limits to these
+    /// peers, and still disconnects them on protocol
     /// errors or inbound overload.
     ///
     /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
@@ -693,6 +698,18 @@ impl Config {
             return Ok(());
         }
 
+        self.write_peer_cache(peer_list).await
+    }
+
+    /// Replaces the peer cache, including when all previous peers have been banned.
+    pub(crate) async fn write_peer_cache(
+        &self,
+        peer_list: HashSet<PeerSocketAddr>,
+    ) -> io::Result<()> {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
+            return Ok(());
+        };
+
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
             .take(MAX_PEER_DISK_CACHE_SIZE)
@@ -708,7 +725,7 @@ impl Config {
         //
         // Sort to destroy any peer order, which could leak peer connection times.
         // (Currently the HashSet argument does this as well.)
-        peer_list.sort();
+        peer_list.sort_unstable();
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
@@ -740,7 +757,7 @@ impl Config {
 
                 Ok(())
             }
-            Err(error) => Err(error.error),
+            Err(error) => Err(error),
         }
     }
 
@@ -1012,10 +1029,32 @@ struct DTestnetParameters {
     /// scheduled issuance and monetary pools. The cumulative schedule through the block
     /// before NU7 must then fit in `MAX_MONEY`. An explicit value overrides that derivation.
     initial_nsm_value_balance: Option<u64>,
+    /// The Regtest form's `params` table. Read here so `network` needs no buffering, and
+    /// rejected anywhere other than directly inside `network`.
+    #[serde(default, skip_serializing)]
+    params: Option<Box<DTestnetParameters>>,
+    /// The Regtest form's `regtest` flag, accepted alongside `params`.
+    #[serde(default, skip_serializing)]
+    regtest: Option<bool>,
+}
+
+impl DTestnetParameters {
+    /// Rejects the Regtest form's `params` and `regtest` keys where they don't belong.
+    fn reject_regtest_form_keys<E: de::Error>(&self) -> Result<(), E> {
+        match (&self.params, &self.regtest) {
+            (Some(_), _) => Err(E::custom(
+                "unknown field `params`: it is only valid directly inside `network`",
+            )),
+            (None, Some(_)) => Err(E::custom(
+                "unknown field `regtest`: it is only valid next to `network.params`",
+            )),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// Network configuration used during deserialization.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
@@ -1026,6 +1065,47 @@ enum DNetwork {
         regtest: Option<bool>,
     },
     ConfiguredTestnet(Box<DTestnetParameters>),
+}
+
+impl<'de> Deserialize<'de> for DNetwork {
+    /// Dispatches on the value's shape instead of buffering it like `#[serde(untagged)]`, so the
+    /// network parameter types are only instantiated for the config's own deserializer.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DNetworkVisitor;
+
+        impl<'de> Visitor<'de> for DNetworkVisitor {
+            type Value = DNetwork;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a network kind or a table of network parameters")
+            }
+
+            fn visit_str<E: de::Error>(self, kind: &str) -> Result<DNetwork, E> {
+                NetworkKind::deserialize(kind.into_deserializer()).map(DNetwork::DefaultForKind)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DNetwork, A::Error> {
+                let mut table = DTestnetParameters::deserialize(MapAccessDeserializer::new(map))?;
+                match table.params.take() {
+                    // Like the former untagged variant, other parameters next to `params` are
+                    // ignored.
+                    Some(params) => {
+                        params.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredRegtest {
+                            params,
+                            regtest: table.regtest,
+                        })
+                    }
+                    None => {
+                        table.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredTestnet(Box::new(table)))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DNetworkVisitor)
+    }
 }
 
 impl Default for DNetwork {
@@ -1140,6 +1220,8 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
                 },
             ),
+            params: None,
+            regtest: None,
         }
     }
 }
@@ -1248,6 +1330,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
+                params.reject_regtest_form_keys::<D::Error>()?;
                 build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
@@ -1347,6 +1430,13 @@ impl<'de> Deserialize<'de> for Config {
             ));
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
+        if p2p_stack.resolve(&network).runs_zakura() {
+            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
+            // lowers a larger cap after tracing starts so its warning is logged.
+            zakura
+                .budgeted_max_connections()
+                .map_err(de::Error::custom)?;
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
@@ -1425,6 +1515,9 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         initial_nsm_value_balance,
+        // Deserialization only builds a configured Testnet from a table without these.
+        params: _,
+        regtest: _,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();

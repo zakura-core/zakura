@@ -3,10 +3,14 @@
 //! `closed.punitive` is reserved in the schema until Zakura has a punitive close
 //! path and matching metric. `closed.neutral` carries a bounded `reason` label
 //! describing the teardown cause (for example `idle_timeout`, `accept_failed`,
-//! `outbound_closed`, `bad_response`, or `cancelled`). Connection admission
-//! rejects use `rejected.admission` with a bounded `reason` label rather than
-//! one event name per rejection metric, so readers should pivot by `event` plus
-//! `reason` for those rows.
+//! `outbound_closed`, `bad_response`, or `cancelled`). A frame-read error
+//! records `ordered_read_rejected` or `request_read_rejected` for a peer fault,
+//! and the neutral `ordered_read_timeout`, `request_read_timeout`,
+//! `ordered_read_transport`, or `request_read_transport` otherwise. Readers
+//! can match the `ordered_read_` and `request_read_` prefixes. Connection
+//! admission rejects use `rejected.admission` with a bounded `reason` label
+//! rather than one event name per rejection metric, so readers should pivot by
+//! `event` plus `reason` for those rows.
 
 use std::sync::Arc;
 
@@ -81,7 +85,7 @@ pub(crate) mod header_sync_trace {
     pub(crate) const SELECTED_TIP_HEIGHT: &str = "selected_tip_height";
     pub(crate) const SELECTED_TIP_HASH: &str = "selected_tip_hash";
     pub(crate) const MAX_HEADERS_PER_RESPONSE: &str = "max_headers_per_response";
-    pub(crate) const MAX_INFLIGHT_REQUESTS: &str = "max_inflight_requests";
+    pub(crate) const MAX_SUBSCRIPTIONS: &str = "max_subscriptions";
     pub(crate) const MAX_MESSAGE_BYTES: &str = "max_message_bytes";
     pub(crate) const TREE_AUX_SCHEMA_MASK: &str = "tree_aux_schema_mask";
     pub(crate) const OLD_SELECTED_HEIGHT: &str = "old_selected_height";
@@ -116,6 +120,9 @@ pub(crate) mod header_sync_trace {
     pub(crate) const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
     pub(crate) const HEADER_SNAPSHOT_OBSERVED: &str = "header_snapshot_observed";
     pub(crate) const HEADER_VCT_REPAIR_STATE: &str = "header_vct_repair_state";
+    /// One full pass over cached offers, with the peers it walked in
+    /// `peers_considered`.
+    pub(crate) const HEADER_CACHED_OFFER_PASS: &str = "header_cached_offer_pass";
 }
 
 /// Legacy compatibility request/response events.
@@ -197,12 +204,6 @@ pub mod block_sync_trace {
     pub const RANGE_COUNT: &str = "range_count";
     /// Expected/requested count field.
     pub const EXPECTED_COUNT: &str = "expected_count";
-    /// Estimated byte reservation for a requested range.
-    pub const ESTIMATED_BYTES: &str = "estimated_bytes";
-    /// Serialized byte size of a received body.
-    pub const SERIALIZED_BYTES: &str = "serialized_bytes";
-    /// Attributed decoded-memory size of a block body.
-    pub const DECODED_ATTRIBUTED_MEMORY_SIZE_BYTES: &str = "decoded_attributed_memory_size_bytes";
     /// Decoded attributed-memory bytes queued at the Sequencer input.
     pub const SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
         "sequencer_input_decoded_attributed_memory_bytes";
@@ -217,10 +218,6 @@ pub mod block_sync_trace {
         "active_pipeline_decoded_attributed_memory_bytes";
     /// End-to-end elapsed milliseconds for a traced operation.
     pub const ELAPSED_MS: &str = "elapsed_ms";
-    /// Elapsed milliseconds before response frames were ready to send.
-    pub const PREPARE_ELAPSED_MS: &str = "prepare_elapsed_ms";
-    /// Elapsed milliseconds spent enqueueing response frames.
-    pub const SEND_ELAPSED_MS: &str = "send_elapsed_ms";
     /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
     pub const RESULT: &str = "result";
     /// Bounded reason field.
@@ -229,82 +226,28 @@ pub mod block_sync_trace {
     pub const ERROR: &str = "error";
     /// Block apply token field.
     pub const APPLY_TOKEN: &str = "apply_token";
-    /// Scheduler/query lower bound for block body requests.
-    pub const REQUEST_FLOOR: &str = "request_floor";
-    /// Highest contiguous body height already submitted for apply.
-    pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
-    /// First height not yet in the contiguous body-download floor.
-    pub const FLOOR_GAP_HEIGHT: &str = "floor_gap_height";
     /// Reactor-local classification for the first missing body height.
     pub const FLOOR_GAP_STATE: &str = "floor_gap_state";
-    /// Peers advertising the first missing body height.
-    pub const FLOOR_GAP_SERVABLE_PEERS: &str = "floor_gap_servable_peers";
-    /// Peers with free request slots that advertise the first missing body height.
-    pub const FLOOR_GAP_AVAILABLE_PEERS: &str = "floor_gap_available_peers";
-    /// Peers with outstanding requests that include the first missing body height.
-    pub const FLOOR_GAP_OUTSTANDING_PEERS: &str = "floor_gap_outstanding_peers";
-    /// Age in milliseconds of the oldest outstanding request for the first missing body height.
-    pub const FLOOR_GAP_OLDEST_OUTSTANDING_MS: &str = "floor_gap_oldest_outstanding_ms";
-    /// Remaining milliseconds until the next outstanding request deadline for the first missing body height.
-    pub const FLOOR_GAP_NEXT_DEADLINE_MS: &str = "floor_gap_next_deadline_ms";
     /// Highest verified (committed) block-body height.
     pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
     /// Best header tip driving the body-download target.
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
-    /// Header tip minus verified body tip.
-    pub const BODY_LAG: &str = "body_lag";
     /// Count of blocks submitted-but-not-yet-committed (held against budget).
     pub const APPLYING: &str = "applying";
-    /// Count of applying blocks already submitted to the verifier driver.
-    pub const SUBMITTED_APPLIES: &str = "submitted_applies";
     /// Count of out-of-order bodies buffered awaiting a contiguous prefix.
     pub const REORDER: &str = "reorder";
     /// Count of outstanding (in-flight) range requests across peers.
     pub const OUTSTANDING: &str = "outstanding";
-    /// Remaining in-flight body byte budget.
-    pub const BUDGET_AVAILABLE: &str = "budget_available";
     /// Reserved in-flight body byte budget.
     pub const BUDGET_RESERVED: &str = "budget_reserved";
-    /// Reserved in-flight body byte budget observed at a single body event
-    /// (e.g. immediately after a receive-path shrink or a commit-path release).
-    pub const BUDGET_RESERVED_AFTER: &str = "budget_reserved_after";
-    /// Body bytes received off the wire per second (download throughput).
-    pub const RECEIVED_BYTES_PER_SEC: &str = "received_bytes_per_sec";
-    /// Bodies received off the wire per second (download throughput).
-    pub const RECEIVED_BLOCKS_PER_SEC: &str = "received_blocks_per_sec";
-    /// Body bytes committed to the chain per second (commit throughput).
-    pub const COMMITTED_BYTES_PER_SEC: &str = "committed_bytes_per_sec";
-    /// Bodies committed to the chain per second (commit throughput).
-    pub const COMMITTED_BLOCKS_PER_SEC: &str = "committed_blocks_per_sec";
-    /// 1 when at least one peer has free request slots but the byte budget is too
-    /// low to issue another worst-case block (download is budget-limited).
-    pub const DOWNLOAD_BLOCKED_ON_BUDGET: &str = "download_blocked_on_budget";
-    /// Peers with received status that currently have free outbound request slots.
-    pub const PEERS_WANTING_SLOTS: &str = "peers_wanting_slots";
     /// Connected block-sync peers.
     pub const PEERS: &str = "peers";
-    /// Active reactor service sessions after this event.
-    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
-    /// Connected block-sync peers whose status we have received (schedulable).
-    pub const PEERS_WITH_STATUS: &str = "peers_with_status";
-    /// Lowest height still in the body-sync `needed` set (the gap to fetch next).
-    pub const NEEDED_MIN: &str = "needed_min";
     /// Number of heights in the body-sync `needed` set after buffer filtering.
     pub const NEEDED_COUNT: &str = "needed_count";
     /// Number of ranges queued in the scheduler.
     pub const QUEUE_LEN: &str = "queue_len";
-    /// Number of block heights queued in the scheduler.
-    pub const QUEUE_BLOCKS: &str = "queue_blocks";
-    /// Lowest start height across queued scheduler ranges.
-    pub const QUEUE_MIN_START: &str = "queue_min_start";
     /// Number of distinct assigned range keys in the scheduler.
     pub const ASSIGNED_LEN: &str = "assigned_len";
-    /// Count of locally queued, in-flight, buffered, or applying block bodies.
-    pub const LOCAL_BODY_WORK: &str = "local_body_work";
-    /// Local body work threshold below which the reactor refills from state.
-    pub const REFILL_LOW_WATER: &str = "refill_low_water";
-    /// Highest end height across the scheduler's covered intervals.
-    pub const COVERED_MAX_END: &str = "covered_max_end";
 
     /// Peer status received (servable body range advertised by the peer).
     pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
@@ -318,14 +261,10 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
-    /// Reactor accepted an inbound event.
-    pub const BLOCK_EVENT_RECEIVED: &str = "block_event_received";
     /// Reactor accepted a decoded inbound block-sync wire message.
     pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
     /// Reactor queued an outbound block-sync wire message for transport.
     pub const BLOCK_MESSAGE_SENT: &str = "block_message_sent";
-    /// Reactor queued an outbound driver action.
-    pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
     /// Body received from a peer.
     pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
     /// Body handed from a peer routine to the sequencer input channel.
@@ -345,7 +284,6 @@ pub mod block_sync_trace {
     /// Peer reported a requested range as unavailable.
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.
-    pub const BLOCK_RANGE_RESPONSE_SENT: &str = "block_range_response_sent";
     /// Work-queue producer added needed heights to the pending set.
     pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
     /// A peer claimed a contiguous chunk of pending work for issuance.
@@ -355,15 +293,9 @@ pub mod block_sync_trace {
     /// The floor watchdog force-cancelled an expired request claim.
     pub const BLOCK_FLOOR_WATCHDOG_CANCELLED: &str = "block_floor_watchdog_cancelled";
     /// A `try_fill` pass ended having issued no request: the routine went idle this wake.
-    /// Carries [`FILL_STOP_REASON`] plus the slot/budget/work snapshot so a trace can
+    /// Carries `fill_stop_reason` plus the slot/budget/work snapshot so a trace can
     /// attribute carrier idle ("bubble") time to a cause rather than inferring it.
     pub const BLOCK_FILL_STOP: &str = "block_fill_stop";
-    /// Why a `try_fill` pass stopped issuing requests (`no_status` / `cwnd_saturated` /
-    /// `no_work` / `lookahead_cap` / `retry_avoid` / `budget` / `outbound_full` /
-    /// `send_error` / `internal`).
-    pub const FILL_STOP_REASON: &str = "fill_stop_reason";
-    /// Requests this `try_fill` pass issued before stopping (0 = a candidate bubble).
-    pub const FILL_SENT: &str = "fill_sent";
     /// Verified body frontier advanced from state.
     pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
     /// Chain tip reset rolled the body frontier back.
@@ -378,6 +310,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
     /// Block-sync service session locally parked for a liveness reason.
     pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
+    /// Block-sync session closed because a peer withheld a range's ending past its deadline.
+    pub const BLOCK_PEER_ENDING_TIMEOUT: &str = "block_peer_ending_timeout";
 }
 
 /// Shared discovery trace event names and field keys.
@@ -389,9 +323,19 @@ pub mod discovery_trace {
     pub const PEER: &str = "peer";
     /// Dial result label.
     pub const RESULT: &str = "result";
+    /// Discovery stream session id field.
+    pub const SESSION_ID: &str = "session_id";
+    /// Frame-header message type field.
+    pub const MESSAGE_TYPE: &str = "message_type";
+    /// Reader stage label.
+    pub const STAGE: &str = "stage";
+    /// Rejection error text.
+    pub const ERROR: &str = "error";
 
     /// A discovery dial worker completed and was classified for backoff.
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
+    /// The discovery reader rejected a peer's frame and closed the connection.
+    pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.
@@ -694,12 +638,6 @@ impl<'a> ZakuraTraceEvent<'a> {
     /// Attach a bounded peer label.
     pub fn peer(mut self, peer: &'a str) -> Self {
         self.peer = Some(peer);
-        self
-    }
-
-    /// Attach a bounded peer label when one is available.
-    pub fn maybe_peer(mut self, peer: Option<&'a str>) -> Self {
-        self.peer = peer;
         self
     }
 

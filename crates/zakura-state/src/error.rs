@@ -1015,7 +1015,7 @@ impl ValidateContextError {
                         BodyCommitmentKind::Other("chain_history_root")
                     }
                     CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. } => {
-                        BodyCommitmentKind::Other("chain_history_block_tx_auth_commitment")
+                        BodyCommitmentKind::CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT
                     }
                     CommitmentError::InvalidPreNu5OrchardRoot { .. } => {
                         BodyCommitmentKind::Other("pre_nu5_orchard_root")
@@ -1199,8 +1199,7 @@ impl ValidateContextError {
     /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
-    /// parks and retries the same block for both. A header insertion wakes a missing-root stall.
-    /// A short bounded delay wakes an await-successor stall.
+    /// parks and retries the same block for both. A committed header insertion wakes either stall.
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height }
@@ -1273,6 +1272,10 @@ mod tests {
         };
         for error in [auth_commitment.clone(), prevalidated_root] {
             assert!(error.is_auth_commitment_mismatch());
+            assert!(matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(kind) if kind.proves_tampered_body()
+            ));
             let commit = CommitCheckpointVerifiedError::from(
                 CommitBlockError::ValidateContextError(Box::new(error)),
             );
@@ -1299,6 +1302,10 @@ mod tests {
             ValidateContextError::AncestorBodyRejected(block::Hash([9; 32])),
         ] {
             assert!(!error.is_auth_commitment_mismatch());
+            assert!(!matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(kind) if kind.proves_tampered_body()
+            ));
         }
     }
 

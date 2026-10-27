@@ -12,7 +12,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
-        Network, NetworkUpgrade,
+        Network, NetworkKind, NetworkUpgrade,
     },
 };
 
@@ -23,8 +23,9 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack, UnconditionalPeers,
 };
@@ -702,7 +703,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.block_sync]
         replace_legacy_syncer = true
-        max_blocks_per_response = 5
         status_refresh_interval = "12s"
 
         [zakura.quic]
@@ -729,7 +729,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
-    assert!(serialized.contains("max_blocks_per_response = 5"));
     assert!(serialized.contains("status_refresh_interval = \"12s\""));
     assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     assert!(
@@ -851,6 +850,125 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
+}
+
+#[test]
+fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
+    let _init_guard = zakura_test::init();
+
+    // A config generated before the budget existed keeps loading. The endpoint
+    // lowers its cap to what the default budget admits.
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.zakura.max_connections, 256);
+    assert_eq!(
+        config.zakura.budgeted_max_connections(),
+        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    );
+    assert_eq!(
+        ZakuraLocalLimits::from_config(&config).max_connections,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS
+    );
+
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        peer_memory_budget_bytes = 19595788288
+        "#,
+    )
+    .unwrap();
+    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
+    // admitted and 32 of headroom.
+    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+
+    // The transport holds the admitted connections and the headroom, half of
+    // it kept for dials (zakura-quic ADM-12), and two closing connections per
+    // live slot (ADM-13).
+    let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (288, 16, 576)
+    );
+    let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (124, 16, 248)
+    );
+
+    // A 1 GiB receive window leaves the default budget room for 7 QUIC
+    // connections, less than its headroom alone.
+    let error = toml::from_str::<Config>(
+        r#"
+        p2p_stack = "dual"
+
+        [zakura.quic]
+        receive_window_bytes = 1073741824
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("[network.zakura] peer_memory_budget_bytes"),
+        "{error}"
+    );
+    assert!(error.contains("receive_window_bytes"), "{error}");
+}
+
+/// An unused QUIC budget cannot reject legacy startup, but every resolved
+/// stack that runs v2 must enforce it before the endpoint starts.
+#[test]
+fn zakura_peer_memory_budget_only_rejects_v2_stacks() {
+    let _init_guard = zakura_test::init();
+
+    for network in ["Mainnet", "Testnet"] {
+        for stack in [
+            None,
+            Some("default"),
+            Some("legacy"),
+            Some("zakura"),
+            Some("dual"),
+        ] {
+            let stack_config = stack
+                .map(|stack| format!("p2p_stack = \"{stack}\"\n"))
+                .unwrap_or_default();
+            let source = format!(
+                "network = \"{network}\"\n{stack_config}\n[zakura]\npeer_memory_budget_bytes = 1\n"
+            );
+            let result = toml::from_str::<Config>(&source);
+            let runs_v2 = match stack {
+                None | Some("default") => network == "Testnet",
+                Some("legacy") => false,
+                Some("zakura" | "dual") => true,
+                _ => unreachable!("the test only supplies supported stack names"),
+            };
+            if runs_v2 {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("peer_memory_budget_bytes"),
+                    "{source}: {error}"
+                );
+            } else {
+                let config = result.unwrap_or_else(|error| panic!("{source}: {error}"));
+                assert!(!config.v2_p2p());
+                assert!(config.legacy_p2p());
+                assert_eq!(config.zakura.peer_memory_budget_bytes, 1);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1297,6 +1415,30 @@ fn regtest_missing_mandatory_checkpoints_returns_config_error() {
 }
 
 #[test]
+fn regtest_form_keys_are_only_accepted_directly_inside_network() {
+    let config: Config =
+        toml::from_str("network = { params = { checkpoints = false }, regtest = true }")
+            .expect("the Regtest form accepts `regtest` next to `params`");
+    assert_eq!(config.network.kind(), NetworkKind::Regtest);
+
+    for (config, field) in [
+        ("network = { params = { params = {} } }", "params"),
+        ("network = { params = { regtest = true } }", "regtest"),
+        (
+            "network = { network_name = 'ConfiguredTestnet', regtest = true }",
+            "regtest",
+        ),
+        ("network = 'Regtest'\n[testnet_parameters.params]", "params"),
+    ] {
+        let error = toml::from_str::<Config>(config).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{config:?} must reject `{field}`: {error}"
+        );
+    }
+}
+
+#[test]
 fn regtest_accepts_checkpoints_covering_delayed_canopy() {
     let genesis = Network::new_regtest(Default::default()).genesis_hash();
     let checkpoint = zakura_chain::block::Hash([7; 32]);
@@ -1352,6 +1494,9 @@ fn unconditional_peers_reject_invalid_entries() {
         "zakura.example.com",
         "192.0.2.1:8233",
         "192.0.2.0/33",
+        "192.0.2.5/24",
+        "2001:db8::1/32",
+        "::ffff:192.0.2.5/120",
         "",
     ] {
         let error = toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']"))
@@ -1578,5 +1723,32 @@ fn activation_height_overlay_is_only_for_configured_testnets() {
             error.contains("Mainnet and public Testnet parameters are fixed"),
             "unexpected configuration error: {error}"
         );
+    }
+}
+
+/// A loaded config must fund at least one GetBlocks request per block-sync
+/// session slot: 3,633 inbound plus outbound slots load, 3,634 do not.
+#[test]
+fn loaded_block_sync_session_slots_must_fund_one_request_each() {
+    let _init_guard = zakura_test::init();
+
+    let load = |inbound: u64, outbound: u64| {
+        toml::from_str::<Config>(&format!(
+            r#"
+            [zakura.block_sync.peer_limits]
+            max_inbound_peers = {inbound}
+            max_outbound_peers = {outbound}
+            "#
+        ))
+    };
+
+    assert!(load(256, 256).is_ok(), "defaults load");
+    assert!(load(0, 0).is_ok(), "zero slots load and serve nobody");
+    assert!(load(3_000, 633).is_ok());
+    for (inbound, outbound) in [(3_000, 634), (i64::MAX as u64, i64::MAX as u64)] {
+        let error = load(inbound, outbound)
+            .expect_err("unfundable session slots must not load")
+            .to_string();
+        assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }

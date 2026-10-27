@@ -3,7 +3,10 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -12,8 +15,10 @@ use quinn_proto::crypto::rustls::QuicClientConfig;
 use tokio::sync::mpsc;
 
 use crate::{
-    endpoint::watch_interfaces, Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo,
-    NodeAddr, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint, VarInt,
+    endpoint::watch_interfaces,
+    sim::{LinkModel, NetEvent, SeededInputs, SimNet, Source},
+    Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
+    QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
 
 const ALPN: &[u8] = b"p2p-v2/3";
@@ -76,6 +81,9 @@ fn loopback() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
+        max_closing_connections: 1024,
     }
 }
 
@@ -83,6 +91,9 @@ fn wildcard() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
+        max_closing_connections: 1024,
     }
 }
 
@@ -103,6 +114,15 @@ fn server_with(
     decide: impl Fn(&IncomingInfo) -> Admit + Send + Sync + 'static,
 ) -> Server {
     let endpoint = QuicEndpoint::bind(NodeSecretKey::generate(), bind, config).unwrap();
+    serve_test_acceptor(endpoint, alpns, decide)
+}
+
+/// Serves a [`TestAcceptor`] on `endpoint`.
+fn serve_test_acceptor(
+    endpoint: QuicEndpoint,
+    alpns: &[&[u8]],
+    decide: impl Fn(&IncomingInfo) -> Admit + Send + Sync + 'static,
+) -> Server {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let banned = Arc::new(Mutex::new(HashSet::new()));
     let (handled_tx, handled) = mpsc::unbounded_channel();
@@ -356,7 +376,7 @@ async fn interface_change_notifies_connections_and_keeps_them() {
             move || ips.lock().unwrap().clone()
         };
         let watcher = tokio::spawn(watch_interfaces(
-            Arc::downgrade(client.shared()),
+            zakura_rt::sync::downgrade(client.shared()),
             list_ips,
             Duration::from_millis(20),
         ));
@@ -1970,4 +1990,1058 @@ async fn a_header_read_takes_only_the_header_from_quinn() {
     })
     .await
     .unwrap();
+}
+
+/// Takes the first stream's data and then rejects the connection, the way
+/// Zakura closes a peer that fails its control handshake.
+struct ChurnAcceptor;
+
+impl Acceptor for ChurnAcceptor {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(50), conn.accept_bi()).await;
+            conn.close(VarInt::from_u32(0), b"control handshake");
+        })
+    }
+}
+
+/// ADM-12, ADM-13: peers that fill a stream, get rejected and reconnect at
+/// once never make the endpoint hold more live connections than its inbound
+/// cap or more closed ones than its closing allowance, and every slot comes
+/// back once they stop.
+#[tokio::test]
+async fn churned_connections_stay_within_both_allowances() {
+    const CAP: usize = 6;
+    const RESERVE: usize = 2;
+    const CLOSING: usize = 3;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: CAP,
+            dial_reserve: RESERVE,
+            max_closing_connections: CLOSING,
+            ..loopback()
+        };
+        let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+        server.serve(ChurnAcceptor).unwrap();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peaks = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let sampler = {
+            let (server, stop, peaks) = (server.clone(), stop.clone(), peaks.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peaks
+                        .0
+                        .fetch_max(server.connection_count(), Ordering::Relaxed);
+                    peaks
+                        .1
+                        .fetch_max(server.closing_connection_count(), Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let mut churners = Vec::new();
+        for _ in 0..12 {
+            let addr = addr.clone();
+            churners.push(tokio::spawn(async move {
+                let client = client();
+                for _ in 0..8 {
+                    if let Ok(conn) = client.connect(addr.clone(), &[ALPN]).await {
+                        if let Ok((mut send, _recv)) = conn.open_bi().await {
+                            let _ = send.write_all(&[7; 256 * 1024]).await;
+                        }
+                        conn.closed().await;
+                    }
+                }
+            }));
+        }
+        for churner in churners {
+            churner.await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        // Inbound attempts stop short of the dial reserve.
+        let peak_live = peaks.0.load(Ordering::Relaxed);
+        assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
+        assert!(peaks.1.load(Ordering::Relaxed) <= CLOSING);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.connection_count() + server.closing_connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every slot frees once its connection drains");
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: inbound connections can't take the dial reserve, and a dial at the
+/// cap fails locally.
+#[tokio::test]
+async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 2,
+            dial_reserve: 1,
+            ..loopback()
+        };
+        let mut node = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let first = client();
+        let _held = first.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 1);
+
+        let second = client();
+        assert!(matches!(
+            second.connect(node.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+
+        let peer = server();
+        assert!(node.endpoint.has_dial_capacity());
+        let _dialed = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 2);
+        assert!(!node.endpoint.has_dial_capacity());
+        assert!(matches!(
+            node.endpoint.connect(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: a dial claims a slot for every address before its first attempt,
+/// so with room for fewer right now it fails before the peer sees anything. A
+/// cap hit partway would mix a local limit with the peer's real results.
+#[tokio::test]
+async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let other = server();
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+
+        // Two slots, one held by a connection to another peer.
+        let two_slots = QuicBindConfig {
+            max_connections: 2,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &two_slots, &test_config()).unwrap();
+        let held = client.connect(other.addr(), &[ALPN]).await.unwrap();
+        assert!(matches!(
+            client.connect(addr.clone(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(client.connection_count(), 1);
+        // The first address would have answered at once; give it time to show.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        // Once the slot frees, the same dial connects.
+        drop(held);
+        while client.connection_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: an endpoint with no connection slot could neither dial nor
+/// accept, so `bind` refuses it.
+#[tokio::test]
+async fn bind_refuses_a_zero_connection_cap() {
+    let bind = QuicBindConfig {
+        max_connections: 0,
+        ..loopback()
+    };
+    assert!(matches!(
+        QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()),
+        Err(crate::BindError::NoConnectionSlots)
+    ));
+}
+
+/// ADM-12: a dial tries at most as many addresses as the table can ever
+/// hold, so a record with more addresses than slots still dials instead of
+/// failing with `ConnectionLimit` forever.
+#[tokio::test]
+async fn a_dial_tries_no_more_addresses_than_the_table_holds() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+        let one_slot = QuicBindConfig {
+            max_connections: 1,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &one_slot, &test_config()).unwrap();
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A UDP relay that delays every datagram by `delay` in each direction.
+struct DelayRelay {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelayRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts a relay to `server` that adds `delay` each way.
+async fn delay_relay(server: SocketAddr, delay: Duration) -> DelayRelay {
+    let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let (mut up, mut down) = (vec![0; 65_536], vec![0; 65_536]);
+        loop {
+            let (data, to, socket) = tokio::select! {
+                Ok((len, from)) = front.recv_from(&mut up) => {
+                    client = Some(from);
+                    (up[..len].to_vec(), server, back.clone())
+                }
+                Ok((len, _)) = back.recv_from(&mut down) => {
+                    let Some(client) = client else { continue };
+                    (down[..len].to_vec(), client, front.clone())
+                }
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = socket.send_to(&data, to).await;
+            });
+        }
+    });
+    DelayRelay { addr, task }
+}
+
+/// Connects to `server` through a relay that makes three PTOs last longer
+/// than `bound`, so a closed connection visibly stays in its table, and
+/// returns the server's side of the connection.
+async fn slow_closing_conn(
+    server: &mut Server,
+    client: &QuicEndpoint,
+    bound: Duration,
+) -> (DelayRelay, Conn, Conn) {
+    let relay = delay_relay(server.endpoint.local_addrs()[0], Duration::from_millis(750)).await;
+    let via_relay = NodeAddr::with_addrs(server.endpoint.local_id(), vec![relay.addr]);
+    let conn = client.connect(via_relay, &[ALPN]).await.unwrap();
+    let inbound = server.handled.recv().await.unwrap();
+    let rtt = inbound.stats().await.unwrap().connection.path.rtt;
+    assert!(rtt * 3 > bound, "{rtt:?}");
+    (relay, conn, inbound)
+}
+
+/// ADM-13: a closed connection still draining moves to the closing allowance,
+/// so a new inbound peer gets the live slot it held.
+#[tokio::test]
+async fn a_draining_connection_does_not_block_inbound() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 1,
+            max_closing_connections: 4,
+            ..loopback()
+        };
+        let mut server = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let slow = client();
+        let (_relay, _conn, inbound) =
+            slow_closing_conn(&mut server, &slow, Duration::from_secs(4)).await;
+        assert_eq!(server.endpoint.connection_count(), 1);
+
+        inbound.close(VarInt::from_u32(0), b"done");
+        while server.endpoint.closing_connection_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.endpoint.connection_count(), 0);
+
+        let fresh = client();
+        fresh.connect(server.addr(), &[ALPN]).await.unwrap();
+        // The first connection is still draining.
+        assert_eq!(server.endpoint.closing_connection_count(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-13: when the closing allowance is full, a connection that closes drops
+/// its state at once instead of draining.
+#[tokio::test]
+async fn a_full_closing_allowance_drops_state_at_once() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_closing_connections: 0,
+            ..loopback()
+        };
+        let mut server = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let slow = client();
+        let bound = Duration::from_secs(1);
+        let (_relay, _conn, inbound) = slow_closing_conn(&mut server, &slow, bound).await;
+
+        inbound.close(VarInt::from_u32(0), b"done");
+        tokio::time::timeout(bound, async {
+            while server.endpoint.connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connection skips its drain");
+        assert_eq!(server.endpoint.closing_connection_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// Silent multi-address discovery attempts leave a live slot for an inbound
+/// peer, while maintained dials can still use the transport's dial reserve.
+#[tokio::test]
+async fn discovery_dials_leave_room_for_an_inbound_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 6,
+            dial_reserve: 2,
+            ..loopback()
+        };
+        let mut config = test_config();
+        config.handshake_timeout_secs = Some(10);
+        let mut node = server_with(&config, &bind, &[ALPN], |_| Admit::Accept);
+        let peer = server();
+        let _maintained = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+
+        let silent: Vec<_> = (0..2)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let target = NodeAddr::with_addrs(
+            NodeSecretKey::generate().public(),
+            silent.iter().map(|socket| socket.local_addr().unwrap()),
+        );
+        let quic = node.endpoint.clone();
+        let discovery = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+        while node.endpoint.connection_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!node.endpoint.has_discovery_capacity());
+        assert!(node.endpoint.has_dial_capacity());
+        assert!(matches!(
+            node.endpoint.connect_discovery(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(node.endpoint.connection_count(), 3);
+
+        let inbound = client();
+        let _accepted = inbound.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 4);
+
+        let _reserved = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 5);
+        discovery.abort();
+        let _ = discovery.await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Discovery caps its address list to its own ceiling, and a ceiling with no
+/// room returns a local limit without contacting the peer or panicking.
+#[tokio::test]
+async fn discovery_handles_small_connection_limits() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for (cap, reserve, can_discover) in [(1, 0, false), (2, 1, false), (3, 1, true)] {
+            let bind = QuicBindConfig {
+                max_connections: cap,
+                dial_reserve: reserve,
+                ..loopback()
+            };
+            let node =
+                QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+            let peer = server();
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let target = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                vec![peer.endpoint.local_addrs()[0], silent.local_addr().unwrap()],
+            );
+            assert_eq!(node.has_discovery_capacity(), can_discover);
+            let result = node.connect_discovery(target, &[ALPN]).await;
+            if can_discover {
+                let held = result.unwrap();
+                assert_eq!(node.connection_count(), 1);
+                assert!(!node.has_discovery_capacity());
+                drop(held);
+            } else {
+                assert!(matches!(result, Err(ConnectError::ConnectionLimit)));
+                assert_eq!(node.connection_count(), 0);
+                assert!(peer.seen.lock().unwrap().is_empty());
+                // A discovery ceiling of zero doesn't disable maintained dials.
+                node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Cancelling discovery returns unused reservations and drains started
+/// attempts, both before and after the staggered second attempt starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_discovery_dials_restore_every_slot() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for started in [1, 2] {
+            let bind = QuicBindConfig {
+                max_connections: 5,
+                dial_reserve: 1,
+                max_closing_connections: 5,
+                ..loopback()
+            };
+            let config = QuicConfig {
+                dial_stagger_ms: if started == 1 { 5000 } else { 25 },
+                handshake_timeout_secs: Some(10),
+                ..test_config()
+            };
+            let node = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &config).unwrap();
+            let peer = server();
+            let retained = node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target = NodeAddr::with_addrs(
+                NodeSecretKey::generate().public(),
+                [first.local_addr().unwrap(), second.local_addr().unwrap()],
+            );
+            let quic = node.clone();
+            let dial = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+            let mut packet = [0; 65_536];
+            first.recv_from(&mut packet).await.unwrap();
+            if started == 2 {
+                second.recv_from(&mut packet).await.unwrap();
+            }
+            // Both addresses reserve slots before either sends an Initial.
+            assert_eq!(node.connection_count(), 3);
+            assert!(!node.has_discovery_capacity());
+            dial.abort();
+            assert!(dial.await.unwrap_err().is_cancelled());
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.connection_count() != 1 || node.closing_connection_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled attempts release every slot while the retained peer stays live");
+            assert!(node.has_discovery_capacity());
+            assert!(retained.stats().await.is_some());
+            if started == 1 {
+                assert!(matches!(
+                    second.try_recv_from(&mut packet),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+
+            // This dial needs both refunded slots, even though its first
+            // address answers before the second address needs to finish.
+            let replacement = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                [peer.endpoint.local_addrs()[0], second.local_addr().unwrap()],
+            );
+            let _connected = node.connect_discovery(replacement, &[ALPN]).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// An endpoint on one simulated socket at `addr`.
+fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
+    let bind = QuicBindConfig {
+        addrs: vec![addr],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        net.clone(),
+        crate::EndpointInputs::default(),
+    )
+    .unwrap()
+}
+
+/// A simulated network whose links take 1 to 5 ms and may reorder.
+fn sim_net() -> SimNet {
+    SimNet::new(LinkModel {
+        min_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        reorder: true,
+        loss_budget: 0,
+    })
+}
+
+/// Delivers every eligible datagram once per simulated millisecond. Links
+/// from [`sim_net`] take at least 1 ms, so each datagram arrives inside its
+/// window, and the assertion checks that time never passed a deadline.
+async fn pump(net: SimNet) {
+    loop {
+        while let Some(id) = net.deliverable().first().copied() {
+            net.deliver(id).unwrap();
+        }
+        assert!(net.can_advance(), "a datagram passed its deadline");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Bounds a simulation test in virtual time. It leaves room for the 91 s the
+/// rebind test sleeps on purpose, and a hang still fails within seconds of
+/// wall time, because paused time jumps ahead while the test waits.
+const SIM_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `10.0.0.n:4000`.
+fn sim_addr(n: u8) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(10, 0, 0, n), 4000))
+}
+
+/// Tasks alive on the current runtime.
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+/// M2.6: the real driver handshakes and echoes over `SimNet`. Simulated
+/// sockets hold no OS handle, and binding one starts only its endpoint task:
+/// no kernel drop poller and no interface watcher. A production bind does
+/// start them.
+#[tokio::test(start_paused = true)]
+async fn the_driver_runs_over_simnet_without_os_sockets_or_pollers() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let before = alive_tasks();
+        let server_endpoint = sim_endpoint(&net, sim_addr(1));
+        assert_eq!(alive_tasks(), before + 1, "only the endpoint task");
+        let mut server = serve_test_acceptor(server_endpoint, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
+
+        let stats = &server.endpoint.socket_stats()[0];
+        assert_eq!(stats.buffers, SocketBuffers::default());
+        assert!(!stats.gso);
+        drop((conn, inbound));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+
+        let events = net.events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Delivered { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Dropped { .. })));
+        assert!(events.contains(&NetEvent::Unbound {
+            addr: sim_addr(1),
+            unread: 0
+        }));
+
+        // A production wildcard bind adds the interface watcher, and on
+        // Linux the kernel drop poller, beside its endpoint task.
+        let before = alive_tasks();
+        let _os =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &wildcard(), &test_config()).unwrap();
+        assert!(alive_tasks() >= before + 2);
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// Injects a fatal receive error into `addr` and waits until the endpoint
+/// has rebound or stopped.
+async fn fail_and_wait(net: &SimNet, endpoint: &QuicEndpoint, addr: SocketAddr) -> SocketStats {
+    let rebinds = endpoint.socket_stats()[0].rebinds;
+    assert!(net.fail_next_recv(addr, std::io::ErrorKind::Other));
+    loop {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let stats = endpoint.socket_stats()[0];
+        if stats.rebinds > rebinds || stats.stopped {
+            return stats;
+        }
+    }
+}
+
+/// M2.5: a SOCK-9 rebind comes from the injected factory and measures its
+/// 60 s window in virtual time. Under `std::time::Instant` the 61 s case
+/// would see almost no elapsed time and stop the socket.
+#[tokio::test(start_paused = true)]
+async fn simnet_rebinds_use_the_factory_and_virtual_time() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let _inbound = server.handled.recv().await.unwrap();
+
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (1, false));
+        let rebind = [
+            NetEvent::Unbound {
+                addr: sim_addr(1),
+                unread: 0,
+            },
+            NetEvent::Bound { addr: sim_addr(1) },
+        ];
+        assert!(net.events().windows(2).any(|pair| pair == rebind));
+        // The connection lives through the rebind.
+        assert_eq!(echo(&conn, b"after the rebind").await, b"after the rebind");
+
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, false));
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, true));
+
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// Counts the calls into one injected input.
+#[derive(Debug, Default)]
+struct Calls(AtomicUsize);
+
+impl Calls {
+    /// Records one call.
+    fn hit(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The calls so far.
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// ring's HMAC reset key, counting signatures.
+struct SpyResetKey(ring::hmac::Key, Arc<Calls>);
+
+impl crate::HmacKey for SpyResetKey {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        self.1.hit();
+        self.0.sign(data, signature_out);
+    }
+
+    fn signature_len(&self) -> usize {
+        self.0.signature_len()
+    }
+
+    fn verify(
+        &self,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<(), quinn_proto::crypto::CryptoError> {
+        self.0.verify(data, signature)
+    }
+}
+
+/// ring's HKDF token key, counting the AEAD keys it derives.
+struct SpyTokenKey(ring::hkdf::Prk, Arc<Calls>);
+
+impl crate::HandshakeTokenKey for SpyTokenKey {
+    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn quinn_proto::crypto::AeadKey> {
+        self.1.hit();
+        self.0.aead_from_hkdf(random_bytes)
+    }
+}
+
+/// quinn-proto's hashed CID generator, counting the IDs it makes.
+struct SpyCids(quinn_proto::HashedConnectionIdGenerator, Arc<Calls>);
+
+impl crate::ConnectionIdGenerator for SpyCids {
+    fn generate_cid(&mut self) -> crate::ConnectionId {
+        self.1.hit();
+        self.0.generate_cid()
+    }
+
+    fn validate(&self, cid: &crate::ConnectionId) -> Result<(), quinn_proto::InvalidCid> {
+        self.0.validate(cid)
+    }
+
+    fn cid_len(&self) -> usize {
+        self.0.cid_len()
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        self.0.cid_lifetime()
+    }
+}
+
+/// ring's TLS random source, counting fills. `&'static`, as rustls needs.
+#[derive(Debug)]
+struct SpyRandom(Calls);
+
+impl crate::SecureRandom for SpyRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        self.0.hit();
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(buf)
+    }
+}
+
+/// ring's X25519 group, counting key exchanges. `&'static`, as rustls needs.
+#[derive(Debug)]
+struct SpyKx(Calls);
+
+impl crate::SupportedKxGroup for SpyKx {
+    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        self.0.hit();
+        rustls::crypto::ring::kx_group::X25519.start()
+    }
+
+    fn name(&self) -> rustls::NamedGroup {
+        rustls::crypto::ring::kx_group::X25519.name()
+    }
+}
+
+static SPY_RANDOM: SpyRandom = SpyRandom(Calls(AtomicUsize::new(0)));
+static SPY_KX: SpyKx = SpyKx(Calls(AtomicUsize::new(0)));
+
+/// Spies on every input `bind_with` takes, so a test can check each one is
+/// used.
+#[derive(Default)]
+struct Spies {
+    reset_key: Arc<Calls>,
+    cid_factory: Arc<Calls>,
+    cids: Arc<Calls>,
+    initial_cid: Arc<Calls>,
+    token_key: Arc<Calls>,
+}
+
+impl Spies {
+    /// Inputs that route every source through a spy. Each spy delegates to
+    /// the production source, so the handshake itself is unchanged.
+    fn inputs(&self) -> crate::EndpointInputs {
+        let rng = ring::rand::SystemRandom::new();
+        let reset_key = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+        let token_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&[7; 64]);
+        let (cid_factory, cids) = (self.cid_factory.clone(), self.cids.clone());
+        let initial_cid = self.initial_cid.clone();
+        crate::EndpointInputs::default()
+            .rng_seed([3; 32])
+            .reset_key(Arc::new(SpyResetKey(reset_key, self.reset_key.clone())))
+            .cid_generator(Arc::new(move || {
+                cid_factory.hit();
+                Box::new(SpyCids(
+                    quinn_proto::HashedConnectionIdGenerator::from_key(7),
+                    cids.clone(),
+                ))
+            }))
+            .initial_dst_cid(Arc::new(move || {
+                let n = initial_cid.0.fetch_add(1, Ordering::Relaxed) as u8;
+                crate::ConnectionId::new(&[n; 16])
+            }))
+            .token_key(Arc::new(SpyTokenKey(token_key, self.token_key.clone())))
+            .tls_random(&SPY_RANDOM)
+            .kx_groups(vec![&SPY_KX])
+    }
+}
+
+/// An endpoint on one simulated socket at `addr`, with `inputs`.
+fn sim_endpoint_with(
+    net: &SimNet,
+    addr: SocketAddr,
+    inputs: crate::EndpointInputs,
+) -> Result<QuicEndpoint, crate::BindError> {
+    let bind = QuicBindConfig {
+        addrs: vec![addr],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        net.clone(),
+        inputs,
+    )
+}
+
+/// M3.3, API-2: a Retry handshake and a stream exchange between two
+/// `bind_with` endpoints use every injected input, and the seed reaches each
+/// socket's endpoint config.
+#[tokio::test(start_paused = true)]
+async fn bind_with_uses_every_injected_input() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let server_spies = Spies::default();
+        let client_spies = Spies::default();
+        let server_endpoint = sim_endpoint_with(&net, sim_addr(1), server_spies.inputs()).unwrap();
+        let mut server = serve_test_acceptor(server_endpoint, &[ALPN], |incoming| {
+            if incoming.validated {
+                Admit::Accept
+            } else {
+                Admit::Retry
+            }
+        });
+        let client = sim_endpoint_with(&net, sim_addr(2), client_spies.inputs()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(echo(&conn, b"injected").await, b"injected");
+        let _inbound = server.handled.recv().await.unwrap();
+        assert!(server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| !seen.validated));
+
+        for endpoint in [&client, &server.endpoint] {
+            let config = format!("{:?}", endpoint.shared().endpoint_config());
+            assert!(config.contains("rng_seed: Some("), "{config}");
+        }
+        for (side, spies) in [("server", &server_spies), ("client", &client_spies)] {
+            assert_eq!(
+                spies.cid_factory.get(),
+                1,
+                "{side}: one generator per socket"
+            );
+            assert!(spies.cids.get() > 0, "{side}: connection IDs");
+            assert!(spies.reset_key.get() > 0, "{side}: reset tokens");
+        }
+        assert!(
+            client_spies.initial_cid.get() > 0,
+            "initial destination CID"
+        );
+        assert_eq!(server_spies.initial_cid.get(), 0, "the server never dials");
+        assert!(
+            server_spies.token_key.get() > 0,
+            "Retry token sealed and opened"
+        );
+        assert!(SPY_RANDOM.0.get() > 0, "TLS random");
+        // One key share per side.
+        assert!(SPY_KX.0.get() >= 2, "TLS key exchange");
+
+        drop(conn);
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// `SeededInputs` carry a Retry handshake and a stream exchange over
+/// `SimNet`, the node keys come from the seed, and the handshake draws from
+/// every source.
+#[tokio::test(start_paused = true)]
+async fn seeded_inputs_handshake_over_simnet() {
+    const SEED: [u8; 32] = [5; 32];
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let bind = |node: u32, addr: SocketAddr, inputs: &SeededInputs| {
+            let bind = QuicBindConfig {
+                addrs: vec![addr],
+                ..loopback()
+            };
+            QuicEndpoint::bind_with(
+                SeededInputs::node_key(SEED, node),
+                &bind,
+                &test_config(),
+                net.clone(),
+                inputs.endpoint_inputs(),
+            )
+            .unwrap()
+        };
+        let server_inputs = SeededInputs::new(SEED, 0);
+        let client_inputs = SeededInputs::new(SEED, 1);
+        let mut server =
+            serve_test_acceptor(bind(0, sim_addr(1), &server_inputs), &[ALPN], |incoming| {
+                if incoming.validated {
+                    Admit::Accept
+                } else {
+                    Admit::Retry
+                }
+            });
+        let client = bind(1, sim_addr(2), &client_inputs);
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_id(), SeededInputs::node_key(SEED, 0).public());
+        assert_eq!(echo(&conn, b"seeded").await, b"seeded");
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(
+            inbound.remote_id(),
+            SeededInputs::node_key(SEED, 1).public()
+        );
+        assert!(server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| !seen.validated));
+
+        for (side, inputs) in [("server", &server_inputs), ("client", &client_inputs)] {
+            for (source, draws) in inputs.record().draws {
+                if side == "server" && source == Source::InitialDstCid {
+                    assert_eq!(draws, 0, "the server never dials");
+                } else {
+                    assert!(draws > 0, "{side}: {source:?}");
+                }
+            }
+        }
+
+        drop((conn, inbound));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
+}
+
+/// TLS-9: key-exchange groups that can't carry TLS 1.3 fail at bind, before
+/// any dial.
+#[tokio::test(start_paused = true)]
+async fn unusable_kx_groups_fail_at_bind() {
+    let net = sim_net();
+    let inputs = crate::EndpointInputs::default().kx_groups(Vec::new());
+    assert!(matches!(
+        sim_endpoint_with(&net, sim_addr(1), inputs),
+        Err(crate::BindError::Tls(_))
+    ));
+}
+
+/// M3.6: `bind` injects nothing. Each socket's endpoint config is the
+/// production one, with no seed, and the TLS provider is rustls' ring
+/// default.
+#[tokio::test]
+async fn bind_keeps_the_production_inputs() {
+    let endpoint =
+        QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+    let shared = endpoint.shared();
+    assert_eq!(
+        format!("{:?}", shared.inputs),
+        "EndpointInputs { rng_seed: false, reset_key: false, cid_generator: false, \
+         initial_dst_cid: false, token_key: false, tls_random: false, kx_groups: None }"
+    );
+    let socket_config = format!("{:?}", shared.endpoint_config());
+    assert_eq!(
+        socket_config,
+        format!("{:?}", shared.config.endpoint_config())
+    );
+    assert!(socket_config.contains("rng_seed: None"), "{socket_config}");
+    assert!(shared.tls.uses_default_provider());
+    endpoint.shutdown().await;
+}
+
+/// Binds on `SimNet` but reports a wildcard local address, as an injected
+/// factory that forwards the requested address might.
+struct WildcardFactory(SimNet);
+
+impl crate::SocketFactory for WildcardFactory {
+    type Socket = <SimNet as crate::SocketFactory>::Socket;
+
+    /// Binds `addr` on the network and reports `0.0.0.0` with its port.
+    fn bind(&self, addr: SocketAddr) -> std::io::Result<crate::BoundSocket<Self::Socket>> {
+        let mut bound = <SimNet as crate::SocketFactory>::bind(&self.0, addr)?;
+        bound.local_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port()));
+        Ok(bound)
+    }
+}
+
+/// Binds one socket at `sim_addr(1)` through a [`WildcardFactory`].
+fn bind_wildcard(net: &SimNet) -> Result<QuicEndpoint, crate::BindError> {
+    let bind = QuicBindConfig {
+        addrs: vec![sim_addr(1)],
+        ..loopback()
+    };
+    QuicEndpoint::bind_with(
+        NodeSecretKey::generate(),
+        &bind,
+        &test_config(),
+        WildcardFactory(net.clone()),
+        crate::EndpointInputs::default(),
+    )
+}
+
+/// SOCK-12: outside a simulated run, an injected socket with a wildcard
+/// local address binds as before and gets the interface watcher.
+#[tokio::test(start_paused = true)]
+async fn a_wildcard_injected_socket_binds_outside_a_simulated_run() {
+    let before = alive_tasks();
+    let endpoint = bind_wildcard(&sim_net()).unwrap();
+    assert_eq!(
+        alive_tasks(),
+        before + 2,
+        "the endpoint task and the watcher"
+    );
+    endpoint.shutdown().await;
+}
+
+/// SOCK-12: inside a simulated run, a wildcard socket would start the
+/// interface watcher on the host's interfaces, so `bind_with` refuses it
+/// and releases the socket it bound.
+#[cfg(zakura_sim)]
+#[test]
+fn a_simulated_run_refuses_a_wildcard_socket() {
+    let net = sim_net();
+    let run = zakura_scheduler::Scheduler::new(
+        zakura_scheduler::SchedulerConfig::default(),
+        zakura_scheduler::SimInstant::ZERO,
+    );
+    let error = bind_wildcard(&net).unwrap_err();
+    drop(run);
+    let crate::BindError::Socket { addr, source } = error else {
+        panic!("expected a socket error, got {error:?}");
+    };
+    assert_eq!(addr, sim_addr(1));
+    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        net.events().last(),
+        Some(&NetEvent::Unbound {
+            addr: sim_addr(1),
+            unread: 0
+        })
+    );
 }

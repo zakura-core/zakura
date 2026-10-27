@@ -16,7 +16,6 @@ use crate::{
     serialization::ZcashDeserializeInto,
 };
 
-use color_eyre::eyre;
 use eyre::Result;
 
 /// Test the history tree using the activation block of a network upgrade

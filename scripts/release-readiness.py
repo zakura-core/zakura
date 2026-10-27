@@ -113,11 +113,6 @@ def changelog_context(
     }
 
 
-def release_entries(repo_root: Path, base_version: str) -> dict[str, list[str]]:
-    entries, _ = changelog_context(repo_root, base_version)
-    return entries
-
-
 def patch_waiver_reason(entries: dict[str, list[str]]) -> str | None:
     combined = "\n".join(body for bodies in entries.values() for body in bodies)
     markers = list(PATCH_WAIVER.finditer(combined))

@@ -70,8 +70,8 @@ impl From<U256> for SuffixWork {
     }
 }
 
-/// Header-selection score: exact suffix work, then raw internal tip hash.
-/// Full-state selection additionally uses the verified block's receipt order.
+/// Header score: exact suffix work, then raw internal tip hash.
+/// Integrated selection preserves its selected tip before applying the hash tie.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ChainScore {
     /// Exact cumulative work after the shared comparison anchor.

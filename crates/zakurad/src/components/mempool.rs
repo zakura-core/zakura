@@ -30,18 +30,13 @@ use std::{
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tower::{
-    buffer::Buffer,
-    timeout::Timeout,
-    util::{BoxCloneService, BoxService},
-    Service, ServiceExt,
-};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::NetworkUpgrade,
+    parameters::{Network, NetworkUpgrade},
     transaction::UnminedTxId,
 };
 use zakura_consensus::{error::TransactionError, transaction};
@@ -50,6 +45,7 @@ use zakura_node_services::mempool::{
     CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
     Request, Response,
 };
+use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
 
@@ -123,12 +119,14 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound = Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
-type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type Outbound =
+    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type State =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
 type TxVerifier = Buffer<
-    BoxService<transaction::Request, transaction::Response, TransactionError>,
     transaction::Request,
+    futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
@@ -178,16 +176,43 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
     bans.then_some(*advertiser_addr)
 }
 
+/// The number of blocks after a network upgrade activates during which a
+/// transaction built for the previous upgrade starts no cooldown.
+///
+/// The transaction verifier's NU6.3 branch ID grace period has the same length.
+const UPGRADE_GRACE_PERIOD_BLOCKS: block::HeightDiff = 40;
+
+/// Returns the network upgrade before the one active at `height`, if `height`
+/// is in the first [`UPGRADE_GRACE_PERIOD_BLOCKS`] blocks of that upgrade.
+///
+/// Only upgrades with a consensus branch ID have a grace period, so
+/// `BeforeOverwinter` does not.
+fn upgrade_grace_period(network: &Network, height: block::Height) -> Option<NetworkUpgrade> {
+    let (upgrade, activation_height) =
+        NetworkUpgrade::current_with_activation_height(network, height);
+
+    if upgrade.branch_id().is_none() || height - activation_height >= UPGRADE_GRACE_PERIOD_BLOCKS {
+        return None;
+    }
+
+    // Several upgrades can activate at one height, so the previous upgrade is
+    // the one active at the block before.
+    let previous_height = activation_height.previous().ok()?;
+    Some(NetworkUpgrade::current(network, previous_height))
+}
+
 /// Returns the peer to put in a transaction cooldown for `error`, if any.
 ///
 /// [`peer_action`] decides which failures start a cooldown. Failures without a
 /// legacy advertiser address do not, and neither do failures verified against
 /// a tip other than `best_tip_height`. `tip_upgrade` is the network upgrade of
-/// the block after `best_tip_height`.
+/// the block after `best_tip_height`. `grace_period_upgrade` is the upgrade
+/// before `tip_upgrade`, if that block is in the upgrade's grace period.
 fn transaction_cooldown_peer(
     error: &TransactionDownloadVerifyError,
     best_tip_height: Option<block::Height>,
     tip_upgrade: NetworkUpgrade,
+    grace_period_upgrade: Option<NetworkUpgrade>,
 ) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
@@ -224,6 +249,17 @@ fn transaction_cooldown_peer(
     // Below NU5, the verifier does not check branch IDs, so such a transaction
     // can fail with other errors.
     if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
+        return None;
+    }
+
+    // A peer whose tip lags an upgrade activation relays transactions built
+    // for the previous upgrade. Those transactions can fail with signature or
+    // pool rule errors. So shortly after an activation,
+    // a transaction that declares the previous upgrade, or declares no
+    // upgrade, starts no cooldown.
+    if grace_period_upgrade.is_some_and(|previous_upgrade| {
+        transaction_network_upgrade.is_none_or(|upgrade| upgrade == previous_upgrade)
+    }) {
         return None;
     }
 
@@ -442,7 +478,7 @@ fn start_peer_cooldown(
             .clone()
             .oneshot(zn::Request::DisconnectPeer(peer))
             .boxed();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
             if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!("could not disconnect a peer after repeated transaction failures");
@@ -585,6 +621,9 @@ pub struct Mempool {
     /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
+
+    /// Configured peers exempt from mempool bans, cooldowns, and disconnects.
+    unconditional_peers: zn::UnconditionalPeers,
 }
 
 impl Mempool {
@@ -601,6 +640,7 @@ impl Mempool {
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
+        unconditional_peers: zn::UnconditionalPeers,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -621,6 +661,7 @@ impl Mempool {
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
+            unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips
                 .into_iter()
                 .map(|ip| ip.to_canonical())
@@ -876,12 +917,12 @@ impl Service<Request> for Mempool {
             let mut mined_mempool_ids = HashSet::<_>::new();
 
             let best_tip_height = self.latest_chain_tip.best_tip_height();
-            let tip_upgrade = NetworkUpgrade::current(
-                self.chain_tip_change.network(),
-                best_tip_height
-                    .and_then(|height| height + 1)
-                    .unwrap_or(Height(0)),
-            );
+            let next_height = best_tip_height
+                .and_then(|height| height + 1)
+                .unwrap_or(Height(0));
+            let network = self.chain_tip_change.network();
+            let tip_upgrade = NetworkUpgrade::current(network, next_height);
+            let grace_period_upgrade = upgrade_grace_period(network, next_height);
 
             // Clean up completed download tasks and add to mempool if successful.
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
@@ -940,8 +981,10 @@ impl Service<Request> for Mempool {
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
                         let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
-                        let ban_peer = transaction_ban_peer(&error)
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        let ban_peer = transaction_ban_peer(&error).filter(|peer| {
+                            !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                && !self.unconditional_peers.contains(peer.ip())
+                        });
                         if let Some(peer) = ban_peer {
                             let _ = self
                                 .misbehavior_sender
@@ -952,10 +995,18 @@ impl Service<Request> for Mempool {
                         // current. A stale node verifies transactions against old rules.
                         let cooldown_peer = is_current_enough_for_mempool
                             .then(|| {
-                                transaction_cooldown_peer(&error, best_tip_height, tip_upgrade)
+                                transaction_cooldown_peer(
+                                    &error,
+                                    best_tip_height,
+                                    tip_upgrade,
+                                    grace_period_upgrade,
+                                )
                             })
                             .flatten()
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                            .filter(|peer| {
+                                !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                    && !self.unconditional_peers.contains(peer.ip())
+                            });
                         if let Some(peer) = cooldown_peer {
                             start_peer_cooldown(
                                 &self.peer_cooldowns,

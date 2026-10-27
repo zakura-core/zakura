@@ -1,3 +1,5 @@
+use zakura_rt::sync::atomic::Ordering;
+
 use super::*;
 
 impl BlockSyncReactor {
@@ -95,12 +97,10 @@ impl BlockSyncReactor {
             }
             row.budget_available = Some(self.state.budget.available());
             row.budget_reserved = Some(self.state.budget.reserved());
-            let sequencer_input_queued_bytes = self
-                .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let sequencer_input_queued_bytes = self.sequencer_input_bytes.load(Ordering::Relaxed);
             let sequencer_input_decoded_attributed_memory_bytes = self
                 .sequencer_input_decoded_attributed_memory_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(Ordering::Relaxed);
             let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =
@@ -301,24 +301,6 @@ impl BlockSyncReactor {
             row.apply_token = token;
             row.sequencer_input_capacity = Some(saturating_usize(capacity));
             row.sequencer_input_max_capacity = Some(saturating_usize(max_capacity));
-        });
-    }
-
-    pub(super) fn trace_range_response_sent(
-        &self,
-        peer: &ZakuraPeerId,
-        response: RangeResponseTrace,
-    ) {
-        self.emit_block(bs_trace::BLOCK_RANGE_RESPONSE_SENT, |row| {
-            row.peer = Some(super::super::trace::peer(peer));
-            row.range_start = Some(height(response.start_height));
-            row.range_count = Some(u64::from(response.sent_count));
-            row.expected_count = Some(u64::from(response.requested_count));
-            row.serialized_bytes = Some(response.sent_bytes);
-            row.reason = Some(response.reason);
-            row.prepare_elapsed_ms = response.prepare_elapsed.map(elapsed_ms);
-            row.send_elapsed_ms = Some(elapsed_ms(response.send_elapsed));
-            row.elapsed_ms = response.total_elapsed.map(elapsed_ms);
         });
     }
 

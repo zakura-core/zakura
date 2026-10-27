@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.7.0-rc0"
+version = "1.7.0"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -63,15 +63,13 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "journald",
-    "opentelemetry",
     "prometheus",
     "indexer",
 ]
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -88,8 +86,11 @@ portable = ["dep:orchard", "orchard/portable"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
+# The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured
+indexer-rpc = ["zakura-rpc/indexer-rpc"]
+
 # Indexer support
-indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
+indexer = ["indexer-rpc", "zakura-state/indexer", "zakura-rpc/indexer"]
 
 # Per-block commit-phase timing histograms (zakura.state.write.*), for perf profiling
 commit-metrics = ["zakura-state/commit-metrics"]
@@ -105,28 +106,27 @@ internal-miner = [
     "zakura-rpc/internal-miner",
 ]
 
-# Tracing and monitoring
-journald = ["tracing-journald"]
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Legacy flag accepted for build compatibility; journald logging is removed.
+journald = []
 
-prometheus = ["metrics-exporter-prometheus"]
+prometheus = []
 
 # Production features that modify dependency behaviour
 
 # Enable additional error debugging in release builds
-error-debug = ["color-eyre/track-caller", "color-eyre/capture-spantrace"]
+error-debug = ["eyre/track-caller"]
 
 # Remove verbose logging at compile-time in release or all builds.
 #
 # Release builds are defined as "cfg(not(debug_assertions))".
 # https://docs.rs/tracing/latest/tracing/level_filters/index.html#compile-time-filters
 release_max_level_warn = ["tracing/release_max_level_warn"]
-release_max_level_info = ["tracing/release_max_level_info", "log/release_max_level_info"]
+release_max_level_info = ["tracing/release_max_level_info"]
 release_max_level_debug = ["tracing/release_max_level_debug"]
 
 max_level_warn = ["tracing/max_level_warn"]
 max_level_info = ["tracing/max_level_info"]
-max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
+max_level_debug = ["tracing/max_level_debug"]
 
 # Testing features that activate extra dependencies
 proptest-impl = [
@@ -146,29 +146,16 @@ zakura-checkpoints = [
     "zakura-utils/zakura-checkpoints",
 ]
 
-# tokio-console support
-#
-# To activate this feature, run:
-# ```sh
-# RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
-# ```
-#
-# The console-subscriber is incompatible with the tracing/max_level_* features.
-#
-# For more details, see:
-# https://github.com/tokio-rs/console/blob/main/console-subscriber/README.md#enabling-tokio-instrumentation
-tokio-console = ["console-subscriber"]
-
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0" }
-zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0" }
+zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "12.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
-zakura-network = { path = "../zakura-network", version = "10.0.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = ["rpc-client"] }
-zakura-rpc = { path = "../zakura-rpc", version = "13.0.0-rc0" }
-zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
-zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
+zakura-network = { path = "../zakura-network", version = "11.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", default-features = false }
+zakura-state = { path = "../zakura-state", version = "11.0.0" }
+zakura-script = { path = "../zakura-script", version = "5.0.0" }
 zcash_script = { workspace = true }
 
 # Only used to forward portable arithmetic through Orchard and Halo 2. Cargo
@@ -176,13 +163,11 @@ zcash_script = { workspace = true }
 orchard = { workspace = true, optional = true }
 
 # Required for crates.io publishing, but it's only used in tests
-zakura-utils = { path = "../zakura-utils", version = "2.2.7-rc0", optional = true }
+zakura-utils = { path = "../zakura-utils", version = "2.2.8", optional = true }
 
-abscissa_core = { workspace = true, default-features = false, features = ["application"] }
-clap = { workspace = true, features = ["cargo"] }
+clap = { workspace = true, features = ["cargo", "derive"] }
 chrono = { workspace = true }
 indexmap = { workspace = true }
-lazy_static = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
@@ -190,72 +175,48 @@ toml = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }
-tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal", "process", "io-util"] }
-tokio-stream = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }
 
-color-eyre = { workspace = true, features = ["issue-url"] }
+eyre = { workspace = true }
 
 thiserror = { workspace = true }
 
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-crossbeam-channel = { workspace = true }
-tracing-error = { workspace = true }
+tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
-# Resolution constraint for transitive URL/DNS dependencies; no direct API use.
-idna_adapter = { workspace = true }
 sha2 = { workspace = true }
-tempfile = { workspace = true }
 
-# Health check server dependencies
-hyper = { workspace = true, features = ["server", "http1"] }
+# Health check server and managed zcashd download dependencies
+hyper = { workspace = true, features = ["client", "server", "http1"] }
 http-body-util = { workspace = true }
-hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
+hyper-util = { workspace = true, features = ["client-proxy", "service", "server", "tokio"] }
 
-# prod feature journald
-tracing-journald = { workspace = true, optional = true }
-
-# prod feature opentelemetry
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 
 bytes = { workspace = true }
 
 # prod feature prometheus
-metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], optional = true }
-
-# prod feature release_max_level_info
-#
-# zakurad uses tracing for logging,
-# we only use `log` to set and print the static log levels in transitive dependencies
-log = { workspace = true }
 
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-# test feature tokio-console
-console-subscriber = { workspace = true, optional = true }
-
 derive-new.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 criterion = { workspace = true }
-abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
-jsonrpsee-types = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 
@@ -263,19 +224,24 @@ insta = { workspace = true, features = ["json"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0", features = ["test-support"] }
-zakura-network = { path = "../zakura-network", version = "10.0.0-rc0", features = ["proptest-impl", "zakura-testkit"] }
-zakura-state = { path = "../zakura-state", version = "11.0.0-rc0", features = ["proptest-impl"] }
-zakura-rpc = { path = "../zakura-rpc", version = "13.0.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "11.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "12.0.0", features = ["proptest-impl"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
+zakura-network = { path = "../zakura-network", version = "11.0.0", features = ["proptest-impl", "zakura-testkit"] }
+zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["proptest-impl"] }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.1", default-features = false, features = ["proptest-impl"] }
 
-zakura-test = { path = "../zakura-test", version = "3.0.0-rc0" }
+zakura-test = { path = "../zakura-test", version = "4.0.0" }
+# The simulator's engine-backed header port, compared against
+# HeaderChainServicePort in its tests. Path-only, with no version, because
+# zakura-storage is never published, so packaging drops it.
+zakura-storage = { path = "../zakura-storage" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.1", features = ["rpc-client"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).
@@ -286,13 +252,11 @@ zakura-test = { path = "../zakura-test", version = "3.0.0-rc0" }
 # When `-Z bindeps` is stabilised, enable this binary dependency instead:
 # https://github.com/rust-lang/cargo/issues/9096
 # zakura-utils { path = "../zakura-utils", artifact = "bin:zakura-checkpoints" }
-zakura-utils = { path = "../zakura-utils", version = "2.2.7-rc0" }
+zakura-utils = { path = "../zakura-utils", version = "2.2.8" }
 
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are used indirectly or constrain transitive resolution.
 normal = [
-    "console-subscriber",  # Used behind the tokio-console feature flag
-    "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]
 development = [

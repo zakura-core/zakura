@@ -300,7 +300,7 @@ proptest! {
                 retried_after_tip_reset: false,
             };
 
-            if transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu7).is_some() {
+            if transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu7, None).is_some() {
                 prop_assert_ne!(error.mempool_misbehavior_score(), 0, "{:?}", error);
                 // The previous mempool policy exempted these despite their score.
                 prop_assert!(!matches!(error,
@@ -587,6 +587,7 @@ fn setup(
         chain_tip_change,
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

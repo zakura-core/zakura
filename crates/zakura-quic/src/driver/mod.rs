@@ -16,17 +16,14 @@
 //!
 //! Nothing shares a `quinn-proto` object, so no lock guards one.
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, StreamId, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use zakura_rt::sync::{
+    atomic::{AtomicUsize, Ordering},
+    counter, mpsc, oneshot, watch,
+};
 
 use crate::{
     error::{ReadError, WriteError},
@@ -44,6 +41,10 @@ pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
 /// at 10 Gbit/s (32 receive calls of up to 64 KiB). Counting bytes rather than
 /// datagrams also bounds memory when a peer sends 64 KiB datagrams.
 pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Datagram bytes the endpoint queues for a closed connection (ADM-13). A
+/// closed connection only answers with CONNECTION_CLOSE, so it needs little.
+pub(crate) const CLOSING_QUEUE_BYTES: usize = 64 * 1024;
 
 /// The datagram bytes one socket may queue across all its connections
 /// (SPEC §6a), so many lagging connection tasks can't add up to
@@ -125,20 +126,22 @@ pub(crate) struct ConnShared {
     /// Datagram bytes the endpoint queued that the task hasn't handled yet.
     pub(crate) queued_datagram_bytes: AtomicUsize,
     /// Datagrams the endpoint dropped because the queue was full.
-    pub(crate) queue_drops: AtomicU64,
+    pub(crate) queue_drops: counter::AtomicU64,
     /// The queued datagram bytes of every connection on this socket.
     pub(crate) socket_queued_bytes: Arc<AtomicUsize>,
 }
 
 impl ConnShared {
     fn new(remote: SocketAddr, socket_queued_bytes: Arc<AtomicUsize>) -> Arc<Self> {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        // A trace ID, so a metrics atomic. It's process-wide, so two runs in
+        // one process number their connections differently.
+        static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
-            queue_drops: AtomicU64::new(0),
+            queue_drops: counter::AtomicU64::new(0),
             socket_queued_bytes,
         })
     }

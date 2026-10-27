@@ -52,18 +52,34 @@ fn operation_sequence_strategy() -> impl Strategy<Value = Vec<Op>> {
     proptest::collection::vec(operation_strategy(), 1..40)
 }
 
-fn proptest_cases() -> u32 {
+/// `PROPTEST_CASES`, or `default` when it is unset.
+fn proptest_cases(default: u32) -> u32 {
     env::var("PROPTEST_CASES")
         .ok()
         .and_then(|cases| cases.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(default)
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(8)))]
 
+    /// Eight sequences, on every pull request.
     #[test]
     fn random_fork_aware_writer_sequences_uphold_store_invariants(
+        operations in operation_sequence_strategy(),
+    ) {
+        let _init_guard = zakura_test::init();
+        Harness::new().run_all(&operations);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(64)))]
+
+    /// Sixty-four sequences, in full-coverage CI runs.
+    #[test]
+    #[ignore = "broad property run; full-coverage CI passes --run-ignored"]
+    fn many_random_fork_aware_writer_sequences_uphold_store_invariants(
         operations in operation_sequence_strategy(),
     ) {
         let _init_guard = zakura_test::init();

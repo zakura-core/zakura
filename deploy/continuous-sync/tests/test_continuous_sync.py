@@ -105,12 +105,17 @@ class ContinuousSyncTests(unittest.TestCase):
                 post.assert_called_once()
 
     def test_archive_preflight_rejects_missing_configuration_and_expiration(self):
+        """Checks archive requirements independently of the host's free disk space."""
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
             config.paths.repo_dir.mkdir()
             config.paths.config_template.write_text("")
             config.paths.wipe_sentinel.write_text("")
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(sync, "check_free_space"),
+                patch.dict(os.environ, {}, clear=True),
+            ):
                 with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
                     sync.preflight(config)
                 with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
@@ -660,6 +665,7 @@ class ContinuousSyncTests(unittest.TestCase):
             alert_status.service_active("zakura.service")
 
     def test_preflight_checks_dependencies_before_a_cycle(self):
+        """Checks required tools independently of the host's free disk space."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             config = make_config(tmp_path)
@@ -667,7 +673,10 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.config_template.write_text("", encoding="utf-8")
             config.paths.wipe_sentinel.write_text("", encoding="utf-8")
 
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which:
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which,
+                patch.object(sync, "check_free_space"),
+            ):
                 sync.preflight(config)
 
             self.assertEqual(
@@ -963,6 +972,18 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertNotIn("zakura-storage.timer", rendered)
         self.assertIn("logrotate", rendered["zakura-monitor.service"])
         self.assertIn("maxsize 64M", rendered["logrotate"])
+
+    def test_deployment_installs_and_loads_network_sysctls(self):
+        node = deploy.load_nodes(DEPLOY_PATH.with_name("nodes.toml"), None)[0]
+        with patch.object(deploy, "run") as run, patch.object(deploy, "ssh_with_script") as ssh:
+            ssh.return_value.returncode = 0
+            result = deploy.deploy_node(node, argparse.Namespace(dry_run=False, no_start=True))
+        self.assertTrue(result[1])
+        uploads = [call.args[0][-1] for call in run.call_args_list]
+        self.assertIn(f"{node.ssh_string}:/tmp/zakura-network-sysctl.conf", uploads)
+        script = ssh.call_args.args[1]
+        self.assertLess(script.index("/etc/sysctl.d/60-zakura-network.conf"),
+                        script.index("sysctl --load /etc/sysctl.d/60-zakura-network.conf"))
 
     def test_relink_backs_up_existing_trace_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1998,6 +2019,39 @@ class NotificationTests(unittest.TestCase):
         ):
             result = deploy.cmd_audit(args)
         return result, post
+
+    def test_ci_receipt_preserves_repeat_suppression_and_reminders(self):
+        """Confirms handled incidents without posting again before the existing reminder."""
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            output = Path(tmp) / "output"
+            for timestamp, should_post in ((1000, True), (1100, False), (88000, True)):
+                output.write_text("")
+                with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                    result, post = self.audit(state, data, timestamp)
+                self.assertEqual(result, 1)
+                self.assertEqual(post.called, should_post)
+                self.assertEqual(output.read_text(), "notification_handled=true\n")
+
+    def test_ci_receipt_requires_delivery_and_persisted_state(self):
+        """A failed post or state write leaves the central failure alert enabled."""
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            output = Path(tmp) / "output"
+            output.write_text("")
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                result, post = self.audit(state, data, 1000, posted=False)
+                self.assertEqual(result, 1)
+                post.assert_called_once()
+                self.assertEqual(output.read_text(), "")
+                with patch.object(deploy, "save_audit_state", side_effect=OSError("disk full")):
+                    with self.assertRaises(OSError):
+                        self.audit(state, data, 1100)
+                self.assertEqual(output.read_text(), "")
 
     def test_halt_receipt_requires_successful_delivery(self):
         for delivered in (False, True):

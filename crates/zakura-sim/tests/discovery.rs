@@ -179,7 +179,7 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
 const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
 
 #[test]
-#[ignore = "rewrites the committed input; needs fixtures/discovery-wait-complete-revert.patch applied"]
+#[ignore = "rewrites the committed input; needs qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch applied"]
 fn regenerate_wait_complete_input() {
     let bytes = hold_source_back().expect("the reverted code misses the wakeup");
     let path = concat!(

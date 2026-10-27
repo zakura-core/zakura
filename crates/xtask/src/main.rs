@@ -9,6 +9,7 @@ use std::{
 
 mod header_conformance;
 mod header_fuzz;
+mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
@@ -94,6 +95,15 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             rt_imports::check(&repo_root()?)
+        }
+        Some("planted") => {
+            let property = args.next();
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "expected at most one property ID after `cargo xtask planted`",
+                )));
+            }
+            planted::run(&repo_root()?, property.as_deref())
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
@@ -301,6 +311,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rt-imports")?;
+    writeln!(output, "  cargo xtask planted [<property-id>]")?;
     writeln!(
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
@@ -343,6 +354,15 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Checks that the v2 P2P code in zakura-network takes runtime names from zakura-rt."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Applies each bypass patch under qa/planted/ in a scratch worktree, and checks that"
+    )?;
+    writeln!(
+        output,
+        "its committed input holds the property unpatched and violates exactly it patched."
     )?;
     writeln!(output)?;
     writeln!(

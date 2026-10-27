@@ -3,7 +3,7 @@
 //!
 //! `tests/harness.rs` compares the manifest with the harnesses' properties,
 //! so a property without a row, or a row no harness reports, fails CI. It
-//! also checks that each named test exists, and that CI runs it.
+//! also checks that each named test or patch exists, and that CI runs it.
 
 /// One property's coverage.
 #[derive(Clone, Copy, Debug)]
@@ -12,8 +12,19 @@ pub struct Coverage {
     pub property: &'static str,
     /// A test where the property applies and holds.
     pub passing: Witness,
-    /// A test where a planted bug violates the property.
-    pub bypass: Witness,
+    /// Where a planted bug violates the property.
+    pub bypass: Bypass,
+}
+
+/// Where a planted bug violates a property.
+#[derive(Clone, Copy, Debug)]
+pub enum Bypass {
+    /// A test that runs a planted variant itself, as the race fixtures do.
+    Test(Witness),
+    /// A patch `qa/planted/<property>/<name>.patch`, which `cargo xtask
+    /// planted` applies to a scratch checkout. The name is without
+    /// `.patch`.
+    Planted(&'static str),
 }
 
 /// A test that runs a property, and the CI job that runs the test.
@@ -46,7 +57,7 @@ const fn race(property: &'static str, test: &'static str) -> Coverage {
     Coverage {
         property,
         passing: sim_test("tests/race_fixtures.rs", test),
-        bypass: sim_test("tests/race_fixtures.rs", test),
+        bypass: Bypass::Test(sim_test("tests/race_fixtures.rs", test)),
     }
 }
 
@@ -55,12 +66,15 @@ pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: super::NO_TASK_PANIC,
         passing: sim_test("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
-        bypass: sim_test("tests/harness.rs", "task_panic_violates_no_task_panic"),
+        bypass: Bypass::Test(sim_test(
+            "tests/harness.rs",
+            "task_panic_violates_no_task_panic",
+        )),
     },
     Coverage {
         property: crate::sim::NO_LIVELOCK,
         passing: sim_test("tests/harness.rs", "a_moving_clock_holds_no_livelock"),
-        bypass: sim_test("tests/harness.rs", "livelock_fires_before_budget"),
+        bypass: Bypass::Test(sim_test("tests/harness.rs", "livelock_fires_before_budget")),
     },
     race("race/lost-update", "lost_update"),
     race("race/snapshot-reserve", "snapshot_reserve"),
@@ -71,9 +85,6 @@ pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: sim_test("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
-        bypass: sim_test(
-            "tests/witness.rs",
-            "discovery_wait_complete_lost_wakeup_reverted",
-        ),
+        bypass: Bypass::Planted("lost-wakeup"),
     },
 ];

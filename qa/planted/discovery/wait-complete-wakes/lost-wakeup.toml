@@ -1,0 +1,4 @@
+# Puts back the `wait_complete` that checked for completion before creating
+# its `Notified`, so a final mark between the two is lost (S4.7). The input
+# holds the source at that point until the sink has run all three marks.
+input = "crates/zakura-sim/tests/fixtures/discovery-wait-complete.bin"

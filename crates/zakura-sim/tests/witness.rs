@@ -31,7 +31,10 @@ fn lost_wakeup(input: PlanInput) -> WitnessScenario<WaitComplete> {
 }
 
 /// S4.7: with the fix, the source wakes even when the final mark lands
-/// while it sits at its `notified`.
+/// while it's preempted in the waiting code. `cargo xtask planted
+/// discovery/wait-complete-wakes` checks that the same input violates the
+/// property with `qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch`
+/// applied.
 #[test]
 fn discovery_wait_complete_lost_wakeup() {
     check_witness(
@@ -41,22 +44,7 @@ fn discovery_wait_complete_lost_wakeup() {
     );
 }
 
-/// The regression, checked against the bug. CI's `sim-build` job applies
-/// `fixtures/discovery-wait-complete-revert.patch`, which puts the old
-/// `wait_complete` back, then runs this test by name. Unpatched, it fails,
-/// so it's ignored.
-#[test]
-#[ignore = "needs fixtures/discovery-wait-complete-revert.patch applied"]
-fn discovery_wait_complete_lost_wakeup_reverted() {
-    check_witness(
-        lost_wakeup(Plan::from_fuzz(INPUT)),
-        WAIT_COMPLETE_WAKES,
-        Expect::Violated,
-    );
-}
-
-/// Without the patch, the fixed code holds, so a test that expects the
-/// violation fails.
+/// The fixed code holds, so a test that expects the violation fails.
 #[test]
 fn violated_witness_fails_while_fixed() {
     assert_eq!(

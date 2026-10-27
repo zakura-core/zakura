@@ -265,6 +265,94 @@ pub enum StorageFact {
         #[serde(skip_serializing_if = "Option::is_none")]
         lease: Option<StorageLease>,
     },
+    /// Block operation `id` arrived, at its first stage if it holds one.
+    BlockSubmitted {
+        /// The operation's ID.
+        id: u64,
+        /// What it asks for.
+        request: StorageRequest,
+        /// Its first stage, such as `queued`, or `None` for a misbehavior
+        /// report, which holds nothing.
+        stage: Option<String>,
+    },
+    /// The apply limits admitted queued submission `id`.
+    Admitted {
+        /// The operation.
+        id: u64,
+    },
+    /// The run completed block operation `id`.
+    BlockCompleted {
+        /// The operation.
+        id: u64,
+        /// The outcome, as in its action identity.
+        outcome: String,
+        /// What it returned.
+        result: StorageResult,
+        /// Whether its reply reached block sync.
+        delivered: bool,
+        /// The engine's state version after it.
+        state_version: u64,
+    },
+    /// The driver took a later query, so block sync's query `query_id`
+    /// gets no reply.
+    Coalesced {
+        /// Block sync's query ID.
+        query_id: u64,
+    },
+    /// The engine installed a transition.
+    TransitionInstalled {
+        /// The state version after it.
+        state_version: u64,
+        /// The verified tip after it.
+        verified_best: StoragePoint,
+        /// The body-work epoch before it.
+        epoch_before: u64,
+        /// Whether it invalidated body work.
+        invalidates_body_work: bool,
+        /// The verified-chain change a commit sent: `grow`,
+        /// `checkpoint-finalized-grow` or `reset`.
+        cause: Option<String>,
+    },
+    /// Full state published a committed view.
+    ViewPublished {
+        /// Its state version.
+        state_version: u64,
+        /// Its body work epoch.
+        epoch: u64,
+        /// Its size hint revision.
+        hint_revision: u64,
+        /// Its verified tip.
+        verified_best: StoragePoint,
+        /// Its header tip.
+        header_best: StoragePoint,
+    },
+    /// Operation `id`'s reply reached block sync's handle.
+    ReplyDelivered {
+        /// The operation.
+        id: u64,
+    },
+    /// Block sync's handle was closed, so operation `id`'s reply was
+    /// dropped.
+    HandleClosed {
+        /// The operation.
+        id: u64,
+    },
+    /// A range read's caller took its reply.
+    ReadTaken {
+        /// The operation.
+        id: u64,
+    },
+    /// A range read's caller dropped its call after the reply was stored.
+    ReadDropped {
+        /// The operation.
+        id: u64,
+    },
+    /// A query's reply found block sync's handle closed, so the driver
+    /// returned, dropping these action operations.
+    DriverExited {
+        /// The operations dropped.
+        dropped: Vec<u64>,
+    },
     /// The service shut down, dropping these operations.
     ShutDown {
         /// The operations dropped.
@@ -275,7 +363,7 @@ pub enum StorageFact {
 /// A work owner with every field of its typed form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkOwner {
-    /// `header` or `body-repair`.
+    /// `header`, `body-repair`, or `body` for block sync's body work.
     pub kind: String,
     /// The scope it works in.
     #[serde(flatten)]
@@ -403,6 +491,57 @@ pub enum StorageRequest {
         /// The header asked about.
         hash: String,
     },
+    /// `QueryNeededBlocks`.
+    QueryNeededBlocks {
+        /// Block sync's query ID.
+        query_id: u64,
+        /// The first height.
+        from: u32,
+        /// The number of heights.
+        limit: u32,
+    },
+    /// `SubmitBlock`.
+    SubmitBlock {
+        /// The body work owner.
+        owner: WorkOwner,
+        /// The supplier.
+        source: String,
+        /// Block sync's apply token.
+        token: u64,
+        /// The coinbase height, if the body has one.
+        height: Option<u32>,
+        /// The block.
+        hash: String,
+        /// Its parent.
+        parent: String,
+        /// Its apply class, `checkpoint` or `full`.
+        class: String,
+    },
+    /// One of the body evidence records.
+    RecordBody {
+        /// The record, such as `record_body_invalid`.
+        record: String,
+        /// The state version block sync last saw.
+        expected_version: u64,
+        /// The header it's about.
+        hash: String,
+    },
+    /// `Misbehavior`.
+    Misbehavior {
+        /// The peer.
+        peer: String,
+        /// Why.
+        reason: String,
+    },
+    /// Serving's range read.
+    ReadRange {
+        /// The first height.
+        start_height: u32,
+        /// The most blocks.
+        count: u32,
+        /// The byte budget.
+        max_body_bytes: u32,
+    },
 }
 
 /// What an operation returned.
@@ -493,11 +632,83 @@ pub enum StorageResult {
     NotSelected,
     /// Not retained.
     NotRetained,
+    /// A queued submission went to the verifier.
+    Admitted,
+    /// A query's answer.
+    NeededBlocks {
+        /// The body anchor.
+        anchor: StoragePoint,
+        /// The missing bodies.
+        blocks: Vec<StoragePoint>,
+    },
+    /// A query's failure.
+    NeededBlocksFailed,
+    /// A submission's verdict.
+    Verdict {
+        /// The verdict, as in its action identity.
+        verdict: String,
+        /// The result block sync reads, such as `committed`.
+        reply: String,
+    },
+    /// A record's attempts, each `committed`, `no-change`, `stale`,
+    /// `resource-stalled` or `refused`.
+    Recorded {
+        /// The attempts, in order.
+        attempts: Vec<String>,
+    },
+    /// A record's state call failed.
+    RecordFailed,
+    /// A served range read.
+    Served {
+        /// The heights served.
+        heights: Vec<u32>,
+        /// Their bytes.
+        bytes: u64,
+    },
+    /// A failed range read.
+    ReadFailed,
 }
 
-/// A storage service's actual owner state.
+/// A storage service's actual owner state, in its service's shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct StorageState {
+#[serde(untagged)]
+pub enum StorageState {
+    /// Header storage's.
+    Header(HeaderStorageState),
+    /// Block storage's.
+    Block(BlockStorageState),
+}
+
+/// Block storage's actual owner state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockStorageState {
+    /// Every operation it holds.
+    pub operations: Vec<BlockOperation>,
+}
+
+/// One operation block storage holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BlockOperation {
+    /// Its ID.
+    pub id: u64,
+    /// What it asked for.
+    pub request: StorageRequest,
+    /// Where it is: `pending`, `queued`, `admitted` or `replied`.
+    pub stage: String,
+    /// For a pending operation, whether a range read's caller waits on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_waiting: Option<bool>,
+    /// For an admitted submission, whether a later copy replaced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<bool>,
+    /// The hash of the submitted block its request holds, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained: Option<String>,
+}
+
+/// Header storage's actual owner state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HeaderStorageState {
     /// Every operation not yet taken or dropped.
     pub operations: Vec<StorageOperation>,
     /// The operations whose permit storage holds.

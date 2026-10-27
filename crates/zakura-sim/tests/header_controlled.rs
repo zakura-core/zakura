@@ -29,7 +29,7 @@ use zakura_rt::sync::Semaphore;
 use zakura_scheduler::{SchedulerConfig, SimInstant, Status};
 use zakura_sim::{
     check::after_step,
-    observe::{StorageFact, StorageRequest, StorageResult},
+    observe::{StorageFact, StorageRequest, StorageResult, StorageState},
     property::{
         Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
         Source, Sources, Status as PropertyStatus, Verdict,
@@ -1249,7 +1249,10 @@ fn alter_fact(delivered: &mut [Observation]) {
 /// Changes the state, keeping its watermark.
 fn alter_state(delivered: &mut [Observation]) {
     if let Some(state) = delivered.iter_mut().find_map(|obs| match obs {
-        Observation::StorageState { state, .. } => Some(state),
+        Observation::StorageState {
+            state: StorageState::Header(state),
+            ..
+        } => Some(state),
         _ => None,
     }) {
         state.last_lease_id += 1;

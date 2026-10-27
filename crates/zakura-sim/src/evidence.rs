@@ -11,7 +11,9 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Weak};
 
-use zakura_storage::header::controlled::ControlledPort;
+use zakura_storage::{
+    block::controlled::ControlledBlockService, header::controlled::ControlledPort,
+};
 
 use crate::{
     observe::{reactor_entries, storage_entries},
@@ -63,6 +65,24 @@ impl LiveEvidence for ControlledPort {
     }
 }
 
+/// A controlled block service publishes storage facts.
+impl LiveEvidence for ControlledBlockService {
+    /// The service's last fact.
+    fn last_seq(&self) -> u64 {
+        ControlledBlockService::last_seq(self)
+    }
+
+    /// Whether the service refused a call outside the run it's bound to.
+    fn refused_outside_run(&self) -> bool {
+        ControlledBlockService::refused_outside_run(self)
+    }
+
+    /// Always healthy: a service that's gone has published nothing more.
+    fn health(&self) -> Option<&'static str> {
+        None
+    }
+}
+
 /// Which kind of evidence a checkpoint holds, which picks its index space
 /// and the log entries it's compared with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +101,16 @@ pub(crate) enum EvidenceKind {
 }
 
 impl EvidenceKind {
-    /// Whether `other` shares this kind's index space.
+    /// Whether `other` shares this kind's index space. Each storage service
+    /// numbers its own instances, so a run's first block storage is
+    /// `storage:block:…` however many header ports came before it.
     pub(crate) fn same_space(&self, other: &EvidenceKind) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match (self, other) {
+            (EvidenceKind::Storage { service }, EvidenceKind::Storage { service: other }) => {
+                service == other
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 
     /// The entries of `observations` that instance `instance` of this kind

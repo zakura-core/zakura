@@ -73,6 +73,13 @@ impl OpKind {
                 (OpKind::Apply, Some(owner.session_id))
             }
             StorageRequest::SelectedChainContains { .. } => (OpKind::Membership, None),
+            StorageRequest::QueryNeededBlocks { .. }
+            | StorageRequest::SubmitBlock { .. }
+            | StorageRequest::RecordBody { .. }
+            | StorageRequest::Misbehavior { .. }
+            | StorageRequest::ReadRange { .. } => {
+                unreachable!("a header node's storage logs only header requests")
+            }
         }
     }
 }

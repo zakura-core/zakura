@@ -181,8 +181,13 @@ fn assert_wakes(report: &RunReport) {
     assert_ne!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
     assert_eq!(report.cleanup.leaked, 0, "shutdown leaked no task");
     assert_eq!(report.end.violation, None);
+    let wakes = report
+        .properties
+        .iter()
+        .find(|r| r.property == PROPERTY)
+        .expect("the harness reports the property");
     assert!(
-        matches!(report.properties[0].outcome, PropertyOutcome::Held { applicable } if applicable > 0),
+        matches!(wakes.outcome, PropertyOutcome::Held { applicable } if applicable > 0),
         "the run reached the point the property checks: {:?}",
         report.properties
     );

@@ -28,11 +28,10 @@ use zakura_rt::{
 };
 use zakura_scheduler::{SchedulerConfig, Status};
 
-use super::Subsystem;
+use super::{registry_checker, Subsystem};
 use crate::{
     check::StepCtx,
-    property::{HasView, Status as PropertyStatus},
-    trace::meta::PropertyRef,
+    property::{Assumptions, HasView, Status as PropertyStatus, Tee},
     Checker, Observation, ObservationLog, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Sim,
     Violation,
 };
@@ -71,18 +70,18 @@ impl Subsystem for WaitComplete {
         WaitComplete
     }
 
-    /// [`WaitCompleteWakes`].
-    fn checker(_: &Rc<Self>, _: &Scenario) -> Box<dyn Checker> {
-        Box::new(WaitCompleteWakes::new())
+    /// The registry's checker, then [`WaitCompleteWakes`], which the
+    /// registry can't express yet.
+    fn checker(this: &Rc<Self>, assumptions: Assumptions<Self>) -> Box<dyn Checker> {
+        Box::new(Tee(
+            registry_checker(this, assumptions),
+            WaitCompleteWakes::new(),
+        ))
     }
 
-    /// [`PROPERTY`], active.
-    fn properties(_: &Scenario) -> Vec<PropertyRef> {
-        vec![PropertyRef {
-            id: PROPERTY.to_owned(),
-            status: PropertyStatus::Active,
-        }]
-    }
+    /// [`PROPERTY`], active, from [`WaitCompleteWakes`].
+    const UNREGISTERED: &'static [(&'static str, PropertyStatus)] =
+        &[(PROPERTY, PropertyStatus::Active)];
 
     /// The only scenario.
     fn draw(_: &[u8]) -> Scenario {
@@ -434,13 +433,13 @@ impl Checker for WaitCompleteWakes {
     /// never applicable.
     fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         let outcome = match &end.violation {
-            Some(violation) => PropertyOutcome::Violated {
+            Some(violation) if violation.property == PROPERTY => PropertyOutcome::Violated {
                 witness: violation.witness.clone(),
             },
-            None if self.applicable > 0 => PropertyOutcome::Held {
+            _ if self.applicable > 0 => PropertyOutcome::Held {
                 applicable: self.applicable,
             },
-            None => PropertyOutcome::NotApplicable,
+            _ => PropertyOutcome::NotApplicable,
         };
         vec![PropertyReport::new(PROPERTY, outcome)]
     }

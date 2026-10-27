@@ -2,8 +2,6 @@
 //! complete, and equal inputs write equal traces.
 #![cfg(zakura_sim)]
 
-use std::rc::Rc;
-
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use zakura_scheduler::SchedulerConfig;
@@ -11,8 +9,8 @@ use zakura_sim::{
     harness::{self, entry, record, HarnessEntry, RecordError, RecordInput, Subsystem, HARNESSES},
     property::HasView,
     record::OutcomeKind,
-    trace::{meta::PropertyRef, TraceReader, INPUT_FILE, TRACE_FILE},
-    Checker, NoChecks, RunConfig, Sim,
+    trace::{TraceReader, INPUT_FILE, TRACE_FILE},
+    RunConfig, Sim,
 };
 
 /// Fixed bytes for a recording: a scenario prefix for harnesses that have
@@ -64,16 +62,6 @@ impl Subsystem for Yielders {
             });
         }
         Yielders
-    }
-
-    /// Checks nothing.
-    fn checker(_: &Rc<Self>, _: &Tasks) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// None.
-    fn properties(_: &Tasks) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// One to four tasks.

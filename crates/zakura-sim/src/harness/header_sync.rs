@@ -1,7 +1,7 @@
 //! The header-sync smoke run: the reactor on the step loop, with inert
 //! storage and no peers.
 
-use std::{any::Any, rc::Rc, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
@@ -13,7 +13,7 @@ use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
-use crate::{property::HasView, trace::meta::PropertyRef, Checker, NoChecks, RunConfig, Sim};
+use crate::{property::HasView, RunConfig, Sim};
 
 /// The smoke run's scenario. It has no knobs yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,8 +21,8 @@ use crate::{property::HasView, trace::meta::PropertyRef, Checker, NoChecks, RunC
 pub struct Scenario {}
 
 /// The header-sync reactor at Regtest genesis, with inert storage and no
-/// peers. It checks nothing, so a run shows only that the reactor runs on a
-/// `Plan` and shuts down.
+/// peers. It checks only the step loop's properties, so a run shows that the
+/// reactor runs on a `Plan` and shuts down.
 pub struct Smoke {
     /// The reactor's handle and action channel. They live until the run
     /// ends, so the reactor doesn't see its inputs close.
@@ -32,7 +32,7 @@ pub struct Smoke {
 impl HasView for Smoke {
     type View = ();
 
-    /// Nothing, since the run checks nothing.
+    /// Nothing, since no property reads it.
     fn view(&self) {}
 }
 
@@ -68,16 +68,6 @@ impl Subsystem for Smoke {
         Smoke {
             _inputs: Box::new((handle, actions)),
         }
-    }
-
-    /// Checks nothing.
-    fn checker(_: &Rc<Self>, _: &Scenario) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// None.
-    fn properties(_: &Scenario) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The only scenario.

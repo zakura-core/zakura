@@ -33,10 +33,11 @@ use zakura_scheduler::{hooks, Op, Point, SchedulerConfig, Status, TaskExit};
 
 use super::Subsystem;
 use crate::{
-    property::{HasView, Status as PropertyStatus},
-    trace::meta::PropertyRef,
-    Checker, ObservationLog, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Sim, StepCtx,
-    Violation,
+    property::{
+        CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status as PropertyStatus,
+        Verdict,
+    },
+    RunConfig, Sim,
 };
 
 /// Which version of a fixture runs.
@@ -158,20 +159,23 @@ impl<F: Fixture> Subsystem for Race<F> {
         Race(F::spawn(sim, scenario.variant))
     }
 
-    /// A [`RaceChecker`] on the fixture's view.
-    fn checker(this: &Rc<Self>, _: &Scenario) -> Box<dyn Checker> {
-        Box::new(RaceChecker {
-            this: Rc::clone(this),
-            applicable: 0,
-        })
+    /// The fixture's one property, active: no race on its view.
+    fn properties() -> Vec<Property<Self>> {
+        vec![Property {
+            id: PropertyId::new(F::NAME),
+            claim: F::EXPECTED,
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View, Source::Schedule],
+            status: PropertyStatus::Active,
+            check: no_race::<F>,
+            witness: None,
+        }]
     }
 
-    /// The fixture's one property, active.
-    fn properties(_: &Scenario) -> Vec<PropertyRef> {
-        vec![PropertyRef {
-            id: F::NAME.to_owned(),
-            status: PropertyStatus::Active,
-        }]
+    /// The fixture's view and the step loop's task observations.
+    fn sources() -> Sources {
+        Sources::observed(&[Source::View, Source::Schedule])
     }
 
     /// Byte 0 picks the variant from [`Variant::ALL`], and byte 1's low bit
@@ -185,43 +189,15 @@ impl<F: Fixture> Subsystem for Race<F> {
     }
 }
 
-/// Checks a fixture's property after each step that leaves no task running.
-pub struct RaceChecker<F> {
-    this: Rc<Race<F>>,
-    /// Steps where the check applied.
-    applicable: u32,
-}
-
-impl<F: Fixture> Checker for RaceChecker<F> {
-    /// Fails the run once the fixture's view shows the race.
-    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        if cx.status == Status::Running {
-            return None;
-        }
-        self.applicable = self.applicable.saturating_add(1);
-        let actual = F::failure(&self.this.view(), cx.status)?;
-        Some(Violation {
-            property: F::NAME.to_owned(),
-            step: cx.step,
-            witness: vec![cx.step],
-            expected: F::EXPECTED.to_owned(),
-            actual,
-        })
+/// Checks a fixture's property after each step that leaves no task running:
+/// violated once the fixture's view shows the race.
+fn no_race<F: Fixture>(cx: &mut CheckCtx<'_, Race<F>>) -> Verdict {
+    if cx.status == Status::Running {
+        return Verdict::NotApplicable;
     }
-
-    /// Reports the property: violated, held at every applicable step, or
-    /// never applicable.
-    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
-        let outcome = match &end.violation {
-            Some(violation) if violation.property == F::NAME => PropertyOutcome::Violated {
-                witness: violation.witness.clone(),
-            },
-            _ if self.applicable > 0 => PropertyOutcome::Held {
-                applicable: self.applicable,
-            },
-            _ => PropertyOutcome::NotApplicable,
-        };
-        vec![PropertyReport::new(F::NAME, outcome)]
+    match F::failure(&cx.view(), cx.status) {
+        Some(actual) => cx.violated(F::EXPECTED, actual),
+        None => Verdict::Holds,
     }
 }
 

@@ -176,6 +176,20 @@ pub trait Checker {
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         None
     }
+
+    /// Whether the step loop's livelock limit applies after this step. A
+    /// checker returns false while a scenario's `BoundedAdversary`
+    /// assumption doesn't hold. The step loop then restarts its count, so
+    /// the limit covers only steps taken while the assumption holds.
+    fn bounds_livelock(&mut self) -> bool {
+        true
+    }
+
+    /// The step loop also found `violation`, at the step where this
+    /// checker's own violation ends the run. `end.violation` keeps the
+    /// checker's, so a checker that reports the step loop's properties
+    /// records this one itself.
+    fn step_loop_violation(&mut self, _violation: &Violation) {}
 }
 
 /// A checker that checks nothing.
@@ -230,5 +244,42 @@ where
 
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         (self.end)(end, log)
+    }
+}
+
+impl<C: Checker + ?Sized> Checker for Box<C> {
+    /// Forwards to the checker.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        (**self).after_step(cx)
+    }
+
+    /// Forwards to the checker.
+    fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
+        (**self).at_end(end, log)
+    }
+
+    /// Forwards to the checker.
+    fn events(&mut self) -> Vec<CheckEvent> {
+        (**self).events()
+    }
+
+    /// Forwards to the checker.
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        (**self).observe_events(events);
+    }
+
+    /// Forwards to the checker.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        (**self).harness_failure()
+    }
+
+    /// Forwards to the checker.
+    fn bounds_livelock(&mut self) -> bool {
+        (**self).bounds_livelock()
+    }
+
+    /// Forwards to the checker.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        (**self).step_loop_violation(violation);
     }
 }

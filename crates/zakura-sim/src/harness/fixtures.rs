@@ -159,7 +159,7 @@ impl<F: Fixture> Subsystem for Race<F> {
         Race(F::spawn(sim, scenario.variant))
     }
 
-    /// The fixture's one property, active: [`no_race`] on its view.
+    /// The fixture's one property, active: no race on its view.
     fn properties() -> Vec<Property<Self>> {
         vec![Property {
             id: PropertyId::new(F::NAME),

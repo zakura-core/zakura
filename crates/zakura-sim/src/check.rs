@@ -167,6 +167,12 @@ pub trait Checker {
     fn bounds_livelock(&mut self) -> bool {
         true
     }
+
+    /// The step loop also found `violation`, at the step where this
+    /// checker's own violation ends the run. `end.violation` keeps the
+    /// checker's, so a checker that reports the step loop's properties
+    /// records this one itself.
+    fn step_loop_violation(&mut self, _violation: &Violation) {}
 }
 
 /// A checker that checks nothing.
@@ -253,5 +259,10 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
     /// Forwards to the checker.
     fn bounds_livelock(&mut self) -> bool {
         (**self).bounds_livelock()
+    }
+
+    /// Forwards to the checker.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        (**self).step_loop_violation(violation);
     }
 }

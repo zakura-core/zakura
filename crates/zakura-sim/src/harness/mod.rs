@@ -474,4 +474,9 @@ impl Checker for Dyn<'_> {
     fn bounds_livelock(&mut self) -> bool {
         self.0.bounds_livelock()
     }
+
+    /// Forwards to the checker.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        self.0.step_loop_violation(violation);
+    }
 }

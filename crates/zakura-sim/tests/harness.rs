@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zakura_rt::{task::yield_now, time::sleep};
 use zakura_sim::{
+    check::{self, StepCtx, Violation},
     harness::{
         self,
         coverage::{Witness, COVERAGE},
@@ -309,6 +310,39 @@ fn a_run_reads_its_assumptions_once() {
     assert_eq!(READS.get(), 1);
 }
 
+/// Review (#1749): a spin past the limit at the step where another check
+/// ends the run still violates `sim/no-livelock`.
+#[test]
+fn a_spin_at_another_violations_step_is_still_reported() {
+    let spin = probe(Behavior::Spin)
+        .end
+        .violation
+        .expect("the spin is a livelock")
+        .step;
+    let mut other = check::after_step(|cx: &StepCtx<'_>| {
+        (cx.step == spin).then(|| Violation {
+            property: "test/other".to_owned(),
+            step: cx.step,
+            witness: vec![cx.step],
+            expected: "no failure at this step".to_owned(),
+            actual: "the test's own check failed".to_owned(),
+        })
+    });
+    let report = run_harness::<Probe>(
+        &Behavior::Spin,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        Some(&mut other),
+    )
+    .unwrap();
+    let ended = report.end.violation.as_ref().expect("the other check");
+    assert_eq!((ended.property.as_str(), ended.step), ("test/other", spin));
+    assert!(matches!(
+        outcome(&report, NO_LIVELOCK),
+        PropertyOutcome::Violated { witness } if *witness == [spin]
+    ));
+}
+
 #[test]
 fn a_moving_clock_holds_no_livelock() {
     let report = probe(Behavior::Sleep);
@@ -372,33 +406,94 @@ fn the_coverage_manifest_lists_every_reported_property() {
     assert_eq!(listed, reported);
 }
 
+/// Checks that `witness` is a test CI runs: `source` defines it once, the
+/// attributes directly above it include `#[test]` and no `#[cfg`, and an
+/// ignored one is named in `workflow`, the `tests-unit.yml` text.
+fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), String> {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let signature = format!("fn {}()", witness.test);
+    let mut defined = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(&signature));
+    let (at, _) = defined
+        .next()
+        .ok_or_else(|| format!("{} has no {}", witness.file, witness.test))?;
+    if defined.next().is_some() {
+        return Err(format!("{} defines {} twice", witness.file, witness.test));
+    }
+    let attributes: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
+        .filter(|line| line.starts_with("#["))
+        .copied()
+        .collect();
+    if !attributes
+        .iter()
+        .any(|a| *a == "#[test]" || a.starts_with("#[tokio::test"))
+    {
+        return Err(format!("{} isn't a test", witness.test));
+    }
+    if attributes.iter().any(|a| a.starts_with("#[cfg")) {
+        return Err(format!("{} is behind a cfg", witness.test));
+    }
+    if !workflow.contains(&format!("name: {}", witness.ci)) {
+        return Err(format!("no `{}` job", witness.ci));
+    }
+    let ignored = attributes.iter().any(|a| a.starts_with("#[ignore"));
+    if ignored && !workflow.contains(witness.test) {
+        return Err(format!("CI never runs the ignored {}", witness.test));
+    }
+    Ok(())
+}
+
 #[test]
 fn every_coverage_witness_exists_and_ci_runs_it() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
-    let check = |property: &str, witness: Witness| {
-        let source = std::fs::read_to_string(crate_dir.join(witness.file))
-            .unwrap_or_else(|error| panic!("{property}: {}: {error}", witness.file));
-        let at = source
-            .find(&format!("fn {}()", witness.test))
-            .unwrap_or_else(|| panic!("{property}: {} has no {}", witness.file, witness.test));
-        let attributes = source[..at].rsplit("#[test]").next().unwrap_or_default();
-        assert!(
-            workflow.contains(&format!("name: {}", witness.ci)),
-            "{property}: no `{}` job",
-            witness.ci
-        );
-        if attributes.contains("#[ignore") {
-            assert!(
-                workflow.contains(witness.test),
-                "{property}: CI never runs the ignored {}",
-                witness.test
-            );
-        }
-    };
     for row in COVERAGE {
-        check(row.property, row.passing);
-        check(row.property, row.bypass);
+        for witness in [row.passing, row.bypass] {
+            let source = std::fs::read_to_string(crate_dir.join(witness.file))
+                .unwrap_or_else(|error| panic!("{}: {}: {error}", row.property, witness.file));
+            if let Err(error) = witness_runs(&source, &workflow, witness) {
+                panic!("{}: {error}", row.property);
+            }
+        }
+    }
+}
+
+/// Review (#1749): the witness check refuses what only looks like a test.
+#[test]
+fn the_witness_check_refuses_lookalikes() {
+    let workflow = "name: zakura_sim build";
+    let witness = Witness {
+        file: "tests/fake.rs",
+        test: "witness",
+        ci: "zakura_sim build",
+    };
+    let check = |source: &str| witness_runs(source, workflow, witness);
+    assert_eq!(check("#[test]\nfn witness() {}"), Ok(()));
+    for (source, error) in [
+        ("fn witness() {}", "witness isn't a test"),
+        (
+            "#[test]\nfn other() {}\nfn witness() {}",
+            "witness isn't a test",
+        ),
+        (
+            "#[cfg(any())]\n#[test]\nfn witness() {}",
+            "witness is behind a cfg",
+        ),
+        (
+            "#[ignore]\n#[test]\nfn witness() {}",
+            "CI never runs the ignored witness",
+        ),
+        (
+            "#[test]\nfn witness() {}\n#[test]\nfn witness() {}",
+            "tests/fake.rs defines witness twice",
+        ),
+    ] {
+        assert_eq!(check(source), Err(error.to_owned()), "{source}");
     }
 }

@@ -1007,6 +1007,7 @@ fn replay_returns_the_violations_end_leaves_out() {
     let steps: Vec<(&str, Vec<u64>)> = report
         .properties
         .iter()
+        .filter(|r| !r.violations.is_empty())
         .map(|r| {
             let steps = r.violations.iter().map(|v| v.step).collect();
             (r.property.as_str(), steps)

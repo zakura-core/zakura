@@ -467,3 +467,77 @@ impl Checker for NodeChecks {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::{StorageRequest, StorageResult};
+
+    /// A submission of operation `id`.
+    fn submitted(id: u64) -> StorageFact {
+        StorageFact::Submitted {
+            id,
+            request: StorageRequest::ContinuationLocator,
+            digest: String::new(),
+        }
+    }
+
+    /// A completion of operation `id`.
+    fn completed(id: u64) -> StorageFact {
+        StorageFact::Completed {
+            id,
+            outcome: "engine".to_owned(),
+            result: StorageResult::NoLocator,
+            delivered: true,
+            generation: 0,
+            state: String::new(),
+        }
+    }
+
+    /// `check` on `facts` in order, with each fact's finding.
+    fn check_all(facts: &[StorageFact]) -> Vec<Option<(String, String)>> {
+        let mut checks = NodeChecks::new(DispatchFlag::default());
+        facts.iter().map(|fact| checks.check(fact)).collect()
+    }
+
+    /// The finding `check` reports.
+    fn finding(expected: &str, actual: &str) -> Option<(String, String)> {
+        Some((expected.to_owned(), actual.to_owned()))
+    }
+
+    /// No M4 run trips [`OPERATION_IDS`], so each of its branches gets a
+    /// hand-built fact sequence: a skipped submission, a completion before
+    /// its submission, and a second completion. In-order facts pass.
+    #[test]
+    fn check_reports_each_operation_id_violation() {
+        assert_eq!(
+            check_all(&[submitted(1), completed(1), submitted(2), completed(2)]),
+            [None, None, None, None]
+        );
+        assert_eq!(
+            check_all(&[submitted(1), submitted(3)]),
+            [
+                None,
+                finding("operation 2 submitted next", "operation 3 submitted")
+            ]
+        );
+        assert_eq!(
+            check_all(&[submitted(1), completed(2)]),
+            [
+                None,
+                finding(
+                    "a completion of a submitted operation, at most 1",
+                    "operation 2 completed before its submission"
+                )
+            ]
+        );
+        assert_eq!(
+            check_all(&[submitted(1), completed(1), completed(1)]),
+            [
+                None,
+                None,
+                finding("operation 1 completes once", "operation 1 completed again")
+            ]
+        );
+    }
+}

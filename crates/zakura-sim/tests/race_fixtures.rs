@@ -14,7 +14,7 @@ use zakura_sim::{
         },
         run_harness,
     },
-    MemorySink, Outcome, PlanInput, RunReport,
+    MemorySink, Outcome, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Inputs to try when a planted race must be found.
@@ -52,7 +52,15 @@ fn violations<F: Fixture>(variant: Variant, workers: u16, count: usize) -> usize
                     assert_eq!(violation.property, F::NAME);
                     true
                 }
-                None => false,
+                None => {
+                    // A passing run counts only if the check applied.
+                    let held = report.properties.iter().any(|r| {
+                        r.property == F::NAME
+                            && matches!(r.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
+                    });
+                    assert!(held, "{}: {:?}", F::NAME, report.properties);
+                    false
+                }
             }
         })
         .count()

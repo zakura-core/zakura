@@ -74,9 +74,12 @@ pub struct PropertyReport {
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
-    /// obligations, so the first alone can hide the rest. A check that fails
-    /// at consecutive evaluations contributes only the first of them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// obligations, so the first alone can hide the rest.
+    ///
+    /// The trace's `end` record leaves them out: their number grows with the
+    /// run, and a record has a size limit. A replay of the trace finds every
+    /// one again.
+    #[serde(skip)]
     pub violations: Vec<Violation>,
 }
 
@@ -155,6 +158,14 @@ pub trait Checker {
     /// failure.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         None
+    }
+
+    /// Whether the step loop's livelock limit applies after this step. A
+    /// checker returns false while a scenario's `BoundedAdversary`
+    /// assumption doesn't hold. The step loop then restarts its count, so
+    /// the limit covers only steps taken while the assumption holds.
+    fn bounds_livelock(&mut self) -> bool {
+        true
     }
 }
 

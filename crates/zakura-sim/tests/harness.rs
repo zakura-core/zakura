@@ -198,6 +198,62 @@ fn livelock_fires_before_budget() {
     ));
 }
 
+/// [`Probe`], but its `BoundedAdversary` assumption never holds.
+struct Unbounded;
+
+impl HasView for Unbounded {
+    type View = ();
+
+    /// Nothing.
+    fn view(&self) {}
+}
+
+impl Subsystem for Unbounded {
+    const NAME: &'static str = "test/unbounded";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Behavior;
+
+    fn config(behavior: &Behavior) -> RunConfig {
+        Probe::config(behavior)
+    }
+
+    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+        Probe::build(sim, behavior);
+        Unbounded
+    }
+
+    fn assumptions(behavior: &Behavior) -> Assumptions<Self> {
+        Assumptions::declare(Probe::assumptions(behavior).records().to_vec())
+            .holds_when(|_, _| false)
+    }
+
+    fn draw(_: &[u8]) -> Behavior {
+        Behavior::Spin
+    }
+}
+
+/// Review P1b-1: the livelock limit applies only while `BoundedAdversary`
+/// holds, so a spin while it doesn't is no violation, and the property
+/// reports that its assumption never held.
+#[test]
+fn livelock_waits_for_its_assumption() {
+    let report = run_harness::<Unbounded>(
+        &Behavior::Spin,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    assert_eq!(
+        *outcome(&report, NO_LIVELOCK),
+        PropertyOutcome::Inconclusive {
+            reason: "assumptions-never-held".to_owned()
+        }
+    );
+}
+
 #[test]
 fn a_moving_clock_holds_no_livelock() {
     let report = probe(Behavior::Sleep);

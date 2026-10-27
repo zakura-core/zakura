@@ -368,6 +368,10 @@ impl Sim {
             if let Some(failure) = self.failure.take().or_else(|| checker.harness_failure()) {
                 return st.end_harness(failure);
             }
+            // Steps taken while the checker suspends the limit don't count.
+            if !checker.bounds_livelock() {
+                at_instant = 0;
+            }
             let violation = violation.or_else(|| {
                 let spinning = phase == Phase::Live
                     && self.config.enforce_no_livelock
@@ -582,7 +586,8 @@ fn checked_reports(
             }
             witness.retain(in_run);
         }
-        for violation in &mut report.violations {
+        // A violation at a step the run didn't take is dropped whole.
+        report.violations.retain_mut(|violation| {
             let mut steps = std::iter::once(&violation.step).chain(&violation.witness);
             if let Some(&step) = steps.find(|step| !in_run(step)) {
                 failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
@@ -591,7 +596,8 @@ fn checked_reports(
                 });
             }
             violation.witness.retain(in_run);
-        }
+            in_run(&violation.step)
+        });
     }
     (reports, failure)
 }
@@ -629,7 +635,15 @@ fn end_record(
         drain: end.drain,
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
-        properties: properties.to_vec(),
+        // The record holds what the trace writes, which leaves out each
+        // report's violations, so a replay compares like with like.
+        properties: properties
+            .iter()
+            .map(|report| PropertyReport {
+                violations: Vec::new(),
+                ..report.clone()
+            })
+            .collect(),
     }
 }
 

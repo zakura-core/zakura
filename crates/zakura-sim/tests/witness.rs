@@ -59,8 +59,8 @@ fn violated_witness_fails_while_fixed() {
     );
 }
 
-/// A broken copy of S4.7 whose round-robin order runs the marks before the
-/// source waits: the property holds, but the run never reaches the race.
+/// A broken copy of S4.7 whose round-robin order parks the source before
+/// the final mark: the property holds, but the run never reaches the race.
 #[test]
 fn missed_trigger_history_fails() {
     assert_eq!(

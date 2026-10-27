@@ -3,7 +3,7 @@
 //! replacement (M4.3).
 //!
 //! A storage `Completed` only queues a reply, so callback isolation is read
-//! from Nora's reactor tap: the events between a call's `CallEnded` and its
+//! from the node's reactor tap: the events between a call's `CallEnded` and its
 //! `Handled`, the call's bracket, are what the reactor did with that reply.
 //! An event is ordered against storage facts by its storage watermark: it
 //! came after every fact numbered up to its `storage_seq`, and before every
@@ -79,7 +79,7 @@ impl Subsystem for Late {
         Storage::prepare(&scenario.storage)
     }
 
-    /// The storage harness, with Nora's reactor tapped.
+    /// The storage harness, with the node's reactor tapped.
     fn build(sim: &mut Sim, scenario: &Budgeted, ports: Ports) -> Self {
         Late(Rc::new(Storage::build(sim, &scenario.storage, ports)))
     }
@@ -128,12 +128,12 @@ fn run(scenario: &Budgeted, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
-/// What a checker saw of Nora's port after each step, from step 0.
+/// What a checker saw of the node's port after each step, from step 0.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
-    /// Her selected tip.
+    /// Its selected tip.
     tip: Frontier,
-    /// Her live leases.
+    /// Its live leases.
     leases: usize,
 }
 
@@ -232,28 +232,28 @@ fn control(peer: &str, action: ControlAction, when: Trigger) -> ControlStep {
     }
 }
 
-/// Closes Mira's first session once `close` holds, grows her chain from A5
-/// to A6 once it's closed, then relinks her on a fresh connection as
+/// Closes `mirror-0`'s first session once `close` holds, grows its chain
+/// from A5 to A6 once it's closed, then relinks it on a fresh connection as
 /// session 2, which offers A6.
 fn close_grow_relink(close: Trigger) -> Vec<ControlStep> {
     vec![
-        control("mira", ControlAction::Close, close),
+        control("mirror-0", ControlAction::Close, close),
         control(
-            "mira",
+            "mirror-0",
             ControlAction::Grow { len: 1 },
-            Trigger::Closed("mira".to_owned()),
+            Trigger::Closed("mirror-0".to_owned()),
         ),
         control(
-            "mira",
+            "mirror-0",
             ControlAction::Relink,
-            Trigger::Grown("mira".to_owned()),
+            Trigger::Grown("mirror-0".to_owned()),
         ),
     ]
 }
 
-/// Nora at genesis syncing from Mira at A5, converging apart from `holds`,
-/// with `controls`, over `budget` steps.
-fn nora_and_mira(holds: Vec<Hold>, controls: Vec<ControlStep>, budget: u64) -> Budgeted {
+/// The node at genesis syncing from `mirror-0` at A5, converging apart from
+/// `holds`, with `controls`, over `budget` steps.
+fn node_and_mirror(holds: Vec<Hold>, controls: Vec<ControlStep>, budget: u64) -> Budgeted {
     Budgeted {
         storage: StorageScenario {
             policy: Policy {
@@ -278,7 +278,7 @@ fn hex(hash: zakura_chain::block::Hash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Nora's header generation before any run: her port starts at genesis or
+/// The node's header generation before any run: its port starts at genesis or
 /// at a preloaded chain, which `generation` counts.
 fn initial_generation(ports: &Ports) -> u64 {
     ports.node.engine().snapshot().header_generation.get()
@@ -286,12 +286,12 @@ fn initial_generation(ports: &Ports) -> u64 {
 
 // History.
 
-/// One entry of Nora's history.
+/// One entry of the node's history.
 #[derive(Clone, Copy, Debug)]
 enum Item<'r> {
-    /// A fact of her storage, with its number.
+    /// A fact of its storage, with its number.
     Fact(u64, &'r StorageFact),
-    /// An event of her reactor, with its storage watermark.
+    /// An event of its reactor, with its storage watermark.
     Event(u64, &'r ReactorFact),
 }
 
@@ -303,7 +303,7 @@ struct Line<'r> {
     item: Item<'r>,
 }
 
-/// One of Nora's storage operations, at its submission.
+/// One of the node's storage operations, at its submission.
 #[derive(Clone, Copy, Debug)]
 struct Op<'r> {
     kind: OpKind,
@@ -324,7 +324,7 @@ struct Done<'r> {
     generation: u64,
 }
 
-/// One of Nora's port calls, by the indexes of its events in the history.
+/// One of the node's port calls, by the indexes of its events in the history.
 #[derive(Clone, Copy, Debug)]
 struct Call<'r> {
     kind: OpKind,
@@ -346,15 +346,16 @@ struct Retirement<'r> {
     reason: &'r str,
 }
 
-/// Nora's storage facts and reactor events, in log order.
+/// The node's storage facts and reactor events, in log order.
 struct History<'r> {
     lines: Vec<Line<'r>>,
-    /// Her engine's header generation before the run.
+    /// Its engine's header generation before the run.
     initial_generation: u64,
 }
 
 impl<'r> History<'r> {
-    /// Nora's history in `report`, whose port started at `initial_generation`.
+    /// The node's history in `report`, whose port started at
+    /// `initial_generation`.
     fn new(report: &'r RunReport, initial_generation: u64) -> Self {
         let mut at = Duration::ZERO;
         let mut lines = Vec::new();
@@ -695,19 +696,19 @@ fn committed(history: &History<'_>, done: &Done<'_>) -> bool {
 
 // M4.3: late replies after a timeout.
 
-/// Nora's first locator is held until its own caller has dropped it and
+/// The node's first locator is held until its own caller has dropped it and
 /// 1 ms more. Time moves only once no task is ready, so by then the reactor
-/// has handled the timeout and asked for Mira's locator again, and that
+/// has handled the timeout and asked for `mirror-0`'s locator again, and that
 /// second locator waits for the first to complete. The reactor's timeout
 /// ends the first call `timed-out`, paired with its operation's
 /// `CallerDropped` at its submission plus the startup's request timeout.
 /// The late completion then reaches no caller, though a newer one waits,
 /// and the later locator call, paired with a later operation, starts
-/// Mira's request inside its bracket.
+/// `mirror-0`'s request inside its bracket.
 #[test]
 fn timed_out_locator_reply_is_dropped() {
     let timeout = request_timeout();
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![
             hold(
                 Select::nth(OpKind::Locator, 1),
@@ -735,7 +736,7 @@ fn timed_out_locator_reply_is_dropped() {
         let (report, ports) = run(&scenario, input);
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
-        let first = nth(&ops, OpKind::Locator, 1).expect("Nora submitted a locator");
+        let first = nth(&ops, OpKind::Locator, 1).expect("the node submitted a locator");
         let (number, call) = history
             .call_of(first)
             .expect("the first locator's call is paired with it");
@@ -750,7 +751,7 @@ fn timed_out_locator_reply_is_dropped() {
         let late = history.completions()[&first];
         assert!(late.seq > seq, "it completed after the drop");
         assert!(!late.delivered, "the late reply reached no caller");
-        let second = nth(&ops, OpKind::Locator, 2).expect("Nora asked for a locator again");
+        let second = nth(&ops, OpKind::Locator, 2).expect("the node asked for a locator again");
         assert!(
             ops[&second].seq < late.seq && history.completions()[&second].seq > late.seq,
             "a newer locator was waiting at the late completion"
@@ -762,7 +763,7 @@ fn timed_out_locator_reply_is_dropped() {
             .find(|(later, call)| {
                 *later > number && call.kind == OpKind::Locator && call.session == 1
             })
-            .expect("Nora asked for Mira's locator again");
+            .expect("the node asked for mirror-0's locator again");
         let (.., end, op) = later.ended.expect("the later locator call ended");
         assert_eq!(end, "replied");
         assert_eq!(op, Some(second), "paired with the newer operation");
@@ -771,7 +772,7 @@ fn timed_out_locator_reply_is_dropped() {
                 event,
                 ReactorFact::Started { request, .. } if request.session_id == 1
             )),
-            "the later locator's bracket starts Mira's request"
+            "the later locator's bracket starts mirror-0's request"
         );
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
@@ -782,22 +783,22 @@ fn timed_out_locator_reply_is_dropped() {
 
 // M4.3: a session closes while its apply is pending.
 
-/// Nora's apply for Mira's session 1 is held until that session's link has
-/// closed and session 2's locator is submitted, then commits. Session 2's
-/// applies wait for it. At the close the reactor retires session 1's
+/// The node's apply for `mirror-0`'s session 1 is held until that session's
+/// link has closed and session 2's locator is submitted, then commits. Session
+/// 2's applies wait for it. At the close the reactor retires session 1's
 /// applying request, but its apply still commits: at its completion the
-/// generation, unchanged since its submission, rises by one, and Nora's tip
-/// is the target, and the reactor handles its reply. Session 2's requests
-/// end admitted in their own apply's bracket, or made obsolete by a commit,
-/// and Nora reaches Mira's grown tip A6.
+/// generation, unchanged since its submission, rises by one, and the node's tip
+/// is the target, and the reactor handles its reply. Session 2's requests end
+/// admitted in their own apply's bracket, or made obsolete by a commit, and the
+/// node reaches `mirror-0`'s grown tip A6.
 #[test]
 fn apply_pending_at_close_still_commits() {
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![
             hold(
                 of(OpKind::Apply, 1),
                 Trigger::All(vec![
-                    Trigger::Closed("mira".to_owned()),
+                    Trigger::Closed("mirror-0".to_owned()),
                     Trigger::Submitted(Select::nth(OpKind::Locator, 2)),
                 ]),
                 Allow::Engine,
@@ -839,7 +840,7 @@ fn apply_pending_at_close_still_commits() {
         assert_eq!(
             watch.at(done.step).tip,
             main_tip(5),
-            "Nora's tip is its target"
+            "the node's tip is its target"
         );
         let (_, call) = history
             .call_of(old)
@@ -884,18 +885,17 @@ fn apply_pending_at_close_still_commits() {
     }
 }
 
-/// Nora's apply for Mira's session 1 is held until session 2's apply is
-/// submitted, which puts session 2 in Applying, then fails with
-/// `local-resource`, which commits nothing. Session 2's apply is held until
-/// the reactor has handled the old one. The old failure lands on nothing:
-/// session 2 started before the old call ended, the old bracket retires
-/// and dispatches nothing, the generation doesn't move, and session 2 isn't
-/// retired until its own apply commits. Then it ends admitted in its own
-/// bracket or obsolete by that commit, and Nora reaches A6 without starting
-/// another request.
+/// The node's apply for `mirror-0`'s session 1 is held until session 2's apply
+/// is submitted, which puts session 2 in Applying, then fails with
+/// `local-resource`, which commits nothing. Session 2's apply is held until the
+/// reactor has handled the old one. The old failure lands on nothing: session 2
+/// started before the old call ended, the old bracket retires and dispatches
+/// nothing, the generation doesn't move, and session 2 isn't retired until its
+/// own apply commits. Then it ends admitted in its own bracket or obsolete by
+/// that commit, and the node reaches A6 without starting another request.
 #[test]
 fn old_apply_failure_leaves_the_applying_replacement_alone() {
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![
             hold(
                 of(OpKind::Apply, 1),
@@ -978,7 +978,7 @@ fn old_apply_failure_leaves_the_applying_replacement_alone() {
                 .starts()
                 .iter()
                 .all(|(index, _)| *index <= started[0]),
-            "no request for Mira after session 2's"
+            "no request for mirror-0 after session 2's"
         );
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
@@ -996,34 +996,34 @@ fn pick_after(report: &RunReport, after: u64, pred: impl Fn(&str) -> bool) -> Op
         .map(|pick| pick.step)
 }
 
-/// Nora's reactor task, the first one spawned. Each step that logged one
-/// of her reactor's events picked it, which the test checks.
-const NORA_REACTOR: &str = "task:header_sync_reactor.1:";
+/// The node's reactor task, the first one spawned. Each step that logged one
+/// of its reactor's events picked it, which the test checks.
+const NODE_REACTOR: &str = "task:header_sync_reactor.1:";
 
-/// Mira's link closes as soon as Nora's apply has committed. Whichever the
-/// reactor takes first, the ready apply or the disconnect, the commit
-/// stays: the generation never falls, Nora's tip stays A5 from the commit
-/// to the end, and no second apply of A5 appears after Mira relinks. Some
-/// plan closes the link before Nora's reactor runs again.
+/// `mirror-0`'s link closes as soon as the node's apply has committed.
+/// Whichever the reactor takes first, the ready apply or the disconnect, the
+/// commit stays: the generation never falls, the node's tip stays A5 from the
+/// commit to the end, and no second apply of A5 appears after `mirror-0`
+/// relinks. Some plan closes the link before the node's reactor runs again.
 #[test]
 fn apply_committed_before_close_stays_committed() {
-    let mut scenario = nora_and_mira(
+    let mut scenario = node_and_mirror(
         Vec::new(),
         vec![
             control(
-                "mira",
+                "mirror-0",
                 ControlAction::Close,
                 Trigger::Completed(Select::nth(OpKind::Apply, 1)),
             ),
             control(
-                "mira",
+                "mirror-0",
                 ControlAction::Relink,
-                Trigger::Closed("mira".to_owned()),
+                Trigger::Closed("mirror-0".to_owned()),
             ),
         ],
         4_000,
     );
-    // The control task needs a free worker to close the link before Nora's
+    // The control task needs a free worker to close the link before the node's
     // reactor runs again, and two can both be busy.
     scenario.workers = 4;
     let a5 = main_tip(5);
@@ -1040,7 +1040,7 @@ fn apply_committed_before_close_stays_committed() {
                 .iter()
                 .find(|pick| pick.step == line.step)
                 .expect("each event's step has a pick");
-            assert!(pick.identity.starts_with(NORA_REACTOR), "{pick:?}");
+            assert!(pick.identity.starts_with(NODE_REACTOR), "{pick:?}");
         }
         let ops = history.ops();
         let applies: Vec<u64> = ops
@@ -1062,12 +1062,12 @@ fn apply_committed_before_close_stays_committed() {
         }
         assert!(never_falls(&history), "the generation never falls");
 
-        let picked = pick_after(&report, done.step, |pick| pick == "peer:mira:close")
+        let picked = pick_after(&report, done.step, |pick| pick == "peer:mirror-0:close")
             .expect("the close is picked after the commit");
         // The relink is offered from the step after the one whose task
         // closed the link, since `Closed` counts the effect.
         let closed = watch
-            .first_offered("peer:mira:relink")
+            .first_offered("peer:mirror-0:relink")
             .expect("the link closed")
             - 1;
         assert!(closed > picked);
@@ -1094,30 +1094,30 @@ fn apply_committed_before_close_stays_committed() {
             "both ends of the closed connection's pipes exit"
         );
         let reactor_between = report.picks.iter().any(|pick| {
-            pick.step > done.step && pick.step < closed && pick.identity.starts_with(NORA_REACTOR)
+            pick.step > done.step && pick.step < closed && pick.identity.starts_with(NODE_REACTOR)
         });
         close_first += usize::from(!reactor_between);
     }
     assert!(
         close_first > 0,
-        "no plan closed the link before Nora's reactor ran after the commit"
+        "no plan closed the link before the node's reactor ran after the commit"
     );
 }
 
 // M4.3: a replacement while a prepare is pending.
 
-/// Nora's prepare for Mira's session 1 is held until session 2's prepare is
-/// submitted. Mira relinks as session 2 once the old prepare is submitted,
-/// which replaces session 1. Session 2's prepare and applies are held until
-/// the reactor has handled the old prepare, so no newer commit decides the
-/// old result. The old result is inert: session 2 started before the old
-/// call ended, the old bracket dispatches no apply and retires nothing, no
-/// apply ever carries session 1, session 2 isn't retired before its own
-/// commit, and Nora converges without another request for Mira.
+/// The node's prepare for `mirror-0`'s session 1 is held until session 2's
+/// prepare is submitted. `mirror-0` relinks as session 2 once the old prepare
+/// is submitted, which replaces session 1. Session 2's prepare and applies are
+/// held until the reactor has handled the old prepare, so no newer commit
+/// decides the old result. The old result is inert: session 2 started before
+/// the old call ended, the old bracket dispatches no apply and retires nothing,
+/// no apply ever carries session 1, session 2 isn't retired before its own
+/// commit, and the node converges without another request for `mirror-0`.
 #[test]
 fn prepare_completed_after_replacement_is_inert() {
     let handled = Trigger::Handled(of(OpKind::Prepare, 1));
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![
             hold(
                 of(OpKind::Prepare, 1),
@@ -1145,7 +1145,7 @@ fn prepare_completed_after_replacement_is_inert() {
             ),
         ],
         vec![control(
-            "mira",
+            "mirror-0",
             ControlAction::Relink,
             Trigger::Submitted(of(OpKind::Prepare, 1)),
         )],
@@ -1165,8 +1165,8 @@ fn prepare_completed_after_replacement_is_inert() {
         let relinked = report
             .picks
             .iter()
-            .find(|pick| pick.identity == "peer:mira:relink")
-            .expect("Mira relinks");
+            .find(|pick| pick.identity == "peer:mirror-0:relink")
+            .expect("mirror-0 relinks");
         let relinked_at = history
             .lines
             .iter()
@@ -1175,7 +1175,7 @@ fn prepare_completed_after_replacement_is_inert() {
             .map_or(Duration::ZERO, |line| line.at);
         assert!(
             relinked_at - ops[&old].at < timeout,
-            "Mira relinked within 30 s of the old prepare"
+            "mirror-0 relinked within 30 s of the old prepare"
         );
         let started: Vec<usize> = history
             .starts()
@@ -1224,7 +1224,7 @@ fn prepare_completed_after_replacement_is_inert() {
                 .starts()
                 .iter()
                 .all(|(index, _)| *index <= started[0]),
-            "no request for Mira after session 2's"
+            "no request for mirror-0 after session 2's"
         );
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
@@ -1235,10 +1235,11 @@ fn prepare_completed_after_replacement_is_inert() {
 
 // M4.3: a stale release.
 
-/// Nora serves Leo. Her publisher's read on Leo's first lease, L1, fails,
-/// so it releases L1, and that release is held until Leo's session 2 has
-/// acquired. Leo's link closes once the release is submitted, then he
-/// relinks, and session 2's acquire waits past L1's 30 s idle deadline.
+/// The node serves `mirror-0`. Its publisher's read on `mirror-0`'s first
+/// lease, L1, fails, so it releases L1, and that release is held until
+/// `mirror-0`'s session 2 has acquired. `mirror-0`'s link closes once the
+/// release is submitted, then it relinks, and session 2's acquire waits past
+/// L1's 30 s idle deadline.
 /// That acquire sweeps L1 as idle and leaves one live lease, its own L2.
 /// The stale release then completes, ends no lease and leaves the count at
 /// one. L2's read waits for that.
@@ -1248,7 +1249,6 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
         storage: StorageScenario {
             node: Chain::main(3),
             mirrors: vec![MirrorSpec {
-                name: "leo".to_owned(),
                 chain: Chain::default(),
                 dialer: Dialer::Node,
             }],
@@ -1287,14 +1287,14 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
             },
             controls: vec![
                 control(
-                    "leo",
+                    "mirror-0",
                     ControlAction::Close,
                     Trigger::Submitted(of(OpKind::Release, 1)),
                 ),
                 control(
-                    "leo",
+                    "mirror-0",
                     ControlAction::Relink,
-                    Trigger::Closed("leo".to_owned()),
+                    Trigger::Closed("mirror-0".to_owned()),
                 ),
             ],
         },
@@ -1366,7 +1366,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
                 )
             })
             .map(|(id, _)| *id)
-            .expect("Leo read L2");
+            .expect("mirror-0 read L2");
         assert!(completions[&read].seq > stale.seq, "L2's read waited");
     }
 }

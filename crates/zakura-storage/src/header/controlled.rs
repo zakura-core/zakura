@@ -569,7 +569,18 @@ impl ControlledPort {
     ///
     /// Refuses, changing nothing, if `id` isn't pending or the contract
     /// doesn't allow `outcome` now.
+    ///
+    /// Only the run completes operations, outside any task: the engine's
+    /// locks, the permit drop and the waiter signals are scheduling points
+    /// between the change and its publish, which a task could interleave.
     pub fn complete(&self, id: OpId, outcome: Outcome) -> Result<Completion, CompleteError> {
+        #[cfg(zakura_sim)]
+        debug_assert!(
+            zakura_rt::sim::executor()
+                .and_then(|executor| executor.current_task())
+                .is_none(),
+            "only the run completes a controlled port's operations"
+        );
         let now = Instant::now();
         let key = self.engine.adapter_key();
         let (request, early, permit, txn) = {

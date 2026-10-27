@@ -385,3 +385,26 @@ fn an_unknown_owner_outranks_an_illegal_head() {
         })
     );
 }
+
+/// A release's head that omits the lease end its facts record disagrees
+/// with them.
+#[test]
+fn a_head_without_its_lease_end_is_an_unexpected_effect() {
+    let (port, chain) = chain(1);
+    let mut facts = lease_and_release(&port, chain[0]);
+    let head = facts
+        .iter()
+        .rposition(|fact| matches!(&fact.kind, FactKind::Completed(c) if !c.lease_ends.is_empty()))
+        .expect("the release ends its lease");
+    let FactKind::Completed(completion) = &mut facts[head].kind else {
+        unreachable!("the head was matched above");
+    };
+    completion.lease_ends.clear();
+    assert_eq!(
+        OwnerModel::new().apply(&facts),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: facts[head].txn,
+            found: facts[head].kind.clone(),
+        })
+    );
+}

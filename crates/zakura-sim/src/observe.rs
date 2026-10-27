@@ -353,14 +353,6 @@ pub enum StorageFact {
         /// The operation.
         id: u64,
     },
-    /// The engine refused to commit operation `id`'s body, which block
-    /// sync recorded invalid.
-    CommitRefused {
-        /// The operation.
-        id: u64,
-        /// Its body.
-        hash: String,
-    },
     /// A query's reply found block sync's handle closed, so the driver
     /// returned, dropping these action operations and deferred actions.
     DriverExited {

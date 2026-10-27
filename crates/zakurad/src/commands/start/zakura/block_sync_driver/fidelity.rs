@@ -171,7 +171,12 @@ impl DriverRun {
     /// give it. The runtime has one thread, so the driver runs only here.
     /// zakura-state answers on its own threads, so this also waits until
     /// it has answered every call.
+    ///
+    /// # Panics
+    ///
+    /// If zakura-state still has calls in flight after 10 s.
     async fn settle(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             for _ in 0..256 {
                 tokio::task::yield_now().await;
@@ -179,6 +184,10 @@ impl DriverRun {
             if self.shared.in_flight.load(Ordering::SeqCst) == 0 {
                 return;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "zakura-state answers every call within 10 s"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
@@ -280,12 +289,21 @@ fn moved_anchor(
     metadata
 }
 
-/// Counts `call` in flight until zakura-state answers it.
+/// Counts `call` in flight until zakura-state answers it or the driver
+/// drops it, as its deadline does.
 async fn counted<T>(shared: &Shared, call: impl std::future::Future<Output = T>) -> T {
+    /// Ends one call's count when dropped.
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     shared.in_flight.fetch_add(1, Ordering::SeqCst);
-    let answer = call.await;
-    shared.in_flight.fetch_sub(1, Ordering::SeqCst);
-    answer
+    let _in_flight = InFlight(&shared.in_flight);
+    call.await
 }
 
 /// State reads, from zakura-state.
@@ -573,4 +591,18 @@ async fn the_driver_and_the_controlled_service_agree_on_every_case() {
             );
         }
     }
+}
+
+/// A state call the driver drops, as its deadline does, ends its count, so
+/// `settle` doesn't wait for it.
+#[test]
+fn a_dropped_state_call_ends_its_count() {
+    use futures::FutureExt;
+
+    let shared = Shared::default();
+    let mut call = Box::pin(counted(&shared, std::future::pending::<()>()));
+    assert!((&mut call).now_or_never().is_none());
+    assert_eq!(shared.in_flight.load(Ordering::SeqCst), 1);
+    drop(call);
+    assert_eq!(shared.in_flight.load(Ordering::SeqCst), 0);
 }

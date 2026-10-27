@@ -18,7 +18,7 @@ use zakura_header_chain::TransientBodyFailureKind;
 use zakura_network::zakura::BlockApplyResult;
 use zakura_scheduler::SimInstant;
 use zakura_storage::block::{
-    controlled::{CompleteError, ControlledBlockService, Fact, FactKind, OpId},
+    controlled::{ControlledBlockService, Fact, FactKind, OpId},
     evidence::{
         OperationStage, OwnerModel, OwnerState, RecordResult, RequestIdentity, ResultIdentity,
     },
@@ -353,10 +353,6 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::Deferred { queue } => StorageFact::Deferred {
             queue: queue.iter().map(request).collect(),
         },
-        FactKind::CommitRefused { id, hash: refused } => StorageFact::CommitRefused {
-            id: id.0,
-            hash: hash(refused),
-        },
         FactKind::TransitionInstalled {
             state_version,
             verified_best,
@@ -457,11 +453,9 @@ impl ActionSource for BlockStorage {
     fn execute(&mut self, local: u64, _: &mut ObservationLog) {
         let (id, outcome) = decode(local);
         match self.service.complete(id, outcome) {
-            // The contract doesn't track records, so `enabled` offers the
-            // commit of a body recorded invalid. The engine refuses it, as
-            // zakura-state does, the service logs the refusal as a fact,
-            // and the run picks again.
-            Ok(_) | Err(CompleteError::RecordedInvalid(_)) => {}
+            // An engine refusal completes as a `Storage` retry, so only an
+            // incoherent commit errs, which fixture chains never make.
+            Ok(_) => {}
             Err(error) => panic!("`enabled` offered this completion at this step: {error}"),
         }
     }

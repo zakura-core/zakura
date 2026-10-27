@@ -1483,43 +1483,36 @@ fn a_record_the_driver_would_fail_closed_on_panics() {
     harness.service.complete(record, BlockOutcome::Apply).ok();
 }
 
-/// ST4.7: the engine refuses to commit a body block sync recorded invalid,
-/// as zakura-state does. The service logs the refusal as a fact, the owner
-/// model accepts it, and nothing else changes.
+/// ST4.4: the engine refuses to commit a body block sync recorded invalid.
+/// zakura-state reports the refusal as `HeaderChainError`, so the verdict
+/// completes as a `Storage` retry and commits nothing.
 #[test]
-fn a_commit_of_a_body_recorded_invalid_is_refused_and_logged() {
+fn a_commit_of_a_body_recorded_invalid_reports_a_storage_retry() {
     let mut harness = Harness::new();
     let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
-    let hash = blocks[0].hash();
     let id = harness.submit(&blocks[0]);
     harness.complete(id, BlockOutcome::Admit);
     let record = harness.record_invalid(&blocks[0]);
     harness.complete(record, BlockOutcome::Apply);
     harness.replies.take();
-    assert!(harness.enabled(id).contains(&COMMITTED));
+    let before = (harness.engine.snapshot(), harness.engine.view());
 
-    let before = (
-        harness.service.owner_state().operations,
-        harness.engine.snapshot(),
-        harness.engine.view(),
+    let completion = harness.complete(id, COMMITTED);
+    assert_eq!(
+        completion.result,
+        ResultIdentity::Verdict {
+            verdict: Verdict::Retryable(RetryKind::Storage),
+            result: BlockApplyResult::Unavailable,
+        }
     );
-    let refused = harness.service.complete(id, COMMITTED);
-    assert!(
-        matches!(refused, Err(CompleteError::RecordedInvalid(refused)) if refused == hash),
-        "{refused:?}"
-    );
-    assert_eq!(harness.facts(), [FactKind::CommitRefused { id, hash }]);
     assert_eq!(
         before,
-        (
-            harness.service.owner_state().operations,
-            harness.engine.snapshot(),
-            harness.engine.view(),
-        ),
-        "the refusal changes nothing but the log"
+        (harness.engine.snapshot(), harness.engine.view()),
+        "the refused commit changes no state"
     );
-    assert!(harness.replies.take().is_empty());
-
-    // A verdict that commits nothing still completes it.
-    harness.complete(id, BlockOutcome::Verdict(Verdict::ConsensusInvalid));
+    assert!(harness.service.owner_state().operations.is_empty());
+    assert!(matches!(
+        harness.replies.take().as_slice(),
+        [HandleEvent::ApplyFinished { .. }]
+    ));
 }

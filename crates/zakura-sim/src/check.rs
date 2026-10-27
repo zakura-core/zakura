@@ -74,7 +74,8 @@ pub struct PropertyReport {
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
-    /// obligations, so the first alone can hide the rest.
+    /// obligations, so the first alone can hide the rest. A check that fails
+    /// at consecutive evaluations contributes only the first of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<Violation>,
 }
@@ -149,8 +150,9 @@ pub trait Checker {
     fn observe_events(&mut self, _events: &[CheckEvent]) {}
 
     /// A harness failure the checker found, such as a source a property
-    /// needs that the harness lacks, or a stale view. The run calls it after
-    /// every step and before `at_end`, and ends at the first failure.
+    /// needs that the harness lacks, or a stale view. The run calls it
+    /// before the first step and after every step, and ends at the first
+    /// failure.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         None
     }

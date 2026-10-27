@@ -1101,7 +1101,7 @@ fn missing_source_fails_the_harness() {
             source: "Frames".to_owned(),
         })
     );
-    assert_eq!(report.end.steps, 1, "the first step's boundary reports it");
+    assert_eq!(report.end.steps, 0, "the run fails before its first step");
 }
 
 /// P1 follow-up: a check that reads the view must see the state at the
@@ -1500,8 +1500,9 @@ fn known_and_active_failures_at_one_boundary() {
     }
 }
 
-/// P1 follow-up: a `Known` property that keeps failing keeps every
-/// violation, not only its first.
+/// P1 follow-up: a `Known` property that fails, recovers, and fails again
+/// keeps both violations. Consecutive failing evaluations keep only their
+/// first, so a state that stays broken doesn't grow the report every step.
 #[test]
 fn every_violation_retained() {
     let world = honest();
@@ -1515,12 +1516,18 @@ fn every_violation_retained() {
                 bump(&task_world);
                 task::yield_now().await;
                 bump(&task_world);
+                task::yield_now().await;
+                task_world.level.set(0);
+                task::yield_now().await;
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
             });
         },
     );
     let violations = &property_report(&report, &LEVEL).violations;
     let actual: Vec<&str> = violations.iter().map(|v| v.actual.as_str()).collect();
-    assert_eq!(actual, ["level 1", "level 2"]);
+    assert_eq!(actual, ["level 1", "level 1"]);
     assert_eq!(
         outcome(&report, &LEVEL),
         PropertyOutcome::Violated {

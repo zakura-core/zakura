@@ -191,7 +191,7 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
 /// budget ends the run.
 pub fn run_config<S: Subsystem>(scenario: &S::Scenario) -> RunConfig {
     let mut config = S::config(scenario);
-    if enforces_no_livelock(&S::assumptions(scenario)) {
+    if S::assumptions(scenario).declares(Assume::BoundedAdversary) {
         config.enforce_no_livelock = true;
         config.max_steps_per_instant = config
             .max_steps_per_instant
@@ -200,20 +200,16 @@ pub fn run_config<S: Subsystem>(scenario: &S::Scenario) -> RunConfig {
     config
 }
 
-/// True if a scenario that declares `assumptions` enforces [`NO_LIVELOCK`].
-fn enforces_no_livelock<S>(assumptions: &Assumptions<S>) -> bool {
-    assumptions.declares(Assume::BoundedAdversary)
-}
-
 /// The run's checker: the registry of the step loop's properties and `S`'s,
-/// with a report for [`NO_LIVELOCK`] after them when the scenario enforces
-/// it.
+/// with a report for [`NO_LIVELOCK`] after them when the run enforces it.
 fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> Box<dyn Checker> {
-    let assumptions = S::assumptions(scenario);
-    let livelock = enforces_no_livelock(&assumptions);
-    let registry =
-        RegistryChecker::new(registry::<S>(), Rc::clone(this), assumptions, &S::sources());
-    if livelock {
+    let registry = RegistryChecker::new(
+        registry::<S>(),
+        Rc::clone(this),
+        S::assumptions(scenario),
+        &S::sources(),
+    );
+    if run_config::<S>(scenario).enforce_no_livelock {
         Box::new(Tee(registry, LivelockReport::default()))
     } else {
         Box::new(registry)
@@ -260,13 +256,15 @@ fn no_task_panic<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 }
 
 /// Every property a run of `scenario` reports, in report order, for
-/// `meta.properties`: the registry's, then [`NO_LIVELOCK`] if the scenario
+/// `meta.properties`: the registry's, then [`NO_LIVELOCK`] if the run
 /// enforces it.
 fn reported<S: Subsystem>(scenario: &S::Scenario) -> Vec<PropertyRef> {
-    let livelock = enforces_no_livelock(&S::assumptions(scenario)).then(|| PropertyRef {
-        id: NO_LIVELOCK.to_owned(),
-        status: Status::Active,
-    });
+    let livelock = run_config::<S>(scenario)
+        .enforce_no_livelock
+        .then(|| PropertyRef {
+            id: NO_LIVELOCK.to_owned(),
+            status: Status::Active,
+        });
     let mut reported = registered::<S>();
     reported.extend(livelock);
     reported

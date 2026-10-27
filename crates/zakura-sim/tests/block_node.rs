@@ -17,7 +17,7 @@ use zakura_sim::{
         header_sync::Dialer,
         run_harness, run_prepared, Subsystem,
     },
-    observe::{StorageFact, StorageRequest, StorageResult},
+    observe::{BodyScope, StorageBranch, StorageFact, StorageRequest, StorageResult, WorkScope},
     property::{HasView, Property, Sources},
     ActionSource, Boundary, Identity, MemorySink, Observation, ObservationLog, PlanInput,
     PropertyOutcome, RunConfig, RunReport, Sim,
@@ -198,6 +198,18 @@ impl Fact {
                     query_id: id,
                     from: 1,
                     limit: 1,
+                    scope: BodyScope {
+                        scope: WorkScope {
+                            header_generation: 1,
+                            branch: StorageBranch {
+                                anchor: "00".to_owned(),
+                                target: "11".to_owned(),
+                            },
+                        },
+                        verified_generation: 1,
+                        body_work_epoch: 1,
+                    },
+                    best_header_tip: 1,
                 },
                 stage: Some("pending".to_owned()),
             },

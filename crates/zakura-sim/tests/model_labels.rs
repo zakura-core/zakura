@@ -341,8 +341,8 @@ fn labels_fixture_frames_pages() {
         objects: 2,
         bytes: 20,
     };
-    assert!(model.subscribe(0, 7, two, 0));
-    assert!(!model.subscribe(0, 7, two, 0), "the key is live");
+    assert!(model.subscribe(0, 7, two));
+    assert!(!model.subscribe(0, 7, two), "the key is live");
     assert_eq!(model.page_frame(0, 7, 0, 1, 1).first(), Label::OverCredit);
     assert_eq!(model.page_frame(0, 7, 1, 21, 1).first(), Label::OverCredit);
     assert!(model.page_frame(0, 7, 1, 10, 1).is_conformant());
@@ -368,7 +368,7 @@ fn labels_fixture_frames_pages() {
     assert_eq!(model.ending_frame(0, 7).first(), Label::Unsolicited);
     assert_eq!(model.page_frame(0, 7, 1, 1, 5).first(), Label::Unsolicited);
     assert!(
-        !model.subscribe(0, 7, two, 0),
+        !model.subscribe(0, 7, two),
         "the publisher may hold its tombstone"
     );
 }

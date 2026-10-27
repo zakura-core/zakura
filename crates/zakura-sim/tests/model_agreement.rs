@@ -424,7 +424,7 @@ proptest! {
                 Subscribing::Subscribe { key, credit } => {
                     let start = guesses.fresh();
                     let production = pages.open(key, credit, start);
-                    prop_assert_eq!(production.is_ok(), model.subscribe(0, key, credit, start), "{}: {:?}", at, production);
+                    prop_assert_eq!(production.is_ok(), model.subscribe(0, key, credit), "{}: {:?}", at, production);
                 }
                 Subscribing::Grant { key, credit } => {
                     let production = pages.grant(key, credit);

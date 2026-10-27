@@ -35,6 +35,19 @@ impl RequestWriteStatus {
         matches!(self.0.load(Ordering::Acquire), STARTED | WRITTEN)
     }
 
+    /// Where the frame write stands now.
+    #[cfg(test)]
+    pub(in crate::zakura::block_sync) fn phase(&self) -> RequestWritePhase {
+        match self.0.load(Ordering::Acquire) {
+            UNPUBLISHED => RequestWritePhase::Unpublished,
+            QUEUED => RequestWritePhase::Queued,
+            STARTED => RequestWritePhase::Started,
+            WRITTEN => RequestWritePhase::Written,
+            EXPIRED => RequestWritePhase::Skipped,
+            state => unreachable!("request write state {state} is one of the five constants"),
+        }
+    }
+
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
@@ -42,6 +55,23 @@ impl RequestWriteStatus {
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+}
+
+/// Where a request's frame write stands. A queued request is published but
+/// not yet sent: transport can still skip it.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::block_sync) enum RequestWritePhase {
+    /// The attempt holds its items provisionally and hasn't published them.
+    Unpublished,
+    /// Published and queued for transport.
+    Queued,
+    /// Transport started writing the frame.
+    Started,
+    /// Transport wrote the frame.
+    Written,
+    /// Transport skipped the frame before writing it.
+    Skipped,
 }
 
 /// Keep the write disposition readable while the last owner is being dropped.

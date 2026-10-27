@@ -467,7 +467,7 @@ impl<P: Produce> Serve<P> {
     }
 
     /// Open requests on this session.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(crate) fn open(&self) -> u32 {
         self.commitments.open.load(Ordering::Acquire)
     }

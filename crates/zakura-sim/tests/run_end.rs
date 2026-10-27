@@ -40,11 +40,7 @@ fn finishes() -> impl check::Checker {
                 },
                 (false, _) => PropertyOutcome::Violated { witness: vec![] },
             };
-            vec![PropertyReport {
-                property: "test/done-finishes".into(),
-                outcome,
-                holds_since: None,
-            }]
+            vec![PropertyReport::new("test/done-finishes", outcome)]
         },
     )
 }

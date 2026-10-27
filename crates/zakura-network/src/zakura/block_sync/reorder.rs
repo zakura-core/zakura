@@ -20,6 +20,13 @@ impl ReorderBuffer {
         self.buffered_bytes
     }
 
+    /// Update the buffered-byte total and its gauge together.
+    fn set_buffered_bytes(&mut self, bytes: u64) {
+        self.buffered_bytes = bytes;
+        // This lossy cast is metrics-only; the buffer keeps the integer value.
+        metrics::gauge!("sync.block.reorder.buffered_bytes").set(bytes as f64);
+    }
+
     pub(super) fn decoded_attributed_memory_bytes(&self) -> u64 {
         self.decoded_attributed_memory_bytes
     }
@@ -34,6 +41,15 @@ impl ReorderBuffer {
 
     pub(super) fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Each buffered body's height and wire bytes, read from the map.
+    #[cfg(test)]
+    pub(super) fn ownership(&self) -> Vec<(block::Height, u64)> {
+        self.blocks
+            .iter()
+            .map(|(height, buffered)| (*height, buffered.bytes))
+            .collect()
     }
 
     pub(super) fn contains(&self, height: block::Height) -> bool {
@@ -104,7 +120,7 @@ impl ReorderBuffer {
                 source_peer,
             },
         );
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.set_buffered_bytes(self.buffered_bytes.saturating_add(bytes));
         self.decoded_attributed_memory_bytes = self
             .decoded_attributed_memory_bytes
             .saturating_add(decoded_attributed_memory_size_bytes);
@@ -122,7 +138,7 @@ impl ReorderBuffer {
         };
 
         while let Some(buffered) = self.blocks.remove(&next) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+            self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
             self.decoded_attributed_memory_bytes = self
                 .decoded_attributed_memory_bytes
                 .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
@@ -161,7 +177,7 @@ impl ReorderBuffer {
         let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
                 self.decoded_attributed_memory_bytes = self
                     .decoded_attributed_memory_bytes
                     .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
@@ -181,7 +197,7 @@ impl ReorderBuffer {
         let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
-                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.set_buffered_bytes(self.buffered_bytes.saturating_sub(buffered.bytes));
                 self.decoded_attributed_memory_bytes = self
                     .decoded_attributed_memory_bytes
                     .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());

@@ -40,8 +40,7 @@ pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_peer_task_unboxed,
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
-pub(crate) use registry::SessionLayout;
-pub use registry::{RegistryError, ServiceRegistry};
+pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,

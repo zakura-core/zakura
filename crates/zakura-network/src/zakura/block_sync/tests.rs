@@ -1,3 +1,4 @@
+pub(super) mod gauge_recorder;
 mod retention;
 
 use std::{

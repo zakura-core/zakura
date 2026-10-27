@@ -1453,3 +1453,125 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
 }
+
+/// The work, budget, and input-queue gauges equal sums over their owners after
+/// charge, receipt, queue exit, queued-body drop, and routine drop. No check calls a
+/// publication helper, so each gauge must follow its owner on its own.
+#[tokio::test]
+async fn byte_gauges_follow_work_and_input_owners() {
+    use super::super::{tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace};
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(first.hash());
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            second.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    let (body_sender, mut bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    let budget = routine.budget.clone();
+    let work = routine.work.clone();
+    // Returns the work-reservation and queue gauges after checking every gauge
+    // against its owners.
+    let check = |queued: &[SequencedBody], label: &str| {
+        let reserved: u64 = work
+            .ownership_snapshot()
+            .iter()
+            .map(|item| item.reserved_bytes)
+            .sum();
+        let queued_bytes: u64 = queued.iter().map(SequencedBody::queued_bytes).sum();
+        let gauges = (
+            recorder.bytes("sync.block.work.reserved_bytes"),
+            recorder.bytes("sync.block.sequencer_input.queued_bytes"),
+        );
+        assert_eq!(gauges, (reserved, queued_bytes), "after {label}");
+        assert_eq!(
+            recorder.bytes("sync.block.budget.reserved_bytes"),
+            budget.reserved(),
+            "budget after {label}"
+        );
+        gauges
+    };
+
+    assert_eq!(check(&[], "start"), (0, 0));
+
+    // Admission publishes the above-floor reservation it read.
+    let view = *routine.sequencer_view.borrow();
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let (charged, _) = check(&[], "charge");
+    assert!(charged > 0);
+    routine.admission_snapshot(&view);
+    let above: u64 = work
+        .ownership_snapshot()
+        .iter()
+        .filter(|item| item.place == WorkItemPlace::InFlight && item.height > view.download_floor)
+        .map(|item| item.reserved_bytes)
+        .sum();
+    assert_eq!(
+        recorder.bytes("sync.block.work.reserved_above_floor_bytes"),
+        above
+    );
+
+    // Receipt moves the body's bytes from its reservation to the queue.
+    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
+    let mut queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
+    assert_eq!(queued.len(), 1);
+    let (reserved, queued_bytes) = check(&queued, "receipt");
+    assert!(reserved < charged);
+    assert!(queued_bytes > 0);
+
+    // The sequencer takes the body out of the queue.
+    queued[0].leave_queue();
+    assert_eq!(check(&queued, "queue exit").1, 0);
+    drop(queued);
+
+    // A body dropped while queued returns its queue charge.
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(check(&[], "second charge").0 > 0);
+    deliver(&mut routine, BlockSyncMessage::Block(second)).await;
+    let queued: Vec<_> = std::iter::from_fn(|| bodies.try_recv().ok()).collect();
+    assert_eq!(queued.len(), 1);
+    assert!(check(&queued, "second receipt").1 > 0);
+    drop(queued);
+    assert_eq!(check(&[], "queued body drop").1, 0);
+
+    // A routine dropped with an outstanding request returns its reservation.
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 1,
+        },
+    )
+    .await;
+    work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(3),
+            block::Hash([3; 32]),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(check(&[], "third charge").0 > 0);
+    drop(routine);
+    assert_eq!(check(&[], "routine drop"), (0, 0));
+}

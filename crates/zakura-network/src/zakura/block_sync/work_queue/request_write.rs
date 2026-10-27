@@ -118,7 +118,7 @@ impl RequestWrite {
             let charge = item.estimated_bytes;
             inner.in_flight_reserved.add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
+        inner.add_reserved_bytes(self.estimated_bytes);
         inner.request_writes.insert(
             self.owner,
             RequestWriteRegistration {

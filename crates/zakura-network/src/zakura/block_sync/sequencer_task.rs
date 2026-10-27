@@ -91,6 +91,17 @@ impl SequencedBody {
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
     }
+
+    /// The wire bytes this body charges to the input-queue counter: its size
+    /// while queued, zero once it left the queue.
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> u64 {
+        if self.queue_accounting.active {
+            self.queue_accounting.bytes
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,6 +121,9 @@ impl SequencerInputAccounting {
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
+        // Gauge increments commute, so concurrent charges and releases leave the
+        // gauge equal to the counter. This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
         add_atomic_bytes(
             &input_decoded_attributed_memory_bytes,
             decoded_attributed_memory_size_bytes,
@@ -128,6 +142,8 @@ impl SequencerInputAccounting {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
+        // This lossy cast is metrics-only.
+        metrics::gauge!("sync.block.sequencer_input.queued_bytes").decrement(self.bytes as f64);
         release_atomic_bytes(
             &self.input_decoded_attributed_memory_bytes,
             self.decoded_attributed_memory_size_bytes,
@@ -1308,6 +1324,7 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod ownership;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;

@@ -67,6 +67,29 @@ pub(super) struct WorkItem {
     answered_elsewhere: bool,
 }
 
+/// Where a queued item sits in its download lifecycle.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkItemPlace {
+    Pending,
+    /// Taken by a request that has not yet published its reservation here.
+    Provisional,
+    InFlight,
+}
+
+/// One queued item's owner and byte quantities.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkItemOwnership {
+    pub(super) height: block::Height,
+    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
+    pub(super) place: WorkItemPlace,
+    /// The size estimate a request for this item reserves.
+    pub(super) estimated_bytes: u64,
+    /// The estimate bytes this item currently charges to the queue's tally.
+    pub(super) reserved_bytes: u64,
+}
+
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct WorkReturnOutcome {
@@ -158,6 +181,22 @@ impl WorkQueueInner {
             .or_else(|| self.in_flight.get(&height))
             .filter(|item| !item.provisional)
             .and_then(|item| item.owner)
+    }
+
+    fn add_reserved_bytes(&mut self, bytes: u64) {
+        self.set_reserved_bytes(self.reserved_bytes.saturating_add(bytes));
+    }
+
+    fn sub_reserved_bytes(&mut self, bytes: u64) {
+        self.set_reserved_bytes(self.reserved_bytes.saturating_sub(bytes));
+    }
+
+    /// Update the reserved tally and its gauge together. The caller holds the
+    /// queue lock, so concurrent writers publish in tally order.
+    fn set_reserved_bytes(&mut self, bytes: u64) {
+        self.reserved_bytes = bytes;
+        // This lossy cast is metrics-only; the tally keeps the integer value.
+        metrics::gauge!("sync.block.work.reserved_bytes").set(bytes as f64);
     }
 }
 
@@ -621,7 +660,7 @@ impl WorkQueue {
         }
         // Released (0) -> Reserved(estimate): the reserved total grows by exactly
         // the bytes just marked.
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
+        inner.add_reserved_bytes(marked);
         inner.in_flight_reserved.add_tally(added);
         marked
     }
@@ -671,7 +710,7 @@ impl WorkQueue {
                 item.answered_elsewhere = answered_elsewhere;
                 (item.budget.release_reserved(), item.owner)
             };
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
             inner.in_flight_reserved.sub(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             (released.saturating_add(outcome.released_bytes), claim)
@@ -723,7 +762,7 @@ impl WorkQueue {
             } else {
                 return 0;
             };
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             (released.saturating_add(outcome.released_bytes), claim)
         };
@@ -771,7 +810,7 @@ impl WorkQueue {
                 released = released.saturating_add(item.budget.release_reserved());
             }
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         inner.in_flight_reserved.sub_tally(released_in_flight);
         released
     }
@@ -799,7 +838,7 @@ impl WorkQueue {
                     moved = true;
                 }
             }
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.sub_reserved_bytes(released);
         }
         if moved {
             self.available.notify_waiters();
@@ -973,7 +1012,7 @@ impl WorkQueue {
             outcome.returned_count = outcome.returned_count.saturating_add(1);
             inner.pending.insert(height, item);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
+        inner.sub_reserved_bytes(outcome.released_bytes);
         if outcome.returned_count > 0 {
             self.available.notify_waiters();
         }
@@ -1019,7 +1058,7 @@ impl WorkQueue {
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         drop(inner);
         if revoked {
             self.note_revocation();
@@ -1074,7 +1113,7 @@ impl WorkQueue {
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);
         }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.sub_reserved_bytes(released);
         drop(inner);
         drop(claims);
         if revoked {
@@ -1148,6 +1187,35 @@ impl WorkQueue {
             .chain(inner.in_flight.values())
             .map(|item| item.budget.reserved_charge())
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Every queued item with its owner and byte quantities, read from the
+    /// queue maps rather than from the maintained tallies.
+    #[cfg(test)]
+    pub(super) fn ownership_snapshot(&self) -> Vec<WorkItemOwnership> {
+        let inner = self.lock();
+        let pending = inner
+            .pending
+            .iter()
+            .map(|(height, item)| (height, item, WorkItemPlace::Pending));
+        let in_flight = inner.in_flight.iter().map(|(height, item)| {
+            let place = if item.provisional {
+                WorkItemPlace::Provisional
+            } else {
+                WorkItemPlace::InFlight
+            };
+            (height, item, place)
+        });
+        pending
+            .chain(in_flight)
+            .map(|(height, item, place)| WorkItemOwnership {
+                height: *height,
+                owner: item.owner,
+                place,
+                estimated_bytes: item.estimated_bytes,
+                reserved_bytes: item.budget.reserved_charge(),
+            })
+            .collect()
     }
 
     /// Number of contiguous runs across `pending` (one queued range per maximal

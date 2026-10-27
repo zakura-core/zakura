@@ -32,6 +32,7 @@ pub(crate) const EVERY_30_SECONDS: Cadence = Cadence {
 };
 
 pub(crate) const GET: MessageRule = MessageRule {
+    name: "get",
     message_type: message_type::GET,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Request {
@@ -41,6 +42,7 @@ pub(crate) const GET: MessageRule = MessageRule {
 };
 
 pub(crate) const PART: MessageRule = MessageRule {
+    name: "part",
     message_type: message_type::PART,
     payload: PayloadLen::of::<PartBytes>(),
     role: MessageRole::Response {
@@ -50,6 +52,7 @@ pub(crate) const PART: MessageRule = MessageRule {
 };
 
 pub(crate) const DONE: MessageRule = MessageRule {
+    name: "done",
     message_type: message_type::DONE,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Response {
@@ -59,6 +62,7 @@ pub(crate) const DONE: MessageRule = MessageRule {
 };
 
 pub(crate) const FAILED: MessageRule = MessageRule {
+    name: "failed",
     message_type: message_type::FAILED,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Response {
@@ -68,6 +72,7 @@ pub(crate) const FAILED: MessageRule = MessageRule {
 };
 
 pub(crate) const STATUS: MessageRule = MessageRule {
+    name: "status",
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Announcement {
@@ -76,6 +81,7 @@ pub(crate) const STATUS: MessageRule = MessageRule {
 };
 
 pub(crate) const PING: MessageRule = MessageRule {
+    name: "ping",
     message_type: message_type::PING,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Request {
@@ -85,6 +91,7 @@ pub(crate) const PING: MessageRule = MessageRule {
 };
 
 pub(crate) const PONG: MessageRule = MessageRule {
+    name: "pong",
     message_type: message_type::PONG,
     payload: PayloadLen::of::<LeU32>(),
     role: MessageRole::Response {

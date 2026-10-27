@@ -2744,7 +2744,7 @@ impl ZakuraProtocolHandler {
             .map(|stream| {
                 self.registry
                     .session_layout(*stream)
-                    .map_or(1, |layout| layout.streams.len())
+                    .map_or(1, |layout| layout.streams().len())
             })
             .sum();
         if opening_stream_count > usize::from(limits.max_open_streams) {
@@ -3315,8 +3315,8 @@ impl ZakuraProtocolHandler {
             .reserve_session(direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
         let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
-        let mut prepared = Vec::with_capacity(layout.streams.len());
-        for member in layout.streams.iter().copied() {
+        let mut prepared = Vec::with_capacity(layout.streams().len());
+        for member in layout.streams().iter().copied() {
             let mut member = self
                 .prepare_ordered_stream(
                     connection,
@@ -10508,6 +10508,7 @@ mod tests {
         use crate::zakura::{block_sync_streams, MessageRole, PayloadLen};
 
         const REQUEST: MessageRule = MessageRule {
+            name: "request",
             message_type: 2,
             payload: PayloadLen::exact(9),
             role: MessageRole::Request {
@@ -10516,6 +10517,7 @@ mod tests {
             },
         };
         const RESPONSE: MessageRule = MessageRule {
+            name: "response",
             message_type: 3,
             payload: PayloadLen::between(1, 99),
             role: MessageRole::Response {

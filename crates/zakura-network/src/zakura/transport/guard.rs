@@ -94,7 +94,10 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    return true;
+                }
                 Err(observed) => reserved = observed,
             }
         }
@@ -115,7 +118,10 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    break;
+                }
                 Err(observed) => reserved = observed,
             }
         }
@@ -140,7 +146,10 @@ impl ByteBudget {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    publish_reserved_change(reserved, next);
+                    break;
+                }
                 Err(observed) => reserved = observed,
             }
         }
@@ -165,6 +174,22 @@ impl ByteBudget {
     /// be missed between the check and the wait.
     pub(crate) fn subscribe_capacity(&self) -> &Notify {
         &self.inner.capacity
+    }
+}
+
+/// Apply one change of the shared reservation counter, from `before` to
+/// `after`, to its gauge.
+///
+/// Gauge increments commute, so concurrent reservers and releasers leave the
+/// gauge equal to the counter. A saturated release passes the counter's actual
+/// change, so it cannot drive the gauge below zero.
+fn publish_reserved_change(before: u64, after: u64) {
+    let gauge = metrics::gauge!("sync.block.budget.reserved_bytes");
+    // These lossy casts are metrics-only; the counter keeps the integer value.
+    if after >= before {
+        gauge.increment((after - before) as f64);
+    } else {
+        gauge.decrement((before - after) as f64);
     }
 }
 

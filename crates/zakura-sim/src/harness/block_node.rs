@@ -35,7 +35,7 @@ use std::{
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use zakura_header_chain::Frontier;
+use zakura_header_chain::{ErrorCategory, Frontier};
 use zakura_network::{
     zakura::{
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
@@ -46,7 +46,7 @@ use zakura_network::{
     },
     BoxError,
 };
-use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
+use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port, PreparedHeaderTarget};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, CancellationToken};
 use zakura_scheduler::{hooks, SimInstant};
@@ -1012,19 +1012,22 @@ impl Topology {
     pub(crate) fn plan_change(&self, action: &control::ControlAction) -> Option<ChainChange> {
         let tip = self.chain.tip();
         let change = match *action {
-            control::ControlAction::Grow { len } => ChainChange {
+            control::ControlAction::Grow { len, .. } => ChainChange {
                 parent: tip,
                 blocks: self.chain.fixture.uniform(tip, len, self.chain.spec, 0),
                 effect: LinkEffect::Grown,
             },
-            control::ControlAction::Reset { fork } => {
-                let Some(parent) = self.chain.at(fork.at) else {
+            control::ControlAction::Reset { fork, .. } => {
+                // A fork from the tip itself is a growth, and resets nothing.
+                if fork.at >= tip.height.0 {
                     *self.effects.failure.borrow_mut() = Some(format!(
-                        "a fork at {} is above the chain's tip {tip:?}",
+                        "a fork at {} doesn't branch below the chain's tip {tip:?}",
                         fork.at
                     ));
                     return None;
-                };
+                }
+                // The chain holds every height below its tip.
+                let parent = self.chain.at(fork.at)?;
                 if fork.at.saturating_add(fork.len) <= tip.height.0 {
                     *self.effects.failure.borrow_mut() = Some(format!(
                         "a fork of {} blocks at {} doesn't outgrow the chain's tip {tip:?}",
@@ -1075,11 +1078,11 @@ impl Topology {
         }
     }
 
-    /// Makes `change` on the node under test: its headers on the node's
-    /// engine, which reorganizes its selected chain through the real engine.
-    /// The node must download the bodies. Only the step loop reads the
-    /// node's engine, so only it may call this.
-    pub(crate) fn change_node(&self, change: &ChainChange) {
+    /// Prepares `change`'s headers on the node under test's engine, for
+    /// [`apply_node`](Self::apply_node). Records a failure, and returns
+    /// `None`, if they don't prepare. Only the step loop reads the node's
+    /// engine, so only it may call this.
+    pub(crate) fn prepare_node(&self, change: &ChainChange) -> Option<PreparedHeaderTarget> {
         let node = &self.nodes[0];
         let request = self.chain.fixture.target_request(
             &node.engine.snapshot(),
@@ -1087,12 +1090,34 @@ impl Topology {
             &change.blocks,
             1,
         );
-        let applied = match ready(node.engine.prepare_header_target(request)) {
-            Ok(prepared) => ready(node.engine.apply_header_target(prepared)),
-            Err(error) => Err(error),
-        };
+        match ready(node.engine.prepare_header_target(request)) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                let tip = node.engine.view().frontiers.header_best;
+                self.settle(node, change, Err(error), Ok(()), tip);
+                None
+            }
+        }
+    }
+
+    /// Applies `change`'s `prepared` headers on the node under test's
+    /// engine, which reorganizes its selected chain through the real engine.
+    /// The node must download the bodies. Returns `false` if a body commit
+    /// since the preparation made it stale, so the caller prepares it again,
+    /// as header sync would. Only the step loop reads the node's engine, so
+    /// only it may call this.
+    pub(crate) fn apply_node(&self, change: &ChainChange, prepared: PreparedHeaderTarget) -> bool {
+        let node = &self.nodes[0];
+        let applied = ready(node.engine.apply_header_target(prepared));
+        if applied
+            .as_ref()
+            .is_err_and(|error| error.category == ErrorCategory::StaleTargetOrGeneration)
+        {
+            return false;
+        }
         let tip = node.engine.view().frontiers.header_best;
         self.settle(node, change, applied, Ok(()), tip);
+        true
     }
 
     /// Records `change`'s effect on `node` if it applied and moved the
@@ -1128,10 +1153,9 @@ impl Topology {
     }
 }
 
-/// A change to every actor's chain: `blocks`, extending `parent`. The
-/// control task makes it on the mirrors first, so they hold the bodies
-/// before the node learns the headers, and the step loop then makes it on
-/// the node.
+/// A change to every actor's chain: `blocks`, extending `parent`. A
+/// control task makes it on the mirrors, and the step loop on the node, in
+/// the order its [`control::ControlAction`] names.
 #[derive(Clone, Debug)]
 pub(crate) struct ChainChange {
     parent: Frontier,

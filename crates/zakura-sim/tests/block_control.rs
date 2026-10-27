@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::inputs;
+use support::{inputs, picks};
 use zakura_network::zakura::BlockSyncMessage;
 use zakura_sim::{
     harness::{
@@ -146,9 +146,9 @@ fn a_held_mirror_read_waits_for_its_trigger() {
     }
 }
 
-/// Closing the mirror's link after four verdicts, then relinking it once
+/// Closing `mirror-0`'s link after four verdicts, then relinking it once
 /// that connection has closed, leaves the node to finish over the new link.
-/// The first link closes, and only it.
+/// The first link closes, and only it: `mirror-1`'s stays open.
 #[test]
 fn close_and_relink_change_only_the_named_link() {
     let control = vec![
@@ -171,13 +171,30 @@ fn close_and_relink_change_only_the_named_link() {
             when: Some(Trigger::Closed("mirror-0".to_owned())),
         },
     ];
+    let scenario = BlockScenario {
+        mirrors: vec![
+            MirrorSpec {
+                dialer: Dialer::Mirror,
+            },
+            MirrorSpec {
+                dialer: Dialer::Node,
+            },
+        ],
+        ..scenario(16, Vec::new(), control)
+    };
     for input in inputs(8, 256) {
-        let (_, ports) = run(&scenario(16, Vec::new(), control.clone()), input);
+        let (_, ports) = run(&scenario, input);
         assert_converged(&ports);
         let links = ports.effects.links.borrow();
-        let closed: Vec<_> = links.iter().map(|link| link.is_closed()).collect();
-        assert_eq!(closed, [true, false], "{links:?}");
-        assert!(links.iter().all(|link| link.peer == "mirror-0"));
+        let state: Vec<_> = links
+            .iter()
+            .map(|link| (link.peer.as_str(), link.is_closed()))
+            .collect();
+        assert_eq!(
+            state,
+            [("mirror-0", true), ("mirror-1", false), ("mirror-0", false)],
+            "{links:?}"
+        );
     }
 }
 
@@ -186,7 +203,10 @@ fn close_and_relink_change_only_the_named_link() {
 #[test]
 fn growth_extends_every_actor_and_the_node_follows() {
     let control = vec![ControlStep {
-        action: ControlAction::Grow { len: 8 },
+        action: ControlAction::Grow {
+            len: 8,
+            node_first: false,
+        },
         when: Some(Trigger::Count(
             8,
             Box::new(Trigger::Completed(Select {
@@ -207,6 +227,72 @@ fn growth_extends_every_actor_and_the_node_follows() {
     }
 }
 
+/// A growth that reaches the node first gives it the new headers before
+/// the mirror holds their bodies, in two steps of the node's own: one
+/// prepares the headers and one applies them. The node still downloads and
+/// commits the new blocks once the mirror has them.
+#[test]
+fn a_node_first_growth_runs_the_headers_ahead_of_the_bodies() {
+    let control = vec![ControlStep {
+        action: ControlAction::Grow {
+            len: 4,
+            node_first: true,
+        },
+        when: Some(Trigger::Count(
+            8,
+            Box::new(Trigger::Completed(Select {
+                kind: Some(BlockKind::Apply),
+                ..Select::default()
+            })),
+        )),
+    }];
+    for input in inputs(4, 256) {
+        let (report, ports) = run(&scenario(8, Vec::new(), control.clone()), input);
+        assert_eq!(ports.live.tip().height.0, 12);
+        assert_converged(&ports);
+        let chains = ports.effects.chains.borrow();
+        let order: Vec<_> = chains.iter().map(|(_, actor)| actor.as_str()).collect();
+        assert_eq!(order, ["node", "mirror-0"], "the node changes first");
+        let picks = picks(&report);
+        let at = |pick| picks.iter().position(|p| *p == pick);
+        let prepare = at("peer:node:grow").expect("the node prepares the headers");
+        let apply = at("peer:node:grow-apply").expect("the node applies them");
+        assert!(prepare < apply, "{picks:?}");
+    }
+}
+
+/// A fork from the chain's tip is a growth, not a reset, so the step fails
+/// the run instead of recording a reset that never happened.
+#[test]
+fn a_reset_from_the_tip_fails_the_run() {
+    let control = vec![ControlStep {
+        action: ControlAction::Reset {
+            fork: Fork {
+                branch: 1,
+                at: 8,
+                len: 2,
+            },
+            node_first: false,
+        },
+        when: None,
+    }];
+    let scenario = scenario(8, Vec::new(), control);
+    let Err(failure) = run_prepared::<Storage>(
+        &scenario,
+        Storage::prepare(&scenario),
+        PlanInput::Bytes(Vec::new()),
+        &mut MemorySink::default(),
+        None,
+    ) else {
+        panic!("a reset from the tip fails the run");
+    };
+    let failure = failure.to_string();
+    assert!(
+        failure.contains("ControlFailed: a fork at 8 doesn't branch below the chain's tip"),
+        "{failure}"
+    );
+}
+
 /// Switching to a fork at height 4 after the node commits the first 12
 /// blocks reorganizes its engine, and once it commits the fork's bodies its
 /// verified chain resets: the engine installs a reset, and the body work
@@ -220,6 +306,7 @@ fn a_reset_switches_the_node_to_the_fork() {
                 at: 4,
                 len: 12,
             },
+            node_first: false,
         },
         when: Some(Trigger::Count(
             12,
@@ -344,7 +431,10 @@ fn an_unsolicited_probe_ending_closes_only_the_probe() {
                 when: None,
             },
             ControlStep {
-                action: ControlAction::Grow { len: 2 },
+                action: ControlAction::Grow {
+                    len: 2,
+                    node_first: false,
+                },
                 when: Some(Trigger::Closed(PROBE.to_owned())),
             },
         ],

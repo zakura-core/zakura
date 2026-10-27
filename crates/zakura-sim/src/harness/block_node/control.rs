@@ -1,16 +1,24 @@
 //! Scripted harness actions on a block-sync run's links and chain.
 //!
 //! [`Control`] offers a scenario's [`ControlStep`]s in order, each once, so
-//! the `Plan` decides when each happens, once its trigger holds. A harness
-//! task carries out each link, probe and mirror action on its next step,
+//! the `Plan` decides when each happens, once its trigger holds. Harness
+//! tasks carry out each link, probe and mirror action on their next step,
 //! since those take locks that tasks hold across scheduling points, where
 //! only a task can wait. So a pick only queues the action, and triggers
-//! count the effect. A chain change reaches the node under test last, as a
-//! step of its own: the step loop alone reads the node's engine.
+//! count the effect. Each kind of work has its own task, so a probe send
+//! the node stops reading, or a mirror busy serving, delays no close or
+//! relink.
+//!
+//! A chain change reaches the node under test in two steps of their own,
+//! one preparing its headers and one applying them, since the step loop
+//! alone reads the node's engine. A body commit can land between them. The
+//! change reaches the mirrors before the node, or after it, as the action
+//! says. Chain changes run one stage at a time, in script order.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use serde::{Deserialize, Serialize};
+use zakura_node_services::header_chain::PreparedHeaderTarget;
 use zakura_rt::sync::mpsc;
 use zakura_scheduler::SimInstant;
 
@@ -29,7 +37,7 @@ pub struct Fork {
     /// The fixture branch, which keeps the fork's blocks apart from every
     /// other branch's.
     pub branch: u8,
-    /// The height the fork extends, at most the chain's tip.
+    /// The height the fork extends, below the chain's tip.
     pub at: u32,
     /// Its blocks. The fork must end above the chain's tip.
     pub len: u32,
@@ -51,20 +59,28 @@ pub enum ControlAction {
         peer: String,
     },
     /// Extend the chain by `len` blocks from its tip on every actor: their
-    /// headers on each engine, and their bodies in each mirror's full state,
-    /// the mirrors first. The node under test must download the bodies.
+    /// headers on each engine, and their bodies in each mirror's full state.
+    /// The node under test must download the bodies.
     Grow {
         /// The new blocks.
         len: u32,
+        /// Whether the node takes the headers before the mirrors take the
+        /// change, so its headers run ahead of its peers' bodies. The
+        /// mirrors go first by default.
+        #[serde(default)]
+        node_first: bool,
     },
     /// Switch every actor to `fork`: its headers on each engine, which
     /// reorganizes the node's selected chain through its real engine, and
-    /// its bodies in each mirror's full state, the mirrors first. The
-    /// node's verified chain resets once it commits the fork's bodies over
-    /// its own.
+    /// its bodies in each mirror's full state. The node's verified chain
+    /// resets once it commits the fork's bodies over its own.
     Reset {
         /// The fork.
         fork: Fork,
+        /// Whether the node takes the headers before the mirrors take the
+        /// change. The mirrors go first by default.
+        #[serde(default)]
+        node_first: bool,
     },
     /// Send `frames` from the probe, in order. The scenario must link one.
     ProbeSend {
@@ -107,84 +123,141 @@ pub struct ControlStep {
     pub when: Option<Trigger>,
 }
 
-/// What the control task does.
-enum Work {
-    /// A link or probe action.
-    Act(ControlAction),
-    /// A chain change, on the mirrors.
-    Change(ChainChange),
+/// One stage of a chain change. Stages run one at a time, in order.
+enum Stage {
+    /// The mirrors make the change, on the chain task.
+    Mirrors(ChainChange),
+    /// The node prepares the change's headers, as a step of its own.
+    NodePrepare(ChainChange),
+    /// The node applies the prepared headers, as a step of its own.
+    NodeApply(ChainChange, PreparedHeaderTarget),
 }
 
-/// The token of the step that makes a chain change on the node.
+/// The chain changes' stages not yet done, in order, shared with the chain
+/// task.
+type Stages = Rc<RefCell<VecDeque<Stage>>>;
+
+/// The token of the step that runs a chain change's node stage.
 const CHANGE_NODE: u64 = u64::MAX;
 
 /// Offers a scenario's scripted actions in order, each once, as
-/// `peer:<actor>:<action>`, and each chain change the mirrors have made as
-/// `peer:node:<action>`. See the module doc.
+/// `peer:<actor>:<action>`, and each node stage of a chain change as
+/// `peer:node:<action>` to prepare it and `peer:node:<action>-apply` to
+/// apply it. See the module doc.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
     predicates: Rc<RefCell<Predicates>>,
     /// The next step to offer.
     next: usize,
-    /// The chain changes the mirrors have made and the node hasn't, in
-    /// order.
-    changed: Rc<RefCell<VecDeque<ChainChange>>>,
-    to_task: mpsc::Sender<Work>,
+    stages: Stages,
+    /// Closes and relinks, for the link task.
+    to_links: mpsc::Sender<ControlAction>,
+    /// Probe sends, for the probe task.
+    to_probe: mpsc::Sender<Vec<ProbeFrame>>,
+    /// Wakes the chain task when a mirror stage comes first.
+    to_chain: mpsc::Sender<()>,
 }
 
 impl Control {
     /// A source for `script` on `topology`, gated by `predicates`, with its
-    /// task spawned on `sim`.
+    /// tasks spawned on `sim`.
     pub fn new(
         sim: &mut Sim,
         topology: Rc<Topology>,
         script: Vec<ControlStep>,
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
-        let (to_task, mut work) = mpsc::channel::<Work>(script.len().max(1));
-        let changed = Rc::new(RefCell::new(VecDeque::new()));
+        // Each channel holds the whole script.
+        let (to_links, mut links) = mpsc::channel::<ControlAction>(script.len().max(1));
+        let (to_probe, mut probe) = mpsc::channel::<Vec<ProbeFrame>>(script.len().max(1));
+        let (to_chain, mut chain) = mpsc::channel::<()>(1);
+        let stages = Stages::default();
         let task_topology = topology.clone();
-        let task_changed = changed.clone();
         sim.scheduler().spawn_root("control", async move {
-            let topology = task_topology;
-            while let Some(work) = work.recv().await {
-                match work {
-                    Work::Act(ControlAction::Close { peer }) => topology
+            while let Some(action) = links.recv().await {
+                match action {
+                    ControlAction::Close { peer } => task_topology
                         .link_to(&peer)
                         .unwrap_or_else(|| panic!("the scenario links `{peer}`"))
                         .close(),
-                    Work::Act(ControlAction::Relink { peer }) => topology.relink(&peer),
-                    Work::Act(ControlAction::ProbeSend { frames }) => {
-                        topology.probe_send(&frames).await
-                    }
-                    Work::Act(action) => unreachable!("`Control` plans {action:?} itself"),
-                    Work::Change(change) => {
-                        topology.change_mirrors(&change).await;
-                        task_changed.borrow_mut().push_back(change);
-                    }
+                    ControlAction::Relink { peer } => task_topology.relink(&peer),
+                    action => unreachable!("the link task gets only links, not {action:?}"),
                 }
             }
         });
+        // Only scripts that use them get the other tasks, so a script
+        // without them schedules as before.
+        if script
+            .iter()
+            .any(|step| matches!(step.action, ControlAction::ProbeSend { .. }))
+        {
+            let task_topology = topology.clone();
+            sim.scheduler().spawn_root("control-probe", async move {
+                while let Some(frames) = probe.recv().await {
+                    task_topology.probe_send(&frames).await;
+                }
+            });
+        }
+        if script.iter().any(|step| {
+            matches!(
+                step.action,
+                ControlAction::Grow { .. } | ControlAction::Reset { .. }
+            )
+        }) {
+            let task_topology = topology.clone();
+            let task_stages = stages.clone();
+            sim.scheduler().spawn_root("control-chain", async move {
+                while chain.recv().await.is_some() {
+                    // The step loop never takes a mirror stage, so the front
+                    // stays this one while the mirrors change.
+                    loop {
+                        let change = match task_stages.borrow().front() {
+                            Some(Stage::Mirrors(change)) => change.clone(),
+                            _ => break,
+                        };
+                        task_topology.change_mirrors(&change).await;
+                        task_stages.borrow_mut().pop_front();
+                    }
+                }
+            });
+        }
         Control {
             script,
             topology,
             predicates,
             next: 0,
-            changed,
-            to_task,
+            stages,
+            to_links,
+            to_probe,
+            to_chain,
+        }
+    }
+
+    /// Wakes the chain task if a mirror stage comes first. A wake already
+    /// queued covers this one.
+    fn wake_chain(&self) {
+        if matches!(self.stages.borrow().front(), Some(Stage::Mirrors(_))) {
+            let _ = self.to_chain.try_send(());
         }
     }
 }
 
 impl ActionSource for Control {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        if let Some(change) = self.changed.borrow().front() {
-            let action = match change.effect {
-                LinkEffect::Reset => "reset",
-                _ => "grow",
-            };
-            out.push((Identity::peer("node", action), CHANGE_NODE));
+        let action = |change: &ChainChange| match change.effect {
+            LinkEffect::Reset => "reset",
+            _ => "grow",
+        };
+        match self.stages.borrow().front() {
+            Some(Stage::NodePrepare(change)) => {
+                out.push((Identity::peer("node", action(change)), CHANGE_NODE));
+            }
+            Some(Stage::NodeApply(change, _)) => out.push((
+                Identity::peer("node", &format!("{}-apply", action(change))),
+                CHANGE_NODE,
+            )),
+            Some(Stage::Mirrors(_)) | None => {}
         }
         let Some(step) = self.script.get(self.next) else {
             return;
@@ -214,27 +287,53 @@ impl ActionSource for Control {
 
     fn execute(&mut self, token: u64, _: &mut ObservationLog) {
         if token == CHANGE_NODE {
-            let change = self
-                .changed
-                .borrow_mut()
-                .pop_front()
-                .expect("`enabled` offered a change the mirrors made");
-            self.topology.change_node(&change);
+            let stage = self.stages.borrow_mut().pop_front();
+            let next = match stage {
+                Some(Stage::NodePrepare(change)) => self
+                    .topology
+                    .prepare_node(&change)
+                    .map(|prepared| Stage::NodeApply(change, prepared)),
+                Some(Stage::NodeApply(change, prepared)) => {
+                    // A stale preparation is made again, as header sync
+                    // would.
+                    (!self.topology.apply_node(&change, prepared))
+                        .then_some(Stage::NodePrepare(change))
+                }
+                _ => unreachable!("`enabled` offers only a node stage that comes first"),
+            };
+            if let Some(next) = next {
+                self.stages.borrow_mut().push_front(next);
+            }
+            self.wake_chain();
             return;
         }
         let action = self.script[self.next].action.clone();
         self.next += 1;
-        let work = match action {
-            ControlAction::Grow { .. } | ControlAction::Reset { .. } => {
-                match self.topology.plan_change(&action) {
-                    Some(change) => Work::Change(change),
-                    None => return,
+        let full = "each channel holds the whole script, and its task outlives the run";
+        match action {
+            ControlAction::Grow { node_first, .. } | ControlAction::Reset { node_first, .. } => {
+                let Some(change) = self.topology.plan_change(&action) else {
+                    return;
+                };
+                let node = Stage::NodePrepare(change.clone());
+                let mirrors = Stage::Mirrors(change);
+                let mut stages = self.stages.borrow_mut();
+                if node_first {
+                    stages.extend([node, mirrors]);
+                } else {
+                    stages.extend([mirrors, node]);
                 }
+                drop(stages);
+                self.wake_chain();
             }
-            action => Work::Act(action),
-        };
-        self.to_task.try_send(work).unwrap_or_else(|_| {
-            panic!("the channel holds the whole script, and the task outlives the run")
-        });
+            ControlAction::ProbeSend { frames } => self
+                .to_probe
+                .try_send(frames)
+                .unwrap_or_else(|_| panic!("{full}")),
+            action => self
+                .to_links
+                .try_send(action)
+                .unwrap_or_else(|_| panic!("{full}")),
+        }
     }
 }

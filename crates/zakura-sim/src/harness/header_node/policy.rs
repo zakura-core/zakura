@@ -8,7 +8,7 @@
 //! keep `enabled` and `boundaries` pure, as replay needs.
 //!
 //! A trigger counts effects, never picks: a `Control` pick only queues its
-//! action, so [`Trigger::Closed`] counts closes a task actually made. No
+//! action, so [`Trigger::Closed`] counts connections that actually closed. No
 //! trigger shows that a caller has handled a reply, only that it took it
 //! ([`Trigger::ReplyTaken`]), since that needs a witness from the reactor
 //! itself.
@@ -134,7 +134,8 @@ pub enum Trigger {
     /// drops a locator's permit before finishing the query. So this isn't
     /// a callback-handled witness, and none of these triggers is one.
     ReplyTaken(Select),
-    /// A link to this peer was closed.
+    /// A connection to this peer closed, counted once per connection,
+    /// whether a `Control` close or a service tearing it down closed it.
     Closed(String),
     /// A link to this peer was made, including at setup.
     Linked(String),
@@ -211,7 +212,7 @@ enum Event {
 pub enum LinkEffect {
     /// A link was made.
     Linked,
-    /// A link's connection tokens were cancelled.
+    /// A link's connection closed. Recorded once per connection.
     Closed,
 }
 

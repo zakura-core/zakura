@@ -13,6 +13,7 @@ pub mod policy;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeSet,
     future::Future,
     pin::pin,
     rc::Rc,
@@ -185,9 +186,10 @@ impl Policy {
     }
 }
 
-/// The link effects tasks made, in order, for [`Trigger::Closed`] and
-/// [`Trigger::Linked`]. Sources read it only in `observe`.
-pub type LinkLog = Rc<RefCell<Vec<(LinkEffect, String)>>>;
+/// Every link a [`Topology`] made, in order, shared with the
+/// [`PolicySource`] that counts their effects for [`Trigger::Linked`] and
+/// [`Trigger::Closed`].
+pub type LinkTable = Rc<RefCell<Vec<Link>>>;
 
 /// `t` plus `d`, saturating at the largest instant.
 fn after(t: SimInstant, d: Duration) -> SimInstant {
@@ -204,15 +206,17 @@ pub struct PolicySource {
     base: Base,
     bound: Option<Duration>,
     predicates: Rc<RefCell<Predicates>>,
-    links: LinkLog,
-    /// How many of `links` are recorded.
-    seen: usize,
+    links: LinkTable,
+    /// How many of `links` are recorded as made.
+    linked: usize,
+    /// The connections recorded as closed.
+    closed: BTreeSet<u64>,
 }
 
 impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
-    /// `sim`. Its predicates count `links` too.
-    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, links: LinkLog) -> Self {
+    /// `sim`. Its predicates count the effects on `links` too.
+    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, links: LinkTable) -> Self {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             port,
@@ -220,7 +224,8 @@ impl PolicySource {
             bound: policy.bound_ms.map(Duration::from_millis),
             predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
             links,
-            seen: 0,
+            linked: 0,
+            closed: BTreeSet::new(),
         }
     }
 
@@ -267,10 +272,17 @@ impl ActionSource for PolicySource {
                 predicates.record(fact);
             }
         }
-        for (effect, peer) in &self.links.borrow()[self.seen..] {
-            predicates.record_link(*effect, peer);
+        let links = self.links.borrow();
+        for link in &links[self.linked..] {
+            predicates.record_link(LinkEffect::Linked, &link.peer);
         }
-        self.seen = self.links.borrow().len();
+        self.linked = links.len();
+        // A connection closes once, whoever cancels it and however often.
+        for link in links.iter() {
+            if link.is_closed() && self.closed.insert(link.conn_id) {
+                predicates.record_link(LinkEffect::Closed, &link.peer);
+            }
+        }
         Ok(())
     }
 }
@@ -357,10 +369,11 @@ impl HeaderNode {
     }
 }
 
-/// One live connection between two nodes, by their index in a
-/// [`Topology`].
+/// One connection between two nodes, by their index in a [`Topology`].
 #[derive(Clone, Debug)]
 pub struct Link {
+    /// The name of the node under test's peer on it.
+    pub peer: String,
     /// The node that dialed.
     pub dialer: usize,
     /// The node that was dialed.
@@ -381,48 +394,35 @@ impl Link {
             token.cancel();
         }
     }
+
+    /// Whether either side's connection token is cancelled: by
+    /// [`Link::close`], or by a service that tears the connection down,
+    /// as replacing a session with an unfinished exchange does. A
+    /// replacement that retires only the old session leaves its connection
+    /// open, so that isn't a closure.
+    pub fn is_closed(&self) -> bool {
+        self.tokens.iter().any(CancellationToken::is_cancelled)
+    }
 }
 
 /// Every node in a run and the links between them.
 pub struct Topology {
     /// The nodes, the node under test first.
     pub nodes: Vec<HeaderNode>,
-    links: RefCell<Vec<Link>>,
-    /// Each link made or closed, by the peer of the node under test.
-    effects: LinkLog,
+    links: LinkTable,
     /// The last connection and session ID handed out. A replacement needs
     /// both to be new, so one counter serves both.
     last_id: Cell<u64>,
 }
 
 impl Topology {
-    /// `nodes`, with no links yet. Each link it makes or closes is recorded
-    /// in `effects`.
-    pub fn new(nodes: Vec<HeaderNode>, effects: LinkLog) -> Self {
+    /// `nodes`, with no links yet. Each link it makes goes in `links`.
+    pub fn new(nodes: Vec<HeaderNode>, links: LinkTable) -> Self {
         Topology {
             nodes,
-            links: RefCell::default(),
-            effects,
+            links,
             last_id: Cell::new(0),
         }
-    }
-
-    /// The name of the node under test's peer on `link`.
-    fn peer_of(&self, link: &Link) -> String {
-        let peer = if link.dialer == 0 {
-            link.listener
-        } else {
-            link.dialer
-        };
-        self.nodes[peer].name.clone()
-    }
-
-    /// Closes `link` and records it.
-    pub fn close(&self, link: &Link) {
-        link.close();
-        self.effects
-            .borrow_mut()
-            .push((LinkEffect::Closed, self.peer_of(link)));
     }
 
     /// Connects `dialer` to `listener` with a new connection and session,
@@ -460,7 +460,9 @@ impl Topology {
                 token.clone(),
             ));
         }
+        let peer = if dialer == 0 { listener } else { dialer };
         let link = Link {
+            peer: self.nodes[peer].name.clone(),
             dialer,
             listener,
             conn_id: id,
@@ -468,9 +470,6 @@ impl Topology {
             tokens,
         };
         self.links.borrow_mut().push(link.clone());
-        self.effects
-            .borrow_mut()
-            .push((LinkEffect::Linked, self.peer_of(&link)));
         link
     }
 
@@ -555,7 +554,7 @@ impl Control {
                     .link_to(&step.peer)
                     .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer));
                 match step.action {
-                    ControlAction::Close => topology.close(&link),
+                    ControlAction::Close => link.close(),
                     ControlAction::Relink => {
                         topology.link(link.dialer, link.listener);
                     }

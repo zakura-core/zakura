@@ -387,3 +387,63 @@ fn control_step_waits_for_its_trigger() {
         );
     }
 }
+
+/// A `Control` step on `peer`.
+fn step(action: ControlAction, when: Option<Trigger>) -> ControlStep {
+    ControlStep {
+        peer: "mira".to_owned(),
+        action,
+        when,
+    }
+}
+
+/// `Closed` counts connections, not close calls. Closing Mira's link twice
+/// closes one connection, so a relink gated on two closures never opens.
+/// Closing a second, relinked connection does open it.
+#[test]
+fn closing_twice_counts_one_closure() {
+    let closures = |n| {
+        Some(Trigger::Count(
+            n,
+            Box::new(Trigger::Closed("mira".to_owned())),
+        ))
+    };
+    let links = |n| {
+        Some(Trigger::Count(
+            n,
+            Box::new(Trigger::Linked("mira".to_owned())),
+        ))
+    };
+    let twice = StorageScenario {
+        controls: vec![
+            step(ControlAction::Close, None),
+            step(ControlAction::Close, None),
+            step(ControlAction::Relink, closures(2)),
+        ],
+        ..StorageScenario::default()
+    };
+    let distinct = StorageScenario {
+        controls: vec![
+            step(ControlAction::Close, None),
+            step(ControlAction::Relink, closures(1)),
+            step(ControlAction::Close, links(2)),
+            step(ControlAction::Relink, closures(2)),
+        ],
+        ..StorageScenario::default()
+    };
+    for input in inputs(4, 256) {
+        let (report, _) = run(&twice, input.clone());
+        let picks: Vec<&str> = report.picks.iter().map(|p| p.identity.as_str()).collect();
+        let count = |action| picks.iter().filter(|pick| **pick == action).count();
+        assert_eq!(count("peer:mira:close"), 2);
+        assert_eq!(count("peer:mira:relink"), 0, "one connection closed");
+
+        let (report, _) = run(&distinct, input);
+        let relinks = report
+            .picks
+            .iter()
+            .filter(|pick| pick.identity == "peer:mira:relink")
+            .count();
+        assert_eq!(relinks, 2, "two connections closed");
+    }
+}

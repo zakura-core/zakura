@@ -19,7 +19,7 @@ use zakura_storage::header::{
 
 use super::{
     header_node::{
-        preload, Chain, Control, ControlStep, DispatchFlag, HeaderNode, LinkLog, Policy,
+        preload, Chain, Control, ControlStep, DispatchFlag, HeaderNode, LinkTable, Policy,
         PolicySource, Topology,
     },
     Subsystem,
@@ -268,7 +268,7 @@ impl Subsystem for Storage {
     /// source.
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
-        let links = LinkLog::default();
+        let links = LinkTable::default();
         let storage = PolicySource::new(
             sim,
             ports.node.clone(),

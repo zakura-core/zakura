@@ -76,6 +76,22 @@ pub enum Observation {
         /// The state.
         state: StorageState,
     },
+    /// One event a header-sync reactor reported through its tap, in the
+    /// order the reactor reported it.
+    Reactor {
+        /// The tap's registration index among the run's taps, an index space
+        /// apart from storage's.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The last fact the node's storage had published when the event
+        /// happened, 0 before any.
+        storage_seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened.
+        event: ReactorFact,
+    },
     /// A peer sent a frame on a tabled stream. The peer's role models
     /// labelled it when it was sent.
     PeerFrame {
@@ -557,6 +573,157 @@ pub struct StorageContinuation {
     pub next: Option<u64>,
     /// How many hashes its path retains.
     pub retained: u64,
+}
+
+/// A header-sync reactor event in plain fields: peers, sources and hashes
+/// in hex, owners as storage writes them, and names for every enum.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum ReactorFact {
+    /// The reactor pushed a port call's future.
+    Dispatched {
+        /// The call's number, from 1 per reactor.
+        call: u64,
+        /// What the call asks storage for.
+        port: ReactorCall,
+    },
+    /// A port call's future ended.
+    CallEnded {
+        /// The call's number.
+        call: u64,
+        /// How it ended: `replied`, `port-error`, `timed-out`,
+        /// `not-submitted` or `port-panicked`.
+        end: String,
+        /// The storage operation the call is paired with. The tap doesn't
+        /// pair calls, so it always logs `None`.
+        op: Option<u64>,
+    },
+    /// The reactor finished processing a call's completion.
+    Handled {
+        /// The call's number.
+        call: u64,
+        /// Whether the call's future was caught panicking.
+        panicked: bool,
+    },
+    /// An active request started.
+    Started {
+        /// The request.
+        request: ReactorRequest,
+        /// Why it started.
+        purpose: ReactorPurpose,
+    },
+    /// An active request was retired.
+    Retired {
+        /// The request.
+        request: ReactorRequest,
+        /// Its phase then: `receiving`, `preparing` or `applying`.
+        phase: String,
+        /// Why it started.
+        purpose: ReactorPurpose,
+        /// Why it was retired, as the reactor's traces name it, such as
+        /// `snapshot_obsolete`.
+        reason: String,
+    },
+    /// An offer was refused for local capacity and stays unspent.
+    OfferWaiting {
+        /// The offering peer.
+        peer: String,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target: String,
+        /// Which capacity refused it: `staging-full` or `locator-capacity`.
+        cause: String,
+    },
+}
+
+/// What a dispatched port call asks storage for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ReactorCall {
+    /// A continuation locator read.
+    Locator {
+        /// The peer whose offer needs it.
+        peer: String,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target: String,
+        /// The header authority it was read under.
+        scope: WorkScope,
+    },
+    /// A VCT repair context read.
+    VctContext {
+        /// The repair's owner.
+        owner: WorkOwner,
+        /// The height that needs repair.
+        height: u32,
+    },
+    /// A target preparation.
+    Prepare {
+        /// The supplying peer.
+        peer: String,
+        /// The supplier's source identity.
+        source: String,
+        /// The request that owns the target.
+        owner: WorkOwner,
+    },
+    /// A prepared target's application.
+    Apply {
+        /// The supplying peer.
+        peer: String,
+        /// The supplier's source identity.
+        source: String,
+        /// The request that owns the target.
+        owner: WorkOwner,
+    },
+}
+
+/// An active request's identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorRequest {
+    /// The peer whose session owns it.
+    pub peer: String,
+    /// The owning session.
+    pub session_id: u64,
+    /// Its correlation ID.
+    pub request_id: u64,
+    /// Its work owner.
+    pub owner: WorkOwner,
+    /// The advertised target it pursues.
+    pub target: String,
+}
+
+/// Why an active request started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "purpose", rename_all = "kebab-case")]
+pub enum ReactorPurpose {
+    /// To admit a complete branch target.
+    Normal,
+    /// To redeliver auxiliary metadata for a selected range.
+    SelectedAuxiliaryRepair {
+        /// The selected target the repair context fixes.
+        selected_target: StoragePoint,
+        /// The repair-signal generation that owns the attempt.
+        repair_generation: u64,
+    },
+}
+
+/// The events that reactor tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn reactor_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::Reactor { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
 }
 
 /// The facts and states that storage `instance` of `service` logged in

@@ -18,8 +18,8 @@ use crate::{
 
 /// The record shapes and field encodings. Any field or variant change bumps
 /// it. Version 2 replaced storage operation events with typed storage facts
-/// and states.
-pub const FORMAT_VERSION: u32 = 2;
+/// and states. Version 3 added header-sync reactor events.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -522,6 +522,155 @@ mod tests {
             r#"[{"obs":"storage","service":"header","instance":1,"seq":1,"txn":4,"fact":{"fact":"submitted","id":1,"request":{"op":"apply_header_target","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"source":"02","parent":"dd","target":"bb"},"digest":"ef"}},{"obs":"storage","service":"header","instance":1,"seq":2,"txn":4,"fact":{"fact":"leased","lease":{"peer":"01","session_id":1,"lease_id":3},"scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}},"target":{"height":3,"hash":"cc"},"common_ancestor":{"height":0,"hash":"cc"},"next":0,"capacity":"general"}},{"obs":"storage","service":"header","instance":1,"seq":3,"txn":4,"fact":{"fact":"retention-ended","lease":{"peer":"01","session_id":1,"lease_id":3},"why":"continued","into":4}},{"obs":"storage","service":"header","instance":1,"seq":4,"txn":4,"fact":{"fact":"waiter-set","class":"peer","lease":{"peer":"01","session_id":1,"lease_id":3}}},{"obs":"storage","service":"header","instance":1,"seq":5,"txn":4,"fact":{"fact":"completed","id":1,"outcome":"engine","result":{"result":"acquired","lease":{"peer":"01","session_id":1,"lease_id":3},"common_ancestor":{"height":0,"hash":"cc"},"target":{"height":3,"hash":"cc"}},"delivered":true,"generation":2,"state":"ab"}},{"obs":"storage","service":"header","instance":1,"seq":6,"txn":4,"fact":{"fact":"shut-down","dropped":[1]}},{"obs":"storage-state","service":"header","instance":1,"through_seq":6,"state":{"operations":[{"id":1,"request":{"op":"apply_header_target","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"source":"02","parent":"dd","target":"bb"},"stage":"replied","result":{"result":"busy"},"caller_alive":true}],"permits":[2],"leases":[{"lease":{"peer":"01","session_id":1,"lease_id":3},"scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}},"target":{"height":3,"hash":"cc"},"last":{"height":0,"hash":"cc"},"next":null,"capacity":"bounded","waiter":false,"leased_txn":4}],"continuations":[],"general_waiter":false,"fallback_waiter":true,"last_lease_id":3,"continuation_hits":1}}]"#,
             "a storage observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test"
+        );
+    }
+
+    /// Pins the reactor observations, one of each event and call kind, and
+    /// the format version that added them.
+    #[test]
+    fn reactor_observation_encoding_is_pinned() {
+        use crate::observe::{
+            ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageBranch, StoragePoint,
+            WorkOwner, WorkScope,
+        };
+
+        let scope = || WorkScope {
+            header_generation: 2,
+            branch: StorageBranch {
+                anchor: "aa".into(),
+                target: "bb".into(),
+            },
+        };
+        let owner = |kind: &str| WorkOwner {
+            kind: kind.into(),
+            scope: scope(),
+            verified_generation: (kind == "body-repair").then_some(5),
+            body_work_epoch: (kind == "body-repair").then_some(6),
+            session_id: 7,
+            request_id: 8,
+        };
+        let request = || ReactorRequest {
+            peer: "01".into(),
+            session_id: 7,
+            request_id: 8,
+            owner: owner("header"),
+            target: "bb".into(),
+        };
+        let repair = || ReactorPurpose::SelectedAuxiliaryRepair {
+            selected_target: StoragePoint {
+                height: 3,
+                hash: "cc".into(),
+            },
+            repair_generation: 4,
+        };
+        let reactor = |seq, event| Observation::Reactor {
+            instance: 0,
+            seq,
+            storage_seq: seq + 10,
+            node: "node".into(),
+            event,
+        };
+        let obs = [
+            reactor(
+                1,
+                ReactorFact::Dispatched {
+                    call: 1,
+                    port: ReactorCall::Locator {
+                        peer: "01".into(),
+                        session_id: 7,
+                        target: "bb".into(),
+                        scope: scope(),
+                    },
+                },
+            ),
+            reactor(
+                2,
+                ReactorFact::Dispatched {
+                    call: 2,
+                    port: ReactorCall::VctContext {
+                        owner: owner("body-repair"),
+                        height: 3,
+                    },
+                },
+            ),
+            reactor(
+                3,
+                ReactorFact::Dispatched {
+                    call: 3,
+                    port: ReactorCall::Prepare {
+                        peer: "01".into(),
+                        source: "02".into(),
+                        owner: owner("header"),
+                    },
+                },
+            ),
+            reactor(
+                4,
+                ReactorFact::Dispatched {
+                    call: 4,
+                    port: ReactorCall::Apply {
+                        peer: "01".into(),
+                        source: "02".into(),
+                        owner: owner("header"),
+                    },
+                },
+            ),
+            reactor(
+                5,
+                ReactorFact::CallEnded {
+                    call: 1,
+                    end: "timed-out".into(),
+                    op: None,
+                },
+            ),
+            reactor(
+                6,
+                ReactorFact::CallEnded {
+                    call: 3,
+                    end: "replied".into(),
+                    op: Some(9),
+                },
+            ),
+            reactor(
+                7,
+                ReactorFact::Handled {
+                    call: 1,
+                    panicked: false,
+                },
+            ),
+            reactor(
+                8,
+                ReactorFact::Started {
+                    request: request(),
+                    purpose: ReactorPurpose::Normal,
+                },
+            ),
+            reactor(
+                9,
+                ReactorFact::Retired {
+                    request: request(),
+                    phase: "applying".into(),
+                    purpose: repair(),
+                    reason: "snapshot_obsolete".into(),
+                },
+            ),
+            reactor(
+                10,
+                ReactorFact::OfferWaiting {
+                    peer: "01".into(),
+                    session_id: 7,
+                    target: "bb".into(),
+                    cause: "staging-full".into(),
+                },
+            ),
+        ];
+        let bump = "a reactor observation's encoding changed, which changes `obs` digests, \
+             so bump FORMAT_VERSION and update this test";
+        assert_eq!(FORMAT_VERSION, 3, "{bump}");
+        assert_eq!(
+            serde_json::to_string(&obs).unwrap(),
+            r#"[{"obs":"reactor","instance":0,"seq":1,"storage_seq":11,"node":"node","event":{"event":"dispatched","call":1,"port":{"kind":"locator","peer":"01","session_id":7,"target":"bb","scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}}}}},{"obs":"reactor","instance":0,"seq":2,"storage_seq":12,"node":"node","event":{"event":"dispatched","call":2,"port":{"kind":"vct-context","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3}}},{"obs":"reactor","instance":0,"seq":3,"storage_seq":13,"node":"node","event":{"event":"dispatched","call":3,"port":{"kind":"prepare","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":4,"storage_seq":14,"node":"node","event":{"event":"dispatched","call":4,"port":{"kind":"apply","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":5,"storage_seq":15,"node":"node","event":{"event":"call-ended","call":1,"end":"timed-out","op":null}},{"obs":"reactor","instance":0,"seq":6,"storage_seq":16,"node":"node","event":{"event":"call-ended","call":3,"end":"replied","op":9}},{"obs":"reactor","instance":0,"seq":7,"storage_seq":17,"node":"node","event":{"event":"handled","call":1,"panicked":false}},{"obs":"reactor","instance":0,"seq":8,"storage_seq":18,"node":"node","event":{"event":"started","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"purpose":{"purpose":"normal"}}},{"obs":"reactor","instance":0,"seq":9,"storage_seq":19,"node":"node","event":{"event":"retired","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"phase":"applying","purpose":{"purpose":"selected-auxiliary-repair","selected_target":{"height":3,"hash":"cc"},"repair_generation":4},"reason":"snapshot_obsolete"}},{"obs":"reactor","instance":0,"seq":10,"storage_seq":20,"node":"node","event":{"event":"offer-waiting","peer":"01","session_id":7,"target":"bb","cause":"staging-full"}}]"#,
+            "{bump}"
         );
     }
 

@@ -109,6 +109,7 @@ impl Subsystem for Probe {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(_: &Behavior) -> RunConfig {
         RunConfig {
@@ -118,7 +119,10 @@ impl Subsystem for Probe {
         }
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {
@@ -214,13 +218,17 @@ impl Subsystem for Unbounded {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(behavior: &Behavior) -> RunConfig {
         Probe::config(behavior)
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
-        Probe::build(sim, behavior);
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
+        Probe::build(sim, behavior, ());
         Unbounded
     }
 
@@ -275,13 +283,17 @@ impl Subsystem for Counted {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(behavior: &Behavior) -> RunConfig {
         Probe::config(behavior)
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
-        Probe::build(sim, behavior);
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
+        Probe::build(sim, behavior, ());
         Counted
     }
 

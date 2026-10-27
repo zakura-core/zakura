@@ -54,14 +54,18 @@ impl Subsystem for WaitComplete {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Scenario;
+    type Prepared = ();
 
     /// [`run_config`].
     fn config(_: &Scenario) -> RunConfig {
         run_config()
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Scenario) {}
+
     /// [`spawn`].
-    fn build(sim: &mut Sim, _: &Scenario) -> Self {
+    fn build(sim: &mut Sim, _: &Scenario, (): ()) -> Self {
         spawn(sim);
         WaitComplete
     }

@@ -27,8 +27,10 @@ zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-quic = { path = "../zakura-quic" }
-# Header storage as an action source.
+# Header storage as an action source, and its owner types for the
+# observation encoding.
 zakura-storage = { path = "../zakura-storage" }
+zakura-header-chain = { path = "../zakura-header-chain" }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
@@ -38,8 +40,6 @@ rand_10 = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
 tokio-stream = { workspace = true }
-# For the engine-backed header storage scenarios.
-zakura-header-chain = { path = "../zakura-header-chain" }
 
 # build.rs hashes the source for trace `meta` records.
 [build-dependencies]

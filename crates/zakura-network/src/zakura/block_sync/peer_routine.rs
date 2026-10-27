@@ -1460,10 +1460,12 @@ impl PeerRoutine {
         [timed, ending].into_iter().flatten().min()
     }
 
+    /// Read the admission inputs and publish the above-floor reservation that
+    /// admission compares with the look-ahead limit.
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
             self.work.reserved_above(view.download_floor);
-        AdmissionSnapshot {
+        let snapshot = AdmissionSnapshot {
             download_floor: view.download_floor,
             verified_block_tip: view.verified_tip,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
@@ -1480,7 +1482,12 @@ impl PeerRoutine {
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),
-        }
+        };
+        // This gauge records an admission input, so it changes only here. This
+        // lossy cast is metrics-only; admission keeps the integer value.
+        metrics::gauge!("sync.block.work.reserved_above_floor_bytes")
+            .set(snapshot.reserved_above_floor_bytes as f64);
+        snapshot
     }
 
     fn request_count_cap(&self) -> usize {

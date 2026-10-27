@@ -20,7 +20,6 @@ on:
       - Header-chain fuzzing
       - Legacy Pages redirect
       - Lint
-      - Perf bench (ephemeral droplets)
       - PR node reaper
       - RPC fuzzing
       - Semver checks

@@ -5,7 +5,12 @@
 //! ends at a violation, when nothing is enabled, or after its step budget and
 //! a bounded drain.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use zakura_scheduler::{
     CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
@@ -16,13 +21,18 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
-    observe::{Exit, Observation},
+    evidence::{Checkpoint, Mark, StorageId},
+    observe::{storage_entries, Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
         ViolationRecord,
     },
     Identity, ObservationLog, Plan, PlanInput,
 };
+
+/// The next run's ID. IDs are never serialized, so their values don't
+/// affect replay.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// The property a run violates when it spins at one instant too long.
 pub const NO_LIVELOCK: &str = "sim/no-livelock";
@@ -94,6 +104,11 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
+    /// Each storage checkpoint the run holds, by its service, in
+    /// registration order.
+    evidence: Vec<(String, Checkpoint)>,
+    /// This run's ID, unique within the process.
+    run_id: u64,
     config: RunConfig,
 }
 
@@ -116,6 +131,8 @@ impl Sim {
             choices,
             failure,
             sources: Vec::new(),
+            evidence: Vec::new(),
+            run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
         }
     }
@@ -132,11 +149,28 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
+    /// Holds `checkpoint` for a storage source of `service` being created.
+    /// At setup and after every step, the run ends with
+    /// [`HarnessFailure::SourceEvidence`] unless it names that step and the
+    /// run's own log holds exactly the facts and states it records, however
+    /// the source was wrapped or added, or if it never was.
+    /// Returns the source's identity, which binds it to this run.
+    pub(crate) fn register_storage(&mut self, service: &str, checkpoint: Checkpoint) -> StorageId {
+        let id = StorageId {
+            run: self.run_id,
+            // usize always fits in u64 on supported targets.
+            index: self.evidence.len() as u64,
+        };
+        self.evidence.push((service.to_owned(), checkpoint));
+        id
+    }
+
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
     /// each step, then `end`.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
+        state.log.set_run(self.run_id);
         let draws = {
             let mut choices = self.choices.borrow_mut();
             // The sink is harness code, so a draw inside it is a failure.
@@ -165,12 +199,39 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
+        // Storage the last step's checker or sink dropped after it observed
+        // fails the run before its properties are reported.
+        let end = match self.end_evidence(&end, &state) {
+            Some(failure) => state.end_harness(failure),
+            None => end,
+        };
         // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
+        // Read even when a failure is already recorded. One `at_end` or its
+        // reports caused still replaces the outcome, as before, and storage
+        // `at_end` dropped ends the run only if nothing else did.
+        let dropped = self.check_evidence(&state).err();
         let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
+        };
+        let end = match dropped {
+            Some(failure) if end.outcome != Outcome::Harness => state.end_harness(failure),
+            _ => end,
+        };
+        // Last, so it covers every way the run ended at a harness failure,
+        // which the checker may have reported before it knew. The report and
+        // the end record both take these.
+        let properties = match end.outcome {
+            Outcome::Harness => properties
+                .into_iter()
+                .map(|report| PropertyReport {
+                    outcome: report.outcome.after_harness_failure(),
+                    ..report
+                })
+                .collect(),
+            _ => properties,
         };
         state.log.freeze();
         let cleanup = self.shut_down();
@@ -232,7 +293,9 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
-        self.observe_sources(st);
+        if let Err(failure) = self.observe_sources(st) {
+            return st.end_harness(failure);
+        }
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -320,13 +383,18 @@ impl Sim {
                 _ => Owner::NoTask,
             };
             self.choices.borrow_mut().set_owner(owner);
-            self.execute(chosen.action, st);
+            let executed = self.execute(chosen.action, st);
             let draws = {
                 let mut choices = self.choices.borrow_mut();
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
-            self.observe_sources(st);
+            let observed = match chosen.action {
+                // `execute` observed right after the task ran, and nothing
+                // has run since.
+                Action::RunTask(_) => executed,
+                _ => executed.and_then(|()| self.observe_sources(st)),
+            };
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {
@@ -340,6 +408,10 @@ impl Sim {
                 obs: Some(digest(st.log.of_step(st.step))),
             }));
             if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
+            // Ends before the checker, which would read incomplete evidence.
+            if let Err(failure) = observed {
                 return st.end_harness(failure);
             }
             ready = match next {
@@ -412,19 +484,96 @@ impl Sim {
         .is_ok_and(|enabled| enabled.is_empty())
     }
 
-    /// Lets every source append what happened inside it to the current step.
-    fn observe_sources(&mut self, st: &mut State) {
-        for source in &mut self.sources {
-            source.observe(&mut st.log);
+    /// Lets every source append what happened inside it to the current
+    /// step, then requires every evidence source's checkpoint to name it.
+    fn observe_sources(&mut self, st: &mut State) -> Result<(), HarnessFailure> {
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            source
+                .observe(&mut st.log)
+                .map_err(|detail| HarnessFailure::SourceEvidence {
+                    source: format!("source {index}"),
+                    detail,
+                })?;
+        }
+        self.check_evidence(st)
+    }
+
+    /// The evidence failure that ends a run which `end` didn't already end
+    /// at a harness failure, if any of its storage was dropped, or skipped
+    /// a boundary, after its last observation. Checked before the log
+    /// freezes, so the run's own shutdown, after it, never fails here.
+    fn end_evidence(&self, end: &RunEnd, st: &State) -> Option<HarnessFailure> {
+        match end.outcome {
+            Outcome::Harness => None,
+            _ => self.check_evidence(st).err(),
         }
     }
 
-    /// Runs `action` and records what it did.
-    fn execute(&mut self, action: Action, st: &mut State) {
+    /// Requires every storage checkpoint to name the current step, with the
+    /// run's own log holding exactly what it records.
+    fn check_evidence(&self, st: &State) -> Result<(), HarnessFailure> {
+        for (instance, (service, checkpoint)) in (0..).zip(&self.evidence) {
+            let detail = match checkpoint.get() {
+                Mark::NotObserved => {
+                    "NotObserved: the setup observation never completed".to_owned()
+                }
+                Mark::Dropped => "Dropped: the storage was dropped during the run".to_owned(),
+                Mark::Observed(delivered) if delivered.step != st.step => format!(
+                    "BoundarySkipped: the last observation was at step {}, not {}",
+                    delivered.step, st.step
+                ),
+                Mark::Observed(delivered) => {
+                    // The port is read live, since activity after the last
+                    // observation leaves the mark as it was.
+                    let port = checkpoint.port();
+                    let live = port.as_ref().map_or(0, |port| port.last_seq());
+                    // Exactly what storage delivered, payloads and order
+                    // included, so the checker reads what the model checked.
+                    let logged = storage_entries(st.log.of_step(st.step), service, instance);
+                    if port.as_ref().is_some_and(|port| port.refused_outside_run()) {
+                        "RefusedOutsideRun: the port refused use outside its run".to_owned()
+                    } else if live > delivered.through_seq {
+                        format!(
+                            "Unobserved: the port published facts {}..={live} after its last \
+                             observation",
+                            delivered.through_seq + 1
+                        )
+                    } else if logged.iter().copied().eq(&delivered.observations) {
+                        continue;
+                    } else {
+                        let differs = logged
+                            .iter()
+                            .zip(&delivered.observations)
+                            .position(|(logged, sent)| *logged != sent)
+                            .unwrap_or(logged.len().min(delivered.observations.len()));
+                        format!(
+                            "Undelivered: at step {} the run log holds {} storage entries and \
+                             storage delivered {}, first differing at entry {differs}",
+                            st.step,
+                            logged.len(),
+                            delivered.observations.len()
+                        )
+                    }
+                }
+            };
+            return Err(HarnessFailure::SourceEvidence {
+                source: format!("storage:{service}#{instance}"),
+                detail,
+            });
+        }
+        Ok(())
+    }
+
+    /// Runs `action` and records what it did. A task's outcome is pushed
+    /// after the sources are drained, so what it made a source do comes
+    /// first in the step.
+    fn execute(&mut self, action: Action, st: &mut State) -> Result<(), HarnessFailure> {
         match action {
             Action::RunTask(task) => {
                 let name = st.names[&task].clone();
-                let obs = match self.sched_mut().run(task) {
+                let outcome = self.sched_mut().run(task);
+                self.observe_sources(st)?;
+                let obs = match outcome {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
@@ -448,6 +597,7 @@ impl Sim {
             }
             Action::Source { source, local } => self.sources[source.0].execute(local, &mut st.log),
         }
+        Ok(())
     }
 
     /// The scheduler's ready tasks with their identities. Records each task

@@ -30,8 +30,9 @@ use zakura_sim::{
         Trace, TraceReader, OBSERVATIONS_FILE, TRACE_FILE,
     },
     ActionSource, Checker, Divergence, HarnessFailure, Identity, NoChecks, Observation,
-    ObservationLog, PropertyOutcome, RunConfig, Sim,
+    ObservationLog, PlanInput, PropertyOutcome, RunConfig, Sim,
 };
+use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
 /// Records `harness` on the full fuzz `input`.
 fn record(harness: &HarnessEntry, input: &[u8]) -> TempDir {
@@ -1081,4 +1082,94 @@ fn observe_refuses_an_existing_log_before_running() {
         std::fs::read_to_string(&log).unwrap(),
         "an earlier replay's log\n"
     );
+}
+
+thread_local! {
+    /// The storage [`ForeignStorage`] adds to its run, made by an earlier
+    /// run.
+    static FOREIGN: std::cell::RefCell<Option<zakura_sim::storage::HeaderStorage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Storage registered with a run that's already dropped, ready for
+/// [`ForeignStorage`].
+fn stage_foreign_storage() {
+    let port = std::sync::Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let mut other = Sim::new(limits(8, 8), PlanInput::Bytes(Vec::new()));
+    let storage = zakura_sim::storage::HeaderStorage::new(&mut other, port);
+    drop(other);
+    FOREIGN.with(|foreign| *foreign.borrow_mut() = Some(storage));
+}
+
+/// A run handed storage from an earlier run, which fails at setup with
+/// `ForeignRun`.
+struct ForeignStorage;
+
+/// [`ForeignStorage`]'s registry entry, which isn't in `HARNESSES`.
+const FOREIGN_STORAGE: HarnessEntry = entry::<ForeignStorage>();
+
+no_view!(ForeignStorage);
+
+impl Subsystem for ForeignStorage {
+    const NAME: &'static str = "test/foreign-storage";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+
+    /// A short budget and drain.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(8, 8)
+    }
+
+    /// Adds the staged storage.
+    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+        let storage = FOREIGN
+            .with(|foreign| foreign.borrow_mut().take())
+            .expect("the test staged storage");
+        sim.add_source(Box::new(storage));
+        ForeignStorage
+    }
+
+    /// No checks.
+    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
+        Box::new(NoChecks)
+    }
+
+    /// No properties.
+    fn properties(_: &Fixed) -> Vec<PropertyRef> {
+        Vec::new()
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// A foreign-storage failure records text that doesn't depend on how many
+/// runs the process made before it, so it replays exactly after more runs.
+#[test]
+fn a_foreign_storage_failure_replays_exactly() {
+    stage_foreign_storage();
+    let dir = record(&FOREIGN_STORAGE, &[]);
+    let recorded = open(dir.path()).end.expect("the trace has an end");
+    assert_eq!(recorded.outcome, OutcomeKind::Harness, "{recorded:?}");
+    assert!(
+        recorded
+            .harness
+            .as_deref()
+            .is_some_and(|failure| failure.contains("ForeignRun")),
+        "{recorded:?}"
+    );
+    for _ in 0..3 {
+        drop(Sim::new(limits(8, 8), PlanInput::Bytes(Vec::new())));
+    }
+    stage_foreign_storage();
+    let report = replay_with(
+        &open(dir.path()),
+        &FOREIGN_STORAGE,
+        ReplayOptions::default(),
+    )
+    .expect("the trace replays");
+    assert!(report.verified(), "{report:?}");
 }

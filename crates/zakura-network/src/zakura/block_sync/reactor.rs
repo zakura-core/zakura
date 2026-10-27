@@ -2022,10 +2022,6 @@ impl BlockSyncReactor {
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
-        metrics::gauge!("sync.block.budget.reserved_bytes")
-            .set(self.state.budget.reserved() as f64);
-        metrics::gauge!("sync.block.reorder.buffered_bytes")
-            .set(self.last_view.reorder_buffered_bytes as f64);
         metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
             .set(sequencer_input_decoded_attributed_memory_bytes as f64);
         metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")

@@ -76,13 +76,18 @@ pub enum RegistryError {
 
 /// A validated set of persistent streams admitted as one service session.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SessionLayout {
-    pub(crate) streams: Arc<[Stream]>,
+pub struct SessionLayout {
+    streams: Arc<[Stream]>,
 }
 
 impl SessionLayout {
+    /// The session's streams, ordered by kind.
+    pub fn streams(&self) -> &[Stream] {
+        &self.streams
+    }
+
     /// The lowest stream kind supplies the session identity and layout version.
-    pub(crate) fn primary(&self) -> Stream {
+    pub fn primary(&self) -> Stream {
         self.streams[0]
     }
 
@@ -300,6 +305,34 @@ impl ServiceRegistry {
             .get(&(stream.kind, stream.version))
             .filter(|layout| layout.streams.contains(&stream))
             .cloned()
+    }
+
+    /// Each tabled persistent session layout once, ordered by primary stream
+    /// kind, then by version.
+    ///
+    /// Layouts without message tables never appear: legacy gossip's kind 2
+    /// and the header-sync passthrough stream declare none. Request/response
+    /// streams, such as legacy gossip's kind 3, never form a session layout.
+    /// The connection's control stream belongs to no service.
+    ///
+    /// This lists every alternative a service registers. A session negotiates
+    /// at most one of them per service from its capability mask.
+    pub fn session_layouts(&self) -> impl Iterator<Item = &SessionLayout> {
+        // Every member stream keys its layout, so keep only the primary's entry.
+        let mut layouts: Vec<&SessionLayout> = self
+            .session_layouts
+            .iter()
+            .filter(|((kind, version), layout)| {
+                let primary = layout.primary();
+                (primary.kind, primary.version) == (*kind, *version) && primary.messages.is_some()
+            })
+            .map(|(_, layout)| layout)
+            .collect();
+        layouts.sort_unstable_by_key(|layout| {
+            let primary = layout.primary();
+            (primary.kind, primary.version)
+        });
+        layouts.into_iter()
     }
 
     fn selected_session_streams(&self, service: &dyn Service, negotiated: u64) -> Vec<Stream> {
@@ -761,6 +794,84 @@ mod tests {
         assert_eq!(registry.persistent_streams_for_negotiated(3), older);
         // Per-kind selection would incorrectly choose stream 7 version 4.
         assert_eq!(registry.persistent_streams_for_negotiated(7), newer);
+    }
+
+    #[test]
+    fn session_layouts_match_negotiated() {
+        use crate::zakura::{MessageRole, MessageRule, PayloadLen};
+
+        const REQUEST: MessageRule = MessageRule {
+            name: "request",
+            message_type: 2,
+            payload: PayloadLen::exact(8),
+            role: MessageRole::Request {
+                max_in_flight: 1,
+                cadence: None,
+            },
+        };
+        const ENDING: MessageRule = MessageRule {
+            name: "ending",
+            message_type: 3,
+            payload: PayloadLen::exact(8),
+            role: MessageRole::Response {
+                request: REQUEST.message_type,
+                ends_exchange: true,
+            },
+        };
+        let tabled = |kind, version, capability, rows: &'static [MessageRule]| Stream {
+            messages: Some(rows),
+            ..versioned_stream(kind, version, capability)
+        };
+        let legacy = versioned_stream(6, 1, 1);
+        let pair = [tabled(6, 2, 2, &[ENDING]), tabled(7, 4, 2, &[REQUEST])];
+        let single = tabled(6, 3, 4, &[REQUEST, ENDING]);
+        let lookup = Stream {
+            mode: StreamMode::RequestResponse,
+            ..tabled(9, 1, 8, &[REQUEST, ENDING])
+        };
+        let other = tabled(5, 1, 16, &[REQUEST, ENDING]);
+        let registry = ServiceRegistry::new(vec![
+            TestService::new(
+                "session",
+                [vec![legacy], pair.to_vec(), vec![single]].concat(),
+            ),
+            TestService::new("lookup", vec![lookup]),
+            TestService::new("other", vec![other]),
+        ])
+        .unwrap();
+
+        let layouts: Vec<Vec<Stream>> = registry
+            .session_layouts()
+            .map(|layout| layout.streams().to_vec())
+            .collect();
+        // The pair appears once, though both of its streams key it. The
+        // untabled layout and the request/response stream do not appear.
+        assert_eq!(layouts, [vec![other], pair.to_vec(), vec![single]]);
+        let negotiated: Vec<Vec<Stream>> = [16, 2, 4]
+            .map(|capability| registry.persistent_streams_for_negotiated(capability))
+            .into();
+        assert_eq!(layouts, negotiated);
+        // Every mask negotiates at most one complete layout per service,
+        // preferring the highest primary version.
+        for mask in 0..32 {
+            let mut expected = if mask & 4 != 0 {
+                vec![single]
+            } else if mask & 2 != 0 {
+                pair.to_vec()
+            } else if mask & 1 != 0 {
+                vec![legacy]
+            } else {
+                vec![]
+            };
+            if mask & 16 != 0 {
+                expected.push(other);
+            }
+            assert_eq!(
+                registry.persistent_streams_for_negotiated(mask),
+                expected,
+                "mask {mask}"
+            );
+        }
     }
 
     #[test]

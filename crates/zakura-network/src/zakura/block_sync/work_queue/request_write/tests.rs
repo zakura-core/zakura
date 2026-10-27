@@ -713,3 +713,90 @@ async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
         assert_eq!(f.budget.reserved(), 0);
     }
 }
+
+/// Both budget-ledger gauges equal sums over the work queue's owners after
+/// each charge, transfer, and release path. No check calls a publication
+/// helper, so each gauge must follow its ledger on its own.
+#[test]
+fn budget_ledger_gauges_follow_work_owners() {
+    use crate::zakura::block_sync::{
+        tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace,
+    };
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mut f = Fixture::new();
+    // Returns the work and budget gauges after checking them against the owners.
+    let check = |f: &Fixture, label: &str| {
+        let owners = f.work.ownership_snapshot();
+        let reserved: u64 = owners.iter().map(|item| item.reserved_bytes).sum();
+        let provisional: u64 = owners
+            .iter()
+            .filter(|item| item.place == WorkItemPlace::Provisional)
+            .map(|item| item.estimated_bytes)
+            .sum();
+        let work_gauge = recorder.bytes("sync.block.work.reserved_bytes");
+        let budget_gauge = recorder.bytes("sync.block.budget.reserved_bytes");
+        assert_eq!(work_gauge, reserved, "work gauge after {label}");
+        assert_eq!(
+            budget_gauge,
+            reserved + provisional,
+            "budget gauge after {label}"
+        );
+        for floor in [block::Height(0), block::Height(1)] {
+            let above: u64 = owners
+                .iter()
+                .filter(|item| item.place == WorkItemPlace::InFlight && item.height > floor)
+                .map(|item| item.reserved_bytes)
+                .sum();
+            assert_eq!(
+                f.work.reserved_above(floor).0,
+                above,
+                "reservations above {floor:?} after {label}"
+            );
+        }
+        (work_gauge, budget_gauge)
+    };
+
+    assert_eq!(check(&f, "start"), (0, 0));
+
+    // The budget funds a provisional take before the queue charges it.
+    let claim = f.take(1);
+    assert_eq!(check(&f, "provisional take"), (0, 200));
+    drop(claim);
+    assert_eq!(check(&f, "unpublished drop"), (0, 0));
+
+    let claim = f.take(2);
+    assert!(claim.publish(|| {}));
+    assert_eq!(check(&f, "publication"), (200, 200));
+    f.budget.release(
+        f.work
+            .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+            .unwrap(),
+    );
+    assert!(check(&f, "receipt").0 < 200);
+    f.reset();
+    drop(claim);
+    assert_eq!(check(&f, "reset after receipt"), (0, 0));
+
+    f.refill();
+    let claim = f.take(3);
+    assert!(claim.publish(|| {}));
+    f.expire(claim.owner());
+    assert_eq!(check(&f, "timeout"), (0, 0));
+    drop(claim);
+    assert_eq!(check(&f, "drop after timeout"), (0, 0));
+
+    let claim = f.take(4);
+    assert!(claim.publish(|| {}));
+    f.reset();
+    assert_eq!(check(&f, "reset"), (0, 0));
+    drop(claim);
+
+    f.refill();
+    let claim = f.take(5);
+    assert!(claim.publish(|| {}));
+    assert_eq!(check(&f, "last publication"), (200, 200));
+    drop(claim);
+    assert_eq!(check(&f, "published drop"), (0, 0));
+}

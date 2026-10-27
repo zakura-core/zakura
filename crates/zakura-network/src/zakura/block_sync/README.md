@@ -255,6 +255,32 @@ The `sync.block.backlog.at_cap` gauge is latched to 1 whenever a pass stops on
 above-floor grant. `sync.block.request.floor_bypass` counts floor requests that
 borrowed a bypass slot.
 
+### Byte gauges
+
+Resource-bound tests read these gauges, so their names are a test contract.
+Each resource gauge is written where its owner changes the value, including
+release and drop paths, so a reader between any two steps sees the current
+value:
+
+| Gauge | Measures | Written |
+| --- | --- | --- |
+| `sync.block.reorder.buffered_bytes` | Wire bytes of bodies in the reorder buffer | When the reorder buffer inserts or drops a body |
+| `sync.block.applying.buffered_bytes` | Wire bytes of bodies in `applying`; a detached submission no longer counts | When the sequencer adds or removes an `applying` body |
+| `sync.block.sequencer_input.queued_bytes` | Wire bytes of bodies in the sequencer input queue | When a body enters the queue, leaves it, or drops |
+| `sync.block.submission.in_flight_bytes` | Wire bytes of decoded submissions the driver can still retain, including detached ones | When the sequencer submits or settles a body |
+| `sync.block.work.reserved_bytes` | Request-estimate bytes that the work queue's ledger reserves | Under the work-queue lock, when the ledger changes |
+| `sync.block.budget.reserved_bytes` | Bytes charged to the shared in-flight request budget | When the budget charges or releases bytes |
+| `sync.block.work.reserved_above_floor_bytes` | Request-estimate bytes that in-flight work above the download floor reserves | At each admission snapshot |
+
+The above-floor gauge records an admission input, not a resource, so it keeps
+the value the latest admission read. It counts every reservation above the
+current download floor, including commit-window work, so it is a diagnostic.
+`lookahead-overshoot-bound` instead sums the estimates of outstanding
+above-window requests from the request records. The budget charges a request before the
+work queue does and releases it after, so the budget gauge can exceed the work
+gauge while a request is in transition. The two gauges are written separately,
+so only a reader that sees no request in transition can compare them.
+
 ## Key config knobs (defaults)
 
 | Knob | Default | Notes |

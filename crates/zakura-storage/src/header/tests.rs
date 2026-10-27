@@ -94,13 +94,8 @@ fn requests(key: &AdapterKey) -> Vec<HeaderRequest> {
     let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
     let scope = owner().header_authority();
     let path = RetainedHeaderPath::from_adapter(key, 7, source, 8, ancestor, target, scope);
-    let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("a fresh semaphore has a permit");
     vec![
-        HeaderRequest::ContinuationLocator {
-            permit: LocatorReadPermit::new(permit),
-        },
+        HeaderRequest::ContinuationLocator,
         HeaderRequest::VctRepairContext {
             owner: BodyWorkAuthority {
                 header: scope,

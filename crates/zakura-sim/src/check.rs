@@ -39,8 +39,9 @@ pub enum PropertyOutcome {
     },
     /// No evaluation applied.
     NotApplicable,
-    /// An obligation was still open at run end, within its bound, or the
-    /// property's assumptions never held.
+    /// An obligation was still open at run end, within its bound, the
+    /// property's assumptions never held, or a harness failure ended the
+    /// run.
     Inconclusive {
         /// Which of the two.
         reason: String,
@@ -50,6 +51,22 @@ pub enum PropertyOutcome {
         /// The steps the violation depends on.
         witness: Vec<u64>,
     },
+}
+
+impl PropertyOutcome {
+    /// This outcome once a harness failure ended the run: one that held or
+    /// never applied is inconclusive, since the run's evidence may be
+    /// incomplete. A violation found before the failure stands.
+    pub(crate) fn after_harness_failure(self) -> Self {
+        match self {
+            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable => {
+                PropertyOutcome::Inconclusive {
+                    reason: crate::property::Inconclusive::HarnessFailed.to_string(),
+                }
+            }
+            outcome => outcome,
+        }
+    }
 }
 
 /// A property's ID and its run outcome.

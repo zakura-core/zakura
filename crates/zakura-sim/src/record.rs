@@ -17,8 +17,9 @@ use crate::{
 };
 
 /// The record shapes and field encodings. Any field or variant change bumps
-/// it.
-pub const FORMAT_VERSION: u32 = 1;
+/// it. Version 2 replaced storage operation events with typed storage facts
+/// and states.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -388,53 +389,138 @@ mod tests {
         assert_eq!(digest(obs.iter()), "917a4440abdd4f53", "{bump}");
     }
 
-    /// Storage observations came after the format's first version. Adding a
-    /// variant changes no other variant's encoding, so this pins them
-    /// separately.
+    /// Pins the storage observations separately, since their types are
+    /// many and change together.
     #[test]
     fn storage_observation_encoding_is_pinned() {
-        use crate::observe::{LeaseEnd, StorageEvent};
-
-        let storage = |id, event| Observation::Storage {
-            service: "header".into(),
-            id,
-            event,
+        use crate::observe::{
+            StorageBranch, StorageFact, StorageLease, StorageLeaseState, StorageOperation,
+            StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner, WorkScope,
         };
-        let ends = || {
-            vec![LeaseEnd {
-                peer: "01".into(),
-                lease: 3,
-                release: "lease-released".into(),
-            }]
+
+        let scope = || WorkScope {
+            header_generation: 2,
+            branch: StorageBranch {
+                anchor: "aa".into(),
+                target: "bb".into(),
+            },
+        };
+        let lease = || StorageLease {
+            peer: "01".into(),
+            session_id: 1,
+            lease_id: 3,
+        };
+        let point = |height| StoragePoint {
+            height,
+            hash: "cc".into(),
+        };
+        let storage = |seq, fact| Observation::Storage {
+            service: "header".into(),
+            instance: 1,
+            seq,
+            txn: 4,
+            fact,
+        };
+        let request = StorageRequest::ApplyHeaderTarget {
+            owner: WorkOwner {
+                kind: "body-repair".into(),
+                scope: scope(),
+                verified_generation: Some(5),
+                body_work_epoch: Some(6),
+                session_id: 7,
+                request_id: 8,
+            },
+            source: "02".into(),
+            parent: Some("dd".into()),
+            target: "bb".into(),
         };
         let obs = [
             storage(
                 1,
-                StorageEvent::Submitted {
-                    op: "acquire_header_path".into(),
-                    request: "ab".into(),
-                    owner: None,
-                    peer: Some("01".into()),
-                    session: Some(2),
+                StorageFact::Submitted {
+                    id: 1,
+                    request: request.clone(),
+                    digest: "ef".into(),
                 },
             ),
-            storage(1, StorageEvent::CallerDropped),
             storage(
-                1,
-                StorageEvent::Completed {
-                    op: "acquire_header_path".into(),
-                    outcome: "engine".into(),
-                    owner: None,
-                    delivered: false,
-                    lease_ends: ends(),
-                    state: "cd".into(),
+                2,
+                StorageFact::Leased {
+                    lease: lease(),
+                    scope: scope(),
+                    target: point(3),
+                    common_ancestor: point(0),
+                    next: Some(0),
+                    capacity: "general".into(),
+                    continued_from: None,
                 },
             ),
-            storage(2, StorageEvent::ReplyDropped { lease_ends: ends() }),
+            storage(
+                3,
+                StorageFact::RetentionEnded {
+                    lease: lease(),
+                    why: "continued".into(),
+                    into: Some(4),
+                },
+            ),
+            storage(
+                4,
+                StorageFact::WaiterSet {
+                    class: "peer".into(),
+                    lease: Some(lease()),
+                },
+            ),
+            storage(
+                5,
+                StorageFact::Completed {
+                    id: 1,
+                    outcome: "engine".into(),
+                    result: StorageResult::Acquired {
+                        lease: lease(),
+                        common_ancestor: point(0),
+                        target: point(3),
+                    },
+                    delivered: true,
+                    generation: 2,
+                    state: "ab".into(),
+                },
+            ),
+            storage(6, StorageFact::ShutDown { dropped: vec![1] }),
+            Observation::StorageState {
+                service: "header".into(),
+                instance: 1,
+                through_seq: 6,
+                state: StorageState {
+                    operations: vec![StorageOperation {
+                        id: 1,
+                        request,
+                        stage: "replied".into(),
+                        caller_waiting: None,
+                        result: Some(StorageResult::Busy),
+                        caller_alive: true,
+                    }],
+                    permits: vec![2],
+                    leases: vec![StorageLeaseState {
+                        lease: lease(),
+                        scope: scope(),
+                        target: point(3),
+                        last: point(0),
+                        next: None,
+                        capacity: "bounded".into(),
+                        waiter: false,
+                        leased_txn: Some(4),
+                    }],
+                    continuations: Vec::new(),
+                    general_waiter: false,
+                    fallback_waiter: true,
+                    last_lease_id: 3,
+                    continuation_hits: 1,
+                },
+            },
         ];
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"storage","service":"header","id":1,"event":{"event":"submitted","op":"acquire_header_path","request":"ab","peer":"01","session":2}},{"obs":"storage","service":"header","id":1,"event":{"event":"caller-dropped"}},{"obs":"storage","service":"header","id":1,"event":{"event":"completed","op":"acquire_header_path","outcome":"engine","delivered":false,"lease_ends":[{"peer":"01","lease":3,"release":"lease-released"}],"state":"cd"}},{"obs":"storage","service":"header","id":2,"event":{"event":"reply-dropped","lease_ends":[{"peer":"01","lease":3,"release":"lease-released"}]}}]"#,
+            r#"[{"obs":"storage","service":"header","instance":1,"seq":1,"txn":4,"fact":{"fact":"submitted","id":1,"request":{"op":"apply_header_target","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"source":"02","parent":"dd","target":"bb"},"digest":"ef"}},{"obs":"storage","service":"header","instance":1,"seq":2,"txn":4,"fact":{"fact":"leased","lease":{"peer":"01","session_id":1,"lease_id":3},"scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}},"target":{"height":3,"hash":"cc"},"common_ancestor":{"height":0,"hash":"cc"},"next":0,"capacity":"general"}},{"obs":"storage","service":"header","instance":1,"seq":3,"txn":4,"fact":{"fact":"retention-ended","lease":{"peer":"01","session_id":1,"lease_id":3},"why":"continued","into":4}},{"obs":"storage","service":"header","instance":1,"seq":4,"txn":4,"fact":{"fact":"waiter-set","class":"peer","lease":{"peer":"01","session_id":1,"lease_id":3}}},{"obs":"storage","service":"header","instance":1,"seq":5,"txn":4,"fact":{"fact":"completed","id":1,"outcome":"engine","result":{"result":"acquired","lease":{"peer":"01","session_id":1,"lease_id":3},"common_ancestor":{"height":0,"hash":"cc"},"target":{"height":3,"hash":"cc"}},"delivered":true,"generation":2,"state":"ab"}},{"obs":"storage","service":"header","instance":1,"seq":6,"txn":4,"fact":{"fact":"shut-down","dropped":[1]}},{"obs":"storage-state","service":"header","instance":1,"through_seq":6,"state":{"operations":[{"id":1,"request":{"op":"apply_header_target","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"source":"02","parent":"dd","target":"bb"},"stage":"replied","result":{"result":"busy"},"caller_alive":true}],"permits":[2],"leases":[{"lease":{"peer":"01","session_id":1,"lease_id":3},"scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}},"target":{"height":3,"hash":"cc"},"last":{"height":0,"hash":"cc"},"next":null,"capacity":"bounded","waiter":false,"leased_txn":4}],"continuations":[],"general_waiter":false,"fallback_waiter":true,"last_lease_id":3,"continuation_hits":1}}]"#,
             "a storage observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test"
         );

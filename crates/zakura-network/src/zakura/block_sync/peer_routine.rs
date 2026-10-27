@@ -226,19 +226,64 @@ fn transactions_match_header(block: &block::Block) -> bool {
     root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
 
-/// Whether a routine accepts a decoded body for `requested` at `height`: the
-/// coinbase height check and the transaction check on frame receipt, then the
-/// requested-hash check in `handle_body`. Controlled storage runs fixture
-/// bodies through these checks.
+/// Why a routine rejects a decoded body when its frame arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameBodyReject {
+    /// Its coinbase height isn't the height its frame was authorized for.
+    CoinbaseHeight,
+    /// Its transactions aren't the ones its header commits to.
+    Transactions,
+}
+
+/// The checks a routine runs, in order, on a body decoded from a frame
+/// authorized for `height`.
+#[inline]
+fn check_frame_body(block: &block::Block, height: block::Height) -> Result<(), FrameBodyReject> {
+    if block.coinbase_height() != Some(height) {
+        return Err(FrameBodyReject::CoinbaseHeight);
+    }
+    if !transactions_match_header(block) {
+        return Err(FrameBodyReject::Transactions);
+    }
+    Ok(())
+}
+
+/// Why a routine rejects a body whose hash isn't the one its outstanding
+/// request expects at the body's height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestedHashReject {
+    /// The request expects this other hash.
+    Mismatch(block::Hash),
+    /// The request expects no body at that height.
+    Unrequested,
+}
+
+/// Checks a body's hash `delivered` against `expected`, the hash its
+/// outstanding request expects at the body's height, if any.
+#[inline]
+fn check_requested_hash(
+    expected: Option<block::Hash>,
+    delivered: block::Hash,
+) -> Result<(), RequestedHashReject> {
+    match expected {
+        Some(requested) if requested != delivered => Err(RequestedHashReject::Mismatch(requested)),
+        Some(_) => Ok(()),
+        None => Err(RequestedHashReject::Unrequested),
+    }
+}
+
+/// Whether a routine accepts a decoded body from a frame authorized for
+/// `height`, when its outstanding request expects `expected` there: the
+/// checks on frame receipt, then the requested-hash check in
+/// `handle_body`. Controlled storage runs fixture bodies through these
+/// checks.
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub fn routine_accepts_body(
     block: &block::Block,
     height: block::Height,
-    requested: block::Hash,
+    expected: Option<block::Hash>,
 ) -> bool {
-    block.coinbase_height() == Some(height)
-        && transactions_match_header(block)
-        && block.hash() == requested
+    check_frame_body(block, height).is_ok() && check_requested_hash(expected, block.hash()).is_ok()
 }
 
 fn header_hash_payload_mismatch(
@@ -829,21 +874,24 @@ impl PeerRoutine {
             }
         };
         self.trace_message_received("block");
-        if block.coinbase_height() != Some(height) {
-            return Err(SinkReject::protocol(
-                "authorized block has a different coinbase height",
-            ));
-        }
-        if !transactions_match_header(&block) {
-            let _ = self
-                .routine_to_reactor
-                .try_send(RoutineToReactor::Misbehavior {
-                    peer: self.peer.clone(),
-                    reason: BlockSyncMisbehavior::InvalidBlock,
-                });
-            return Err(SinkReject::protocol(
-                "authorized block's transactions do not match its header",
-            ));
+        match check_frame_body(&block, height) {
+            Ok(()) => {}
+            Err(FrameBodyReject::CoinbaseHeight) => {
+                return Err(SinkReject::protocol(
+                    "authorized block has a different coinbase height",
+                ));
+            }
+            Err(FrameBodyReject::Transactions) => {
+                let _ = self
+                    .routine_to_reactor
+                    .try_send(RoutineToReactor::Misbehavior {
+                        peer: self.peer.clone(),
+                        reason: BlockSyncMisbehavior::InvalidBlock,
+                    });
+                return Err(SinkReject::protocol(
+                    "authorized block's transactions do not match its header",
+                ));
+            }
         }
         self.trace_wake("own_body");
         self.handle_body(
@@ -1957,8 +2005,9 @@ impl PeerRoutine {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
         }
-        match outstanding.request.expected_hash(height) {
-            Some(requested) if requested != hash => {
+        match check_requested_hash(outstanding.request.expected_hash(height), hash) {
+            Ok(()) => {}
+            Err(RequestedHashReject::Mismatch(requested)) => {
                 let mismatch = header_hash_payload_mismatch(
                     outstanding.request.owner,
                     self.source,
@@ -1969,8 +2018,7 @@ impl PeerRoutine {
                     .await;
                 return;
             }
-            Some(_) => {}
-            None => {
+            Err(RequestedHashReject::Unrequested) => {
                 self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
                     .await;
                 return;
@@ -2105,6 +2153,8 @@ impl PeerRoutine {
             raw_block_payload,
             decoded_attributed_memory_size_bytes,
         );
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff_started(outstanding_owner, height, reserved_estimate);
         self.forward_body_to_sequencer(
             outstanding_owner,
             height,
@@ -2124,11 +2174,39 @@ impl PeerRoutine {
         // top of the next iteration.
     }
 
+    /// Reports that the routine is about to send the body at `height` to the
+    /// sequencer while its request still charges `charge` to the budget. The
+    /// report comes before the send, because the sequencer can dequeue the
+    /// body as soon as the send succeeds. Reports nothing when `charge` is 0,
+    /// because then the budget never counted the body.
+    ///
+    /// A cancelled `send().await` on the `None`-permit path would leave this
+    /// handoff without its end. Production always passes a permit.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_handoff_started(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        charge: u64,
+    ) {
+        if charge == 0 {
+            return;
+        }
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::HandoffStarted {
+                peer: self.peer.clone(),
+                owner,
+                height,
+                charge,
+            }
+        );
+    }
+
     /// Releases the request charge of the body at `height`, which the routine
-    /// just sent to the sequencer, and reports the handoff around the release:
-    /// `HandoffStarted` before it, and `HandoffEnded` after the counter changes
-    /// and before the release wakes any waiter. Reports nothing when `charge`
-    /// is 0, because then the budget never counted the body.
+    /// just sent to the sequencer, and reports `HandoffEnded` after the
+    /// counter changes and before the release wakes any waiter. Reports
+    /// nothing when `charge` is 0, like [`Self::observe_handoff_started`].
     #[cfg(any(test, zakura_sim))]
     fn release_handoff(
         &mut self,
@@ -2141,15 +2219,6 @@ impl PeerRoutine {
             return;
         }
         let (observer, peer) = (&self.observer, &self.peer);
-        observe!(
-            observer,
-            BlockEvent::HandoffStarted {
-                peer: peer.clone(),
-                owner,
-                height,
-                charge,
-            }
-        );
         self.budget.release_then(charge, || {
             observe!(
                 observer,
@@ -2374,6 +2443,8 @@ impl PeerRoutine {
             raw_block_payload,
             decoded_attributed_memory_size_bytes,
         );
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff_started(owner, height, ended_reservation);
         self.forward_body_to_sequencer(
             owner,
             height,
@@ -3825,6 +3896,7 @@ mod tests {
         let owner = routine.window.outstanding.ownership()[0].owner;
         log.0.lock().unwrap().clear();
 
+        routine.observe_handoff_started(owner, block::Height(1), 0);
         routine.release_handoff(owner, block::Height(1), 0);
         let events = std::mem::take(&mut *log.0.lock().unwrap());
         assert_eq!(events, []);

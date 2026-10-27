@@ -190,7 +190,9 @@ impl Sim {
             choices.take_draws()
         };
         sink.record(Record::Init(InitRecord { draws }));
-        let end = match self.failure.take() {
+        // A checker's failure from setup, such as a missing source, ends the
+        // run before its first step.
+        let end = match self.failure.take().or_else(|| checker.harness_failure()) {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
@@ -447,25 +449,36 @@ impl Sim {
                 log: &st.log,
             };
             let violation = checker.after_step(&cx);
-            if let Some(failure) = self.failure.take() {
+            if let Some(failure) = self.failure.take().or_else(|| checker.harness_failure()) {
                 return st.end_harness(failure);
             }
-            let violation = violation.or_else(|| {
-                let spinning = phase == Phase::Live
-                    && self.config.enforce_no_livelock
-                    && at_instant > self.config.max_steps_per_instant
-                    && !self.nothing_enabled(&ready);
-                spinning.then(|| Violation {
-                    property: NO_LIVELOCK.to_owned(),
-                    step: st.step,
-                    witness: vec![st.step],
-                    expected: format!(
-                        "at most {} steps before the clock moves",
-                        self.config.max_steps_per_instant
-                    ),
-                    actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
-                })
+            // Steps taken while the checker suspends the limit don't count.
+            if !checker.bounds_livelock() {
+                at_instant = 0;
+            }
+            // Checked even when the checker found a violation, so a spin at
+            // the same step still reaches the checker.
+            let spinning = phase == Phase::Live
+                && self.config.enforce_no_livelock
+                && at_instant > self.config.max_steps_per_instant
+                && !self.nothing_enabled(&ready);
+            let livelock = spinning.then(|| Violation {
+                property: NO_LIVELOCK.to_owned(),
+                step: st.step,
+                witness: vec![st.step],
+                expected: format!(
+                    "at most {} steps before the clock moves",
+                    self.config.max_steps_per_instant
+                ),
+                actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
             });
+            let violation = match (violation, livelock) {
+                (Some(violation), Some(livelock)) => {
+                    checker.step_loop_violation(&livelock);
+                    Some(violation)
+                }
+                (violation, livelock) => violation.or(livelock),
+            };
             if let Some(violation) = violation {
                 let mut end = st.end(Outcome::Violation);
                 end.violation = Some(violation);
@@ -734,8 +747,8 @@ fn evidence_outside_run(end: &RunEnd) -> Option<HarnessFailure> {
 }
 
 /// `reports` with each step the run didn't take removed from their
-/// `Violated` evidence and `holds_since`, so the `end` record stays readable,
-/// and the failure for the first one removed.
+/// violations' evidence and `holds_since`, so the `end` record stays
+/// readable, and the failure for the first one removed.
 fn checked_reports(
     mut reports: Vec<PropertyReport>,
     steps: u64,
@@ -760,6 +773,18 @@ fn checked_reports(
             }
             witness.retain(in_run);
         }
+        // A violation at a step the run didn't take is dropped whole.
+        report.violations.retain_mut(|violation| {
+            let mut steps = std::iter::once(&violation.step).chain(&violation.witness);
+            if let Some(&step) = steps.find(|step| !in_run(step)) {
+                failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
+                    property: report.property.clone(),
+                    step,
+                });
+            }
+            violation.witness.retain(in_run);
+            in_run(&violation.step)
+        });
     }
     (reports, failure)
 }
@@ -797,7 +822,15 @@ fn end_record(
         drain: end.drain,
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
-        properties: properties.to_vec(),
+        // The record holds what the trace writes, which leaves out each
+        // report's violations, so a replay compares like with like.
+        properties: properties
+            .iter()
+            .map(|report| PropertyReport {
+                violations: Vec::new(),
+                ..report.clone()
+            })
+            .collect(),
     }
 }
 

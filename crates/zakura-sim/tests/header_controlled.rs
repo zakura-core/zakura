@@ -32,7 +32,7 @@ use zakura_sim::{
     observe::{StorageFact, StorageRequest, StorageResult},
     property::{
         Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
-        Source, Status as PropertyStatus, Verdict,
+        Source, Sources, Status as PropertyStatus, Verdict,
     },
     ActionSource, Boundary, HarnessFailure, Identity, IdleStatus, Observation, ObservationLog,
     Outcome, PlanInput, PropertyOutcome, RunConfig, RunReport, Sim, Violation,
@@ -1506,7 +1506,7 @@ fn a_property_is_inconclusive_after_an_evidence_failure() {
         registry,
         Rc::new(Calm),
         Assumptions::none(),
-        &[Source::View],
+        &Sources::observed(&[Source::View]),
     );
     let (report, lines) = recorded(
         storage_config(100),
@@ -1944,7 +1944,7 @@ fn late_drop_run(when: LateDrop) -> (RunReport, Vec<String>, Outcome) {
         registry,
         Rc::new(Calm),
         Assumptions::none(),
-        &[Source::View],
+        &Sources::observed(&[Source::View]),
     );
     let saw = Rc::new(std::cell::Cell::new(None));
     let mut checker = zakura_sim::property::Tee(
@@ -2086,7 +2086,7 @@ fn a_drawing_at_end_without_storage_is_inconclusive() {
         registry,
         Rc::new(Calm),
         Assumptions::none(),
-        &[Source::View],
+        &Sources::observed(&[Source::View]),
     );
     let mut checker = zakura_sim::property::Tee(calm, DrawsAtEnd);
     let (report, lines) = recorded(
@@ -2222,7 +2222,7 @@ fn live_port_run(poke: Poke) -> (RunReport, Vec<String>) {
         registry,
         Rc::new(Calm),
         Assumptions::none(),
-        &[Source::View],
+        &Sources::observed(&[Source::View]),
     );
     let mut checker = zakura_sim::property::Tee(calm, PokeAtEnd { port, poke });
     let mut sink = zakura_sim::MemorySink::default();

@@ -3459,6 +3459,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "tokio-stream",
  "zakura-chain",
  "zakura-header-chain",

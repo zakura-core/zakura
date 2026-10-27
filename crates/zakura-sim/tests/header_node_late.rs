@@ -38,7 +38,10 @@ use zakura_sim::{
             Chain, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode, Policy,
             PolicySource, Topology,
         },
-        header_sync::{storage_config, Dialer, MirrorSpec, Ports, Storage, StorageScenario},
+        header_sync::{
+            storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
+            Storage, StorageScenario,
+        },
         run_prepared, Subsystem,
     },
     observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, StorageResult, WorkOwner},
@@ -94,14 +97,14 @@ impl Subsystem for Late {
         Late(Rc::new(Storage::build(sim, &scenario.storage, ports)))
     }
 
-    /// The storage harness's checker.
-    fn checker(this: &Rc<Self>, scenario: &Budgeted) -> Box<dyn Checker> {
-        Storage::checker(&this.0, &scenario.storage)
+    /// The storage harness's properties.
+    fn properties() -> Vec<zakura_sim::property::Property<Self>> {
+        storage_properties()
     }
 
-    /// The storage harness's properties.
-    fn properties(scenario: &Budgeted) -> Vec<zakura_sim::trace::meta::PropertyRef> {
-        Storage::properties(&scenario.storage)
+    /// The storage harness's sources.
+    fn sources() -> zakura_sim::property::Sources {
+        storage_sources()
     }
 
     /// Unused: these scenarios are only built by hand.

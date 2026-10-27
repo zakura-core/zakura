@@ -68,7 +68,7 @@ pub(crate) use writer_fence::{
     Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
 };
 
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) mod test_family;
 #[cfg(test)]
 mod tests;

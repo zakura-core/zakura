@@ -1544,7 +1544,7 @@ fn every_violation_retained() {
 /// Fails twice at every step where the counter is odd.
 fn twice_when_odd(cx: &mut CheckCtx<'_, World>) -> Verdict {
     let level = cx.view();
-    if level % 2 == 0 {
+    if level.is_multiple_of(2) {
         return Verdict::Holds;
     }
     cx.record_violation("an even level", format!("second look at level {level}"));

@@ -390,7 +390,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         let mut first = None;
         let mut capture = None;
-        for (property, state) in self.properties.iter().zip(&mut self.state) {
+        for (at, (property, state)) in self.properties.iter().zip(&mut self.state).enumerate() {
             if !state.declared || state.excluded.is_some() {
                 continue;
             }
@@ -410,7 +410,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 }
             }
             let violations = step_property(
-                property,
+                (&self.properties, at),
                 state,
                 &self.handle,
                 self.holds,
@@ -482,7 +482,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
 /// Evidence the check found missing becomes `failure` unless one is already
 /// pending.
 fn step_property<S: HasView>(
-    property: &Property<S>,
+    (properties, at): (&[Property<S>], usize),
     state: &mut PropertyState,
     handle: &S,
     holds: fn(&S, Assume) -> bool,
@@ -490,6 +490,7 @@ fn step_property<S: HasView>(
     failure: &mut Option<HarnessFailure>,
     cx: &StepCtx<'_>,
 ) -> Vec<Violation> {
+    let property = &properties[at];
     let event = |to| CheckEvent::Lifecycle {
         property: property.id.clone(),
         to,
@@ -518,7 +519,7 @@ fn step_property<S: HasView>(
     }
 
     let mut violations = Vec::new();
-    let mut ccx = CheckCtx::new(cx, handle, property);
+    let mut ccx = CheckCtx::new(cx, handle, property, properties);
     let verdict = (property.check)(&mut ccx);
     let parts = ccx.into_parts();
     if let Some(detail) = parts.missing {

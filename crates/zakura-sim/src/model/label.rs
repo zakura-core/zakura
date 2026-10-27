@@ -2,11 +2,15 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 /// The violation a simulated peer commits with one frame, or `Conformant`.
 ///
 /// The variants are in the table's order. A frame that matches several
-/// labels takes the first one: see [`Labels::first`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// labels takes the first one: see [`Labels::first`]. Its JSON is
+/// [`Label::name`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Label {
     /// The type is not in the stream's table, or the reader does not admit
     /// its role.
@@ -57,6 +61,26 @@ impl Label {
         Label::BadContent,
         Label::Conformant,
     ];
+
+    /// The label's name in property IDs, such as `reserved-flags` in
+    /// `reserved-flags-closes`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Label::UndeclaredType => "undeclared-type",
+            Label::ReservedFlags => "reserved-flags",
+            Label::ShortPayload => "short-payload",
+            Label::LongPayload => "long-payload",
+            Label::OverMargin => "over-margin",
+            Label::Unsolicited => "unsolicited",
+            Label::OverOwed => "over-owed",
+            Label::OverLive => "over-live",
+            Label::OverCredit => "over-credit",
+            Label::AfterClose => "after-close",
+            Label::BadCursor => "bad-cursor",
+            Label::BadContent => "bad-content",
+            Label::Conformant => "conformant",
+        }
+    }
 
     /// The label's position in the table.
     const fn bit(self) -> u16 {

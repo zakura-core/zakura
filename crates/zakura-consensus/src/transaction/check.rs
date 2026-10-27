@@ -795,11 +795,11 @@ pub fn are_inputs_standard_with_wots(
         return false;
     }
     for (input, spent_output) in tx.inputs().iter().zip(spent_outputs.iter()) {
-        #[cfg(feature = "experimental-wots")]
+        #[cfg(feature = "experimental-pq-transparent")]
         if experimental && zakura_script::wots::standard_input(input, spent_output) {
             continue;
         }
-        #[cfg(not(feature = "experimental-wots"))]
+        #[cfg(not(feature = "experimental-pq-transparent"))]
         let _ = experimental;
         let unlock_script = match input {
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
@@ -913,10 +913,10 @@ pub fn mempool_standard_input_scripts_with_wots(
 
         // Rule: the scriptSig must be within the standard size limit.
         let size = unlock_script.as_raw_bytes().len();
-        #[cfg(feature = "experimental-wots")]
+        #[cfg(feature = "experimental-pq-transparent")]
         let allowed =
             experimental && zakura_script::wots::standard_input(input, &spent_outputs[input_index]);
-        #[cfg(not(feature = "experimental-wots"))]
+        #[cfg(not(feature = "experimental-pq-transparent"))]
         let allowed = false;
         if size > MAX_STANDARD_SCRIPTSIG_SIZE && !allowed {
             return Err(TransactionError::NonStandardScriptSigSize { input_index, size });

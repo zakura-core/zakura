@@ -72,7 +72,7 @@ def run_scenario(command: list[str], timeout: float = 300) -> None:
 def run_demo(node: Path) -> None:
     harness = Path(__file__).resolve().parent
     expected = expected_sources(node)
-    node_features = ["--no-default-features", "--features", "internal-miner,experimental-wots"]
+    node_features = ["--no-default-features", "--features", "internal-miner,experimental-pq-transparent"]
     node_packages = metadata(node / "Cargo.toml", node_features)
     verify_sources(node_packages, expected)
     harness_packages = metadata(harness / "Cargo.toml", [])

@@ -20,7 +20,7 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [features]
 # Local regtest prototype; never enabled by default.
-experimental-wots = ["zakura-script/experimental-wots", "zcash_transparent/experimental-wots"]
+experimental-pq-transparent = ["zakura-script/experimental-pq-transparent", "zcash_transparent/experimental-pq-transparent"]
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

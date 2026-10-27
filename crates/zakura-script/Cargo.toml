@@ -15,7 +15,7 @@ keywords.workspace = true
 categories = ["cryptography::cryptocurrencies"]
 
 [features]
-experimental-wots = ["dep:zcash_transparent", "zcash_transparent/experimental-wots", "zcash_script/experimental-wots"]
+experimental-pq-transparent = ["dep:zcash_transparent", "zcash_transparent/experimental-pq-transparent", "zcash_script/experimental-pq-transparent"]
 
 [dependencies]
 zcash_transparent = { workspace = true, optional = true }

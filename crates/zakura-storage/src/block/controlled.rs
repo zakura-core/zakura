@@ -40,9 +40,10 @@
 //! The verifier receives a body when the run admits it, which fixes the
 //! body's receipt order. Overlapping admissions of the same body share the
 //! first one's receipt, as zakura-consensus's `ReceiptRegistry` does. A
-//! commit the engine finds stale or stalls on its
-//! resource limits commits nothing, and its reply reports a `Storage` retry,
-//! as zakura-state's `HeaderChainError` does.
+//! commit the engine refuses, finds stale or stalls on its resource limits
+//! commits nothing, and its reply reports a `Storage` retry, as
+//! zakura-state's `HeaderChainError` does. The engine refuses, for one, a
+//! body recorded invalid or a body whose ancestor is.
 //!
 //! Every change is published as a transaction: a step that takes an action,
 //! a read's arrival, an admission, a completion, a read caller dropping its
@@ -395,8 +396,10 @@ pub enum CompleteError {
     NotPending(OpId),
     /// The contract doesn't allow this outcome for the operation now.
     Illegal(IllegalOutcome),
-    /// Full state or the engine refused the commit, which leaves both
-    /// unchanged. Fixture blocks at their own heights never cause this.
+    /// Full state found the commit incoherent, which leaves it and the
+    /// engine unchanged: the body has no coinbase height, is already
+    /// committed, or its parent isn't. Engine refusals aren't errors here,
+    /// since zakura-state reports them as a `Storage` retry.
     State(StateError),
     /// The service is bound to another run.
     OutsideRun,
@@ -1258,6 +1261,11 @@ impl ControlledBlockService {
                             ) {
                                 verdict = Verdict::Retryable(RetryKind::Storage);
                             }
+                        }
+                        // zakura-state maps the engine's refusal to
+                        // `HeaderChainError` (`write.rs`), a `Storage` retry.
+                        Err(StateError::Transition(_) | StateError::Install(_)) => {
+                            verdict = Verdict::Retryable(RetryKind::Storage);
                         }
                         Err(error) => {
                             let request = BlockRequest::Action(BlockSyncAction::SubmitBlock {

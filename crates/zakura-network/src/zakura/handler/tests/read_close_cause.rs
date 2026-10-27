@@ -87,15 +87,15 @@ fn status(value: u32) -> Vec<u8> {
     bytes
 }
 
-pub(super) struct Link {
+struct Link {
     server: QuicEndpoint,
     client: QuicEndpoint,
-    pub(super) connection: Connection,
+    connection: Connection,
     streams: mpsc::Receiver<(SendStream, RecvStream)>,
 }
 
 impl Link {
-    pub(super) async fn connect() -> Result<Self, BoxError> {
+    async fn connect() -> Result<Self, BoxError> {
         let server = LocalEndpointFactory::new().endpoint(95101).await?;
         let (connection_tx, _connections) = mpsc::channel(1);
         let (stream_tx, streams) = mpsc::channel(2);
@@ -119,7 +119,7 @@ impl Link {
     }
 
     /// Open a stream, send `bytes` so the server sees it, and accept it.
-    pub(super) async fn open(
+    async fn open(
         &mut self,
         bytes: &[u8],
     ) -> Result<(SendStream, RecvStream, SendStream, RecvStream), BoxError> {
@@ -131,7 +131,7 @@ impl Link {
         Ok((peer_send, peer_recv, send, recv))
     }
 
-    pub(super) async fn close(self) {
+    async fn close(self) {
         self.connection.close(0u32.into(), b"done");
         let _ = timeout(TEST_TIMEOUT, self.client.shutdown()).await;
         let _ = timeout(TEST_TIMEOUT, self.server.shutdown()).await;

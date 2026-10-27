@@ -24,8 +24,6 @@ use super::{
 };
 #[cfg(test)]
 use crate::zakura::framed_channel;
-#[cfg(any(test, zakura_sim))]
-use crate::zakura::RegulationTap;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -35,7 +33,7 @@ use crate::zakura::{
         SessionTable, WriterFence,
     },
     spawn_supervised_pipe,
-    transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
+    transport::{GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
     BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
@@ -742,14 +740,14 @@ impl Service for HeaderSyncService {
             subscriber,
             status,
         );
-        let (publisher, publishing) = sim_arg!(spawn_publisher(
+        let (publisher, publishing) = spawn_publisher(
             &self.header_sync,
             header_bytes,
             &peer_id,
             session_id,
             send,
             service_cancel_token.clone(),
-        ); recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)));
+        );
 
         let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
@@ -883,7 +881,6 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
-    #[cfg(any(test, zakura_sim))] tap: Option<RegulationTap<u64>>,
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
     let push = header_sync.serving.push(peer);
@@ -893,9 +890,9 @@ fn spawn_publisher(
     };
     let limits = header_sync.page_limits;
     if header_bytes == REGTEST_HEADER_BYTES {
-        sim_arg!(Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel)
     } else {
-        sim_arg!(Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
+        Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel)
     }
 }
 

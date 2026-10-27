@@ -93,22 +93,6 @@ impl FramedRecv {
             .is_some_and(|slot| slot.attach(precheck))
     }
 
-    /// The transport observer of this stream's reader, if it has one.
-    #[cfg(any(test, zakura_sim))]
-    pub(crate) fn stream_tap(&self) -> Option<&Arc<super::StreamTap>> {
-        self.precheck.as_ref().and_then(PrecheckSlot::tap)
-    }
-
-    /// Take the tag of the frame [`Self::recv`] just returned, so the
-    /// regulation events it causes name it. Call it once per received frame,
-    /// on a stream whose tap tags frames.
-    #[cfg(any(test, zakura_sim))]
-    pub(crate) fn take_tag(&self) {
-        if let Some(tap) = self.stream_tap() {
-            tap.take_tag();
-        }
-    }
-
     /// Failure of any member, retained through session cancellation for service policy.
     pub(crate) fn failure(&self) -> Option<OrderedStreamFailure> {
         self.failure_cause.as_ref().and_then(|cause| cause.get())

@@ -34,7 +34,6 @@ use crate::zakura::{
         header_sync_trace as hs_trace, peer_label as trace_peer_label,
         queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
     },
-    transport::sim_arg,
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
@@ -1779,7 +1778,7 @@ impl HeaderSyncReactor {
                         HeaderRequestTerminal::MalformedResponse,
                     ),
                 );
-                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
             let inputs: Vec<_> = response
@@ -1805,7 +1804,7 @@ impl HeaderSyncReactor {
         }
         if !active.matches_response_page(response.initial_target_tip_hash, returned_ancestor) {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
         if !self
@@ -1813,7 +1812,7 @@ impl HeaderSyncReactor {
             .consume_response_capacity(&peer, response.entries.len())
         {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
         self.reset_unproductive_requests(&peer, session_id);
@@ -1832,7 +1831,7 @@ impl HeaderSyncReactor {
         let target_tip_height = active.target.status.selected_tip_height;
         let Some(staged_tip) = active.staged_tip() else {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-            sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
         let checkpoint_prefix_ready = self
@@ -1880,7 +1879,7 @@ impl HeaderSyncReactor {
         if complete || bounded_prefix {
             if complete && staged_tip.hash != active.target.status.selected_tip_hash {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
-                sim_arg!(self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage); session_id);
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
             let common_ancestor = active
@@ -5223,7 +5222,7 @@ impl HeaderSyncReactor {
             }
             _ => return,
         };
-        sim_arg!(self.dispatch_misbehavior(peer, reason, owner); None);
+        self.dispatch_misbehavior(peer, reason, owner);
     }
 
     /// Record a violation that a reactor check found in an admitted page.
@@ -5231,15 +5230,7 @@ impl HeaderSyncReactor {
     /// It does not disconnect. These checks compare the page with local
     /// scheduler state, so a mismatch can be local. The session reader
     /// already disconnects for the reservation violations themselves.
-    ///
-    /// In test and simulator builds, `origin` is the session of the message
-    /// that showed the violation.
-    fn report_misbehavior(
-        &mut self,
-        peer: ZakuraPeerId,
-        reason: HeaderSyncMisbehavior,
-        #[cfg(any(test, zakura_sim))] origin: u64,
-    ) {
+    fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
         let category = match reason {
             HeaderSyncMisbehavior::MalformedMessage => {
                 zakura_header_chain::ErrorCategory::MalformedProtocol
@@ -5254,7 +5245,7 @@ impl HeaderSyncReactor {
             "attribution" => "header_peer",
         )
         .increment(1);
-        sim_arg!(self.dispatch_misbehavior(peer, reason, None); Some(origin));
+        self.dispatch_misbehavior(peer, reason, None);
     }
 
     /// Record `peer`'s violation. A fault in `owner`'s work also disconnects
@@ -5262,28 +5253,14 @@ impl HeaderSyncReactor {
     /// subscription never acknowledges the failed cursor. The peer then waits
     /// out the readmission cooldown, so it cannot reconnect and restage the
     /// same branch at once.
-    ///
-    /// In test and simulator builds, it reports `Misbehavior` with `owner`'s
-    /// session as the origin, or else `reported`, the session of the message
-    /// that showed the violation.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
         reason: HeaderSyncMisbehavior,
         owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
-        #[cfg(any(test, zakura_sim))] reported: Option<u64>,
     ) {
         let session = self.peer_state.get(&peer).map(|state| &state.session);
         let session_id = session.map(|session| session.session_id());
-        observe!(
-            self,
-            ReactorEvent::Misbehavior {
-                peer: peer.clone(),
-                reason,
-                origin: owner.map(|owner| owner.session_id()).or(reported),
-                current: session_id,
-            }
-        );
         let faulted = owner.filter(|owner| Some(owner.session_id()) == session_id);
         if let (Some(owner), Some(session)) = (faulted, session) {
             session.disconnect_for_header_fault(owner.request_id().get());

@@ -74,9 +74,12 @@ pub struct PropertyReport {
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
-    /// obligations, so the first alone can hide the rest. A check that fails
-    /// at consecutive evaluations contributes only the first of them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// obligations, so the first alone can hide the rest.
+    ///
+    /// The trace's `end` record leaves them out: their number grows with the
+    /// run, and a record has a size limit. A replay of the trace finds every
+    /// one again.
+    #[serde(skip)]
     pub violations: Vec<Violation>,
 }
 

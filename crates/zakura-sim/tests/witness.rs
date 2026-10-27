@@ -189,6 +189,7 @@ impl Subsystem for Probe {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(_: &Behavior) -> RunConfig {
         RunConfig {
@@ -198,7 +199,10 @@ impl Subsystem for Probe {
         }
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {

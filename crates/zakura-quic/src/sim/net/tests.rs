@@ -547,6 +547,26 @@ fn events_since_returns_the_tail_of_events() {
 }
 
 #[test]
+fn queries_at_an_instant_answer_for_that_instant() {
+    let net = SimNet::new(fifo(50, 100));
+    let a = net.bind(addr(1)).unwrap();
+    let sent = now();
+    send(&a, addr(2), b"later");
+    let [id] = net.in_flight()[..] else {
+        panic!("one datagram in flight")
+    };
+    // This test runs on the real clock, so the send's own reading is a
+    // little after `sent`.
+    let opens = net
+        .next_eligible_after(sent)
+        .expect("the window opens after the send");
+    assert!(opens >= sent + Duration::from_millis(50));
+    assert_eq!(net.deliverable_at(opens - Duration::from_nanos(1)), []);
+    assert_eq!(net.deliverable_at(opens), [id]);
+    assert_eq!(net.next_eligible_after(opens), None);
+}
+
+#[test]
 fn a_simulated_socket_binds_only_explicit_addresses() {
     let net = SimNet::new(fifo(0, 10));
     for bad in [

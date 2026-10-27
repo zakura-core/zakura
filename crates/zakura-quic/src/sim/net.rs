@@ -343,7 +343,12 @@ impl SimNet {
     /// The datagrams the harness may deliver now: every eligible one on a
     /// reordering link, and the oldest one on any other link once eligible.
     pub fn deliverable(&self) -> Vec<DatagramId> {
-        let now = now();
+        self.deliverable_at(now())
+    }
+
+    /// [`SimNet::deliverable`] as it would be at `now`, for a harness
+    /// that asks about an instant other than the clock's.
+    pub fn deliverable_at(&self, now: Instant) -> Vec<DatagramId> {
         let state = self.lock();
         state
             .in_flight
@@ -388,7 +393,11 @@ impl SimNet {
 
     /// The next time a datagram in flight becomes eligible, if any isn't yet.
     pub fn next_eligible(&self) -> Option<Instant> {
-        let now = now();
+        self.next_eligible_after(now())
+    }
+
+    /// [`SimNet::next_eligible`] as it would be at `now`.
+    pub fn next_eligible_after(&self, now: Instant) -> Option<Instant> {
         self.lock()
             .in_flight
             .values()

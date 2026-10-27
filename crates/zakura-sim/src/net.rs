@@ -100,15 +100,10 @@ impl State {
             .unwrap_or(SimInstant::from_start(Duration::MAX))
     }
 
-    /// Panics unless `now` is the run's current instant. The network reads
-    /// the driver's clock itself, so it can only answer for the instant
-    /// the run is at, which is the one the step loop passes.
-    fn check_now(&self, now: SimInstant) {
-        let current = self.sim_of(zakura_rt::time::Instant::now().into_std());
-        assert_eq!(
-            now, current,
-            "a Net answers only for the run's current instant"
-        );
+    /// `at`, from the run's clock, on the driver's clock: the inverse of
+    /// [`State::sim_of`], saturating at the origin.
+    fn std_of(&self, at: SimInstant) -> std::time::Instant {
+        self.std_origin + at.saturating_duration_since(self.sim_origin)
     }
 
     /// The datagrams the plan may drop now: those its network allows,
@@ -143,12 +138,10 @@ fn offered(list: Vec<DatagramId>, index: u64) -> DatagramId {
 
 impl ActionSource for Net {
     /// A `deliver` for each datagram the network may deliver at `now`, and
-    /// a `drop` for each one it may drop. `now` must be the run's current
-    /// instant (see `State::check_now`).
+    /// a `drop` for each one it may drop.
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
         let state = self.0.borrow();
-        state.check_now(now);
-        for (index, id) in (0..).zip(state.sim.deliverable()) {
+        for (index, id) in (0..).zip(state.sim.deliverable_at(state.std_of(now))) {
             out.push((Identity::deliver(&link_name(id.link), id.seq), 2 * index));
         }
         for (index, id) in (0..).zip(state.droppable()) {
@@ -158,12 +151,10 @@ impl ActionSource for Net {
 
     /// Where the next delivery window opens, and the earliest deadline in
     /// flight. A deadline that's already due is `now`, so time can't move
-    /// until a datagram goes. `now` must be the run's current instant, as
-    /// for `enabled`.
+    /// until a datagram goes.
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         let state = self.0.borrow();
-        state.check_now(now);
-        if let Some(opens) = state.sim.next_eligible() {
+        if let Some(opens) = state.sim.next_eligible_after(state.std_of(now)) {
             out.push(Boundary::Opens(state.sim_of(opens)));
         }
         if let Some(limit) = state.sim.time_limit() {

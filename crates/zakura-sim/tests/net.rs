@@ -482,14 +482,48 @@ fn fifo_link_offers_only_the_oldest() {
     drop(sim);
 }
 
-/// `Net` reads the network's own clock, so it refuses to answer for any
-/// instant but the run's current one rather than answer for the wrong one.
+/// `enabled` and `boundaries` answer for the `now` they're given, not the
+/// run's clock: with the run at 0 and a datagram's window at 50 to 100 ms,
+/// asking at 50 ms offers it and asking at 60 ms shows only the deadline.
 #[test]
-#[should_panic(expected = "a Net answers only for the run's current instant")]
-fn queries_answer_only_for_the_current_instant() {
+fn queries_answer_for_the_supplied_instant() {
     let _sim = Sim::new(run_config(), Plan::from_fuzz(&[]));
-    let net = scenario(link(100, true)).net();
-    net.enabled(at(Duration::from_millis(50)), &mut Vec::new());
+    let window = LinkSpec {
+        min_delay_ms: 50,
+        ..link(100, true)
+    };
+    let net = scenario(window).net();
+    let sim_net = net.sim();
+    let (a, _b) = (
+        sim_net.bind(addr(1)).unwrap(),
+        sim_net.bind(addr(2)).unwrap(),
+    );
+    send(&a, addr(2), 10);
+    let ms = |n| at(Duration::from_millis(n));
+    let offers = |now| {
+        let mut out = Vec::new();
+        net.enabled(now, &mut out);
+        out.into_iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<Vec<_>>()
+    };
+    let bounds = |now| {
+        let mut out = Vec::new();
+        net.boundaries(now, &mut out);
+        out
+    };
+    assert_eq!(offers(ms(0)), Vec::<String>::new());
+    assert_eq!(offers(ms(50)), ["deliver:10.0.0.1:4000->10.0.0.2:4000:0"]);
+    assert_eq!(
+        bounds(ms(0)),
+        [Boundary::Opens(ms(50)), Boundary::Deadline(ms(100))]
+    );
+    assert_eq!(bounds(ms(60)), [Boundary::Deadline(ms(100))]);
+    assert_eq!(
+        bounds(ms(150)),
+        [Boundary::Deadline(ms(150))],
+        "a due deadline is now"
+    );
 }
 
 /// With `loss_after_admission`, a link offers no drop until the harness

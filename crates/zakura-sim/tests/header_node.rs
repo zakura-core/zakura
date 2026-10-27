@@ -1,5 +1,5 @@
-//! A header-sync node on controlled storage (M4-B1): Nora's real reactor and
-//! publisher submit every storage call to one `ControlledPort`, and every
+//! A header-sync node on controlled storage (M4-B1): the node's real reactor
+//! and publisher submit every storage call to one `ControlledPort`, and every
 //! completion comes from the `Plan`.
 #![cfg(zakura_sim)]
 
@@ -40,7 +40,7 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
-/// Every request Nora's storage saw submitted, in order.
+/// Every request the node's storage saw submitted, in order.
 fn requests(report: &RunReport) -> Vec<StorageRequest> {
     report
         .log
@@ -57,13 +57,9 @@ fn requests(report: &RunReport) -> Vec<StorageRequest> {
         .collect()
 }
 
-/// A mirror named `name` holding `chain`.
-fn mirror(name: &str, chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec {
-        name: name.to_owned(),
-        chain,
-        dialer,
-    }
+/// A mirror holding `chain`.
+fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
+    MirrorSpec { chain, dialer }
 }
 
 /// The hex peer identity of the actor whose key is `seed` repeated, as
@@ -73,8 +69,8 @@ fn peer(seed: u8) -> String {
     id.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Nora at genesis syncs to Mira's A5 under every plan, through a locator,
-/// a prepare and an apply on her own port, each completed by the
+/// The node at genesis syncs to `mirror-0`'s A5 under every plan, through a
+/// locator, a prepare and an apply on its own port, each completed by the
 /// converging policy.
 #[test]
 fn node_syncs_from_a_mirror_on_controlled_storage() {
@@ -96,7 +92,7 @@ fn node_syncs_from_a_mirror_on_controlled_storage() {
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             Chain::main(5).tip(&ports.fixture),
-            "Nora reaches Mira's tip"
+            "the node reaches mirror-0's tip"
         );
         let requests = requests(&report);
         for kind in [
@@ -109,35 +105,34 @@ fn node_syncs_from_a_mirror_on_controlled_storage() {
     }
 }
 
-/// The worked example: Mira, on a heavier fork, dials Nora, and Nora dials
-/// Leo at genesis. Nora's requester and publisher both use her one port, so
-/// her log holds both in one ID sequence, which `NodeChecks` checks, and
-/// Leo follows her to Mira's tip.
+/// The worked example: `mirror-0`, on a heavier fork, dials the node, and the
+/// node dials `mirror-1` at genesis. The node's requester and publisher both
+/// use its one port, so its log holds both in one ID sequence, which
+/// `NodeChecks` checks, and `mirror-1` follows it to `mirror-0`'s tip.
 #[test]
 fn one_port_serves_requester_and_publisher() {
     let scenario = StorageScenario {
         node: Chain::main(3),
         mirrors: vec![
             mirror(
-                "mira",
                 Chain {
                     main: 1,
                     fork: Some(Fork { branch: 1, len: 4 }),
                 },
                 Dialer::Mirror,
             ),
-            mirror("leo", Chain::default(), Dialer::Node),
+            mirror(Chain::default(), Dialer::Node),
         ],
         ..StorageScenario::default()
     };
     // Actors' key seeds follow their order, and links count sessions from 1
-    // in mirror order. Mira also pulls Nora's own branch, so both peers
-    // acquire from Nora's publisher.
-    let (mira, leo) = ((peer(2), 1), (peer(3), 2));
+    // in mirror order. `mirror-0` also pulls the node's own branch, so both
+    // peers acquire from the node's publisher.
+    let (mirror_0, mirror_1) = ((peer(2), 1), (peer(3), 2));
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
         let requests = requests(&report);
-        let (mut requester, mut leo_acquires, mut reads) = (0, 0, 0);
+        let (mut requester, mut mirror_1_acquires, mut reads) = (0, 0, 0);
         for request in &requests {
             let lease = match request {
                 StorageRequest::ContinuationLocator
@@ -149,7 +144,7 @@ fn one_port_serves_requester_and_publisher() {
                 StorageRequest::AcquireHeaderPath {
                     peer, session_id, ..
                 } => {
-                    leo_acquires += usize::from(*peer == leo.0);
+                    mirror_1_acquires += usize::from(*peer == mirror_1.0);
                     Some((peer, *session_id))
                 }
                 StorageRequest::ReadHeaderPath { lease, .. } => {
@@ -164,22 +159,22 @@ fn one_port_serves_requester_and_publisher() {
             };
             // Each path operation carries the session of the peer it serves.
             assert!(
-                [&mira, &leo]
+                [&mirror_0, &mirror_1]
                     .into_iter()
                     .any(|(peer, session)| lease == Some((peer, *session))),
                 "{request:?}"
             );
         }
         assert!(
-            requester > 0 && leo_acquires > 0 && reads > 0,
-            "Nora's log has requester and publisher operations: {requests:?}"
+            requester > 0 && mirror_1_acquires > 0 && reads > 0,
+            "the node's log has requester and publisher operations: {requests:?}"
         );
         let tip = ports.node.engine().snapshot().frontiers.header_best;
         assert_eq!(tip, scenario.mirrors[0].chain.tip(&ports.fixture));
         assert_eq!(
             ports.mirrors[1].snapshot().frontiers.header_best,
             tip,
-            "Leo follows Nora"
+            "mirror-1 follows the node"
         );
     }
 }
@@ -210,16 +205,16 @@ fn direct_dispatch_guard_reports_a_violation() {
     );
 }
 
-/// `Control` closes Mira's link and relinks her on a new connection and
-/// session, at points the `Plan` picks. Nora still reaches Mira's tip, and
-/// some plan closes early enough that she syncs over the new session.
+/// `Control` closes `mirror-0`'s link and relinks it on a new connection and
+/// session, at points the `Plan` picks. The node still reaches `mirror-0`'s
+/// tip, and some plan closes early enough that it syncs over the new session.
 #[test]
 fn control_closes_and_relinks_a_mirror() {
     let scenario = StorageScenario {
         controls: [ControlAction::Close, ControlAction::Relink]
             .into_iter()
             .map(|action| ControlStep {
-                peer: "mira".to_owned(),
+                peer: "mirror-0".to_owned(),
                 action,
                 when: None,
             })
@@ -230,7 +225,7 @@ fn control_closes_and_relinks_a_mirror() {
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
         let picks: Vec<&str> = report.picks.iter().map(|p| p.identity.as_str()).collect();
-        assert!(picks.contains(&"peer:mira:close") && picks.contains(&"peer:mira:relink"));
+        assert!(picks.contains(&"peer:mirror-0:close") && picks.contains(&"peer:mirror-0:relink"));
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             Chain::main(5).tip(&ports.fixture)
@@ -250,7 +245,7 @@ fn control_closes_and_relinks_a_mirror() {
 fn control_close_ends_both_sides_of_the_session() {
     let scenario = StorageScenario {
         controls: vec![ControlStep {
-            peer: "mira".to_owned(),
+            peer: "mirror-0".to_owned(),
             action: ControlAction::Close,
             when: None,
         }],
@@ -261,7 +256,7 @@ fn control_close_ends_both_sides_of_the_session() {
         let close = report
             .picks
             .iter()
-            .find(|pick| pick.identity == "peer:mira:close")
+            .find(|pick| pick.identity == "peer:mirror-0:close")
             .expect("the close is picked")
             .step;
         let pipes: Vec<(u64, &str)> = report
@@ -278,7 +273,7 @@ fn control_close_ends_both_sides_of_the_session() {
         assert_eq!(
             pipes.len(),
             2,
-            "Nora's and Mira's pipes both end: {pipes:?}"
+            "the node's and mirror-0's pipes both end: {pipes:?}"
         );
         assert!(
             pipes.iter().all(|(step, _)| *step > close),

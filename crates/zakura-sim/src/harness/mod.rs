@@ -49,6 +49,9 @@ pub const NO_TASK_PANIC: &str = "sim/no-task-panic";
 /// The built harness is the [`HasView`] handle. [`run_harness`] keeps it in
 /// an `Rc`, so the checker can hold a clone and read the view after each
 /// step. Production tasks never hold that `Rc`.
+///
+/// Its functions of the scenario must depend on the scenario alone. [`meta`]
+/// and each replay call them again, and must get what the run used.
 pub trait Subsystem: HasView + Sized + 'static {
     /// The harness's name, written to `meta.sim`, such as
     /// `discovery/wait-complete`.
@@ -89,12 +92,13 @@ pub trait Subsystem: HasView + Sized + 'static {
         Assumptions::none()
     }
 
-    /// The run's checker: [`registry_checker`] by default. A harness
-    /// overrides it only to run a checker for properties the registry can't
-    /// express yet after the registry's, and lists those properties in
-    /// [`Subsystem::UNREGISTERED`].
-    fn checker(this: &Rc<Self>, scenario: &Self::Scenario) -> Box<dyn Checker> {
-        registry_checker(this, scenario)
+    /// The run's checker, over the [`Subsystem::assumptions`] that
+    /// [`run_harness`] read once for the run: [`registry_checker`] by
+    /// default. A harness overrides it only to run a checker for properties
+    /// the registry can't express yet after the registry's, and lists those
+    /// properties in [`Subsystem::UNREGISTERED`].
+    fn checker(this: &Rc<Self>, assumptions: Assumptions<Self>) -> Box<dyn Checker> {
+        registry_checker(this, assumptions)
     }
 
     /// The properties an overridden [`Subsystem::checker`] reports outside
@@ -151,9 +155,13 @@ pub fn run_harness<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
-    let mut sim = Sim::new(run_config::<S>(scenario), input);
+    // One read of the assumptions sets both the step loop's livelock limit
+    // and the checker's, so the two can't disagree (V12 F-299).
+    let assumptions = S::assumptions(scenario);
+    let config = limit_livelock(S::config(scenario), &assumptions);
+    let mut sim = Sim::new(config, input);
     let this = Rc::new(S::build(&mut sim, scenario));
-    let mut checker = S::checker(&this, scenario);
+    let mut checker = S::checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
@@ -204,8 +212,13 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
 /// at a tenth of the budget, so the livelock check fires well before the
 /// budget ends the run.
 pub fn run_config<S: Subsystem>(scenario: &S::Scenario) -> RunConfig {
-    let mut config = S::config(scenario);
-    if S::assumptions(scenario).declares(Assume::BoundedAdversary) {
+    limit_livelock(S::config(scenario), &S::assumptions(scenario))
+}
+
+/// `config` with [`NO_LIVELOCK`] enforced if `assumptions` declares
+/// [`Assume::BoundedAdversary`] ([`run_config`]).
+fn limit_livelock<S>(mut config: RunConfig, assumptions: &Assumptions<S>) -> RunConfig {
+    if assumptions.declares(Assume::BoundedAdversary) {
         config.enforce_no_livelock = true;
         config.max_steps_per_instant = config
             .max_steps_per_instant
@@ -216,11 +229,14 @@ pub fn run_config<S: Subsystem>(scenario: &S::Scenario) -> RunConfig {
 
 /// The checker [`Subsystem::checker`] returns by default: the registry of
 /// the step loop's properties and `S`'s.
-pub fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> Box<dyn Checker> {
+pub fn registry_checker<S: Subsystem>(
+    this: &Rc<S>,
+    assumptions: Assumptions<S>,
+) -> Box<dyn Checker> {
     Box::new(RegistryChecker::new(
         registry::<S>(),
         Rc::clone(this),
-        S::assumptions(scenario),
+        assumptions,
         &S::sources(),
     ))
 }

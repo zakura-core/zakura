@@ -31,7 +31,7 @@ use zakura_scheduler::{SchedulerConfig, Status};
 use super::{registry_checker, Subsystem};
 use crate::{
     check::StepCtx,
-    property::{HasView, Status as PropertyStatus, Tee},
+    property::{Assumptions, HasView, Status as PropertyStatus, Tee},
     Checker, Observation, ObservationLog, PropertyOutcome, PropertyReport, RunConfig, RunEnd, Sim,
     Violation,
 };
@@ -72,9 +72,9 @@ impl Subsystem for WaitComplete {
 
     /// The registry's checker, then [`WaitCompleteWakes`], which the
     /// registry can't express yet.
-    fn checker(this: &Rc<Self>, scenario: &Scenario) -> Box<dyn Checker> {
+    fn checker(this: &Rc<Self>, assumptions: Assumptions<Self>) -> Box<dyn Checker> {
         Box::new(Tee(
-            registry_checker(this, scenario),
+            registry_checker(this, assumptions),
             WaitCompleteWakes::new(),
         ))
     }

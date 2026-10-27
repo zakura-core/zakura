@@ -3,7 +3,7 @@
 //! coverage manifest lists with the tests that show them working.
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeSet, path::Path, time::Duration};
+use std::{cell::Cell, collections::BTreeSet, path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -252,6 +252,61 @@ fn livelock_waits_for_its_assumption() {
             reason: "assumptions-never-held".to_owned()
         }
     );
+}
+
+thread_local! {
+    /// How many times [`Counted`] declared its assumptions.
+    static READS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// [`Probe`], counting each read of its assumptions.
+struct Counted;
+
+impl HasView for Counted {
+    type View = ();
+
+    /// Nothing.
+    fn view(&self) {}
+}
+
+impl Subsystem for Counted {
+    const NAME: &'static str = "test/counted";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Behavior;
+
+    fn config(behavior: &Behavior) -> RunConfig {
+        Probe::config(behavior)
+    }
+
+    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+        Probe::build(sim, behavior);
+        Counted
+    }
+
+    fn assumptions(behavior: &Behavior) -> Assumptions<Self> {
+        READS.set(READS.get() + 1);
+        Assumptions::declare(Probe::assumptions(behavior).records().to_vec())
+    }
+
+    fn draw(_: &[u8]) -> Behavior {
+        Behavior::Sleep
+    }
+}
+
+/// V12 F-299: a run reads its assumptions once, so the step loop's livelock
+/// limit and the checker's `BoundedAdversary` come from one declaration.
+#[test]
+fn a_run_reads_its_assumptions_once() {
+    READS.set(0);
+    run_harness::<Counted>(
+        &Behavior::Sleep,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(READS.get(), 1);
 }
 
 #[test]

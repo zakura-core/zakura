@@ -28,6 +28,7 @@ pub mod sim;
 pub mod storage;
 pub mod table;
 pub mod trace;
+pub mod witness;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
 pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};

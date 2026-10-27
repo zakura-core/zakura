@@ -7,7 +7,7 @@ use zakura_scheduler::Status as SchedulerStatus;
 use crate::{
     observe::Entry,
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    Observation, Violation,
+    Observation, ObservationLog, Violation,
 };
 
 /// `wait_complete` wakes the source once the initial exchange completes.
@@ -28,8 +28,28 @@ pub fn wait_complete_wakes<S: HasView>() -> Property<S> {
         needs: &[Source::Schedule],
         status: Status::Active,
         check: check_wait_complete_wakes::<S>,
-        witness: None,
+        witness: Some(final_mark_raced_the_wait),
     }
+}
+
+/// [`WAIT_COMPLETE_WAKES`]'s trigger history: the sink's final mark ran
+/// while the source was preempted in the waiting code, runnable rather than
+/// parked on its wakeup. The lost wakeup needs that order. With the bug,
+/// the source stops at its `notified`, after its check; with the fix, at
+/// its check, after its `notified`. A run where the source is parked, or
+/// hasn't reached the waiting code, when the marks finish never reaches the
+/// bug.
+fn final_mark_raced_the_wait(log: &ObservationLog) -> bool {
+    let mut state = WaitState::new();
+    for step in WaitState::steps(log.entries()) {
+        let held = state.source_in_waiting_code();
+        let marked = state.all_marked();
+        state.apply(step);
+        if !marked && state.all_marked() {
+            return held;
+        }
+    }
+    false
 }
 
 /// Checks [`WAIT_COMPLETE_WAKES`] from the run's whole log. It applies only
@@ -71,6 +91,9 @@ pub struct WaitState {
     /// and hasn't checked for completion since, so it can only go on when
     /// woken.
     in_wait: bool,
+    /// True if the source's last stop was a poll that returned pending, so
+    /// it runs again only once woken.
+    source_parked: bool,
 }
 
 impl WaitState {
@@ -80,29 +103,53 @@ impl WaitState {
     /// that observation says which task ran. The point it ran from is where
     /// the task last stopped.
     pub fn of(entries: &[Entry]) -> WaitState {
-        let sites = sites();
-        let mut state = WaitState {
+        let mut state = WaitState::new();
+        WaitState::steps(entries).for_each(|step| state.apply(step));
+        state
+    }
+
+    /// The state before any step.
+    fn new() -> WaitState {
+        WaitState {
             next: BTreeMap::new(),
-            marked: vec![None; sites.marks.len()],
+            marked: vec![None; sites().marks.len()],
             last_load: None,
             last_notified: None,
             in_wait: false,
-        };
-        // Step 0 is setup, which runs no task.
+            source_parked: false,
+        }
+    }
+
+    /// `entries` split into steps, without step 0, which is setup and runs
+    /// no task.
+    fn steps(entries: &[Entry]) -> impl Iterator<Item = &[Entry]> {
         let start = entries.partition_point(|e| e.step == 0);
-        for step in entries[start..].chunk_by(|a, b| a.step == b.step) {
-            if let Some(task) = step.iter().find_map(|e| ran(&e.obs)) {
-                state.ran(sites, task, step[0].step);
-            }
-            for entry in step {
-                if let Observation::TaskReached { task, at, site } = &entry.obs {
-                    state
-                        .next
+        entries[start..].chunk_by(|a, b| a.step == b.step)
+    }
+
+    /// Applies one step's entries.
+    fn apply(&mut self, step: &[Entry]) {
+        let sites = sites();
+        if let Some(task) = step.iter().find_map(|e| ran(&e.obs)) {
+            self.ran(sites, task, step[0].step);
+        }
+        for entry in step {
+            match &entry.obs {
+                Observation::TaskReached { task, at, site } => {
+                    if is_source(task) {
+                        self.source_parked = false;
+                    }
+                    self.next
                         .insert(task.clone(), (at.clone(), sites.line(site)));
                 }
+                Observation::TaskWaiting { task } | Observation::TaskParked { task }
+                    if is_source(task) =>
+                {
+                    self.source_parked = true;
+                }
+                _ => {}
             }
         }
-        state
     }
 
     /// Notes that `task` ran at `step` from its last stop.
@@ -142,11 +189,21 @@ impl WaitState {
     /// True if the source's next point is its `notified` in the waiting
     /// code.
     pub fn source_at_notified(&self) -> bool {
+        self.source_waits_at(|at| at.starts_with("notified"))
+    }
+
+    /// True if the source stopped at a point in the waiting code and isn't
+    /// parked on a wakeup.
+    fn source_in_waiting_code(&self) -> bool {
+        !self.source_parked && self.source_waits_at(|_| true)
+    }
+
+    /// True if the source's next point is in the waiting code, at a point
+    /// whose kind `at` accepts.
+    fn source_waits_at(&self, at: impl Fn(&str) -> bool) -> bool {
         let sites = sites();
-        self.next.iter().any(|(task, (at, line))| {
-            is_source(task)
-                && at.starts_with("notified")
-                && line.is_some_and(|line| sites.waiting.contains(&line))
+        self.next.iter().any(|(task, (kind, line))| {
+            is_source(task) && at(kind) && line.is_some_and(|line| sites.waiting.contains(&line))
         })
     }
 }

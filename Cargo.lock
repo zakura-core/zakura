@@ -3460,6 +3460,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "zakura-chain",
  "zakura-header-chain",
  "zakura-network",

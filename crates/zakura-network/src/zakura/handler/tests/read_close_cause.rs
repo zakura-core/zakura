@@ -90,7 +90,7 @@ fn status(value: u32) -> Vec<u8> {
 pub(super) struct Link {
     server: QuicEndpoint,
     client: QuicEndpoint,
-    connection: Connection,
+    pub(super) connection: Connection,
     streams: mpsc::Receiver<(SendStream, RecvStream)>,
 }
 

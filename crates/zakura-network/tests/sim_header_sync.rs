@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::BoxFuture;
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
@@ -28,16 +29,18 @@ use zakura_network::{
         ServiceRegistry, StreamPrelude, TransportEvent, TransportObserver, ZakuraControlAck,
         ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint, ZakuraHandshakeConfig,
         ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
-        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace, CONTROL_HELLO_MAGIC,
-        CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace, CONTROL_ACK_MAGIC,
+        CONTROL_HELLO_MAGIC, CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_HEADER_SYNC,
     },
     Config,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_quic::{
     sim::{LinkModel, SeededInputs, SimNet},
-    NodeAddr, NodeId, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint,
+    Acceptor, Admit, Conn, IncomingInfo, NodeAddr, NodeId, NodeSecretKey, QuicBindConfig,
+    QuicConfig, QuicEndpoint,
 };
 use zakura_rt::sync::CancellationToken;
 use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
@@ -1264,4 +1267,144 @@ fn the_observer_adds_no_scheduling_point() {
         wire.finish();
     }
     assert_eq!(steps[0], steps[1]);
+}
+
+/// A peer that answers the node's dial: it acks the node's hello with the
+/// nonce echoed and header sync accepted, accepts the header stream the node
+/// opens, and holds the connection until it closes.
+struct Responder;
+
+impl Acceptor for Responder {
+    /// Accepts every attempt.
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    /// The node's ALPN.
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![P2P_V2_ALPN.to_vec()]
+    }
+
+    /// Runs the responder's side of the control handshake.
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                return;
+            };
+            let mut len = [0; 4];
+            recv.read_exact(&mut len)
+                .await
+                .expect("the hello's length arrives");
+            let mut hello =
+                vec![0; usize::try_from(u32::from_le_bytes(len)).expect("u32 fits usize")];
+            recv.read_exact(&mut hello)
+                .await
+                .expect("the hello arrives");
+            let hello = ZakuraControlHello::decode(&hello).expect("the hello decodes");
+            let ack = ZakuraControlAck {
+                magic: CONTROL_ACK_MAGIC,
+                control_version: CONTROL_VERSION,
+                selected_zakura_protocol: hello.selected_zakura_protocol,
+                peer_nonce: [9; 32],
+                remote_peer_nonce: hello.peer_nonce,
+                accepted_capabilities: hello.capabilities & ZAKURA_CAP_HEADER_SYNC,
+                accepted_channels: 0,
+                accepted_limits: hello.initial_limits,
+            }
+            .encode()
+            .expect("the ack encodes");
+            let len = u32::try_from(ack.len()).expect("an ack fits u32");
+            send.write_all(&len.to_le_bytes())
+                .await
+                .expect("the ack's length is written");
+            send.write_all(&ack).await.expect("the ack is written");
+            let _ = send.finish();
+            // The node opens the header stream. Hold it until the end.
+            let _header_stream = conn.accept_bi().await;
+            conn.closed().await;
+        })
+    }
+}
+
+/// Dropping an admitted `dial` decides its close at once, through the
+/// connection's cleanup guard, though no task saw the token cancelled. Endpoint
+/// shutdown later reports nothing more for it.
+///
+/// This fails if the guard's cancellation skips the observer.
+#[test]
+fn a_dropped_dial_is_decided_at_once() {
+    let plan = Rc::new(RefCell::new(Plan(31)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+    let net = SimNet::new(LinkModel::default());
+    let recorder = Arc::new(Recorder::default());
+    let shutdown = CancellationToken::new();
+    let (go, stop) = (CancellationToken::new(), CancellationToken::new());
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+    sched.spawn_root("reactor", async move {
+        reactor.await.expect("the reactor ends on shutdown");
+    });
+    let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(handle));
+    {
+        let (net, recorder, go, stop) = (net.clone(), recorder.clone(), go.clone(), stop.clone());
+        sched.spawn_root("node", async move {
+            let _actions = actions;
+            let (quic, supervisor, handler, limits) = bind_node(&net, service, Some(recorder));
+            let peer = QuicEndpoint::bind_with(
+                SeededInputs::node_key(SEED, 1),
+                &bind_config(peer_addr()),
+                &QuicConfig::default(),
+                net,
+                SeededInputs::new(SEED, 1).endpoint_inputs(),
+            )
+            .expect("the peer binds");
+            peer.serve(Responder).expect("the peer serves");
+            let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
+            let target = NodeAddr::with_addrs(peer.local_id(), [peer_addr()]);
+            zakura_rt::select! {
+                result = endpoint.dial(target, &limits) => {
+                    panic!("the dial ended before the test dropped it: {result:?}");
+                }
+                () = go.cancelled() => {}
+            }
+            stop.cancelled().await;
+            endpoint.shutdown().await;
+            peer.shutdown().await;
+        });
+    }
+    let mut wire = Wire {
+        sched,
+        plan,
+        net,
+        recorder,
+        stop,
+        go,
+        shutdown,
+        held: None,
+        steps: Vec::new(),
+    };
+    wire.run_until(Duration::from_secs(5));
+    let (conn_id, _) = header_stream(&wire.events());
+    assert_eq!(closes(&wire.events()), vec![]);
+
+    wire.go.cancel();
+    wire.run_until(Duration::from_secs(6));
+    let decided = vec![TransportEvent::CloseDecided {
+        conn_id,
+        cause: None,
+    }];
+    assert_eq!(
+        closes(&wire.events()),
+        decided,
+        "dropping the dial decides it"
+    );
+
+    wire.stop.cancel();
+    wire.run_until(Duration::from_secs(20));
+    assert_eq!(closes(&wire.events()), decided, "shutdown adds nothing");
+    wire.finish();
 }

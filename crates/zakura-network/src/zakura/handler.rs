@@ -1852,6 +1852,10 @@ impl RegisteredPeerCleanupGuard {
     async fn cleanup_registered_peer(mut self) {
         if self.armed {
             self.disconnect_token.cancel();
+            #[cfg(any(test, zakura_sim))]
+            self.supervisor
+                .close_causes
+                .cancelled_and_forget(self.conn_id);
             self.remove_admitted_services();
             self.supervisor
                 .deregister(&self.peer_id, self.conn_id)
@@ -1868,6 +1872,10 @@ impl Drop for RegisteredPeerCleanupGuard {
         }
 
         self.disconnect_token.cancel();
+        #[cfg(any(test, zakura_sim))]
+        self.supervisor
+            .close_causes
+            .cancelled_and_forget(self.conn_id);
         self.remove_admitted_services();
 
         let supervisor = self.supervisor.clone();
@@ -2498,6 +2506,27 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    /// Report `connection`'s registration as `conn_id`, attach the observer
+    /// to its `close_cause`, and let the supervisor find that cause.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_registered(
+        &self,
+        conn_id: ZakuraConnId,
+        close_cause: &CloseCause,
+        connection: &Connection,
+    ) {
+        if let Some(observer) = &self.transport_observer {
+            close_cause.observe_with(Arc::new(super::ConnTap::new(observer.clone(), conn_id)));
+            self.supervisor
+                .close_causes
+                .insert(conn_id, close_cause.clone());
+            observer.observe(super::TransportEvent::Registered {
+                conn_id,
+                remote: connection.admitted_addr(),
+            });
+        }
+    }
+
     /// Report that `connection` was refused before registration, for
     /// `reason`: its handshake error or the refusal's trace label.
     #[cfg(any(test, zakura_sim))]
@@ -2577,6 +2606,8 @@ impl ZakuraProtocolHandler {
         }) = claim
         else {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+            #[cfg(any(test, zakura_sim))]
+            self.handshake_refused(&connection, "admission");
             let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
             conn.trace_connection(
                 "rejected.admission",
@@ -3398,10 +3429,7 @@ impl ZakuraProtocolHandler {
             Some(close_cause.get_or("cancelled")),
         );
         #[cfg(any(test, zakura_sim))]
-        {
-            close_cause.torn_down();
-            self.supervisor.close_causes.forget(conn_id);
-        }
+        close_cause.torn_down();
         Ok(())
     }
 
@@ -3830,6 +3858,12 @@ impl ZakuraProtocolHandler {
                 context.accepted_capabilities,
             )
             .await;
+        // Before the guard's drop below, which can be a scheduling point, so a
+        // supervisor that cancels the connection finds its close cause.
+        #[cfg(any(test, zakura_sim))]
+        if let ZakuraRegistration::Registered { conn_id, .. } = &registration {
+            self.observe_registered(*conn_id, &close_cause, &connection);
+        }
         // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
 
@@ -3840,18 +3874,6 @@ impl ZakuraProtocolHandler {
                 remote_ip,
                 disconnect_token,
             } => {
-                #[cfg(any(test, zakura_sim))]
-                if let Some(observer) = &self.transport_observer {
-                    close_cause
-                        .observe_with(Arc::new(super::ConnTap::new(observer.clone(), conn_id)));
-                    self.supervisor
-                        .close_causes
-                        .insert(conn_id, close_cause.clone());
-                    observer.observe(super::TransportEvent::Registered {
-                        conn_id,
-                        remote: connection.admitted_addr(),
-                    });
-                }
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
                 context.conn.trace_connection(
                     "accepted",

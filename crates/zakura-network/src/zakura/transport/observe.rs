@@ -173,7 +173,9 @@ pub enum TransportEvent {
         /// The first recorded cause.
         cause: Option<&'static str>,
     },
-    /// The connection's workers drained and its peer was unregistered.
+    /// The connection's workers drained and its peer was unregistered. A
+    /// serving future that is dropped instead reports no `TornDown`, though
+    /// its close is still decided.
     TornDown {
         /// The connection.
         conn_id: ZakuraConnId,
@@ -334,9 +336,16 @@ impl ConnTap {
     }
 }
 
-/// The close causes of a supervisor's registered connections, so a
-/// supervisor that cancels a connection reports its close decision at that
-/// moment.
+/// The close causes of a supervisor's registered connections, so whatever
+/// cancels a connection's token without recording a cause reports the close
+/// decision right then.
+///
+/// Every connection-level close inside the handler and its services records
+/// a cause first. The cause-free ones are the supervisor's disconnects and
+/// evictions, endpoint shutdown, the cleanup guard (which also runs when the
+/// serving future is dropped), and the transport loop's own exit. Each calls
+/// [`CloseCause::cancelled_without_cause`], directly or through this
+/// registry.
 #[derive(Debug, Default)]
 pub(crate) struct CloseRegistry(Mutex<BTreeMap<ZakuraConnId, CloseCause>>);
 
@@ -346,9 +355,13 @@ impl CloseRegistry {
         lock(&self.0).insert(conn_id, cause);
     }
 
-    /// Stop tracking `conn_id`.
-    pub(crate) fn forget(&self, conn_id: ZakuraConnId) {
-        lock(&self.0).remove(&conn_id);
+    /// [`Self::cancelled`] for `conn_id`, whose cleanup just cancelled its
+    /// token, and stop tracking it.
+    pub(crate) fn cancelled_and_forget(&self, conn_id: ZakuraConnId) {
+        let cause = lock(&self.0).remove(&conn_id);
+        if let Some(cause) = cause {
+            cause.cancelled_without_cause();
+        }
     }
 
     /// Report `CloseDecided` with no cause for `conn_id`, whose token was

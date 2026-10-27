@@ -31,7 +31,7 @@ use zakura_network::zakura::{
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
-use zakura_node_services::header_chain::Port;
+use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
@@ -195,6 +195,9 @@ pub struct Effects {
     pub links: Rc<RefCell<Vec<Link>>>,
     /// Each peer whose chain grew, once per committed growth, in order.
     pub grown: Rc<RefCell<Vec<String>>>,
+    /// Why a `Control` step couldn't take effect, which ends the run as a
+    /// harness failure: the scenario asked for something that can't happen.
+    pub failure: Rc<RefCell<Option<String>>>,
 }
 
 /// `t` plus `d`, saturating at the largest instant.
@@ -297,7 +300,10 @@ impl ActionSource for PolicySource {
             predicates.record_link(LinkEffect::Grown, peer);
         }
         self.grown = grown.len();
-        Ok(())
+        match self.effects.failure.borrow().as_ref() {
+            Some(failure) => Err(format!("ControlFailed: {failure}")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -444,16 +450,24 @@ impl Topology {
     }
 
     /// Extends the selected chain of the node named `peer` by `len` fixture
-    /// headers from its tip, through its own port, as if it had mined them,
-    /// and records the growth once the apply has committed and published
-    /// it. The node must be a mirror, on an engine port, that isn't
-    /// applying anything else.
+    /// headers from its tip, through its own port, as if it had mined them.
+    /// It records the growth only once the mirror's published tip is the
+    /// new one. Anything else, such as a resource stall that leaves the
+    /// target unadmitted, is recorded as a failure instead. The node must
+    /// be a mirror, on an engine port, that isn't applying anything else.
     async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
         let node = self
             .nodes
             .iter()
             .find(|node| node.name == peer)
             .unwrap_or_else(|| panic!("the scenario has a `{peer}`"));
+        let published = || {
+            node.port
+                .selected_chain()
+                .borrow()
+                .as_ref()
+                .map(|snapshot| snapshot.frontiers.header_best)
+        };
         let snapshot = node
             .port
             .selected_chain()
@@ -462,17 +476,30 @@ impl Topology {
             .expect("an engine port publishes its snapshot from the start");
         let tip = snapshot.frontiers.header_best;
         let headers = fixture.extend(tip, len, 0);
+        let target = Frontier::new(
+            block::Height(
+                tip.height
+                    .0
+                    .checked_add(len)
+                    .expect("fixture heights stay small"),
+            ),
+            headers.last().expect("a growth has headers").hash(),
+        );
         let request = fixture.target_request(&snapshot, tip, &headers, 1);
-        let prepared = node
-            .port
-            .prepare_header_target(request)
-            .await
-            .expect("fixture headers on the mirror's own tip prepare");
-        node.port
-            .apply_header_target(prepared)
-            .await
-            .expect("a mirror applying nothing else keeps its tip current");
-        self.effects.grown.borrow_mut().push(peer.to_owned());
+        let applied = match node.port.prepare_header_target(request).await {
+            Ok(prepared) => node.port.apply_header_target(prepared).await,
+            Err(error) => Err(error),
+        };
+        match (applied, published()) {
+            (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
+                self.effects.grown.borrow_mut().push(peer.to_owned());
+            }
+            (applied, now) => {
+                *self.effects.failure.borrow_mut() = Some(format!(
+                    "growing {peer} to {target:?} gave {applied:?}, with its tip at {now:?}"
+                ));
+            }
+        }
     }
 
     /// Connects `dialer` to `listener` with a new connection and session,

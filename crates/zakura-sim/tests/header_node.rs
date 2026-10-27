@@ -18,7 +18,7 @@ use zakura_sim::{
         header_sync::{
             Dialer, MirrorSpec, NodeChecks, Ports, Storage, StorageScenario, DIRECT_DISPATCH,
         },
-        run_prepared, Subsystem,
+        run_prepared, HarnessError, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
     MemorySink, Observation, PlanInput, RunReport, Sim,
@@ -477,4 +477,73 @@ fn a_grown_mirror_leads_nora_to_its_new_tip() {
             "Nora reaches Mira's new tip"
         );
     }
+}
+
+/// A `Grow` that storage can't admit fails the run instead of counting as
+/// grown. Mira starts 64,000 headers past A5 with finality at genesis, so
+/// growing her by 4,000 more passes the 65,536 retained-header limit, and
+/// the apply stalls without admitting the target.
+#[test]
+fn a_stalled_growth_fails_the_run() {
+    use zakura_header_chain::Frontier;
+    use zakura_node_services::header_chain::Port;
+
+    /// Polls `future` once, outside a run.
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        match std::pin::pin!(future).poll(&mut std::task::Context::from_waker(waker)) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("an engine port finishes on its first poll"),
+        }
+    }
+
+    let scenario = StorageScenario {
+        controls: vec![
+            step(ControlAction::Grow { len: 4_000 }, None),
+            step(
+                ControlAction::Close,
+                Some(Trigger::Grown("mira".to_owned())),
+            ),
+        ],
+        ..StorageScenario::default()
+    };
+    let ports = Storage::prepare(&scenario);
+    let mira = &ports.mirrors[0];
+    for request_id in 1..=16 {
+        let tip: Frontier = mira.snapshot().frontiers.header_best;
+        let headers = ports.fixture.extend(tip, 4_000, 0);
+        let request = ports
+            .fixture
+            .target_request(&mira.snapshot(), tip, &headers, request_id);
+        let prepared = ready(mira.prepare_header_target(request)).expect("a batch prepares");
+        ready(mira.apply_header_target(prepared)).expect("a batch applies");
+    }
+    let before = mira.snapshot().frontiers.header_best;
+    assert_eq!(before.height.0, 64_005);
+
+    let error = run_prepared::<Storage>(
+        &scenario,
+        ports.clone(),
+        inputs(1, 0).remove(0),
+        &mut MemorySink::default(),
+        None,
+    )
+    .expect_err("the stalled growth fails the run");
+    let HarnessError::Run { failure, report } = error else {
+        panic!("{error}");
+    };
+    assert!(failure.to_string().contains("ControlFailed"), "{failure}");
+    assert!(failure.to_string().contains("ResourceStalled"), "{failure}");
+    assert_eq!(
+        mira.snapshot().frontiers.header_best,
+        before,
+        "Mira didn't grow"
+    );
+    assert!(
+        !report
+            .picks
+            .iter()
+            .any(|pick| pick.identity == "peer:mira:close"),
+        "the gated close never opened"
+    );
 }

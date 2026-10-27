@@ -102,8 +102,8 @@ pub struct WaitState {
     created_notified: bool,
     /// True once the source's check has failed in the current pass through
     /// the waiting code: it ran a load and then parked or stopped at its
-    /// `notified`. A pass ends when the source parks or leaves the waiting
-    /// code.
+    /// `notified`. A pass ends when the source parks, leaves the waiting
+    /// code, or runs its `notified` or check again.
     check_failed: bool,
 }
 
@@ -171,6 +171,13 @@ impl WaitState {
             }
         }
         if source_ran {
+            // A source that repeats an operation of its pass without parking
+            // went through a `notified.await` that was already woken, so it
+            // starts a new pass.
+            if (created && self.created_notified) || (loaded && self.check_failed) {
+                self.created_notified = false;
+                self.check_failed = false;
+            }
             self.created_notified |= created;
             self.check_failed |= loaded && (self.source_parked || self.source_at_notified());
             if self.source_parked || !self.source_waits_at(|_| true) {
@@ -465,5 +472,21 @@ mod tests {
         woken.run(SOURCE, load(0)).run(SOURCE, load(1));
         woken.mark(2);
         assert!(!woken.raced());
+    }
+
+    /// Peers lands between the fix's `notified()` and its failed check, so
+    /// the source's `notified.await` returns without parking. The next
+    /// pass starts over: the final mark lands during that pass's check, as
+    /// in [`marks_after_the_notified_race_the_check`].
+    #[test]
+    fn a_wait_that_was_already_woken_starts_a_new_pass() {
+        let mut fix = History::new();
+        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.mark(1);
+        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.mark(0);
+        fix.run(SOURCE, load(1)).run(SOURCE, load(2));
+        fix.mark(2);
+        assert!(fix.raced());
     }
 }

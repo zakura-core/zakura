@@ -143,7 +143,7 @@ impl WaitState {
     /// Applies one step's entries.
     fn apply(&mut self, step: &[Entry]) {
         let sites = sites();
-        let task = step.iter().find_map(|e| ran(&e.obs));
+        let task = step.iter().find_map(|e| e.obs.ran_task());
         // A parked source that runs resumes its await, not its next point.
         let source_ran = task.is_some_and(is_source);
         let from = |kind: &str| {
@@ -234,17 +234,6 @@ impl WaitState {
         self.next.iter().any(|(task, (kind, line))| {
             is_source(task) && at(kind) && line.is_some_and(|line| sites.waiting.contains(&line))
         })
-    }
-}
-
-/// The task a step ran, from the observation its run appended.
-fn ran(obs: &Observation) -> Option<&str> {
-    match obs {
-        Observation::TaskReached { task, .. }
-        | Observation::TaskWaiting { task }
-        | Observation::TaskParked { task }
-        | Observation::TaskExited { task, .. } => Some(task),
-        _ => None,
     }
 }
 

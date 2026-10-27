@@ -543,14 +543,18 @@ impl Subsystem for Spinners {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Fixed;
+    type Prepared = ();
 
     /// A short budget and drain.
     fn config(_: &Fixed) -> RunConfig {
         limits(8, 16)
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
     /// Spawns the two spinners.
-    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         for label in ["a", "b"] {
             sim.scheduler().spawn_root(label, async move {
                 for pass in 1u32.. {
@@ -637,14 +641,18 @@ impl Subsystem for DuplicateIdentity {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Fixed;
+    type Prepared = ();
 
     /// Room for more steps than the run takes.
     fn config(_: &Fixed) -> RunConfig {
         limits(100, 10)
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
     /// Adds the source.
-    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         sim.add_source(Box::new(Duplicates(Cell::new(false))));
         DuplicateIdentity
     }
@@ -735,14 +743,18 @@ impl Subsystem for PlantedClock {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Fixed;
+    type Prepared = ();
 
     /// Room for the four actions.
     fn config(_: &Fixed) -> RunConfig {
         limits(100, 10)
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
     /// Adds the clock.
-    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         sim.add_source(Box::new(Clock(Cell::new(0))));
         PlantedClock
     }
@@ -890,14 +902,18 @@ impl Subsystem for EffectsHarness {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Fixed;
+    type Prepared = ();
 
     /// Room for every operation.
     fn config(_: &Fixed) -> RunConfig {
         limits(100, 10)
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
     /// Adds the source.
-    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         EFFECTS_BUILT.set(EFFECTS_BUILT.get() + 1);
         sim.add_source(Box::new(Effects(Cell::new(0))));
         EffectsHarness
@@ -1088,14 +1104,18 @@ impl Subsystem for ForeignStorage {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Fixed;
+    type Prepared = ();
 
     /// A short budget and drain.
     fn config(_: &Fixed) -> RunConfig {
         limits(8, 8)
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
     /// Adds the staged storage.
-    fn build(sim: &mut Sim, _: &Fixed) -> Self {
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
         let storage = FOREIGN
             .with(|foreign| foreign.borrow_mut().take())
             .expect("the test staged storage");

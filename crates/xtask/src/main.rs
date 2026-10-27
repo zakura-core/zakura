@@ -101,6 +101,11 @@ fn try_main() -> Result<(), BoxError> {
             let mut property = None;
             while let Some(arg) = args.next() {
                 if arg == "--changed-since" {
+                    if changed_since.is_some() {
+                        return Err(Box::new(UsageError(
+                            "expected at most one `--changed-since`",
+                        )));
+                    }
                     changed_since = Some(
                         args.next()
                             .ok_or(UsageError("expected a revision after `--changed-since`"))?,

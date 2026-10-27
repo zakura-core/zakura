@@ -48,7 +48,7 @@ use std::{
     env,
     ffi::OsString,
     fmt, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
@@ -307,6 +307,16 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
+            for path in std::iter::once(&input).chain(&checks) {
+                if !is_plain_relative(path) {
+                    return Err(format!(
+                        "{}: {} isn't a plain path relative to the repository root",
+                        case_file.display(),
+                        path.display()
+                    )
+                    .into());
+                }
+            }
             Ok(Case {
                 property,
                 patch,
@@ -317,23 +327,50 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
         .collect()
 }
 
+/// True if `path` is non-empty and made only of ordinary names, so that it
+/// compares with `git diff`'s repository-relative paths component by
+/// component.
+fn is_plain_relative(path: &Path) -> bool {
+    path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 /// The paths `git diff` reports changed between `rev`'s merge base with
-/// `HEAD` and `HEAD`, relative to the repository root. Without rename
-/// detection, a renamed file shows up as its deleted old path and its added
-/// new one, so a case watching the old path sees the rename.
+/// `HEAD` and `HEAD`, relative to the repository root. `rev` must name a
+/// commit. Without rename detection, a renamed file shows up as its deleted
+/// old path and its added new one, so a case watching the old path sees the
+/// rename.
 fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxError> {
+    // Resolving `rev` first keeps git from reading it as an option, a
+    // pathspec or a range.
+    let resolved = git(repo_root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .output()?;
+    if !resolved.status.success() {
+        return Err(format!("`{rev}` doesn't name a commit").into());
+    }
+    let base = String::from_utf8(resolved.stdout)?.trim().to_owned();
     let output = git(repo_root)
         .args([
             "diff",
             "--name-only",
             "--no-renames",
             "-z",
-            &format!("{rev}...HEAD"),
+            &format!("{base}...HEAD"),
+            "--",
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "`git diff {rev}...HEAD` failed: {}",
+            "`git diff {base}...HEAD` failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
@@ -1054,6 +1091,39 @@ mod tests {
         let error = changed_since_rev(&repo_root, "no-such-revision")
             .expect_err("the revision doesn't exist");
         assert!(error.to_string().contains("no-such-revision"), "{error}");
+    }
+
+    /// An empty revision, an option, a path and a range each fail instead
+    /// of reaching `git diff` as something other than a commit.
+    #[test]
+    fn a_revision_that_isnt_a_commit_fails() {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        for rev in ["", "--output=/dev/null", "crates", "HEAD^1..HEAD", "-z"] {
+            let error =
+                changed_since_rev(&repo_root, rev).expect_err("the revision doesn't name a commit");
+            assert!(
+                error.to_string().contains("doesn't name a commit"),
+                "{rev}: {error}"
+            );
+        }
+    }
+
+    /// Case paths must be plain repository-relative names, so they compare
+    /// with `git diff`'s paths.
+    #[test]
+    fn case_paths_must_be_plain() {
+        for path in ["a/b", "a", "crates/zakura-network/src/zakura/discovery"] {
+            assert!(is_plain_relative(Path::new(path)), "{path}");
+        }
+        for path in [
+            "",
+            "/a",
+            "./a",
+            "a/../a",
+            "crates/zakura-network/src/zakura/discovery/../discovery",
+        ] {
+            assert!(!is_plain_relative(Path::new(path)), "{path}");
+        }
     }
 
     /// Each committed case watches its patch's production files and its

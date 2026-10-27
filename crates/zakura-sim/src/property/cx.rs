@@ -6,7 +6,7 @@ use super::{
     Cardinality, Kind, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Subject,
     Verdict,
 };
-use crate::{check::Violation, Observation, StepCtx};
+use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
@@ -65,6 +65,7 @@ pub struct CheckCtx<'a, S: HasView> {
     handle: &'a S,
     property: &'a Property<S>,
     obliged: Vec<Obligation>,
+    labelled: Vec<LabelledFrame>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -75,12 +76,14 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             handle,
             property,
             obliged: Vec::new(),
+            labelled: Vec::new(),
         }
     }
 
-    /// The obligations the check opened, in order.
-    pub(crate) fn into_obligations(self) -> Vec<Obligation> {
-        self.obliged
+    /// The obligations the check opened and the frames it labelled, each in
+    /// order.
+    pub(crate) fn into_parts(self) -> (Vec<Obligation>, Vec<LabelledFrame>) {
+        (self.obliged, self.labelled)
     }
 
     /// The property being checked.
@@ -163,6 +166,12 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             "no observation counts toward an Ops bound on polls"
         );
         self.obliged.push(obligation);
+    }
+
+    /// Records a frame a role model labelled. The registry passes it on as
+    /// a [`CheckEvent::Label`](super::CheckEvent::Label) after the check.
+    pub fn label(&mut self, frame: LabelledFrame) {
+        self.labelled.push(frame);
     }
 
     /// A violation of the property at this step, with this step as its

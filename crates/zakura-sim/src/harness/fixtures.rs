@@ -14,6 +14,7 @@
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     future::{poll_fn, Future},
     pin::pin,
     rc::Rc,
@@ -37,7 +38,7 @@ use crate::{
         CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status as PropertyStatus,
         Verdict,
     },
-    RunConfig, Sim,
+    Observation, ObservationLog, RunConfig, Sim,
 };
 
 /// Which version of a fixture runs.
@@ -111,6 +112,11 @@ pub trait Fixture: Sized + 'static {
     /// What went wrong, if `view` shows the race after a step that leaves
     /// the scheduler `status`, with no task running.
     fn failure(view: &Self::View, status: Status) -> Option<String>;
+
+    /// True if `log` shows the interleaving the planted race needs. The fix
+    /// can reach it too, and then holds anyway: it is the property's
+    /// trigger history, for its witness tests.
+    fn trigger_history(log: &ObservationLog) -> bool;
 }
 
 /// A [`Fixture`] as a harness.
@@ -169,7 +175,7 @@ impl<F: Fixture> Subsystem for Race<F> {
             needs: &[Source::View, Source::Schedule],
             status: PropertyStatus::Active,
             check: no_race::<F>,
-            witness: None,
+            witness: Some(F::trigger_history),
         }]
     }
 
@@ -198,6 +204,76 @@ fn no_race<F: Fixture>(cx: &mut CheckCtx<'_, Race<F>>) -> Verdict {
     match F::failure(&cx.view(), cx.status) {
         Some(actual) => cx.violated(F::EXPECTED, actual),
         None => Verdict::Holds,
+    }
+}
+
+/// One step of a fixture's run that ran a task, replayed from the log.
+struct Ran<'a> {
+    /// The task, without its spawn suffix: `inc_a` for `inc_a.1`.
+    task: &'a str,
+    /// The point it ran from, such as `load#1`, or `None` for its first
+    /// run.
+    from: Option<&'a str>,
+    /// The point each live task last stopped at before the step, by task.
+    stopped: &'a BTreeMap<String, String>,
+}
+
+impl Ran<'_> {
+    /// True if the step ran from a point of kind `kind`, such as `load`.
+    fn ran_kind(&self, kind: &str) -> bool {
+        self.from.is_some_and(|at| point_kind(at) == kind)
+    }
+
+    /// The point `task` last stopped at before the step, if it is live.
+    fn stopped_at(&self, task: &str) -> Option<&str> {
+        self.stopped.get(task).map(String::as_str)
+    }
+}
+
+/// The kind of point `at`: `load` for `load#2`.
+fn point_kind(at: &str) -> &str {
+    at.split_once('#').map_or(at, |(kind, _)| kind)
+}
+
+/// True if `trigger` holds for some step of `log` that ran a task.
+fn some_step(log: &ObservationLog, mut trigger: impl FnMut(&Ran<'_>) -> bool) -> bool {
+    let entries = log.entries();
+    let start = entries.partition_point(|e| e.step == 0);
+    let mut stopped = BTreeMap::new();
+    for step in entries[start..].chunk_by(|a, b| a.step == b.step) {
+        let Some(task) = step.iter().find_map(|e| e.obs.ran_task()) else {
+            continue;
+        };
+        let task = task.split_once('.').map_or(task, |(name, _)| name);
+        let ran = Ran {
+            task,
+            from: stopped.get(task).map(String::as_str),
+            stopped: &stopped,
+        };
+        if trigger(&ran) {
+            return true;
+        }
+        for entry in step {
+            match &entry.obs {
+                Observation::TaskReached { at, .. } => {
+                    stopped.insert(task.to_owned(), at.clone());
+                }
+                Observation::TaskExited { .. } => {
+                    stopped.remove(task);
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// The other task of a fixture's pair `a` and `b`.
+fn other<'a>(task: &str, (a, b): (&'a str, &'a str)) -> &'a str {
+    if task == a {
+        b
+    } else {
+        a
     }
 }
 
@@ -242,6 +318,17 @@ impl Fixture for LostUpdate {
     /// The counter is short once both incrementers finish.
     fn failure(&(counter, done): &(u64, u32), _: Status) -> Option<String> {
         (done == 2 && counter != 2).then(|| format!("counter = {counter}, want 2"))
+    }
+
+    /// One incrementer writes the counter while the other stopped at its
+    /// own write: with the race, both loaded before either stored; with the
+    /// fix, both reached their atomic add at once.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        let at_write = |at: &str| matches!(point_kind(at), "store" | "rmw");
+        some_step(log, |ran| {
+            let other = other(ran.task, ("inc_a", "inc_b"));
+            ran.from.is_some_and(at_write) && ran.stopped_at(other).is_some_and(at_write)
+        })
     }
 }
 
@@ -296,6 +383,16 @@ impl Fixture for SnapshotReserve {
     fn failure(&left: &i64, _: Status) -> Option<String> {
         (left < 0).then(|| format!("over-committed: available = {left}"))
     }
+
+    /// One task takes its first lock while the other has taken its own and
+    /// hasn't finished: with the race, it checks the capacity before the
+    /// other reserves; with the fix, it waits for the other's reservation.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        some_step(log, |ran| {
+            let other = other(ran.task, ("res_a", "res_b"));
+            ran.from == Some("lock#1") && ran.stopped_at(other).is_some_and(|at| at != "lock#1")
+        })
+    }
 }
 
 /// Discovery's `wait_complete` shape: check a flag, then create
@@ -349,6 +446,23 @@ impl Fixture for MissedNotify {
     /// The waiter timed out.
     fn failure(&timed_out: &bool, _: Status) -> Option<String> {
         timed_out.then(|| "the waiter missed the notification".to_owned())
+    }
+
+    /// The marker notifies while the waiter has run one of its flag check
+    /// and its `notified`, but not the other: with the race, between the
+    /// check and the registration; with the fix, between the registration
+    /// and the check.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        let (mut checked, mut registered) = (false, false);
+        some_step(log, |ran| {
+            match ran.task {
+                "waiter" if ran.ran_kind("load") => checked = true,
+                "waiter" if ran.ran_kind("notified") => registered = true,
+                "marker" if ran.ran_kind("notify") => return checked != registered,
+                _ => {}
+            }
+            false
+        })
     }
 }
 
@@ -434,6 +548,14 @@ impl Fixture for TimerCancel {
     fn failure(&bad: &bool, _: Status) -> Option<String> {
         bad.then(|| "timeout chosen after cancel".to_owned())
     }
+
+    /// The closer cancels before the timer's select decides. The timer
+    /// exits in the step that decides, so it is live until then.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        some_step(log, |ran| {
+            ran.task == "closer" && ran.ran_kind("cancel") && ran.stopped_at("timer").is_some()
+        })
+    }
 }
 
 /// Opposite lock order. The fix takes both locks in one order.
@@ -475,6 +597,15 @@ impl Fixture for AbBa {
     /// The scheduler found the lock cycle.
     fn failure(_: &(), status: Status) -> Option<String> {
         (status == Status::Deadlock).then(|| "deadlock".to_owned())
+    }
+
+    /// One task tries its first lock while the other holds its own first
+    /// lock and stopped at its second.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        some_step(log, |ran| {
+            let other = other(ran.task, ("ab", "ba"));
+            ran.from == Some("lock#1") && ran.stopped_at(other) == Some("lock#2")
+        })
     }
 }
 
@@ -535,5 +666,13 @@ impl Fixture for AbortWithoutJoin {
     /// The aborter found the resource held.
     fn failure(&bad: &bool, _: Status) -> Option<String> {
         bad.then(|| "the aborted task still held its resource".to_owned())
+    }
+
+    /// The aborter aborts the worker while the worker still holds its
+    /// resource.
+    fn trigger_history(log: &ObservationLog) -> bool {
+        some_step(log, |ran| {
+            ran.task == "aborter" && ran.ran_kind("abort") && ran.stopped_at("worker").is_some()
+        })
     }
 }

@@ -40,8 +40,8 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
     }
 }
 
-/// A race fixture's row: its test runs the fix to a pass and finds each
-/// planted variant.
+/// A race fixture's row: its witness test runs the fix to a pass and the
+/// planted race to its violation, both through the race's trigger history.
 const fn race(property: &'static str, test: &'static str) -> Coverage {
     Coverage {
         property,
@@ -62,12 +62,12 @@ pub static COVERAGE: &[Coverage] = &[
         passing: sim_test("tests/harness.rs", "a_moving_clock_holds_no_livelock"),
         bypass: sim_test("tests/harness.rs", "livelock_fires_before_budget"),
     },
-    race("race/lost-update", "lost_update"),
-    race("race/snapshot-reserve", "snapshot_reserve"),
-    race("race/missed-notify", "missed_notify"),
-    race("race/timer-cancel", "timer_cancel"),
-    race("race/ab-ba", "ab_ba"),
-    race("race/abort-without-join", "abort_without_join"),
+    race("race/lost-update", "lost_update_witness"),
+    race("race/snapshot-reserve", "snapshot_reserve_witness"),
+    race("race/missed-notify", "missed_notify_witness"),
+    race("race/timer-cancel", "timer_cancel_witness"),
+    race("race/ab-ba", "ab_ba_witness"),
+    race("race/abort-without-join", "abort_without_join_witness"),
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: sim_test("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),

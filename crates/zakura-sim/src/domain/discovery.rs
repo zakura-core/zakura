@@ -130,7 +130,7 @@ impl WaitState {
     /// Applies one step's entries.
     fn apply(&mut self, step: &[Entry]) {
         let sites = sites();
-        if let Some(task) = step.iter().find_map(|e| ran(&e.obs)) {
+        if let Some(task) = step.iter().find_map(|e| e.obs.ran_task()) {
             self.ran(sites, task, step[0].step);
         }
         for entry in step {
@@ -205,17 +205,6 @@ impl WaitState {
         self.next.iter().any(|(task, (kind, line))| {
             is_source(task) && at(kind) && line.is_some_and(|line| sites.waiting.contains(&line))
         })
-    }
-}
-
-/// The task a step ran, from the observation its run appended.
-fn ran(obs: &Observation) -> Option<&str> {
-    match obs {
-        Observation::TaskReached { task, .. }
-        | Observation::TaskWaiting { task }
-        | Observation::TaskParked { task }
-        | Observation::TaskExited { task, .. } => Some(task),
-        _ => None,
     }
 }
 

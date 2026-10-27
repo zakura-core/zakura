@@ -133,6 +133,21 @@ pub enum Observation {
     },
 }
 
+impl Observation {
+    /// The task whose run appended this observation, if a step that runs a
+    /// task appends it: a stop at a point, a wait, a park or an exit. Each
+    /// such step appends exactly one.
+    pub fn ran_task(&self) -> Option<&str> {
+        match self {
+            Observation::TaskReached { task, .. }
+            | Observation::TaskWaiting { task }
+            | Observation::TaskParked { task }
+            | Observation::TaskExited { task, .. } => Some(task),
+            _ => None,
+        }
+    }
+}
+
 /// A storage fact in plain fields: hashes and peers in hex, counters as
 /// numbers, and names where the port has them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

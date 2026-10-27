@@ -4,18 +4,20 @@
 use std::{
     future::Future,
     pin::pin,
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
 use zakura_chain::block;
 use zakura_header_chain::{Frontier, HeaderWorkAuthority, SourceId};
 use zakura_node_services::header_chain::{
-    AcquirePath, AcquirePathReply, ApplyHeaderTargetOutcome, Port, PortError, ReadPath,
-    RetainedHeaderPath,
+    AcquirePath, AcquirePathReply, ApplyHeaderTargetOutcome, LocatorReadPermit, Port, PortError,
+    ReadPath, RetainedHeaderPath,
 };
+use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
     controlled::{ControlledPort, Fact, FactKind, OpId},
-    evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, StateField},
+    evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, StateField},
     fixture::HeaderFixture,
     Outcome,
 };
@@ -407,4 +409,64 @@ fn a_head_without_its_lease_end_is_an_unexpected_effect() {
             found: facts[head].kind.clone(),
         })
     );
+}
+
+/// Each field of a real owner state, changed alone without naming an
+/// unknown owner, is a mismatch in that field. Dropping an operation is
+/// the slot vanishing without a fact.
+#[test]
+fn each_changed_state_field_is_a_mismatch() {
+    let (port, chain) = chain(3);
+    let mut model = OwnerModel::new();
+    let anchor = HeaderFixture::regtest().anchor();
+    let path = acquired(run(
+        &port,
+        port.acquire_header_path(acquire(&port, chain[2])),
+    ));
+    run(&port, port.read_header_path(path, page_after(anchor, 1))).expect("the page reads");
+    let mut other = acquire(&port, chain[2]);
+    other.source = SourceId::from_digest([2; 32]);
+    acquired(run(&port, port.acquire_header_path(other)));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut locator = port.continuation_locator(LocatorReadPermit::new(
+        Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("the semaphore has a permit"),
+    ));
+    assert!(pin!(&mut locator)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    checked(&port, &mut model);
+    let actual = port.owner_state();
+    assert!(
+        !actual.operations.is_empty()
+            && !actual.permits.is_empty()
+            && !actual.leases.is_empty()
+            && !actual.continuations.is_empty(),
+        "every owner kind is present: {actual:?}"
+    );
+    let changes: [(StateField, fn(&mut OwnerState)); 7] = [
+        (StateField::Operations, |state| state.operations.clear()),
+        (StateField::Permits, |state| state.permits.clear()),
+        (StateField::Leases, |state| state.leases.clear()),
+        (StateField::Continuations, |state| {
+            state.continuations.clear()
+        }),
+        (StateField::ClassWaiters, |state| {
+            state.class_waiters.general = !state.class_waiters.general
+        }),
+        (StateField::LastLeaseId, |state| state.last_lease_id += 1),
+        (StateField::ContinuationHits, |state| {
+            state.continuation_hits += 1
+        }),
+    ];
+    for (field, change) in changes {
+        let mut changed = actual.clone();
+        change(&mut changed);
+        assert_eq!(
+            model.compare(&changed),
+            Err(ModelFailure::Mismatch(field)),
+            "{field:?}"
+        );
+    }
 }

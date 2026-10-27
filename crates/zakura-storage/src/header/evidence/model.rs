@@ -1009,29 +1009,37 @@ impl OwnerModel {
         }) {
             return Err(ModelFailure::UndisposedReply(op.id));
         }
-        let expected = self.state();
+        // Destructured without `..`, so a new field can't go uncompared.
+        let OwnerState {
+            // Checked first, as freshness.
+            through_seq: _,
+            operations,
+            permits,
+            leases,
+            continuations,
+            class_waiters,
+            last_lease_id,
+            continuation_hits,
+        } = self.state();
         let fields = [
-            (
-                StateField::Operations,
-                expected.operations == actual.operations,
-            ),
-            (StateField::Permits, expected.permits == actual.permits),
-            (StateField::Leases, expected.leases == actual.leases),
+            (StateField::Operations, operations == actual.operations),
+            (StateField::Permits, permits == actual.permits),
+            (StateField::Leases, leases == actual.leases),
             (
                 StateField::Continuations,
-                expected.continuations == actual.continuations,
+                continuations == actual.continuations,
             ),
             (
                 StateField::ClassWaiters,
-                expected.class_waiters == actual.class_waiters,
+                class_waiters == actual.class_waiters,
             ),
             (
                 StateField::LastLeaseId,
-                expected.last_lease_id == actual.last_lease_id,
+                last_lease_id == actual.last_lease_id,
             ),
             (
                 StateField::ContinuationHits,
-                expected.continuation_hits == actual.continuation_hits,
+                continuation_hits == actual.continuation_hits,
             ),
         ];
         match fields.into_iter().find(|(_, equal)| !equal) {

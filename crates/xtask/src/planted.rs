@@ -31,10 +31,10 @@
 //! violation of another property, a patch the input doesn't catch, and a
 //! catch that misses the trigger history are each reported as their own
 //! failure, never as a catch. The campaign reports how many of its inputs
-//! caught the patch. It fails the case only on a run that fails, ends at a
-//! harness failure, violates another property, or violates the case's
-//! property without its trigger history, so the gate stays the committed
-//! input.
+//! caught the patch, and how the others' runs ended. It fails the case only
+//! on a run that fails, ends at a harness failure, violates another
+//! property, doesn't report the case's property, or violates it without its
+//! trigger history, so the gate stays the committed input.
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -44,6 +44,7 @@
 //! change to its old and its new path.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsString,
     fmt, fs,
@@ -148,12 +149,15 @@ enum Run {
 }
 
 /// What a case's short campaign found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Campaign {
     /// Inputs recorded.
     inputs: usize,
     /// Inputs whose run violated the case's property.
     caught: usize,
+    /// How many of the other inputs' runs ended with each outcome of the
+    /// case's property, such as `held` or `not-applicable`.
+    missed: BTreeMap<String, usize>,
 }
 
 /// How a case ended.
@@ -172,14 +176,17 @@ enum Verdict {
     Harness(String),
     /// The patched run violated another property.
     Unrelated(String),
-    /// The patched run didn't violate the property.
+    /// The patched run reported the property, with an outcome other than
+    /// violated.
     NotCaught(String),
+    /// The patched run didn't report the property.
+    Unreported,
     /// The patched run violated the property, but its witness test failed,
     /// as when the run missed the trigger history.
     WitnessFails(String),
     /// A campaign input's patched run failed, ended at a harness failure,
-    /// violated another property, or violated the case's property without
-    /// its trigger history.
+    /// violated another property, didn't report the case's property, or
+    /// violated it without its trigger history.
     CampaignFails {
         /// The input.
         input: PathBuf,
@@ -192,10 +199,21 @@ impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Verdict::Caught(None) => f.write_str("caught"),
-            Verdict::Caught(Some(Campaign { inputs, caught })) => write!(
-                f,
-                "caught; the campaign caught it on {caught} of {inputs} inputs"
-            ),
+            Verdict::Caught(Some(Campaign {
+                inputs,
+                caught,
+                missed,
+            })) => {
+                write!(
+                    f,
+                    "caught; the campaign caught it on {caught} of {inputs} inputs"
+                )?;
+                for (index, (outcome, count)) in missed.iter().enumerate() {
+                    let lead = if index == 0 { "; the others: " } else { ", " };
+                    write!(f, "{lead}{count} {outcome}")?;
+                }
+                Ok(())
+            }
             Verdict::BaselineFails(why) => write!(f, "the unpatched baseline fails: {why}"),
             Verdict::PatchDoesntApply(why) => write!(f, "the patch doesn't apply: {why}"),
             Verdict::Failed(why) => write!(f, "the patched run failed: {why}"),
@@ -206,6 +224,7 @@ impl fmt::Display for Verdict {
             Verdict::NotCaught(outcome) => {
                 write!(f, "the patched run didn't violate it: {outcome}")
             }
+            Verdict::Unreported => f.write_str("the patched run didn't report the property"),
             Verdict::WitnessFails(why) => {
                 write!(f, "the patched run's witness test fails: {why}")
             }
@@ -471,6 +490,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
     fs::create_dir_all(dir)?;
     let binary = target.join("debug").join("zakura-sim");
     let mut caught = 0;
+    let mut missed = BTreeMap::new();
     for (index, bytes) in campaign_inputs(&case.property).into_iter().enumerate() {
         let input = dir.join(format!("input-{index}.bin"));
         fs::write(&input, bytes)?;
@@ -484,7 +504,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
         )?;
         match classify(&case.property, &run) {
             Verdict::Caught(_) => caught += 1,
-            Verdict::NotCaught(_) => {}
+            Verdict::NotCaught(outcome) => *missed.entry(outcome).or_default() += 1,
             verdict => {
                 return Ok(Verdict::CampaignFails {
                     input,
@@ -496,6 +516,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
     Ok(Verdict::Caught(Some(Campaign {
         inputs: CAMPAIGN_INPUTS,
         caught,
+        missed,
     })))
 }
 
@@ -712,13 +733,14 @@ fn classify(property: &str, patched: &Run) -> Verdict {
         } => Verdict::Unrelated(violated.clone()),
         Run::Ended {
             violation: None,
-            outcome,
+            outcome: None,
             ..
-        } if outcome.as_deref() != Some("violated") => Verdict::NotCaught(
-            outcome
-                .clone()
-                .unwrap_or_else(|| format!("{property} is not reported")),
-        ),
+        } => Verdict::Unreported,
+        Run::Ended {
+            violation: None,
+            outcome: Some(outcome),
+            ..
+        } if outcome != "violated" => Verdict::NotCaught(outcome.clone()),
         Run::Ended {
             witness: Some(why), ..
         } => Verdict::WitnessFails(why.clone()),
@@ -793,10 +815,7 @@ mod tests {
             classify(ID, &run(None, &[(ID, HELD)])),
             Verdict::NotCaught("held".to_owned())
         );
-        assert_eq!(
-            classify(ID, &run(None, &[])),
-            Verdict::NotCaught(format!("{ID} is not reported"))
-        );
+        assert_eq!(classify(ID, &run(None, &[])), Verdict::Unreported);
         assert_eq!(
             classify(ID, &Run::Failed("build".to_owned())),
             Verdict::Failed("build".to_owned())
@@ -910,8 +929,9 @@ mod tests {
         assert_ne!(inputs, campaign_inputs("race/lost-update"));
     }
 
-    /// A campaign run that violates another property fails the case and
-    /// names the input; one that holds or catches the patch doesn't.
+    /// A campaign run that violates another property or doesn't report the
+    /// case's fails the case and names the input. One that holds or catches
+    /// the patch doesn't, and the verdict counts the others' outcomes.
     #[test]
     fn campaign_failures_name_their_input() {
         let verdict = Verdict::CampaignFails {
@@ -922,13 +942,25 @@ mod tests {
             verdict.to_string(),
             "campaign input campaign/input-3.bin: the patched run violated sim/no-task-panic instead"
         );
+        let verdict = Verdict::CampaignFails {
+            input: PathBuf::from("campaign/input-4.bin"),
+            verdict: Box::new(classify(ID, &run(None, &[]))),
+        };
+        assert_eq!(
+            verdict.to_string(),
+            "campaign input campaign/input-4.bin: the patched run didn't report the property"
+        );
         assert_eq!(
             Verdict::Caught(Some(Campaign {
                 inputs: 32,
-                caught: 5
+                caught: 5,
+                missed: BTreeMap::from([
+                    ("held".to_owned(), 25),
+                    ("not-applicable".to_owned(), 2)
+                ]),
             }))
             .to_string(),
-            "caught; the campaign caught it on 5 of 32 inputs"
+            "caught; the campaign caught it on 5 of 32 inputs; the others: 25 held, 2 not-applicable"
         );
     }
 

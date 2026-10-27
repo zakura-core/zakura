@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -162,6 +163,83 @@ class DailySummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, "destination missing or changed"):
             self.deliver(self.due)
         self.assertEqual(self.path.read_text(), before)
+
+    def test_monitoring_destination_is_required_and_alerts_keep_their_route(self):
+        """Alert credentials cannot silently receive routine summaries."""
+        with patch.dict(os.environ, {"SLACK_WEB_HOOK": "https://slack.invalid/alerts"}, clear=True):
+            self.assertEqual(deploy.slack_webhook_url(), "https://slack.invalid/alerts")
+            self.assertEqual(summary.slack_webhook_url(), "")
+            with patch.object(summary, "post_slack") as post:
+                with self.assertRaisesRegex(deploy.DeployError, "destination missing or changed"):
+                    summary.deliver(self.config, self.path, self.due)
+                post.assert_not_called()
+            with patch.dict(os.environ, {"SLACK_MONITORING_WEBHOOK_URL": self.webhook}), \
+                 patch.object(summary.monitor, "query_node", return_value=self.data()), \
+                 patch.object(deploy.urllib.request, "urlopen") as urlopen:
+                response = urlopen.return_value.__enter__.return_value
+                response.status = 200
+                response.read.return_value = b"ok"
+                summary.deliver(self.config, self.path, self.due)
+                self.assertEqual(urlopen.call_args.args[0].full_url, self.webhook)
+                deploy.post_slack("actionable failure")
+                self.assertEqual(urlopen.call_args.args[0].full_url, "https://slack.invalid/alerts")
+
+    def test_migration_retains_pending_runs_and_deadline_through_delivery_retry(self):
+        """Changing channels preserves confirmed history and all unreported completions."""
+        self.state["unavailable"] = ["node"]
+        summary.save_state(self.path, self.state)
+        old_destination = self.state["destination"]
+        self.webhook += "-monitoring"
+        with patch.object(summary, "slack_webhook_url", return_value=self.webhook), \
+             patch.object(summary, "post_slack") as post:
+            summary.migrate_destination(self.config, self.path, self.due, old_destination)
+            post.assert_not_called()
+        migrated = {**self.state, "destination": hashlib.sha256(self.webhook.encode()).hexdigest()}
+        self.assertEqual(json.loads(self.path.read_text()), migrated)
+        with self.assertRaisesRegex(deploy.DeployError, "delivery failed"):
+            self.deliver(self.due, posted=False)
+        self.assertEqual(json.loads(self.path.read_text()), migrated)
+        _, post = self.deliver(self.due + 60, statuses={"node": self.data(4)})
+        self.assertIn("2 completed", post.call_args.args[0])
+        self.assertEqual(post.call_args.kwargs["webhook"], self.webhook)
+        _, post = self.deliver(self.due + 120)
+        post.assert_not_called()
+
+    def test_migration_rejects_unexpected_destination_missing_webhook_and_bad_state(self):
+        """Failed migration checks cannot replace existing delivery history."""
+        before = self.path.read_text()
+        with patch.object(summary, "slack_webhook_url", return_value=self.webhook):
+            with self.assertRaisesRegex(deploy.DeployError, "expected destination"):
+                summary.migrate_destination(self.config, self.path, self.due, "wrong")
+        self.assertEqual(self.path.read_text(), before)
+        with patch.object(summary, "slack_webhook_url", return_value=""):
+            with self.assertRaisesRegex(deploy.DeployError, "not configured"):
+                summary.migrate_destination(self.config, self.path, self.due, self.state["destination"])
+        self.assertEqual(self.path.read_text(), before)
+        for contents in [None, "{}", "invalid"]:
+            if contents is None:
+                self.path.unlink()
+            else:
+                self.path.write_text(contents)
+            with self.assertRaisesRegex(deploy.DeployError, "state missing or invalid"):
+                summary.migrate_destination(self.config, self.path, self.due, self.state["destination"])
+            self.assertEqual(self.path.read_text() if self.path.exists() else None, contents)
+
+    def test_migration_cli_uses_the_delivery_lock(self):
+        """Migration cannot race a sender between its post and state save."""
+        argv = ["--config", str(self.path), "migrate-destination",
+                "--expected-destination", self.state["destination"]]
+        with patch.object(summary.tomllib, "load", return_value=self.config), \
+             patch.object(summary.socket, "gethostname", return_value="node"), \
+             patch.object(summary.time, "time", return_value=self.due), \
+             patch.object(summary, "slack_webhook_url", return_value=self.webhook + "-monitoring"), \
+             self.path.with_suffix(".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(summary.main(argv), 1)
+            self.assertEqual(json.loads(self.path.read_text()), self.state)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.assertEqual(summary.main(argv), 0)
+        self.assertEqual(json.loads(self.path.read_text())["cursors"], self.state["cursors"])
 
     def test_dry_run_does_not_post_or_advance(self):
         before = self.path.read_text()

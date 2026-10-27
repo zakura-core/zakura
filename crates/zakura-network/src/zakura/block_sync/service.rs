@@ -1,4 +1,7 @@
-use zakura_rt::sync::atomic::{AtomicU64, Ordering};
+use zakura_rt::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use super::{
     config::*, events::*, peer_registry::SessionAdmission, regulated::status_sender::StatusSend,
@@ -10,7 +13,6 @@ use crate::zakura::{
     SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
     ZakuraPeerId, FRAME_HEADER_BYTES,
 };
-use std::time::Instant;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -51,7 +53,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// The block-sync stream layout.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
 }
@@ -183,7 +185,7 @@ impl BlockSyncPeerSession {
             };
             zakura_rt::select! {
                 () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
-                () = zakura_rt::time::sleep_until(retry_at.into()) => {},
+                () = zakura_rt::time::sleep_until(retry_at) => {},
             }
         }
     }
@@ -463,6 +465,7 @@ impl BlockSyncService {
         reserved: bool,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
+            // Block sync still runs on std's clock.
             return SessionDemand::RetryAt(deadline);
         }
 
@@ -906,6 +909,7 @@ impl Service for BlockSyncService {
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
+            "block_sync_pipe",
             peer_id.clone(),
             service_cancel_token.clone(),
             on_teardown,

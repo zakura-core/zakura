@@ -8,7 +8,7 @@ use crate::zakura::{
 };
 use rand_10::Rng;
 use std::num::NonZeroU64;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,7 +104,7 @@ fn synchronize_persisted_body_alarm(
                 (
                     zakura_header_chain::BodyWorkAuthority::for_view(view),
                     view.frontiers.header_best.hash,
-                    retry_deadline_instant(summary.next_probe_at),
+                    retry_deadline_instant(summary.next_probe_at, &BlockSyncClock),
                 )
             })
     });
@@ -240,6 +240,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         initial_body_scope,
         crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
+        Arc::new(BlockSyncClock),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -250,7 +251,7 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
-    spawn_erased(sequencer_task.run());
+    spawn_erased_named("block_sync_sequencer", sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
@@ -336,7 +337,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
-    let task = spawn_erased(reactor.run());
+    let task = spawn_erased_named("block_sync_reactor", reactor.run());
 
     Ok((handle, actions_rx, task))
 }
@@ -475,7 +476,7 @@ impl BlockSyncReactor {
             let status_refresh_at = self.status_refresh_at;
             let status_refresh = async move {
                 match status_refresh_at {
-                    Some(deadline) => time::sleep_until(deadline.into()).await,
+                    Some(deadline) => time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
             };
@@ -598,7 +599,7 @@ impl BlockSyncReactor {
 
     fn needed_query_retry_sleep(&self) -> time::Sleep {
         match self.needed_query_retry_at {
-            Some(deadline) => time::sleep_until(deadline.into()),
+            Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }
@@ -1453,7 +1454,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: previous.started_at,
             attempts: previous.attempts,
@@ -1517,7 +1518,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let now = chrono::Utc::now();
+        let now = utc_now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
             started_at: now,
             attempts: 0,
@@ -2021,10 +2022,6 @@ impl BlockSyncReactor {
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
-        metrics::gauge!("sync.block.budget.reserved_bytes")
-            .set(self.state.budget.reserved() as f64);
-        metrics::gauge!("sync.block.reorder.buffered_bytes")
-            .set(self.last_view.reorder_buffered_bytes as f64);
         metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
             .set(sequencer_input_decoded_attributed_memory_bytes as f64);
         metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")
@@ -2080,7 +2077,7 @@ impl BlockSyncReactor {
         if let Some((frontier, summary)) = current {
             let hash = format!("{:?}", frontier.hash);
             let height = frontier.height.0.to_string();
-            let age_seconds = chrono::Utc::now()
+            let age_seconds = utc_now()
                 .signed_duration_since(summary.started_at)
                 .num_milliseconds()
                 .max(0) as f64
@@ -2260,7 +2257,7 @@ mod refill_target_tests {
                     ServicePeerDirection::Inbound,
                     config,
                     0,
-                    std::time::Instant::now(),
+                    Instant::now(),
                 )
                 .generation();
             registry.upsert_status(

@@ -1,3 +1,4 @@
+pub(super) mod gauge_recorder;
 mod retention;
 
 use std::{
@@ -840,7 +841,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
             ServicePeerDirection::Outbound,
             &wiring.config,
             0,
-            std::time::Instant::now(),
+            Instant::now(),
         )
         .generation();
     wiring.registry.upsert_status(
@@ -4885,6 +4886,7 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
             block2.header.previous_block_hash,
             block2_body,
             200,
+            None,
             peer(0)
         ),
         AcceptOutcome::Buffered {
@@ -4960,6 +4962,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
                 block.header.previous_block_hash,
                 body,
                 100,
+                None,
                 peer(0)
             ),
             AcceptOutcome::Buffered { covered: height }
@@ -5011,6 +5014,7 @@ fn capped_sequencer_with_blocks_1_to_3(
             block.header.previous_block_hash,
             body,
             wire_bytes,
+            None,
             peer(0),
         );
     }
@@ -5257,6 +5261,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -5282,6 +5287,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                     Some(raw_block_payload(block)),
                 ),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5478,6 +5484,7 @@ impl CappedSequencerTask {
             frontiers,
             Some(test_work_scope()),
             crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -5516,6 +5523,7 @@ impl CappedSequencerTask {
                     Some(raw_block_payload(block)),
                 ),
                 wire_bytes,
+                None,
                 peer(1),
                 Instant::now(),
                 self.body_input_bytes.clone(),
@@ -5729,6 +5737,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         frontiers,
         Some(test_work_scope()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -5754,6 +5763,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                     Some(raw_block_payload(block)),
                 ),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5820,6 +5830,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                     Some(raw_block_payload(block)),
                 ),
                 u64::from(block_size(block)),
+                None,
                 peer(1),
                 Instant::now(),
                 body_input_bytes.clone(),
@@ -5994,6 +6005,7 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
             block.header.previous_block_hash,
             body,
             100,
+            None,
             peer(0),
         );
     }
@@ -6445,6 +6457,7 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
             block1.header.previous_block_hash,
             body,
             100,
+            None,
             peer(0)
         ),
         AcceptOutcome::Buffered {

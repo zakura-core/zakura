@@ -3,13 +3,13 @@
 use std::{
     cmp::min,
     io::{self, Cursor, Read, Write},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
-use zakura_rt::collections::HashMap;
+use zakura_rt::{collections::HashMap, time::Instant};
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
 

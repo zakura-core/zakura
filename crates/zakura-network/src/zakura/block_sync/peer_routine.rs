@@ -28,7 +28,7 @@ use zakura_rt::{
         futures::Notified,
         mpsc, watch, CancellationToken, Mutex,
     },
-    time,
+    time::{self, Instant},
 };
 
 use super::events::RoutineToReactor;
@@ -55,7 +55,7 @@ use super::{
 };
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
-use std::{sync::Arc, time::Duration, time::Instant};
+use std::{sync::Arc, time::Duration};
 use zakura_chain::{block, serialization::ZcashSerialize};
 
 #[cfg(test)]
@@ -485,7 +485,7 @@ impl PeerRoutine {
             && self
                 .requester
                 .retirement_deadline(self.config.effective_liveness_timeout())
-                .is_some_and(|deadline| time::Instant::now().into_std() >= deadline)
+                .is_some_and(|deadline| Instant::now() >= deadline)
         {
             self.trace_ending_timeout();
         }
@@ -498,7 +498,7 @@ impl PeerRoutine {
                 while let Ok(frame) = self.recv.try_recv() {
                     self.handle_frame(&mut guard, frame).await?;
                 }
-                return self.handle_stream_failure(time::Instant::now().into_std(), failure);
+                return self.handle_stream_failure(Instant::now(), failure);
             }
         }
         result
@@ -542,7 +542,7 @@ impl PeerRoutine {
 
             // Check before the biased receive arm so incoming traffic cannot
             // keep abandoned authorization alive or postpone request timeouts.
-            let now = time::Instant::now().into_std();
+            let now = Instant::now();
             self.check_request_liveness(now)?;
             if self
                 .window
@@ -571,7 +571,7 @@ impl PeerRoutine {
             if outbound_queue_has_capacity {
                 self.outbound_full_since = None;
             } else if self.outbound_full_since.is_none() {
-                self.outbound_full_since = Some(time::Instant::now().into_std());
+                self.outbound_full_since = Some(Instant::now());
             }
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
@@ -595,7 +595,7 @@ impl PeerRoutine {
                         // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
                         None => return self.handle_stream_failure(
-                            time::Instant::now().into_std(),
+                            Instant::now(),
                             self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
                         ),
                     }
@@ -607,7 +607,7 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout => self.handle_deadlines(time::Instant::now().into_std()).await?,
+                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -695,7 +695,7 @@ impl PeerRoutine {
                 self.registry.defer_incompatible_bodies(
                     self.source,
                     bodies,
-                    time::Instant::now().into_std() + self.config.effective_liveness_timeout(),
+                    Instant::now() + self.config.effective_liveness_timeout(),
                 );
                 return Err(SinkReject::local(
                     "GetBlocks header does not match the next expected header",
@@ -815,7 +815,7 @@ impl PeerRoutine {
     /// servable read for want-work is this routine's own fields.
     fn handle_status(&mut self, status: BlockSyncStatus) {
         self.session.record_received_status(status);
-        let now = time::Instant::now().into_std();
+        let now = Instant::now();
         let range_changed =
             status.servable_high != self.servable_high || status.servable_low != self.servable_low;
         let limits = (
@@ -877,10 +877,7 @@ impl PeerRoutine {
     }
 
     fn flush_pending_status(&mut self) {
-        if !self
-            .inbound_status_meter
-            .is_ready(time::Instant::now().into_std())
-        {
+        if !self.inbound_status_meter.is_ready(Instant::now()) {
             return;
         }
         if let Some(status) = self.pending_status.take() {
@@ -936,7 +933,7 @@ impl PeerRoutine {
     /// its only work re-runs want-work once the bias lifts even if no external event
     /// arrives. Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
-        let now = time::Instant::now().into_std();
+        let now = Instant::now();
         let earliest_deadline = self.window.outstanding.earliest_deadline();
         let liveness_deadline = self.window.block_liveness_deadline;
         let local_retry_avoid = self.retry_avoid.values().min().copied();
@@ -990,7 +987,7 @@ impl PeerRoutine {
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
-        let now = time::Instant::now().into_std();
+        let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
         let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
@@ -1320,7 +1317,7 @@ impl PeerRoutine {
                     break FillStop::Internal;
                 }
             };
-            let queued_at = time::Instant::now().into_std();
+            let queued_at = Instant::now();
             let msg = BlockSyncMessage::GetBlocks {
                 start_height: request.start_height,
                 count: request.count,
@@ -1463,10 +1460,12 @@ impl PeerRoutine {
         [timed, ending].into_iter().flatten().min()
     }
 
+    /// Read the admission inputs and publish the above-floor reservation that
+    /// admission compares with the look-ahead limit.
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
             self.work.reserved_above(view.download_floor);
-        AdmissionSnapshot {
+        let snapshot = AdmissionSnapshot {
             download_floor: view.download_floor,
             verified_block_tip: view.verified_tip,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
@@ -1483,7 +1482,12 @@ impl PeerRoutine {
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),
-        }
+        };
+        // This gauge records an admission input, so it changes only here. This
+        // lossy cast is metrics-only; admission keeps the integer value.
+        metrics::gauge!("sync.block.work.reserved_above_floor_bytes")
+            .set(snapshot.reserved_above_floor_bytes as f64);
+        snapshot
     }
 
     fn request_count_cap(&self) -> usize {
@@ -1532,7 +1536,7 @@ impl PeerRoutine {
     /// immediately re-grab them (the peer-local retry bias). The heights stay
     /// `pending` and contestable by every other peer; only this routine defers.
     fn note_retry_avoid(&mut self, heights: impl IntoIterator<Item = block::Height>) {
-        let until = time::Instant::now().into_std() + RETRY_AVOID_BACKOFF;
+        let until = Instant::now() + RETRY_AVOID_BACKOFF;
         for height in heights {
             self.retry_avoid.insert(height, until);
         }
@@ -1914,7 +1918,7 @@ impl PeerRoutine {
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
-        let request_elapsed = time::Instant::from_std(outstanding.queued_at).elapsed();
+        let request_elapsed = outstanding.queued_at.elapsed();
         let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
         // The body's transactions are not validated against the header here;
@@ -1974,10 +1978,8 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
-        self.window.note_block_progress(
-            time::Instant::now().into_std(),
-            self.config.effective_liveness_timeout(),
-        );
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         self.window
             .outstanding
             .record_body_bytes(key, serialized_bytes);
@@ -1998,7 +2000,7 @@ impl PeerRoutine {
             // and the per-ack delivery rate (BtlBw) for this request's block count and
             // delivered bytes.
             self.window.record_delivery(
-                time::Instant::now().into_std(),
+                Instant::now(),
                 request_elapsed,
                 request_range_count,
                 outstanding.delivered_bytes,
@@ -2028,6 +2030,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            Some(estimated_bytes),
             body_permit,
         )
         .await;
@@ -2047,9 +2050,10 @@ impl PeerRoutine {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         serialized_bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
-        let received_at = time::Instant::now().into_std();
+        let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
         let body = SequencedBody::new_queued(
             owner,
@@ -2059,6 +2063,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            admitted_estimate_bytes,
             self.peer.clone(),
             received_at,
             self.sequencer_input_bytes.clone(),
@@ -2132,7 +2137,12 @@ impl PeerRoutine {
 
         // The reservation this arrival ended (an active competing request, or a
         // stale charge on the claimed height); released after the forward below.
-        let ended_reservation = if is_pending {
+        // A pending height's body is admitted on its wire size, so it carries no
+        // request estimate. A body that answers a competing request carries that
+        // request's per-height charge, read by the same owner-checked release
+        // that ends it; the released total can also hold the bytes of a retired
+        // unsent request.
+        let (ended_reservation, admitted_estimate_bytes) = if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
             if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
@@ -2151,17 +2161,17 @@ impl PeerRoutine {
             // stale request reservation the height still owned is released below.
             let _ = self.work.take_in_range(height, height, 1);
             metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            self.work.claim_received_for_owner(owner, height)
+            (self.work.claim_received_for_owner(owner, height), None)
         } else {
             // First-completion-wins for a timed-out height already re-issued to
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
+            let Some(ended) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            estimate
+            (ended.released, Some(ended.charge))
         };
 
         let decoded_attributed_memory_size_bytes =
@@ -2182,10 +2192,8 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        self.window.note_block_progress(
-            time::Instant::now().into_std(),
-            self.config.effective_liveness_timeout(),
-        );
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         // Also credit the reliability EWMA: this late body offsets the failure its own
         // timeout charged, so a peer that merely slowed down (backlog draining past the
         // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
@@ -2206,6 +2214,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            admitted_estimate_bytes,
             body_permit,
         )
         .await;
@@ -2240,7 +2249,7 @@ impl PeerRoutine {
                 self.trace_range_unavailable(
                     start_height,
                     outstanding.request.count,
-                    elapsed_ms_u64(time::Instant::from_std(outstanding.queued_at).elapsed()),
+                    elapsed_ms_u64(outstanding.queued_at.elapsed()),
                 );
                 Disposition::RetryOriginal
             }
@@ -2380,10 +2389,8 @@ impl PeerRoutine {
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, key: RequestKey, height: block::Height) {
-        self.window.note_block_progress(
-            time::Instant::now().into_std(),
-            self.config.effective_liveness_timeout(),
-        );
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         self.window.outstanding.mark_received(key, height);
         let Some(outstanding) = self.window.outstanding.get(key) else {
             return;
@@ -2498,7 +2505,7 @@ impl PeerRoutine {
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
                 // floor-preference comparison.
-                bbr_rtprop_ms: self.window.bbr_rtprop_ms(time::Instant::now().into_std()),
+                bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
             },
         );
     }
@@ -2591,14 +2598,16 @@ impl Drop for PeerRoutine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
+    use zakura_rt::time::Instant;
 
     use super::super::config::MAX_BS_INFLIGHT_REQUESTS;
     use super::super::peer_registry::PeerRegistry;
@@ -2612,6 +2621,7 @@ mod tests {
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::tests::genesis_frontiers;
     use super::super::work_queue::WorkQueue;
+    use super::super::work_queue::{RequestWritePhase, WorkItemPlace};
     use super::super::{
         BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig,
     };
@@ -2834,7 +2844,7 @@ mod tests {
         // Consume the initial heartbeat before publishing the two finite scores.
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(futures::poll!(running.as_mut()).is_pending());
-        let before_refill = tokio::time::Instant::now();
+        let before_refill = Instant::now();
         let slots = SlotDiagnostics {
             available_slots: 3,
             bbr_rtprop_ms: Some(75),
@@ -2893,7 +2903,7 @@ mod tests {
         ));
         assert!(work.in_flight_contains(block::Height(1)));
         assert!(!work.pending_contains(block::Height(1)));
-        assert_eq!(tokio::time::Instant::now(), before_refill);
+        assert_eq!(Instant::now(), before_refill);
 
         cancel.cancel();
         assert!(timeout(Duration::from_secs(1), running)
@@ -3447,6 +3457,160 @@ mod tests {
             !work.pending_contains(block::Height(1)),
             "the floor height was taken, not returned",
         );
+    }
+
+    /// A routine for peer `[id; 32]` that shares `budget`, `work` and `registry`
+    /// and reads the download floor from `view`. It has received a `Status`
+    /// that makes heights 1 to 10 servable.
+    fn shared_floor_routine(
+        id: u8,
+        budget: &ByteBudget,
+        work: &Arc<WorkQueue>,
+        registry: &Arc<PeerRegistry>,
+        view: watch::Receiver<super::super::sequencer_task::SequencerView>,
+    ) -> (PeerRoutine, crate::zakura::FramedRecv) {
+        let config = ZakuraBlockSyncConfig::default();
+        let cancel = CancellationToken::new();
+        let (out_send, out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![id; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let generation = registry
+            .admit_session(
+                &peer,
+                session.direction(),
+                &config,
+                u64::from(id),
+                Instant::now(),
+            )
+            .generation();
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
+        let mut routine = PeerRoutine::new(
+            peer,
+            u64::from(id),
+            session,
+            in_recv,
+            requester,
+            serving,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            Arc::clone(work),
+            Arc::clone(registry),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+        (routine, out_recv)
+    }
+
+    /// Each outstanding height, read from the routine's request handles, from
+    /// the registry's published claims, and from the work queue's items. All
+    /// three name the same owner and the estimate reserved at admission, and
+    /// those estimates are the budget's only charges. Dropping the routine
+    /// empties all three owners and returns the budget to zero.
+    #[tokio::test]
+    async fn request_owners_agree_across_routine_registry_and_queue() {
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.extend(
+            super::super::test_work_scope(),
+            (1u8..=4).map(|height| {
+                (
+                    block::Height(u32::from(height)),
+                    block::Hash([height; 32]),
+                    BlockSizeEstimate::Advertised(1_000 * u32::from(height)),
+                )
+            }),
+        );
+        let registry = Arc::new(PeerRegistry::new());
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (mut routine, mut out_recv) =
+            shared_floor_routine(7, &budget, &work, &registry, view_rx);
+        let _ = routine.try_fill().await;
+
+        let requests = routine.window.outstanding.ownership();
+        assert!(!requests.is_empty(), "the routine issued a request");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.write == RequestWritePhase::Queued),
+            "transport hasn't taken the frames: {requests:?}"
+        );
+        let from_requests: BTreeMap<_, _> = requests
+            .iter()
+            .flat_map(|request| {
+                request.heights.iter().map(move |requested| {
+                    assert!(!requested.received);
+                    (requested.height, (request.owner, requested.estimated_bytes))
+                })
+            })
+            .collect();
+        let from_registry: BTreeMap<_, _> = registry
+            .outstanding_snapshot(&routine.peer)
+            .into_iter()
+            .map(|(height, meta)| (height, (meta.owner, meta.estimated_bytes)))
+            .collect();
+        let from_queue: BTreeMap<_, _> = work
+            .ownership_snapshot()
+            .into_iter()
+            .filter(|item| item.place == WorkItemPlace::InFlight)
+            .map(|item| {
+                assert_eq!(item.reserved_bytes, item.estimated_bytes);
+                (
+                    item.height,
+                    (
+                        item.owner.expect("an in-flight item has an owner"),
+                        item.estimated_bytes,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(from_requests, from_registry);
+        assert_eq!(from_requests, from_queue);
+        assert_eq!(
+            budget.reserved(),
+            from_requests
+                .values()
+                .map(|(_, estimate)| estimate)
+                .sum::<u64>()
+        );
+
+        // The in-memory transport writes every frame it takes, so each
+        // handle records a completed write.
+        while let Ok(Some(_)) = timeout(Duration::from_millis(1), out_recv.recv()).await {}
+        assert!(routine
+            .window
+            .outstanding
+            .ownership()
+            .iter()
+            .all(|request| request.write == RequestWritePhase::Written));
+
+        let peer = routine.peer.clone();
+        drop(routine);
+        assert!(registry.outstanding_snapshot(&peer).is_empty());
+        assert!(work
+            .ownership_snapshot()
+            .iter()
+            .all(|item| item.place == WorkItemPlace::Pending && item.reserved_bytes == 0));
+        assert_eq!(budget.reserved(), 0);
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

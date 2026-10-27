@@ -2,13 +2,9 @@
 //! `quinn_proto::Endpoint`.
 
 use std::{
-    collections::HashMap,
     io,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -16,9 +12,13 @@ use bytes::BytesMut;
 use quinn_proto::{
     ConnectionEvent, ConnectionHandle, DatagramEvent, EndpointEvent, Incoming, Transmit,
 };
-use tokio::{
-    sync::{mpsc, oneshot, watch},
-    task::JoinSet,
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, oneshot, watch,
+    },
+    task::{JoinSet, JoinSetExt},
 };
 
 use super::{
@@ -33,7 +33,7 @@ use crate::{
         decide, inbound_handshake, Acceptor, Admit, ConnectionSlot, IncomingInfo, Shared,
         SocketSlot,
     },
-    socket::{bind_udp, SocketCell, UdpIo, RECV_BUFFER_BYTES},
+    socket::{SocketCell, SocketFactory, UdpIo, RECV_BUFFER_BYTES},
     sys::canonical_addr,
 };
 
@@ -88,9 +88,11 @@ struct RecvCounters {
     oversize_drops: u64,
 }
 
-pub(crate) struct EndpointTask {
+pub(crate) struct EndpointTask<F: SocketFactory> {
     endpoint: quinn_proto::Endpoint,
-    socket: Arc<SocketCell>,
+    /// Builds the SOCK-9 replacement socket.
+    factory: Arc<F>,
+    socket: Arc<SocketCell<F::Socket>>,
     slot: Arc<SocketSlot>,
     shared: Arc<Shared>,
     cmds: mpsc::UnboundedReceiver<EndpointCmd>,
@@ -113,30 +115,29 @@ pub(crate) struct EndpointTask {
     queued_total: Arc<AtomicUsize>,
 }
 
-impl Drop for EndpointTask {
+impl<F: SocketFactory> Drop for EndpointTask<F> {
     /// Releases the socket even when `shutdown` aborts the task (API-7).
     fn drop(&mut self) {
         self.socket.close();
     }
 }
 
-impl EndpointTask {
+impl<F: SocketFactory> EndpointTask<F> {
+    /// A task for the socket `io`, which `factory` bound at `slot.local_addr`.
     pub(crate) fn new(
         shared: Arc<Shared>,
         slot: Arc<SocketSlot>,
-        io: UdpIo,
+        factory: Arc<F>,
+        io: F::Socket,
         cmds: mpsc::UnboundedReceiver<EndpointCmd>,
     ) -> Self {
         let allow_mtud = io.mtud_allowed();
-        let endpoint = quinn_proto::Endpoint::new(
-            Arc::new(shared.config.endpoint_config()),
-            None,
-            allow_mtud,
-            None,
-        );
+        let endpoint =
+            quinn_proto::Endpoint::new(Arc::new(shared.endpoint_config()), None, allow_mtud, None);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             endpoint,
+            factory,
             socket: Arc::new(SocketCell::new(io)),
             slot,
             shared,
@@ -161,9 +162,9 @@ impl EndpointTask {
     }
 
     pub(crate) async fn run(mut self) {
-        let mut flush = tokio::time::interval(FLUSH_INTERVAL);
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut deadline = Box::pin(tokio::time::sleep(Duration::ZERO));
+        let mut flush = zakura_rt::time::interval(FLUSH_INTERVAL);
+        flush.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Delay);
+        let mut deadline = Box::pin(zakura_rt::time::sleep(Duration::ZERO));
         loop {
             if self.close_deadline.is_some() && self.conns.is_empty() {
                 break;
@@ -175,9 +176,11 @@ impl EndpointTask {
             };
             let more_to_recv = self.more_to_recv;
             if let Some(at) = self.close_deadline {
-                deadline.as_mut().reset(tokio::time::Instant::from_std(at));
+                deadline
+                    .as_mut()
+                    .reset(zakura_rt::time::Instant::from_std(at));
             }
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 Some((handle, event)) = self.events_rx.recv() => {
                     self.on_endpoint_event(handle, event);
@@ -209,7 +212,7 @@ impl EndpointTask {
                 }
                 // Yield to the runtime between receive batches, so a busy
                 // socket can't hold this worker thread.
-                () = tokio::task::yield_now(), if io.is_some() && more_to_recv => {
+                () = zakura_rt::task::yield_now(), if io.is_some() && more_to_recv => {
                     self.receive(io).await;
                 }
             }
@@ -296,24 +299,27 @@ impl EndpointTask {
             send_window: config.send_window_bytes,
             max_bidi_streams: u64::from(self.shared.max_bidi_streams),
         };
-        tokio::spawn(connection::run(ConnTaskParams {
-            handle,
-            conn,
-            shared: shared.clone(),
-            cmds,
-            datagrams,
-            control,
-            to_endpoint: self.events_tx.clone(),
-            socket: self.socket.clone(),
-            closing: self.closing.subscribe(),
-            network: self.shared.network.subscribe(),
-            probe,
-            hooks: self.shared.hooks.clone(),
-            admitted: canonical_addr(admitted),
-            handshake: handshake_tx,
-            limits,
-            slot,
-        }));
+        zakura_rt::task::spawn_named(
+            "quic.connection",
+            connection::run(ConnTaskParams {
+                handle,
+                conn,
+                shared: shared.clone(),
+                cmds,
+                datagrams,
+                control,
+                to_endpoint: self.events_tx.clone(),
+                socket: self.socket.clone(),
+                closing: self.closing.subscribe(),
+                network: self.shared.network.subscribe(),
+                probe,
+                hooks: self.shared.hooks.clone(),
+                admitted: canonical_addr(admitted),
+                handshake: handshake_tx,
+                limits,
+                slot,
+            }),
+        );
         Connecting {
             conn: ConnRef {
                 cmds: cmds_tx,
@@ -343,7 +349,7 @@ impl EndpointTask {
     }
 
     /// Reads until the socket is empty or the per-wakeup budget runs out.
-    async fn receive(&mut self, io: Option<Arc<crate::socket::UdpIo>>) {
+    async fn receive(&mut self, io: Option<Arc<F::Socket>>) {
         let Some(io) = io else {
             return;
         };
@@ -393,7 +399,7 @@ impl EndpointTask {
         dst_ip: Option<std::net::IpAddr>,
         stride: usize,
         data: &[u8],
-        io: &UdpIo,
+        io: &F::Socket,
     ) {
         let now = now();
         // The advertised limit fits in a u16, so the cast can't truncate.
@@ -443,7 +449,7 @@ impl EndpointTask {
         }
     }
 
-    fn send_response(&self, transmit: &Transmit, io: &UdpIo) {
+    fn send_response(&self, transmit: &Transmit, io: &F::Socket) {
         // A stateless response that can't go out now is dropped; the peer
         // retries.
         if let Err(error) = io.try_send(transmit, &self.response_buf[..transmit.size]) {
@@ -455,7 +461,7 @@ impl EndpointTask {
     }
 
     /// Admission (SPEC §7): decide before any handshake work (ADM-2).
-    fn on_incoming(&mut self, incoming: Incoming, io: &UdpIo) {
+    fn on_incoming(&mut self, incoming: Incoming, io: &F::Socket) {
         let Some((server, acceptor)) = self
             .serve
             .as_ref()
@@ -501,12 +507,15 @@ impl EndpointTask {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         let connecting =
                             self.spawn_connection(handle, conn, probe, raw_remote, slot);
-                        self.tasks.spawn(inbound_handshake(
-                            connecting,
-                            self.shared.config.handshake_timeout(),
-                            pending,
-                            acceptor,
-                        ));
+                        self.tasks.spawn_named(
+                            "quic.inbound_handshake",
+                            inbound_handshake(
+                                connecting,
+                                self.shared.config.handshake_timeout(),
+                                pending,
+                                acceptor,
+                            ),
+                        );
                     }
                     Err(error) => {
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);
@@ -547,32 +556,31 @@ impl EndpointTask {
     async fn on_socket_error(&mut self, error: io::Error) {
         let local_addr = self.slot.local_addr;
         tracing::warn!(target: "zakura_quic", %local_addr, %error, "UDP socket failed; rebinding");
+        // The driver's clock, not `Instant::now`, so a simulation's virtual
+        // time decides the window too.
         if self
             .last_rebind
-            .is_some_and(|at| at.elapsed() < REBIND_WINDOW)
+            .is_some_and(|at| now().saturating_duration_since(at) < REBIND_WINDOW)
         {
             tracing::error!(target: "zakura_quic", %local_addr, %error, "UDP socket failed twice within 60 s; stopping the endpoint");
             self.stop_socket();
             return;
         }
-        let config = &self.shared.config;
+        let factory = &self.factory;
         let slot = &self.slot;
         let rebound = self
             .socket
             .replace(|| {
-                let bound = bind_udp(
-                    local_addr,
-                    config.recv_buffer_bytes as usize,
-                    config.send_buffer_bytes as usize,
-                )?;
+                let bound = factory.bind(local_addr)?;
                 slot.inode
                     .store(bound.inode.unwrap_or(0), Ordering::Relaxed);
-                UdpIo::new(bound.socket, config.gso)
+                Ok(bound.io)
             })
             .await;
         match rebound {
             Ok(()) => {
-                self.last_rebind = Some(Instant::now());
+                // The window starts once the replacement is in place.
+                self.last_rebind = Some(now());
                 self.slot.rebinds.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("zakura.quic.socket.rebinds").increment(1);
             }
@@ -629,4 +637,71 @@ pub(crate) fn split_segments(
 ) -> impl Iterator<Item = Option<BytesMut>> + '_ {
     data.chunks(stride.max(1))
         .map(move |segment| (segment.len() <= max_len).then(|| BytesMut::from(segment)))
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_rt::sync::{
+        atomic::{AtomicBool, AtomicU64},
+        counter,
+    };
+
+    use super::*;
+    use crate::{
+        endpoint::{ConnectionSlots, PendingTable},
+        sim::{LinkModel, SimNet},
+        socket::SocketBuffers,
+        tls::TlsConfig,
+        NodeSecretKey, QuicConfig,
+    };
+
+    /// SOCK-9: the window starts once the replacement is installed, so time
+    /// spent waiting for the old socket's last user doesn't shorten it.
+    #[tokio::test(start_paused = true)]
+    async fn the_rebind_window_starts_when_the_replacement_is_installed() {
+        let secret = NodeSecretKey::generate();
+        let shared = Arc::new(Shared {
+            id: secret.public(),
+            config: QuicConfig::default(),
+            max_bidi_streams: 16,
+            tls: TlsConfig::new(&secret),
+            pending: PendingTable::default(),
+            connections: ConnectionSlots::new(16, 0, 16),
+            hooks: Arc::default(),
+            shutdown: watch::Sender::new(false),
+            network: watch::Sender::new(0),
+            network_changes: counter::AtomicU64::new(0),
+            inputs: crate::EndpointInputs::default(),
+        });
+        let addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let slot = Arc::new(SocketSlot {
+            local_addr: addr,
+            buffers: SocketBuffers::default(),
+            gso: false,
+            rebinds: counter::AtomicU64::new(0),
+            inode: AtomicU64::new(0),
+            recv_calls: counter::AtomicU64::new(0),
+            datagrams_received: counter::AtomicU64::new(0),
+            queue_drops: counter::AtomicU64::new(0),
+            oversize_drops: counter::AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        });
+        let net = SimNet::new(LinkModel::default());
+        let io = net.bind(addr).unwrap();
+        let (_cmds, cmds_rx) = mpsc::unbounded_channel();
+        let mut task = EndpointTask::new(shared, slot, Arc::new(net), io, cmds_rx);
+
+        // An in-flight user holds the old socket for 500 ms.
+        let held = task.socket.get().unwrap();
+        let started = now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        });
+        task.on_socket_error(io::Error::other("injected")).await;
+
+        assert_eq!(task.slot.rebinds.load(Ordering::Relaxed), 1);
+        let rebound_at = task.last_rebind.expect("the rebind succeeded");
+        assert!(rebound_at >= started + Duration::from_millis(500));
+    }
 }

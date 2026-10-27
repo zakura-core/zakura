@@ -42,7 +42,7 @@ use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, Port, PortError, ReadPath, ReadPathReply, RetainedHeaderPath,
     RetainedHeaderPathPage, SelectedChainMembership, ServingCapacitySignal,
 };
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_rt::{
     sync::{mpsc, watch, CancellationToken, Mutex, MutexGuard, Notify, PoisonError},
     task::JoinHandle,
@@ -227,20 +227,23 @@ impl Publisher {
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);
-        let task = spawn_erased(publish::<HEADER_BYTES>(
-            Task {
-                shared: shared.clone(),
-                wake: wake.clone(),
-                port,
-                push,
-                owner,
-                limits,
-                panics,
-            },
-            send,
-            panicked,
-            cancel,
-        ));
+        let task = spawn_erased_named(
+            "header_sync_publisher",
+            publish::<HEADER_BYTES>(
+                Task {
+                    shared: shared.clone(),
+                    wake: wake.clone(),
+                    port,
+                    push,
+                    owner,
+                    limits,
+                    panics,
+                },
+                send,
+                panicked,
+                cancel,
+            ),
+        );
         (
             Self {
                 shared,
@@ -769,6 +772,10 @@ enum Admission {
 }
 
 /// How a page in progress finished.
+// The simulator build's sync wrappers make `PushSend` about 376 bytes, past
+// clippy's threshold. One `Progress` is returned per page, so boxing the send
+// would only add an allocation per page in production.
+#[cfg_attr(zakura_sim, allow(clippy::large_enum_variant))]
 enum Progress<'a> {
     Page(Page, PushSend<'a>),
     Other(Output),
@@ -941,7 +948,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         } else {
             Admission::Page(push.acquire(bytes).await)
         };
-        let running = zakura_rt::task::spawn(async move {
+        let running = zakura_rt::task::spawn_named("header_sync_page_job", async move {
             let job = AssertUnwindSafe(run_job::<HEADER_BYTES>(&*port, owner, &job));
             match job.catch_unwind().await {
                 Ok(output) => Some((output, permit)),

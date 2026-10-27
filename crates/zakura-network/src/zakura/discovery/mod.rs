@@ -10,6 +10,8 @@ mod redial;
 mod requester;
 mod runtime;
 mod service;
+#[cfg(zakura_sim)]
+pub(crate) use service::discovery_streams;
 mod serving;
 mod trace;
 pub(crate) mod wire;

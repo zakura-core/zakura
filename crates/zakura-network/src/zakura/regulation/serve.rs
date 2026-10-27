@@ -467,7 +467,7 @@ impl<P: Produce> Serve<P> {
     }
 
     /// Open requests on this session.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(crate) fn open(&self) -> u32 {
         self.commitments.open.load(Ordering::Acquire)
     }
@@ -486,6 +486,7 @@ impl ServingTasks {
     /// Spawn a task that runs once per serving session, boxed like other per-session tasks.
     fn spawn_session(&self, task: impl Future<Output = ()> + Send + 'static) {
         crate::zakura::transport::spawn_supervised_peer_task(
+            "serve_session",
             self.peer.clone(),
             || {},
             self.on_panic(),
@@ -497,6 +498,7 @@ impl ServingTasks {
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         // Dispatch spawns one task per served request, so keep it unboxed.
         crate::zakura::transport::spawn_supervised_peer_task_unboxed(
+            "serve_request",
             self.peer.clone(),
             || {},
             self.on_panic(),

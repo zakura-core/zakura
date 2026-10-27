@@ -713,3 +713,138 @@ async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
         assert_eq!(f.budget.reserved(), 0);
     }
 }
+
+/// Both budget-ledger gauges equal sums over the work queue's owners after
+/// each charge, transfer, and release path. No check calls a publication
+/// helper, so each gauge must follow its ledger on its own.
+#[test]
+fn budget_ledger_gauges_follow_work_owners() {
+    use crate::zakura::block_sync::{
+        tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace,
+    };
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mut f = Fixture::new();
+    // Returns the work and budget gauges after checking them against the owners.
+    let check = |f: &Fixture, label: &str| {
+        let owners = f.work.ownership_snapshot();
+        let reserved: u64 = owners.iter().map(|item| item.reserved_bytes).sum();
+        let provisional: u64 = owners
+            .iter()
+            .filter(|item| item.place == WorkItemPlace::Provisional)
+            .map(|item| item.estimated_bytes)
+            .sum();
+        let work_gauge = recorder.bytes("sync.block.work.reserved_bytes");
+        let budget_gauge = recorder.bytes("sync.block.budget.reserved_bytes");
+        assert_eq!(work_gauge, reserved, "work gauge after {label}");
+        assert_eq!(
+            budget_gauge,
+            reserved + provisional,
+            "budget gauge after {label}"
+        );
+        for floor in [block::Height(0), block::Height(1)] {
+            let above: u64 = owners
+                .iter()
+                .filter(|item| item.place == WorkItemPlace::InFlight && item.height > floor)
+                .map(|item| item.reserved_bytes)
+                .sum();
+            assert_eq!(
+                f.work.reserved_above(floor).0,
+                above,
+                "reservations above {floor:?} after {label}"
+            );
+        }
+        (work_gauge, budget_gauge)
+    };
+
+    assert_eq!(check(&f, "start"), (0, 0));
+
+    // The budget funds a provisional take before the queue charges it.
+    let claim = f.take(1);
+    assert_eq!(check(&f, "provisional take"), (0, 200));
+    drop(claim);
+    assert_eq!(check(&f, "unpublished drop"), (0, 0));
+
+    let claim = f.take(2);
+    assert!(claim.publish(|| {}));
+    assert_eq!(check(&f, "publication"), (200, 200));
+    f.budget.release(
+        f.work
+            .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+            .unwrap(),
+    );
+    assert!(check(&f, "receipt").0 < 200);
+    f.reset();
+    drop(claim);
+    assert_eq!(check(&f, "reset after receipt"), (0, 0));
+
+    f.refill();
+    let claim = f.take(3);
+    assert!(claim.publish(|| {}));
+    f.expire(claim.owner());
+    assert_eq!(check(&f, "timeout"), (0, 0));
+    drop(claim);
+    assert_eq!(check(&f, "drop after timeout"), (0, 0));
+
+    let claim = f.take(4);
+    assert!(claim.publish(|| {}));
+    f.reset();
+    assert_eq!(check(&f, "reset"), (0, 0));
+    drop(claim);
+
+    f.refill();
+    let claim = f.take(5);
+    assert!(claim.publish(|| {}));
+    assert_eq!(check(&f, "last publication"), (200, 200));
+    drop(claim);
+    assert_eq!(check(&f, "published drop"), (0, 0));
+}
+
+/// Review P5a-2: a body that answers a competing request carries the charge
+/// of the request its release settles. Another routine can retire the old
+/// request and publish a replacement with a new estimate between a separate
+/// charge read and the release, so the charge comes from the release.
+#[test]
+fn answered_elsewhere_returns_the_settled_requests_charge() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let work = Arc::new(WorkQueue::new(block::Height(0)));
+    work.extend(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(2_000))],
+    );
+    let mut budget = ByteBudget::new(10_000);
+    let cancel = CancellationToken::new();
+    let take = |id, budget: &mut ByteBudget, bytes| {
+        let items =
+            work.take_for_request(height, height, 1, 10_000, 7, NonZeroU64::new(id).unwrap());
+        assert_eq!(items.len(), 1);
+        assert!(budget.try_reserve(bytes));
+        let claim = RequestWrite::new(
+            items[0].1.owner.unwrap(),
+            items,
+            work.clone(),
+            budget.clone(),
+            cancel.clone(),
+        );
+        assert!(claim.publish(|| {}));
+        claim
+    };
+    let old = take(1, &mut budget, 2_000);
+    assert_eq!(work.reserved_in_flight_charge(height), Some(2_000));
+    let retired = work.release_reserved_and_return_items_detailed_for_owner(old.owner(), [height]);
+    budget.release(retired.released_bytes);
+    work.refresh_size_estimates(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(1_500))],
+    );
+    let replacement = take(2, &mut budget, 1_500);
+
+    let ended = work
+        .release_answered_elsewhere(replacement.owner(), height)
+        .expect("the replacement owns the reserved height");
+    budget.release(ended.released);
+    assert_eq!(ended.charge, 1_500);
+    assert_eq!(budget.reserved(), 0);
+}

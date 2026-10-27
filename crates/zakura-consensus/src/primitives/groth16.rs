@@ -1,6 +1,7 @@
 //! Async Groth16 verifier service for Sprout JoinSplit proofs
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use bellman::{
     gadgets::multipack,
@@ -9,7 +10,6 @@ use bellman::{
 };
 use bls12_381::Bls12;
 use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
 
 use tokio::sync::watch;
 use tower::util::ServiceFn;
@@ -77,9 +77,9 @@ pub type ItemVerifyingKey = PreparedVerifyingKey<Bls12>;
 /// Note that making a `Service` call requires mutable access to the service, so
 /// you should call `.clone()` on the global handle to create a local, mutable
 /// handle.
-pub static JOINSPLIT_VERIFIER: Lazy<
+pub static JOINSPLIT_VERIFIER: LazyLock<
     ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), BoxedError>>>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     // We just need a Service to use: there is no batch verification for JoinSplits.
     //
     // See the note on [`SPEND_VERIFIER`] for details.

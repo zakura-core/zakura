@@ -37,6 +37,10 @@ pub(super) struct ApplyingBlock {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate the body's request reserved at admission, carried from
+    /// the reorder buffer. `None` for a body admitted on its wire size.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the owner snapshot tests
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) submitted: bool,
     /// The peer that delivered this body, used to attribute an apply rejection
     /// for misbehavior scoring.
@@ -84,6 +88,32 @@ struct InFlightSubmission {
     decoded_attributed_memory_bytes: u64,
     /// The block left `applying`, but the driver can still retain its decoded `Arc<Block>`.
     detached: bool,
+}
+
+/// The bodies the sequencer holds, read from its maps rather than from its
+/// running totals.
+///
+/// An attached submission and its `applying` entry share one body, so the two
+/// lists can name the same wire bytes. Sum each list on its own.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SequencerOwnership {
+    /// Each reorder-buffer body.
+    pub(super) reorder: Vec<RetainedBody>,
+    /// Each `applying` body.
+    pub(super) applying: Vec<RetainedBody>,
+    /// Each decoded submission the driver can still retain.
+    pub(super) submissions: Vec<SubmissionOwnership>,
+}
+
+/// One decoded submission and its wire bytes.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct SubmissionOwnership {
+    pub(super) height: block::Height,
+    pub(super) bytes: u64,
+    /// The body left `applying` while the driver can still retain it.
+    pub(super) detached: bool,
 }
 
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
@@ -228,6 +258,13 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
+    /// Update the applying-byte total and its gauge together.
+    fn set_applying_buffered_bytes(&mut self, bytes: u64) {
+        self.applying_buffered_bytes = bytes;
+        // This lossy cast is metrics-only; the sequencer keeps the integer value.
+        metrics::gauge!("sync.block.applying.buffered_bytes").set(bytes as f64);
+    }
+
     pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
         self.applying_decoded_attributed_memory_bytes
             .saturating_add(self.detached_submission_decoded_attributed_memory_bytes)
@@ -295,6 +332,13 @@ impl Sequencer {
         self.in_flight_submission_bytes
     }
 
+    /// Update the in-flight submission total and its gauge together.
+    fn set_in_flight_submission_bytes(&mut self, bytes: u64) {
+        self.in_flight_submission_bytes = bytes;
+        // This lossy cast is metrics-only; the sequencer keeps the integer value.
+        metrics::gauge!("sync.block.submission.in_flight_bytes").set(bytes as f64);
+    }
+
     /// Number of decoded submissions the driver can still retain.
     pub(super) fn in_flight_submission_count(&self) -> usize {
         self.in_flight_submission_count
@@ -312,6 +356,34 @@ impl Sequencer {
             .values()
             .map(|submission| submission.bytes)
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Every body held in `applying` or by an in-flight submission.
+    #[cfg(test)]
+    pub(super) fn ownership_snapshot(&self) -> SequencerOwnership {
+        SequencerOwnership {
+            reorder: self.reorder.ownership(),
+            applying: self
+                .applying
+                .iter()
+                .map(|(height, applying)| RetainedBody {
+                    height: *height,
+                    owner: applying.owner,
+                    bytes: applying.bytes,
+                    admitted_estimate_bytes: applying.admitted_estimate_bytes,
+                    allocation: applying.body.allocation(),
+                })
+                .collect(),
+            submissions: self
+                .in_flight_submissions
+                .values()
+                .map(|submission| SubmissionOwnership {
+                    height: submission.height,
+                    bytes: submission.bytes,
+                    detached: submission.detached,
+                })
+                .collect(),
+        }
     }
 
     #[cfg(test)]
@@ -391,6 +463,7 @@ impl Sequencer {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             bytes,
+            None,
             source_peer,
         )
     }
@@ -413,6 +486,7 @@ impl Sequencer {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
         if self.already_retains(height, hash) {
@@ -439,6 +513,7 @@ impl Sequencer {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             source_peer,
         ) {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
@@ -497,13 +572,15 @@ impl Sequencer {
                     previous_block_hash: drained.previous_block_hash,
                     body,
                     bytes: drained.bytes,
+                    admitted_estimate_bytes: drained.admitted_estimate_bytes,
                     submitted: false,
                     source_peer: drained.source_peer,
                 },
             );
             // New bodies enter `applying` unsubmitted, so only the total grows.
-            self.applying_buffered_bytes =
-                self.applying_buffered_bytes.saturating_add(drained.bytes);
+            self.set_applying_buffered_bytes(
+                self.applying_buffered_bytes.saturating_add(drained.bytes),
+            );
             self.applying_decoded_attributed_memory_bytes = self
                 .applying_decoded_attributed_memory_bytes
                 .saturating_add(decoded_attributed_memory_size_bytes);
@@ -664,7 +741,7 @@ impl Sequencer {
             },
         );
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_add(1);
-        self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_add(bytes);
+        self.set_in_flight_submission_bytes(self.in_flight_submission_bytes.saturating_add(bytes));
         Some(SubmitItem {
             owner,
             source,
@@ -791,7 +868,7 @@ impl Sequencer {
         let detached = submission.detached;
         self.in_flight_submissions.remove(&token);
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
-        self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+        self.set_in_flight_submission_bytes(self.in_flight_submission_bytes.saturating_sub(bytes));
         if detached {
             self.detached_submission_decoded_attributed_memory_bytes = self
                 .detached_submission_decoded_attributed_memory_bytes
@@ -856,7 +933,9 @@ impl Sequencer {
                 .remove(&token)
                 .expect("submission exists because it matched above");
             self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
-            self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+            self.set_in_flight_submission_bytes(
+                self.in_flight_submission_bytes.saturating_sub(bytes),
+            );
             if submission.detached {
                 self.detached_submission_decoded_attributed_memory_bytes = self
                     .detached_submission_decoded_attributed_memory_bytes
@@ -912,7 +991,9 @@ impl Sequencer {
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
         let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
-        self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
+        self.set_applying_buffered_bytes(
+            self.applying_buffered_bytes.saturating_sub(removed.bytes),
+        );
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
             .saturating_sub(decoded_attributed_memory_bytes);
@@ -1041,7 +1122,7 @@ impl Sequencer {
             self.submitted_applies.clear();
         }
         self.applying.clear();
-        self.applying_buffered_bytes = 0;
+        self.set_applying_buffered_bytes(0);
         self.applying_decoded_attributed_memory_bytes = 0;
         self.attached_submission_count = 0;
         released

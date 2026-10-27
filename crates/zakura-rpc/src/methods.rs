@@ -2615,28 +2615,34 @@ where
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
+        let response = match self
+            .read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
+                return Err("block height not in best chain").map_error(
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    if hash_or_height.hash().is_some() {
+                        server::error::LegacyCode::InvalidAddressOrKey
+                    } else {
+                        server::error::LegacyCode::InvalidParameter
+                    },
+                );
+            }
+            Err(error) => return Err(error).map_misc_error(),
+        };
         let zakura_state::ReadResponse::BlockHeader {
             header,
             hash,
             height,
             next_block_hash,
-        } = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
-            .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
-                } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+        } = response
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -3043,39 +3049,37 @@ where
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-        // Fetch the block referenced by [`hash_or_height`] from the state.
+        // Get the header of the block that [`hash_or_height`] identifies from the state.
         //
         // # Concurrency
         //
         // For consistency, this lookup must be performed first, then all the other lookups must
         // be based on the hash.
-        //
-        // TODO: If this RPC is called a lot, just get the block header, rather than the whole block.
-        let block = match call_service(
-            &mut read_state,
-            zakura_state::ReadRequest::Block(hash_or_height),
-        )
-        .await?
+        let response = match read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
         {
-            zakura_state::ReadResponse::Block(Some(block)) => block,
-            zakura_state::ReadResponse::Block(None) => {
+            Ok(response) => response,
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 return Err("the requested block is not in the main chain")
                     .map_error(server::error::LegacyCode::InvalidParameter);
             }
-            _ => unreachable!("unmatched response to a block request"),
+            Err(error) => return Err(error).map_misc_error(),
+        };
+        let zakura_state::ReadResponse::BlockHeader {
+            header,
+            hash,
+            height,
+            ..
+        } = response
+        else {
+            unreachable!("unmatched response to a block header request")
         };
 
-        let hash = hash_or_height
-            .hash_or_else(|_| Some(block.hash()))
-            .expect("block hash");
-
-        let height = hash_or_height
-            .height_or_else(|_| block.coinbase_height())
-            .expect("verified blocks have a coinbase height");
-
-        let time = u32::try_from(block.header.time.timestamp())
+        let time = u32::try_from(header.time.timestamp())
             .expect("Timestamps of valid blocks always fit into u32.");
 
         let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {

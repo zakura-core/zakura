@@ -172,12 +172,26 @@ fn an_admission_starts_the_verdict_stage() {
         &predicates,
         &Trigger::Submitted(Select::nth(BlockKind::Apply, 1))
     ));
+    let count = |n, kind| {
+        Trigger::Count(
+            n,
+            Box::new(Trigger::Submitted(Select {
+                kind: Some(kind),
+                ..Select::default()
+            })),
+        )
+    };
     assert!(
         holds(
             &predicates,
-            &Trigger::Count(3, Box::new(Trigger::Submitted(Select::default())))
+            &Trigger::Submitted(Select::nth(BlockKind::Admit, 2))
         ),
-        "each stage counts once"
+        "a later stage leaves the earlier stage's submission as it was"
+    );
+    assert!(holds(&predicates, &count(2, BlockKind::Admit)));
+    assert!(
+        !holds(&predicates, &count(2, BlockKind::Apply)),
+        "each stage counts once, under its own kind"
     );
 }
 

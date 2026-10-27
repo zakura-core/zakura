@@ -29,7 +29,7 @@ use zakura_storage::{
 
 use super::{
     block_node::{
-        control::{Control, ControlStep},
+        control::{Control, ControlAction, ControlStep},
         default_limits, preload,
         probe::ProbeLog,
         tap::BlockTap,
@@ -317,15 +317,24 @@ impl Subsystem for Storage {
 const STEPS_PER_BLOCK: u64 = 1_000;
 
 /// The storage run's config for `scenario`: 2 workers, the default stack,
-/// which engine planning needs, and room to sync every block and then idle
-/// on timers.
+/// which engine planning needs, and room to sync every block, including
+/// those its control steps grow or fork, and then idle on timers.
 pub fn storage_config(scenario: &BlockScenario) -> RunConfig {
+    let changed: u64 = scenario
+        .control
+        .iter()
+        .map(|step| match step.action {
+            ControlAction::Grow { len, .. } => u64::from(len),
+            ControlAction::Reset { fork, .. } => u64::from(fork.len),
+            _ => 0,
+        })
+        .sum();
     RunConfig {
         scheduler: SchedulerConfig {
             workers: 2,
             ..SchedulerConfig::default()
         },
-        budget: 8_000 + STEPS_PER_BLOCK * u64::from(scenario.blocks),
+        budget: 8_000 + STEPS_PER_BLOCK * (u64::from(scenario.blocks) + changed),
         drain_bound: 2_000,
         ..RunConfig::default()
     }

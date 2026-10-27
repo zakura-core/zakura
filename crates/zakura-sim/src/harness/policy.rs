@@ -129,10 +129,16 @@ pub enum Trigger<K> {
     /// A link to this peer was made, including at setup.
     Linked(String),
     /// This actor's chain grew: a `Control` growth committed its heavier
-    /// tip and published it on the actor's watch.
+    /// tip and published it on the actor's watch. A block-sync mirror
+    /// counts once it holds the new bodies too. The block-sync node under
+    /// test counts once its engine switches its header tip, before it
+    /// commits any new body.
     Grown(String),
     /// This actor's chain switched to a fork: a `Control` reset committed
-    /// the fork's tip and published it on the actor's watch.
+    /// the fork's tip and published it on the actor's watch. A block-sync
+    /// mirror counts once it holds the fork's bodies too. The block-sync
+    /// node under test counts once its engine switches its header tip to
+    /// the fork, before its verified chain resets.
     Reset(String),
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
@@ -189,7 +195,8 @@ pub enum LinkEffect {
     Reset,
 }
 
-/// What [`Predicates`] knows about one operation from its submission.
+/// What [`Predicates`] knows about one stage of an operation from that
+/// stage's submission.
 #[derive(Clone, Copy, Debug)]
 struct Op<K> {
     kind: K,
@@ -205,8 +212,9 @@ struct Call<K, Key> {
     kind: K,
     /// The session its work belongs to.
     session: u64,
-    /// The operation it's paired with.
-    op: Option<Key>,
+    /// The operation it's paired with, and that operation's stage when the
+    /// call ended.
+    op: Option<(Key, usize)>,
 }
 
 /// The time a trigger is judged at, and the operation it's judged for.
@@ -228,11 +236,13 @@ type HoldOn<'a, F> = (
 #[derive(Clone, Debug)]
 pub struct Predicates<F: Family> {
     holds: Vec<Hold<F::Kind, F::Allow>>,
-    ops: BTreeMap<F::Key, Op<F::Kind>>,
+    /// Each operation's stages, in order.
+    ops: BTreeMap<F::Key, Vec<Op<F::Kind>>>,
     calls: BTreeMap<u64, Call<F::Kind, F::Key>>,
     submitted: BTreeMap<F::Kind, u32>,
-    /// Each operation event with its operation.
-    events: Vec<(Event, F::Key)>,
+    /// Each operation event with its operation and the stage it happened
+    /// in, so a later stage never changes how an earlier event is judged.
+    events: Vec<(Event, F::Key, usize)>,
     /// Each handled call, in order.
     handled: Vec<u64>,
     links: Vec<(LinkEffect, String)>,
@@ -255,7 +265,8 @@ impl<F: Family> Predicates<F> {
     /// Counts operation `key`'s submission as `kind`, attributed to
     /// `session`. The first hold whose selection matches it holds it. An
     /// operation submitted again enters its next stage: it counts toward
-    /// the new kind, and the holds pick it afresh.
+    /// the new kind, and the holds pick it afresh. Its earlier stages'
+    /// events still count under their own stage.
     pub(crate) fn submit(&mut self, key: F::Key, kind: F::Kind, session: Option<u64>) {
         let nth = self.submitted.entry(kind).or_default();
         *nth += 1;
@@ -269,22 +280,38 @@ impl<F: Family> Predicates<F> {
             .holds
             .iter()
             .position(|hold| !hold.select.held && op.matches(&hold.select));
-        self.ops.insert(key, op);
-        self.events.push((Event::Submitted, key));
+        let stages = self.ops.entry(key).or_default();
+        stages.push(op);
+        let stage = stages.len() - 1;
+        self.events.push((Event::Submitted, key, stage));
+    }
+
+    /// Operation `key`'s current stage, or 0 for an operation never
+    /// submitted, which no selection matches.
+    fn stage(&self, key: F::Key) -> usize {
+        self.ops
+            .get(&key)
+            .map_or(0, |stages| stages.len().saturating_sub(1))
     }
 
     /// Counts operation `key`'s next stage as a submission of `kind`, in the
     /// session its first stage was attributed to. Does nothing for an
     /// operation never submitted.
     pub(crate) fn restage(&mut self, key: F::Key, kind: F::Kind) {
-        if let Some(session) = self.ops.get(&key).map(|op| op.session) {
+        if let Some(session) = self
+            .ops
+            .get(&key)
+            .and_then(|stages| stages.first())
+            .map(|op| op.session)
+        {
             self.submit(key, kind, session);
         }
     }
 
-    /// Counts one `event` of operation `key`.
+    /// Counts one `event` of operation `key`, in its current stage.
     pub(crate) fn event(&mut self, event: Event, key: F::Key) {
-        self.events.push((event, key));
+        let stage = self.stage(key);
+        self.events.push((event, key, stage));
     }
 
     /// Counts port call `call`'s dispatch, as `kind` in `session`.
@@ -299,8 +326,10 @@ impl<F: Family> Predicates<F> {
         );
     }
 
-    /// Pairs port call `call` with operation `op`, if any, when it ends.
+    /// Pairs port call `call` with operation `op`, if any, in its current
+    /// stage, when it ends.
     pub(crate) fn call_ended(&mut self, call: u64, op: Option<F::Key>) {
+        let op = op.map(|key| (key, self.stage(key)));
         if let Some(ended) = self.calls.get_mut(&call) {
             ended.op = op;
         }
@@ -316,12 +345,21 @@ impl<F: Family> Predicates<F> {
         self.links.push((effect, peer.to_owned()));
     }
 
-    /// Whether operation `key` matches `select` in `cx`.
-    fn selects(&self, select: &Select<F::Kind>, key: F::Key, cx: Context<F::Key>) -> bool {
+    /// Whether operation `key`, in `stage`, matches `select` in `cx`.
+    fn selects(
+        &self,
+        select: &Select<F::Kind>,
+        key: F::Key,
+        stage: usize,
+        cx: Context<F::Key>,
+    ) -> bool {
         if select.held && cx.held != Some(key) {
             return false;
         }
-        self.ops.get(&key).is_some_and(|op| op.matches(select))
+        self.ops
+            .get(&key)
+            .and_then(|stages| stages.get(stage))
+            .is_some_and(|op| op.matches(select))
     }
 
     /// Whether port call `call` matches `select` in `cx`: through its paired
@@ -331,7 +369,7 @@ impl<F: Family> Predicates<F> {
             return false;
         };
         match handled.op {
-            Some(op) => self.selects(select, op, cx),
+            Some((op, stage)) => self.selects(select, op, stage, cx),
             None => {
                 !select.held
                     && select.nth.is_none()
@@ -348,7 +386,9 @@ impl<F: Family> Predicates<F> {
         let events = |kind: Event, select: &Select<F::Kind>| {
             self.events
                 .iter()
-                .filter(|(event, key)| *event == kind && self.selects(select, *key, cx))
+                .filter(|(event, key, stage)| {
+                    *event == kind && self.selects(select, *key, *stage, cx)
+                })
                 .count()
         };
         let links = |kind: LinkEffect, peer: &str| {
@@ -417,10 +457,10 @@ impl<F: Family> Predicates<F> {
         );
     }
 
-    /// The hold on operation `key`, and the context its trigger is judged
-    /// in, `since` its submission.
+    /// The hold on operation `key`'s current stage, and the context its
+    /// trigger is judged in, `since` that stage's submission.
     fn hold_on(&self, key: F::Key, since: Duration) -> Option<HoldOn<'_, F>> {
-        let hold = self.ops.get(&key)?.hold?;
+        let hold = self.ops.get(&key)?.last()?.hold?;
         Some((
             &self.holds[hold],
             Context {

@@ -10,7 +10,10 @@
 //! the checker will see exactly what was drained. Any failure ends the run
 //! with [`HarnessFailure::SourceEvidence`](crate::HarnessFailure).
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -27,7 +30,7 @@ use zakura_storage::header::{
 };
 
 use crate::{
-    evidence::{Checkpoint, StorageId},
+    evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
         StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
@@ -69,7 +72,7 @@ pub struct HeaderStorage {
     delivered: Option<u64>,
     checkpoint: Checkpoint,
     /// Binds it to the run that holds its checkpoint.
-    id: StorageId,
+    id: EvidenceId,
     /// The service in its action identities: `header` for the run's first
     /// instance, so one-instance runs keep their identities, and
     /// `header-<index>` for each later one, so instances never share one.
@@ -112,8 +115,14 @@ impl HeaderStorage {
             "a storage source needs a pristine port: build it before the run and use it only \
              inside the run"
         );
-        let checkpoint = Checkpoint::new(&port);
-        let id = sim.register_storage(SERVICE, checkpoint.clone());
+        let live: Weak<dyn LiveEvidence> = Arc::<ControlledPort>::downgrade(&port);
+        let checkpoint = Checkpoint::new(
+            EvidenceKind::Storage {
+                service: SERVICE.to_owned(),
+            },
+            live,
+        );
+        let id = sim.register(checkpoint.clone());
         HeaderStorage {
             port,
             max_latency,
@@ -136,12 +145,12 @@ fn after(t: SimInstant, d: Duration) -> SimInstant {
 }
 
 /// `bytes` as lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// `hash` as hex, in its byte order.
-fn hash(hash: block::Hash) -> String {
+pub(crate) fn hash(hash: block::Hash) -> String {
     hex(&hash.0)
 }
 
@@ -151,7 +160,7 @@ fn peer(peer: SourceId) -> String {
 }
 
 /// `frontier` in plain fields.
-fn point(frontier: Frontier) -> StoragePoint {
+pub(crate) fn point(frontier: Frontier) -> StoragePoint {
     StoragePoint {
         height: frontier.height.0,
         hash: hash(frontier.hash),
@@ -168,7 +177,7 @@ fn lease(key: LeaseKey) -> StorageLease {
 }
 
 /// `authority` in plain fields.
-fn scope(authority: HeaderWorkAuthority) -> WorkScope {
+pub(crate) fn scope(authority: HeaderWorkAuthority) -> WorkScope {
     WorkScope {
         header_generation: authority.header_generation.get(),
         branch: StorageBranch {
@@ -191,7 +200,7 @@ fn header_owner(owner: HeaderWorkOwner) -> WorkOwner {
 }
 
 /// A body owner in plain fields.
-fn body_owner(owner: BodyWorkOwner) -> WorkOwner {
+pub(crate) fn body_owner(owner: BodyWorkOwner) -> WorkOwner {
     WorkOwner {
         kind: "body-repair".to_owned(),
         scope: scope(owner.authority.header),

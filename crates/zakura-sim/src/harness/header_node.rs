@@ -7,9 +7,11 @@
 //! calls finish on first poll. Each actor's chain is committed before
 //! `Sim::new` by [`preload`], since a run's scenario clock would otherwise
 //! decide whether the fixture headers validate. [`policy`] holds individual
-//! operations, and gates `Control` steps, until chosen events happen.
+//! operations, and gates `Control` steps, until chosen events happen. A
+//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
 
 pub mod policy;
+pub mod tap;
 
 use std::{
     cell::{Cell, RefCell},
@@ -26,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_header_chain::{Frontier, VctRootRepairStatus};
 use zakura_network::zakura::{
-    framed_channel, spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncHandle,
-    HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
+    framed_channel, observe::HeaderSyncObserver, spawn_header_sync_reactor, FullStateFrontiers,
+    HeaderSyncHandle, HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
@@ -39,7 +41,10 @@ use zakura_storage::header::{
     adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture, Outcome,
 };
 
-use self::policy::{Hold, LinkEffect, Predicates, Trigger};
+use self::{
+    policy::{Hold, LinkEffect, Predicates, Trigger},
+    tap::ReactorTap,
+};
 use crate::{
     storage::HeaderStorage, ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -208,9 +213,11 @@ fn after(t: SimInstant, d: Duration) -> SimInstant {
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
-/// pure.
+/// pure. With a [`ReactorTap`], it logs the node's reactor events after its
+/// storage facts, which its predicates don't read.
 pub struct PolicySource {
     storage: HeaderStorage,
+    tap: Option<ReactorTap>,
     port: Arc<ControlledPort>,
     base: Base,
     bound: Option<Duration>,
@@ -230,6 +237,7 @@ impl PolicySource {
     pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
+            tap: None,
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
@@ -238,6 +246,15 @@ impl PolicySource {
             linked: 0,
             closed: BTreeSet::new(),
             grown: 0,
+        }
+    }
+
+    /// This source, draining `tap` at each observation, after storage, so
+    /// each event's storage watermark is already logged.
+    pub fn with_tap(self, tap: ReactorTap) -> Self {
+        PolicySource {
+            tap: Some(tap),
+            ..self
         }
     }
 
@@ -277,6 +294,9 @@ impl ActionSource for PolicySource {
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let before = log.entries().len();
         self.storage.observe(log)?;
+        if let Some(tap) = &mut self.tap {
+            tap.observe(log)?;
+        }
         let mut predicates = self.predicates.borrow_mut();
         // The storage source appends only its own port's facts.
         for entry in &log.entries()[before..] {
@@ -347,7 +367,9 @@ impl HeaderNode {
     /// at `tip`, as `zakurad` wires them: production config and timers, the
     /// port's own watch as the committed snapshots, and the default dispatch,
     /// which is direct outside test builds. A guard sets `dispatch` if the
-    /// reactor dispatches externally instead. Peer IDs come from `seed`.
+    /// reactor dispatches externally instead. Peer IDs come from `seed`. The
+    /// reactor reports its events to `observer`, if one is given.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         sim: &mut Sim,
         name: &str,
@@ -356,6 +378,7 @@ impl HeaderNode {
         fixture: &HeaderFixture,
         tip: Frontier,
         dispatch: DispatchFlag,
+        observer: Option<Arc<dyn HeaderSyncObserver>>,
     ) -> Self {
         let anchor = fixture.anchor();
         let mut startup = HeaderSyncStartup::new(
@@ -374,6 +397,7 @@ impl HeaderNode {
         startup.committed_snapshots = Some(port.selected_chain());
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
+        startup.observer.0 = observer;
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
         guard_dispatch(sim, actions, dispatch);

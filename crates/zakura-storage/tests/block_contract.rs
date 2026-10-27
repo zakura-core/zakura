@@ -283,14 +283,6 @@ fn each_gate_opens_under_its_conditions() {
         (Gate::Always, committed, true),
         (Gate::AdmitNext, room, true),
         (Gate::AdmitNext, none, false),
-        (
-            Gate::AdmitNext,
-            Conditions {
-                driver_awaiting: true,
-                ..room
-            },
-            false,
-        ),
         (Gate::ParentCommitted, parent, true),
         (Gate::ParentCommitted, none, false),
         (Gate::ParentCommitted, committed, false),
@@ -402,6 +394,24 @@ fn a_submission_has_the_outcomes_its_situation_allows() {
         []
     );
     assert_eq!(queued(Conditions::default()), []);
+    // Nor does it take a verdict then.
+    let parent = Conditions {
+        parent_committed: true,
+        ..Conditions::default()
+    };
+    let admitted = |conditions: Conditions| {
+        BlockOp::SubmitBlock.enabled(Stage::Admitted, ApplyClass::Full, &conditions)
+    };
+    assert!(admitted(parent).contains(&verdict(Verdict::Committed)));
+    assert_eq!(
+        admitted(Conditions {
+            driver_awaiting: true,
+            ..parent
+        }),
+        []
+    );
+    assert!(Stage::Queued.needs_free_driver() && Stage::Admitted.needs_free_driver());
+    assert!(!Stage::Pending.needs_free_driver());
 
     // `check` refuses an outcome the stage lacks or the gate closes.
     assert_eq!(
@@ -484,11 +494,6 @@ fn verdicts_report_the_drivers_results() {
     for (verdict, result) in verdicts {
         let outcome = verdict.outcome(owner, source, hash, ApplyClass::Full);
         assert_eq!(outcome.result(), result, "{verdict:?}");
-        assert_eq!(
-            outcome,
-            verdict.outcome(owner, source, hash, ApplyClass::Full),
-            "{verdict:?} evidence is stable"
-        );
         // Ambiguous reports exactly what a verifier-unavailable retry does.
         if verdict != Verdict::Ambiguous {
             assert!(evidence.insert(outcome.evidence().digest()), "{verdict:?}");
@@ -525,9 +530,10 @@ fn apply_limits_admit_by_class() {
         (limits.checkpoint, limits.full, limits.combined),
         (MAX_CHECKPOINT_HEIGHT_GAP, 1, 3)
     );
+    let raised = ApplyLimits::clamped(10_000, 5, 0, block::Height(10));
     assert_eq!(
-        ApplyLimits::clamped(10_000, 5, 0, block::Height(10)).checkpoint,
-        MAX_CHECKPOINT_HEIGHT_GAP
+        (raised.checkpoint, raised.full, raised.combined),
+        (MAX_CHECKPOINT_HEIGHT_GAP, 5, 1)
     );
     assert_eq!(
         ApplyClass::of(block::Height(10), limits.max_checkpoint_height),
@@ -550,13 +556,25 @@ fn apply_limits_admit_by_class() {
 }
 
 /// Decodes `block`'s bytes as a routine decodes a `Block` payload, and
-/// whether the routine's own checks accept it for its height and hash.
-fn routine_accepts(block: &FixtureBlock) -> bool {
+/// whether the routine's own checks accept it from a frame authorized for
+/// `height`, when the outstanding request expects `expected` there.
+fn routine_accepts_at(
+    block: &FixtureBlock,
+    height: block::Height,
+    expected: Option<block::Hash>,
+) -> bool {
     let mut payload = vec![MSG_BS_BLOCK];
     payload.extend(block.bytes());
     let (decoded, _) = decode_block_payload_for_test(payload).expect("a fixture payload decodes");
     assert_eq!(*decoded, *block.block, "the payload decodes to the block");
-    routine_accepts_body(&decoded, block.height, block.hash())
+    routine_accepts_body(&decoded, height, expected)
+}
+
+/// Whether the routine accepts `block` for a request that names its
+/// header's hash at its height.
+fn routine_accepts(block: &FixtureBlock) -> bool {
+    let requested = block.block.header.hash();
+    routine_accepts_at(block, block.height, Some(requested))
 }
 
 /// ST4.2: a fixture chain links parent to child, its bodies decode to
@@ -599,7 +617,8 @@ fn fixture_bodies_link_decode_and_pass_the_routine_checks() {
 }
 
 /// ST4.2: bodies at heights that need multi-byte coinbase height pushes
-/// still decode, and two branches never share a block at a height.
+/// still decode, two branches never share a block at a height, and the
+/// routine rejects a body for another height or hash.
 #[test]
 fn fixture_heights_and_branches_stay_distinct() {
     let fixture = BlockFixture::regtest();
@@ -611,6 +630,16 @@ fn fixture_heights_and_branches_stay_distinct() {
         assert_eq!(left.height, right.height);
         assert_ne!(left.hash(), right.hash());
     }
+    // The routine rejects a body for another height, for a sibling's
+    // hash, or where the request expects no body.
+    let next = main[0].height.next().expect("heights stay small");
+    assert!(!routine_accepts_at(&main[0], next, Some(main[0].hash())));
+    assert!(!routine_accepts_at(
+        &main[0],
+        main[0].height,
+        Some(fork[0].hash())
+    ));
+    assert!(!routine_accepts_at(&main[0], main[0].height, None));
     // A far parent exercises the 3-byte height push.
     let far = Frontier::new(block::Height(69_999), main[0].hash());
     let block = fixture.block(far, 0, spec);

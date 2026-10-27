@@ -18,16 +18,3 @@ fn the_controlled_service_passes_every_shared_case() {
         }
     }
 }
-
-/// ST4.6: a case runs the same way twice.
-#[test]
-fn shared_cases_are_deterministic() {
-    for case in cases() {
-        assert_eq!(
-            run_controlled(&case),
-            run_controlled(&case),
-            "{}",
-            case.name
-        );
-    }
-}

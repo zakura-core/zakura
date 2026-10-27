@@ -33,7 +33,8 @@ pub struct Applied {
     /// What the engine installed, or `None` if it installed nothing.
     pub installed: Option<Installed>,
     /// The verified-chain change a commit sent the engine, or `None` for a
-    /// side path or a body record.
+    /// side path, a body record, or a commit the engine stalled, which
+    /// changes no verified chain.
     pub cause: Option<VerifiedChangeCause>,
 }
 
@@ -345,7 +346,7 @@ impl EnginePort {
                 return Ok(Applied {
                     result: ApplyResult::ResourceStalled(receipt),
                     installed: None,
-                    cause,
+                    cause: None,
                 });
             }
             let current = transition.snapshot_after_commit().clone();
@@ -354,7 +355,7 @@ impl EnginePort {
             return Ok(Applied {
                 result: ApplyResult::ResourceStalled(receipt),
                 installed: Some(Installed { effect, view }),
-                cause,
+                cause: None,
             });
         }
         if let Some(expected) = expected_verified {

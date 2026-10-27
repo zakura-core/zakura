@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Weak};
 
+use zakura_header_chain::TransientBodyFailureKind;
 use zakura_network::zakura::BlockApplyResult;
 use zakura_scheduler::SimInstant;
 use zakura_storage::block::{
@@ -24,11 +25,12 @@ use zakura_storage::block::{
     ApplyClass, BlockOutcome, Commitment, RetryKind, Stage, Verdict,
 };
 
-use super::{block_owner, hash, hex, peer, point};
+use super::{block_owner, hash, hex, peer, point, scope};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        BlockOperation, BlockStorageState, StorageFact, StorageRequest, StorageResult, StorageState,
+        BlockOperation, BlockStorageState, BodyScope, StorageFact, StorageRequest, StorageResult,
+        StorageState,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -204,6 +206,19 @@ fn attempt(attempt: RecordResult) -> String {
     .to_owned()
 }
 
+/// `kind`'s name.
+fn failure(kind: TransientBodyFailureKind) -> String {
+    match kind {
+        TransientBodyFailureKind::MissingContext => "missing-context",
+        TransientBodyFailureKind::Canceled => "canceled",
+        TransientBodyFailureKind::Storage => "storage",
+        TransientBodyFailureKind::VerifierUnavailable => "verifier-unavailable",
+        TransientBodyFailureKind::Timeout => "timeout",
+        TransientBodyFailureKind::ResourceExhausted => "resource-exhausted",
+    }
+    .to_owned()
+}
+
 /// `request` in plain fields.
 fn request(request: &RequestIdentity) -> StorageRequest {
     match request {
@@ -211,10 +226,18 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             query_id,
             from,
             limit,
+            scope: seen,
+            best_header_tip,
         } => StorageRequest::QueryNeededBlocks {
             query_id: query_id.get(),
             from: from.0,
             limit: *limit,
+            scope: BodyScope {
+                scope: scope(seen.header),
+                verified_generation: seen.verified_generation.get(),
+                body_work_epoch: seen.body_work_epoch.get(),
+            },
+            best_header_tip: best_header_tip.0,
         },
         RequestIdentity::Submit {
             owner,
@@ -237,10 +260,18 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             op,
             expected_version,
             hash: about,
+            evidence,
+            rule,
+            source,
+            failure: kind,
         } => StorageRequest::RecordBody {
             record: op.name().to_owned(),
             expected_version: expected_version.get(),
             hash: hash(*about),
+            evidence: hex(&evidence.digest()),
+            rule: rule.as_ref().map(|rule| rule.as_str().to_owned()),
+            source: source.map(peer),
+            failure: kind.map(failure),
         },
         RequestIdentity::Misbehavior {
             peer: reported,
@@ -315,6 +346,13 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::Coalesced { query_id } => StorageFact::Coalesced {
             query_id: query_id.get(),
         },
+        FactKind::Deferred { queue } => StorageFact::Deferred {
+            queue: queue.iter().map(request).collect(),
+        },
+        FactKind::CommitRefused { id, hash: refused } => StorageFact::CommitRefused {
+            id: id.0,
+            hash: hash(refused),
+        },
         FactKind::TransitionInstalled {
             state_version,
             verified_best,
@@ -349,13 +387,15 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::CallerDropped { id } => StorageFact::CallerDropped { id: id.0 },
         FactKind::ReadTaken { id } => StorageFact::ReadTaken { id: id.0 },
         FactKind::ReadDropped { id } => StorageFact::ReadDropped { id: id.0 },
-        FactKind::DriverExited { dropped } => StorageFact::DriverExited {
+        FactKind::DriverExited { dropped, deferred } => StorageFact::DriverExited {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
+            deferred: deferred.iter().map(request).collect(),
         },
         // Mapped like any fact. Shutdown at the end of a run happens after
         // the log is frozen and is never observed.
-        FactKind::ShutDown { dropped } => StorageFact::ShutDown {
+        FactKind::ShutDown { dropped, deferred } => StorageFact::ShutDown {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
+            deferred: deferred.iter().map(request).collect(),
         },
     };
     Observation::Storage {
@@ -392,6 +432,7 @@ fn state(state: &OwnerState) -> StorageState {
                 }
             })
             .collect(),
+        deferred: state.deferred.iter().map(request).collect(),
     })
 }
 
@@ -412,10 +453,11 @@ impl ActionSource for BlockStorage {
     fn execute(&mut self, local: u64, _: &mut ObservationLog) {
         let (id, outcome) = decode(local);
         match self.service.complete(id, outcome) {
-            // The contract can't see full state's refusals, such as a commit
-            // of a body recorded invalid, so `enabled` offers them. The
-            // refusal changes nothing, and the run picks again.
-            Ok(_) | Err(CompleteError::State(_)) => {}
+            // The contract doesn't track records, so `enabled` offers the
+            // commit of a body recorded invalid. The engine refuses it, as
+            // zakura-state does, the service logs the refusal as a fact,
+            // and the run picks again.
+            Ok(_) | Err(CompleteError::RecordedInvalid(_)) => {}
             Err(error) => panic!("`enabled` offered this completion at this step: {error}"),
         }
     }
@@ -476,6 +518,8 @@ impl Drop for BlockStorage {
 mod tests {
     use zakura_storage::block::{ApplyClass, BlockOp, Stage};
 
+    use zakura_storage::block::controlled::OpId;
+
     use super::{code, decode, outcome, CODES};
 
     /// Every outcome the contract lists has its own code, which decodes
@@ -489,7 +533,7 @@ mod tests {
                     for (listed, _) in op.outcomes(stage, class) {
                         assert!(code(listed) < CODES);
                         assert_eq!(outcome(code(listed)), Some(listed));
-                        assert_eq!(decode(7 * CODES + code(listed)).1, listed);
+                        assert_eq!(decode(7 * CODES + code(listed)), (OpId(7), listed));
                         codes.push(code(listed));
                     }
                 }
@@ -498,5 +542,38 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes, (0..18).collect::<Vec<_>>(), "every code is in use");
+    }
+
+    /// Each outcome's name in its action identity, by code. A renamed
+    /// outcome changes every plan that picks it.
+    #[test]
+    fn outcome_names_are_pinned() {
+        let names: Vec<String> = (0..CODES)
+            .map_while(outcome)
+            .map(|listed| listed.name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "answer",
+                "fail",
+                "admit",
+                "apply",
+                "serve",
+                "error",
+                "committed",
+                "duplicate",
+                "payload-mismatch-auth-data-root",
+                "payload-mismatch-chain-history-block-tx-auth-commitment",
+                "payload-mismatch-final-sapling-root",
+                "consensus-invalid",
+                "retryable-missing-context",
+                "retryable-canceled",
+                "retryable-storage",
+                "retryable-verifier-unavailable",
+                "retryable-resource-exhausted",
+                "ambiguous",
+            ]
+        );
     }
 }

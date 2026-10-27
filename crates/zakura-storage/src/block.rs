@@ -79,9 +79,13 @@
 //! outcomes need no gate. A [`Gate`] says when the other outcomes are legal,
 //! from the [`Conditions`] the service computes for each pending operation:
 //!
+//! * The driver admits a body and reports a verdict only at the top of
+//!   its loop or in its select, never while it awaits a query or record
+//!   ([`Stage::needs_free_driver`]). A verdict commits and replies at
+//!   once, so this leaves out a commit that lands while the driver awaits.
 //! * The driver admits queued submissions in arrival order, skipping one
-//!   whose class is at its limit, and never while it awaits a query or
-//!   record ([`Gate::AdmitNext`]). The limits are [`ApplyLimits`].
+//!   whose class is at its limit ([`Gate::AdmitNext`]). The limits are
+//!   [`ApplyLimits`].
 //! * The verifier commits a body only once its parent is committed. Full
 //!   state queues a body whose parent is missing
 //!   (`QueuedBlocks` in zakura-state), so `committed` and `ambiguous` wait
@@ -133,6 +137,10 @@
 //! * A commit visible before its reply. Full state commits and publishes the
 //!   new view, then the driver sends `BlockApplyFinished`. Here both happen in
 //!   one completion.
+//! * A commit while the driver awaits a query or record. Production's
+//!   verifier can commit then, and the driver replies once it's free. Here
+//!   a verdict commits and replies at once, so it waits for a free driver
+//!   ([`Stage::needs_free_driver`]).
 //! * Chunks of one query reading different states. The driver reads up to
 //!   4,000 heights per state read, and fails the query if the anchor moves
 //!   between reads. Here every chunk reads one state, so that failure only
@@ -151,14 +159,10 @@
 //! * the driver's shutdown when a `record_body_invalid` isn't durable;
 //! * the driver's 30 s deadlines on state calls;
 //! * the checkpoint verifier holding a body until its checkpoint range is
-//!   complete. Regtest's only checkpoint is genesis, so every fixture body
-//!   is full-class.
-//!
-//! One history is wider than production. The driver doesn't poll its
-//! in-flight applies while it awaits a query or record, so it sends no
-//! `BlockApplyFinished` then. Here a verdict is legal at any time after
-//! admission. Block sync must handle every order anyway, since its own
-//! channel can deliver them in any order.
+//!   complete. A body at or below [`ApplyLimits::max_checkpoint_height`] is
+//!   checkpoint-class: it counts against the checkpoint limits and has the
+//!   checkpoint verifier's retry kinds, but its verdict never waits for the
+//!   rest of its range.
 
 use std::{fmt, num::NonZeroU64};
 
@@ -225,6 +229,15 @@ pub enum Stage {
     Queued,
     /// A submission the verifier is working on.
     Admitted,
+}
+
+impl Stage {
+    /// Whether an operation at this stage completes only while the driver
+    /// awaits nothing: it admits a body and takes a verdict only at the top
+    /// of its loop or in its select.
+    pub const fn needs_free_driver(self) -> bool {
+        matches!(self, Stage::Queued | Stage::Admitted)
+    }
 }
 
 /// How a pending operation completes, or moves to its next stage.
@@ -483,8 +496,7 @@ impl ApplyLimits {
 pub enum Gate {
     /// Always.
     Always,
-    /// The driver isn't awaiting a query or record, and the submission is
-    /// the oldest queued one whose class has room.
+    /// The submission is the oldest queued one whose class has room.
     AdmitNext,
     /// The body's parent is committed and the body isn't.
     ParentCommitted,
@@ -518,7 +530,7 @@ impl Gate {
     pub const fn open(self, conditions: &Conditions) -> bool {
         match self {
             Gate::Always => true,
-            Gate::AdmitNext => !conditions.driver_awaiting && conditions.oldest_with_room,
+            Gate::AdmitNext => conditions.oldest_with_room,
             Gate::ParentCommitted => conditions.parent_committed && !conditions.committed,
             Gate::KnownToState => {
                 conditions.committed || conditions.replaced || conditions.older_in_flight
@@ -761,6 +773,9 @@ impl BlockOp {
         class: ApplyClass,
         conditions: &Conditions,
     ) -> Vec<BlockOutcome> {
+        if stage.needs_free_driver() && conditions.driver_awaiting {
+            return Vec::new();
+        }
         self.outcomes(stage, class)
             .into_iter()
             .filter(|(_, gate)| gate.open(conditions))

@@ -11,9 +11,11 @@
 //!
 //! A chain change reaches the node under test in two steps of their own,
 //! one preparing its headers and one applying them, since the step loop
-//! alone reads the node's engine. A body commit can land between them. The
-//! change reaches the mirrors before the node, or after it, as the action
-//! says. Chain changes run one stage at a time, in script order.
+//! alone reads the node's engine. A body commit can land between them, and
+//! leaves the preparation valid: only a header change makes it stale, and no
+//! other actor changes the node's headers, so a stale apply fails the run.
+//! The change reaches the mirrors before the node, or after it, as the
+//! action says. Chain changes run one stage at a time, in script order.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
@@ -294,10 +296,8 @@ impl ActionSource for Control {
                     .prepare_node(&change)
                     .map(|prepared| Stage::NodeApply(change, prepared)),
                 Some(Stage::NodeApply(change, prepared)) => {
-                    // A stale preparation is made again, as header sync
-                    // would.
-                    (!self.topology.apply_node(&change, prepared))
-                        .then_some(Stage::NodePrepare(change))
+                    self.topology.apply_node(&change, prepared);
+                    None
                 }
                 _ => unreachable!("`enabled` offers only a node stage that comes first"),
             };

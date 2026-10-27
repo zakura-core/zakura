@@ -41,7 +41,7 @@ use std::{
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use zakura_header_chain::{ErrorCategory, Frontier};
+use zakura_header_chain::Frontier;
 use zakura_network::{
     zakura::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
@@ -1146,22 +1146,16 @@ impl Topology {
 
     /// Applies `change`'s `prepared` headers on the node under test's
     /// engine, which reorganizes its selected chain through the real engine.
-    /// The node must download the bodies. Returns `false` if a body commit
-    /// since the preparation made it stale, so the caller prepares it again,
-    /// as header sync would. Only the step loop reads the node's engine, so
-    /// only it may call this.
-    pub(crate) fn apply_node(&self, change: &ChainChange, prepared: PreparedHeaderTarget) -> bool {
+    /// The node must download the bodies. Records a failure if they don't
+    /// apply, a stale preparation included: a body commit since the
+    /// preparation leaves it valid, and nothing else changes the node's
+    /// headers. Only the step loop reads the node's engine, so only it may
+    /// call this.
+    pub(crate) fn apply_node(&self, change: &ChainChange, prepared: PreparedHeaderTarget) {
         let node = &self.nodes[0];
         let applied = ready(node.engine.apply_header_target(prepared));
-        if applied
-            .as_ref()
-            .is_err_and(|error| error.category == ErrorCategory::StaleTargetOrGeneration)
-        {
-            return false;
-        }
         let tip = node.engine.view().frontiers.header_best;
         self.settle(node, change, applied, Ok(()), tip);
-        true
     }
 
     /// Records `change`'s effect on `node` if it applied and moved the

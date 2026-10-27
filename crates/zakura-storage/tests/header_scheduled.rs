@@ -373,6 +373,37 @@ fn a_bound_port_refuses_use_outside_its_run() {
     }
 }
 
+/// A call submitted and completed during its run, then taken or dropped
+/// after that run ends or in a later run, is refused too: taking returns
+/// nothing, dropping leaves the reply, and neither publishes.
+#[test]
+fn a_bound_port_refuses_a_reply_outside_its_run() {
+    for later in [false, true] {
+        for take in [false, true] {
+            let (port, target) = chain();
+            let sched = scheduler();
+            assert_eq!(port.bind_to_run(), Ok(()));
+            let mut call = port.selected_chain_contains(target.hash);
+            assert!(pin!(&mut call)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            assert!(port.complete(OpId(1), Outcome::Engine).is_ok());
+            assert!(!port.take_facts().is_empty());
+            drop(sched);
+            let other = later.then(scheduler);
+            if take {
+                assert!(pin!(&mut call)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+            drop(call);
+            assert!(port.take_facts().is_empty(), "later {later}, take {take}");
+            assert!(port.refused_outside_run(), "later {later}, take {take}");
+            drop(other);
+        }
+    }
+}
+
 /// #1721 review P1: abandoning an unread `Acquired` reply fires the capacity
 /// signal another acquire waits on, a scheduling point. The run must still
 /// be able to take the lease lock there, or its next completion panics

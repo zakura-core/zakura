@@ -59,8 +59,8 @@ fn violated_witness_fails_while_fixed() {
     );
 }
 
-/// A broken copy of S4.7 whose round-robin order runs the marks before the
-/// source waits: the property holds, but the run never reaches the race.
+/// A broken copy of S4.7 whose round-robin order parks the source before
+/// the final mark: the property holds, but the run never reaches the race.
 #[test]
 fn missed_trigger_history_fails() {
     assert_eq!(
@@ -314,4 +314,57 @@ fn no_trigger_history_fails() {
         witness(probe(Behavior::Sleep), NO_HISTORY, Expect::Holds),
         Err(WitnessError::NoTriggerHistory)
     );
+}
+
+/// Recording a witness test writes the trace of the run it judged, and
+/// judges it with the same rule as `witness`: the fixed code passes Holds
+/// and fails Violated, and either way the trace is complete.
+#[test]
+fn recorded_witness_judges_its_own_trace() {
+    let entry = harness::find(WaitComplete::NAME).expect("S4.7's harness is registered");
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    let (trace, result) = harness::record_witness(
+        entry,
+        harness::RecordInput::Input(INPUT),
+        &dir.path().join("holds"),
+        WAIT_COMPLETE_WAKES,
+        Expect::Holds,
+    )
+    .expect("the trace is written");
+    assert_eq!(result, Ok(()));
+    assert!(trace.end.is_some());
+
+    let (trace, result) = harness::record_witness(
+        entry,
+        harness::RecordInput::Input(INPUT),
+        &dir.path().join("violated"),
+        WAIT_COMPLETE_WAKES,
+        Expect::Violated,
+    )
+    .expect("a failed witness test still writes its trace");
+    assert_eq!(
+        result,
+        Err(WitnessError::Outcome(PropertyOutcome::Held {
+            applicable: 1
+        }))
+    );
+    assert!(trace.end.is_some());
+
+    let error = harness::record_witness(
+        entry,
+        harness::RecordInput::Input(INPUT),
+        &dir.path().join("unregistered"),
+        "discovery/no-such-property",
+        Expect::Holds,
+    )
+    .expect_err("an unregistered property has no witness test");
+    assert!(
+        matches!(
+            error,
+            harness::RecordError::Witness(WitnessError::Unregistered)
+        ),
+        "{error}"
+    );
+    assert!(!dir.path().join("unregistered").exists());
 }

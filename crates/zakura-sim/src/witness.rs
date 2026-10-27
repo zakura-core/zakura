@@ -7,13 +7,13 @@
 //! property's bug needs. A run that reaches the right verdict along a
 //! harmless path proves nothing, so it fails.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use crate::{
     harness::{self, run_harness, HarnessError, Subsystem},
     property::Status,
     record::Record,
-    MemorySink, Outcome, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -29,6 +29,29 @@ pub enum Expect {
     /// The property applies and holds. Other `Known` or `Draft` properties
     /// may report violations, as long as none stopped the run.
     Applicable,
+}
+
+impl Expect {
+    /// The expectation's name, as `zakura-sim record --expect` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Expect::Holds => "holds",
+            Expect::Violated => "violated",
+            Expect::Applicable => "applicable",
+        }
+    }
+}
+
+impl FromStr for Expect {
+    type Err = String;
+
+    /// Reads [`Expect::name`].
+    fn from_str(name: &str) -> Result<Expect, String> {
+        [Expect::Holds, Expect::Violated, Expect::Applicable]
+            .into_iter()
+            .find(|expect| expect.name() == name)
+            .ok_or_else(|| format!("`{name}` isn't holds, violated or applicable"))
+    }
 }
 
 /// A witness test's scenario: the harness's scenario and the run's input.
@@ -120,6 +143,25 @@ pub fn witness<S: Subsystem>(
     property: &str,
     expect: Expect,
 ) -> Result<(), WitnessError> {
+    witness_into::<S>(
+        &scenario.scenario,
+        scenario.input,
+        property,
+        expect,
+        &mut MemorySink::default(),
+    )
+}
+
+/// [`witness`], writing the run's records to `sink`, so a recorded trace
+/// is the run the test judged. Nothing is written if the property isn't
+/// registered or has no trigger-history check.
+pub fn witness_into<S: Subsystem>(
+    scenario: &S::Scenario,
+    input: PlanInput,
+    property: &str,
+    expect: Expect,
+    sink: &mut dyn RecordSink,
+) -> Result<(), WitnessError> {
     let registered = harness::registry::<S>();
     let registered = registered
         .properties()
@@ -129,15 +171,15 @@ pub fn witness<S: Subsystem>(
     let trigger_history = registered.witness.ok_or(WitnessError::NoTriggerHistory)?;
     let status = registered.status;
 
-    let mut sink = MemorySink::default();
-    let report = match run_harness::<S>(&scenario.scenario, scenario.input, &mut sink, None) {
+    let mut sink = EndSeen { sink, ended: false };
+    let report = match run_harness::<S>(scenario, input, &mut sink, None) {
         Ok(report) => report,
         Err(HarnessError::Run { failure, .. }) => {
             return Err(WitnessError::HarnessEnd(failure.to_string()))
         }
         Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
     };
-    if !matches!(sink.records.last(), Some(Record::End(_))) {
+    if !sink.ended {
         return Err(WitnessError::NoEnd);
     }
     judge(&report, property, status, expect)?;
@@ -145,6 +187,19 @@ pub fn witness<S: Subsystem>(
         Ok(())
     } else {
         Err(WitnessError::LostTriggerHistory)
+    }
+}
+
+/// A sink that notes whether the last record it passed on was the `end`.
+struct EndSeen<'a> {
+    sink: &'a mut dyn RecordSink,
+    ended: bool,
+}
+
+impl RecordSink for EndSeen<'_> {
+    fn record(&mut self, record: Record) {
+        self.ended = matches!(record, Record::End(_));
+        self.sink.record(record);
     }
 }
 

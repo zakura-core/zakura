@@ -274,9 +274,8 @@ fn run_and_read(checker: &mut dyn Checker) -> (RunReport, EndRecord) {
 /// A report for `test/at-end`.
 fn at_end(outcome: PropertyOutcome, holds_since: Option<u64>) -> PropertyReport {
     PropertyReport {
-        property: "test/at-end".into(),
-        outcome,
         holds_since,
+        ..PropertyReport::new("test/at-end", outcome)
     }
 }
 
@@ -1513,9 +1512,8 @@ fn end() -> impl Strategy<Value = EndRecord> {
     let properties = vec(
         (text(), property_outcome(), option::of(edge_u64())).prop_map(
             |(property, outcome, holds_since)| PropertyReport {
-                property,
-                outcome,
                 holds_since,
+                ..PropertyReport::new(property, outcome)
             },
         ),
         0..3,

@@ -37,13 +37,28 @@ pub struct Obligation {
     pub bound: LivenessBound,
     /// True if an observation discharges the obligation with `key`.
     pub discharged_by: fn(&ObligationKey, &Observation) -> bool,
+    /// How many open obligations one matching observation discharges.
+    pub cardinality: Cardinality,
     /// The steps a violation would depend on, in order.
     pub witness: Vec<u64>,
 }
 
-/// What an obligation waits on: its property and one subject. One
-/// observation discharges at most the oldest open obligation that it
-/// matches, so two subjects never share a discharge.
+/// How many open obligations one observation discharges. Either way, it
+/// discharges only obligations whose trigger it follows and whose key it
+/// matches, so an old close never answers a later trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cardinality {
+    /// The oldest match only, as a completion belongs to one operation or
+    /// owner.
+    One,
+    /// Every match, as one connection close answers every earlier
+    /// consequence on that connection.
+    Every,
+}
+
+/// What an obligation waits on: its property and one subject. Its
+/// [`Cardinality`] says whether one observation may discharge several
+/// obligations with matching keys.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObligationKey {
     /// The property that opened it.

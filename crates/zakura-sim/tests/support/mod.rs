@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod feed;
+
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};
 

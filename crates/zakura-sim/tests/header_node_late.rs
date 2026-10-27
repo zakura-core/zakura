@@ -1427,7 +1427,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
 
 // M4.4: locator permits.
 
-/// Seventeen mirrors at distinct height-1 tips give Nora 17 targets, and
+/// Seventeen mirrors at distinct height-1 tips give the node 17 targets, and
 /// every locator is held until its caller has dropped it and 1 ms more, so
 /// the reactor handles every timeout while storage still holds each
 /// permit. Accepted work keeps its permit: some step has 16 locators whose
@@ -1443,7 +1443,6 @@ fn locator_permits_wait_for_accepted_work() {
             node: Chain::default(),
             mirrors: (1..=17)
                 .map(|branch| MirrorSpec {
-                    name: format!("m{branch}"),
                     chain: Chain {
                         main: 0,
                         fork: Some(Fork { branch, len: 1 }),
@@ -1580,7 +1579,7 @@ fn timeout_enabled_from(watch: &Watch, id: u64, submitted: Duration, dropped: (u
     assert!(!waiting, "and its caller no longer waits");
 }
 
-/// Nora's first locator is held until its caller drops it. The call ends
+/// The node's first locator is held until its caller drops it. The call ends
 /// `timed-out` exactly the startup's 30 s request timeout after the
 /// submission, paired with that `CallerDropped`, and the port offers
 /// `timeout` from that instant, since the adapter's deadline is 30 s too.
@@ -1588,7 +1587,7 @@ fn timeout_enabled_from(watch: &Watch, id: u64, submitted: Duration, dropped: (u
 fn locator_times_out_at_the_reactors_30_seconds() {
     let timeout = request_timeout();
     assert_eq!(timeout, Duration::from_secs(30));
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![hold(
             Select::nth(OpKind::Locator, 1),
             Trigger::CallerDropped(Select::held()),
@@ -1605,7 +1604,7 @@ fn locator_times_out_at_the_reactors_30_seconds() {
         drop(checker);
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
-        let first = nth(&ops, OpKind::Locator, 1).expect("Nora submitted a locator");
+        let first = nth(&ops, OpKind::Locator, 1).expect("the node submitted a locator");
         timed_out_at(&history, &watch, first, ops[&first].at, timeout);
     }
 }
@@ -1631,7 +1630,7 @@ fn timed_out_at(
     timeout_enabled_from(watch, id, submitted, (dropped.step, dropped.at));
 }
 
-/// Nora preloaded at A3 needs a VCT repair at height 2, so her reactor asks
+/// The node preloaded at A3 needs a VCT repair at height 2, so its reactor asks
 /// storage for its context, and that call is held until its caller drops
 /// it. It ends `timed-out` 30 s after its submission, paired with that
 /// drop, and the port offers `timeout` from then.
@@ -1660,11 +1659,11 @@ fn vct_context_times_out_at_30_seconds() {
                     ..Policy::converging()
                 };
                 let storage = PolicySource::new(sim, node.clone(), policy, effects.clone());
-                let (observer, tap) = ReactorTap::new(sim, &node, "nora");
+                let (observer, tap) = ReactorTap::new(sim, &node, "node");
                 sim.add_source(Box::new(storage.with_tap(tap)));
-                let nora = HeaderNode::spawn(
+                let actor = HeaderNode::spawn(
                     sim,
-                    "nora",
+                    "node",
                     1,
                     node.clone(),
                     &fixture,
@@ -1672,7 +1671,8 @@ fn vct_context_times_out_at_30_seconds() {
                     DispatchFlag::default(),
                     Some(observer),
                 );
-                nora.vct_repairs
+                actor
+                    .vct_repairs
                     .send(VctRootRepairStatus {
                         state: VctRootRepairState::Unavailable {
                             height: zakura_chain::block::Height(2),
@@ -1680,7 +1680,7 @@ fn vct_context_times_out_at_30_seconds() {
                         generation: 0,
                     })
                     .expect("the reactor holds the repair receiver");
-                topology = Some(Topology::new(vec![nora], effects));
+                topology = Some(Topology::new(vec![actor], effects));
             },
             &mut checker,
         );
@@ -1690,7 +1690,8 @@ fn vct_context_times_out_at_30_seconds() {
         assert_eq!(report.end.harness, None, "{:?}", report.end);
         let history = History::new(&report, initial);
         let ops = history.ops();
-        let context = nth(&ops, OpKind::VctContext, 1).expect("Nora asked for a repair context");
+        let context =
+            nth(&ops, OpKind::VctContext, 1).expect("the node asked for a repair context");
         timed_out_at(&history, &watch, context, ops[&context].at, timeout);
     }
 }
@@ -1719,22 +1720,22 @@ fn waited_without_timeout(history: &History<'_>, watch: &Watch, id: u64) {
     );
 }
 
-/// Steps enough to idle past two hours of virtual time on Nora's timers.
+/// Steps enough to idle past two hours of virtual time on the node's timers.
 const TWO_HOUR_BUDGET: u64 = 40_000;
 
 /// Two hours, in milliseconds.
 const TWO_HOURS_MS: u64 = 7_200_000;
 
-/// Nora's first prepare is held for two hours. The request deadline retires
+/// The node's first prepare is held for two hours. The request deadline retires
 /// its owner `timed_out` while it's preparing, 30 s after its pages, and
-/// Nora syncs through a new request. The prepare never times out: its
+/// the node syncs through a new request. The prepare never times out: its
 /// caller keeps waiting with only `engine` and `local-resource` offered.
 /// Its late completion is handled with no apply dispatched, and no apply
 /// ever carries the retired owner.
 #[test]
 fn held_prepare_outlives_its_retired_owner() {
     let timeout = request_timeout();
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![hold(
             Select::nth(OpKind::Prepare, 1),
             Trigger::VirtualTime(TWO_HOURS_MS),
@@ -1751,7 +1752,7 @@ fn held_prepare_outlives_its_retired_owner() {
         drop(checker);
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
-        let prepare = nth(&ops, OpKind::Prepare, 1).expect("Nora prepared");
+        let prepare = nth(&ops, OpKind::Prepare, 1).expect("the node prepared");
         let owner = owner_of(ops[&prepare].request);
         let retired: Vec<_> = history
             .retirements()
@@ -1798,19 +1799,19 @@ fn held_prepare_outlives_its_retired_owner() {
     }
 }
 
-/// Nora's first apply is held for two hours, and every later apply until
-/// it completes, so nothing commits first. Mira's link closes once a later
-/// apply is submitted, which stops Nora's new requests. The request
-/// deadline retires the apply's owner `timed_out` 30 s after its
-/// submission, but the apply never times out: its caller keeps waiting
-/// with only `engine` and `local-resource` offered. At its late completion
-/// the generation is the one it was submitted under, and it commits: the
-/// generation rises by one and Nora's tip is the target. The reactor
-/// handles it with no second retirement of its owner.
+/// The node's first apply is held for two hours, and every later apply until it
+/// completes, so nothing commits first. `mirror-0`'s link closes once a later
+/// apply is submitted, which stops the node's new requests. The request
+/// deadline retires the apply's owner `timed_out` 30 s after its submission,
+/// but the apply never times out: its caller keeps waiting with only `engine`
+/// and `local-resource` offered. At its late completion the generation is the
+/// one it was submitted under, and it commits: the generation rises by one and
+/// the node's tip is the target. The reactor handles it with no second
+/// retirement of its owner.
 #[test]
 fn held_apply_commits_late() {
     let timeout = request_timeout();
-    let scenario = nora_and_mira(
+    let scenario = node_and_mirror(
         vec![
             hold(
                 Select::nth(OpKind::Apply, 1),
@@ -1828,7 +1829,7 @@ fn held_apply_commits_late() {
             ),
         ],
         vec![control(
-            "mira",
+            "mirror-0",
             ControlAction::Close,
             Trigger::Submitted(Select::nth(OpKind::Apply, 2)),
         )],
@@ -1841,7 +1842,7 @@ fn held_apply_commits_late() {
         drop(checker);
         let history = History::new(&report, initial_generation(&ports));
         let ops = history.ops();
-        let apply = nth(&ops, OpKind::Apply, 1).expect("Nora applied");
+        let apply = nth(&ops, OpKind::Apply, 1).expect("the node applied");
         let owner = owner_of(ops[&apply].request);
         let retired: Vec<_> = history
             .retirements()

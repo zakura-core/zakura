@@ -23,14 +23,13 @@ use zakura_sim::{
     MemorySink, Observation,
 };
 
-/// Nora prepares a 160-header batch from Mira, whose chain was itself
+/// The node prepares a 160-header batch from `mirror-0`, whose chain was itself
 /// prepared before the run, and commits it. Then rayon's global pool can
 /// still be built, so no preparation in the process used it.
 #[test]
 fn preparation_never_starts_the_rayon_pool() {
     let scenario = StorageScenario {
         mirrors: vec![MirrorSpec {
-            name: "mira".to_owned(),
             chain: Chain::main(160),
             dialer: Dialer::Mirror,
         }],
@@ -74,7 +73,7 @@ fn preparation_never_starts_the_rayon_pool() {
                 _ => {}
             }
         }
-        assert!(prepared, "Nora prepared all 160 headers in one batch");
+        assert!(prepared, "the node prepared all 160 headers in one batch");
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             Chain::main(160).tip(&ports.fixture)

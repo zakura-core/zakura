@@ -23,7 +23,7 @@ pub use cadence::{CadenceModel, Charge};
 pub use exchange::{ExchangeModel, Owed};
 pub use frame::{FrameHeader, FrameModel, ReaderEnd};
 pub use label::{Direction, Label, LabelOutcome, LabelledFrame, Labels};
-pub use subscription::{SubscriptionModel, Totals};
+pub use subscription::{SubscriptionModel, Totals, Update};
 
 /// A peer session, numbered by the harness.
 pub type SessionId = u64;

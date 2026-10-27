@@ -7,6 +7,17 @@ use zakura_network::zakura::{Credit, MessageRole, MessageRule};
 
 use super::{Cursor, ExchangeKey, Label, Labels, SessionId};
 
+/// An update the node writes as subscriber: the fields that go on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// Zero for `Open`, then one more for each update.
+    pub sequence: u32,
+    /// The start for `Open`, then the last page the handler accepted.
+    pub acknowledged: Cursor,
+    /// The credit the update adds. `Close` adds none.
+    pub added: Credit,
+}
+
 /// Cumulative objects and payload bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
@@ -69,12 +80,19 @@ struct Publisher {
     live: BTreeMap<ExchangeKey, Publication>,
     /// Oldest first.
     tombstones: VecDeque<Tombstone>,
+    /// Ended subscriptions whose terminal outcome the node is still writing,
+    /// oldest first. Each holds its slot until the write finishes, and the
+    /// peer counts it as live until then.
+    writing: Vec<ExchangeKey>,
 }
 
 /// A subscription the node opened on a peer.
 #[derive(Clone, Debug)]
 struct Subscription {
     sequence: u32,
+    /// The cursor the next update acknowledges: the start, then the last
+    /// accepted page.
+    acknowledged: Cursor,
     granted: Totals,
     consumed: Totals,
     /// Received pages the handler hasn't accepted, oldest first, with the
@@ -111,8 +129,9 @@ struct Subscriber {
 /// - The subscriber's `Open` proves it received the oldest terminal
 ///   outcomes, so the publisher keeps at most `max_live - 1` live
 ///   subscriptions and tombstones once it applies an `Open`.
-///
-/// The node writes a terminal outcome as soon as the model records its end.
+/// - A subscription's slot stays held from its `Open` until the node
+///   finishes writing its terminal outcome ([`SubscriptionModel::end`],
+///   [`SubscriptionModel::terminal_written`]).
 #[derive(Clone, Debug)]
 pub struct SubscriptionModel {
     row: &'static MessageRule,
@@ -169,7 +188,8 @@ impl SubscriptionModel {
         let publisher = self.publishers.entry(session).or_default();
         let reused = publisher.live.contains_key(&key)
             || publisher.tombstones.iter().any(|dead| dead.key == key);
-        let held = publisher.live.len();
+        let live = publisher.live.len();
+        let held = live + publisher.writing.len();
         let partial = credit.objects == 0 || credit.bytes == 0;
         let labels = grant_faults(self.credit, Totals::default(), credit, Totals::default())
             .with_if(held >= max_live.saturating_mul(2), Label::OverLive)
@@ -179,7 +199,7 @@ impl SubscriptionModel {
         if !labels.is_conformant() {
             return labels;
         }
-        let keep = max_live.saturating_sub(1).saturating_sub(held);
+        let keep = max_live.saturating_sub(1).saturating_sub(live);
         while publisher.tombstones.len() > keep {
             publisher.tombstones.pop_front();
         }
@@ -315,8 +335,9 @@ impl SubscriptionModel {
         true
     }
 
-    /// The node ends `key` on `session` and writes its terminal outcome.
-    /// False if it isn't live.
+    /// The node ends `key` on `session` and starts writing its terminal
+    /// outcome. The subscription leaves a tombstone now, and its slot stays
+    /// held until [`Self::terminal_written`]. False if it isn't live.
     pub fn end(&mut self, session: SessionId, key: ExchangeKey) -> bool {
         let bound = self.max_live.saturating_mul(2);
         let Some(publisher) = self.publishers.get_mut(&session) else {
@@ -325,6 +346,7 @@ impl SubscriptionModel {
         let Some(live) = publisher.live.remove(&key) else {
             return false;
         };
+        publisher.writing.push(key);
         publisher.tombstones.push_back(Tombstone {
             key,
             sequence: live.sequence,
@@ -338,6 +360,19 @@ impl SubscriptionModel {
         true
     }
 
+    /// The node finished writing `key`'s terminal outcome on `session`,
+    /// which frees its slot. False if no such write is pending.
+    pub fn terminal_written(&mut self, session: SessionId, key: ExchangeKey) -> bool {
+        let Some(publisher) = self.publishers.get_mut(&session) else {
+            return false;
+        };
+        let Some(at) = publisher.writing.iter().position(|pending| *pending == key) else {
+            return false;
+        };
+        publisher.writing.remove(at);
+        true
+    }
+
     /// Tombstones the node holds on `session`.
     pub fn tombstones(&self, session: SessionId) -> usize {
         self.publishers
@@ -347,11 +382,17 @@ impl SubscriptionModel {
 
     // The node as subscriber: its own updates, and the peer's pages.
 
-    /// The node opens `key` on `session` with `credit`. False if the session
-    /// holds `max_live` subscriptions, the key is live or among the last
-    /// `max_live` ended, or the credit lacks a unit or exceeds the row's.
-    /// The start cursor decides nothing, so the model doesn't take it.
-    pub fn subscribe(&mut self, session: SessionId, key: ExchangeKey, credit: Credit) -> bool {
+    /// The `Open` the node writes to open `key` on `session` with `credit`
+    /// from `start`. `None` if the session holds `max_live` subscriptions,
+    /// the key is live or among the last `max_live` ended, or the credit
+    /// lacks a unit or exceeds the row's.
+    pub fn subscribe(
+        &mut self,
+        session: SessionId,
+        key: ExchangeKey,
+        credit: Credit,
+        start: Cursor,
+    ) -> Option<Update> {
         let empty_unit = credit.objects == 0 || credit.bytes == 0;
         let above = credit.objects > self.credit.objects || credit.bytes > self.credit.bytes;
         let subscriber = self.subscribers.entry(session).or_default();
@@ -361,15 +402,17 @@ impl SubscriptionModel {
             || empty_unit
             || above
         {
-            return false;
+            return None;
         }
-        let granted = Totals::default()
-            .plus(credit)
-            .expect("u32 credit fits u64 totals");
+        let granted = Totals {
+            objects: credit.objects.into(),
+            bytes: credit.bytes.into(),
+        };
         subscriber.live.insert(
             key,
             Subscription {
                 sequence: 0,
+                acknowledged: start,
                 granted,
                 consumed: Totals::default(),
                 unaccepted: VecDeque::new(),
@@ -377,53 +420,56 @@ impl SubscriptionModel {
                 close_sent: false,
             },
         );
-        true
+        Some(Update {
+            sequence: 0,
+            acknowledged: start,
+            added: credit,
+        })
     }
 
-    /// The node grants `added` on `key`. False if `key` isn't live, `Close`
-    /// was sent, `added` is empty, or the window from the accepted pages
-    /// would exceed the row's credit.
-    pub fn grant(&mut self, session: SessionId, key: ExchangeKey, added: Credit) -> bool {
+    /// The `Grant` the node writes to add `added` on `key`. `None` if `key`
+    /// isn't live, `Close` was sent, `added` is empty, or the window from
+    /// the accepted pages would exceed the row's credit.
+    pub fn grant(&mut self, session: SessionId, key: ExchangeKey, added: Credit) -> Option<Update> {
         let credit = self.credit;
-        let Some(live) = self
+        let live = self
             .subscribers
             .get_mut(&session)
-            .and_then(|subscriber| subscriber.live.get_mut(&key))
-        else {
-            return false;
-        };
-        let Some(granted) = live.granted.plus(added) else {
-            return false;
-        };
+            .and_then(|subscriber| subscriber.live.get_mut(&key))?;
+        let granted = live.granted.plus(added)?;
         let within = within_window(credit, granted, live.accepted);
-        let Some(sequence) = live.sequence.checked_add(1) else {
-            return false;
-        };
+        let sequence = live.sequence.checked_add(1)?;
         if live.close_sent || (added.objects == 0 && added.bytes == 0) || !within {
-            return false;
+            return None;
         }
         live.sequence = sequence;
         live.granted = granted;
-        true
+        Some(Update {
+            sequence,
+            acknowledged: live.acknowledged,
+            added,
+        })
     }
 
-    /// The node sends `Close` on `key`. False if `key` isn't live or `Close`
-    /// was sent.
-    pub fn close(&mut self, session: SessionId, key: ExchangeKey) -> bool {
-        let Some(live) = self
+    /// The `Close` the node writes on `key`. `None` if `key` isn't live or
+    /// `Close` was sent.
+    pub fn close(&mut self, session: SessionId, key: ExchangeKey) -> Option<Update> {
+        let live = self
             .subscribers
             .get_mut(&session)
             .and_then(|subscriber| subscriber.live.get_mut(&key))
-            .filter(|live| !live.close_sent)
-        else {
-            return false;
-        };
-        let Some(sequence) = live.sequence.checked_add(1) else {
-            return false;
-        };
+            .filter(|live| !live.close_sent)?;
+        let sequence = live.sequence.checked_add(1)?;
         live.sequence = sequence;
         live.close_sent = true;
-        true
+        Some(Update {
+            sequence,
+            acknowledged: live.acknowledged,
+            added: Credit {
+                objects: 0,
+                bytes: 0,
+            },
+        })
     }
 
     /// The node's handler accepted every page of `key` through `cursor`.
@@ -445,6 +491,7 @@ impl SubscriptionModel {
             .next_back()
             .expect("the drained range ends at a found index");
         live.accepted = through;
+        live.acknowledged = cursor;
         true
     }
 

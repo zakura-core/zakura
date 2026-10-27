@@ -26,7 +26,8 @@ use crate::zakura::{
         test_family::{self, Probe},
         CadenceBuckets, CadenceCharge, Produce, Publications, ReservationPool, Reservations,
         ReserveRefused, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
-        ServeLimits, SinkProgress, SubscribeRefused, SubscriptionLimits, Subscriptions, WorkLease,
+        ServeLimits, SinkProgress, SubscribeRefused, SubscriptionLimits, Subscriptions,
+        TerminalPermit, WorkLease,
     },
     transport::{FrameFilter, InboundReader},
     Clock, CloseCause, Credit, FrameRejection, FramedRecv, MessageRule, Stream, ZakuraPeerId,
@@ -314,6 +315,9 @@ fn limits(rules: &[MessageRule], subscription_type: u16) -> SubscriptionLimits {
 /// and cursors: the updates a peer sends to this node.
 pub struct Updates {
     publications: Publications<u64, u64>,
+    /// Ended subscriptions' terminal outcomes still being written, oldest
+    /// first. Each permit holds its subscription's slot.
+    writing: Vec<(u64, TerminalPermit)>,
 }
 
 impl Updates {
@@ -321,6 +325,7 @@ impl Updates {
     pub fn new(rules: &'static [MessageRule], subscription_type: u16) -> Self {
         Updates {
             publications: Publications::new(limits(rules, subscription_type)),
+            writing: Vec::new(),
         }
     }
 
@@ -385,15 +390,52 @@ impl Updates {
             })
     }
 
-    /// Ends `key`'s subscription and writes its terminal outcome at once.
+    /// Ends `key`'s subscription and starts writing its terminal outcome,
+    /// which holds the subscription's slot until [`Self::terminal_written`].
     /// False if it isn't live.
     pub fn end(&mut self, key: u64) -> bool {
-        self.publications.end(&key).is_some()
+        let Some(permit) = self.publications.end(&key) else {
+            return false;
+        };
+        self.writing.push((key, permit));
+        true
+    }
+
+    /// Finishes writing `key`'s terminal outcome, which frees its slot.
+    /// False if no such write is pending.
+    pub fn terminal_written(&mut self, key: u64) -> bool {
+        let Some(at) = self.writing.iter().position(|(pending, _)| *pending == key) else {
+            return false;
+        };
+        drop(self.writing.remove(at));
+        true
     }
 
     /// Tombstones held.
     pub fn tombstones(&self) -> usize {
         self.publications.tombstones()
+    }
+}
+
+/// An update [`Pages`] records before this node writes it: the fields that
+/// go on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// Zero for `Open`, then one more for each update.
+    pub sequence: u32,
+    /// The start for `Open`, then the last page the handler accepted.
+    pub acknowledged: u64,
+    /// The credit the update adds. `Close` adds none.
+    pub added: Credit,
+}
+
+impl From<crate::zakura::regulation::Update<u64>> for Update {
+    fn from(update: crate::zakura::regulation::Update<u64>) -> Self {
+        Update {
+            sequence: update.sequence,
+            acknowledged: update.acknowledged,
+            added: update.added,
+        }
     }
 }
 
@@ -425,25 +467,28 @@ impl Pages {
         }
     }
 
-    /// Records `Open` before this node writes it.
-    pub fn open(&mut self, key: u64, credit: Credit, start: u64) -> Result<(), &'static str> {
+    /// Records `Open` before this node writes it, and returns it.
+    pub fn open(&mut self, key: u64, credit: Credit, start: u64) -> Result<Update, &'static str> {
         self.subscriptions
             .open(key, credit, start)
-            .map(|_| ())
+            .map(Update::from)
             .map_err(refused)
     }
 
-    /// Records `Grant` before this node writes it.
-    pub fn grant(&mut self, key: u64, added: Credit) -> Result<(), &'static str> {
+    /// Records `Grant` before this node writes it, and returns it.
+    pub fn grant(&mut self, key: u64, added: Credit) -> Result<Update, &'static str> {
         self.subscriptions
             .grant(&key, added)
-            .map(|_| ())
+            .map(Update::from)
             .map_err(refused)
     }
 
-    /// Records `Close` before this node writes it.
-    pub fn close(&mut self, key: u64) -> Result<(), &'static str> {
-        self.subscriptions.close(&key).map(|_| ()).map_err(refused)
+    /// Records `Close` before this node writes it, and returns it.
+    pub fn close(&mut self, key: u64) -> Result<Update, &'static str> {
+        self.subscriptions
+            .close(&key)
+            .map(Update::from)
+            .map_err(refused)
     }
 
     /// Records that the handler accepted every page through `cursor`.

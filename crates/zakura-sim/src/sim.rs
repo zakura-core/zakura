@@ -144,7 +144,9 @@ impl Sim {
             choices.take_draws()
         };
         sink.record(Record::Init(InitRecord { draws }));
-        let end = match self.failure.take() {
+        // A checker's failure from setup, such as a missing source, ends the
+        // run before its first step.
+        let end = match self.failure.take().or_else(|| checker.harness_failure()) {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
@@ -154,18 +156,14 @@ impl Sim {
             _ => self.choices.borrow().decider.finish().err(),
         };
         // A failure the last step's code left behind outranks the outcome,
-        // and so do an unreached trace record, evidence that names a step
-        // the run didn't take, and a failure the checker found, as in a run
-        // that ended before any step.
+        // and so do an unreached trace record and evidence that names a step
+        // the run didn't take.
         let end = match self
             .failure
             .take()
             .or_else(|| unreached.map(HarnessFailure::Plan))
             .or_else(|| evidence_outside_run(&end))
-            .or_else(|| match end.outcome {
-                Outcome::Harness => None,
-                _ => checker.harness_failure(),
-            }) {
+        {
             Some(failure) => state.end_harness(failure),
             None => end,
         };

@@ -482,6 +482,16 @@ fn fifo_link_offers_only_the_oldest() {
     drop(sim);
 }
 
+/// `Net` reads the network's own clock, so it refuses to answer for any
+/// instant but the run's current one rather than answer for the wrong one.
+#[test]
+#[should_panic(expected = "a Net answers only for the run's current instant")]
+fn queries_answer_only_for_the_current_instant() {
+    let _sim = Sim::new(run_config(), Plan::from_fuzz(&[]));
+    let net = scenario(link(100, true)).net();
+    net.enabled(at(Duration::from_millis(50)), &mut Vec::new());
+}
+
 /// With `loss_after_admission`, a link offers no drop until the harness
 /// says a session was admitted on it, and then both of its directions do.
 #[test]

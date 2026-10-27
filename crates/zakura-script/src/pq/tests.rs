@@ -5,8 +5,8 @@ use zakura_chain::{
     transaction::{Hash, LockTime},
 };
 use zcash_script::script::Evaluable as _;
-use zcash_transparent::wots::{
-    master_from_seed, signing_key, AccountScript, Authorization, KeySet, WOTS_SIGOP_COST,
+use zcash_transparent::pq::{
+    master_from_seed, signing_key, AccountScript, Authorization, KeySet, Scheme, SignatureScheme,
 };
 
 use super::*;
@@ -75,7 +75,7 @@ fn covered_sig() -> Vec<u8> {
 
 fn regtest() -> Network {
     Network::new_regtest(RegtestParameters {
-        experimental_wots_activation_height: Some(Height(200)),
+        experimental_pq_transparent_activation_height: Some(Height(200)),
         ..Default::default()
     })
 }
@@ -92,7 +92,7 @@ fn cached(
         NetworkUpgrade::Nu5,
     )
     .unwrap()
-    .with_wots_context(network, height)
+    .with_pq_context(network, height)
 }
 
 /// A first spend: a deposit signed by step 0, spare 0, plus a covered deposit, creating the
@@ -125,15 +125,15 @@ fn account_rules_replace_the_interpreter_only_after_regtest_activation() {
     let network = regtest();
 
     let accepted = cached(&tx, &previous, &network, Height(200));
-    assert_eq!(accepted.wots_accounts(), Ok(()));
+    assert_eq!(accepted.pq_accounts(), Ok(()));
     assert_eq!(accepted.is_valid(0), Ok(()));
     assert_eq!(accepted.is_valid(1), Ok(()));
-    assert_eq!(accepted.p2sh_sigops(), WOTS_SIGOP_COST);
+    assert_eq!(accepted.p2sh_sigops(), Scheme::SIGOPS);
 
     // Before activation, or off regtest, the interpreter rejects the account opcode.
     for (network, height) in [(&network, Height(199)), (&Network::Mainnet, Height(200))] {
         let inactive = cached(&tx, &previous, network, height);
-        assert_eq!(inactive.wots_accounts(), Ok(()));
+        assert_eq!(inactive.pq_accounts(), Ok(()));
         assert!(inactive.is_valid(0).is_err());
         assert!(inactive.is_valid(1).is_err());
     }
@@ -151,7 +151,7 @@ fn account_rules_commit_to_the_whole_transaction() {
     }
     let rejected = cached(&tx, &previous, &regtest(), Height(200));
     assert_eq!(
-        rejected.wots_accounts(),
+        rejected.pq_accounts(),
         Err(crate::Error::Accounts(AccountError::Signature))
     );
     // Every input fails, including the covered deposit, which has no signature of its own.
@@ -165,13 +165,13 @@ fn control_outputs_need_the_account_s_authorization() {
     let tx = transaction(vec![input(1, &[])], vec![control(1)]);
     let forged = cached(&tx, &previous, &regtest(), Height(200));
     assert_eq!(
-        forged.wots_accounts(),
+        forged.pq_accounts(),
         Err(crate::Error::Accounts(
             AccountError::UnauthorizedControlOutput
         ))
     );
     assert_eq!(
-        cached(&tx, &previous, &regtest(), Height(199)).wots_accounts(),
+        cached(&tx, &previous, &regtest(), Height(199)).pq_accounts(),
         Ok(())
     );
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned WOTS-only demo and run it against an isolated regtest node.
+"""Build the pinned post-quantum account demo and run it against an isolated regtest node.
 
 Reads the node's Git dependency pins, checks the resolved node and harness graphs,
 builds both binaries, and starts the disposable-key scenario. Cargo.lock files
@@ -91,7 +91,7 @@ def run_demo(node: Path) -> None:
         ["cargo", "build", "--locked", "--manifest-path", str(harness / "Cargo.toml")],
         cwd=node, env=env, check=True, timeout=600,
     )
-    run_scenario([str(target / "debug/zakura-wots-regtest"), str(target / "debug/zakurad")])
+    run_scenario([str(target / "debug/zakura-pq-regtest"), str(target / "debug/zakurad")])
 
 
 def main(argv=None) -> int:
@@ -100,7 +100,7 @@ def main(argv=None) -> int:
     try:
         run_demo(Path(__file__).resolve().parents[2])
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"WOTS regtest demo failed: {error}", file=sys.stderr)
+        print(f"PQ regtest demo failed: {error}", file=sys.stderr)
         return 1
     return 0
 

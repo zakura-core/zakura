@@ -13,7 +13,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use zakura_wots_regtest::{Account, BOOTSTRAP_REDEEM, Coin, Unlock, build, output};
+use zakura_pq_regtest::{Account, BOOTSTRAP_REDEEM, Coin, Unlock, build, output};
 use zcash_primitives::transaction::Transaction;
 use zcash_script::script::{Code, Evaluable};
 use zcash_transparent::{
@@ -23,7 +23,7 @@ use zcash_transparent::{
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const ACTIVATION: u32 = 200;
-const SEED: &[u8] = b"zakura wots regtest account seed";
+const SEED: &[u8] = b"zakura pq regtest account seed";
 const COIN: u64 = 100_000_000;
 
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ fn main() -> Result<()> {
     let binary = PathBuf::from(
         std::env::args_os()
             .nth(1)
-            .ok_or("usage: zakura-wots-regtest /path/to/zakurad")?,
+            .ok_or("usage: zakura-pq-regtest /path/to/zakurad")?,
     )
     .canonicalize()?;
     let directory = tempfile::tempdir()?;
@@ -217,7 +217,7 @@ listen_addr = "127.0.0.1:0"
 initial_testnet_peers = []
 cache_dir = false
 [network.testnet_parameters]
-experimental_wots_activation_height = {ACTIVATION}
+experimental_pq_transparent_activation_height = {ACTIVATION}
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 [state]
@@ -411,7 +411,7 @@ fn scenario(node: &mut Node) -> Result<()> {
                    spare: u8,
                    paid: u64,
                    expiry: u32,
-                   tamper: &dyn Fn(&mut zcash_transparent::wots::Authorization)| {
+                   tamper: &dyn Fn(&mut zcash_transparent::pq::Authorization)| {
         build(
             &[
                 (
@@ -478,7 +478,7 @@ fn scenario(node: &mut Node) -> Result<()> {
     let forged = |inputs: Vec<(Coin, Unlock<'_>)>,
                   pay: Vec<TxOut>,
                   change: &Script,
-                  tamper: &dyn Fn(&mut zcash_transparent::wots::Authorization)|
+                  tamper: &dyn Fn(&mut zcash_transparent::pq::Authorization)|
      -> Result<Transaction> {
         Ok(build(
             &inputs,
@@ -547,7 +547,7 @@ fn scenario(node: &mut Node) -> Result<()> {
             successor(),
             &deposit,
             &|authorization| {
-                authorization.signature[3] ^= 1;
+                authorization.witness[3] ^= 1;
             },
         )?,
         "altered signature",

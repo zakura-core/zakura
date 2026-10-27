@@ -619,10 +619,10 @@ where
                 // doing expensive script verification, to avoid DoS attacks on
                 // the script interpreter.
                 #[cfg(feature = "experimental-pq-transparent")]
-                let experimental = zakura_script::wots::active(&network, req.height());
+                let experimental = zakura_script::pq::active(&network, req.height());
                 #[cfg(not(feature = "experimental-pq-transparent"))]
                 let experimental = false;
-                check::mempool_standard_input_scripts_with_wots(tx.as_ref(), &spent_outputs, experimental)?;
+                check::mempool_standard_input_scripts_with_pq(tx.as_ref(), &spent_outputs, experimental)?;
             }
 
             let mempool_transaction = req.mempool_transaction();
@@ -643,11 +643,11 @@ where
                 {
                     let cached = CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?;
                     #[cfg(feature = "experimental-pq-transparent")]
-                    let cached = cached.with_wots_context(&network, req.height());
+                    let cached = cached.with_pq_context(&network, req.height());
                     // Account rules cover the whole transaction, including coinbase and
                     // transactions without account inputs, so they can't wait for input scripts.
                     #[cfg(feature = "experimental-pq-transparent")]
-                    cached.wots_accounts()?;
+                    cached.pq_accounts()?;
                     Arc::new(cached)
                 };
 

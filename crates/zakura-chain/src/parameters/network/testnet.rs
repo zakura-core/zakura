@@ -1240,7 +1240,7 @@ impl ParametersBuilder {
             initial_nsm_value_balance,
         } = self;
         let mut parameters = Parameters {
-            experimental_wots_activation_height: None,
+            experimental_pq_transparent_activation_height: None,
             network_name,
             network_magic,
             genesis_hash,
@@ -1381,8 +1381,8 @@ fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderE
 /// A struct of parameters for configuring Regtest in Zebra.
 #[derive(Debug, Default, Clone)]
 pub struct RegtestParameters {
-    /// Explicit activation for the experimental WOTS opcode; regtest only.
-    pub experimental_wots_activation_height: Option<Height>,
+    /// Explicit activation for the experimental post-quantum transparent accounts; regtest only.
+    pub experimental_pq_transparent_activation_height: Option<Height>,
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,
     /// Configured funding streams
@@ -1418,7 +1418,7 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
     /// Explicit activation configured only by the Regtest constructor.
-    experimental_wots_activation_height: Option<Height>,
+    experimental_pq_transparent_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -1497,9 +1497,9 @@ impl Default for Parameters {
 }
 
 impl Parameters {
-    /// Returns the regtest-only WOTS activation, absent on public Testnet.
-    pub fn experimental_wots_activation_height(&self) -> Option<Height> {
-        self.experimental_wots_activation_height
+    /// Returns the regtest-only post-quantum transparent activation, absent on public Testnet.
+    pub fn experimental_pq_transparent_activation_height(&self) -> Option<Height> {
+        self.experimental_pq_transparent_activation_height
     }
 
     /// Creates a new [`ParametersBuilder`].
@@ -1515,7 +1515,7 @@ impl Parameters {
     /// checkpoint before Canopy activation, or if another parameter is invalid.
     pub fn new_regtest(
         RegtestParameters {
-            experimental_wots_activation_height,
+            experimental_pq_transparent_activation_height,
             activation_heights,
             funding_streams,
             lockbox_disbursements,
@@ -1571,7 +1571,7 @@ impl Parameters {
         check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
         let parameters = Self {
-            experimental_wots_activation_height,
+            experimental_pq_transparent_activation_height,
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
@@ -1620,7 +1620,7 @@ impl Parameters {
             // Regtest chains start empty, so the seed is always zero. It stays out of the
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
-            experimental_wots_activation_height: _,
+            experimental_pq_transparent_activation_height: _,
             initial_nsm_value_balance: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 

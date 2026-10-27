@@ -768,6 +768,92 @@ fn every_lease_end_cause_reclaims_before_shutdown() {
     }
 }
 
+/// Accepted page work survives its session's cancellation and still
+/// releases its lease. The node serves `mirror-0`, whose link closes once
+/// the node's first read is submitted, and that read is held until the
+/// connection has closed, then completes with `engine`. The publisher's
+/// page job outlives the session and takes the reply, and the read consumes
+/// its lease in the log, so the lease ends before shutdown, not by it.
+#[test]
+fn page_work_outlives_a_closed_session_and_ends_its_lease() {
+    use zakura_sim::harness::header_node::{
+        policy::{Allow, Hold, OpKind, Select, Trigger},
+        ControlAction, ControlStep,
+    };
+
+    let read = || Select::nth(OpKind::Read, 1);
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "mirror-0".to_owned(),
+            action: ControlAction::Close,
+            when: Some(Trigger::Submitted(read())),
+        }],
+        ..node_at_a3(
+            true,
+            vec![Hold {
+                select: read(),
+                until: Trigger::Closed("mirror-0".to_owned()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+        )
+    };
+    for input in inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let port = ports.node.clone();
+        let live = std::cell::Cell::new(None);
+        let mut last = after_step(|_| {
+            live.set(Some(port.engine().live_leases()));
+            None
+        });
+        let report = run_on(&scenario, &ports, input, &mut last);
+        drop(last);
+        let facts = facts(&report);
+        let (id, lease) = facts
+            .iter()
+            .find_map(|(_, fact)| match fact {
+                StorageFact::Submitted {
+                    id,
+                    request: StorageRequest::ReadHeaderPath { lease, .. },
+                    ..
+                } => Some((*id, lease.clone().expect("the node's port issued it"))),
+                _ => None,
+            })
+            .expect("the node reads a page for mirror-0");
+        let step_of = |wanted: &dyn Fn(&StorageFact) -> bool| {
+            facts
+                .iter()
+                .find(|(_, fact)| wanted(fact))
+                .map(|(step, _)| *step)
+        };
+        let closed = report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == "peer:mirror-0:close")
+            .expect("the close is picked")
+            .step;
+        let completed = step_of(&|fact| {
+            matches!(fact, StorageFact::Completed { id: c, outcome, .. } if *c == id && outcome == "engine")
+        })
+        .expect("the held read completes with engine");
+        let taken = step_of(&|fact| matches!(fact, StorageFact::ReplyTaken { id: t } if *t == id))
+            .expect("the page job outlives the session and takes the read's reply");
+        let ended = step_of(&|fact| {
+            matches!(
+                fact,
+                StorageFact::CapabilityEnded { lease: l, release }
+                    if l.lease_id == lease.lease_id && release == "lease-consumed-by-read"
+            )
+        })
+        .expect("the read consumes its lease during the run");
+        assert!(
+            closed < ended && ended <= completed && completed < taken,
+            "closed {closed}, lease ended {ended}, completed {completed}, taken {taken}"
+        );
+        assert_eq!(live.get(), Some(0), "no lease is live at the last step");
+    }
+}
+
 /// The probe acquires a path to the node's tip, releases it, then reads the
 /// released handle. The read replies `Unavailable`, never a page.
 #[test]

@@ -41,6 +41,8 @@ pub(crate) use pipe::{
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
+#[cfg(any(test, zakura_sim))]
+pub use service::CloseReason;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,

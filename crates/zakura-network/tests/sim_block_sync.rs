@@ -16,18 +16,34 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use zakura_chain::{block, parameters::Network};
+use futures::future::BoxFuture;
+use zakura_chain::{
+    block,
+    parameters::Network,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    transaction::Transaction,
+    transparent,
+};
 use zakura_header_chain::{
     AlarmSet, BodyUnavailableSummary, BodyWorkEpoch, ChainScore, CommittedHeaderChainView,
     EngineMode, EngineSnapshot, Frontier, FrontierSet, HeaderGeneration, StateVersion, SuffixWork,
     VerifiedGeneration,
 };
-use zakura_network::zakura::{
-    spawn_block_sync_reactor, BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup,
-    ZakuraBlockSyncConfig,
+use zakura_network::{
+    zakura::{
+        framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
+        BlockRangeSource, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
+        BlockSyncFrontiers, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStartup,
+        CloseReason, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
+        ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+    },
+    BoxError,
 };
+use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{watch, CancellationToken};
 use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
+use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 /// A run that takes more steps than this is stuck.
 const MAX_STEPS: usize = 100_000;
@@ -567,4 +583,410 @@ fn block_sync_alarm_age_follows_scenario_utc() {
         run.finish(settled)
     });
     assert_no_panic(&observed);
+}
+
+/// Mainnet block 1 with its coinbase rewritten to claim `height`, and its
+/// merkle root recomputed. Each such block has its own hash, decodes, and
+/// passes the routine's coinbase-height and merkle checks.
+fn fixture_block(height: u32) -> Arc<block::Block> {
+    let mut block: block::Block = BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet block 1 decodes");
+    let coinbase = Arc::make_mut(&mut block.transactions[0]);
+    let input = match coinbase {
+        Transaction::V1 { inputs, .. }
+        | Transaction::V2 { inputs, .. }
+        | Transaction::V3 { inputs, .. }
+        | Transaction::V4 { inputs, .. }
+        | Transaction::V5 { inputs, .. }
+        | Transaction::V6 { inputs, .. } => &mut inputs[0],
+    };
+    let transparent::Input::Coinbase {
+        height: coinbase_height,
+        ..
+    } = input
+    else {
+        panic!("block 1 starts with a coinbase input");
+    };
+    *coinbase_height = block::Height(height);
+    let mut header = *block.header;
+    header.merkle_root = block.transactions.iter().collect();
+    block.header = Arc::new(header);
+    Arc::new(block)
+}
+
+/// Serves the fixture blocks at heights 1 and up, as committed storage would.
+#[derive(Debug)]
+struct FixtureSource(Vec<Arc<block::Block>>);
+
+impl BlockRangeSource for FixtureSource {
+    /// Returns the stored blocks from `start_height`, up to the count and
+    /// byte limits.
+    fn read(
+        &self,
+        request: BlockRangeRead,
+    ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
+        let mut blocks = Vec::new();
+        let mut bytes = 0;
+        for height in (request.start_height.0..).take(request.count as usize) {
+            let Some(block) = height
+                .checked_sub(1)
+                .and_then(|index| self.0.get(index as usize))
+            else {
+                break;
+            };
+            let body = block.zcash_serialize_to_vec().expect("a block serializes");
+            bytes += body.len();
+            if bytes > request.max_body_bytes as usize {
+                break;
+            }
+            blocks.push((block::Height(height), body));
+        }
+        let lease = request.lease;
+        Box::pin(async move { Ok(BlockRangeReadResult { blocks, lease }) })
+    }
+}
+
+/// How long a run of linked nodes may take in virtual time.
+const MAX_NET_TIME: Duration = Duration::from_secs(600);
+
+/// One block-sync node: its reactor's handle, view sender and service, and
+/// the heights its sequencer submitted.
+struct Node {
+    /// Shared with the node's action task, which replies through it. Shutdown
+    /// takes it, so the sequencer's body input can close.
+    handle: Rc<RefCell<Option<BlockSyncHandle>>>,
+    _views: watch::Sender<Option<CommittedHeaderChainView>>,
+    service: BlockSyncService,
+    submitted: Rc<RefCell<Vec<block::Height>>>,
+}
+
+/// Block-sync nodes on one scheduler, linked by in-memory streams.
+struct Net {
+    sched: Scheduler,
+    plan: Rc<RefCell<Plan>>,
+    steps: Vec<String>,
+    shutdown: CancellationToken,
+    nodes: Vec<Node>,
+    exits: Rc<RefCell<Vec<String>>>,
+    /// Each linked connection's token and close reason.
+    connections: Vec<(CancellationToken, CloseReason)>,
+}
+
+impl Net {
+    fn new(seed: u64) -> Self {
+        let plan = Rc::new(RefCell::new(Plan(seed)));
+        let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        {
+            let plan = Rc::clone(&plan);
+            sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+        }
+        Net {
+            sched,
+            plan,
+            steps: Vec::new(),
+            shutdown: CancellationToken::new(),
+            nodes: Vec::new(),
+            exits: Rc::default(),
+            connections: Vec::new(),
+        }
+    }
+
+    /// Starts a node named `name` from `view`. Its storage holds `chain` up
+    /// to the view's verified tip, and its action task answers every query
+    /// with the rest of `chain`. It records each submission and replies to
+    /// none.
+    fn spawn(
+        &mut self,
+        name: &'static str,
+        view: CommittedHeaderChainView,
+        chain: &[Arc<block::Block>],
+    ) -> usize {
+        let verified = view.frontiers.verified_best.height.0 as usize;
+        let (views, views_rx) = watch::channel(Some(view.clone()));
+        let source = FixtureSource(chain[..verified].to_vec());
+        let (handle, mut actions, reactor) = spawn_block_sync_reactor(
+            startup(&view, views_rx, self.shutdown.clone()).with_range_source(Arc::new(source)),
+        )
+        .expect("block sync starts");
+        let service = BlockSyncService::new_with_handle(handle.clone());
+
+        let exits = Rc::clone(&self.exits);
+        self.sched.spawn_root(name, async move {
+            let exit = match reactor.await {
+                Ok(()) => "completed".to_owned(),
+                Err(error) => format!("{error}"),
+            };
+            exits.borrow_mut().push(exit);
+        });
+
+        let handle = Rc::new(RefCell::new(Some(handle)));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let metas: Vec<_> = chain
+            .iter()
+            .map(|block| BlockSyncBlockMeta {
+                height: block
+                    .coinbase_height()
+                    .expect("a fixture block has a height"),
+                hash: block.hash(),
+                size: BlockSizeEstimate::Confirmed(
+                    block.zcash_serialized_size() as u32, // a block is below 2 MB
+                ),
+            })
+            .collect();
+        {
+            let (handle, submitted) = (Rc::clone(&handle), Rc::clone(&submitted));
+            self.sched.spawn_root("actions", async move {
+                while let Some(action) = actions.recv().await {
+                    match action {
+                        BlockSyncAction::QueryNeededBlocks {
+                            query_id,
+                            from,
+                            limit,
+                            scope,
+                            ..
+                        } => {
+                            let blocks = metas
+                                .iter()
+                                .filter(|meta| meta.height >= from)
+                                .take(limit as usize)
+                                .copied()
+                                .collect();
+                            if let Some(handle) = &*handle.borrow() {
+                                let _ = handle.send_control(BlockSyncEvent::ScopedNeededBlocks {
+                                    query_id,
+                                    scope,
+                                    body_anchor: genesis(),
+                                    blocks,
+                                });
+                            }
+                        }
+                        BlockSyncAction::SubmitBlock { block, .. } => submitted.borrow_mut().push(
+                            block
+                                .coinbase_height()
+                                .expect("a submitted block has a height"),
+                        ),
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        self.nodes.push(Node {
+            handle,
+            _views: views,
+            service,
+            submitted,
+        });
+        self.nodes.len() - 1
+    }
+
+    /// Opens a session on node `node` over `streams`, from `remote` in
+    /// `direction`, on connection `conn_id`.
+    fn add_peer(
+        &mut self,
+        node: usize,
+        remote: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        conn_id: u64,
+        streams: (FramedRecv, FramedSend),
+    ) {
+        let connection = CancellationToken::new();
+        let peer = Peer::new_versioned(
+            conn_id,
+            remote,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            direction,
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+            1,
+            streams,
+            connection.clone(),
+        );
+        self.connections.push((connection, peer.close_reason()));
+        self.nodes[node].service.add_peer(peer);
+    }
+
+    /// Runs ready tasks, picked by the plan, until none is ready or `stop`
+    /// holds.
+    fn settle_until(&mut self, stop: impl Fn(&Self) -> bool) -> Status {
+        loop {
+            assert!(
+                self.steps.len() < MAX_STEPS,
+                "the run took {MAX_STEPS} steps"
+            );
+            let status = self.sched.status();
+            if status != Status::Running || stop(self) {
+                return status;
+            }
+            let ready = self.sched.ready();
+            let index = self.plan.borrow_mut().below(ready.len() as u64); // a Vec's length fits in u64
+            let pick = ready[index as usize]; // below `ready.len()`, a usize
+            self.steps
+                .push(format!("{}:{}", self.sched.task_name(pick.task), pick.at));
+            if let RunOutcome::Panicked(message) = self.sched.run(pick.task) {
+                self.steps.push(format!("panicked: {message}"));
+            }
+        }
+    }
+
+    /// Settles, advancing time whenever the run only waits on it, until
+    /// `stop` holds, the run stops for another reason, or virtual time
+    /// passes [`MAX_NET_TIME`].
+    fn run_until(&mut self, stop: impl Fn(&Self) -> bool) -> Status {
+        loop {
+            match self.settle_until(&stop) {
+                Status::WaitingOnTime
+                    if !stop(self) && self.sched.now().since_start() < MAX_NET_TIME =>
+                {
+                    let next = self
+                        .sched
+                        .next_deadline()
+                        .expect("WaitingOnTime has a timer");
+                    self.sched.advance_to(next);
+                    self.steps.push("advance-time".to_owned());
+                }
+                status => return status,
+            }
+        }
+    }
+
+    /// Shuts every node down and closes every connection. Each reactor ends
+    /// before its handle drops, as [`Run::finish`] explains.
+    fn finish(mut self) -> Vec<String> {
+        self.shutdown.cancel();
+        for (connection, _) in &self.connections {
+            connection.cancel();
+        }
+        let count = self.nodes.len();
+        self.run_until(|net| net.exits.borrow().len() == count);
+        assert_eq!(self.exits.borrow().len(), count, "every reactor ends");
+        for node in self.nodes.drain(..) {
+            node.handle.take();
+        }
+        assert_eq!(
+            self.run_until(|_| false),
+            Status::Quiescent,
+            "every task ends after shutdown"
+        );
+        assert_eq!(
+            self.sched.shutdown(),
+            Default::default(),
+            "no task was left"
+        );
+        assert!(
+            !self.steps.iter().any(|step| step.starts_with("panicked")),
+            "{:?}",
+            self.steps
+        );
+        self.exits.take()
+    }
+}
+
+/// The peer identity of the node whose key is `seed` repeated.
+fn peer_id(seed: u8) -> ZakuraPeerId {
+    let node = NodeSecretKey::from_bytes(&[seed; 32]).public();
+    ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id")
+}
+
+/// The fixture chain at heights 1 through `count`.
+fn fixture_chain(count: u32) -> Vec<Arc<block::Block>> {
+    (1..=count).map(fixture_block).collect()
+}
+
+/// Node `b` stores the whole fixture chain. Node `a` has its headers but no
+/// bodies, so it downloads them from `b` over a pair of in-memory streams,
+/// one each way, and submits each body in height order.
+#[test]
+fn block_sync_serves_a_range_over_memory_streams() {
+    const HEIGHTS: u32 = 4;
+    let chain = fixture_chain(HEIGHTS);
+    let tip = Frontier::new(block::Height(HEIGHTS), chain[chain.len() - 1].hash());
+    let mut net = Net::new(3);
+    let a = net.spawn(
+        "a",
+        committed_view(genesis(), tip, AlarmSet::default()),
+        &chain,
+    );
+    let b = net.spawn("b", committed_view(tip, tip, AlarmSet::default()), &chain);
+
+    // `a` writes what `b` reads, and the other way round.
+    let (a_send, b_recv) = framed_channel(8);
+    let (b_send, a_recv) = framed_channel(8);
+    net.add_peer(
+        a,
+        peer_id(2),
+        ServicePeerDirection::Outbound,
+        1,
+        (a_recv, a_send),
+    );
+    net.add_peer(
+        b,
+        peer_id(1),
+        ServicePeerDirection::Inbound,
+        1,
+        (b_recv, b_send),
+    );
+
+    let expected: Vec<_> = (1..=HEIGHTS).map(block::Height).collect();
+    let done = |net: &Net| *net.nodes[a].submitted.borrow() == expected;
+    net.run_until(done);
+    assert!(
+        done(&net),
+        "`a` submits every body in height order: {:?}",
+        net.nodes[a].submitted.borrow()
+    );
+    assert!(
+        net.nodes[b].submitted.borrow().is_empty(),
+        "`b` already had every body"
+    );
+    for (connection, reason) in &net.connections {
+        assert!(
+            !connection.is_cancelled(),
+            "neither service closed its connection"
+        );
+        assert_eq!(reason.get(), None);
+    }
+    assert_eq!(net.finish(), ["completed", "completed"]);
+}
+
+/// A peer that sends `BlocksDone` for a range nobody asked for breaks the
+/// stream-6 table. The node's routine rejects the frame, which closes the
+/// connection and records why.
+#[test]
+fn an_unsolicited_ending_closes_the_connection_with_its_cause() {
+    let genesis = genesis();
+    let mut net = Net::new(4);
+    let a = net.spawn(
+        "a",
+        committed_view(genesis, genesis, AlarmSet::default()),
+        &[],
+    );
+
+    let (a_send, mut probe_recv) = framed_channel(8);
+    let (probe_send, a_recv) = framed_channel(8);
+    net.add_peer(
+        a,
+        peer_id(2),
+        ServicePeerDirection::Outbound,
+        1,
+        (a_recv, a_send),
+    );
+    let frame = BlockSyncMessage::BlocksDone {
+        start_height: block::Height(1),
+        returned: 1,
+    }
+    .encode_frame()
+    .expect("a valid ending encodes");
+    net.sched.spawn_root("probe", async move {
+        probe_send.send(frame).await.expect("`a` reads the stream");
+        // Drains `a`'s status until the connection closes.
+        while probe_recv.recv().await.is_some() {}
+    });
+
+    let (connection, reason) = net.connections[0].clone();
+    net.run_until(|_| connection.is_cancelled());
+    assert!(connection.is_cancelled(), "{:?}", net.steps);
+    assert_eq!(reason.get(), Some("service_protocol_reject"));
+    assert_eq!(net.finish(), ["completed"]);
 }

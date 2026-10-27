@@ -72,10 +72,9 @@ pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
 #[cfg(any(test, zakura_sim))]
 pub(crate) use service::block_sync_streams;
-pub use service::BlockSyncPeerSession;
-pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use service::{BlockSyncPeerSession, BlockSyncService};
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{

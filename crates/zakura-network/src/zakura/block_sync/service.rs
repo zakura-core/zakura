@@ -216,7 +216,7 @@ impl BlockSyncPeerSession {
 
 /// Native stream-6 block-sync service scaffold.
 #[derive(Debug)]
-pub(crate) struct BlockSyncService {
+pub struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
@@ -326,8 +326,10 @@ impl BlockSyncService {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
-    /// Serve with a reactor that already validated its config.
-    pub(crate) fn new_with_handle(handle: BlockSyncHandle) -> Self {
+    /// Builds the service that admits block-sync sessions for the reactor
+    /// behind `handle`, which already validated its config, with no
+    /// sync-lifecycle gate.
+    pub fn new_with_handle(handle: BlockSyncHandle) -> Self {
         let config = handle
             .routine_wiring
             .as_ref()

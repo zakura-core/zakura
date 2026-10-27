@@ -70,8 +70,9 @@ pub(crate) enum Paired {
 /// storage's operations drain by drain. See the module doc.
 #[derive(Debug, Default)]
 pub(crate) struct Pairer {
-    /// Each submission the sequencer retained and storage hasn't finished
-    /// pairing, by token.
+    /// Each submission the sequencer ever retained, by token. A paired
+    /// submission stays, so a second operation on its token fails, even
+    /// after a holder change.
     submissions: BTreeMap<u64, Submission>,
     /// Each lease held now, oldest first.
     leases: Vec<Lease>,
@@ -173,9 +174,6 @@ impl Pairer {
             ));
         }
         submission.op = Some(op);
-        if !submission.held {
-            self.submissions.remove(&token);
-        }
         Ok(Paired::Submission { token, op })
     }
 
@@ -222,15 +220,10 @@ impl Pairer {
             } => {
                 let retained = change == "retained";
                 match self.submissions.get_mut(token) {
-                    // A token sent again after a failed send, or a
-                    // submission that detached.
-                    Some(submission) if retained => submission.held = true,
-                    Some(submission) => {
-                        submission.held = false;
-                        if submission.op.is_some() {
-                            self.submissions.remove(token);
-                        }
-                    }
+                    // A submission that detached: its `Detached` holder
+                    // takes over from its `Submitted` one. A retry takes a
+                    // new token, so this is the only second retain.
+                    Some(submission) => submission.held = retained,
                     None if retained => {
                         self.submissions.insert(
                             *token,
@@ -242,8 +235,7 @@ impl Pairer {
                             },
                         );
                     }
-                    // Released once paired and gone, or never retained,
-                    // which the holder fold reports.
+                    // Never retained, which the holder fold reports.
                     None => {}
                 }
                 Ok(())
@@ -424,6 +416,30 @@ mod tests {
             &[(1, holder(7, 3, "retained"))],
         );
         assert!(result.unwrap_err().starts_with("Unpaired"));
+    }
+
+    #[test]
+    fn a_detached_submission_pairs_only_once() {
+        let mut pairer = Pairer::default();
+        let detached = BlockSyncFact::Holder {
+            body: BlockSyncBody {
+                height: 3,
+                owner: owner(1),
+                bytes: 100,
+            },
+            holder: BlockSyncHolder::Detached { token: 7 },
+            change: "retained".to_owned(),
+        };
+        let result = drain(
+            &mut pairer,
+            &[(1, submit(1, 7, 3)), (2, submit(2, 7, 3))],
+            &[
+                (0, holder(7, 3, "retained")),
+                (1, holder(7, 3, "released")),
+                (1, detached),
+            ],
+        );
+        assert!(result.unwrap_err().starts_with("PairedTwice"));
     }
 
     #[test]

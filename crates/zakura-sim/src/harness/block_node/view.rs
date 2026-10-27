@@ -6,9 +6,13 @@
 //! leases. Checks compare it with independent models. An event the fold
 //! can't apply, such as a release of something never retained, is kept in
 //! [`BlockSyncView::anomalies`] for a check to judge, since it describes
-//! the node, not the harness.
+//! the node, not the harness. Each sequencer snapshot is compared with the
+//! folded holders it should match, and a mismatch is an anomaly too.
+//!
+//! Sessions are never pruned: block sync reports no session close yet, so a
+//! closed session's entry stays.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use zakura_chain::block::Height;
 use zakura_header_chain::BodyWorkOwner;
@@ -213,7 +217,10 @@ impl BlockSyncView {
                     .insert((snapshot.conn_id, snapshot.generation), snapshot.clone());
             }
             BlockEvent::WorkQueue(items) => self.work_queue.clone_from(items),
-            BlockEvent::Sequencer(ownership) => self.sequencer.clone_from(ownership),
+            BlockEvent::Sequencer(ownership) => {
+                self.compare_holders(ownership);
+                self.sequencer.clone_from(ownership);
+            }
             BlockEvent::SequencerClosed => self.sequencer_closed = true,
             // Frames, requests and the serving frames change no owner state
             // that a snapshot doesn't report.
@@ -221,9 +228,155 @@ impl BlockSyncView {
         }
     }
 
+    /// Records an anomaly unless `ownership`'s holders, as a multiset, are
+    /// the folded holders other than the work queue's.
+    fn compare_holders(&mut self, ownership: &SequencerOwnership) {
+        let mut counts: HashMap<(Holder, HeldBody), i64> = HashMap::new();
+        for held in ownership.holders() {
+            *counts.entry(held).or_default() += 1;
+        }
+        for held in &self.holders {
+            if !matches!(held.0, Holder::Queued { .. }) {
+                *counts.entry(*held).or_default() -= 1;
+            }
+        }
+        let mut differ: Vec<_> = counts
+            .into_iter()
+            .filter(|(_, count)| *count != 0)
+            .map(|((holder, body), count)| format!("{holder:?} at {} ({count:+})", body.height.0))
+            .collect();
+        if !differ.is_empty() {
+            differ.sort();
+            self.anomalies.push(format!(
+                "the sequencer's snapshot differs from its holder events: {}",
+                differ.join(", ")
+            ));
+        }
+    }
+
     /// The bytes of open handoffs, D2's `h·B` term with each handoff's own
     /// charge.
     pub fn handoff_bytes(&self) -> u64 {
         self.handoffs.iter().map(|handoff| handoff.charge).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use zakura_header_chain::{
+        BodyWorkAuthority, BodyWorkEpoch, BranchId, HeaderGeneration, HeaderWorkAuthority,
+        VerifiedGeneration,
+    };
+    use zakura_network::zakura::block_sync_observe::{
+        BudgetChangeKind, RetainedBody, SubmissionOwnership,
+    };
+
+    use super::*;
+
+    /// A body at height 3.
+    fn body() -> HeldBody {
+        HeldBody {
+            height: Height(3),
+            owner: BodyWorkAuthority {
+                header: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(1),
+                    branch: BranchId::new(
+                        zakura_chain::block::Hash([1; 32]),
+                        zakura_chain::block::Hash([2; 32]),
+                    ),
+                },
+                verified_generation: VerifiedGeneration::new(1),
+                body_work_epoch: BodyWorkEpoch::default(),
+            }
+            .bind(1, NonZeroU64::MIN),
+            bytes: 100,
+        }
+    }
+
+    /// `holder` of [`body`] changing.
+    fn holder(holder: Holder, change: HolderChange) -> BlockEvent {
+        BlockEvent::Holder {
+            body: body(),
+            holder,
+            change,
+        }
+    }
+
+    /// A sequencer snapshot holding [`body`] in the reorder buffer at
+    /// `allocation`, and submitted under token 9 if `submitted`.
+    fn snapshot(allocation: usize, submitted: bool) -> BlockEvent {
+        let held = body();
+        BlockEvent::Sequencer(SequencerOwnership {
+            reorder: vec![RetainedBody {
+                height: held.height,
+                owner: held.owner,
+                bytes: held.bytes,
+                admitted_estimate_bytes: None,
+                allocation,
+            }],
+            applying: Vec::new(),
+            submissions: submitted
+                .then_some(SubmissionOwnership {
+                    height: held.height,
+                    owner: held.owner,
+                    token: 9,
+                    bytes: held.bytes,
+                    detached: false,
+                })
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_release_never_retained_is_an_anomaly() {
+        let mut view = BlockSyncView::default();
+        view.fold(&holder(
+            Holder::Reorder { allocation: 1 },
+            HolderChange::Released,
+        ));
+        assert_eq!(view.anomalies.len(), 1, "{:?}", view.anomalies);
+        assert!(view.holders.is_empty());
+    }
+
+    #[test]
+    fn a_budget_change_from_another_count_is_an_anomaly() {
+        let mut view = BlockSyncView::default();
+        view.fold(&BlockEvent::Budget(BudgetChange {
+            kind: BudgetChangeKind::Reserved,
+            before: 0,
+            after: 100,
+        }));
+        assert!(view.anomalies.is_empty());
+        view.fold(&BlockEvent::Budget(BudgetChange {
+            kind: BudgetChangeKind::Released,
+            before: 50,
+            after: 0,
+        }));
+        assert_eq!(view.anomalies.len(), 1, "{:?}", view.anomalies);
+        assert_eq!(view.reserved, 0);
+    }
+
+    #[test]
+    fn a_snapshot_must_match_the_holder_events() {
+        let mut view = BlockSyncView::default();
+        view.fold(&holder(
+            Holder::Queued { allocation: 1 },
+            HolderChange::Retained,
+        ));
+        view.fold(&holder(
+            Holder::Reorder { allocation: 1 },
+            HolderChange::Retained,
+        ));
+        view.fold(&snapshot(1, false));
+        assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+        // A submission no holder event retained.
+        view.fold(&snapshot(1, true));
+        assert_eq!(view.anomalies.len(), 1, "{:?}", view.anomalies);
+        // A reorder body at another allocation than the events say.
+        view.fold(&snapshot(2, false));
+        assert_eq!(view.anomalies.len(), 2, "{:?}", view.anomalies);
     }
 }

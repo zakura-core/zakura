@@ -527,7 +527,7 @@ pub(crate) async fn drive_header_sync_actions(
 
 /// Native header-sync service.
 #[derive(Debug)]
-pub(crate) struct HeaderSyncService {
+pub struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
     /// Each peer's current session, with its connection direction.
     sessions: Arc<SessionTable<ServicePeerDirection>>,
@@ -541,7 +541,9 @@ pub(crate) struct HeaderSyncService {
 }
 
 impl HeaderSyncService {
-    pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
+    /// Builds the service that admits header-sync sessions for the reactor
+    /// behind `header_sync`, with no sync-lifecycle gate.
+    pub fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {
             header_sync,
             sessions: Arc::default(),

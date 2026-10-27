@@ -515,13 +515,14 @@ jobs:
           RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
         env:
           RUSTFLAGS: --cfg zakura_sim
-      # S4.7: the discovery regression must still find the bug it guards.
+      # S4.7: the discovery witness test must still find the bug it guards.
       # The patch reverts the wait_complete fix in this disposable checkout,
       # so this step runs last. A patch that no longer applies fails here.
-      - name: Check the discovery regression against the reverted fix
+      - name: Check the discovery witness test against the reverted fix
         run: |
           git apply crates/zakura-sim/tests/fixtures/discovery-wait-complete-revert.patch
-          cargo test --locked -p zakura-sim --test discovery -- --ignored --exact reverted_fix_misses_the_wakeup
+          cargo test --locked -p zakura-sim --test witness -- --exact discovery_wait_complete_lost_wakeup && exit 1
+          cargo test --locked -p zakura-sim --test witness -- --ignored --exact discovery_wait_complete_lost_wakeup_reverted
         env:
           RUSTFLAGS: --cfg zakura_sim
 

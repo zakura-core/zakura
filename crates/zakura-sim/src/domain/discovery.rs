@@ -7,7 +7,7 @@ use zakura_scheduler::Status as SchedulerStatus;
 use crate::{
     observe::Entry,
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    Observation, Violation,
+    Observation, ObservationLog, Violation,
 };
 
 /// `wait_complete` wakes the source once the initial exchange completes.
@@ -28,8 +28,28 @@ pub fn wait_complete_wakes<S: HasView>() -> Property<S> {
         needs: &[Source::Schedule],
         status: Status::Active,
         check: check_wait_complete_wakes::<S>,
-        witness: None,
+        witness: Some(final_mark_raced_the_wait),
     }
+}
+
+/// [`WAIT_COMPLETE_WAKES`]'s trigger history: the sink's final mark ran
+/// between the source's failed check and its `notified()`, the two
+/// operations the fix reorders. With the bug, the check comes first, and
+/// the mark lands before the `Notified` exists to catch it. With the fix,
+/// the `Notified` comes first, and the mark lands while the check is still
+/// loading flags. A run where the final mark lands before the source has
+/// done either, or after it has done both, never reaches the bug.
+fn final_mark_raced_the_wait(log: &ObservationLog) -> bool {
+    let mut state = WaitState::new();
+    for step in WaitState::steps(log.entries()) {
+        let raced = state.created_notified != state.check_failed;
+        let marked = state.all_marked();
+        state.apply(step);
+        if !marked && state.all_marked() {
+            return raced;
+        }
+    }
+    false
 }
 
 /// Checks [`WAIT_COMPLETE_WAKES`] from the run's whole log. It applies only
@@ -58,6 +78,9 @@ fn check_wait_complete_wakes<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 }
 
 /// What the observations show about the source's wait and the sink's marks.
+/// It follows one source and one sink, as the single-peer harness runs
+/// them; a harness with several peers needs each session's tasks told
+/// apart first.
 #[derive(Clone, Debug)]
 pub struct WaitState {
     /// Each task's next point, as (kind, line), from its last stop.
@@ -71,6 +94,17 @@ pub struct WaitState {
     /// and hasn't checked for completion since, so it can only go on when
     /// woken.
     in_wait: bool,
+    /// True if the source's last stop was a poll that returned pending, so
+    /// it runs again only once woken.
+    source_parked: bool,
+    /// True once the source has created its `Notified` in the current pass
+    /// through the waiting code.
+    created_notified: bool,
+    /// True once the source's check has failed in the current pass through
+    /// the waiting code: it ran a load and then parked or stopped at its
+    /// `notified`. A pass ends when the source parks, leaves the waiting
+    /// code, or runs its `notified` or check again.
+    check_failed: bool,
 }
 
 impl WaitState {
@@ -80,29 +114,77 @@ impl WaitState {
     /// that observation says which task ran. The point it ran from is where
     /// the task last stopped.
     pub fn of(entries: &[Entry]) -> WaitState {
-        let sites = sites();
-        let mut state = WaitState {
+        let mut state = WaitState::new();
+        WaitState::steps(entries).for_each(|step| state.apply(step));
+        state
+    }
+
+    /// The state before any step.
+    fn new() -> WaitState {
+        WaitState {
             next: BTreeMap::new(),
-            marked: vec![None; sites.marks.len()],
+            marked: vec![None; sites().marks.len()],
             last_load: None,
             last_notified: None,
             in_wait: false,
-        };
-        // Step 0 is setup, which runs no task.
+            source_parked: false,
+            created_notified: false,
+            check_failed: false,
+        }
+    }
+
+    /// `entries` split into steps, without step 0, which is setup and runs
+    /// no task.
+    fn steps(entries: &[Entry]) -> impl Iterator<Item = &[Entry]> {
         let start = entries.partition_point(|e| e.step == 0);
-        for step in entries[start..].chunk_by(|a, b| a.step == b.step) {
-            if let Some(task) = step.iter().find_map(|e| ran(&e.obs)) {
-                state.ran(sites, task, step[0].step);
-            }
-            for entry in step {
-                if let Observation::TaskReached { task, at, site } = &entry.obs {
-                    state
-                        .next
+        entries[start..].chunk_by(|a, b| a.step == b.step)
+    }
+
+    /// Applies one step's entries.
+    fn apply(&mut self, step: &[Entry]) {
+        let sites = sites();
+        let task = step.iter().find_map(|e| ran(&e.obs));
+        // A parked source that runs resumes its await, not its next point.
+        let source_ran = task.is_some_and(is_source);
+        let from = |kind: &str| {
+            source_ran && !self.source_parked && self.source_waits_at(|at| at.starts_with(kind))
+        };
+        let (created, loaded) = (from("notified"), from("load"));
+        if let Some(task) = task {
+            self.ran(sites, task, step[0].step);
+        }
+        for entry in step {
+            match &entry.obs {
+                Observation::TaskReached { task, at, site } => {
+                    if is_source(task) {
+                        self.source_parked = false;
+                    }
+                    self.next
                         .insert(task.clone(), (at.clone(), sites.line(site)));
                 }
+                Observation::TaskWaiting { task } | Observation::TaskParked { task }
+                    if is_source(task) =>
+                {
+                    self.source_parked = true;
+                }
+                _ => {}
             }
         }
-        state
+        if source_ran {
+            // A source that repeats an operation of its pass without parking
+            // went through a `notified.await` that was already woken, so it
+            // starts a new pass.
+            if (created && self.created_notified) || (loaded && self.check_failed) {
+                self.created_notified = false;
+                self.check_failed = false;
+            }
+            self.created_notified |= created;
+            self.check_failed |= loaded && (self.source_parked || self.source_at_notified());
+            if self.source_parked || !self.source_waits_at(|_| true) {
+                self.created_notified = false;
+                self.check_failed = false;
+            }
+        }
     }
 
     /// Notes that `task` ran at `step` from its last stop.
@@ -142,11 +224,15 @@ impl WaitState {
     /// True if the source's next point is its `notified` in the waiting
     /// code.
     pub fn source_at_notified(&self) -> bool {
+        self.source_waits_at(|at| at.starts_with("notified"))
+    }
+
+    /// True if the source's next point is in the waiting code, at a point
+    /// whose kind `at` accepts.
+    fn source_waits_at(&self, at: impl Fn(&str) -> bool) -> bool {
         let sites = sites();
-        self.next.iter().any(|(task, (at, line))| {
-            is_source(task)
-                && at.starts_with("notified")
-                && line.is_some_and(|line| sites.waiting.contains(&line))
+        self.next.iter().any(|(task, (kind, line))| {
+            is_source(task) && at(kind) && line.is_some_and(|line| sites.waiting.contains(&line))
         })
     }
 }
@@ -261,5 +347,157 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(*sites(), Sites::parse(SERVICE_RS));
+    }
+
+    const SINK: &str = "discovery_admission.1/discovery_pipe.1";
+    const SOURCE: &str = "discovery_admission.1/discovery_source.1";
+
+    /// A log built one step at a time, each step running one task.
+    struct History {
+        log: ObservationLog,
+        step: u64,
+    }
+
+    impl History {
+        fn new() -> History {
+            History {
+                log: ObservationLog::default(),
+                step: 0,
+            }
+        }
+
+        /// One step that runs `task` to point `at` on `line` of the
+        /// service's file, or parks it for `None`.
+        fn run(&mut self, task: &str, to: Option<(&str, u32)>) -> &mut History {
+            self.step += 1;
+            self.log.begin(self.step);
+            let task = task.to_owned();
+            self.log.push(match to {
+                Some((at, line)) => Observation::TaskReached {
+                    task,
+                    at: at.to_owned(),
+                    site: Some(format!("{}:{line}", sites().file)),
+                },
+                None => Observation::TaskWaiting { task },
+            });
+            self
+        }
+
+        /// The sink stores flag `i` and runs its notify, stopping before
+        /// the next mark's store.
+        fn mark(&mut self, i: usize) -> &mut History {
+            let notify = sites().marks[i];
+            self.run(SINK, Some(("store#1", notify - 1)))
+                .run(SINK, Some(("notify#1", notify)))
+                .run(SINK, Some(("send#1", 1)))
+        }
+
+        fn raced(&self) -> bool {
+            final_mark_raced_the_wait(&self.log)
+        }
+    }
+
+    /// The line of the service's first line that contains `needle`.
+    fn line_of(needle: &str) -> u32 {
+        let index = SERVICE_RS
+            .lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("service.rs has `{needle}`"));
+        // The file has far fewer than 2^32 lines.
+        index as u32 + 1
+    }
+
+    /// The point before flag `i`'s load in `complete`.
+    fn load(i: usize) -> Option<(&'static str, u32)> {
+        let flag = ["hello", "peers", "services"][i];
+        Some(("load#1", line_of(&format!("self.{flag}.load("))))
+    }
+
+    /// The point before `wait_complete`'s `notified()`.
+    fn notified() -> Option<(&'static str, u32)> {
+        Some(("notified#1", line_of("self.notify.notified()")))
+    }
+
+    /// The bug's order: the check fails on Hello, and every mark lands
+    /// while the source sits at its `notified`.
+    #[test]
+    fn marks_after_a_failed_check_race_the_wait() {
+        let mut bug = History::new();
+        bug.run(SOURCE, load(0)).run(SOURCE, notified());
+        bug.mark(0).mark(1).mark(2);
+        assert!(bug.raced());
+    }
+
+    /// The fix's order: the source created its `Notified`, and the final
+    /// mark lands while its check still has the Services load to run.
+    #[test]
+    fn marks_after_the_notified_race_the_check() {
+        let mut fix = History::new();
+        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.mark(0).mark(1);
+        fix.run(SOURCE, load(1)).run(SOURCE, load(2));
+        fix.mark(2);
+        assert!(fix.raced());
+    }
+
+    /// The same order without the `Notified`: with the bug, the final mark
+    /// lands while the check still has the Services load to run, which
+    /// sees the mark. The source never waits.
+    #[test]
+    fn a_mark_during_the_bugs_check_misses_the_race() {
+        let mut bug = History::new();
+        bug.run(SOURCE, load(0));
+        bug.mark(0).mark(1);
+        bug.run(SOURCE, load(1)).run(SOURCE, load(2));
+        bug.mark(2);
+        assert!(!bug.raced());
+    }
+
+    /// A source that has done both, or neither, misses the race: parked
+    /// after creating its `Notified` and failing its check, under either
+    /// order, or back at its `notified` after a wake.
+    #[test]
+    fn a_source_outside_the_window_misses_the_race() {
+        let mut bug = History::new();
+        bug.run(SOURCE, load(0))
+            .run(SOURCE, notified())
+            .run(SOURCE, None);
+        bug.mark(0).mark(1).mark(2);
+        assert!(!bug.raced());
+
+        let mut fix = History::new();
+        fix.run(SOURCE, notified())
+            .run(SOURCE, load(0))
+            .run(SOURCE, None);
+        fix.mark(0).mark(1).mark(2);
+        assert!(!fix.raced());
+
+        // Woken by Peers, the bug's source runs its check again, and Services
+        // lands mid-check.
+        let mut woken = History::new();
+        woken
+            .run(SOURCE, load(0))
+            .run(SOURCE, notified())
+            .run(SOURCE, None);
+        woken.mark(0).mark(1);
+        woken.run(SOURCE, load(0)).run(SOURCE, load(1));
+        woken.mark(2);
+        assert!(!woken.raced());
+    }
+
+    /// Peers lands between the fix's `notified()` and its failed check, so
+    /// the source's `notified.await` returns without parking. The next
+    /// pass starts over: the final mark lands during that pass's check, as
+    /// in [`marks_after_the_notified_race_the_check`].
+    #[test]
+    fn a_wait_that_was_already_woken_starts_a_new_pass() {
+        let mut fix = History::new();
+        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.mark(1);
+        fix.run(SOURCE, notified()).run(SOURCE, load(0));
+        fix.mark(0);
+        fix.run(SOURCE, load(1)).run(SOURCE, load(2));
+        fix.mark(2);
+        assert!(fix.raced());
     }
 }

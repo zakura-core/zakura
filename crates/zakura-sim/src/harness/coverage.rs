@@ -70,8 +70,11 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/abort-without-join", "abort_without_join"),
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
-        passing: sim_test("tests/discovery.rs", "committed_input_wakes"),
-        bypass: sim_test("tests/discovery.rs", "reverted_fix_misses_the_wakeup"),
+        passing: sim_test("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
+        bypass: sim_test(
+            "tests/witness.rs",
+            "discovery_wait_complete_lost_wakeup_reverted",
+        ),
     },
     Coverage {
         property: super::header_sync::OPERATION_IDS,

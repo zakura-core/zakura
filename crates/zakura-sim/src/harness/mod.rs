@@ -253,7 +253,7 @@ fn registry_checker<S: Subsystem>(this: &Rc<S>, assumptions: Assumptions<S>) -> 
 ///
 /// If two share an ID. `every_harness_names_its_statuses` builds every
 /// harness's registry.
-fn registry<S: Subsystem>() -> Registry<S> {
+pub(crate) fn registry<S: Subsystem>() -> Registry<S> {
     let mut properties = vec![
         Property {
             id: PropertyId::new(NO_TASK_PANIC),

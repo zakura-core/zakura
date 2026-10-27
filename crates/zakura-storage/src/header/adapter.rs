@@ -23,7 +23,10 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
+    },
 };
 
 use sha2::{Digest, Sha256};
@@ -87,6 +90,10 @@ pub struct EnginePort {
     /// The committed-view publisher, locked as `full_state` is. Its watch
     /// sends under the engine lock, as the selected watch does.
     views: StdMutex<ViewPublisher>,
+    /// Whether a block service commits through this port, which ends
+    /// [`Self::preload_blocks`]. Set once, and never across a run's
+    /// scheduling points, so a plain atomic suffices.
+    block_service: AtomicBool,
 }
 
 impl EnginePort {
@@ -154,7 +161,26 @@ impl EnginePort {
             selected: StdMutex::new(Some(selected)),
             full_state: StdMutex::new(VerifiedChain::new(fixture.genesis_block())),
             views: StdMutex::new(views),
+            block_service: AtomicBool::new(false),
         }
+    }
+
+    /// Records that a block service commits through this port.
+    ///
+    /// # Panics
+    ///
+    /// If one already does: two services would hand out the same operation
+    /// IDs and receipts.
+    pub(crate) fn bind_block_service(&self) {
+        assert!(
+            !self.block_service.swap(true, Ordering::Relaxed),
+            "one block service commits through a port"
+        );
+    }
+
+    /// Whether a block service commits through this port.
+    pub(crate) fn has_block_service(&self) -> bool {
+        self.block_service.load(Ordering::Relaxed)
     }
 
     /// The port, planning each later transition with at most

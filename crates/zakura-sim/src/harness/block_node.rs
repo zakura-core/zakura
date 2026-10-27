@@ -9,6 +9,9 @@
 //! holds the whole fixture chain: [`MirrorStorage`] answers each of their
 //! queries and reads on first poll. Each actor's headers, and each mirror's
 //! bodies, are committed before `Sim::new` by [`preload`].
+//!
+//! Mirrors hold every body, so they never ask the node for one. The node's
+//! serving is wired, but only a peer that lacks bodies would exercise it.
 
 use std::{
     cell::Cell,
@@ -85,13 +88,16 @@ pub fn preload(engine: &EnginePort, fixture: &BlockFixture, chain: &[FixtureBloc
         .expect("full state commits fixture bodies in order");
 }
 
+/// Regtest's last checkpoint: its checkpoint list holds only genesis.
+const LAST_CHECKPOINT: zakura_chain::block::Height = zakura_chain::block::Height(0);
+
 /// The apply limits zakurad's driver runs with by default on Regtest: the
 /// checkpoint limit clamped to its one legal value, `sync.full_verify_
 /// concurrency_limit`'s default 20, `sync.zakura_block_apply_concurrency_
-/// limit`'s default 32 (`zakurad/src/components/sync.rs`), and genesis as
-/// the last checkpoint, since Regtest's checkpoint list holds only genesis.
+/// limit`'s default 32 (`zakurad/src/components/sync.rs`), and
+/// [`LAST_CHECKPOINT`].
 pub fn default_limits() -> ApplyLimits {
-    ApplyLimits::clamped(usize::MAX, 20, 32, zakura_chain::block::Height(0))
+    ApplyLimits::clamped(usize::MAX, 20, 32, LAST_CHECKPOINT)
 }
 
 /// Which outcomes the policy offers.
@@ -332,8 +338,12 @@ pub struct BlockNode {
 impl BlockNode {
     /// Starts a reactor and its service on `engine`'s committed views, as
     /// zakurad wires them: production config, `engine`'s view watch as the
-    /// committed views, and `storage` answering its actions and range
-    /// reads. Peer IDs come from `seed`.
+    /// committed views, the decoded-window cap above [`LAST_CHECKPOINT`],
+    /// and `storage` answering its actions and range reads. Peer IDs come
+    /// from `seed`.
+    ///
+    /// Unlike zakurad, it supplies no retention, so every actor serves as
+    /// archive storage: no fixture chain is long enough to prune.
     pub fn spawn(
         sim: &mut Sim,
         name: &str,
@@ -343,7 +353,7 @@ impl BlockNode {
     ) -> Self {
         let view = engine.view();
         let frontiers = &view.frontiers;
-        let startup = BlockSyncStartup::new_with_committed_views(
+        let mut startup = BlockSyncStartup::new_with_committed_views(
             BlockSyncFrontiers {
                 finalized_height: frontiers.finalized.height,
                 verified_block_tip: frontiers.verified_best.height,
@@ -353,6 +363,7 @@ impl BlockNode {
             engine.subscribe_views(),
             ZakuraBlockSyncConfig::default(),
         );
+        startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
         let source: Arc<dyn BlockRangeSource> = match &storage {
             NodeStorage::Controlled { service, .. } => Arc::new(service.range_source()),
             NodeStorage::Mirror(mirror) => Arc::new(mirror.clone()),

@@ -47,15 +47,13 @@ use self::{
     tap::ReactorTap,
 };
 use crate::{
-    storage::HeaderStorage, ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    storage::{HeaderStorage, HEADER_SERVICE},
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
 /// Frames each direction of a link buffers, enough for a page and control
 /// frames in flight.
 pub(crate) const LINK_DEPTH: usize = 8;
-
-/// The header storage service's name in storage observations.
-const HEADER: &str = "header";
 
 /// A chain an actor holds before its run: `main` headers on branch 0 from
 /// genesis, then `fork`, if any, from that tip.
@@ -309,7 +307,7 @@ impl ActionSource for PolicySource {
                     |entry| match &entry.obs {
                         Observation::Storage {
                             service, seq, fact, ..
-                        } if service == HEADER => Some((*seq, fact)),
+                        } if service == HEADER_SERVICE => Some((*seq, fact)),
                         _ => None,
                     },
                 ));
@@ -323,7 +321,7 @@ impl ActionSource for PolicySource {
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
-                Observation::Storage { service, fact, .. } if service == HEADER => {
+                Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
                     predicates.record(fact)
                 }
                 Observation::Reactor { event, .. } => predicates.record_reactor(event),

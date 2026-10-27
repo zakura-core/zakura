@@ -20,7 +20,7 @@ mod header;
 
 pub use block::BlockStorage;
 pub(crate) use block::{decode as decode_block, SERVICE as BLOCK_SERVICE};
-pub(crate) use header::decode;
+pub(crate) use header::{decode, SERVICE as HEADER_SERVICE};
 pub use header::{request, work_owner, HeaderStorage};
 
 /// `t` plus `d`, saturating at the largest instant.

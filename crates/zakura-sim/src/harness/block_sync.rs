@@ -1,9 +1,11 @@
 //! The `block-sync/storage` harness: a block-sync node on controlled block
 //! storage, with mirror peers that hold the whole fixture chain.
 //!
-//! The node's real reactor, routines, sequencer and serving run against a
+//! The node's real reactor, routines and sequencer run against a
 //! [`ControlledBlockService`] that shares its engine with the node's header
-//! side, as zakurad's driver shares zakura-state with header sync. Header
+//! side, as zakurad's driver shares zakura-state with header sync. Its
+//! serving reads through the same service, but no mirror asks it for a
+//! body. Header
 //! sync itself doesn't run: every actor's headers are committed before the
 //! run, so block sync's work comes only from the committed views.
 //!
@@ -134,7 +136,17 @@ impl Subsystem for Storage {
 
     /// Commits every actor's headers, and each mirror's bodies, to its
     /// engine.
+    ///
+    /// # Panics
+    ///
+    /// If the node holds more bodies than the scenario has blocks.
     fn prepare(scenario: &BlockScenario) -> Ports {
+        assert!(
+            scenario.node_bodies <= scenario.blocks,
+            "a node holds at most the scenario's {} blocks, not {}",
+            scenario.blocks,
+            scenario.node_bodies
+        );
         let fixture = BlockFixture::regtest();
         let chain = fixture.uniform(
             fixture.anchor(),

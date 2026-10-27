@@ -1105,6 +1105,22 @@ impl PeerRegistry {
         })
     }
 
+    /// `peer`'s published outstanding claims, by height, read from its entry.
+    /// Empty for a peer with no entry.
+    #[cfg(test)]
+    pub(super) fn outstanding_snapshot(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Vec<(block::Height, OutstandingMeta)> {
+        self.lock().get(peer).map_or_else(Vec::new, |entry| {
+            entry
+                .outstanding
+                .iter()
+                .map(|(height, meta)| (*height, *meta))
+                .collect()
+        })
+    }
+
     /// Snapshot all peer claims for one height.
     pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
         let peers = self.lock();

@@ -370,6 +370,10 @@ impl OwnerModel {
         if heads != 1 || !head.is_head() {
             return Err(ModelFailure::MalformedTxn { txn: txn.txn });
         }
+        let actual: Vec<_> = txn.facts[..txn.facts.len() - 1]
+            .iter()
+            .map(|fact| fact.kind.clone())
+            .collect();
         let mut next = self.clone();
         let expected = match next.expect(txn, head) {
             Ok(expected) => expected,
@@ -380,16 +384,14 @@ impl OwnerModel {
                 })
             }
             Err(HeadError::Unexpected) => {
+                // An unknown owner outranks the illegal head.
+                self.unknown_owners(txn.txn, &actual, &actual)?;
                 return Err(ModelFailure::UnexpectedEffect {
                     txn: txn.txn,
                     found: head.clone(),
-                })
+                });
             }
         };
-        let actual: Vec<_> = txn.facts[..txn.facts.len() - 1]
-            .iter()
-            .map(|fact| fact.kind.clone())
-            .collect();
         self.compare_effects(txn.txn, &expected, &actual)?;
         // Checked once the facts match, so a missing end is reported as the
         // missing fact rather than as a head that disagrees with it.
@@ -431,21 +433,7 @@ impl OwnerModel {
                 None => extra.push(fact),
             }
         }
-        let created: Vec<LeaseKey> = actual
-            .iter()
-            .filter_map(|fact| match fact {
-                FactKind::Lease(LeaseFact::Leased { lease, .. }) => Some(*lease),
-                _ => None,
-            })
-            .collect();
-        for fact in &extra {
-            if let Some(owner) = self.unknown_owner(fact, &created) {
-                return Err(ModelFailure::UnknownOwner {
-                    txn: Some(txn),
-                    owner,
-                });
-            }
-        }
+        self.unknown_owners(txn, actual, extra.iter().copied())?;
         if let Some(fact) = missing.first() {
             return Err(ModelFailure::MissingEffect {
                 txn,
@@ -462,6 +450,34 @@ impl OwnerModel {
             return Err(ModelFailure::OrderViolation { txn });
         }
         Ok(())
+    }
+
+    /// Fails at the first of `scanned`, facts of transaction `txn`, that
+    /// names an owner the model lacks. A lease any of the transaction's
+    /// `actual` non-head facts creates isn't unknown.
+    fn unknown_owners<'f>(
+        &self,
+        txn: u64,
+        actual: &[FactKind],
+        scanned: impl IntoIterator<Item = &'f FactKind>,
+    ) -> Result<(), ModelFailure> {
+        let created: Vec<LeaseKey> = actual
+            .iter()
+            .filter_map(|fact| match fact {
+                FactKind::Lease(LeaseFact::Leased { lease, .. }) => Some(*lease),
+                _ => None,
+            })
+            .collect();
+        match scanned
+            .into_iter()
+            .find_map(|fact| self.unknown_owner(fact, &created))
+        {
+            Some(owner) => Err(ModelFailure::UnknownOwner {
+                txn: Some(txn),
+                owner,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The owner `fact` names that the model lacks, if any. A lease the
@@ -993,29 +1009,37 @@ impl OwnerModel {
         }) {
             return Err(ModelFailure::UndisposedReply(op.id));
         }
-        let expected = self.state();
+        // Destructured without `..`, so a new field can't go uncompared.
+        let OwnerState {
+            // Checked first, as freshness.
+            through_seq: _,
+            operations,
+            permits,
+            leases,
+            continuations,
+            class_waiters,
+            last_lease_id,
+            continuation_hits,
+        } = self.state();
         let fields = [
-            (
-                StateField::Operations,
-                expected.operations == actual.operations,
-            ),
-            (StateField::Permits, expected.permits == actual.permits),
-            (StateField::Leases, expected.leases == actual.leases),
+            (StateField::Operations, operations == actual.operations),
+            (StateField::Permits, permits == actual.permits),
+            (StateField::Leases, leases == actual.leases),
             (
                 StateField::Continuations,
-                expected.continuations == actual.continuations,
+                continuations == actual.continuations,
             ),
             (
                 StateField::ClassWaiters,
-                expected.class_waiters == actual.class_waiters,
+                class_waiters == actual.class_waiters,
             ),
             (
                 StateField::LastLeaseId,
-                expected.last_lease_id == actual.last_lease_id,
+                last_lease_id == actual.last_lease_id,
             ),
             (
                 StateField::ContinuationHits,
-                expected.continuation_hits == actual.continuation_hits,
+                continuation_hits == actual.continuation_hits,
             ),
         ];
         match fields.into_iter().find(|(_, equal)| !equal) {

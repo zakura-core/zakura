@@ -6,7 +6,7 @@ use super::{
     Cardinality, Kind, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Subject,
     Verdict,
 };
-use crate::{check::Violation, Observation, StepCtx};
+use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
@@ -67,6 +67,7 @@ pub struct CheckCtx<'a, S: HasView> {
     obliged: Vec<Obligation>,
     recorded: Vec<Violation>,
     missing: Option<String>,
+    labelled: Vec<LabelledFrame>,
 }
 
 /// What a check left behind besides its verdict.
@@ -77,6 +78,8 @@ pub(crate) struct CheckParts {
     pub(crate) recorded: Vec<Violation>,
     /// The first evidence it found missing.
     pub(crate) missing: Option<String>,
+    /// The frames it labelled, in order.
+    pub(crate) labelled: Vec<LabelledFrame>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -89,6 +92,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             obliged: Vec::new(),
             recorded: Vec::new(),
             missing: None,
+            labelled: Vec::new(),
         }
     }
 
@@ -98,6 +102,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             obliged: self.obliged,
             recorded: self.recorded,
             missing: self.missing,
+            labelled: self.labelled,
         }
     }
 
@@ -181,6 +186,12 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             "no observation counts toward an Ops bound on polls"
         );
         self.obliged.push(obligation);
+    }
+
+    /// Records a frame a role model labelled. The registry passes it on as
+    /// a [`CheckEvent::Label`](super::CheckEvent::Label) after the check.
+    pub fn label(&mut self, frame: LabelledFrame) {
+        self.labelled.push(frame);
     }
 
     /// A violation of the property at this step, with this step as its

@@ -11,6 +11,7 @@ use super::{
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, RunEnd},
+    model::LabelledFrame,
     Observation, ObservationLog,
 };
 
@@ -24,6 +25,13 @@ pub enum CheckEvent {
         property: PropertyId,
         /// The point it reached.
         to: Lifecycle,
+    },
+    /// A property's check labelled a frame through [`CheckCtx::label`].
+    Label {
+        /// The property.
+        property: PropertyId,
+        /// The frame, its label, and what the receiver did with it.
+        frame: LabelledFrame,
     },
 }
 
@@ -439,7 +447,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             .collect()
     }
 
-    /// The lifecycle events since the last call.
+    /// The lifecycle and label events since the last call.
     fn events(&mut self) -> Vec<CheckEvent> {
         std::mem::take(&mut self.events)
     }
@@ -531,6 +539,10 @@ fn step_property<S: HasView>(
         Verdict::Violated(v) => violations.push(v),
     }
     violations.extend(parts.recorded);
+    events.extend(parts.labelled.into_iter().map(|frame| CheckEvent::Label {
+        property: property.id.clone(),
+        frame,
+    }));
     for obligation in parts.obliged {
         events.push(event(Lifecycle::Obliged));
         state.open.push(Open {

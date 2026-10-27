@@ -19,6 +19,7 @@ use zakura_scheduler::Op;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     fake::FakeStorage,
+    model::{Direction, Label, LabelOutcome, LabelledFrame},
     observe::Exit,
     property::{
         Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent, HasView,
@@ -230,9 +231,20 @@ impl Recorder {
     fn points(&self) -> Vec<Lifecycle> {
         self.events
             .iter()
-            .map(|event| match event {
-                CheckEvent::Lifecycle { to, .. } => *to,
-                other => panic!("unexpected event {other:?}"),
+            .filter_map(|event| match event {
+                CheckEvent::Lifecycle { to, .. } => Some(*to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The labelled frames it received, in order.
+    fn labelled(&self) -> Vec<LabelledFrame> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                CheckEvent::Label { frame, .. } => Some(frame.clone()),
+                _ => None,
             })
             .collect()
     }
@@ -1613,4 +1625,78 @@ fn missing_evidence_fails_the_harness() {
             detail: "no label for the judged frame".to_owned(),
         })
     );
+}
+
+/// A frame of the `level` row, labelled `label`.
+fn level_frame(label: Label) -> LabelledFrame {
+    LabelledFrame {
+        family: "test",
+        version: 1,
+        row: "level",
+        direction: Direction::ToNode,
+        label,
+        outcome: LabelOutcome::Unobserved,
+    }
+}
+
+/// Labels one frame per bump: `Conformant` for the first, and `OverMargin`
+/// after.
+fn label_each_bump(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    match cx.view() {
+        0 => Verdict::NotApplicable,
+        1 => {
+            cx.label(level_frame(Label::Conformant));
+            Verdict::Holds
+        }
+        _ => {
+            cx.label(level_frame(Label::OverMargin));
+            Verdict::Holds
+        }
+    }
+}
+
+/// P3a: a frame a check labels reaches the next checker as a
+/// `CheckEvent::Label`, after the check's lifecycle events and in step
+/// order.
+#[test]
+fn labelled_frames_reach_the_next_checker() {
+    let world = honest();
+    let task_world = world.clone();
+    let property = Property {
+        check: label_each_bump,
+        ..level(Status::Active)
+    };
+    let (_, _, recorder) = run_with(
+        world,
+        vec![property],
+        Assumptions::none(),
+        Recorder::default(),
+        |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                task::yield_now().await;
+                bump(&task_world);
+            });
+        },
+    );
+    assert!(matches!(
+        recorder.events.first(),
+        Some(CheckEvent::Lifecycle {
+            to: Lifecycle::Applicable,
+            ..
+        })
+    ));
+    let labels: Vec<Label> = recorder
+        .labelled()
+        .iter()
+        .map(|frame| frame.label)
+        .collect();
+    assert_eq!(labels.first(), Some(&Label::Conformant));
+    assert!(labels.len() >= 2, "{labels:?}");
+    assert!(labels[1..].iter().all(|label| *label == Label::OverMargin));
+    assert!(recorder.events.iter().all(|event| match event {
+        CheckEvent::Label { property, .. } | CheckEvent::Lifecycle { property, .. } =>
+            *property == LEVEL,
+        _ => false,
+    }));
 }

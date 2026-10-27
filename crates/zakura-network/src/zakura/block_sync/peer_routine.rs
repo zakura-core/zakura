@@ -3593,14 +3593,15 @@ mod tests {
                 .sum::<u64>()
         );
 
-        // Transport takes the frames, so the handles record the write.
+        // The in-memory transport writes every frame it takes, so each
+        // handle records a completed write.
         while let Ok(Some(_)) = timeout(Duration::from_millis(1), out_recv.recv()).await {}
         assert!(routine
             .window
             .outstanding
             .ownership()
             .iter()
-            .all(|request| request.write != RequestWritePhase::Queued));
+            .all(|request| request.write == RequestWritePhase::Written));
 
         let peer = routine.peer.clone();
         drop(routine);

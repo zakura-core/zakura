@@ -58,10 +58,10 @@ impl Completions {
         }
     }
 
-    /// The completed admissions not yet consumed, oldest first. Reads the
+    /// The completion records not yet consumed, oldest first. Reads the
     /// queue without draining it.
     #[cfg(test)]
-    pub(crate) fn published(&self) -> Vec<CompletionId> {
+    pub(crate) fn recorded(&self) -> Vec<CompletionId> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state.completed.to_vec()
     }

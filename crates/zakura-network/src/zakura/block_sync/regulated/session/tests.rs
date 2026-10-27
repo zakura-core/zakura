@@ -308,7 +308,7 @@ async fn live_ranges_and_leases_follow_a_blocked_read() {
         let live: Vec<_> = session
             .admitted_ranges()
             .iter()
-            .filter(|range| !range.ended)
+            .filter(|range| !range.completed)
             .map(|range| (range.first, range.last))
             .collect();
         live == ranges && serving.leases_held(&peer).0 == slots
@@ -545,7 +545,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
 }
 
 /// Review P5a-2: the range snapshot is read-only. A range whose ending is
-/// published stays recorded, marked ended, until the next admission removes
+/// published stays recorded, marked completed, until the next admission removes
 /// it, and reading the snapshot changes neither the map nor the queue.
 #[tokio::test]
 async fn admitted_ranges_leave_owner_state_unchanged() {
@@ -558,18 +558,18 @@ async fn admitted_ranges_leave_owner_state_unchanged() {
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
     assert_eq!(served(&mut output).await, done(1, 1));
     let ranges = session.ranges.clone();
-    let published = session.completed.published();
+    let recorded = session.completed.recorded();
     let observed = session.admitted_ranges();
     assert_eq!(session.admitted_ranges(), observed);
     assert_eq!(session.ranges, ranges);
-    assert_eq!(session.completed.published(), published);
+    assert_eq!(session.completed.recorded(), recorded);
     cancel.cancel();
     assert_eq!(
         observed,
         [AdmittedRange {
             first: Height(1),
             last: Height(1),
-            ended: true,
+            completed: true,
         }]
     );
 }

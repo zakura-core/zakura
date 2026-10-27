@@ -163,9 +163,11 @@ impl Serving {
 pub(crate) struct AdmittedRange {
     pub(crate) first: Height,
     pub(crate) last: Height,
-    /// The session published the range's ending. The next admission removes
-    /// the record.
-    pub(crate) ended: bool,
+    /// The range's completion is recorded: its ending was published, its
+    /// publication failed, or it was cancelled. The session doesn't tell
+    /// these apart, and the next admission removes the record either way.
+    /// Whether an ending reached the peer is the output's to say.
+    pub(crate) completed: bool,
 }
 
 pub(crate) struct ServingSession {
@@ -201,18 +203,18 @@ impl ServingSession {
         Ok(())
     }
 
-    /// Every range the session records, with whether its ending is
-    /// published. Reads the range map and the completion queue without
+    /// Every range the session records, with whether its completion is
+    /// recorded. Reads the range map and the completion queue without
     /// draining either, so cleanup stays with [`Self::admit`].
     #[cfg(test)]
     pub(crate) fn admitted_ranges(&self) -> Vec<AdmittedRange> {
-        let published = self.completed.published();
+        let completed = self.completed.recorded();
         self.ranges
             .iter()
             .map(|(start, (last, id))| AdmittedRange {
                 first: *start,
                 last: *last,
-                ended: published.contains(id),
+                completed: completed.contains(id),
             })
             .collect()
     }

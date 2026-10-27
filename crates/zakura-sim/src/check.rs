@@ -78,7 +78,7 @@ pub struct PropertyReport {
     ///
     /// The trace's `end` record leaves them out: their number grows with the
     /// run, and a record has a size limit. A replay of the trace finds every
-    /// one again.
+    /// one again, in `ReplayReport::properties`.
     #[serde(skip)]
     pub violations: Vec<Violation>,
 }
@@ -167,6 +167,12 @@ pub trait Checker {
     fn bounds_livelock(&mut self) -> bool {
         true
     }
+
+    /// The step loop also found `violation`, at the step where this
+    /// checker's own violation ends the run. `end.violation` keeps the
+    /// checker's, so a checker that reports the step loop's properties
+    /// records this one itself.
+    fn step_loop_violation(&mut self, _violation: &Violation) {}
 }
 
 /// A checker that checks nothing.

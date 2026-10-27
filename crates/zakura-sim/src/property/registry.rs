@@ -87,6 +87,12 @@ impl<A: Checker, B: Checker> Checker for Tee<A, B> {
         let first = self.0.bounds_livelock();
         self.1.bounds_livelock() && first
     }
+
+    /// Passes `violation` to both.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        self.0.step_loop_violation(violation);
+        self.1.step_loop_violation(violation);
+    }
 }
 
 /// A harness's properties, with unique IDs.
@@ -418,16 +424,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// belongs to the registered property with its ID.
     fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         if let Some(violation) = &end.violation {
-            let ended = self
-                .properties
-                .iter()
-                .zip(&mut self.state)
-                .find(|(property, _)| property.id.as_str() == violation.property);
-            if let Some((_, state)) = ended {
-                if !state.violations.contains(violation) {
-                    state.violations.push(violation.clone());
-                }
-            }
+            self.step_loop_violation(violation);
         }
         self.properties
             .iter()
@@ -455,6 +452,20 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// False while a declared `BoundedAdversary` assumption doesn't hold.
     fn bounds_livelock(&mut self) -> bool {
         !self.bounded || (self.holds)(&self.handle, Assume::BoundedAdversary)
+    }
+
+    /// Records `violation` as the registered property's with its ID, once.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        let found = self
+            .properties
+            .iter()
+            .zip(&mut self.state)
+            .find(|(property, _)| property.id.as_str() == violation.property);
+        if let Some((_, state)) = found {
+            if !state.violations.contains(violation) {
+                state.violations.push(violation.clone());
+            }
+        }
     }
 }
 

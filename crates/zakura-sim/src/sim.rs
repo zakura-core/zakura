@@ -372,22 +372,29 @@ impl Sim {
             if !checker.bounds_livelock() {
                 at_instant = 0;
             }
-            let violation = violation.or_else(|| {
-                let spinning = phase == Phase::Live
-                    && self.config.enforce_no_livelock
-                    && at_instant > self.config.max_steps_per_instant
-                    && !self.nothing_enabled(&ready);
-                spinning.then(|| Violation {
-                    property: NO_LIVELOCK.to_owned(),
-                    step: st.step,
-                    witness: vec![st.step],
-                    expected: format!(
-                        "at most {} steps before the clock moves",
-                        self.config.max_steps_per_instant
-                    ),
-                    actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
-                })
+            // Checked even when the checker found a violation, so a spin at
+            // the same step still reaches the checker.
+            let spinning = phase == Phase::Live
+                && self.config.enforce_no_livelock
+                && at_instant > self.config.max_steps_per_instant
+                && !self.nothing_enabled(&ready);
+            let livelock = spinning.then(|| Violation {
+                property: NO_LIVELOCK.to_owned(),
+                step: st.step,
+                witness: vec![st.step],
+                expected: format!(
+                    "at most {} steps before the clock moves",
+                    self.config.max_steps_per_instant
+                ),
+                actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
             });
+            let violation = match (violation, livelock) {
+                (Some(violation), Some(livelock)) => {
+                    checker.step_loop_violation(&livelock);
+                    Some(violation)
+                }
+                (violation, livelock) => violation.or(livelock),
+            };
             if let Some(violation) = violation {
                 let mut end = st.end(Outcome::Violation);
                 end.violation = Some(violation);

@@ -995,6 +995,30 @@ fn effects_replay_in_a_fresh_process() {
     );
 }
 
+/// The `end` record leaves violations out, and a replay gives them back.
+#[test]
+fn replay_returns_the_violations_end_leaves_out() {
+    let dir = record(&EFFECTS, &[]);
+    let trace = open(dir.path());
+    let end = trace.end.as_ref().unwrap();
+    assert!(end.properties.iter().all(|r| r.violations.is_empty()));
+    let report = replay_with(&trace, &EFFECTS, ReplayOptions::default()).unwrap();
+    assert!(report.verified(), "{report:?}");
+    let steps: Vec<(&str, Vec<u64>)> = report
+        .properties
+        .iter()
+        .filter(|r| !r.violations.is_empty())
+        .map(|r| {
+            let steps = r.violations.iter().map(|v| v.step).collect();
+            (r.property.as_str(), steps)
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [(KNOWN.as_str(), vec![2]), (ACTIVE.as_str(), vec![2])]
+    );
+}
+
 #[test]
 fn changed_effects_are_nondeterministic() {
     let dir = record(&EFFECTS, &[]);

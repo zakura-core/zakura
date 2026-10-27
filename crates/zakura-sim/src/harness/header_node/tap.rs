@@ -376,8 +376,9 @@ impl ActionSource for ReactorTap {
 
     /// Pairs and logs every event recorded since the last observation, in
     /// order, and records what it delivered in the checkpoint. A drain that
-    /// doesn't pair is still logged, then fails, or records a port panic
-    /// as the run's harness failure.
+    /// doesn't pair is still logged, then fails, unless the tap is unhealthy,
+    /// which the run reports instead, or records a port panic as the run's
+    /// harness failure.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -416,6 +417,11 @@ impl ActionSource for ReactorTap {
         self.checkpoint.record(log.step(), &sent, last);
         match paired {
             Ok(()) => Ok(()),
+            // A reactor that unwound, from a callback or observer panic,
+            // leaves its last receipts with no call end. The run's evidence
+            // check then reports the tap's own health, `ReactorGone` or
+            // `PortGone`, so the crash isn't read as a pairing bug.
+            Err(PairError::Evidence(_)) if self.state.health().is_some() => Ok(()),
             Err(PairError::Evidence(detail)) => Err(detail),
             Err(PairError::PortPanicked { call }) => {
                 // The run checks this after the step, ahead of any evidence

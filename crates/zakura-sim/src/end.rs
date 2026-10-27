@@ -68,7 +68,7 @@ pub enum HarnessFailure {
     /// run expects. It outranks any evidence failure of the same step,
     /// since the panic leaves the call's storage receipt unpaired.
     ReactorPortPanicked {
-        /// The tap, such as `reactor:nora#0`.
+        /// The tap, such as `reactor:node#0`.
         source: String,
         /// The call's number.
         call: u64,

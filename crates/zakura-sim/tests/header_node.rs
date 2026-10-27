@@ -1,5 +1,5 @@
-//! A header-sync node on controlled storage (M4-B1): Nora's real reactor and
-//! publisher submit every storage call to one `ControlledPort`, and every
+//! A header-sync node on controlled storage (M4-B1): the node's real reactor
+//! and publisher submit every storage call to one `ControlledPort`, and every
 //! completion comes from the `Plan`.
 #![cfg(zakura_sim)]
 
@@ -40,7 +40,7 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
-/// Every request Nora's storage saw submitted, in order.
+/// Every request the node's storage saw submitted, in order.
 fn requests(report: &RunReport) -> Vec<StorageRequest> {
     report
         .log
@@ -57,13 +57,9 @@ fn requests(report: &RunReport) -> Vec<StorageRequest> {
         .collect()
 }
 
-/// A mirror named `name` holding `chain`.
-fn mirror(name: &str, chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec {
-        name: name.to_owned(),
-        chain,
-        dialer,
-    }
+/// A mirror holding `chain`.
+fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
+    MirrorSpec { chain, dialer }
 }
 
 /// The hex peer identity of the actor whose key is `seed` repeated, as
@@ -73,8 +69,8 @@ fn peer(seed: u8) -> String {
     id.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Nora at genesis syncs to Mira's A5 under every plan, through a locator,
-/// a prepare and an apply on her own port, each completed by the
+/// The node at genesis syncs to `mirror-0`'s A5 under every plan, through a
+/// locator, a prepare and an apply on its own port, each completed by the
 /// converging policy.
 #[test]
 fn node_syncs_from_a_mirror_on_controlled_storage() {
@@ -96,7 +92,7 @@ fn node_syncs_from_a_mirror_on_controlled_storage() {
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             Chain::main(5).tip(&ports.fixture),
-            "Nora reaches Mira's tip"
+            "the node reaches mirror-0's tip"
         );
         let requests = requests(&report);
         for kind in [
@@ -109,35 +105,34 @@ fn node_syncs_from_a_mirror_on_controlled_storage() {
     }
 }
 
-/// The worked example: Mira, on a heavier fork, dials Nora, and Nora dials
-/// Leo at genesis. Nora's requester and publisher both use her one port, so
-/// her log holds both in one ID sequence, which `NodeChecks` checks, and
-/// Leo follows her to Mira's tip.
+/// The worked example: `mirror-0`, on a heavier fork, dials the node, and the
+/// node dials `mirror-1` at genesis. The node's requester and publisher both
+/// use its one port, so its log holds both in one ID sequence, which
+/// `NodeChecks` checks, and `mirror-1` follows it to `mirror-0`'s tip.
 #[test]
 fn one_port_serves_requester_and_publisher() {
     let scenario = StorageScenario {
         node: Chain::main(3),
         mirrors: vec![
             mirror(
-                "mira",
                 Chain {
                     main: 1,
                     fork: Some(Fork { branch: 1, len: 4 }),
                 },
                 Dialer::Mirror,
             ),
-            mirror("leo", Chain::default(), Dialer::Node),
+            mirror(Chain::default(), Dialer::Node),
         ],
         ..StorageScenario::default()
     };
     // Actors' key seeds follow their order, and links count sessions from 1
-    // in mirror order. Mira also pulls Nora's own branch, so both peers
-    // acquire from Nora's publisher.
-    let (mira, leo) = ((peer(2), 1), (peer(3), 2));
+    // in mirror order. `mirror-0` also pulls the node's own branch, so both
+    // peers acquire from the node's publisher.
+    let (mirror_0, mirror_1) = ((peer(2), 1), (peer(3), 2));
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
         let requests = requests(&report);
-        let (mut requester, mut leo_acquires, mut reads) = (0, 0, 0);
+        let (mut requester, mut mirror_1_acquires, mut reads) = (0, 0, 0);
         for request in &requests {
             let lease = match request {
                 StorageRequest::ContinuationLocator
@@ -149,7 +144,7 @@ fn one_port_serves_requester_and_publisher() {
                 StorageRequest::AcquireHeaderPath {
                     peer, session_id, ..
                 } => {
-                    leo_acquires += usize::from(*peer == leo.0);
+                    mirror_1_acquires += usize::from(*peer == mirror_1.0);
                     Some((peer, *session_id))
                 }
                 StorageRequest::ReadHeaderPath { lease, .. } => {
@@ -164,22 +159,22 @@ fn one_port_serves_requester_and_publisher() {
             };
             // Each path operation carries the session of the peer it serves.
             assert!(
-                [&mira, &leo]
+                [&mirror_0, &mirror_1]
                     .into_iter()
                     .any(|(peer, session)| lease == Some((peer, *session))),
                 "{request:?}"
             );
         }
         assert!(
-            requester > 0 && leo_acquires > 0 && reads > 0,
-            "Nora's log has requester and publisher operations: {requests:?}"
+            requester > 0 && mirror_1_acquires > 0 && reads > 0,
+            "the node's log has requester and publisher operations: {requests:?}"
         );
         let tip = ports.node.engine().snapshot().frontiers.header_best;
         assert_eq!(tip, scenario.mirrors[0].chain.tip(&ports.fixture));
         assert_eq!(
             ports.mirrors[1].snapshot().frontiers.header_best,
             tip,
-            "Leo follows Nora"
+            "mirror-1 follows the node"
         );
     }
 }
@@ -210,16 +205,16 @@ fn direct_dispatch_guard_reports_a_violation() {
     );
 }
 
-/// `Control` closes Mira's link and relinks her on a new connection and
-/// session, at points the `Plan` picks. Nora still reaches Mira's tip, and
-/// some plan closes early enough that she syncs over the new session.
+/// `Control` closes `mirror-0`'s link and relinks it on a new connection and
+/// session, at points the `Plan` picks. The node still reaches `mirror-0`'s
+/// tip, and some plan closes early enough that it syncs over the new session.
 #[test]
 fn control_closes_and_relinks_a_mirror() {
     let scenario = StorageScenario {
         controls: [ControlAction::Close, ControlAction::Relink]
             .into_iter()
             .map(|action| ControlStep {
-                peer: "mira".to_owned(),
+                peer: "mirror-0".to_owned(),
                 action,
                 when: None,
             })
@@ -230,7 +225,7 @@ fn control_closes_and_relinks_a_mirror() {
     for input in inputs(16, 256) {
         let (report, ports) = run(&scenario, input);
         let picks: Vec<&str> = report.picks.iter().map(|p| p.identity.as_str()).collect();
-        assert!(picks.contains(&"peer:mira:close") && picks.contains(&"peer:mira:relink"));
+        assert!(picks.contains(&"peer:mirror-0:close") && picks.contains(&"peer:mirror-0:relink"));
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             Chain::main(5).tip(&ports.fixture)
@@ -250,7 +245,7 @@ fn control_closes_and_relinks_a_mirror() {
 fn control_close_ends_both_sides_of_the_session() {
     let scenario = StorageScenario {
         controls: vec![ControlStep {
-            peer: "mira".to_owned(),
+            peer: "mirror-0".to_owned(),
             action: ControlAction::Close,
             when: None,
         }],
@@ -261,7 +256,7 @@ fn control_close_ends_both_sides_of_the_session() {
         let close = report
             .picks
             .iter()
-            .find(|pick| pick.identity == "peer:mira:close")
+            .find(|pick| pick.identity == "peer:mirror-0:close")
             .expect("the close is picked")
             .step;
         let pipes: Vec<(u64, &str)> = report
@@ -278,7 +273,7 @@ fn control_close_ends_both_sides_of_the_session() {
         assert_eq!(
             pipes.len(),
             2,
-            "Nora's and Mira's pipes both end: {pipes:?}"
+            "the node's and mirror-0's pipes both end: {pipes:?}"
         );
         assert!(
             pipes.iter().all(|(step, _)| *step > close),
@@ -287,7 +282,7 @@ fn control_close_ends_both_sides_of_the_session() {
     }
 }
 
-/// Each storage fact of Nora's for operations of `kind`, with the virtual
+/// Each storage fact of the node's for operations of `kind`, with the virtual
 /// time it was logged at in nanoseconds and its step.
 fn facts_of(report: &RunReport, kind: fn(&StorageRequest) -> bool) -> Vec<(u64, u64, StorageFact)> {
     let (mut now, mut ids) = (0, std::collections::BTreeSet::new());
@@ -317,7 +312,7 @@ fn facts_of(report: &RunReport, kind: fn(&StorageRequest) -> bool) -> Vec<(u64, 
     out
 }
 
-/// Nora's first apply, held for 10 s of virtual time, completes no sooner
+/// The node's first apply, held for 10 s of virtual time, completes no sooner
 /// than that, while every other operation follows the 5 s bound.
 #[test]
 fn held_apply_waits_for_its_virtual_time() {
@@ -354,13 +349,13 @@ fn held_apply_waits_for_its_virtual_time() {
     }
 }
 
-/// A `Control` step gated on Nora's first apply completing is never picked
+/// A `Control` step gated on the node's first apply completing is never picked
 /// before that completion.
 #[test]
 fn control_step_waits_for_its_trigger() {
     let scenario = StorageScenario {
         controls: vec![ControlStep {
-            peer: "mira".to_owned(),
+            peer: "mirror-0".to_owned(),
             action: ControlAction::Close,
             when: Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
         }],
@@ -377,7 +372,7 @@ fn control_step_waits_for_its_trigger() {
         let close = report
             .picks
             .iter()
-            .find(|pick| pick.identity == "peer:mira:close")
+            .find(|pick| pick.identity == "peer:mirror-0:close")
             .expect("the close opens and is picked")
             .step;
         // An early close can also stop the sync, so no apply completes.
@@ -391,13 +386,13 @@ fn control_step_waits_for_its_trigger() {
 /// A `Control` step on `peer`.
 fn step(action: ControlAction, when: Option<Trigger>) -> ControlStep {
     ControlStep {
-        peer: "mira".to_owned(),
+        peer: "mirror-0".to_owned(),
         action,
         when,
     }
 }
 
-/// `Closed` counts connections, not close calls. Closing Mira's link twice
+/// `Closed` counts connections, not close calls. Closing `mirror-0`'s link twice
 /// closes one connection, so a relink gated on two closures never opens.
 /// Closing a second, relinked connection does open it.
 #[test]
@@ -405,13 +400,13 @@ fn closing_twice_counts_one_closure() {
     let closures = |n| {
         Some(Trigger::Count(
             n,
-            Box::new(Trigger::Closed("mira".to_owned())),
+            Box::new(Trigger::Closed("mirror-0".to_owned())),
         ))
     };
     let links = |n| {
         Some(Trigger::Count(
             n,
-            Box::new(Trigger::Linked("mira".to_owned())),
+            Box::new(Trigger::Linked("mirror-0".to_owned())),
         ))
     };
     let twice = StorageScenario {
@@ -435,30 +430,30 @@ fn closing_twice_counts_one_closure() {
         let (report, _) = run(&twice, input.clone());
         let picks: Vec<&str> = report.picks.iter().map(|p| p.identity.as_str()).collect();
         let count = |action| picks.iter().filter(|pick| **pick == action).count();
-        assert_eq!(count("peer:mira:close"), 2);
-        assert_eq!(count("peer:mira:relink"), 0, "one connection closed");
+        assert_eq!(count("peer:mirror-0:close"), 2);
+        assert_eq!(count("peer:mirror-0:relink"), 0, "one connection closed");
 
         let (report, _) = run(&distinct, input);
         let relinks = report
             .picks
             .iter()
-            .filter(|pick| pick.identity == "peer:mira:relink")
+            .filter(|pick| pick.identity == "peer:mirror-0:relink")
             .count();
         assert_eq!(relinks, 2, "two connections closed");
     }
 }
 
-/// Mira grows to A6 mid-run, through her own port. Once the growth is
-/// witnessed, `Control` closes her link and relinks her, and Nora follows
-/// her to the new tip.
+/// `mirror-0` grows to A6 mid-run, through its own port. Once the growth is
+/// witnessed, `Control` closes its link and relinks it, and the node follows
+/// it to the new tip.
 #[test]
-fn a_grown_mirror_leads_nora_to_its_new_tip() {
-    let mira = || "mira".to_owned();
+fn a_grown_mirror_leads_the_node_to_its_new_tip() {
+    let mirror = || "mirror-0".to_owned();
     let scenario = StorageScenario {
         controls: vec![
             step(ControlAction::Grow { len: 1 }, None),
-            step(ControlAction::Close, Some(Trigger::Grown(mira()))),
-            step(ControlAction::Relink, Some(Trigger::Closed(mira()))),
+            step(ControlAction::Close, Some(Trigger::Grown(mirror()))),
+            step(ControlAction::Relink, Some(Trigger::Closed(mirror()))),
         ],
         ..StorageScenario::default()
     };
@@ -467,21 +462,21 @@ fn a_grown_mirror_leads_nora_to_its_new_tip() {
         let relinked = report
             .picks
             .iter()
-            .any(|pick| pick.identity == "peer:mira:relink");
+            .any(|pick| pick.identity == "peer:mirror-0:relink");
         assert!(relinked, "the growth, close and relink all happened");
         let a6 = Chain::main(6).tip(&ports.fixture);
         assert_eq!(ports.mirrors[0].snapshot().frontiers.header_best, a6);
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             a6,
-            "Nora reaches Mira's new tip"
+            "the node reaches mirror-0's new tip"
         );
     }
 }
 
 /// A `Grow` that storage can't admit fails the run instead of counting as
-/// grown. Mira starts 64,000 headers past A5 with finality at genesis, so
-/// growing her by 4,000 more passes the 65,536 retained-header limit, and
+/// grown. `mirror-0` starts 64,000 headers past A5 with finality at genesis,
+/// so growing it by 4,000 more passes the 65,536 retained-header limit, and
 /// the apply stalls without admitting the target.
 #[test]
 fn a_stalled_growth_fails_the_run() {
@@ -502,23 +497,23 @@ fn a_stalled_growth_fails_the_run() {
             step(ControlAction::Grow { len: 4_000 }, None),
             step(
                 ControlAction::Close,
-                Some(Trigger::Grown("mira".to_owned())),
+                Some(Trigger::Grown("mirror-0".to_owned())),
             ),
         ],
         ..StorageScenario::default()
     };
     let ports = Storage::prepare(&scenario);
-    let mira = &ports.mirrors[0];
+    let mirror = &ports.mirrors[0];
     for request_id in 1..=16 {
-        let tip: Frontier = mira.snapshot().frontiers.header_best;
+        let tip: Frontier = mirror.snapshot().frontiers.header_best;
         let headers = ports.fixture.extend(tip, 4_000, 0);
         let request = ports
             .fixture
-            .target_request(&mira.snapshot(), tip, &headers, request_id);
-        let prepared = ready(mira.prepare_header_target(request)).expect("a batch prepares");
-        ready(mira.apply_header_target(prepared)).expect("a batch applies");
+            .target_request(&mirror.snapshot(), tip, &headers, request_id);
+        let prepared = ready(mirror.prepare_header_target(request)).expect("a batch prepares");
+        ready(mirror.apply_header_target(prepared)).expect("a batch applies");
     }
-    let before = mira.snapshot().frontiers.header_best;
+    let before = mirror.snapshot().frontiers.header_best;
     assert_eq!(before.height.0, 64_005);
 
     let error = run_prepared::<Storage>(
@@ -535,15 +530,15 @@ fn a_stalled_growth_fails_the_run() {
     assert!(failure.to_string().contains("ControlFailed"), "{failure}");
     assert!(failure.to_string().contains("ResourceStalled"), "{failure}");
     assert_eq!(
-        mira.snapshot().frontiers.header_best,
+        mirror.snapshot().frontiers.header_best,
         before,
-        "Mira didn't grow"
+        "mirror-0 didn't grow"
     );
     assert!(
         !report
             .picks
             .iter()
-            .any(|pick| pick.identity == "peer:mira:close"),
+            .any(|pick| pick.identity == "peer:mirror-0:close"),
         "the gated close never opened"
     );
 }

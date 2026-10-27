@@ -71,31 +71,26 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> (RunReport, Ports) {
     (report, ports)
 }
 
-/// A mirror named `name` holding `chain`.
-fn mirror(name: &str, chain: Chain, dialer: Dialer) -> MirrorSpec {
-    MirrorSpec {
-        name: name.to_owned(),
-        chain,
-        dialer,
-    }
+/// A mirror holding `chain`.
+fn mirror(chain: Chain, dialer: Dialer) -> MirrorSpec {
+    MirrorSpec { chain, dialer }
 }
 
-/// The worked example under `policy`: Nora at A3, Mira dialing in from a
-/// heavier fork A1, B2 to B5, and Nora dialing Leo at genesis, so Nora both
-/// requests and serves.
+/// The worked example under `policy`: the node at A3, `mirror-0` dialing in
+/// from a heavier fork A1, B2 to B5, and the node dialing `mirror-1` at
+/// genesis, so the node both requests and serves.
 fn worked_example(policy: Policy) -> StorageScenario {
     StorageScenario {
         node: Chain::main(3),
         mirrors: vec![
             mirror(
-                "mira",
                 Chain {
                     main: 1,
                     fork: Some(Fork { branch: 1, len: 4 }),
                 },
                 Dialer::Mirror,
             ),
-            mirror("leo", Chain::default(), Dialer::Node),
+            mirror(Chain::default(), Dialer::Node),
         ],
         policy,
         controls: Vec::new(),
@@ -111,7 +106,7 @@ fn any() -> Policy {
     }
 }
 
-/// Nora's storage facts, in log order, with their steps.
+/// The node's storage facts, in log order, with their steps.
 fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
     report
         .log
@@ -126,11 +121,11 @@ fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
         .collect()
 }
 
-/// Under every outcome and no bound, Nora's operation IDs rise by one per
+/// Under every outcome and no bound, the node's operation IDs rise by one per
 /// submission, and each completes at most once, after its submission.
 /// `NodeChecks` checks that after every step, and some plan completes an
-/// operation with a fault, so faults are exercised. The harness taps Nora's
-/// reactor, so every run also logs her calls, paired with her storage
+/// operation with a fault, so faults are exercised. The harness taps the
+/// node's reactor, so every run also logs its calls, paired with its storage
 /// receipts, and some plan pairs a call that ended with a port error.
 #[test]
 fn operation_ids_are_unique_and_complete_once() {
@@ -162,7 +157,7 @@ fn operation_ids_are_unique_and_complete_once() {
                 _ => None,
             })
             .collect();
-        assert!(!ends.is_empty(), "Nora's tap logs her calls");
+        assert!(!ends.is_empty(), "the node's tap logs its calls");
         paired_error |= ends
             .iter()
             .any(|(end, op)| *end == "port-error" && op.is_some());
@@ -174,7 +169,7 @@ fn operation_ids_are_unique_and_complete_once() {
     );
 }
 
-/// Nora's storage history: every storage observation, as text, with its
+/// The node's storage history: every storage observation, as text, with its
 /// step.
 fn history(report: &RunReport) -> Vec<String> {
     report
@@ -272,12 +267,12 @@ fn illegal_outcomes_are_refused_in_a_node_run() {
 }
 
 /// The worked example, converging, under 64 plans. After every step,
-/// Nora's selected-chain watch holds her engine's snapshot, and at the end
-/// Leo, served by her publisher, holds her tip.
+/// the node's selected-chain watch holds its engine's snapshot, and at the
+/// end `mirror-1`, served by its publisher, holds its tip.
 ///
-/// Left alone, serving finishes long before Nora's prepare, so holds pin
-/// the overlap: her first publisher read waits for her first prepare, and
-/// her first apply waits for that read. Every plan must then complete a
+/// Left alone, serving finishes long before the node's prepare, so holds pin
+/// the overlap: its first publisher read waits for its first prepare, and
+/// its first apply waits for that read. Every plan must then complete a
 /// read between the prepare and the apply.
 #[test]
 fn requester_and_publisher_share_committed_state() {
@@ -322,11 +317,11 @@ fn requester_and_publisher_share_committed_state() {
         assert_eq!(
             ports.mirrors[1].snapshot().frontiers.header_best,
             tip,
-            "Leo"
+            "mirror-1"
         );
 
         // Which kind each operation is, then where a serving completion
-        // falls against Nora's first prepare and apply completions.
+        // falls against the node's first prepare and apply completions.
         let mut kinds = std::collections::BTreeMap::new();
         let (mut prepared, mut served_between) = (false, false);
         for (_, fact) in facts(&report) {
@@ -353,8 +348,8 @@ fn requester_and_publisher_share_committed_state() {
     }
 }
 
-/// A smoke test: Nora prepares a 160-header batch from Mira, and no task
-/// panics.
+/// A smoke test: the node prepares a 160-header batch from `mirror-0`, and no
+/// task panics.
 ///
 /// It doesn't prove that preparation stays on the run's thread. Waking a
 /// completion's caller from another OS thread passes it, because the
@@ -365,7 +360,7 @@ fn requester_and_publisher_share_committed_state() {
 #[test]
 fn a_160_header_preparation_panics_no_task() {
     let scenario = StorageScenario {
-        mirrors: vec![mirror("mira", Chain::main(160), Dialer::Mirror)],
+        mirrors: vec![mirror(Chain::main(160), Dialer::Mirror)],
         ..StorageScenario::default()
     };
     for input in inputs(4, 256) {
@@ -390,7 +385,7 @@ fn a_160_header_preparation_panics_no_task() {
                 }
             )
         });
-        assert!(batch, "Nora prepared all 160 headers in one batch");
+        assert!(batch, "the node prepared all 160 headers in one batch");
         assert_eq!(
             ports
                 .node
@@ -405,13 +400,13 @@ fn a_160_header_preparation_panics_no_task() {
     }
 }
 
-/// What a probe task does on Nora's port as peer Pat, in a [`Probing`]
-/// run.
+/// What a probe task does on the node's port as peer `probe`, in a
+/// [`Probing`] run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Probe {
     /// Nothing.
     Idle,
-    /// Acquire a path to Nora's tip, then release it.
+    /// Acquire a path to the node's tip, then release it.
     AcquireRelease,
     /// Acquire, release, then read the released handle.
     ReadReleased,
@@ -471,12 +466,13 @@ impl zakura_sim::property::HasView for Probing {
     }
 }
 
-/// Pat, the probe's peer identity.
-fn pat() -> zakura_header_chain::SourceId {
+/// The probe's peer identity.
+fn probe_id() -> zakura_header_chain::SourceId {
     zakura_header_chain::SourceId::from_digest([9; 32])
 }
 
-/// Runs `probe` as Pat against `port`, whose chains come from `fixture`.
+/// Runs `probe` as peer `probe` against `port`, whose chains come from
+/// `fixture`.
 async fn probe(
     probe: Probe,
     port: Arc<ControlledPort>,
@@ -496,7 +492,7 @@ async fn probe(
         let snapshot = snapshot();
         let tip = snapshot.frontiers.header_best.hash;
         port.acquire_header_path(AcquirePath {
-            source: pat(),
+            source: probe_id(),
             session_id: 1,
             scope: zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, tip),
             target_tip_hash: tip,
@@ -505,13 +501,15 @@ async fn probe(
     };
     let acquired = |reply| match reply {
         Ok(AcquirePathReply::Acquired(path)) => *path,
-        other => panic!("Pat acquires: {other:?}"),
+        other => panic!("the probe acquires: {other:?}"),
     };
     match probe {
         Probe::Idle => {}
         Probe::AcquireRelease => {
             let path = acquired(acquire().await);
-            port.release_header_path(path).await.expect("Pat releases");
+            port.release_header_path(path)
+                .await
+                .expect("the probe releases");
         }
         Probe::AcquireHold => {
             let _path = acquired(acquire().await);
@@ -521,7 +519,7 @@ async fn probe(
             let path = acquired(acquire().await);
             port.release_header_path(path.clone())
                 .await
-                .expect("Pat releases");
+                .expect("the probe releases");
             let read = ReadPath {
                 after_hash: fixture.anchor().hash,
                 max_header_count: 160,
@@ -544,7 +542,9 @@ async fn probe(
         Probe::SweepLate => {
             zakura_rt::time::sleep(Duration::from_secs(31)).await;
             let path = acquired(acquire().await);
-            port.release_header_path(path).await.expect("Pat releases");
+            port.release_header_path(path)
+                .await
+                .expect("the probe releases");
         }
         Probe::Prepare { len } => {
             let anchor = fixture.anchor();
@@ -635,16 +635,16 @@ fn run_probed(
     (report, ready)
 }
 
-/// Nora alone at A3, or with Leo at genesis dialed by her, converging,
+/// The node alone at A3, or dialing `mirror-0` at genesis, converging,
 /// with `holds`.
-fn nora_at_a3(
-    leo: bool,
+fn node_at_a3(
+    with_mirror: bool,
     holds: Vec<zakura_sim::harness::header_node::policy::Hold>,
 ) -> StorageScenario {
     StorageScenario {
         node: Chain::main(3),
-        mirrors: if leo {
-            vec![mirror("leo", Chain::default(), Dialer::Node)]
+        mirrors: if with_mirror {
+            vec![mirror(Chain::default(), Dialer::Node)]
         } else {
             Vec::new()
         },
@@ -696,22 +696,22 @@ fn every_lease_end_cause_reclaims_before_shutdown() {
     let cases = [
         (
             "lease-consumed-by-read",
-            nora_at_a3(true, Vec::new()),
+            node_at_a3(true, Vec::new()),
             Probe::Idle,
         ),
         (
             "lease-released",
-            nora_at_a3(false, Vec::new()),
+            node_at_a3(false, Vec::new()),
             Probe::AcquireRelease,
         ),
         (
             "lease-released",
-            nora_at_a3(true, vec![fault(read(), Allow::Unavailable)]),
+            node_at_a3(true, vec![fault(read(), Allow::Unavailable)]),
             Probe::Idle,
         ),
         (
             "lease-idle-expired",
-            nora_at_a3(
+            node_at_a3(
                 true,
                 vec![
                     fault(read(), Allow::Unavailable),
@@ -722,7 +722,7 @@ fn every_lease_end_cause_reclaims_before_shutdown() {
         ),
         (
             "lease-abandoned-acquire",
-            nora_at_a3(false, Vec::new()),
+            node_at_a3(false, Vec::new()),
             Probe::AbandonAcquire,
         ),
     ];
@@ -790,12 +790,98 @@ fn every_lease_end_cause_reclaims_before_shutdown() {
     }
 }
 
-/// Pat acquires a path to Nora's tip, releases it, then reads the released
-/// handle. The read replies `Unavailable`, never a page.
+/// Accepted page work survives its session's cancellation and still
+/// releases its lease. The node serves `mirror-0`, whose link closes once
+/// the node's first read is submitted, and that read is held until the
+/// connection has closed, then completes with `engine`. The publisher's
+/// page job outlives the session and takes the reply, and the read consumes
+/// its lease in the log, so the lease ends before shutdown, not by it.
+#[test]
+fn page_work_outlives_a_closed_session_and_ends_its_lease() {
+    use zakura_sim::harness::header_node::{
+        policy::{Allow, Hold, OpKind, Select, Trigger},
+        ControlAction, ControlStep,
+    };
+
+    let read = || Select::nth(OpKind::Read, 1);
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "mirror-0".to_owned(),
+            action: ControlAction::Close,
+            when: Some(Trigger::Submitted(read())),
+        }],
+        ..node_at_a3(
+            true,
+            vec![Hold {
+                select: read(),
+                until: Trigger::Closed("mirror-0".to_owned()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+        )
+    };
+    for input in inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let port = ports.node.clone();
+        let live = std::cell::Cell::new(None);
+        let mut last = after_step(|_| {
+            live.set(Some(port.engine().live_leases()));
+            None
+        });
+        let report = run_on(&scenario, &ports, input, &mut last);
+        drop(last);
+        let facts = facts(&report);
+        let (id, lease) = facts
+            .iter()
+            .find_map(|(_, fact)| match fact {
+                StorageFact::Submitted {
+                    id,
+                    request: StorageRequest::ReadHeaderPath { lease, .. },
+                    ..
+                } => Some((*id, lease.clone().expect("the node's port issued it"))),
+                _ => None,
+            })
+            .expect("the node reads a page for mirror-0");
+        let step_of = |wanted: &dyn Fn(&StorageFact) -> bool| {
+            facts
+                .iter()
+                .find(|(_, fact)| wanted(fact))
+                .map(|(step, _)| *step)
+        };
+        let closed = report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == "peer:mirror-0:close")
+            .expect("the close is picked")
+            .step;
+        let completed = step_of(&|fact| {
+            matches!(fact, StorageFact::Completed { id: c, outcome, .. } if *c == id && outcome == "engine")
+        })
+        .expect("the held read completes with engine");
+        let taken = step_of(&|fact| matches!(fact, StorageFact::ReplyTaken { id: t } if *t == id))
+            .expect("the page job outlives the session and takes the read's reply");
+        let ended = step_of(&|fact| {
+            matches!(
+                fact,
+                StorageFact::CapabilityEnded { lease: l, release }
+                    if l.lease_id == lease.lease_id && release == "lease-consumed-by-read"
+            )
+        })
+        .expect("the read consumes its lease during the run");
+        assert!(
+            closed < ended && ended <= completed && completed < taken,
+            "closed {closed}, lease ended {ended}, completed {completed}, taken {taken}"
+        );
+        assert_eq!(live.get(), Some(0), "no lease is live at the last step");
+    }
+}
+
+/// The probe acquires a path to the node's tip, releases it, then reads the
+/// released handle. The read replies `Unavailable`, never a page.
 #[test]
 fn ended_handle_reads_unavailable() {
     let scenario = Probed {
-        storage: nora_at_a3(false, Vec::new()),
+        storage: node_at_a3(false, Vec::new()),
         probe: Probe::ReadReleased,
         utc_origin: None,
         budget: None,
@@ -810,9 +896,9 @@ fn ended_handle_reads_unavailable() {
 /// A run that stops at its step budget with a locator pending and a lease
 /// live, both witnessed at its last step, shuts down cleanly: nothing
 /// leaks, the port then has nothing pending and no live lease, and the
-/// frozen log has no shutdown entry. Nora at A3 holds her locator toward
-/// Mira's A5 forever, and Pat holds a path to A3, which nothing sweeps
-/// since nobody else acquires.
+/// frozen log has no shutdown entry. The node at A3 holds its locator toward
+/// `mirror-0`'s A5 forever, and the probe holds a path to A3, which nothing
+/// sweeps since nobody else acquires.
 #[test]
 fn run_end_returns_every_permit_and_lease() {
     use zakura_sim::harness::header_node::policy::{Hold, OpKind, Select, Trigger};
@@ -876,8 +962,8 @@ fn run_end_returns_every_permit_and_lease() {
     }
 }
 
-/// The peak number of Nora's locators pending at once in each wave: the
-/// first, before her first 16 locators completed, and the second, among
+/// The peak number of the node's locators pending at once in each wave: the
+/// first, before its first 16 locators completed, and the second, among
 /// locators submitted after step `grown`, when every mirror's new tip was
 /// committed. A locator submitted before then, such as a retry toward an
 /// old tip, never counts toward the second wave.
@@ -950,11 +1036,7 @@ fn locator_capacity_recovers_after_success_and_failure() {
             mirrors: (1..=16)
                 .map(|branch| {
                     let fork = Some(Fork { branch, len: 1 });
-                    mirror(
-                        &format!("m{branch}"),
-                        Chain { main: 0, fork },
-                        Dialer::Mirror,
-                    )
+                    mirror(Chain { main: 0, fork }, Dialer::Mirror)
                 })
                 .collect(),
             policy: Policy {
@@ -965,7 +1047,7 @@ fn locator_capacity_recovers_after_success_and_failure() {
             },
             controls: (1..=16)
                 .map(|m| ControlStep {
-                    peer: format!("m{m}"),
+                    peer: format!("mirror-{}", m - 1),
                     action: ControlAction::Grow { len: 1 },
                     when: (m == 1)
                         .then(|| Trigger::Count(16, Box::new(Trigger::Completed(locators())))),
@@ -1040,12 +1122,12 @@ fn deferred(secs: i64, now: std::time::SystemTime) -> bool {
     i128::from(secs) * 1_000_000_000 > i128::try_from(now).unwrap() + 7_200 * 1_000_000_000
 }
 
-/// Pat prepares 150 fixture headers on Nora's port with the scenario clock
-/// set so the last ones are more than 2 h ahead. At the completion, each
-/// prepared header is `DeferredUntil` 2 h before its time exactly when it's
-/// more than 2 h past the scenario clock, and `Valid` otherwise. Some are
-/// deferred, which host time never would, since every fixture header is in
-/// the host's past.
+/// The probe prepares 150 fixture headers on the node's port with the
+/// scenario clock set so the last ones are more than 2 h ahead. At the
+/// completion, each prepared header is `DeferredUntil` 2 h before its time
+/// exactly when it's more than 2 h past the scenario clock, and `Valid`
+/// otherwise. Some are deferred, which host time never would, since every
+/// fixture header is in the host's past.
 #[test]
 fn prepared_target_follows_the_scenario_clock() {
     use zakura_header_chain::HeaderValidationState;
@@ -1067,10 +1149,10 @@ fn prepared_target_follows_the_scenario_clock() {
             .borrow_mut()
             .prepared
             .take()
-            .expect("Pat's prepare completed");
+            .expect("the probe's prepare completed");
         let insert = prepared
             .into_insert(ready.ports.node.engine().adapter_key())
-            .unwrap_or_else(|_| panic!("Nora's port sealed the target"));
+            .unwrap_or_else(|_| panic!("the node's port sealed the target"));
         let headers = insert.batch.headers();
         assert_eq!(headers.len(), usize::try_from(CLOCK_HEADERS).unwrap());
         let mut deferrals = 0;
@@ -1091,20 +1173,34 @@ fn prepared_target_follows_the_scenario_clock() {
     }
 }
 
-/// Nora syncs 150 headers from Mira with the scenario clock set so the last
-/// ones are more than 2 h ahead. Right after her first apply completes,
-/// her tip is the last header no more than 2 h past the scenario clock
-/// then, and some header is still deferred. With the clock a day past
-/// every header, she reaches Mira's tip.
+/// The node syncs 150 headers from `mirror-0` with the scenario clock set so
+/// the last ones are more than 2 h ahead. Its first apply is held until 20 s
+/// into the run, so admission sees a later clock than preparation did and
+/// must promote the deferred headers that came due meanwhile. Right after
+/// that apply completes, its tip is the last header no more than 2 h past
+/// the scenario clock then, and some header is still deferred. With the
+/// clock a day past every header, it reaches `mirror-0`'s tip.
 #[test]
 fn selected_tip_follows_the_scenario_clock() {
+    use zakura_sim::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
+
     let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
     let late = origin_deferring(&fixture, 100);
     let ahead = origin_deferring(&fixture, 0) + 7_200 + 86_400;
+    let held_apply = Hold {
+        select: Select::nth(OpKind::Apply, 1),
+        until: Trigger::VirtualTime(20_000),
+        then: vec![Allow::Engine],
+        deadline_ms: Some(21_000),
+    };
     for (origin, all) in [(late, false), (ahead, true)] {
         let scenario = Probed {
             storage: StorageScenario {
-                mirrors: vec![mirror("mira", Chain::main(CLOCK_HEADERS), Dialer::Mirror)],
+                mirrors: vec![mirror(Chain::main(CLOCK_HEADERS), Dialer::Mirror)],
+                policy: Policy {
+                    holds: vec![held_apply.clone()],
+                    ..Policy::converging()
+                },
                 ..StorageScenario::default()
             },
             probe: Probe::Idle,
@@ -1155,7 +1251,7 @@ fn selected_tip_follows_the_scenario_clock() {
             )
             .unwrap_or_else(|error| panic!("{error}"));
             drop(watch);
-            let (now, tip) = first.get().expect("Nora applied");
+            let (now, tip) = first.get().expect("the node applied");
             let headers = fixture.extend(fixture.anchor(), CLOCK_HEADERS, 0);
             let eligible = headers
                 .iter()

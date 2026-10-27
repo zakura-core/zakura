@@ -7,6 +7,13 @@
 //! [`Observation::Reactor`]. The tap registers its checkpoint with the run
 //! like storage does, so the run checks its evidence the same way.
 //!
+//! Before it logs a drain, the reader pairs each port call's end with the
+//! storage receipt it took, as [`super::pair`] describes, from the facts
+//! [`PolicySource`](super::PolicySource) hands it. A tap read on its own
+//! sees no storage facts, so any call that took a receipt fails to pair.
+//! A call caught panicking ends the run with
+//! [`HarnessFailure::ReactorPortPanicked`] once its drain is logged.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -29,11 +36,13 @@ use zakura_rt::sim::RunId;
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::ControlledPort;
 
+use super::pair::{PairError, Pairer};
 use crate::{
+    draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
-    observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest},
+    observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
     storage::{body_owner, hash, hex, point, scope, work_owner},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
 };
 
 /// The run's reader of one reactor's events. Dropping it while the run is
@@ -46,6 +55,10 @@ pub struct ReactorTap {
     node: String,
     /// The last event delivered to the log, 0 before any.
     delivered: u64,
+    /// Pairs calls with the node's storage receipts.
+    pairer: Pairer,
+    /// The run's harness failure, set when a call panics.
+    failure: Failure,
 }
 
 /// What the observer and the reader share.
@@ -184,8 +197,20 @@ impl ReactorTap {
             id,
             node: node.to_owned(),
             delivered: 0,
+            pairer: Pairer::default(),
+            failure: sim.failure(),
         };
         (observer, tap)
+    }
+
+    /// Reads the node's storage facts that this step's drain logged, as
+    /// `(seq, fact)` in order, so the next [`observe`](ActionSource::observe)
+    /// can pair calls with them.
+    pub(crate) fn storage_facts<'f>(
+        &mut self,
+        facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
+    ) {
+        self.pairer.facts(facts);
     }
 }
 
@@ -349,8 +374,10 @@ impl ActionSource for ReactorTap {
         unreachable!("a reactor tap offers no actions");
     }
 
-    /// Logs every event recorded since the last observation, in order, and
-    /// records what it delivered in the checkpoint.
+    /// Pairs and logs every event recorded since the last observation, in
+    /// order, and records what it delivered in the checkpoint. A drain that
+    /// doesn't pair is still logged, then fails, or records a port panic
+    /// as the run's harness failure.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -360,7 +387,7 @@ impl ActionSource for ReactorTap {
         }
         let events = mem::take(&mut self.state.buffer().events);
         let last = events.last().map_or(self.delivered, |(seq, _, _)| *seq);
-        let sent = events
+        let mut sent = events
             .into_iter()
             .map(|(seq, storage_seq, event)| {
                 Ok(Observation::Reactor {
@@ -372,6 +399,14 @@ impl ActionSource for ReactorTap {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let paired = self
+            .pairer
+            .pair(sent.iter_mut().filter_map(|obs| match obs {
+                Observation::Reactor {
+                    storage_seq, event, ..
+                } => Some((*storage_seq, event)),
+                _ => None,
+            }));
         for obs in &sent {
             log.push(obs.clone());
         }
@@ -379,7 +414,21 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        Ok(())
+        match paired {
+            Ok(()) => Ok(()),
+            Err(PairError::Evidence(detail)) => Err(detail),
+            Err(PairError::PortPanicked { call }) => {
+                // The run checks this after the step, ahead of any evidence
+                // failure the same step reports.
+                self.failure
+                    .borrow_mut()
+                    .get_or_insert(HarnessFailure::ReactorPortPanicked {
+                        source: self.checkpoint.kind().source(self.id.index),
+                        call,
+                    });
+                Ok(())
+            }
+        }
     }
 }
 

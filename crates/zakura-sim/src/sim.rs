@@ -149,6 +149,12 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
+    /// The run's harness failure cell, which a source sets for a failure
+    /// it finds while observing. The run checks it after every step.
+    pub(crate) fn failure(&self) -> Failure {
+        self.failure.clone()
+    }
+
     /// Holds `checkpoint` for an evidence source being created. At setup
     /// and after every step, the run ends with
     /// [`HarnessFailure::SourceEvidence`] unless it names that step and the

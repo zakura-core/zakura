@@ -10,6 +10,7 @@
 //! operations, and gates `Control` steps, until chosen events happen. A
 //! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
 
+mod pair;
 pub mod policy;
 pub mod tap;
 
@@ -214,7 +215,7 @@ fn after(t: SimInstant, d: Duration) -> SimInstant {
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
 /// pure. With a [`ReactorTap`], it logs the node's reactor events after its
-/// storage facts, which its predicates don't read.
+/// storage facts, paired with them, which its predicates don't read.
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
@@ -250,7 +251,8 @@ impl PolicySource {
     }
 
     /// This source, draining `tap` at each observation, after storage, so
-    /// each event's storage watermark is already logged.
+    /// each event's storage watermark is already logged and the tap pairs
+    /// calls with that step's facts.
     pub fn with_tap(self, tap: ReactorTap) -> Self {
         PolicySource {
             tap: Some(tap),
@@ -295,6 +297,13 @@ impl ActionSource for PolicySource {
         let before = log.entries().len();
         self.storage.observe(log)?;
         if let Some(tap) = &mut self.tap {
+            // The storage source appends only its own port's facts.
+            tap.storage_facts(log.entries()[before..].iter().filter_map(
+                |entry| match &entry.obs {
+                    Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
+                    _ => None,
+                },
+            ));
             tap.observe(log)?;
         }
         let mut predicates = self.predicates.borrow_mut();

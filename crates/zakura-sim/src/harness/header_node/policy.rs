@@ -50,7 +50,7 @@ pub enum OpKind {
 impl OpKind {
     /// `request`'s kind, and the session it's attributed to, if any.
     /// Locators and membership reads carry none.
-    fn of(request: &StorageRequest) -> (OpKind, Option<u64>) {
+    pub(crate) fn of(request: &StorageRequest) -> (OpKind, Option<u64>) {
         match request {
             StorageRequest::ContinuationLocator => (OpKind::Locator, None),
             StorageRequest::VctRepairContext { owner, .. } => {

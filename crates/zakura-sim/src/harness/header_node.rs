@@ -52,7 +52,10 @@ use crate::{
 
 /// Frames each direction of a link buffers, enough for a page and control
 /// frames in flight.
-const LINK_DEPTH: usize = 8;
+pub(crate) const LINK_DEPTH: usize = 8;
+
+/// The header storage service's name in storage observations.
+const HEADER: &str = "header";
 
 /// A chain an actor holds before its run: `main` headers on branch 0 from
 /// genesis, then `fork`, if any, from that tip.
@@ -300,10 +303,13 @@ impl ActionSource for PolicySource {
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
             Some(tap) => {
-                // The storage source appends only its own port's facts.
+                // The storage source appends only its own port's facts, but
+                // a run may hold other services' storage too.
                 tap.storage_facts(log.entries()[before..].iter().filter_map(
                     |entry| match &entry.obs {
-                        Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
+                        Observation::Storage {
+                            service, seq, fact, ..
+                        } if service == HEADER => Some((*seq, fact)),
                         _ => None,
                     },
                 ));
@@ -317,7 +323,9 @@ impl ActionSource for PolicySource {
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
-                Observation::Storage { fact, .. } => predicates.record(fact),
+                Observation::Storage { service, fact, .. } if service == HEADER => {
+                    predicates.record(fact)
+                }
                 Observation::Reactor { event, .. } => predicates.record_reactor(event),
                 _ => {}
             }

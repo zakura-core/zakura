@@ -381,29 +381,46 @@ pub fn storage_sources() -> Sources {
     Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
 }
 
-/// A submission or completion on the node's storage, instance 0.
-fn operation_fact(obs: &Observation) -> Option<&StorageFact> {
+/// A submission or completion on the node's `service` storage, instance 0.
+fn operation_fact<'o>(service: &str, obs: &'o Observation) -> Option<&'o StorageFact> {
     match obs {
         Observation::Storage {
+            service: logged,
             instance: 0,
-            fact: fact @ (StorageFact::Submitted { .. } | StorageFact::Completed { .. }),
+            fact:
+                fact @ (StorageFact::Submitted { .. }
+                | StorageFact::Completed { .. }
+                | StorageFact::BlockSubmitted { .. }
+                | StorageFact::BlockCompleted { .. }),
             ..
-        } => Some(fact),
+        } if logged == service => Some(fact),
         _ => None,
     }
 }
 
-/// Checks [`OPERATION_IDS`] at each step that logs a submission or
-/// completion on the node's storage. A check keeps no state between steps,
-/// so it replays the node's facts from the run's start, and reports the
-/// first finding among this step's.
+/// Checks [`OPERATION_IDS`] on the node's header storage.
 fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
-    if !cx.observations().any(|obs| operation_fact(obs).is_some()) {
+    check_service_operation_ids("header", cx)
+}
+
+/// Checks that the node's `service` storage gives its operations rising
+/// IDs and completes each at most once, after its submission, at each step
+/// that logs a submission or completion there. A check keeps no state
+/// between steps, so it replays the node's facts from the run's start, and
+/// reports the first finding among this step's.
+pub(crate) fn check_service_operation_ids<S: HasView>(
+    service: &str,
+    cx: &mut CheckCtx<'_, S>,
+) -> Verdict {
+    if !cx
+        .observations()
+        .any(|obs| operation_fact(service, obs).is_some())
+    {
         return Verdict::NotApplicable;
     }
     let mut ids = OperationIds::default();
     for entry in cx.log.entries() {
-        let Some(fact) = operation_fact(&entry.obs) else {
+        let Some(fact) = operation_fact(service, &entry.obs) else {
             continue;
         };
         if let Some((expected, actual)) = ids.check(fact) {
@@ -443,7 +460,7 @@ impl OperationIds {
     /// (expected, actual).
     fn check(&mut self, fact: &StorageFact) -> Option<(String, String)> {
         match *fact {
-            StorageFact::Submitted { id, .. } => {
+            StorageFact::Submitted { id, .. } | StorageFact::BlockSubmitted { id, .. } => {
                 let expected = self.submitted + 1;
                 self.submitted = id;
                 (id != expected).then(|| {
@@ -453,7 +470,7 @@ impl OperationIds {
                     )
                 })
             }
-            StorageFact::Completed { id, .. } => {
+            StorageFact::Completed { id, .. } | StorageFact::BlockCompleted { id, .. } => {
                 if id > self.submitted {
                     Some((
                         format!(

@@ -19,6 +19,7 @@ mod block;
 mod header;
 
 pub use block::BlockStorage;
+pub(crate) use block::{decode as decode_block, SERVICE as BLOCK_SERVICE};
 pub(crate) use header::decode;
 pub use header::{request, work_owner, HeaderStorage};
 

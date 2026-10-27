@@ -35,7 +35,7 @@ use crate::{
 };
 
 /// The service name in identities and observations.
-const SERVICE: &str = "block";
+pub(crate) const SERVICE: &str = "block";
 
 /// Action indices hold the operation ID times this, plus the outcome's
 /// code.
@@ -101,7 +101,7 @@ fn outcome(code: u64) -> Option<BlockOutcome> {
 }
 
 /// The operation and outcome that action index `local` names.
-fn decode(local: u64) -> (OpId, BlockOutcome) {
+pub(crate) fn decode(local: u64) -> (OpId, BlockOutcome) {
     let outcome = outcome(local % CODES).expect("indices come from `enabled`, which codes them");
     (OpId(local / CODES), outcome)
 }

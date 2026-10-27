@@ -95,4 +95,12 @@ pub static COVERAGE: &[Coverage] = &[
             "direct_dispatch_guard_reports_a_violation",
         ),
     },
+    Coverage {
+        property: super::block_sync::OPERATION_IDS,
+        passing: sim_test("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
+        bypass: sim_test(
+            "tests/block_node.rs",
+            "planted_block_operation_ids_violate_the_property",
+        ),
+    },
 ];

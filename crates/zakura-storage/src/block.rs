@@ -73,9 +73,13 @@
 //! outcomes need no gate. A [`Gate`] says when the other outcomes are legal,
 //! from the [`Conditions`] the service computes for each pending operation:
 //!
+//! * The driver admits a body and reports a verdict only at the top of
+//!   its loop or in its select, never while it awaits a query or record
+//!   ([`Stage::needs_free_driver`]). A verdict commits and replies at
+//!   once, so this leaves out a commit that lands while the driver awaits.
 //! * The driver admits queued submissions in arrival order, skipping one
-//!   whose class is at its limit, and never while it awaits a query or
-//!   record ([`Gate::AdmitNext`]). The limits are [`ApplyLimits`].
+//!   whose class is at its limit ([`Gate::AdmitNext`]). The limits are
+//!   [`ApplyLimits`].
 //! * The verifier commits a body only once its parent is committed. Full
 //!   state queues a body whose parent is missing
 //!   (`QueuedBlocks` in zakura-state), so `committed` and `ambiguous` wait
@@ -215,6 +219,15 @@ pub enum Stage {
     Queued,
     /// A submission the verifier is working on.
     Admitted,
+}
+
+impl Stage {
+    /// Whether an operation at this stage completes only while the driver
+    /// awaits nothing: it admits a body and takes a verdict only at the top
+    /// of its loop or in its select.
+    pub const fn needs_free_driver(self) -> bool {
+        matches!(self, Stage::Queued | Stage::Admitted)
+    }
 }
 
 /// How a pending operation completes, or moves to its next stage.
@@ -473,8 +486,7 @@ impl ApplyLimits {
 pub enum Gate {
     /// Always.
     Always,
-    /// The driver isn't awaiting a query or record, and the submission is
-    /// the oldest queued one whose class has room.
+    /// The submission is the oldest queued one whose class has room.
     AdmitNext,
     /// The body's parent is committed and the body isn't.
     ParentCommitted,
@@ -508,7 +520,7 @@ impl Gate {
     pub const fn open(self, conditions: &Conditions) -> bool {
         match self {
             Gate::Always => true,
-            Gate::AdmitNext => !conditions.driver_awaiting && conditions.oldest_with_room,
+            Gate::AdmitNext => conditions.oldest_with_room,
             Gate::ParentCommitted => conditions.parent_committed && !conditions.committed,
             Gate::KnownToState => {
                 conditions.committed || conditions.replaced || conditions.older_in_flight
@@ -736,6 +748,9 @@ impl BlockOp {
         class: ApplyClass,
         conditions: &Conditions,
     ) -> Vec<BlockOutcome> {
+        if stage.needs_free_driver() && conditions.driver_awaiting {
+            return Vec::new();
+        }
         self.outcomes(stage, class)
             .into_iter()
             .filter(|(_, gate)| gate.open(conditions))

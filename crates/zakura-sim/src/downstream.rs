@@ -188,12 +188,14 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
 
 /// `receiver-credit-conserved`: work the node admits for a subscription of
 /// `row`, from all its page rows, stays within the credit the node granted
-/// before it, in objects and in bytes.
+/// since the subscription opened, in objects and in bytes. A terminal
+/// outcome spends no credit, so its work isn't counted.
 pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Found {
     let Observation::WorkAdmitted {
         connection,
         request,
         exchange,
+        ends: false,
         ..
     } = &entries[at].obs
     else {
@@ -212,7 +214,12 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
                 exchange: e,
                 objects,
                 bytes,
+                opens,
             } if (c, subscription, e) == (connection, request, exchange) => {
+                if *opens {
+                    granted = Quantity::default();
+                    admitted = Quantity::default();
+                }
                 granted.add(*objects, *bytes);
             }
             Observation::WorkAdmitted {
@@ -221,6 +228,7 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
                 exchange: e,
                 objects,
                 bytes,
+                ends: false,
                 ..
             } if (c, r, e) == (connection, request, exchange) => admitted.add(*objects, *bytes),
             _ => {}
@@ -247,16 +255,24 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
 /// only for a request frame with its key that the peer's models labelled
 /// `Conformant` and the reader judged, while the request is open: before
 /// the node writes its ending, on a connection still open. Each such
-/// request gets at most one owner. Conformant requests stay within the
-/// receiver's margin, so its serving owners do too.
+/// request gets at most one owner. The node's output answers only such an
+/// open request too, whether or not an owner wrote it. Conformant requests
+/// stay within the receiver's margin, so its serving owners and outputs do
+/// too.
 pub(crate) fn serving_bounded(entries: &[Entry], at: usize, row: &RowAt) -> Found {
-    let Observation::Serving {
-        connection,
-        request,
-        exchange,
-    } = &entries[at].obs
-    else {
-        return None;
+    let (connection, request, exchange) = match &entries[at].obs {
+        Observation::Serving {
+            connection,
+            request,
+            exchange,
+        } => (connection, request, exchange),
+        Observation::NodeOutput {
+            connection,
+            request,
+            exchange,
+            ..
+        } => return answered(&entries[..at], *connection, request, *exchange, row),
+        _ => return None,
     };
     if request != row {
         return None;
@@ -281,6 +297,32 @@ pub(crate) fn serving_bounded(entries: &[Entry], at: usize, row: &RowAt) -> Foun
         Err(Failure::new(
             format!("{what} is served only while a conformant request is open"),
             "the node started serving it with no request open",
+        ))
+    })
+}
+
+/// The output part of `receiver-serving-bounded`: the node's output for a
+/// request of `row` with key `exchange` on `connection` answers a
+/// conformant, judged request still open in `before`.
+fn answered(
+    before: &[Entry],
+    connection: u64,
+    request: &RowAt,
+    exchange: u64,
+    row: &RowAt,
+) -> Found {
+    if request != row {
+        return None;
+    }
+    Some(if requests(before, connection, row, exchange).open > 0 {
+        Ok(())
+    } else {
+        Err(Failure::new(
+            format!(
+                "connection {connection}'s {row} request {exchange} is answered only while a \
+                 conformant request is open"
+            ),
+            "the node answered it with no request open",
         ))
     })
 }

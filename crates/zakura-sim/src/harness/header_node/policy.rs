@@ -8,7 +8,10 @@
 //! keep `enabled` and `boundaries` pure, as replay needs.
 //!
 //! A trigger counts effects, never picks: a `Control` pick only queues its
-//! action, so [`Trigger::Closed`] counts closes a task actually made.
+//! action, so [`Trigger::Closed`] counts closes a task actually made. No
+//! trigger shows that a caller has handled a reply, only that it took it
+//! ([`Trigger::ReplyTaken`]), since that needs a witness from the reactor
+//! itself.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -125,8 +128,11 @@ pub enum Trigger {
     CallerDropped(Select),
     /// A selected operation completed. Its reply is only queued then.
     Completed(Select),
-    /// A selected operation's caller took its reply, so the caller's
-    /// callback has run.
+    /// A selected operation's caller consumed its reply. That doesn't mean
+    /// the caller has acted on it: a caller can reach a scheduling point
+    /// between taking a reply and handling it, as the reactor does when it
+    /// drops a locator's permit before finishing the query. So this isn't
+    /// a callback-handled witness, and none of these triggers is one.
     ReplyTaken(Select),
     /// A link to this peer was closed.
     Closed(String),

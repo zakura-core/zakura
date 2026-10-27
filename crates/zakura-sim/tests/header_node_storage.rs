@@ -1066,19 +1066,33 @@ fn prepared_target_follows_the_scenario_clock() {
 }
 
 /// The node syncs 150 headers from `mirror-0` with the scenario clock set so
-/// the last ones are more than 2 h ahead. Right after its first apply
-/// completes, its tip is the last header no more than 2 h past the scenario
-/// clock then, and some header is still deferred. With the clock a day past
-/// every header, it reaches `mirror-0`'s tip.
+/// the last ones are more than 2 h ahead. Its first apply is held until 20 s
+/// into the run, so admission sees a later clock than preparation did and
+/// must promote the deferred headers that came due meanwhile. Right after
+/// that apply completes, its tip is the last header no more than 2 h past
+/// the scenario clock then, and some header is still deferred. With the
+/// clock a day past every header, it reaches `mirror-0`'s tip.
 #[test]
 fn selected_tip_follows_the_scenario_clock() {
+    use zakura_sim::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
+
     let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
     let late = origin_deferring(&fixture, 100);
     let ahead = origin_deferring(&fixture, 0) + 7_200 + 86_400;
+    let held_apply = Hold {
+        select: Select::nth(OpKind::Apply, 1),
+        until: Trigger::VirtualTime(20_000),
+        then: vec![Allow::Engine],
+        deadline_ms: Some(21_000),
+    };
     for (origin, all) in [(late, false), (ahead, true)] {
         let scenario = Probed {
             storage: StorageScenario {
                 mirrors: vec![mirror(Chain::main(CLOCK_HEADERS), Dialer::Mirror)],
+                policy: Policy {
+                    holds: vec![held_apply.clone()],
+                    ..Policy::converging()
+                },
                 ..StorageScenario::default()
             },
             probe: Probe::Idle,

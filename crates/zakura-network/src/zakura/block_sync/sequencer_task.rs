@@ -47,6 +47,9 @@ pub(super) struct SequencedBody {
     pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    /// The size estimate this body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
     queue_accounting: SequencerInputAccounting,
@@ -62,6 +65,7 @@ impl SequencedBody {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
         received_at: Instant,
         input_bytes: Arc<AtomicU64>,
@@ -76,6 +80,7 @@ impl SequencedBody {
             previous_block_hash,
             body,
             bytes,
+            admitted_estimate_bytes,
             peer,
             received_at,
             queue_accounting: SequencerInputAccounting::new(
@@ -602,6 +607,7 @@ impl SequencerTask {
             body.previous_block_hash,
             body.body,
             body.bytes,
+            body.admitted_estimate_bytes,
             body.peer,
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
@@ -1393,6 +1399,7 @@ mod tests {
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             123,
+            None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
@@ -1558,6 +1565,7 @@ mod tests {
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
             bytes,
+            None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             task._body_input_bytes.clone(),

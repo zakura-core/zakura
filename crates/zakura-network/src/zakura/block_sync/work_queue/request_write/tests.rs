@@ -800,3 +800,51 @@ fn budget_ledger_gauges_follow_work_owners() {
     drop(claim);
     assert_eq!(check(&f, "published drop"), (0, 0));
 }
+
+/// Review P5a-2: a body that answers a competing request carries the charge
+/// of the request its release settles. Another routine can retire the old
+/// request and publish a replacement with a new estimate between a separate
+/// charge read and the release, so the charge comes from the release.
+#[test]
+fn answered_elsewhere_returns_the_settled_requests_charge() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let work = Arc::new(WorkQueue::new(block::Height(0)));
+    work.extend(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(2_000))],
+    );
+    let mut budget = ByteBudget::new(10_000);
+    let cancel = CancellationToken::new();
+    let take = |id, budget: &mut ByteBudget, bytes| {
+        let items =
+            work.take_for_request(height, height, 1, 10_000, 7, NonZeroU64::new(id).unwrap());
+        assert_eq!(items.len(), 1);
+        assert!(budget.try_reserve(bytes));
+        let claim = RequestWrite::new(
+            items[0].1.owner.unwrap(),
+            items,
+            work.clone(),
+            budget.clone(),
+            cancel.clone(),
+        );
+        assert!(claim.publish(|| {}));
+        claim
+    };
+    let old = take(1, &mut budget, 2_000);
+    assert_eq!(work.reserved_in_flight_charge(height), Some(2_000));
+    let retired = work.release_reserved_and_return_items_detailed_for_owner(old.owner(), [height]);
+    budget.release(retired.released_bytes);
+    work.refresh_size_estimates(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(1_500))],
+    );
+    let replacement = take(2, &mut budget, 1_500);
+
+    let ended = work
+        .release_answered_elsewhere(replacement.owner(), height)
+        .expect("the replacement owns the reserved height");
+    budget.release(ended.released);
+    assert_eq!(ended.charge, 1_500);
+    assert_eq!(budget.reserved(), 0);
+}

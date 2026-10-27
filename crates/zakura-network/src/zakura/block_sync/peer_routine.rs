@@ -2030,6 +2030,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            Some(estimated_bytes),
             body_permit,
         )
         .await;
@@ -2049,6 +2050,7 @@ impl PeerRoutine {
         previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         serialized_bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
         let received_at = Instant::now();
@@ -2061,6 +2063,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            admitted_estimate_bytes,
             self.peer.clone(),
             received_at,
             self.sequencer_input_bytes.clone(),
@@ -2134,7 +2137,12 @@ impl PeerRoutine {
 
         // The reservation this arrival ended (an active competing request, or a
         // stale charge on the claimed height); released after the forward below.
-        let ended_reservation = if is_pending {
+        // A pending height's body is admitted on its wire size, so it carries no
+        // request estimate. A body that answers a competing request carries that
+        // request's per-height charge, read by the same owner-checked release
+        // that ends it; the released total can also hold the bytes of a retired
+        // unsent request.
+        let (ended_reservation, admitted_estimate_bytes) = if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
             if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
@@ -2153,17 +2161,17 @@ impl PeerRoutine {
             // stale request reservation the height still owned is released below.
             let _ = self.work.take_in_range(height, height, 1);
             metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            self.work.claim_received_for_owner(owner, height)
+            (self.work.claim_received_for_owner(owner, height), None)
         } else {
             // First-completion-wins for a timed-out height already re-issued to
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
+            let Some(ended) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            estimate
+            (ended.released, Some(ended.charge))
         };
 
         let decoded_attributed_memory_size_bytes =
@@ -2206,6 +2214,7 @@ impl PeerRoutine {
             previous_block_hash,
             body,
             serialized_bytes,
+            admitted_estimate_bytes,
             body_permit,
         )
         .await;
@@ -2589,6 +2598,7 @@ impl Drop for PeerRoutine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2611,6 +2621,7 @@ mod tests {
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::tests::genesis_frontiers;
     use super::super::work_queue::WorkQueue;
+    use super::super::work_queue::{RequestWritePhase, WorkItemPlace};
     use super::super::{
         BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig,
     };
@@ -3446,6 +3457,160 @@ mod tests {
             !work.pending_contains(block::Height(1)),
             "the floor height was taken, not returned",
         );
+    }
+
+    /// A routine for peer `[id; 32]` that shares `budget`, `work` and `registry`
+    /// and reads the download floor from `view`. It has received a `Status`
+    /// that makes heights 1 to 10 servable.
+    fn shared_floor_routine(
+        id: u8,
+        budget: &ByteBudget,
+        work: &Arc<WorkQueue>,
+        registry: &Arc<PeerRegistry>,
+        view: watch::Receiver<super::super::sequencer_task::SequencerView>,
+    ) -> (PeerRoutine, crate::zakura::FramedRecv) {
+        let config = ZakuraBlockSyncConfig::default();
+        let cancel = CancellationToken::new();
+        let (out_send, out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![id; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let generation = registry
+            .admit_session(
+                &peer,
+                session.direction(),
+                &config,
+                u64::from(id),
+                Instant::now(),
+            )
+            .generation();
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
+        let mut routine = PeerRoutine::new(
+            peer,
+            u64::from(id),
+            session,
+            in_recv,
+            requester,
+            serving,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            Arc::clone(work),
+            Arc::clone(registry),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+        (routine, out_recv)
+    }
+
+    /// Each outstanding height, read from the routine's request handles, from
+    /// the registry's published claims, and from the work queue's items. All
+    /// three name the same owner and the estimate reserved at admission, and
+    /// those estimates are the budget's only charges. Dropping the routine
+    /// empties all three owners and returns the budget to zero.
+    #[tokio::test]
+    async fn request_owners_agree_across_routine_registry_and_queue() {
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.extend(
+            super::super::test_work_scope(),
+            (1u8..=4).map(|height| {
+                (
+                    block::Height(u32::from(height)),
+                    block::Hash([height; 32]),
+                    BlockSizeEstimate::Advertised(1_000 * u32::from(height)),
+                )
+            }),
+        );
+        let registry = Arc::new(PeerRegistry::new());
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (mut routine, mut out_recv) =
+            shared_floor_routine(7, &budget, &work, &registry, view_rx);
+        let _ = routine.try_fill().await;
+
+        let requests = routine.window.outstanding.ownership();
+        assert!(!requests.is_empty(), "the routine issued a request");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.write == RequestWritePhase::Queued),
+            "transport hasn't taken the frames: {requests:?}"
+        );
+        let from_requests: BTreeMap<_, _> = requests
+            .iter()
+            .flat_map(|request| {
+                request.heights.iter().map(move |requested| {
+                    assert!(!requested.received);
+                    (requested.height, (request.owner, requested.estimated_bytes))
+                })
+            })
+            .collect();
+        let from_registry: BTreeMap<_, _> = registry
+            .outstanding_snapshot(&routine.peer)
+            .into_iter()
+            .map(|(height, meta)| (height, (meta.owner, meta.estimated_bytes)))
+            .collect();
+        let from_queue: BTreeMap<_, _> = work
+            .ownership_snapshot()
+            .into_iter()
+            .filter(|item| item.place == WorkItemPlace::InFlight)
+            .map(|item| {
+                assert_eq!(item.reserved_bytes, item.estimated_bytes);
+                (
+                    item.height,
+                    (
+                        item.owner.expect("an in-flight item has an owner"),
+                        item.estimated_bytes,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(from_requests, from_registry);
+        assert_eq!(from_requests, from_queue);
+        assert_eq!(
+            budget.reserved(),
+            from_requests
+                .values()
+                .map(|(_, estimate)| estimate)
+                .sum::<u64>()
+        );
+
+        // The in-memory transport writes every frame it takes, so each
+        // handle records a completed write.
+        while let Ok(Some(_)) = timeout(Duration::from_millis(1), out_recv.recv()).await {}
+        assert!(routine
+            .window
+            .outstanding
+            .ownership()
+            .iter()
+            .all(|request| request.write == RequestWritePhase::Written));
+
+        let peer = routine.peer.clone();
+        drop(routine);
+        assert!(registry.outstanding_snapshot(&peer).is_empty());
+        assert!(work
+            .ownership_snapshot()
+            .iter()
+            .all(|item| item.place == WorkItemPlace::Pending && item.reserved_bytes == 0));
+        assert_eq!(budget.reserved(), 0);
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

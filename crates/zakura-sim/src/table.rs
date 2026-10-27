@@ -7,7 +7,9 @@
 //! property covers.
 //!
 //! [`downstream_properties`] adds the templates that compare the node's
-//! actual effects with the role models, which `downstream.rs` checks.
+//! actual effects with the role models, which `downstream.rs` checks, and
+//! [`sender_properties`] the templates that check the node's own frames as
+//! the peer's role models label them, which `sender.rs` checks.
 //!
 //! The close checks read four observations: [`Observation::PeerFrame`], which a
 //! peer's role models label at send time; [`Observation::FrameJudged`], the
@@ -31,7 +33,7 @@ use crate::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
         Source, Status, Subject, Verdict,
     },
-    Observation,
+    sender, Observation,
 };
 
 /// What a generated property claims.
@@ -59,6 +61,24 @@ pub enum Template {
     /// Per response row: the node's output for an exchange stays within
     /// what the peer's request owes.
     SenderWithinResponseQuantity,
+    /// Per request row: the node's open requests stay within the limit the
+    /// peer advertised.
+    SenderWithinLimit,
+    /// Per response row that doesn't end its exchange: the node responds
+    /// only within an exchange the peer opened.
+    SenderAnswersOpen,
+    /// Per response row that ends its exchange: the node ends only an open
+    /// exchange, so it ends each at most once.
+    SenderEndsOnce,
+    /// Per subscription row: the node's live subscriptions stay within
+    /// `max_live`.
+    SenderWithinLive,
+    /// Per subscription row: the node's pages stay within the credit the
+    /// peer granted.
+    SenderWithinCredit,
+    /// Per row with a cadence: the node's frames never empty the peer's
+    /// cadence bucket.
+    SenderCadence,
 }
 
 impl Template {
@@ -72,6 +92,12 @@ impl Template {
             Template::CreditConserved => "receiver-credit-conserved".to_owned(),
             Template::ServingBounded => "receiver-serving-bounded".to_owned(),
             Template::SenderWithinResponseQuantity => "sender-within-response-quantity".to_owned(),
+            Template::SenderWithinLimit => "sender-within-limit".to_owned(),
+            Template::SenderAnswersOpen => "sender-answers-open".to_owned(),
+            Template::SenderEndsOnce => "sender-ends-once".to_owned(),
+            Template::SenderWithinLive => "sender-within-live".to_owned(),
+            Template::SenderWithinCredit => "sender-within-credit".to_owned(),
+            Template::SenderCadence => "sender-cadence".to_owned(),
         }
     }
 
@@ -84,6 +110,12 @@ impl Template {
             "receiver-credit-conserved" => Some(Template::CreditConserved),
             "receiver-serving-bounded" => Some(Template::ServingBounded),
             "sender-within-response-quantity" => Some(Template::SenderWithinResponseQuantity),
+            "sender-within-limit" => Some(Template::SenderWithinLimit),
+            "sender-answers-open" => Some(Template::SenderAnswersOpen),
+            "sender-ends-once" => Some(Template::SenderEndsOnce),
+            "sender-within-live" => Some(Template::SenderWithinLive),
+            "sender-within-credit" => Some(Template::SenderWithinCredit),
+            "sender-cadence" => Some(Template::SenderCadence),
             _ => {
                 let name = claim.strip_suffix("-closes")?;
                 let label = Label::ALL.into_iter().find(|l| l.name() == name)?;
@@ -113,13 +145,32 @@ impl Template {
             Template::SenderWithinResponseQuantity => {
                 "the node's responses stay within what the request owes"
             }
+            Template::SenderWithinLimit => {
+                "the node's open requests stay within the limit the peer advertised"
+            }
+            Template::SenderAnswersOpen => {
+                "the node responds only within an exchange the peer opened"
+            }
+            Template::SenderEndsOnce => "the node ends only an open exchange, so each at most once",
+            Template::SenderWithinLive => "the node's live subscriptions stay within max_live",
+            Template::SenderWithinCredit => {
+                "the node's pages stay within the credit the peer granted"
+            }
+            Template::SenderCadence => "the node's frames never empty the peer's cadence bucket",
         }
     }
 
     /// The sources the check reads: frames and closes, and storage for the
-    /// templates that read `Misbehavior` or the node's work.
+    /// templates that read `Misbehavior` or the node's work. The sender
+    /// templates read only frames.
     fn needs(self) -> &'static [Source] {
         match self {
+            Template::SenderWithinLimit
+            | Template::SenderAnswersOpen
+            | Template::SenderEndsOnce
+            | Template::SenderWithinLive
+            | Template::SenderWithinCredit
+            | Template::SenderCadence => &[Source::Frames],
             Template::SenderWithinResponseQuantity => &[Source::Frames, Source::Closes],
             Template::Closes(label) if consequence(label) != Consequence::FamilyContent => {
                 &[Source::Frames, Source::Closes]
@@ -140,7 +191,13 @@ impl Template {
             | Template::WorkAuthorized
             | Template::CreditConserved
             | Template::ServingBounded
-            | Template::SenderWithinResponseQuantity => Kind::Safety,
+            | Template::SenderWithinResponseQuantity
+            | Template::SenderWithinLimit
+            | Template::SenderAnswersOpen
+            | Template::SenderEndsOnce
+            | Template::SenderWithinLive
+            | Template::SenderWithinCredit
+            | Template::SenderCadence => Kind::Safety,
         }
     }
 }
@@ -299,6 +356,69 @@ pub fn downstream_properties<S: HasView>(
     properties
 }
 
+/// The sender properties of `family`'s tabled `streams`, for a harness
+/// whose peers label the node's frames ([`Observation::NodeFrame`]): per
+/// request row, `sender-within-limit`; per response row,
+/// `sender-answers-open`, or `sender-ends-once` if the row ends its
+/// exchange; per subscription row, `sender-within-live` and
+/// `sender-within-credit`; and `sender-cadence` per row with a cadence. A
+/// stream with no table yields none.
+///
+/// # Panics
+///
+/// As [`table_properties`].
+pub fn sender_properties<S: HasView>(family: &'static str, streams: &[Stream]) -> Vec<Property<S>> {
+    let mut properties = Vec::new();
+    for stream in streams {
+        let Some(rules) = stream.messages else {
+            continue;
+        };
+        for rule in rules {
+            let mut templates = match rule.role {
+                MessageRole::Announcement { .. } => vec![],
+                MessageRole::Request { .. } => vec![Template::SenderWithinLimit],
+                MessageRole::Response {
+                    ends_exchange: false,
+                    ..
+                } => vec![Template::SenderAnswersOpen],
+                MessageRole::Response {
+                    ends_exchange: true,
+                    ..
+                } => vec![Template::SenderEndsOnce],
+                MessageRole::Subscription { .. } => {
+                    vec![Template::SenderWithinLive, Template::SenderWithinCredit]
+                }
+            };
+            if has_cadence(rule) {
+                templates.push(Template::SenderCadence);
+            }
+            for template in templates {
+                properties.push(generated(GeneratedId {
+                    family,
+                    stream: StreamId {
+                        kind: stream.kind,
+                        version: stream.version,
+                    },
+                    row: Some(rule.name),
+                    template,
+                }));
+            }
+        }
+    }
+    properties
+}
+
+/// True if `rule` declares a cadence.
+fn has_cadence(rule: &MessageRule) -> bool {
+    match rule.role {
+        MessageRole::Announcement { .. } => true,
+        MessageRole::Request { cadence, .. } | MessageRole::Subscription { cadence, .. } => {
+            cadence.is_some()
+        }
+        MessageRole::Response { .. } => false,
+    }
+}
+
 /// True if `message_type` in `streams` is a Request row, not a
 /// Subscription row.
 fn answers_request(streams: &[Stream], message_type: u16) -> bool {
@@ -318,29 +438,20 @@ fn row_templates(rule: &MessageRule) -> Vec<Template> {
         Label::ShortPayload,
         Label::LongPayload,
     ];
-    let cadence = match rule.role {
-        MessageRole::Announcement { .. } => true,
-        MessageRole::Request { cadence, .. } => {
-            labels.push(Label::OverMargin);
-            cadence.is_some()
-        }
-        MessageRole::Response { .. } => {
-            labels.extend([Label::Unsolicited, Label::OverOwed]);
-            false
-        }
-        MessageRole::Subscription { cadence, .. } => {
-            labels.extend([
-                Label::OverLive,
-                Label::OverCredit,
-                Label::AfterClose,
-                Label::BadCursor,
-            ]);
-            cadence.is_some()
-        }
-    };
+    match rule.role {
+        MessageRole::Announcement { .. } => {}
+        MessageRole::Request { .. } => labels.push(Label::OverMargin),
+        MessageRole::Response { .. } => labels.extend([Label::Unsolicited, Label::OverOwed]),
+        MessageRole::Subscription { .. } => labels.extend([
+            Label::OverLive,
+            Label::OverCredit,
+            Label::AfterClose,
+            Label::BadCursor,
+        ]),
+    }
     labels.push(Label::BadContent);
     let mut templates: Vec<Template> = labels.into_iter().map(Template::Closes).collect();
-    if cadence {
+    if has_cadence(rule) {
         templates.push(Template::CadenceNeverCloses);
     }
     templates
@@ -406,6 +517,17 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         Template::ServingBounded => downstream::check_serving(cx, &id),
         Template::SenderWithinResponseQuantity => {
             downstream::check(cx, &id, downstream::within_response_quantity)
+        }
+        Template::SenderWithinLimit
+        | Template::SenderAnswersOpen
+        | Template::SenderEndsOnce
+        | Template::SenderWithinLive
+        | Template::SenderWithinCredit
+        | Template::SenderCadence => {
+            let template = id.template;
+            downstream::check(cx, &id, |entries, at, row| {
+                sender::frame(template, &entries[at].obs, row)
+            })
         }
     }
 }

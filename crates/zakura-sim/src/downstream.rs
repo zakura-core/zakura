@@ -32,12 +32,13 @@ use crate::{
     Observation,
 };
 
-/// Checks the downstream template `id` names with `effect`, its check of
-/// one log entry, over every entry this step appended.
+/// Checks the per-row template `id` names with `effect`, its check of one
+/// log entry, over every entry this step appended. The sender templates
+/// share it.
 pub(crate) fn check<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
-    effect: fn(&[Entry], usize, &RowAt) -> Found,
+    effect: impl Fn(&[Entry], usize, &RowAt) -> Found,
 ) -> Verdict {
     check_with(cx, id, effect, None)
 }
@@ -53,10 +54,10 @@ pub(crate) fn check_serving<S: HasView>(cx: &mut CheckCtx<'_, S>, id: &Generated
 fn check_with<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
-    effect: fn(&[Entry], usize, &RowAt) -> Found,
+    effect: impl Fn(&[Entry], usize, &RowAt) -> Found,
     at_rest: Option<fn(&[Entry], &RowAt) -> Found>,
 ) -> Verdict {
-    let row = RowAt::new(id.stream, id.row.expect("downstream templates are per row"));
+    let row = RowAt::new(id.stream, id.row.expect("these templates are per row"));
     let entries = cx.log.entries();
     let start = entries.partition_point(|e| e.step < cx.step);
     let mut verdict = Verdict::NotApplicable;
@@ -88,7 +89,7 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    fn new(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+    pub(crate) fn new(expected: impl Into<String>, actual: impl Into<String>) -> Self {
         Failure {
             expected: expected.into(),
             actual: actual.into(),

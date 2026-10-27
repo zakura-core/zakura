@@ -113,8 +113,10 @@ pub enum Observation {
         rule_stream: StreamId,
         /// The frame's label.
         label: Label,
-        /// True if the frame emptied its row's cadence bucket. Such a frame
-        /// is still conformant.
+        /// True if charging the frame to its row's cadence bucket found it
+        /// empty: [`crate::model::CadenceModel`]'s charge returned
+        /// [`crate::model::Charge::Exhausted`]. Such a frame is still
+        /// conformant.
         exhausted: bool,
         /// The exchange or subscription the frame belongs to, as the peer's
         /// role models key it: a request's own key, or the key a response,
@@ -123,6 +125,32 @@ pub enum Observation {
         exchange: Option<u64>,
         /// The payload's length in bytes, frame header excluded.
         payload: u64,
+    },
+    /// A frame the node sent on a tabled stream reached a peer, whose role
+    /// models labelled it on arrival under the sender's rules: `OverMargin`
+    /// once the node's open requests exceed the highest limit the peer
+    /// advertised, and `OverLive` once the node's live subscriptions exceed
+    /// `max_live`, without the receiver's margin of twice those. A model
+    /// input, like [`Observation::CreditGranted`].
+    NodeFrame {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame's position among the node's frames on this stream,
+        /// from 0.
+        seq: u64,
+        /// The row whose rule `label` enforces, as for
+        /// [`Observation::PeerFrame`].
+        row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
+        /// The frame's label.
+        label: Label,
+        /// True if the peer's [`crate::model::CadenceModel`] charged the
+        /// frame to an empty bucket: its charge returned
+        /// [`crate::model::Charge::Exhausted`].
+        exhausted: bool,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
@@ -249,6 +277,21 @@ pub enum Observation {
         /// What happened.
         event: String,
     },
+}
+
+impl Observation {
+    /// The task whose run appended this observation, if a step that runs a
+    /// task appends it: a stop at a point, a wait, a park or an exit. Each
+    /// such step appends exactly one.
+    pub fn ran_task(&self) -> Option<&str> {
+        match self {
+            Observation::TaskReached { task, .. }
+            | Observation::TaskWaiting { task }
+            | Observation::TaskParked { task }
+            | Observation::TaskExited { task, .. } => Some(task),
+            _ => None,
+        }
+    }
 }
 
 /// A storage fact in plain fields: hashes and peers in hex, counters as

@@ -198,13 +198,14 @@ use zakura_header_chain::{
     BodyWorkOwner, ErrorSubject, HeaderChainError, HeaderLocator, HeaderSyncWorkOwner,
 };
 use zakura_node_services::header_chain::{
-    AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetReply, LocatorReadPermit,
-    PortError, PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath,
-    ReadPathReply, RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
+    AcquirePath, AcquirePathReply, AdapterKey, ApplyHeaderTargetReply, PortError,
+    PrepareHeaderTarget, PrepareHeaderTargetReply, PreparedHeaderTarget, ReadPath, ReadPathReply,
+    RetainedHeaderPath, SelectedChainMembership, VctRepairContextReply,
 };
 
 pub mod adapter;
 pub mod controlled;
+pub mod evidence;
 pub mod fixture;
 pub mod lease;
 #[cfg(test)]
@@ -711,12 +712,11 @@ impl std::error::Error for IllegalOutcome {}
 /// An operation's accepted inputs, which own what the caller handed over.
 #[derive(Debug)]
 pub enum HeaderRequest {
-    /// `continuation_locator`. The permit stays owned until the operation
-    /// finishes.
-    ContinuationLocator {
-        /// The caller's permit clone.
-        permit: LocatorReadPermit,
-    },
+    /// `continuation_locator`. The caller's permit isn't part of the
+    /// request: the controlled port holds its clone beside the operation
+    /// until the operation finishes, and the engine port holds it in its
+    /// future.
+    ContinuationLocator,
     /// `vct_repair_context`.
     VctRepairContext {
         /// The repair owner.
@@ -777,7 +777,7 @@ impl HeaderRequest {
     /// The operation this request is for.
     pub fn op(&self) -> HeaderOp {
         match self {
-            HeaderRequest::ContinuationLocator { .. } => HeaderOp::ContinuationLocator,
+            HeaderRequest::ContinuationLocator => HeaderOp::ContinuationLocator,
             HeaderRequest::VctRepairContext { .. } => HeaderOp::VctRepairContext,
             HeaderRequest::AcquireHeaderPath(_) => HeaderOp::AcquireHeaderPath,
             HeaderRequest::ReadHeaderPath { .. } => HeaderOp::ReadHeaderPath,
@@ -902,7 +902,7 @@ impl HeaderRequest {
             ))
         };
         Ok(match self {
-            HeaderRequest::ContinuationLocator { .. } => {
+            HeaderRequest::ContinuationLocator => {
                 HeaderReply::ContinuationLocator(Err(port_error()))
             }
             HeaderRequest::VctRepairContext { .. } => {

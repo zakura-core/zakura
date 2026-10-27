@@ -20,7 +20,8 @@ use zakura_node_services::header_chain::{
 };
 use zakura_scheduler::{At, Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, TaskId};
 use zakura_storage::header::{
-    controlled::{ControlledPort, OpId, StorageEvent},
+    controlled::{BindError, CompleteError, ControlledPort, Fact, FactKind, OpId},
+    evidence::{OwnerModel, ResultIdentity},
     fixture::HeaderFixture,
     lease::LeaseEnd,
     HeaderOp, Outcome, Release,
@@ -194,42 +195,71 @@ fn spawn_competing(sched: &mut Scheduler, port: &Arc<ControlledPort>, target: Fr
 }
 
 /// A task drops an unread `Acquired` reply, after another acquire for the
-/// same peer registered a capacity waiter if `with_waiter`. At every
+/// same peer, completed through the controlled port, registered a capacity
+/// waiter if `with_waiter`. At every
 /// scheduling point the drop reaches, acts as the run may there: takes the
-/// lease lock, checks that a lease already gone has its `ReplyDropped`
-/// recorded, lists pending operations, and completes a competing
-/// operation. Returns what went wrong, and every event.
-fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
+/// lease lock, checks the facts so far and the actual owner state against
+/// an [`OwnerModel`], checks that a lease already gone has its
+/// `ReplyDropped` recorded, lists pending operations, and completes a
+/// competing operation. Returns what went wrong, and every event.
+fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<Fact>) {
     let mut sched = scheduler();
     let (port, target) = chain();
     spawn_competing(&mut sched, &port, target);
     let task = spawn_unread_acquire(&mut sched, &port, target);
     let unread = OpId(COMPETING + 1);
-    assert!(
-        port.complete(unread, Outcome::Engine)
-            .expect("completes")
-            .delivered
-    );
+    let completion = port.complete(unread, Outcome::Engine).expect("completes");
+    assert!(completion.delivered);
+    let ResultIdentity::Acquired {
+        lease: unread_lease,
+        ..
+    } = completion.result
+    else {
+        panic!("expected a lease, got {:?}", completion.result);
+    };
     let waiter = with_waiter.then(|| {
-        match ready(port.engine().acquire_header_path(acquire(&port, target))) {
-            Ok(AcquirePathReply::CapacityBusy(signal)) => signal,
+        let mut call = port.acquire_header_path(acquire(&port, target));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        port.complete(OpId(COMPETING + 2), Outcome::Engine)
+            .expect("the refusal completes");
+        match call.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(AcquirePathReply::CapacityBusy(signal))) => signal,
             other => panic!("expected CapacityBusy, got {other:?}"),
         }
     });
 
     sched.advance_to(SimInstant::from_start(Duration::from_secs(10)));
     let mut problems = Vec::new();
-    let mut events = port.take_events();
+    let mut events = port.take_facts();
+    let mut model = OwnerModel::new();
+    assert_eq!(
+        model.check_boundary(&events, &port.owner_state()),
+        Ok(()),
+        "the setup matches the model"
+    );
     let mut competing = (1..=COMPETING).map(OpId);
     step(&mut sched, task, |at| {
         let Ok(live) = catch_unwind(AssertUnwindSafe(|| port.engine().live_leases())) else {
             problems.push(format!("the lease lock was held at {at}"));
             return;
         };
-        events.extend(port.take_events());
+        let facts = port.take_facts();
+        let state = port.owner_state();
+        if let Err(failure) = model.check_boundary(&facts, &state) {
+            problems.push(format!("the owner model failed with {failure:?} at {at}"));
+        }
+        events.extend(facts);
+        let slot_held = state.operations.iter().any(|op| op.id == unread);
+        let lease_held = state.leases.iter().any(|lease| lease.lease == unread_lease);
+        if slot_held != lease_held {
+            problems.push(format!(
+                "the reply's slot and its lease changed apart at {at}"
+            ));
+        }
         let recorded = events
             .iter()
-            .any(|event| matches!(event, StorageEvent::ReplyDropped { .. }));
+            .any(|fact| matches!(fact.kind, FactKind::ReplyDropped { .. }));
         if live == 0 && !recorded {
             problems.push(format!("the lease was gone before its record at {at}"));
         }
@@ -245,7 +275,14 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
                 id.0, completion.lease_ends
             ));
         }
-        events.extend(port.take_events());
+        let facts = port.take_facts();
+        if let Err(failure) = model.check_boundary(&facts, &port.owner_state()) {
+            problems.push(format!(
+                "the owner model failed with {failure:?} after completing {} at {at}",
+                id.0
+            ));
+        }
+        events.extend(facts);
     });
     if !problems.is_empty() {
         // A task suspended with a lock held never releases it, so shutting
@@ -253,24 +290,118 @@ fn abandon_with_probes(with_waiter: bool) -> (Vec<String>, Vec<StorageEvent>) {
         std::mem::forget(sched);
         return (problems, events);
     }
-    events.extend(port.take_events());
+    let facts = port.take_facts();
+    if let Err(failure) = model.check_boundary(&facts, &port.owner_state()) {
+        problems.push(format!(
+            "the owner model failed with {failure:?} after the drop"
+        ));
+    }
+    events.extend(facts);
     if let Some(waiter) = waiter {
         assert!(waiter.is_released(), "the waiter's signal fired");
     }
     (problems, events)
 }
 
-/// The unread acquire's `ReplyDropped` lease ends.
-fn reply_dropped_ends(events: &[StorageEvent]) -> Vec<LeaseEnd> {
-    events
+/// The capability ends of the unread acquire's `ReplyDropped` transaction.
+fn reply_dropped_ends(facts: &[Fact]) -> Vec<LeaseEnd> {
+    let txn = facts
         .iter()
-        .find_map(|event| match event {
-            StorageEvent::ReplyDropped { id, lease_ends } if *id == OpId(COMPETING + 1) => {
-                Some(lease_ends.clone())
-            }
+        .find_map(|fact| match fact.kind {
+            FactKind::ReplyDropped { id } if id == OpId(COMPETING + 1) => Some(fact.txn),
             _ => None,
         })
-        .expect("the unread reply was dropped")
+        .expect("the unread reply was dropped");
+    facts
+        .iter()
+        .filter(|fact| fact.txn == txn)
+        .filter_map(|fact| match &fact.kind {
+            FactKind::Lease(lease) => LeaseEnd::of(lease),
+            _ => None,
+        })
+        .collect()
+}
+
+/// C2: a port binds only inside an active run, here the scheduler's, only
+/// while pristine, and only once.
+#[test]
+fn binding_needs_an_active_run() {
+    let (port, target) = chain();
+    let (leased, _) = chain();
+    acquired(
+        ready(
+            leased
+                .engine()
+                .acquire_header_path(acquire(&leased, target)),
+        )
+        .expect("acquires"),
+    );
+    assert_eq!(port.bind_to_run(), Err(BindError::NotInRun));
+    let sched = scheduler();
+    assert_eq!(port.bind_to_run(), Ok(()));
+    assert_eq!(port.bind_to_run(), Err(BindError::AlreadyBound));
+    assert_eq!(leased.bind_to_run(), Err(BindError::NotPristine));
+    drop(sched);
+}
+
+/// A port bound to a run refuses use outside it, after that run ends or in
+/// a later run: a call polled then submits and publishes nothing, a
+/// completion is refused, and the port reports the refusal, so its
+/// evidence never carries another clock's instants.
+#[test]
+fn a_bound_port_refuses_use_outside_its_run() {
+    for later in [false, true] {
+        let (port, target) = chain();
+        let sched = scheduler();
+        assert_eq!(port.bind_to_run(), Ok(()));
+        drop(sched);
+        let other = later.then(scheduler);
+        assert!(!port.refused_outside_run());
+        let mut call = port.selected_chain_contains(target.hash);
+        assert!(pin!(&mut call)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(port.take_facts().is_empty(), "later run: {later}");
+        assert!(port.pending().is_empty());
+        assert!(port.refused_outside_run());
+        assert_eq!(
+            port.complete(OpId(1), Outcome::Engine),
+            Err(CompleteError::OutsideRun)
+        );
+        drop(call);
+        drop(other);
+    }
+}
+
+/// A call submitted and completed during its run, then taken or dropped
+/// after that run ends or in a later run, is refused too: taking returns
+/// nothing, dropping leaves the reply, and neither publishes.
+#[test]
+fn a_bound_port_refuses_a_reply_outside_its_run() {
+    for later in [false, true] {
+        for take in [false, true] {
+            let (port, target) = chain();
+            let sched = scheduler();
+            assert_eq!(port.bind_to_run(), Ok(()));
+            let mut call = port.selected_chain_contains(target.hash);
+            assert!(pin!(&mut call)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            assert!(port.complete(OpId(1), Outcome::Engine).is_ok());
+            assert!(!port.take_facts().is_empty());
+            drop(sched);
+            let other = later.then(scheduler);
+            if take {
+                assert!(pin!(&mut call)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+            drop(call);
+            assert!(port.take_facts().is_empty(), "later {later}, take {take}");
+            assert!(port.refused_outside_run(), "later {later}, take {take}");
+            drop(other);
+        }
+    }
 }
 
 /// #1721 review P1: abandoning an unread `Acquired` reply fires the capacity
@@ -307,8 +438,8 @@ fn an_abandoned_lease_end_stays_with_its_reply() {
     ));
     let completed = events
         .iter()
-        .filter(|event| {
-            matches!(event, StorageEvent::Completed(completion)
+        .filter(|fact| {
+            matches!(&fact.kind, FactKind::Completed(completion)
                 if completion.op == HeaderOp::SelectedChainContains)
         })
         .count();

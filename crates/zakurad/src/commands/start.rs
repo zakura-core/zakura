@@ -734,6 +734,7 @@ impl StartCmd {
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
         node_tasks.track(&rpc_tx_queue_handle);
+        let rpc_impl = rpc_impl.with_mining_trace(config.network.zakura.spawn_tracer());
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
             read_state: read_only_state_service.clone(),

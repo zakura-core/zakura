@@ -535,6 +535,18 @@ fn a_datagram_to_an_unbound_address_is_dropped_on_arrival() {
 }
 
 #[test]
+fn events_since_returns_the_tail_of_events() {
+    let net = SimNet::new(fifo(0, 10));
+    let a = net.bind(addr(1)).unwrap();
+    send(&a, addr(9), b"one");
+    let all = net.events();
+    assert_eq!(net.events_since(0), all);
+    assert_eq!(net.events_since(1), all[1..]);
+    assert_eq!(net.events_since(all.len()), []);
+    assert_eq!(net.events_since(all.len() + 5), []);
+}
+
+#[test]
 fn a_simulated_socket_binds_only_explicit_addresses() {
     let net = SimNet::new(fifo(0, 10));
     for bad in [

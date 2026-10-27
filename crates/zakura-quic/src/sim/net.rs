@@ -471,6 +471,15 @@ impl SimNet {
     pub fn events(&self) -> Vec<NetEvent> {
         self.lock().events.clone()
     }
+
+    /// The events from index `start` on, in order. A reader that polls
+    /// after every step copies each event once, not the whole history.
+    pub fn events_since(&self, start: usize) -> Vec<NetEvent> {
+        self.lock()
+            .events
+            .get(start..)
+            .map_or_else(Vec::new, <[NetEvent]>::to_vec)
+    }
 }
 
 impl SocketFactory for SimNet {

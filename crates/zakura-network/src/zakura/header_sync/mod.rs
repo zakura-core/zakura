@@ -10,6 +10,8 @@ mod error;
 mod events;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
+#[cfg(any(test, zakura_sim))]
+pub mod observe;
 mod pipe;
 mod reactor;
 mod scheduler;

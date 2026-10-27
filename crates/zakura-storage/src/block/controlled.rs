@@ -466,6 +466,16 @@ struct Ops {
     refused: bool,
 }
 
+/// What every operation's gates share.
+struct Gates {
+    /// The driver awaits a query or record.
+    driver_awaiting: bool,
+    /// The oldest queued submission whose class has room.
+    next_admission: Option<OpId>,
+    /// The oldest admitted submission of each hash.
+    oldest_admitted: BTreeMap<[u8; 32], OpId>,
+}
+
 /// One held operation.
 #[derive(Debug)]
 struct Slot {
@@ -615,14 +625,9 @@ impl Ops {
         }
     }
 
-    /// What the gates read for `id`, given which hashes full state holds.
-    fn conditions(
-        &self,
-        id: OpId,
-        limits: &ApplyLimits,
-        committed: &BTreeSet<[u8; 32]>,
-    ) -> Conditions {
-        let slot = &self.slots[&id];
+    /// What every operation's gates share, read once per enumeration so
+    /// that listing every operation stays near-linear.
+    fn gates(&self, limits: &ApplyLimits) -> Gates {
         let (in_flight_checkpoint, in_flight_full) =
             self.slots.values().filter(|other| other.admitted()).fold(
                 (0usize, 0usize),
@@ -631,25 +636,42 @@ impl Ops {
                     ApplyClass::Full => (checkpoint, full + 1),
                 },
             );
-        let oldest_with_room = self
+        let next_admission = self
             .slots
             .iter()
-            .find(|(_, other)| {
+            .find(|(_, slot)| {
                 matches!(
-                    other.stage,
+                    slot.stage,
                     SlotStage::Waiting {
                         stage: Stage::Queued,
                         ..
                     }
-                ) && limits.has_room(other.class, in_flight_checkpoint, in_flight_full)
+                ) && limits.has_room(slot.class, in_flight_checkpoint, in_flight_full)
             })
-            .is_some_and(|(oldest, _)| *oldest == id);
-        let hash = slot.identity.submitted_hash();
-        let older_in_flight = hash.is_some()
-            && self
-                .slots
-                .range(..id)
-                .any(|(_, other)| other.admitted() && other.identity.submitted_hash() == hash);
+            .map(|(id, _)| *id);
+        let mut oldest_admitted = BTreeMap::new();
+        for (id, slot) in &self.slots {
+            if let Some(hash) = slot.identity.submitted_hash().filter(|_| slot.admitted()) {
+                oldest_admitted.entry(hash.0).or_insert(*id);
+            }
+        }
+        Gates {
+            driver_awaiting: self.driver_awaiting(),
+            next_admission,
+            oldest_admitted,
+        }
+    }
+
+    /// What the gates read for `id`, given what all gates share and which
+    /// hashes full state holds.
+    fn conditions(&self, id: OpId, gates: &Gates, committed: &BTreeSet<[u8; 32]>) -> Conditions {
+        let slot = &self.slots[&id];
+        let older_in_flight = slot.identity.submitted_hash().is_some_and(|hash| {
+            gates
+                .oldest_admitted
+                .get(&hash.0)
+                .is_some_and(|oldest| *oldest < id)
+        });
         let (parent_committed, committed_now) = match &slot.identity {
             RequestIdentity::Submit { hash, parent, .. } => {
                 (committed.contains(&parent.0), committed.contains(&hash.0))
@@ -657,13 +679,31 @@ impl Ops {
             _ => (false, false),
         };
         Conditions {
-            driver_awaiting: self.driver_awaiting(),
-            oldest_with_room,
+            driver_awaiting: gates.driver_awaiting,
+            oldest_with_room: gates.next_admission == Some(id),
             parent_committed,
             committed: committed_now,
             replaced: slot.replaced,
             older_in_flight,
         }
+    }
+
+    /// Operation `id` with the outcomes legal now, or `None` if the run
+    /// can't complete it.
+    fn pending(
+        &self,
+        id: OpId,
+        gates: &Gates,
+        committed: &BTreeSet<[u8; 32]>,
+    ) -> Option<PendingOp> {
+        let (stage, op) = self.stage(id)?;
+        let conditions = self.conditions(id, gates, committed);
+        Some(PendingOp {
+            id,
+            op,
+            stage,
+            enabled: op.enabled(stage, self.slots[&id].class, &conditions),
+        })
     }
 
     /// The hashes the gates of submissions read.
@@ -972,19 +1012,20 @@ impl ControlledBlockService {
         let hashes = self.ops().gated_hashes();
         let committed = self.committed(hashes);
         let ops = self.ops();
+        let gates = ops.gates(&self.inner.limits);
         ops.slots
             .keys()
-            .filter_map(|id| {
-                let (stage, op) = ops.stage(*id)?;
-                let conditions = ops.conditions(*id, &self.inner.limits, &committed);
-                Some(PendingOp {
-                    id: *id,
-                    op,
-                    stage,
-                    enabled: op.enabled(stage, ops.slots[id].class, &conditions),
-                })
-            })
+            .filter_map(|id| ops.pending(*id, &gates, &committed))
             .collect()
+    }
+
+    /// Operation `id` with the outcomes legal now, or `None` if the run
+    /// can't complete it.
+    pub fn pending_op(&self, id: OpId) -> Option<PendingOp> {
+        let hashes = self.ops().gated_hashes();
+        let committed = self.committed(hashes);
+        let ops = self.ops();
+        ops.pending(id, &ops.gates(&self.inner.limits), &committed)
     }
 
     /// Completes pending operation `id` with `outcome`, as the module doc
@@ -1012,7 +1053,8 @@ impl ControlledBlockService {
             }
             let (stage, op) = ops.stage(id).ok_or(CompleteError::NotPending(id))?;
             let class = ops.slots[&id].class;
-            let conditions = ops.conditions(id, &self.inner.limits, &committed);
+            let gates = ops.gates(&self.inner.limits);
+            let conditions = ops.conditions(id, &gates, &committed);
             op.check(stage, class, &conditions, outcome)
                 .map_err(CompleteError::Illegal)?;
             if outcome == BlockOutcome::Admit {

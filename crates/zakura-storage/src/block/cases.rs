@@ -6,8 +6,11 @@
 //! see: the submissions the driver sends to the verifier, the attempts each
 //! record makes, and the events at the handle. [`run_controlled`] runs a
 //! case on the controlled service. zakurad's `block_sync_driver/fidelity.rs`
-//! runs it on `drive_block_sync_actions`, with state and verifier fakes over
-//! the same engine, and checks that both runs see the same events.
+//! runs it on `drive_block_sync_actions` and checks that both runs see the
+//! same events. A case with no verdict runs there over a real ephemeral
+//! zakura-state holding the case's headers. A case with verdicts commits
+//! fixture bodies, which zakura-state's contextual checks reject, so it runs
+//! over state fakes on the case's engine.
 //!
 //! The controlled run takes the driver's choices. It sends each step's
 //! actions to the driver's channel, a queue here, and runs the driver's
@@ -31,13 +34,15 @@
 //! |:--|:--|
 //! | Legacy handoff and abandoned applies | A node that runs only the Zakura stack never yields after bootstrap |
 //! | Fail-closed shutdown after a `record_body_invalid` exhausts its retries | Shutdown ends the run |
+//! | A `record_body_invalid` that goes stale again after its refresh | Another state change must land between the two attempts. A completion runs atomically here, so the refresh always records |
 //! | The 30 s deadlines on state and verifier calls | The run picks when each operation completes |
 //! | The throughput probe | It's a debug mode |
 //! | A query reply that finds the handle closed ends the driver | The detached handle can't close. `block_controlled`'s tests cover the service's exit |
 //! | A misbehavior report waits for the supervisor | The simulator doesn't run the supervisor |
-//! | A checkpoint verifier error | Regtest checkpoints only genesis, so every verdict is the full verifier's, and checkpoint-class bodies only commit |
+//! | A checkpoint verifier error | The verifier fake answers as the full verifier does, so checkpoint-class bodies get only full-verifier verdicts |
+//! | The verifier returning another block's hash | The fake returns the submitted hash. The driver reports another hash as a `VerifierUnavailable` retry, the same event as [`Verdict::Retryable`] with that kind |
 //! | `record_body_unavailable`, `restart_body_availability` and `retry_body_availability` | Their fakes would need retry-episode summaries the fixture engine accepts. The service builds their engine requests with [`record_request`](super::controlled::record_request), from the driver's arms |
-//! | zakura-state's own `MissingBlockBodyMetadata` read | The fakes answer from the engine port's port of it. An ephemeral zakura-state would need the fixture headers selected and the fixture bodies committed, and fixture bodies never pass zakura-state's contextual checks |
+//! | zakura-state's own `MissingBlockBodyMetadata` read and `RecordHeaderChainBodyInvalid` write, in a case with verdicts | The verdict-free cases run both on a real zakura-state. A case with verdicts would need the fixture bodies committed there, and fixture bodies never pass zakura-state's contextual checks, so the fakes answer from the engine port's ports of them |
 //!
 //! A moved anchor fails a query in the driver when its chunks read
 //! different states. The controlled service reads every chunk from one
@@ -52,7 +57,8 @@ use std::{
 use futures::FutureExt;
 use zakura_chain::block;
 use zakura_header_chain::{
-    BodyRuleId, BodyWorkAuthority, ConsensusBodyInvalid, EvidenceId, SourceId, StateVersion,
+    BodyRuleId, BodyWorkAuthority, CommittedHeaderChainView, ConsensusBodyInvalid, EvidenceId,
+    SourceId, StateVersion,
 };
 use zakura_network::zakura::{BlockApplyResult, BlockApplyToken, BlockSyncAction};
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
@@ -282,24 +288,10 @@ impl Script {
     pub fn new(case: &Case) -> Self {
         let fixture = BlockFixture::regtest();
         let engine = Arc::new(EnginePort::new(fixture.headers()));
-        let anchor = fixture.anchor();
-        let blocks = fixture.extend(anchor, &case.bodies, 0);
-        let mut parent = anchor;
-        for (request_id, batch) in (1..).zip(blocks.chunks(HEADER_BATCH)) {
-            let request = fixture.target_request(&engine.snapshot(), parent, batch, request_id);
-            let prepared = engine
-                .prepare_header_target(request)
-                .now_or_never()
-                .expect("the engine port completes each operation on its first poll")
-                .expect("fixture headers prepare");
-            let applied = engine
-                .apply_header_target(prepared)
-                .now_or_never()
-                .expect("the engine port completes each operation on its first poll")
-                .expect("fixture headers apply");
-            assert_eq!(applied, ApplyHeaderTargetOutcome::Applied);
-            parent = batch.last().expect("a chunk holds a block").frontier();
-        }
+        let blocks = fixture.extend(fixture.anchor(), &case.bodies, 0);
+        insert_headers(&*engine, &blocks)
+            .now_or_never()
+            .expect("the engine port completes each operation on its first poll");
         Script {
             engine,
             blocks,
@@ -315,7 +307,22 @@ impl Script {
     ///
     /// If `step` is a verdict, which sends nothing.
     pub fn actions(&mut self, step: &Step) -> Vec<BlockSyncAction> {
-        let scope = BodyWorkAuthority::for_view(&self.engine.view());
+        let view = self.engine.view();
+        self.actions_in(step, &view)
+    }
+
+    /// The actions `step` sends, in order, with the scope and best header
+    /// tip of `view`, the latest view of the state the driver runs on.
+    ///
+    /// # Panics
+    ///
+    /// If `step` is a verdict, which sends nothing.
+    pub fn actions_in(
+        &mut self,
+        step: &Step,
+        view: &CommittedHeaderChainView,
+    ) -> Vec<BlockSyncAction> {
+        let scope = BodyWorkAuthority::for_view(view);
         match step {
             Step::Query { from, limit } | Step::QueryAnchorMoves { from, limit } => {
                 self.next_query += 1;
@@ -323,7 +330,7 @@ impl Script {
                     query_id: NonZeroU64::new(self.next_query).expect("counts from 1"),
                     from: block::Height(*from),
                     limit: *limit,
-                    best_header_tip: self.engine.snapshot().frontiers.header_best.height,
+                    best_header_tip: view.snapshot.frontiers.header_best.height,
                     scope,
                 }]
             }
@@ -347,9 +354,41 @@ impl Script {
                     source: SOURCE,
                 },
             }],
-            Step::Burst(steps) => steps.iter().flat_map(|step| self.actions(step)).collect(),
+            Step::Burst(steps) => steps
+                .iter()
+                .flat_map(|step| self.actions_in(step, view))
+                .collect(),
             Step::Verdict(..) => panic!("a verdict sends no action"),
         }
+    }
+}
+
+/// Inserts the headers of `blocks`, a chain on the fixture's anchor, into
+/// `port`, in batches within the engine's per-transition limit.
+///
+/// # Panics
+///
+/// If `port` refuses a batch.
+pub async fn insert_headers(port: &dyn Port, blocks: &[FixtureBlock]) {
+    let fixture = BlockFixture::regtest();
+    let mut parent = fixture.anchor();
+    for (request_id, batch) in (1..).zip(blocks.chunks(HEADER_BATCH)) {
+        let snapshot = port
+            .selected_chain()
+            .borrow()
+            .clone()
+            .expect("an attached port has a snapshot");
+        let request = fixture.target_request(&snapshot, parent, batch, request_id);
+        let prepared = port
+            .prepare_header_target(request)
+            .await
+            .expect("fixture headers prepare");
+        let applied = port
+            .apply_header_target(prepared)
+            .await
+            .expect("fixture headers apply");
+        assert_eq!(applied, ApplyHeaderTargetOutcome::Applied);
+        parent = batch.last().expect("a chunk holds a block").frontier();
     }
 }
 
@@ -443,7 +482,7 @@ impl ControlledRun<'_> {
     /// Completes `id` at once if the driver awaits it: a query, answered or
     /// failed if its anchor moves, or a record.
     fn finish_awaited(&mut self, id: OpId, seen: &mut Observed) {
-        let Some(pending) = self.service.pending().into_iter().find(|op| op.id == id) else {
+        let Some(pending) = self.service.pending_op(id) else {
             return;
         };
         let outcome = match pending.op {
@@ -473,10 +512,11 @@ impl ControlledRun<'_> {
             .into_iter()
             .find(|op| op.enabled.contains(&BlockOutcome::Admit))
         {
-            self.service
+            let completion = self
+                .service
                 .complete(admit.id, BlockOutcome::Admit)
                 .expect("an enabled admission completes");
-            let RequestIdentity::Submit { token, .. } = self.request(admit.id) else {
+            let RequestIdentity::Submit { token, .. } = completion.request else {
                 unreachable!("only a submission is admitted");
             };
             seen.admitted.push(token);
@@ -688,6 +728,44 @@ pub fn cases() -> Vec<Case> {
                     Seen::events([finished(3, Committed)]).and_admitted([4]),
                 ),
             ],
+        },
+        Case {
+            name: "checkpoint admission stops at two ranges, and a full body goes ahead",
+            bodies: vec![BodySpec::exact(300); 802],
+            // Heights 1 to 801 are checkpoint-class. The driver raises the
+            // checkpoint limit to the checkpoint gap, so checkpoint applies
+            // have room for two ranges, 800 bodies.
+            limits: Configured {
+                checkpoint: 1,
+                full: 1,
+                combined: 1_000,
+                max_checkpoint_height: 801,
+            },
+            steps: {
+                // The action channel holds 64 actions.
+                let mut steps: Vec<_> = (0..801)
+                    .collect::<Vec<usize>>()
+                    .chunks(64)
+                    .map(|indices| {
+                        let admitted = indices
+                            .iter()
+                            .map(|index| *index as u64 + 1)
+                            .filter(|token| *token <= 800);
+                        (
+                            Step::Burst(indices.iter().copied().map(Step::Submit).collect()),
+                            Seen::admitted(admitted),
+                        )
+                    })
+                    .collect();
+                // Block 800 waits for checkpoint room, so the full body at
+                // height 802 goes ahead of it.
+                steps.push((Step::Submit(801), Seen::admitted([802])));
+                steps.push((
+                    Step::Verdict(0, Verdict::Committed),
+                    Seen::events([finished(1, Committed)]).and_admitted([801]),
+                ));
+                steps
+            },
         },
         Case {
             name: "each verifier class",

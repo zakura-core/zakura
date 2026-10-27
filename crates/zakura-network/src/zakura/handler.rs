@@ -985,8 +985,13 @@ impl ZakuraEndpoint {
         self.quic.shutdown().await;
     }
 
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    pub(crate) fn from_parts(
+    /// An endpoint over a bound `quic` endpoint, its `supervisor`, and the
+    /// `handler` that serves its connections, with no sync services or
+    /// background tasks attached.
+    ///
+    /// It doesn't serve inbound connections itself. Pass `handler` to
+    /// `quic.serve` for those, and dial with [`Self::dial`].
+    pub fn new(
         quic: QuicEndpoint,
         supervisor: ZakuraSupervisorHandle,
         handler: ZakuraProtocolHandler,
@@ -999,10 +1004,34 @@ impl ZakuraEndpoint {
             block_sync: None,
             header_sync_tasks: None,
             header_sync_fatal_events: None,
+            #[cfg(any(test, feature = "zakura-testkit"))]
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Dials `node_addr` as a maintained dial and serves the connection under
+    /// `limits` until it ends.
+    ///
+    /// Returns the dial, handshake, or serving error unchanged, such as a
+    /// [`ZakuraHandlerError::QuicConnect`] that holds the transport's
+    /// handshake timeout.
+    pub async fn dial(
+        &self,
+        node_addr: NodeAddr,
+        limits: &ZakuraLocalLimits,
+    ) -> Result<(), ZakuraHandlerError> {
+        serve_native_dial_connection(self, node_addr, limits).await
+    }
+
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(crate) fn from_parts(
+        quic: QuicEndpoint,
+        supervisor: ZakuraSupervisorHandle,
+        handler: ZakuraProtocolHandler,
+    ) -> Self {
+        Self::new(quic, supervisor, handler)
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]

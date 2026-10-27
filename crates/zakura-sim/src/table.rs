@@ -34,8 +34,9 @@ pub enum Template {
     /// Per stream: a peer whose judged frames on every stream of the
     /// connection are all `Conformant` is never punished.
     ConformantNeverCloses,
-    /// A judged frame with this label gets a fault close before quiescence.
-    /// `UndeclaredType` is per stream; the others are per row.
+    /// A judged frame with this label gets its consequence before
+    /// quiescence: a fault close, or for `BadContent` the family's content
+    /// consequence. `UndeclaredType` is per stream; the others are per row.
     Closes(Label),
     /// Per row with a cadence: emptying the row's bucket never gets a
     /// conformant peer punished.
@@ -60,7 +61,7 @@ impl Template {
             _ => {
                 let name = claim.strip_suffix("-closes")?;
                 let label = Label::ALL.into_iter().find(|l| l.name() == name)?;
-                (consequence(label) == Consequence::FaultClose).then_some(Template::Closes(label))
+                (consequence(label) != Consequence::NoPunishment).then_some(Template::Closes(label))
             }
         }
     }
@@ -69,6 +70,9 @@ impl Template {
     fn sentence(self) -> &'static str {
         match self {
             Template::ConformantNeverCloses => "a conformant peer is never punished",
+            Template::Closes(Label::BadContent) => {
+                "a frame with bad content gets a Misbehavior or a fault close"
+            }
             Template::Closes(_) => "a frame with this label gets a fault close",
             Template::CadenceNeverCloses => "exhausting a cadence bucket is never punished",
         }
@@ -134,8 +138,8 @@ impl fmt::Display for GeneratedId<'_> {
 
 /// The receiver properties of `family`'s tabled `streams`: per stream,
 /// `conformant-never-closes` and `undeclared-type-closes`; per row, the
-/// `<label>-closes` of each label the row's role can commit, and
-/// `cadence-never-closes` for a row with a cadence. A stream with no table
+/// `<label>-closes` of each label the row's role can commit, including
+/// `bad-content-closes`, and `cadence-never-closes` for a row with a cadence. A stream with no table
 /// yields none.
 ///
 /// # Panics
@@ -195,6 +199,7 @@ fn row_templates(rule: &MessageRule) -> Vec<Template> {
             cadence.is_some()
         }
     };
+    labels.push(Label::BadContent);
     let mut templates: Vec<Template> = labels.into_iter().map(Template::Closes).collect();
     if cadence {
         templates.push(Template::CadenceNeverCloses);
@@ -323,10 +328,21 @@ fn fault_close(key: &ObligationKey, obs: &Observation) -> bool {
         if is_fault_cause(cause) && key.subject == session(*connection))
 }
 
+/// True if `obs` closes the obligation's connection with a fault cause, or
+/// is a `Misbehavior` against it: either is a family's content consequence.
+/// Which one a family owes needs its adapter (properties.md, Consequence
+/// table), so this accepts both.
+fn content_consequence(key: &ObligationKey, obs: &Observation) -> bool {
+    fault_close(key, obs)
+        || matches!(obs, Observation::Misbehavior { connection }
+            if key.subject == session(*connection))
+}
+
 /// `<label>-closes`: each frame with `label` on the ID's stream and row that
 /// the node judges this step, on a connection still open, opens an
-/// obligation that a fault close of the connection discharges. One close
-/// discharges every obligation on its connection.
+/// obligation that the label's consequence discharges: a fault close of the
+/// connection, or [`content_consequence`] for `BadContent`. One discharge
+/// covers every obligation on its connection.
 fn check_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -360,8 +376,12 @@ fn check_closes<S: HasView>(
     if obliged.is_empty() {
         return Verdict::NotApplicable;
     }
+    let discharged_by: fn(&ObligationKey, &Observation) -> bool = match consequence(label) {
+        Consequence::FamilyContent => content_consequence,
+        Consequence::FaultClose | Consequence::NoPunishment => fault_close,
+    };
     for (at, connection) in obliged {
-        let mut obligation = cx.obligation(Some(at), session(connection), fault_close);
+        let mut obligation = cx.obligation(Some(at), session(connection), discharged_by);
         obligation.cardinality = Cardinality::Every;
         cx.oblige(obligation);
     }

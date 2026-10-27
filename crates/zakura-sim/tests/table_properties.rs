@@ -171,10 +171,14 @@ fn every_row_yields_its_templates() {
         let per_row: usize = rules
             .iter()
             .map(|rule| match rule.role {
-                MessageRole::Announcement { .. } => 3 + 1,
-                MessageRole::Request { cadence, .. } => 3 + 1 + usize::from(cadence.is_some()),
-                MessageRole::Response { .. } => 3 + 2,
-                MessageRole::Subscription { cadence, .. } => 3 + 4 + usize::from(cadence.is_some()),
+                // Three framing labels, the role's own, `BadContent`, and
+                // the cadence template. An announcement always has a cadence.
+                MessageRole::Announcement { .. } => 3 + 1 + 1,
+                MessageRole::Request { cadence, .. } => 3 + 1 + 1 + usize::from(cadence.is_some()),
+                MessageRole::Response { .. } => 3 + 2 + 1,
+                MessageRole::Subscription { cadence, .. } => {
+                    3 + 4 + 1 + usize::from(cadence.is_some())
+                }
             })
             .sum();
         let properties: Vec<Property<Node>> = table_properties(family, &[stream]);
@@ -209,9 +213,12 @@ fn generated_ids_are_unique_and_parse_back() {
             template: Template::Closes(Label::OverLive),
         })
     );
-    // Conformant frames and content faults have no `-closes` template.
+    // Conformant frames have no `-closes` template; content faults do.
     assert_eq!(Template::parse("conformant-closes"), None);
-    assert_eq!(Template::parse("bad-content-closes"), None);
+    assert_eq!(
+        Template::parse("bad-content-closes"),
+        Some(Template::Closes(Label::BadContent))
+    );
 }
 
 #[test]
@@ -316,6 +323,33 @@ fn a_fault_without_a_fault_close_is_a_violation() {
     ]);
     let violation = report.end.violation.expect("the fault went unpunished");
     assert_eq!(violation.property, "feed/s64v1/ended/over-owed-closes");
+}
+
+/// V12 F-298: a frame with bad content opens an obligation that a
+/// `Misbehavior` or a fault close discharges, and nothing else does.
+#[test]
+fn bad_content_gets_its_family_consequence() {
+    const ID: &str = "feed/s64v1/watch/bad-content-closes";
+    let bad = || {
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::BadContent),
+            judged(FEED_STREAM, 0),
+        ]
+    };
+    for consequence in [
+        Observation::Misbehavior { connection: 1 },
+        closed("header_peer_fault"),
+    ] {
+        let report = run_script(vec![bad(), vec![consequence.clone()]]);
+        assert_eq!(report.end.violation, None, "{consequence:?}");
+        assert!(held(outcome(&report, ID)), "{consequence:?}");
+    }
+    let report = run_script(vec![bad(), vec![closed("idle_timeout")]]);
+    let violation = report
+        .end
+        .violation
+        .expect("the bad content went unpunished");
+    assert_eq!(violation.property, ID);
 }
 
 #[test]

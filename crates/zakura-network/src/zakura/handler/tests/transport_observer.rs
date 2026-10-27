@@ -69,12 +69,12 @@ fn header(message_type: u16, payload_len: usize) -> Vec<u8> {
     bytes
 }
 
-/// A subscriber table with one subscription holding the row's whole credit
-/// window, so any page the row allows fits it.
-fn subscribed() -> SharedSubscriptions<u64, Cursor> {
+/// A subscriber table reporting through `tap`, with one subscription
+/// holding the row's whole credit window, so any page the row allows fits it.
+fn subscribed(tap: Option<RegulationTap<u64>>) -> SharedSubscriptions<u64, Cursor> {
     let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
         .expect("SUBSCRIBE_HEADERS is a subscription row");
-    let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows()));
+    let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows()).observed_by(tap));
     tools
         .lock()
         .open(
@@ -124,10 +124,7 @@ async fn run_worker(
     let tap = Arc::new(StreamTap::new(conn, quic_stream));
     context.precheck.observe_with(tap.clone());
     if subscription {
-        let tools = subscribed();
-        tools
-            .lock()
-            .observe_with(RegulationTap::new(tap.clone(), |id| *id));
+        let tools = subscribed(Some(RegulationTap::new(tap.clone(), |id| *id)));
         context.precheck.attach(Arc::new(tools.admitting()));
     }
     let prelude = StreamPrelude {
@@ -194,6 +191,15 @@ async fn the_length_guard_alone_closes_an_oversize_page() -> Result<(), BoxError
     assert_eq!(
         run.events,
         vec![
+            TransportEvent::Regulated {
+                conn_id: CONN,
+                quic_stream,
+                transition: Transition::OpenIssued {
+                    subscription: 1,
+                    objects: v9::MAX_HS_PUSH_CREDIT_HEADERS,
+                    bytes: v9::MAX_HS_PUSH_CREDIT_BYTES,
+                },
+            },
             TransportEvent::HeaderRead {
                 conn_id: CONN,
                 quic_stream,
@@ -433,8 +439,8 @@ fn regulation_tables_report_each_transition() {
         tap.take_tag();
     };
 
-    let mut subscriptions = Subscriptions::new(limits, rows());
-    subscriptions.observe_with(RegulationTap::new(tap.clone(), |id| *id));
+    let mut subscriptions = Subscriptions::new(limits, rows())
+        .observed_by(Some(RegulationTap::new(tap.clone(), |id| *id)));
     subscriptions
         .open(1, credit(2, 1_000), cursor(0))
         .expect("the open fits");
@@ -459,8 +465,8 @@ fn regulation_tables_report_each_transition() {
     tap.header_read(HEADERS, 0, 300);
     assert!(subscriptions.admit(HEADERS, 300).is_err());
 
-    let mut publications = Publications::new(limits);
-    publications.observe_with(RegulationTap::new(tap.clone(), |id| *id));
+    let mut publications =
+        Publications::new(limits).observed_by(Some(RegulationTap::new(tap.clone(), |id| *id)));
     tap.header_read(SUBSCRIBE_HEADERS, 0, 100);
     serve();
     publications
@@ -541,4 +547,103 @@ fn regulation_tables_report_each_transition() {
             Transition::PublicationEnded { subscription: 9 },
         ]
     );
+}
+
+/// Records whether a fenced subscription's exchange was still open when its
+/// `EndClaimed` arrived.
+#[derive(Debug, Default)]
+struct EndWatcher {
+    writer: Mutex<Option<crate::zakura::regulation::ExchangeWriter>>,
+    open_at_end: Mutex<Option<bool>>,
+}
+
+impl TransportObserver for EndWatcher {
+    fn observe(&self, event: TransportEvent) {
+        if let TransportEvent::Regulated {
+            transition: Transition::EndClaimed { .. },
+            ..
+        } = event
+        {
+            let writer = self.writer.lock().expect("no test panics holding it");
+            // An exchange that already ended or was abandoned refuses to
+            // publish.
+            let open = writer.as_ref().map(|writer| writer.publish(|| {}));
+            *self.open_at_end.lock().expect("no test panics holding it") = open;
+        }
+    }
+}
+
+/// `EndClaimed` is reported before the fenced exchange ends, since ending it
+/// takes the fence's locks, which are scheduling points in a simulated run.
+#[test]
+fn end_claimed_precedes_the_exchange_end() {
+    let watcher = Arc::new(EndWatcher::default());
+    let tap = Arc::new(StreamTap::new(
+        Arc::new(ConnTap::new(watcher.clone(), CONN)),
+        4,
+    ));
+    let fence =
+        crate::zakura::regulation::WriterFence::new(CancellationToken::new(), CloseCause::new());
+    let exchange = fence.open().expect("a fresh fence opens");
+    *watcher.writer.lock().expect("no test panics holding it") = Some(exchange.writer());
+    let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
+        .expect("SUBSCRIBE_HEADERS is a subscription row");
+    let mut subscriptions =
+        Subscriptions::new(limits, rows()).observed_by(Some(RegulationTap::new(tap, |id| *id)));
+    subscriptions
+        .open_fenced(
+            1,
+            Credit {
+                objects: 1,
+                bytes: 1_000,
+            },
+            cursor(0),
+            exchange,
+        )
+        .expect("the open fits");
+    subscriptions.claim_end(&1).expect("the subscription ends");
+    assert_eq!(
+        *watcher
+            .open_at_end
+            .lock()
+            .expect("no test panics holding it"),
+        Some(true)
+    );
+}
+
+/// An observer that panics on every call.
+#[derive(Debug)]
+struct AlwaysPanics;
+
+impl TransportObserver for AlwaysPanics {
+    fn observe(&self, _event: TransportEvent) {
+        panic!("observer boom");
+    }
+}
+
+/// An observer panic in a supervised pipe unwinds that task with its own
+/// payload. The pipe's panic hook records a close cause during the unwind,
+/// and the observer, which already panicked, isn't called again, so the
+/// process doesn't abort on a second panic.
+#[tokio::test]
+async fn an_observer_panic_in_a_pipe_unwinds_once() {
+    let cause = CloseCause::new();
+    let conn = Arc::new(ConnTap::new(Arc::new(AlwaysPanics), CONN));
+    cause.observe_with(conn.clone());
+    let hook_cause = cause.clone();
+    let pipe = crate::zakura::spawn_supervised_pipe(
+        "observed_pipe",
+        test_peer(52),
+        CancellationToken::new(),
+        || {},
+        move || hook_cause.record("service_panic"),
+        async move {
+            conn.emit(TransportEvent::TornDown { conn_id: CONN });
+        },
+    );
+    let error = pipe.await.expect_err("the observer panic ends the pipe");
+    assert!(error.is_panic());
+    let payload = error.into_panic();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"observer boom"));
+    assert_eq!(cause.get_or("unset"), "service_panic");
 }

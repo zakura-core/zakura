@@ -128,10 +128,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         }
     }
 
-    /// Report this table's transitions through `tap`.
+    /// This table, reporting its transitions through `tap` if there is one.
+    /// Attach it before sharing the table, since locking a shared table is a
+    /// scheduling point in a simulated run.
     #[cfg(any(test, zakura_sim))]
-    pub(crate) fn observe_with(&mut self, tap: crate::zakura::RegulationTap<K>) {
-        self.tap = Some(tap);
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.tap = tap;
+        self
     }
 
     /// Report `transition` if a tap is attached. `transition` is built only

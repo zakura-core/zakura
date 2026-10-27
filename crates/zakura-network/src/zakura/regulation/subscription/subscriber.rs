@@ -120,10 +120,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         }
     }
 
-    /// Report this table's transitions through `tap`.
+    /// This table, reporting its transitions through `tap` if there is one.
+    /// Attach it before sharing the table, since locking a shared table is a
+    /// scheduling point in a simulated run.
     #[cfg(any(test, zakura_sim))]
-    pub(crate) fn observe_with(&mut self, tap: crate::zakura::RegulationTap<K>) {
-        self.tap = Some(tap);
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.tap = tap;
+        self
     }
 
     /// Report `transition` if a tap is attached. `transition` is built only
@@ -507,6 +510,12 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
             .live
             .remove(key)
             .ok_or_else(|| SubscriptionFault::Unknown.counted(self.limits.message_type))?;
+        // Reported before the exchange ends, since ending it takes the
+        // fence's locks, which are scheduling points in a simulated run.
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::EndClaimed {
+            subscription: tap.id(key),
+        });
         if let Some(exchange) = &mut subscribed.exchange {
             exchange.end();
         }
@@ -514,10 +523,6 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         while self.ended.len() > self.limits.max_live() {
             self.ended.pop_front();
         }
-        #[cfg(any(test, zakura_sim))]
-        self.regulated(|tap| crate::zakura::Transition::EndClaimed {
-            subscription: tap.id(key),
-        });
         Ok(SubscriptionEnded {
             pages: subscribed.pages,
             close_sent: subscribed.close_sent,

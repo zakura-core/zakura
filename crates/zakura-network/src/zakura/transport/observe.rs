@@ -15,15 +15,16 @@
 //! scheduling point to a simulated run.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
-use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
+use crate::zakura::{CloseCause, FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 
 /// Receives transport events as they happen.
 ///
@@ -282,6 +283,10 @@ pub(crate) struct ConnTap {
     conn_id: ZakuraConnId,
     /// 1 once `CloseDecided` was reported.
     decided: AtomicU64,
+    /// 1 once the observer panicked. It gets no more of this connection's
+    /// events, so a teardown hook running during that panic's unwind can't
+    /// panic in it a second time and abort the process.
+    panicked: AtomicU64,
 }
 
 impl ConnTap {
@@ -291,6 +296,7 @@ impl ConnTap {
             observer,
             conn_id,
             decided: AtomicU64::new(0),
+            panicked: AtomicU64::new(0),
         }
     }
 
@@ -299,9 +305,21 @@ impl ConnTap {
         self.conn_id
     }
 
-    /// Reports `event`.
+    /// Reports `event`, unless the observer already panicked on this
+    /// connection. An observer panic resumes with its own payload, except
+    /// while the thread is already unwinding, where a second panic would
+    /// abort.
     pub(crate) fn emit(&self, event: TransportEvent) {
-        self.observer.observe(event);
+        if self.panicked.load(Ordering::Acquire) == 1 {
+            return;
+        }
+        let observed = std::panic::catch_unwind(AssertUnwindSafe(|| self.observer.observe(event)));
+        if let Err(payload) = observed {
+            self.panicked.store(1, Ordering::Release);
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 
     /// Reports `CloseDecided` with `cause`, unless a decision was already
@@ -312,6 +330,42 @@ impl ConnTap {
                 conn_id: self.conn_id,
                 cause,
             });
+        }
+    }
+}
+
+/// The close causes of a supervisor's registered connections, so a
+/// supervisor that cancels a connection reports its close decision at that
+/// moment.
+#[derive(Debug, Default)]
+pub(crate) struct CloseRegistry(Mutex<BTreeMap<ZakuraConnId, CloseCause>>);
+
+impl CloseRegistry {
+    /// Track `conn_id`'s `cause` until [`Self::forget`].
+    pub(crate) fn insert(&self, conn_id: ZakuraConnId, cause: CloseCause) {
+        lock(&self.0).insert(conn_id, cause);
+    }
+
+    /// Stop tracking `conn_id`.
+    pub(crate) fn forget(&self, conn_id: ZakuraConnId) {
+        lock(&self.0).remove(&conn_id);
+    }
+
+    /// Report `CloseDecided` with no cause for `conn_id`, whose token was
+    /// just cancelled, unless it already recorded a cause.
+    pub(crate) fn cancelled(&self, conn_id: Option<ZakuraConnId>) {
+        let cause = conn_id.and_then(|conn_id| lock(&self.0).get(&conn_id).cloned());
+        if let Some(cause) = cause {
+            cause.cancelled_without_cause();
+        }
+    }
+
+    /// [`Self::cancelled`] for every tracked connection, whose tokens a
+    /// shutdown just cancelled.
+    pub(crate) fn cancelled_all(&self) {
+        let causes: Vec<CloseCause> = lock(&self.0).values().cloned().collect();
+        for cause in causes {
+            cause.cancelled_without_cause();
         }
     }
 }

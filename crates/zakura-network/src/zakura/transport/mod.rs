@@ -37,7 +37,7 @@ pub use message_rule::{
     PayloadLen,
 };
 #[cfg(any(test, zakura_sim))]
-pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
+pub(crate) use observe::{CloseRegistry, ConnTap, RegulationTap, StreamTap};
 #[cfg(any(test, zakura_sim))]
 pub use observe::{HeaderCheck, Transition, TransportEvent, TransportObserver};
 #[cfg(feature = "internal-bench")]
@@ -85,6 +85,9 @@ macro_rules! sim_arg {
     ($($f:ident).+ ($($arg:expr),* $(,)?); $extra:expr) => {
         $($f).+($($arg,)* $extra)
     };
+    ($ty:ident :: $f:ident :: <$($g:ty),+> ($($arg:expr),* $(,)?); $extra:expr) => {
+        $ty::$f::<$($g),+>($($arg,)* $extra)
+    };
 }
 
 /// Calls `$f` with its arguments alone.
@@ -94,6 +97,9 @@ macro_rules! sim_arg {
 macro_rules! sim_arg {
     ($($f:ident).+ ($($arg:expr),* $(,)?); $extra:expr) => {
         $($f).+($($arg),*)
+    };
+    ($ty:ident :: $f:ident :: <$($g:ty),+> ($($arg:expr),* $(,)?); $extra:expr) => {
+        $ty::$f::<$($g),+>($($arg),*)
     };
 }
 pub(crate) use sim_arg;

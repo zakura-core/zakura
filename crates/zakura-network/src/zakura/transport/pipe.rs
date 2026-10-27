@@ -76,9 +76,9 @@ impl CloseCause {
         self.tap.get()
     }
 
-    /// Report `CloseDecided` with no cause when the connection's token is
-    /// cancelled before any cause was recorded. A cause recorded after this
-    /// isn't reported.
+    /// Report `CloseDecided` with no cause, right after the connection's token
+    /// was cancelled, if no cause was recorded before. A cause recorded after
+    /// this isn't reported.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn cancelled_without_cause(&self) {
         if let (None, Some(tap)) = (self.reason.get(), self.tap.get()) {

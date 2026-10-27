@@ -61,6 +61,7 @@ use crate::zakura::{
         Applied, ExecutionSlots, Publications, Push, PushPermit, PushSend, SubscriptionFault,
         SubscriptionLimits, TerminalPermit, Totals,
     },
+    transport::sim_chain,
     wire_codec::encode_frame,
     Frame, FramedSend,
 };
@@ -208,7 +209,8 @@ impl Publisher {
     /// and can close the session.
     ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
-    /// version 9 codec.
+    /// version 9 codec. In test and simulator builds, `tap` reports the
+    /// subscription transitions.
     pub(crate) fn spawn<const HEADER_BYTES: usize>(
         port: Arc<dyn Port>,
         push: Push,
@@ -216,11 +218,12 @@ impl Publisher {
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
+        #[cfg(any(test, zakura_sim))] tap: Option<crate::zakura::RegulationTap<u64>>,
     ) -> (Self, JoinHandle<()>) {
         let limits_row = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         let shared = Arc::new(Mutex::new(Shared {
-            publications: Publications::new(limits_row),
+            publications: sim_chain!(Publications::new(limits_row) => observed_by(tap)),
             subscriptions: BTreeMap::new(),
             last_served: None,
         }));
@@ -252,15 +255,6 @@ impl Publisher {
             },
             task,
         )
-    }
-
-    /// Report this publisher's subscription transitions through `tap`.
-    /// Attach it before applying any update.
-    #[cfg(any(test, zakura_sim))]
-    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>) {
-        lock(&self.shared)
-            .publications
-            .observe_with(crate::zakura::RegulationTap::new(tap, |id| *id));
     }
 
     /// Apply one `SubscribeHeaders` update, in stream order.

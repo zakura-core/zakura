@@ -485,12 +485,13 @@ struct Wire {
 }
 
 /// Builds the node: a header-sync reactor on inert storage behind the real
-/// handler, which advertises header sync alone and reports to `recorder`.
-/// Returns its QUIC endpoint, supervisor, handler and local limits.
+/// handler, which advertises header sync alone and reports to `recorder`, if
+/// there is one. Returns its QUIC endpoint, supervisor, handler and local
+/// limits.
 fn bind_node(
     net: &SimNet,
     service: Arc<dyn Service>,
-    recorder: Arc<Recorder>,
+    recorder: Option<Arc<Recorder>>,
 ) -> (
     QuicEndpoint,
     ZakuraSupervisorHandle,
@@ -517,8 +518,11 @@ fn bind_node(
         Arc::new(registry),
         ZakuraTrace::noop(),
     )
-    .with_local_node_id(quic.local_id())
-    .with_transport_observer(recorder);
+    .with_local_node_id(quic.local_id());
+    let handler = match recorder {
+        Some(recorder) => handler.with_transport_observer(recorder),
+        None => handler,
+    };
     (quic, supervisor, handler, limits)
 }
 
@@ -531,6 +535,9 @@ struct Script {
     first: Vec<u8>,
     /// The bytes it writes once the test starts it.
     second: Vec<u8>,
+    /// Whether the node's supervisor disconnects the peer once the test
+    /// starts it.
+    disconnect: bool,
 }
 
 /// Dials the node from the peer, runs the control handshake with header
@@ -637,6 +644,12 @@ impl Wire {
     /// Starts the node and a peer that runs `script`, which writes its second
     /// bytes after [`Self::go`] is cancelled.
     fn start(seed: u64, script: Script) -> Self {
+        Self::start_observed(seed, script, true)
+    }
+
+    /// [`Self::start`], with the node's transport observer installed only if
+    /// `observed`.
+    fn start_observed(seed: u64, script: Script, observed: bool) -> Self {
         let plan = Rc::new(RefCell::new(Plan(seed)));
         let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
         {
@@ -659,11 +672,26 @@ impl Wire {
                 (net.clone(), recorder.clone(), stop.clone(), go.clone());
             sched.spawn_root("node", async move {
                 let _actions = actions;
+                let recorder = observed.then_some(recorder);
                 let (quic, supervisor, handler, _limits) = bind_node(&net, service, recorder);
                 quic.serve(handler.clone()).expect("the node serves");
                 let node = quic.local_id();
-                let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
-                peer_script(net, node, script, go, stop.clone()).await;
+                let endpoint = ZakuraEndpoint::new(quic, supervisor.clone(), handler);
+                let disconnect = script.disconnect;
+                let disconnecting = {
+                    let go = go.clone();
+                    async move {
+                        if disconnect {
+                            go.cancelled().await;
+                            assert!(supervisor.disconnect_peer(&wire_peer()).await);
+                        }
+                    }
+                };
+                futures::future::join(
+                    peer_script(net, node, script, go, stop.clone()),
+                    disconnecting,
+                )
+                .await;
                 endpoint.shutdown().await;
             });
         }
@@ -968,7 +996,7 @@ fn endpoint_new_builds_without_the_testkit() {
         sched.spawn_root("node", async move {
             let _actions = actions;
             let (quic, supervisor, handler, limits) =
-                bind_node(&net, service, Arc::new(Recorder::default()));
+                bind_node(&net, service, Some(Arc::new(Recorder::default())));
             let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
             let unreachable =
                 NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
@@ -1154,4 +1182,86 @@ fn a_connection_is_observed_from_handshake_to_admission() {
         ]
     );
     wire.finish();
+}
+
+/// The peer's identity on the node's supervisor.
+fn wire_peer() -> ZakuraPeerId {
+    let node = SeededInputs::node_key(SEED, 1).public();
+    ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id")
+}
+
+/// A supervisor disconnect with no recorded cause is decided when the
+/// supervisor cancels the connection, while the connection's serving task,
+/// which would otherwise notice it first, is held. Teardown follows once it
+/// runs.
+///
+/// This fails if the decision waits for the serving task.
+#[test]
+fn a_cancellation_is_decided_when_it_happens() {
+    let mut wire = Wire::start(
+        23,
+        Script {
+            disconnect: true,
+            ..Script::default()
+        },
+    );
+    wire.run_until(Duration::from_secs(5));
+    let (conn_id, _) = header_stream(&wire.events());
+
+    wire.held = Some("quic.inbound_handshake");
+    wire.go.cancel();
+    wire.run_until(Duration::from_secs(10));
+    let events = wire.events();
+    assert_eq!(
+        closes(&events),
+        vec![TransportEvent::CloseDecided {
+            conn_id,
+            cause: None,
+        }],
+        "the cancellation is decided while the serving task is held"
+    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, TransportEvent::TornDown { .. })));
+
+    wire.held = None;
+    wire.run_until(Duration::from_secs(15));
+    let events = wire.events();
+    assert_eq!(closes(&events).len(), 1, "the decision is reported once");
+    assert!(events.contains(&TransportEvent::TornDown { conn_id }));
+    wire.finish();
+}
+
+/// Installing the transport observer adds no scheduling point: one plan takes
+/// the same steps with and without it, through the handshake, admission,
+/// a whole frame and the regulation checks of a page header.
+///
+/// This fails if attaching a tap takes a simulator lock.
+#[test]
+fn the_observer_adds_no_scheduling_point() {
+    let status = status_len();
+    let script = Script {
+        first: [
+            frame_header(1, status),
+            vec![0; usize::try_from(status).expect("u32 fits usize")],
+            frame_header(3, 300),
+        ]
+        .concat(),
+        ..Script::default()
+    };
+    let mut steps = Vec::new();
+    for observed in [true, false] {
+        let mut wire = Wire::start_observed(29, script.clone(), observed);
+        wire.run_until(Duration::from_secs(5));
+        assert_eq!(
+            wire.events()
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Regulated { .. })),
+            observed,
+            "only the observed run reports, and it reached the regulation checks"
+        );
+        steps.push(std::mem::take(&mut wire.steps));
+        wire.finish();
+    }
+    assert_eq!(steps[0], steps[1]);
 }

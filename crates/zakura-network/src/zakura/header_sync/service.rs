@@ -748,6 +748,10 @@ impl Service for HeaderSyncService {
             send,
             service_cancel_token.clone(),
         );
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = recv.stream_tap() {
+            publisher.observe_with(tap.clone());
+        }
 
         let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();

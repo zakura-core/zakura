@@ -6,17 +6,39 @@
 //! draw.
 #![cfg(zakura_sim)]
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    net::{Ipv4Addr, SocketAddr},
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use zakura_chain::parameters::Network;
-use zakura_network::zakura::{
-    framed_channel, spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncService,
-    HeaderSyncStartup, Peer, Service, ServicePeerDirection, ZakuraHeaderSyncConfig, ZakuraPeerId,
-    LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    ZAKURA_STREAM_HEADER_SYNC,
+use zakura_network::{
+    zakura::{
+        framed_channel, header_sync_header_bytes_for_network, spawn_header_sync_reactor,
+        v9::{
+            self, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
+            RegtestMessage, SubscribeHeaders,
+        },
+        wire_codec::{decode_frame, encode_frame},
+        zakura_protocol_for_alpn, AuxSchema, Credit, FullStateFrontiers, HeaderEntry,
+        HeaderSyncService, HeaderSyncStartup, MessageRule, Peer, Service, ServicePeerDirection,
+        ServiceRegistry, StreamPrelude, TransportEvent, TransportObserver, ZakuraControlAck,
+        ZakuraControlHello, ZakuraControlRole, ZakuraEndpoint, ZakuraHandshakeConfig,
+        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
+        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace, CONTROL_HELLO_MAGIC,
+        CONTROL_VERSION, LOCAL_MAX_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    },
+    Config,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
-use zakura_quic::NodeSecretKey;
+use zakura_quic::{
+    sim::{LinkModel, SeededInputs, SimNet},
+    NodeAddr, NodeId, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint,
+};
 use zakura_rt::sync::CancellationToken;
 use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
 
@@ -378,4 +400,758 @@ fn a_replacement_session_outlives_the_old_teardown() {
         !steps.iter().any(|step| step.starts_with("panicked")),
         "{steps:?}"
     );
+}
+
+// A header-sync node behind the real handler on `SimNet`, a raw peer that
+// runs the control handshake from the public wire types, and a transport
+// observer. The node runs production limits and timeouts.
+
+/// The node's address.
+fn node_addr() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 4000))
+}
+
+/// The peer's address.
+fn peer_addr() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 4000))
+}
+
+/// The seed of every endpoint's keys and inputs.
+const SEED: [u8; 32] = [5; 32];
+
+/// One socket at `addr`.
+fn bind_config(addr: SocketAddr) -> QuicBindConfig {
+    QuicBindConfig {
+        addrs: vec![addr],
+        max_bidi_streams: 16,
+        max_connections: 16,
+        dial_reserve: 0,
+        max_closing_connections: 16,
+    }
+}
+
+/// Production network config on Regtest.
+fn regtest_config() -> Config {
+    Config {
+        network: Network::new_regtest(Default::default()),
+        ..Config::default()
+    }
+}
+
+/// Records every transport event in order.
+#[derive(Debug, Default)]
+struct Recorder(Mutex<Vec<TransportEvent>>);
+
+impl TransportObserver for Recorder {
+    fn observe(&self, event: TransportEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(event);
+    }
+}
+
+impl Recorder {
+    /// The events recorded so far.
+    fn events(&self) -> Vec<TransportEvent> {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .clone()
+    }
+}
+
+/// Converts a runtime instant to scheduler time, given one moment read
+/// from both clocks.
+fn sim_of(instant: std::time::Instant, now_std: std::time::Instant, now: SimInstant) -> SimInstant {
+    SimInstant::from_start(now.since_start() + instant.saturating_duration_since(now_std))
+}
+
+/// The node and its scheduler, driven step by step.
+struct Wire {
+    sched: Scheduler,
+    plan: Rc<RefCell<Plan>>,
+    net: SimNet,
+    recorder: Arc<Recorder>,
+    /// Ends the peer's script and both endpoints.
+    stop: CancellationToken,
+    /// Starts the peer's second write.
+    go: CancellationToken,
+    shutdown: CancellationToken,
+    /// Tasks whose own name, the last part of their path, starts with this
+    /// aren't run.
+    held: Option<&'static str>,
+    steps: Vec<String>,
+}
+
+/// Builds the node: a header-sync reactor on inert storage behind the real
+/// handler, which advertises header sync alone and reports to `recorder`.
+/// Returns its QUIC endpoint, supervisor, handler and local limits.
+fn bind_node(
+    net: &SimNet,
+    service: Arc<dyn Service>,
+    recorder: Arc<Recorder>,
+) -> (
+    QuicEndpoint,
+    ZakuraSupervisorHandle,
+    ZakuraProtocolHandler,
+    ZakuraLocalLimits,
+) {
+    let config = regtest_config();
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let quic = QuicEndpoint::bind_with(
+        SeededInputs::node_key(SEED, 0),
+        &bind_config(node_addr()),
+        &limits.quic,
+        net.clone(),
+        SeededInputs::new(SEED, 0).endpoint_inputs(),
+    )
+    .expect("the node binds");
+    let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
+    let registry = ServiceRegistry::new(vec![service]).expect("one service registers");
+    let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
+        supervisor.clone(),
+        config.network.clone(),
+        ZakuraHandshakeConfig::for_network(&config.network),
+        limits.clone(),
+        Arc::new(registry),
+        ZakuraTrace::noop(),
+    )
+    .with_local_node_id(quic.local_id())
+    .with_transport_observer(recorder);
+    (quic, supervisor, handler, limits)
+}
+
+/// What the peer writes.
+#[derive(Clone, Debug, Default)]
+struct Script {
+    /// A stream kind and version to open before the header stream.
+    other_stream: Option<(u16, u16)>,
+    /// The bytes after the header stream's prelude.
+    first: Vec<u8>,
+    /// The bytes it writes once the test starts it.
+    second: Vec<u8>,
+}
+
+/// Dials the node from the peer, runs the control handshake with header
+/// sync as the only capability, and opens a header stream with its prelude.
+/// Writes `script`'s first bytes on it, then its second once `go` is
+/// cancelled, and keeps the connection until `stop` is cancelled.
+async fn peer_script(
+    net: SimNet,
+    node: NodeId,
+    script: Script,
+    go: CancellationToken,
+    stop: CancellationToken,
+) {
+    let config = regtest_config();
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let quic = QuicEndpoint::bind_with(
+        SeededInputs::node_key(SEED, 1),
+        &bind_config(peer_addr()),
+        &QuicConfig::default(),
+        net,
+        SeededInputs::new(SEED, 1).endpoint_inputs(),
+    )
+    .expect("the peer binds");
+    let conn = quic
+        .connect(NodeAddr::with_addrs(node, [node_addr()]), &[P2P_V2_ALPN])
+        .await
+        .expect("the peer connects");
+    let handshake = ZakuraHandshakeConfig::for_network(&config.network);
+    let hello = ZakuraControlHello {
+        magic: CONTROL_HELLO_MAGIC,
+        control_version: CONTROL_VERSION,
+        selected_zakura_protocol: zakura_protocol_for_alpn(conn.alpn())
+            .expect("the connection's ALPN is a Zakura protocol"),
+        handshake_path: ZakuraHandshakePath::Native,
+        role: ZakuraControlRole::Initiator,
+        network_id: handshake.network_id,
+        chain_id: handshake.chain_id,
+        iroh_node_id: quic.local_id().as_bytes().to_vec(),
+        peer_nonce: [7; 32],
+        initiator_upgrade_nonce: [0; 32],
+        responder_upgrade_nonce: [0; 32],
+        legacy_upgrade_transcript: [0; 32],
+        capabilities: ZAKURA_CAP_HEADER_SYNC,
+        required_channels: 0,
+        initial_limits: limits.initial_limits(),
+    };
+    let (mut send, mut recv) = conn.open_bi().await.expect("the control stream opens");
+    let hello = hello.encode().expect("the hello encodes");
+    let len = u32::try_from(hello.len()).expect("a hello fits u32");
+    send.write_all(&len.to_le_bytes())
+        .await
+        .expect("the hello's length is written");
+    send.write_all(&hello).await.expect("the hello is written");
+    let _ = send.finish();
+    let mut len = [0; 4];
+    recv.read_exact(&mut len)
+        .await
+        .expect("the ack's length arrives");
+    let mut ack = vec![0; usize::try_from(u32::from_le_bytes(len)).expect("u32 fits usize")];
+    recv.read_exact(&mut ack).await.expect("the ack arrives");
+    let ack = ZakuraControlAck::decode(&ack).expect("the ack decodes");
+    assert_eq!(ack.remote_peer_nonce, [7; 32], "the ack echoes the nonce");
+    assert_eq!(ack.accepted_capabilities, ZAKURA_CAP_HEADER_SYNC);
+
+    let mut other = None;
+    if let Some((stream_kind, stream_version)) = script.other_stream {
+        let (mut send, recv) = conn.open_bi().await.expect("the other stream opens");
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind,
+            stream_version,
+            request_id: None,
+            max_frame_bytes: RegtestMessage::LAYOUT[0].frame_cap,
+        };
+        send.write_all(&prelude.encode().expect("the prelude encodes"))
+            .await
+            .expect("the other prelude is written");
+        other = Some((send, recv));
+    }
+    let (mut send, _recv) = conn.open_bi().await.expect("the header stream opens");
+    let prelude = StreamPrelude {
+        magic: STREAM_PRELUDE_MAGIC,
+        stream_kind: ZAKURA_STREAM_HEADER_SYNC,
+        stream_version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        request_id: None,
+        max_frame_bytes: RegtestMessage::LAYOUT[0].frame_cap,
+    };
+    let prelude = prelude.encode().expect("the prelude encodes");
+    send.write_all(&[prelude, script.first].concat())
+        .await
+        .expect("the first bytes are written");
+    go.cancelled().await;
+    if !script.second.is_empty() {
+        // The node may already have closed.
+        let _ = send.write_all(&script.second).await;
+    }
+    stop.cancelled().await;
+    drop((send, other));
+    conn.close(0u32.into(), b"done");
+    quic.shutdown().await;
+}
+
+impl Wire {
+    /// Starts the node and a peer that runs `script`, which writes its second
+    /// bytes after [`Self::go`] is cancelled.
+    fn start(seed: u64, script: Script) -> Self {
+        let plan = Rc::new(RefCell::new(Plan(seed)));
+        let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        {
+            let plan = Rc::clone(&plan);
+            sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+        }
+        let net = SimNet::new(LinkModel::default());
+        let recorder = Arc::new(Recorder::default());
+        let shutdown = CancellationToken::new();
+        let stop = CancellationToken::new();
+        let go = CancellationToken::new();
+        let (handle, actions, reactor) =
+            spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+        sched.spawn_root("reactor", async move {
+            reactor.await.expect("the reactor ends on shutdown");
+        });
+        let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(handle));
+        {
+            let (net, recorder, stop, go) =
+                (net.clone(), recorder.clone(), stop.clone(), go.clone());
+            sched.spawn_root("node", async move {
+                let _actions = actions;
+                let (quic, supervisor, handler, _limits) = bind_node(&net, service, recorder);
+                quic.serve(handler.clone()).expect("the node serves");
+                let node = quic.local_id();
+                let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
+                peer_script(net, node, script, go, stop.clone()).await;
+                endpoint.shutdown().await;
+            });
+        }
+        Self {
+            sched,
+            plan,
+            net,
+            recorder,
+            stop,
+            go,
+            shutdown,
+            held: None,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Runs ready tasks, delivers datagrams, and advances time, in `plan`'s
+    /// order, until nothing is left at or before `until` since the start.
+    fn run_until(&mut self, until: Duration) {
+        loop {
+            assert!(
+                self.steps.len() < MAX_STEPS,
+                "the run took {MAX_STEPS} steps"
+            );
+            let ready: Vec<_> = self
+                .sched
+                .ready()
+                .into_iter()
+                .filter(|ready| {
+                    self.held.is_none_or(|held| {
+                        let path = self.sched.task_name(ready.task);
+                        !path.rsplit('/').next().unwrap_or(&path).starts_with(held)
+                    })
+                })
+                .collect();
+            if !ready.is_empty() {
+                // A Vec's length fits in u64, and the choice is below it.
+                let index = self.plan.borrow_mut().below(ready.len() as u64) as usize;
+                let pick = ready[index];
+                self.steps
+                    .push(format!("{}:{}", self.sched.task_name(pick.task), pick.at));
+                if let RunOutcome::Panicked(message) = self.sched.run(pick.task) {
+                    panic!(
+                        "task {} panicked: {message}",
+                        self.sched.task_name(pick.task)
+                    );
+                }
+                continue;
+            }
+            let deliverable = self.net.deliverable();
+            if !deliverable.is_empty() {
+                // As above.
+                let index = self.plan.borrow_mut().below(deliverable.len() as u64) as usize;
+                self.net
+                    .deliver(deliverable[index])
+                    .expect("a deliverable datagram delivers");
+                continue;
+            }
+            let now_std = zakura_rt::time::Instant::now().into_std();
+            let now = self.sched.now();
+            let limit = self
+                .net
+                .time_limit()
+                .map(|limit| sim_of(limit, now_std, now));
+            let target = [
+                self.sched.next_deadline(),
+                self.net.next_eligible().map(|at| sim_of(at, now_std, now)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|target| limit.map_or(target, |limit| target.min(limit)))
+            // A timer due now fires only on an advance, so `now` is a target.
+            .filter(|target| *target >= now && self.net.can_advance());
+            match target {
+                Some(target) if target.since_start() <= until => {
+                    self.sched.advance_to(target);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// The events the observer recorded so far.
+    fn events(&self) -> Vec<TransportEvent> {
+        self.recorder.events()
+    }
+
+    /// Stops the peer and the node, and runs every task to its end.
+    fn finish(mut self) {
+        self.held = None;
+        self.go.cancel();
+        self.stop.cancel();
+        self.shutdown.cancel();
+        let end = self.sched.now().since_start() + Duration::from_secs(60);
+        self.run_until(end);
+        let _ = self.sched.shutdown();
+    }
+}
+
+/// The admitted header stream's connection and QUIC stream.
+fn header_stream(events: &[TransportEvent]) -> (u64, u64) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Admitted {
+                conn_id,
+                quic_stream,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                ..
+            } => Some((*conn_id, *quic_stream)),
+            _ => None,
+        })
+        .expect("the header stream was admitted")
+}
+
+/// The reader stages of `events` on `quic_stream`.
+fn reads(events: &[TransportEvent], stream: u64) -> Vec<TransportEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event,
+                TransportEvent::HeaderRead { quic_stream, .. }
+                | TransportEvent::FrameRead { quic_stream, .. } if *quic_stream == stream)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The close decisions in `events`.
+fn closes(events: &[TransportEvent]) -> Vec<TransportEvent> {
+    events
+        .iter()
+        .filter(|event| matches!(event, TransportEvent::CloseDecided { .. }))
+        .cloned()
+        .collect()
+}
+
+/// A frame header for `message_type` that declares `payload_len` bytes.
+fn frame_header(message_type: u16, payload_len: u32) -> Vec<u8> {
+    [
+        &message_type.to_le_bytes()[..],
+        &0u16.to_le_bytes(),
+        &payload_len.to_le_bytes(),
+    ]
+    .concat()
+}
+
+/// The `Status` row's payload length.
+fn status_len() -> u32 {
+    let row = RegtestMessage::ROWS
+        .iter()
+        .find(|row| row.name == "status")
+        .expect("the table has a status row");
+    u32::try_from(row.payload.min()).expect("a row length fits u32")
+}
+
+/// A header cut after 5 bytes reaches neither reader stage, and a frame cut
+/// mid-payload reaches only `HeaderRead`, at a point after all ready work
+/// ran and before the reader's deadline for the missing bytes. Past that
+/// deadline, under production timeouts, each closes with the reader's
+/// neutral timeout cause.
+///
+/// This fails if `HeaderRead` moves before the header is read, or if a
+/// partial frame gets a fault cause.
+#[test]
+fn partial_frames_reach_only_their_stage() {
+    let status = status_len();
+    let whole_header = frame_header(1, status);
+    let cases = [
+        ("a header cut after 5 bytes", whole_header[..5].to_vec(), 0),
+        (
+            "a frame cut mid-payload",
+            [whole_header.clone(), vec![0; 4]].concat(),
+            1,
+        ),
+    ];
+    for (case, bytes, stages) in cases {
+        let mut wire = Wire::start(
+            11,
+            Script {
+                first: bytes,
+                ..Script::default()
+            },
+        );
+        // Ready work drains long before the reader's deadline, which is the
+        // connection's idle timeout of almost 150 s.
+        wire.run_until(Duration::from_secs(5));
+        let events = wire.events();
+        let (conn_id, quic_stream) = header_stream(&events);
+        let expected = [TransportEvent::HeaderRead {
+            conn_id,
+            quic_stream,
+            seq: 0,
+            message_type: 1,
+            flags: 0,
+            payload_len: status,
+        }];
+        assert_eq!(reads(&events, quic_stream), expected[..stages], "{case}");
+        assert_eq!(closes(&events), vec![], "{case}");
+
+        wire.run_until(Duration::from_secs(160));
+        let events = wire.events();
+        assert_eq!(reads(&events, quic_stream), expected[..stages], "{case}");
+        assert_eq!(
+            closes(&events),
+            vec![TransportEvent::CloseDecided {
+                conn_id,
+                cause: Some("ordered_read_timeout"),
+            }],
+            "{case}: the timeout is neutral"
+        );
+        wire.finish();
+    }
+}
+
+/// The node decides to close when its reader rejects a header, while the
+/// connection's teardown waits behind its held serving task, which runs the
+/// peer's unregistration. `TornDown` follows only once it runs.
+///
+/// This fails if `CloseDecided` moves to teardown.
+#[test]
+fn close_is_observed_before_teardown() {
+    let frame_cap = RegtestMessage::LAYOUT[0].frame_cap;
+    let mut wire = Wire::start(
+        13,
+        Script {
+            second: frame_header(1, frame_cap),
+            ..Script::default()
+        },
+    );
+    wire.run_until(Duration::from_secs(5));
+    let (conn_id, quic_stream) = header_stream(&wire.events());
+
+    wire.held = Some("quic.inbound_handshake");
+    wire.go.cancel();
+    wire.run_until(Duration::from_secs(10));
+    let events = wire.events();
+    assert_eq!(
+        reads(&events, quic_stream),
+        [TransportEvent::HeaderRead {
+            conn_id,
+            quic_stream,
+            seq: 0,
+            message_type: 1,
+            flags: 0,
+            payload_len: frame_cap,
+        }]
+    );
+    assert_eq!(
+        closes(&events),
+        vec![TransportEvent::CloseDecided {
+            conn_id,
+            cause: Some("ordered_read_rejected"),
+        }],
+        "the close is decided while teardown is held"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::TornDown { .. })),
+        "teardown waits for its task"
+    );
+
+    wire.held = None;
+    wire.run_until(Duration::from_secs(15));
+    let events = wire.events();
+    let closed = events
+        .iter()
+        .position(|event| matches!(event, TransportEvent::CloseDecided { .. }))
+        .expect("the close was decided");
+    let torn_down = events
+        .iter()
+        .position(|event| *event == TransportEvent::TornDown { conn_id })
+        .expect("the released task tears the connection down");
+    assert!(closed < torn_down);
+    wire.finish();
+}
+
+/// `ZakuraEndpoint::new` and `ZakuraEndpoint::dial` build and run without
+/// `zakura-testkit`. A dial to an address where nothing answers returns the
+/// transport's handshake timeout unchanged.
+#[test]
+fn endpoint_new_builds_without_the_testkit() {
+    let plan = Rc::new(RefCell::new(Plan(17)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+    let net = SimNet::new(LinkModel::default());
+    let shutdown = CancellationToken::new();
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+    sched.spawn_root("reactor", async move {
+        reactor.await.expect("the reactor ends on shutdown");
+    });
+    let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(handle));
+    let dialed = Rc::new(RefCell::new(None));
+    {
+        let (net, dialed) = (net.clone(), Rc::clone(&dialed));
+        sched.spawn_root("node", async move {
+            let _actions = actions;
+            let (quic, supervisor, handler, limits) =
+                bind_node(&net, service, Arc::new(Recorder::default()));
+            let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
+            let unreachable =
+                NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
+            let result = endpoint.dial(unreachable, &limits).await;
+            *dialed.borrow_mut() = Some(format!("{result:?}"));
+            endpoint.shutdown().await;
+        });
+    }
+    let mut steps = Vec::new();
+    run_to_end(&mut sched, &plan, &mut steps);
+    shutdown.cancel();
+    run_to_end(&mut sched, &plan, &mut steps);
+    let _ = sched.shutdown();
+    let dialed = dialed.borrow_mut().take().expect("the dial returned");
+    // The transport's handshake timeout comes back as it is, not wrapped as
+    // the dial's own deadline.
+    assert_eq!(dialed, "Err(QuicConnect(HandshakeTimeout))");
+}
+
+/// Every version 9 message builds from public fields, encodes, decodes to
+/// itself, and reads back field by field.
+#[test]
+fn codec_builds_every_row_from_outside_the_crate() {
+    let genesis = zakura_chain::block::genesis::regtest_genesis_block();
+    let parent = (zakura_chain::block::Height(0), genesis.hash());
+    let mut header = *genesis.header;
+    header.previous_block_hash = parent.1;
+    let target = header.hash();
+    let status = v9::Status {
+        work_anchor_height: parent.0,
+        work_anchor_hash: parent.1,
+        selected_tip_height: zakura_chain::block::Height(1),
+        selected_tip_hash: target,
+        suffix_cumulative_work: Default::default(),
+        oldest_retained_height: parent.0,
+        max_headers_per_response: 160,
+        max_subscriptions: 1,
+        max_message_bytes: 1 << 20,
+        tree_aux_schema_mask: 0,
+    };
+    let cursor = Cursor {
+        height: parent.0,
+        hash: parent.1,
+        headers: 0,
+        bytes: 0,
+    };
+    let open = SubscribeHeaders {
+        operation: Operation::Open,
+        subscription_id: 1,
+        update_sequence: 0,
+        initial_target_tip_hash: target,
+        acknowledged: cursor,
+        locator_hashes: vec![parent.1],
+        added_credit: Credit {
+            objects: 10,
+            bytes: 10_000,
+        },
+        tree_aux_schema: AuxSchema::None,
+    };
+    let page = Headers {
+        subscription_id: 1,
+        initial_target_tip_hash: target,
+        common_ancestor_height: parent.0,
+        common_ancestor_hash: parent.1,
+        reaches_initial_target: true,
+        tree_aux_schema: AuxSchema::None,
+        entries: vec![HeaderEntry {
+            header: Arc::new(header),
+            body_size: 1_000,
+            tree_aux: None,
+        }],
+    };
+    let outcome = HeadersOutcome {
+        subscription_id: 1,
+        initial_target_tip_hash: target,
+        outcome: HeadersOutcomeCode::SubscriptionClosed,
+    };
+    let messages = [
+        RegtestMessage::Status(status.clone()),
+        RegtestMessage::SubscribeHeaders(open.clone()),
+        RegtestMessage::Headers(page.clone()),
+        RegtestMessage::HeadersOutcome(outcome),
+    ];
+    for (message, row) in messages.iter().zip(RegtestMessage::ROWS) {
+        let frame = encode_frame(message).expect("the message encodes");
+        assert_eq!(frame.message_type, row.message_type, "{}", row.name);
+        let decoded = decode_frame::<RegtestMessage>(&frame).expect("the frame decodes");
+        assert_eq!(&decoded, message, "{}", row.name);
+        match decoded {
+            Message::Status(decoded) => {
+                assert_eq!(decoded.selected_tip_hash, status.selected_tip_hash);
+                assert_eq!(decoded.max_headers_per_response, 160);
+                assert_eq!(decoded.max_message_bytes, 1 << 20);
+            }
+            Message::SubscribeHeaders(decoded) => {
+                assert_eq!(decoded.operation, Operation::Open);
+                assert_eq!(decoded.acknowledged, cursor);
+                assert_eq!(decoded.locator_hashes, open.locator_hashes);
+                assert_eq!(decoded.added_credit, open.added_credit);
+            }
+            Message::Headers(decoded) => {
+                assert_eq!(decoded.common_ancestor_hash, parent.1);
+                assert!(decoded.reaches_initial_target);
+                assert_eq!(decoded.entries[0].header.hash(), target);
+                assert_eq!(decoded.entries[0].body_size, 1_000);
+            }
+            Message::HeadersOutcome(decoded) => {
+                assert_eq!(decoded.outcome, HeadersOutcomeCode::SubscriptionClosed);
+                assert_eq!(decoded.initial_target_tip_hash, target);
+            }
+        }
+    }
+    let network = Network::new_regtest(Default::default());
+    let names = |rows: &[MessageRule]| rows.iter().map(|row| row.name).collect::<Vec<_>>();
+    assert_eq!(
+        names(v9::rows(header_sync_header_bytes_for_network(&network))),
+        names(&RegtestMessage::ROWS)
+    );
+    assert_eq!(
+        v9::layout(&network)[0].messages.map(names),
+        Some(names(&RegtestMessage::ROWS))
+    );
+}
+
+/// The handshake, registration, a refused stream and the header stream's
+/// admission are each observed, keyed as the identity rules say: the
+/// handshake by the remote address, the rest by the registered connection.
+#[test]
+fn a_connection_is_observed_from_handshake_to_admission() {
+    // Kind 4 is discovery, which this node doesn't register.
+    let mut wire = Wire::start(
+        19,
+        Script {
+            other_stream: Some((4, 2)),
+            ..Script::default()
+        },
+    );
+    wire.run_until(Duration::from_secs(5));
+    let events = wire.events();
+    let (conn_id, quic_stream) = header_stream(&events);
+    let limits = ZakuraLocalLimits::from_config(&regtest_config());
+    let TransportEvent::StreamRefused {
+        quic_stream: refused,
+        ..
+    } = events[2]
+    else {
+        panic!("the other stream is refused before admission: {events:?}");
+    };
+    assert_ne!(refused, quic_stream);
+    assert_eq!(
+        events,
+        vec![
+            TransportEvent::Negotiated {
+                remote: peer_addr(),
+                local: ZAKURA_CAP_HEADER_SYNC,
+                offered: ZAKURA_CAP_HEADER_SYNC,
+                negotiated: ZAKURA_CAP_HEADER_SYNC,
+            },
+            TransportEvent::Registered {
+                conn_id,
+                remote: peer_addr(),
+            },
+            TransportEvent::StreamRefused {
+                conn_id,
+                quic_stream: refused,
+                kind: 4,
+                version: 2,
+                reason: "unknown_kind",
+            },
+            TransportEvent::Admitted {
+                conn_id,
+                quic_stream,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                session_id: match events[3] {
+                    TransportEvent::Admitted { session_id, .. } => session_id,
+                    _ => panic!("the header stream is admitted last: {events:?}"),
+                },
+                negotiated_limits: limits.clamp(&limits.initial_limits()),
+                inbound_depth: 4,
+                outbound_depth: usize::from(limits.max_inbound_queue_depth),
+            },
+        ]
+    );
+    wire.finish();
 }

@@ -254,6 +254,15 @@ impl Publisher {
         )
     }
 
+    /// Report this publisher's subscription transitions through `tap`.
+    /// Attach it before applying any update.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>) {
+        lock(&self.shared)
+            .publications
+            .observe_with(crate::zakura::RegulationTap::new(tap, |id| *id));
+    }
+
     /// Apply one `SubscribeHeaders` update, in stream order.
     ///
     /// `Applied::Crossed` means the update crossed its subscription's

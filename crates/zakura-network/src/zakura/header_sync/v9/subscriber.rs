@@ -297,6 +297,15 @@ impl Subscriber {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes)));
+        // The reader waits for this precheck, so it tags and reports every
+        // frame from the first.
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = recv.stream_tap() {
+            tap.tag_frames();
+            tools
+                .lock()
+                .observe_with(crate::zakura::RegulationTap::new(tap.clone(), |id| *id));
+        }
         let transport_admits = recv.attach_precheck(Arc::new(tools.admitting()));
         Self {
             tools,

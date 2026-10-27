@@ -101,6 +101,9 @@ pub(crate) struct Subscriptions<K, C> {
     /// Pages a reader admitted that the handler has not yet taken, one
     /// object and their payload bytes each.
     queued: Totals,
+    /// Reports this table's transitions, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<crate::zakura::RegulationTap<K>>,
 }
 
 impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
@@ -112,6 +115,26 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
             live: HashMap::new(),
             ended: VecDeque::new(),
             queued: Totals::default(),
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
+        }
+    }
+
+    /// Report this table's transitions through `tap`.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&mut self, tap: crate::zakura::RegulationTap<K>) {
+        self.tap = Some(tap);
+    }
+
+    /// Report `transition` if a tap is attached. `transition` is built only
+    /// then.
+    #[cfg(any(test, zakura_sim))]
+    fn regulated(
+        &self,
+        transition: impl FnOnce(&crate::zakura::RegulationTap<K>) -> crate::zakura::Transition,
+    ) {
+        if let Some(tap) = &self.tap {
+            tap.stream().regulated(transition(tap));
         }
     }
 
@@ -163,6 +186,12 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         granted
             .grant(credit, Totals::default(), self.limits.credit)
             .map_err(|_| SubscribeRefused::AboveWindow)?;
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::OpenIssued {
+            subscription: tap.id(&key),
+            objects: credit.objects,
+            bytes: credit.bytes,
+        });
         self.live.insert(
             key,
             Subscribed {
@@ -210,6 +239,15 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
             .grant(added, subscribed.accepted.1, limit)
             .map_err(|_| SubscribeRefused::AboveWindow)?;
         subscribed.sequence = sequence;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::GrantIssued {
+                    subscription: tap.id(key),
+                    objects: added.objects,
+                    bytes: added.bytes,
+                });
+        }
         Ok(Update {
             sequence: subscribed.sequence,
             acknowledged: subscribed.accepted.0.clone(),
@@ -330,6 +368,10 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<(), SubscriptionFault> {
+        #[cfg(any(test, zakura_sim))]
+        if self.tap.is_some() {
+            return self.admit_observed(message_type, payload_len);
+        }
         if self.check_header(message_type, payload_len)? {
             return Ok(());
         }
@@ -352,6 +394,40 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         Ok(())
     }
 
+    /// [`Self::admit`], reporting its verdict as `HeaderChecked` for the
+    /// header the reader has now, before the caller releases the lock.
+    #[cfg(any(test, zakura_sim))]
+    fn admit_observed(
+        &mut self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(), SubscriptionFault> {
+        use crate::zakura::{HeaderCheck, Transition};
+
+        let tap = self
+            .tap
+            .take()
+            .expect("the caller checked the tap is attached");
+        let queued = self.queued;
+        let result = self.admit(message_type, payload_len);
+        let outcome = match result {
+            Ok(()) if self.queued != queued => HeaderCheck::Reserved {
+                objects: self.queued.objects - queued.objects,
+                bytes: self.queued.bytes - queued.bytes,
+            },
+            Ok(()) => HeaderCheck::AdmittedTerminal,
+            Err(fault) => HeaderCheck::Refused {
+                reason: self.frame_rejection(fault),
+            },
+        };
+        tap.stream().regulated(Transition::HeaderChecked {
+            seq: tap.stream().reading(),
+            outcome,
+        });
+        self.tap = Some(tap);
+        result
+    }
+
     /// [`Self::claim_page`] for a page that [`Self::admit`] charged: spend
     /// its credit and release its charge together, so a reader never sees
     /// that credit free in between. A refused claim keeps the charge.
@@ -371,6 +447,12 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         );
         self.queued.objects = self.queued.objects.saturating_sub(1);
         self.queued.bytes = self.queued.bytes.saturating_sub(bytes);
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::PageClaimed {
+            seq: tap.stream().serving(),
+            objects,
+            bytes,
+        });
         Ok(())
     }
 
@@ -432,6 +514,10 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         while self.ended.len() > self.limits.max_live() {
             self.ended.pop_front();
         }
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::EndClaimed {
+            subscription: tap.id(key),
+        });
         Ok(SubscriptionEnded {
             pages: subscribed.pages,
             close_sent: subscribed.close_sent,

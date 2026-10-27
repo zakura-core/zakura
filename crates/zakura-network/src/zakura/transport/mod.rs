@@ -42,7 +42,7 @@ pub(crate) use pipe::{
 };
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
 #[cfg(any(test, zakura_sim))]
-pub use service::CloseReason;
+pub use service::CloseCauseReader;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,

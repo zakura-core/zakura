@@ -5,9 +5,9 @@
 //! [`ControlledBlockService`] that shares its engine with the node's header
 //! side, as zakurad's driver shares zakura-state with header sync. Its
 //! serving reads through the same service, but only a probe asks it for a
-//! body. Header
-//! sync itself doesn't run: every actor's headers are committed before the
-//! run, so block sync's work comes only from the committed views.
+//! body. Header sync itself doesn't run: every actor's headers are
+//! committed before the run, so block sync's work comes only from the
+//! committed views.
 //!
 //! The scenario leaves out what the service doesn't model: zakurad's legacy
 //! handoff and `SyncCoordinator` phases, the debug throughput probe, stall

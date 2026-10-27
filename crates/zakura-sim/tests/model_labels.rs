@@ -341,8 +341,8 @@ fn labels_fixture_frames_pages() {
         objects: 2,
         bytes: 20,
     };
-    assert!(model.subscribe(0, 7, two));
-    assert!(!model.subscribe(0, 7, two), "the key is live");
+    assert!(model.subscribe(0, 7, two, 0).is_some());
+    assert!(model.subscribe(0, 7, two, 0).is_none(), "the key is live");
     assert_eq!(model.page_frame(0, 7, 0, 1, 1).first(), Label::OverCredit);
     assert_eq!(model.page_frame(0, 7, 1, 21, 1).first(), Label::OverCredit);
     assert!(model.page_frame(0, 7, 1, 10, 1).is_conformant());
@@ -355,20 +355,23 @@ fn labels_fixture_frames_pages() {
         objects: 3,
         bytes: 40,
     };
-    assert!(!model.grant(0, 7, refill), "the window is still full");
+    assert!(
+        model.grant(0, 7, refill).is_none(),
+        "the window is still full"
+    );
     assert!(model.accept(0, 7, 2));
-    assert!(model.grant(0, 7, refill));
+    assert!(model.grant(0, 7, refill).is_some());
     assert!(model.page_frame(0, 7, 1, 30, 3).is_conformant());
 
     // Pages after the node's `Close` within the credit are conformant.
-    assert!(model.close(0, 7));
-    assert!(!model.grant(0, 7, ONE), "Close was sent");
+    assert!(model.close(0, 7).is_some());
+    assert!(model.grant(0, 7, ONE).is_none(), "Close was sent");
     assert!(model.page_frame(0, 7, 2, 10, 4).is_conformant());
     assert!(model.ending_frame(0, 7).is_conformant());
     assert_eq!(model.ending_frame(0, 7).first(), Label::Unsolicited);
     assert_eq!(model.page_frame(0, 7, 1, 1, 5).first(), Label::Unsolicited);
     assert!(
-        !model.subscribe(0, 7, two),
+        model.subscribe(0, 7, two, 0).is_none(),
         "the publisher may hold its tombstone"
     );
 }

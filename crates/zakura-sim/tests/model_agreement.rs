@@ -18,14 +18,14 @@ use proptest::prelude::*;
 use support::feed::{self, FEED};
 use zakura_network::zakura::{
     testkit::regulation::{
-        check_header, production_tables, Pages, Rates, Reader, Requests, Responses, Updates,
+        self, check_header, production_tables, Pages, Rates, Reader, Requests, Responses, Updates,
         TEST_FAMILY,
     },
-    Credit, MessageRule,
+    Credit, MessageRole, MessageRule,
 };
 use zakura_sim::model::{
     CadenceModel, Charge, ExchangeModel, FrameHeader, FrameModel, Label, Labels, Owed, ReaderEnd,
-    SubscriptionModel,
+    SubscriptionModel, Update,
 };
 
 /// The row named `name` in `rules`.
@@ -285,6 +285,10 @@ enum Publishing {
     End {
         key: u64,
     },
+    /// The terminal outcome's write finishes, freeing its slot.
+    Written {
+        key: u64,
+    },
     /// Sends the next update with a sequence `skew` off.
     Skew(u32),
 }
@@ -298,7 +302,8 @@ fn publishing() -> impl Strategy<Value = Publishing> {
         1 => (key.clone(), 0..8usize).prop_map(|(key, ack)| Publishing::Close { key, ack }),
         4 => (key.clone(), 0..3u32, 1..33usize)
             .prop_map(|(key, objects, bytes)| Publishing::Page { key, objects, bytes }),
-        2 => key.prop_map(|key| Publishing::End { key }),
+        2 => key.clone().prop_map(|key| Publishing::End { key }),
+        2 => key.prop_map(|key| Publishing::Written { key }),
         1 => (1..3u32).prop_map(Publishing::Skew),
     ]
 }
@@ -377,11 +382,52 @@ proptest! {
                 Publishing::End { key } => {
                     prop_assert_eq!(updates.end(key), model.end(0, key), "{}", at);
                 }
+                Publishing::Written { key } => {
+                    prop_assert_eq!(
+                        updates.terminal_written(key),
+                        model.terminal_written(0, key),
+                        "{}", at
+                    );
+                }
                 Publishing::Skew(skew) => guesses.skew = skew,
             }
             prop_assert_eq!(updates.tombstones(), model.tombstones(0), "{}: tombstones", at);
         }
     }
+}
+
+/// Review (#1748): a terminal outcome still being written holds its slot,
+/// so an `Open` that needs the slot is `OverLive` to both until the write
+/// finishes.
+#[test]
+fn a_pending_terminal_write_holds_its_slot() {
+    let MessageRole::Subscription { max_live, .. } = row(FEED, "watch").role else {
+        panic!("watch is a subscription");
+    };
+    let slots = 2 * u64::from(max_live);
+    let one = Credit {
+        objects: 1,
+        bytes: 1,
+    };
+    let mut updates = Updates::new(FEED, feed::WATCH);
+    let mut model = SubscriptionModel::new(FEED, feed::WATCH).expect("watch is a subscription");
+    for key in 0..slots {
+        assert!(updates.open(key, 0, one, key).is_ok());
+        assert!(model.open_frame(0, key, 0, one, key).is_conformant());
+    }
+    assert!(updates.end(0));
+    assert!(model.end(0, 0));
+    let refused = updates.open(slots, 0, one, slots);
+    let labels = model.open_frame(0, slots, 0, one, slots);
+    assert_eq!(labels.first(), Label::OverLive);
+    agree("pending write", refused, labels).unwrap();
+
+    assert!(updates.terminal_written(0));
+    assert!(model.terminal_written(0, 0));
+    assert!(updates.open(slots + 1, 0, one, slots + 1).is_ok());
+    assert!(model
+        .open_frame(0, slots + 1, 0, one, slots + 1)
+        .is_conformant());
 }
 
 /// One step of the node subscribing to a peer.
@@ -408,11 +454,26 @@ fn subscribing() -> impl Strategy<Value = Subscribing> {
     ]
 }
 
+/// An update's wire fields: sequence, acknowledged cursor, added credit.
+type Wire = (u32, u64, Credit);
+
+/// The wire fields of a model update.
+fn wire(update: Update) -> Wire {
+    (update.sequence, update.acknowledged, update.added)
+}
+
+/// The wire fields of the update production recorded, if it recorded one.
+fn written(production: Result<regulation::Update, &str>) -> Option<Wire> {
+    production
+        .ok()
+        .map(|update| (update.sequence, update.acknowledged, update.added))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// `Subscriptions` and `SubscriptionModel` agree on each update the
-    /// node may send and on each page and terminal outcome it receives.
+    /// node may send, field by field, and on each page and terminal outcome it receives.
     #[test]
     fn pages_agree(steps in prop::collection::vec(subscribing(), 1..80)) {
         let mut pages = Pages::new(FEED, feed::WATCH);
@@ -424,15 +485,18 @@ proptest! {
                 Subscribing::Subscribe { key, credit } => {
                     let start = guesses.fresh();
                     let production = pages.open(key, credit, start);
-                    prop_assert_eq!(production.is_ok(), model.subscribe(0, key, credit), "{}: {:?}", at, production);
+                    let model = model.subscribe(0, key, credit, start);
+                    prop_assert_eq!(written(production), model.map(wire), "{}", at);
                 }
                 Subscribing::Grant { key, credit } => {
                     let production = pages.grant(key, credit);
-                    prop_assert_eq!(production.is_ok(), model.grant(0, key, credit), "{}: {:?}", at, production);
+                    let model = model.grant(0, key, credit);
+                    prop_assert_eq!(written(production), model.map(wire), "{}", at);
                 }
                 Subscribing::Close { key } => {
                     let production = pages.close(key);
-                    prop_assert_eq!(production.is_ok(), model.close(0, key), "{}: {:?}", at, production);
+                    let model = model.close(0, key);
+                    prop_assert_eq!(written(production), model.map(wire), "{}", at);
                 }
                 Subscribing::Accept { key, cursor } => {
                     let cursor = guesses.cursor(cursor);

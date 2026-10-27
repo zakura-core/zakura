@@ -25,7 +25,7 @@ pub use consequence::{consequence, is_fault_cause, Consequence, FAULT_CAUSES};
 pub use exchange::{ExchangeModel, Owed};
 pub use frame::{FrameHeader, FrameModel, ReaderEnd};
 pub use label::{Direction, Label, LabelOutcome, LabelledFrame, Labels};
-pub use subscription::{SubscriptionModel, Totals};
+pub use subscription::{SubscriptionModel, Totals, Update};
 
 /// A peer session, numbered by the harness.
 pub type SessionId = u64;

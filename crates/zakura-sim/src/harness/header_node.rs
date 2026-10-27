@@ -186,10 +186,16 @@ impl Policy {
     }
 }
 
-/// Every link a [`Topology`] made, in order, shared with the
-/// [`PolicySource`] that counts their effects for [`Trigger::Linked`] and
-/// [`Trigger::Closed`].
-pub type LinkTable = Rc<RefCell<Vec<Link>>>;
+/// What tasks did to a [`Topology`], shared with the [`PolicySource`] that
+/// counts it for [`Trigger::Linked`], [`Trigger::Closed`] and
+/// [`Trigger::Grown`].
+#[derive(Clone, Default)]
+pub struct Effects {
+    /// Every link made, in order.
+    pub links: Rc<RefCell<Vec<Link>>>,
+    /// Each peer whose chain grew, once per committed growth, in order.
+    pub grown: Rc<RefCell<Vec<String>>>,
+}
 
 /// `t` plus `d`, saturating at the largest instant.
 fn after(t: SimInstant, d: Duration) -> SimInstant {
@@ -206,26 +212,29 @@ pub struct PolicySource {
     base: Base,
     bound: Option<Duration>,
     predicates: Rc<RefCell<Predicates>>,
-    links: LinkTable,
-    /// How many of `links` are recorded as made.
+    effects: Effects,
+    /// How many links are recorded as made.
     linked: usize,
     /// The connections recorded as closed.
     closed: BTreeSet<u64>,
+    /// How many growths are recorded.
+    grown: usize,
 }
 
 impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
-    /// `sim`. Its predicates count the effects on `links` too.
-    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, links: LinkTable) -> Self {
+    /// `sim`. Its predicates count `effects` too.
+    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
             predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
-            links,
+            effects,
             linked: 0,
             closed: BTreeSet::new(),
+            grown: 0,
         }
     }
 
@@ -272,7 +281,7 @@ impl ActionSource for PolicySource {
                 predicates.record(fact);
             }
         }
-        let links = self.links.borrow();
+        let links = self.effects.links.borrow();
         for link in &links[self.linked..] {
             predicates.record_link(LinkEffect::Linked, &link.peer);
         }
@@ -283,6 +292,11 @@ impl ActionSource for PolicySource {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
             }
         }
+        let grown = self.effects.grown.borrow();
+        for peer in &grown[self.grown..] {
+            predicates.record_link(LinkEffect::Grown, peer);
+        }
+        self.grown = grown.len();
         Ok(())
     }
 }
@@ -314,6 +328,8 @@ pub struct HeaderNode {
     pub id: ZakuraPeerId,
     /// The reactor's handle.
     pub handle: HeaderSyncHandle,
+    /// The port its reactor and publisher share.
+    pub port: Arc<dyn Port>,
     service: HeaderSyncService,
     /// The VCT repair state the reactor follows. `Idle` unless a scenario
     /// sets it.
@@ -351,7 +367,7 @@ impl HeaderNode {
         let (vct_repairs, repairs) = watch::channel(VctRootRepairStatus::default());
         startup.committed_snapshots = Some(port.selected_chain());
         startup.vct_root_repairs = Some(repairs);
-        startup.header_chain_port = port;
+        startup.header_chain_port = port.clone();
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
         guard_dispatch(sim, actions, dispatch);
@@ -364,6 +380,7 @@ impl HeaderNode {
             id: ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id"),
             service: HeaderSyncService::new(handle.clone()),
             handle,
+            port,
             vct_repairs,
         }
     }
@@ -409,20 +426,53 @@ impl Link {
 pub struct Topology {
     /// The nodes, the node under test first.
     pub nodes: Vec<HeaderNode>,
-    links: LinkTable,
+    effects: Effects,
     /// The last connection and session ID handed out. A replacement needs
     /// both to be new, so one counter serves both.
     last_id: Cell<u64>,
 }
 
 impl Topology {
-    /// `nodes`, with no links yet. Each link it makes goes in `links`.
-    pub fn new(nodes: Vec<HeaderNode>, links: LinkTable) -> Self {
+    /// `nodes`, with no links yet. Each link it makes, and each growth,
+    /// goes in `effects`.
+    pub fn new(nodes: Vec<HeaderNode>, effects: Effects) -> Self {
         Topology {
             nodes,
-            links,
+            effects,
             last_id: Cell::new(0),
         }
+    }
+
+    /// Extends the selected chain of the node named `peer` by `len` fixture
+    /// headers from its tip, through its own port, as if it had mined them,
+    /// and records the growth once the apply has committed and published
+    /// it. The node must be a mirror, on an engine port, that isn't
+    /// applying anything else.
+    async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.name == peer)
+            .unwrap_or_else(|| panic!("the scenario has a `{peer}`"));
+        let snapshot = node
+            .port
+            .selected_chain()
+            .borrow()
+            .clone()
+            .expect("an engine port publishes its snapshot from the start");
+        let tip = snapshot.frontiers.header_best;
+        let headers = fixture.extend(tip, len, 0);
+        let request = fixture.target_request(&snapshot, tip, &headers, 1);
+        let prepared = node
+            .port
+            .prepare_header_target(request)
+            .await
+            .expect("fixture headers on the mirror's own tip prepare");
+        node.port
+            .apply_header_target(prepared)
+            .await
+            .expect("a mirror applying nothing else keeps its tip current");
+        self.effects.grown.borrow_mut().push(peer.to_owned());
     }
 
     /// Connects `dialer` to `listener` with a new connection and session,
@@ -469,7 +519,7 @@ impl Topology {
             session_id: id,
             tokens,
         };
-        self.links.borrow_mut().push(link.clone());
+        self.effects.links.borrow_mut().push(link.clone());
         link
     }
 
@@ -477,7 +527,8 @@ impl Topology {
     /// `peer`.
     pub fn link_to(&self, peer: &str) -> Option<Link> {
         let peer = self.nodes.iter().position(|node| node.name == peer)?;
-        self.links
+        self.effects
+            .links
             .borrow()
             .iter()
             .rev()
@@ -498,6 +549,12 @@ pub enum ControlAction {
     /// Link the peer again, with a new connection and session, in the
     /// newest link's direction.
     Relink,
+    /// Extend the peer's chain by `len` headers from its tip. The peer must
+    /// be a mirror.
+    Grow {
+        /// The new headers.
+        len: u32,
+    },
 }
 
 impl ControlAction {
@@ -506,6 +563,7 @@ impl ControlAction {
         match self {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",
+            ControlAction::Grow { .. } => "grow",
         }
     }
 }
@@ -539,25 +597,30 @@ pub struct Control {
 }
 
 impl Control {
-    /// A source for `script` on `topology`, gated by `predicates`, with its
-    /// task spawned on `sim`.
+    /// A source for `script` on `topology`, whose chains come from
+    /// `fixture`, gated by `predicates`, with its task spawned on `sim`.
     pub fn new(
         sim: &mut Sim,
         topology: Rc<Topology>,
+        fixture: HeaderFixture,
         script: Vec<ControlStep>,
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
         let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
         sim.scheduler().spawn_root("control", async move {
             while let Some(step) = steps.recv().await {
-                let link = topology
-                    .link_to(&step.peer)
-                    .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer));
+                let link = || {
+                    topology
+                        .link_to(&step.peer)
+                        .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
+                };
                 match step.action {
-                    ControlAction::Close => link.close(),
+                    ControlAction::Close => link().close(),
                     ControlAction::Relink => {
+                        let link = link();
                         topology.link(link.dialer, link.listener);
                     }
+                    ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                 }
             }
         });

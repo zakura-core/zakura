@@ -139,6 +139,9 @@ pub enum Trigger {
     Closed(String),
     /// A link to this peer was made, including at setup.
     Linked(String),
+    /// This mirror's chain grew: a `Control` growth committed its heavier
+    /// tip and published it on the mirror's watch.
+    Grown(String),
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
     VirtualTime(u64),
@@ -214,6 +217,8 @@ pub enum LinkEffect {
     Linked,
     /// A link's connection closed. Recorded once per connection.
     Closed,
+    /// A mirror's chain grew and published its new tip.
+    Grown,
 }
 
 /// What [`Predicates`] knows about one operation from its submission.
@@ -316,6 +321,7 @@ impl Predicates {
             Trigger::ReplyTaken(select) => events(Event::ReplyTaken, select),
             Trigger::Closed(peer) => links(LinkEffect::Closed, peer),
             Trigger::Linked(peer) => links(LinkEffect::Linked, peer),
+            Trigger::Grown(peer) => links(LinkEffect::Grown, peer),
             Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }

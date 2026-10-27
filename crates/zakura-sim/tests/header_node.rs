@@ -447,3 +447,34 @@ fn closing_twice_counts_one_closure() {
         assert_eq!(relinks, 2, "two connections closed");
     }
 }
+
+/// Mira grows to A6 mid-run, through her own port. Once the growth is
+/// witnessed, `Control` closes her link and relinks her, and Nora follows
+/// her to the new tip.
+#[test]
+fn a_grown_mirror_leads_nora_to_its_new_tip() {
+    let mira = || "mira".to_owned();
+    let scenario = StorageScenario {
+        controls: vec![
+            step(ControlAction::Grow { len: 1 }, None),
+            step(ControlAction::Close, Some(Trigger::Grown(mira()))),
+            step(ControlAction::Relink, Some(Trigger::Closed(mira()))),
+        ],
+        ..StorageScenario::default()
+    };
+    for input in inputs(8, 256) {
+        let (report, ports) = run(&scenario, input);
+        let relinked = report
+            .picks
+            .iter()
+            .any(|pick| pick.identity == "peer:mira:relink");
+        assert!(relinked, "the growth, close and relink all happened");
+        let a6 = Chain::main(6).tip(&ports.fixture);
+        assert_eq!(ports.mirrors[0].snapshot().frontiers.header_best, a6);
+        assert_eq!(
+            ports.node.engine().snapshot().frontiers.header_best,
+            a6,
+            "Nora reaches Mira's new tip"
+        );
+    }
+}

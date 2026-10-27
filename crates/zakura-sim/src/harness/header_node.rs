@@ -209,12 +209,6 @@ pub struct Effects {
     pub failure: Rc<RefCell<Option<String>>>,
 }
 
-/// `t` plus `d`, saturating at the largest instant.
-fn after(t: SimInstant, d: Duration) -> SimInstant {
-    t.checked_add(d)
-        .unwrap_or(SimInstant::from_start(Duration::MAX))
-}
-
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
 /// pure. With a [`ReactorTap`], it logs the node's reactor events after its

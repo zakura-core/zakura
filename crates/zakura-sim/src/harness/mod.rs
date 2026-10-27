@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod policy;
 mod record;
 
 use std::{fmt, rc::Rc};

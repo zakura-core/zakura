@@ -7,13 +7,27 @@
 //! the real header-chain engine and models only the verifier. Mirror peers
 //! run the same block-sync code on a plain [`EnginePort`] whose full state
 //! holds the whole fixture chain: [`MirrorStorage`] answers each of their
-//! queries and reads on first poll. Each actor's headers, and each mirror's
-//! bodies, are committed before `Sim::new` by [`preload`].
+//! queries at once, and serves each range read when the run picks it, so a
+//! [`policy`] hold can delay a mirror's serving too. Each actor's headers,
+//! and each mirror's bodies, are committed before `Sim::new` by [`preload`].
+//! [`policy`] holds individual operations, and gates [`control`] steps,
+//! until chosen events happen. Control steps close and relink links, grow
+//! or fork every actor's chain mid-run, and make a [`probe`], a scripted
+//! peer, send frames.
+
+pub mod control;
+pub mod policy;
+pub mod probe;
 
 use std::{
-    cell::Cell,
-    future::ready as ready_future,
-    sync::{Arc, OnceLock},
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+    rc::Rc,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use futures::future::BoxFuture;
@@ -23,40 +37,46 @@ use zakura_network::{
     zakura::{
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService,
-        BlockSyncStartup, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig, ZakuraPeerId,
-        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-        ZAKURA_STREAM_BLOCK_SYNC,
+        BlockSyncStartup, CloseCauseReader, FramedSend, Peer, Service, ServicePeerDirection,
+        ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, CancellationToken};
-use zakura_scheduler::SimInstant;
+use zakura_scheduler::{hooks, SimInstant};
 use zakura_storage::{
     block::{
         controlled::{BlockReplies, ControlledBlockService, HandleClosed},
-        fixture::{BlockFixture, FixtureBlock},
+        fixture::{BlockFixture, BodySpec, FixtureBlock},
         ApplyLimits, BlockOutcome, HandleEvent, Verdict,
     },
     full_state::query_needed_blocks,
     header::adapter::EnginePort,
 };
 
+use self::{
+    policy::{BlockKey, Hold, MirrorEvent, Predicates},
+    probe::ProbeLog,
+};
 use super::header_node::LINK_DEPTH;
 use crate::{
-    storage::{decode_block, BlockStorage},
-    ActionSource, Boundary, Identity, ObservationLog, Sim,
+    harness::policy::LinkEffect,
+    observe::StorageFact,
+    storage::{decode_block, BlockStorage, BLOCK_SERVICE},
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
-/// Polls `future` once outside a run, where every engine port call finishes
-/// on its first poll.
+/// Polls `future` once outside any task: before a run, or in the step loop.
+/// Every engine port call finishes on its first poll.
 fn ready<F: std::future::Future>(future: F) -> F::Output {
     match std::pin::pin!(future).poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
     {
         std::task::Poll::Ready(output) => output,
         std::task::Poll::Pending => {
-            panic!("an engine port call outside a run finishes on its first poll")
+            panic!("an engine port call finishes on its first poll")
         }
     }
 }
@@ -94,7 +114,7 @@ pub fn default_limits() -> ApplyLimits {
     ApplyLimits::clamped(usize::MAX, 20, 32, zakura_chain::block::Height(0))
 }
 
-/// Which outcomes the policy offers.
+/// Which outcomes the policy offers for operations no hold picks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Base {
@@ -131,59 +151,140 @@ impl Base {
     }
 }
 
-/// How the run completes the node's block operations. The scenario records
-/// it, so a trace replays it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How the run completes the node's block operations and the mirrors' range
+/// reads. The scenario records it, so a trace replays it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
-    /// The outcomes offered.
+    /// The outcomes offered for the node's operations.
     pub base: Base,
+    /// If set, each of the node's operations must complete within this many
+    /// milliseconds of its current stage's start, and time stops there until
+    /// it does.
+    #[serde(default)]
+    pub bound_ms: Option<u64>,
+    /// Operations held apart from the base, each stage by the first hold
+    /// that picks it. A mirror read no hold picks is served at once.
+    #[serde(default)]
+    pub holds: Vec<Hold>,
 }
 
 impl Policy {
-    /// [`Base::SuccessOnly`], the convergence policy.
+    /// [`Base::SuccessOnly`] with no bound and no holds, the convergence
+    /// policy.
     pub fn converging() -> Self {
         Policy {
             base: Base::SuccessOnly,
+            bound_ms: None,
+            holds: Vec::new(),
         }
     }
 }
 
-/// A [`BlockStorage`] whose offers follow a [`Policy`].
+/// What the run did to a [`Topology`], shared with the [`PolicySource`] that
+/// counts it for the link and chain triggers.
+#[derive(Clone, Default)]
+pub struct Effects {
+    /// Every link made, in order.
+    pub links: Rc<RefCell<Vec<Link>>>,
+    /// Each actor whose chain grew or switched to a fork, once per change,
+    /// in order.
+    pub chains: Rc<RefCell<Vec<(LinkEffect, String)>>>,
+    /// Why a `Control` step couldn't take effect, which ends the run as a
+    /// harness failure: the scenario asked for something that can't happen.
+    pub failure: Rc<RefCell<Option<String>>>,
+}
+
+/// The time since each operation's current stage began.
+#[derive(Clone, Debug, Default)]
+struct Stages(BTreeMap<BlockKey, SimInstant>);
+
+impl Stages {
+    /// Operation `key` starts a stage now.
+    fn start(&mut self, key: BlockKey) {
+        let now = hooks::now().expect("sources observe only inside a run");
+        self.0.insert(key, now);
+    }
+
+    /// How long ago `key`'s stage began, at `now`.
+    fn since(&self, key: BlockKey, now: SimInstant) -> Duration {
+        self.0.get(&key).map_or(Duration::ZERO, |start| {
+            now.since_start() - start.since_start()
+        })
+    }
+}
+
+/// A [`BlockStorage`] whose offers follow a [`Policy`]. It changes its
+/// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
+/// pure.
 pub struct PolicySource {
     storage: BlockStorage,
     service: Arc<ControlledBlockService>,
-    policy: Policy,
+    base: Base,
+    bound: Option<Duration>,
+    predicates: Rc<RefCell<Predicates>>,
+    stages: Stages,
+    effects: Effects,
+    /// How many links are recorded as made.
+    linked: usize,
+    /// The connections recorded as closed.
+    closed: BTreeSet<u64>,
+    /// How many chain changes are recorded.
+    changed: usize,
 }
 
 impl PolicySource {
     /// `service`'s storage under `policy`, with its checkpoint registered
-    /// with `sim`.
-    pub fn new(sim: &mut Sim, service: Arc<ControlledBlockService>, policy: Policy) -> Self {
+    /// with `sim`. Its predicates count `effects` too.
+    pub fn new(
+        sim: &mut Sim,
+        service: Arc<ControlledBlockService>,
+        policy: Policy,
+        effects: Effects,
+    ) -> Self {
         PolicySource {
             storage: BlockStorage::new(sim, service.clone()),
             service,
-            policy,
+            base: policy.base,
+            bound: policy.bound_ms.map(Duration::from_millis),
+            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
+            stages: Stages::default(),
+            effects,
+            linked: 0,
+            closed: BTreeSet::new(),
+            changed: 0,
         }
+    }
+
+    /// The predicates, for a [`control::Control`] or a [`MirrorReadSource`]
+    /// gated by the same counts.
+    pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
+        self.predicates.clone()
     }
 }
 
 impl ActionSource for PolicySource {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
         let pending = self.service.pending();
+        let predicates = self.predicates.borrow();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
             let (id, outcome) = decode_block(*local);
-            pending
-                .iter()
-                .find(|op| op.id == id)
-                .is_some_and(|op| self.policy.base.offers(&op.enabled, outcome))
+            pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                let since = self.stages.since(BlockKey::Service(id.0), now);
+                predicates.offers(self.base, op, since, outcome)
+            })
         }));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         self.storage.boundaries(now, out);
+        let predicates = self.predicates.borrow();
+        for op in self.service.pending() {
+            let key = BlockKey::Service(op.id.0);
+            predicates.boundaries(self.bound, key, self.stages.since(key, now), now, out);
+        }
     }
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
@@ -191,7 +292,44 @@ impl ActionSource for PolicySource {
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        self.storage.observe(log)
+        let before = log.entries().len();
+        self.storage.observe(log)?;
+        let mut predicates = self.predicates.borrow_mut();
+        // Only this source's storage appends here.
+        for entry in &log.entries()[before..] {
+            if let Observation::Storage { service, fact, .. } = &entry.obs {
+                if service != BLOCK_SERVICE {
+                    continue;
+                }
+                match fact {
+                    StorageFact::BlockSubmitted { id, .. } | StorageFact::Admitted { id } => {
+                        self.stages.start(BlockKey::Service(*id))
+                    }
+                    _ => {}
+                }
+                predicates.record(fact);
+            }
+        }
+        let links = self.effects.links.borrow();
+        for link in &links[self.linked..] {
+            predicates.record_link(LinkEffect::Linked, &link.peer);
+        }
+        self.linked = links.len();
+        // A connection closes once, whoever cancels it and however often.
+        for link in links.iter() {
+            if link.is_closed() && self.closed.insert(link.conn_id) {
+                predicates.record_link(LinkEffect::Closed, &link.peer);
+            }
+        }
+        let chains = self.effects.chains.borrow();
+        for (effect, actor) in &chains[self.changed..] {
+            predicates.record_link(*effect, actor);
+        }
+        self.changed = chains.len();
+        match self.effects.failure.borrow().as_ref() {
+            Some(failure) => Err(format!("ControlFailed: {failure}")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -221,17 +359,140 @@ impl BlockReplies for LateHandle {
     }
 }
 
+/// One mirror range read the run hasn't let its caller take yet.
+struct PendingRead {
+    /// The mirror's name.
+    mirror: String,
+    /// The mirror's storage.
+    engine: Arc<EnginePort>,
+    /// The read.
+    request: BlockRangeRead,
+    /// Whether the run has served it, which lets its caller read full state.
+    served: bool,
+    /// The caller's waker.
+    waker: Option<Waker>,
+}
+
+/// Every mirror's range reads that wait for the run.
+#[derive(Default)]
+struct ReadQueue {
+    /// The last read ID handed out. Reads count up from 1 across mirrors.
+    last_id: u64,
+    pending: BTreeMap<u64, PendingRead>,
+    /// What happened since the source last drained it.
+    events: Vec<MirrorEvent>,
+    /// Everything that happened, in order.
+    history: Vec<MirrorEvent>,
+}
+
+impl ReadQueue {
+    fn push(&mut self, event: MirrorEvent) {
+        self.events.push(event);
+        self.history.push(event);
+    }
+}
+
+/// The mirrors' range reads, shared by their storage and the
+/// [`MirrorReadSource`] that serves them.
+#[derive(Clone, Default)]
+pub struct MirrorReads(Arc<Mutex<ReadQueue>>);
+
+impl std::fmt::Debug for MirrorReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let queue = self.queue();
+        f.debug_struct("MirrorReads")
+            .field("last_id", &queue.last_id)
+            .field("pending", &queue.pending.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl MirrorReads {
+    /// The queue. No caller panics while it holds the lock, and none holds
+    /// it across a scheduling point.
+    fn queue(&self) -> MutexGuard<'_, ReadQueue> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Everything that happened to the mirrors' reads, in order.
+    pub fn history(&self) -> Vec<MirrorEvent> {
+        self.queue().history.clone()
+    }
+}
+
+/// A caller's wait for mirror read `id`.
+struct MirrorRead {
+    reads: MirrorReads,
+    id: u64,
+}
+
+impl Future for MirrorRead {
+    type Output = Result<BlockRangeReadResult, BoxError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let read = {
+            let mut queue = self.reads.queue();
+            let read = queue
+                .pending
+                .get_mut(&self.id)
+                .expect("a read stays queued until its caller takes it or drops it");
+            if !read.served {
+                read.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            queue.push(MirrorEvent::Taken(self.id));
+            queue
+                .pending
+                .remove(&self.id)
+                .expect("the read was just found served")
+        };
+        // The caller reads full state itself: the engine's lock may be held
+        // across a scheduling point, so only a task can wait for it.
+        let request = read.request;
+        let blocks = read.engine.read_block_range(
+            request.start_height,
+            request.count,
+            request.max_body_bytes,
+            || false,
+        );
+        Poll::Ready(
+            blocks
+                .map(|blocks| BlockRangeReadResult {
+                    blocks,
+                    lease: request.lease,
+                })
+                .map_err(BoxError::from),
+        )
+    }
+}
+
+impl Drop for MirrorRead {
+    fn drop(&mut self) {
+        let mut queue = self.reads.queue();
+        if queue.pending.remove(&self.id).is_some() {
+            queue.push(MirrorEvent::Dropped(self.id));
+        }
+    }
+}
+
 /// A mirror's storage: full state holding the whole fixture chain, which
-/// answers each query and read on first poll.
+/// answers each query at once. Its range reads wait for the run.
 #[derive(Clone, Debug)]
 pub struct MirrorStorage {
+    name: String,
     engine: Arc<EnginePort>,
+    reads: MirrorReads,
 }
 
 impl MirrorStorage {
-    /// Storage over `engine`.
-    pub fn new(engine: Arc<EnginePort>) -> Self {
-        MirrorStorage { engine }
+    /// Storage for the mirror named `name` over `engine`, whose range reads
+    /// join `reads`.
+    pub fn new(name: &str, engine: Arc<EnginePort>, reads: MirrorReads) -> Self {
+        MirrorStorage {
+            name: name.to_owned(),
+            engine,
+            reads,
+        }
     }
 
     /// Spawns a task that answers each of `actions` until the channel
@@ -285,23 +546,99 @@ impl MirrorStorage {
 }
 
 impl BlockRangeSource for MirrorStorage {
-    /// Reads the range from full state, as zakura-state's blocking read
-    /// does, uncancelled.
+    /// Queues the read until the run serves it, then reads full state in
+    /// the caller's task, uncancelled, as zakura-state's blocking read does.
     fn read(
         &self,
         request: BlockRangeRead,
     ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
-        let read = self.engine.read_block_range(
-            request.start_height,
-            request.count,
-            request.max_body_bytes,
-            || false,
+        let mut queue = self.reads.queue();
+        queue.last_id += 1;
+        let id = queue.last_id;
+        queue.pending.insert(
+            id,
+            PendingRead {
+                mirror: self.name.clone(),
+                engine: self.engine.clone(),
+                request,
+                served: false,
+                waker: None,
+            },
         );
-        let lease = request.lease;
-        Box::pin(ready_future(
-            read.map(|blocks| BlockRangeReadResult { blocks, lease })
-                .map_err(BoxError::from),
-        ))
+        queue.push(MirrorEvent::Submitted(id));
+        Box::pin(MirrorRead {
+            reads: self.reads.clone(),
+            id,
+        })
+    }
+}
+
+/// Offers each queued mirror read as `storage:<mirror>:<id>:serve`, once the
+/// policy's predicates let it be served. It records the reads' events in
+/// those predicates.
+pub struct MirrorReadSource {
+    reads: MirrorReads,
+    predicates: Rc<RefCell<Predicates>>,
+    stages: Stages,
+}
+
+impl MirrorReadSource {
+    /// A source for `reads`, gated and counted by `predicates`.
+    pub fn new(reads: MirrorReads, predicates: Rc<RefCell<Predicates>>) -> Self {
+        MirrorReadSource {
+            reads,
+            predicates,
+            stages: Stages::default(),
+        }
+    }
+}
+
+impl ActionSource for MirrorReadSource {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        let queue = self.reads.queue();
+        let predicates = self.predicates.borrow();
+        for (id, read) in &queue.pending {
+            let since = self.stages.since(BlockKey::Mirror(*id), now);
+            if !read.served && predicates.serves(*id, since) {
+                out.push((Identity::storage(&read.mirror, *id, "serve"), *id));
+            }
+        }
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        let queue = self.reads.queue();
+        let predicates = self.predicates.borrow();
+        for (id, read) in &queue.pending {
+            if !read.served {
+                let key = BlockKey::Mirror(*id);
+                predicates.boundaries(None, key, self.stages.since(key, now), now, out);
+            }
+        }
+    }
+
+    fn execute(&mut self, id: u64, _: &mut ObservationLog) {
+        let mut queue = self.reads.queue();
+        let read = queue
+            .pending
+            .get_mut(&id)
+            .expect("`enabled` offered a queued read");
+        read.served = true;
+        if let Some(waker) = read.waker.take() {
+            waker.wake();
+        }
+        queue.push(MirrorEvent::Served(id));
+    }
+
+    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
+        let events = std::mem::take(&mut self.reads.queue().events);
+        let mut predicates = self.predicates.borrow_mut();
+        for event in events {
+            if let MirrorEvent::Submitted(id) = event {
+                self.stages.start(BlockKey::Mirror(id));
+            }
+            predicates.record_mirror(event);
+        }
+        Ok(())
     }
 }
 
@@ -320,12 +657,15 @@ pub enum NodeStorage {
 
 /// One block-sync actor: a real reactor and service on its storage.
 pub struct BlockNode {
-    /// The actor's role name, `node` or `mirror-<i>`.
+    /// The actor's role name, `node` or `mirror-<i>`, which `Control`
+    /// actions name.
     pub name: String,
     /// Its peer identity, which its links present.
     pub id: ZakuraPeerId,
     /// The reactor's handle.
     pub handle: BlockSyncHandle,
+    /// Its engine, whose committed views its reactor follows.
+    pub engine: Arc<EnginePort>,
     service: BlockSyncService,
 }
 
@@ -338,7 +678,7 @@ impl BlockNode {
         sim: &mut Sim,
         name: &str,
         seed: u8,
-        engine: &EnginePort,
+        engine: &Arc<EnginePort>,
         storage: NodeStorage,
     ) -> Self {
         let view = engine.view();
@@ -372,27 +712,36 @@ impl BlockNode {
             }
             NodeStorage::Mirror(mirror) => mirror.spawn(sim, actions, handle.clone()),
         }
-        let node = NodeSecretKey::from_bytes(&[seed; 32]).public();
         BlockNode {
             name: name.to_owned(),
-            id: ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id"),
+            id: peer_id(seed),
             service: BlockSyncService::new_with_handle(handle.clone()),
             handle,
+            engine: engine.clone(),
         }
     }
 }
 
-/// One connection between two nodes, by their index in a [`Topology`].
+/// The peer identity seeded by `seed`.
+fn peer_id(seed: u8) -> ZakuraPeerId {
+    let node = NodeSecretKey::from_bytes(&[seed; 32]).public();
+    ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id")
+}
+
+/// One connection to the node under test, by its peer's index in a
+/// [`Topology`], or the probe's.
 #[derive(Clone, Debug)]
 pub struct Link {
     /// The name of the node under test's peer on it.
     pub peer: String,
-    /// The node that dialed.
-    pub dialer: usize,
+    /// The node that dialed, or `None` for the probe, which always dials.
+    pub dialer: Option<usize>,
     /// The node that was dialed.
     pub listener: usize,
     /// The connection's ID, the same on both sides.
     pub conn_id: u64,
+    /// Why the node under test's side closed, once it has.
+    pub cause: CloseCauseReader,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
 }
@@ -406,85 +755,385 @@ impl Link {
         }
     }
 
-    /// Whether either side's connection token is cancelled.
+    /// Whether either side's connection token is cancelled: by
+    /// [`Link::close`], or by a service that tears the connection down, as
+    /// a routine that rejects a frame does.
     pub fn is_closed(&self) -> bool {
         self.tokens.iter().any(CancellationToken::is_cancelled)
     }
+}
+
+/// The fixture chain every actor follows, which `Control` steps grow and
+/// fork. Cloning shares it, so a test can read it after a run.
+#[derive(Clone)]
+pub struct LiveChain {
+    /// The fixture every block comes from.
+    pub fixture: BlockFixture,
+    /// Every new block's body.
+    pub spec: BodySpec,
+    blocks: Rc<RefCell<Vec<FixtureBlock>>>,
+}
+
+impl LiveChain {
+    /// `blocks` above the fixture's genesis, each new block like `spec`.
+    pub fn new(fixture: BlockFixture, blocks: Vec<FixtureBlock>, spec: BodySpec) -> Self {
+        LiveChain {
+            fixture,
+            spec,
+            blocks: Rc::new(RefCell::new(blocks)),
+        }
+    }
+
+    /// The chain's blocks above genesis now.
+    pub fn blocks(&self) -> Vec<FixtureBlock> {
+        self.blocks.borrow().clone()
+    }
+
+    /// The chain's tip now.
+    pub fn tip(&self) -> Frontier {
+        self.blocks
+            .borrow()
+            .last()
+            .map_or(self.fixture.anchor(), FixtureBlock::frontier)
+    }
+
+    /// The chain's frontier at `height`, which must be on it.
+    fn at(&self, height: u32) -> Option<Frontier> {
+        if height == 0 {
+            return Some(self.fixture.anchor());
+        }
+        let index = usize::try_from(height - 1).ok()?;
+        self.blocks.borrow().get(index).map(FixtureBlock::frontier)
+    }
+}
+
+/// The probe's end of its link: it sends what `Control` steps script, and
+/// its reader logs what the node sends.
+struct ProbeEnd {
+    /// The probe's sends to the node.
+    send: FramedSend,
 }
 
 /// Every node in a run and the links between them.
 pub struct Topology {
     /// The nodes, the node under test first.
     pub nodes: Vec<BlockNode>,
-    /// Every link made, in order.
-    links: std::cell::RefCell<Vec<Link>>,
+    effects: Effects,
+    chain: LiveChain,
+    /// The probe's end of its link, once linked.
+    probe: RefCell<Option<ProbeEnd>>,
     /// The last connection and session ID handed out.
     last_id: Cell<u64>,
 }
 
 impl Topology {
-    /// `nodes`, with no links yet.
-    pub fn new(nodes: Vec<BlockNode>) -> Self {
+    /// `nodes`, following `chain`, with no links yet. Each link it makes,
+    /// and each chain change, goes in `effects`.
+    pub fn new(nodes: Vec<BlockNode>, effects: Effects, chain: LiveChain) -> Self {
         Topology {
             nodes,
-            links: std::cell::RefCell::default(),
+            effects,
+            chain,
+            probe: RefCell::new(None),
             last_id: Cell::new(0),
         }
     }
 
-    /// Connects `dialer` to `listener` with a new connection and session,
-    /// each side's stream 6 at the regulated version over a pair of
-    /// in-memory channels.
-    pub fn link(&self, dialer: usize, listener: usize) -> Link {
+    /// The next connection and session ID.
+    fn next_id(&self) -> u64 {
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
+        id
+    }
+
+    /// Admits `local`'s side of connection `id` to its service, from
+    /// `remote`, with `streams`, and returns why it closes.
+    fn admit(
+        &self,
+        local: usize,
+        remote: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        id: u64,
+        streams: (zakura_network::zakura::FramedRecv, FramedSend),
+        token: &CancellationToken,
+    ) -> CloseCauseReader {
+        let peer = Peer::new_versioned(
+            id,
+            remote,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            direction,
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+            id,
+            streams,
+            token.clone(),
+        );
+        let cause = peer.close_cause_reader();
+        self.nodes[local].service.add_peer(peer);
+        cause
+    }
+
+    /// Connects `dialer` to `listener` with a new connection and session,
+    /// each side's stream 6 at the regulated version over a pair of
+    /// in-memory channels. One side must be the node under test.
+    pub fn link(&self, dialer: usize, listener: usize) -> Link {
+        let id = self.next_id();
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
-        let sides = [
-            (
-                dialer,
-                listener,
-                ServicePeerDirection::Outbound,
-                (from_listener, to_listener),
-            ),
-            (
-                listener,
-                dialer,
-                ServicePeerDirection::Inbound,
-                (from_dialer, to_dialer),
-            ),
-        ];
-        for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
-            self.nodes[local].service.add_peer(Peer::new_versioned(
-                id,
-                self.nodes[remote].id.clone(),
-                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-                direction,
-                ZAKURA_STREAM_BLOCK_SYNC,
-                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-                id,
-                streams,
-                token.clone(),
-            ));
-        }
-        let peer = if dialer == 0 { listener } else { dialer };
+        let dialed = self.admit(
+            dialer,
+            self.nodes[listener].id.clone(),
+            ServicePeerDirection::Outbound,
+            id,
+            (from_listener, to_listener),
+            &tokens[0],
+        );
+        let listened = self.admit(
+            listener,
+            self.nodes[dialer].id.clone(),
+            ServicePeerDirection::Inbound,
+            id,
+            (from_dialer, to_dialer),
+            &tokens[1],
+        );
+        let (peer, cause) = if dialer == 0 {
+            (listener, dialed)
+        } else {
+            (dialer, listened)
+        };
         let link = Link {
             peer: self.nodes[peer].name.clone(),
-            dialer,
+            dialer: Some(dialer),
             listener,
             conn_id: id,
+            cause,
             tokens,
         };
-        self.links.borrow_mut().push(link.clone());
+        self.effects.links.borrow_mut().push(link.clone());
         link
     }
 
-    /// Every link made, in order.
-    pub fn links(&self) -> Vec<Link> {
-        self.links.borrow().clone()
+    /// Connects the probe, named `probe`, to the node under test, as the
+    /// dialer, with its reader spawned on `sim` logging to `log`.
+    pub fn link_probe(&self, sim: &mut Sim, log: ProbeLog) -> Link {
+        let id = self.next_id();
+        let (to_node, from_probe) = framed_channel(LINK_DEPTH);
+        let (to_probe, from_node) = framed_channel(LINK_DEPTH);
+        let tokens = [CancellationToken::new(), CancellationToken::new()];
+        let cause = self.admit(
+            0,
+            peer_id(PROBE_SEED),
+            ServicePeerDirection::Inbound,
+            id,
+            (from_probe, to_probe),
+            &tokens[1],
+        );
+        log.spawn_reader(sim, from_node);
+        *self.probe.borrow_mut() = Some(ProbeEnd { send: to_node });
+        let link = Link {
+            peer: PROBE.to_owned(),
+            dialer: None,
+            listener: 0,
+            conn_id: id,
+            cause,
+            tokens,
+        };
+        self.effects.links.borrow_mut().push(link.clone());
+        link
+    }
+
+    /// The newest link between the node under test and the peer named
+    /// `peer`.
+    pub fn link_to(&self, peer: &str) -> Option<Link> {
+        self.effects
+            .links
+            .borrow()
+            .iter()
+            .rev()
+            .find(|link| link.peer == peer)
+            .cloned()
+    }
+
+    /// Links the mirror named `peer` again, in its newest link's
+    /// direction. The probe links only once, so relinking it is a failure.
+    fn relink(&self, peer: &str) {
+        let link = self
+            .link_to(peer)
+            .unwrap_or_else(|| panic!("the scenario links `{peer}`"));
+        match link.dialer {
+            Some(dialer) => {
+                self.link(dialer, link.listener);
+            }
+            None => {
+                *self.effects.failure.borrow_mut() = Some("the probe links only once".to_owned());
+            }
+        }
+    }
+
+    /// Sends `frames` from the probe, in order, stopping at the first the
+    /// node's side no longer reads.
+    async fn probe_send(&self, frames: &[probe::ProbeFrame]) {
+        let genesis = self.chain.fixture.anchor().hash;
+        let blocks = self.chain.blocks();
+        let send = match self.probe.borrow().as_ref() {
+            Some(probe) => probe.send.clone(),
+            None => {
+                *self.effects.failure.borrow_mut() =
+                    Some("a probe step needs a linked probe".to_owned());
+                return;
+            }
+        };
+        for frame in frames {
+            let frame = frame
+                .message(genesis, &blocks)
+                .encode_frame()
+                .expect("a probe frame encodes");
+            if send.send(frame).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Plans the chain change `action` names, a `Grow` or a `Reset`, and
+    /// makes it the live chain. Records a failure, and returns `None`, if
+    /// the change can't happen.
+    pub(crate) fn plan_change(&self, action: &control::ControlAction) -> Option<ChainChange> {
+        let tip = self.chain.tip();
+        let change = match *action {
+            control::ControlAction::Grow { len } => ChainChange {
+                parent: tip,
+                blocks: self.chain.fixture.uniform(tip, len, self.chain.spec, 0),
+                effect: LinkEffect::Grown,
+            },
+            control::ControlAction::Reset { fork } => {
+                let Some(parent) = self.chain.at(fork.at) else {
+                    *self.effects.failure.borrow_mut() = Some(format!(
+                        "a fork at {} is above the chain's tip {tip:?}",
+                        fork.at
+                    ));
+                    return None;
+                };
+                if fork.at.saturating_add(fork.len) <= tip.height.0 {
+                    *self.effects.failure.borrow_mut() = Some(format!(
+                        "a fork of {} blocks at {} doesn't outgrow the chain's tip {tip:?}",
+                        fork.len, fork.at
+                    ));
+                    return None;
+                }
+                ChainChange {
+                    parent,
+                    blocks: self.chain.fixture.uniform(
+                        parent,
+                        fork.len,
+                        self.chain.spec,
+                        fork.branch,
+                    ),
+                    effect: LinkEffect::Reset,
+                }
+            }
+            _ => unreachable!("only `Grow` and `Reset` change the chain"),
+        };
+        let mut chain = self.chain.blocks.borrow_mut();
+        chain.truncate(usize::try_from(change.parent.height.0).expect("fixture heights fit usize"));
+        chain.extend(change.blocks.iter().cloned());
+        Some(change)
+    }
+
+    /// Makes `change` on each mirror: its headers on the mirror's engine,
+    /// and its bodies in the mirror's full state. Mirror tasks hold their
+    /// engine's lock across scheduling points, so only a task may call this.
+    pub(crate) async fn change_mirrors(&self, change: &ChainChange) {
+        for node in &self.nodes[1..] {
+            let request = self.chain.fixture.target_request(
+                &node.engine.snapshot(),
+                change.parent,
+                &change.blocks,
+                1,
+            );
+            let applied = match node.engine.prepare_header_target(request).await {
+                Ok(prepared) => node.engine.apply_header_target(prepared).await,
+                Err(error) => Err(error),
+            };
+            let committed = node
+                .engine
+                .preload_blocks(change.blocks.iter().map(|block| block.block.clone()))
+                .map_err(|error| format!("{error:?}"));
+            let tip = node.engine.view().frontiers.verified_best;
+            self.settle(node, change, applied, committed, tip);
+        }
+    }
+
+    /// Makes `change` on the node under test: its headers on the node's
+    /// engine, which reorganizes its selected chain through the real engine.
+    /// The node must download the bodies. Only the step loop reads the
+    /// node's engine, so only it may call this.
+    pub(crate) fn change_node(&self, change: &ChainChange) {
+        let node = &self.nodes[0];
+        let request = self.chain.fixture.target_request(
+            &node.engine.snapshot(),
+            change.parent,
+            &change.blocks,
+            1,
+        );
+        let applied = match ready(node.engine.prepare_header_target(request)) {
+            Ok(prepared) => ready(node.engine.apply_header_target(prepared)),
+            Err(error) => Err(error),
+        };
+        let tip = node.engine.view().frontiers.header_best;
+        self.settle(node, change, applied, Ok(()), tip);
+    }
+
+    /// Records `change`'s effect on `node` if it applied and moved the
+    /// actor's `tip` to the change's tip, and a failure if not.
+    fn settle<E: std::fmt::Debug>(
+        &self,
+        node: &BlockNode,
+        change: &ChainChange,
+        applied: Result<ApplyHeaderTargetOutcome, E>,
+        committed: Result<(), String>,
+        tip: Frontier,
+    ) {
+        let target = change
+            .blocks
+            .last()
+            .expect("a chain change has blocks")
+            .frontier();
+        match (applied, committed) {
+            (Ok(ApplyHeaderTargetOutcome::Applied), Ok(())) if tip == target => {
+                self.effects
+                    .chains
+                    .borrow_mut()
+                    .push((change.effect, node.name.clone()));
+            }
+            (applied, committed) => {
+                *self.effects.failure.borrow_mut() = Some(format!(
+                    "moving {} to {target:?} gave {applied:?} and {committed:?}, with its tip at \
+                     {tip:?}",
+                    node.name
+                ));
+            }
+        }
     }
 }
+
+/// A change to every actor's chain: `blocks`, extending `parent`. The
+/// control task makes it on the mirrors first, so they hold the bodies
+/// before the node learns the headers, and the step loop then makes it on
+/// the node.
+#[derive(Clone, Debug)]
+pub(crate) struct ChainChange {
+    parent: Frontier,
+    blocks: Vec<FixtureBlock>,
+    /// What the change records for each actor.
+    pub(crate) effect: LinkEffect,
+}
+
+/// The probe's name, which `Control` steps and link triggers use.
+pub const PROBE: &str = "probe";
+
+/// The probe's identity seed, apart from every node's.
+const PROBE_SEED: u8 = 0xEE;
 
 /// The verified tip `engine` publishes.
 pub fn verified_tip(engine: &EnginePort) -> Frontier {

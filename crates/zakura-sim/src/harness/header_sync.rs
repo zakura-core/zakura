@@ -146,12 +146,11 @@ pub enum Dialer {
     Node,
 }
 
-/// A mirror peer: real header-sync code on an engine port.
+/// A mirror peer: real header-sync code on an engine port. It's named
+/// `mirror-<i>` by its index in [`StorageScenario::mirrors`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MirrorSpec {
-    /// Its name, such as `mira`.
-    pub name: String,
     /// The chain it holds when the run starts.
     pub chain: Chain,
     /// Which end of its link to the node dials.
@@ -162,11 +161,11 @@ pub struct MirrorSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageScenario {
-    /// The chain the node under test, Nora, holds when the run starts.
+    /// The chain the node under test holds when the run starts.
     pub node: Chain,
     /// The mirror peers, each linked once to the node at setup.
     pub mirrors: Vec<MirrorSpec>,
-    /// How the run completes Nora's storage operations.
+    /// How the run completes the node's storage operations.
     pub policy: Policy,
     /// Link actions the `Plan` may take, in order.
     #[serde(default)]
@@ -174,12 +173,11 @@ pub struct StorageScenario {
 }
 
 impl Default for StorageScenario {
-    /// Nora at genesis and Mira at A5, under the converging policy.
+    /// The node at genesis and `mirror-0` at A5, under the converging policy.
     fn default() -> Self {
         StorageScenario {
             node: Chain::default(),
             mirrors: vec![MirrorSpec {
-                name: "mira".to_owned(),
                 chain: Chain::main(5),
                 dialer: Dialer::Mirror,
             }],
@@ -195,13 +193,14 @@ impl Default for StorageScenario {
 pub struct Ports {
     /// The fixture every chain comes from.
     pub fixture: HeaderFixture,
-    /// Nora's controlled port.
+    /// The node's controlled port.
     pub node: Arc<ControlledPort>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
 }
 
-/// Nora on a controlled port with mirror peers, checked by [`NodeChecks`].
+/// The node under test, named `node`, on a controlled port with mirror
+/// peers, checked by [`NodeChecks`].
 pub struct Storage {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
@@ -212,7 +211,7 @@ pub struct Storage {
 
 /// What [`Storage`]'s checks read between steps.
 pub struct StorageView {
-    /// Nora's port, for its pending operations and its engine's state.
+    /// The node's port, for its pending operations and its engine's state.
     pub port: Arc<ControlledPort>,
     /// Whether any reactor dispatched a storage call externally.
     pub direct_dispatch_broken: bool,
@@ -221,7 +220,7 @@ pub struct StorageView {
 impl HasView for Storage {
     type View = StorageView;
 
-    /// Nora's port and the dispatch guard's flag.
+    /// The node's port and the dispatch guard's flag.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
@@ -263,26 +262,32 @@ impl Subsystem for Storage {
         }
     }
 
-    /// Spawns Nora on her controlled port under the scenario's policy, then
-    /// each mirror, links each mirror to Nora once, and adds the `Control`
-    /// source.
+    /// Spawns the node on its controlled port under the scenario's policy,
+    /// then each mirror, links each mirror to the node once, and adds the
+    /// `Control` source.
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let storage = PolicySource::new(sim, ports.node.clone(), scenario.policy);
         sim.add_source(Box::new(storage));
         let mut nodes = vec![HeaderNode::spawn(
             sim,
-            "nora",
+            "node",
             1,
             ports.node.clone(),
             &ports.fixture,
             scenario.node.tip(&ports.fixture),
             dispatch.clone(),
         )];
-        for ((spec, port), seed) in scenario.mirrors.iter().zip(&ports.mirrors).zip(2..) {
+        for (index, ((spec, port), seed)) in scenario
+            .mirrors
+            .iter()
+            .zip(&ports.mirrors)
+            .zip(2..)
+            .enumerate()
+        {
             nodes.push(HeaderNode::spawn(
                 sim,
-                &spec.name,
+                &format!("mirror-{index}"),
                 seed,
                 port.clone(),
                 &ports.fixture,
@@ -342,7 +347,7 @@ pub fn storage_config() -> RunConfig {
     }
 }
 
-/// Checks [`OPERATION_IDS`] on Nora's storage facts, instance 0, after
+/// Checks [`OPERATION_IDS`] on the node's storage facts, instance 0, after
 /// every step, and reports [`DIRECT_DISPATCH`] on the step the guard's
 /// flag is set.
 pub struct NodeChecks {

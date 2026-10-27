@@ -73,4 +73,26 @@ pub static COVERAGE: &[Coverage] = &[
         passing: sim_test("tests/discovery.rs", "committed_input_wakes"),
         bypass: sim_test("tests/discovery.rs", "reverted_fix_misses_the_wakeup"),
     },
+    Coverage {
+        property: super::header_sync::OPERATION_IDS,
+        passing: sim_test(
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        ),
+        bypass: sim_test(
+            "tests/header_node.rs",
+            "planted_operation_ids_violate_the_property",
+        ),
+    },
+    Coverage {
+        property: super::header_sync::DIRECT_DISPATCH,
+        passing: sim_test(
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        ),
+        bypass: sim_test(
+            "tests/header_node.rs",
+            "direct_dispatch_guard_reports_a_violation",
+        ),
+    },
 ];

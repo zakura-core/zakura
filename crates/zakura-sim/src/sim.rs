@@ -21,8 +21,8 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
-    evidence::{Checkpoint, Mark, StorageId},
-    observe::{storage_entries, Exit, Observation},
+    evidence::{Checkpoint, EvidenceId, Mark},
+    observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
         ViolationRecord,
@@ -104,9 +104,9 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
-    /// Each storage checkpoint the run holds, by its service, in
-    /// registration order.
-    evidence: Vec<(String, Checkpoint)>,
+    /// Each evidence checkpoint the run holds, with its index among its
+    /// kind's, in registration order.
+    evidence: Vec<(u64, Checkpoint)>,
     /// This run's ID, unique within the process.
     run_id: u64,
     config: RunConfig,
@@ -149,19 +149,31 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
-    /// Holds `checkpoint` for a storage source of `service` being created.
-    /// At setup and after every step, the run ends with
+    /// The run's harness failure cell, which a source sets for a failure
+    /// it finds while observing. The run checks it after every step.
+    pub(crate) fn failure(&self) -> Failure {
+        self.failure.clone()
+    }
+
+    /// Holds `checkpoint` for an evidence source being created. At setup
+    /// and after every step, the run ends with
     /// [`HarnessFailure::SourceEvidence`] unless it names that step and the
-    /// run's own log holds exactly the facts and states it records, however
-    /// the source was wrapped or added, or if it never was.
-    /// Returns the source's identity, which binds it to this run.
-    pub(crate) fn register_storage(&mut self, service: &str, checkpoint: Checkpoint) -> StorageId {
-        let id = StorageId {
+    /// run's own log holds exactly the entries it records, however the
+    /// source was wrapped or added, or if it never was. Returns the
+    /// source's identity, whose index counts the run's earlier sources of
+    /// the same kind, and which binds it to this run.
+    pub(crate) fn register(&mut self, checkpoint: Checkpoint) -> EvidenceId {
+        let index = self
+            .evidence
+            .iter()
+            .filter(|(_, held)| held.kind().same_space(checkpoint.kind()))
+            .count();
+        let id = EvidenceId {
             run: self.run_id,
             // usize always fits in u64 on supported targets.
-            index: self.evidence.len() as u64,
+            index: index as u64,
         };
-        self.evidence.push((service.to_owned(), checkpoint));
+        self.evidence.push((id.index, checkpoint));
         id
     }
 
@@ -201,8 +213,8 @@ impl Sim {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
-        // Storage the last step's checker or sink dropped after it observed
-        // fails the run before its properties are reported.
+        // An evidence source the last step's checker or sink dropped after
+        // it observed fails the run before its properties are reported.
         let end = match self.end_evidence(&end, &state) {
             Some(failure) => state.end_harness(failure),
             None => end,
@@ -211,7 +223,7 @@ impl Sim {
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
         // Read even when a failure is already recorded. One `at_end` or its
-        // reports caused still replaces the outcome, as before, and storage
+        // reports caused still replaces the outcome, as before, and a source
         // `at_end` dropped ends the run only if nothing else did.
         let dropped = self.check_evidence(&state).err();
         let end = match self.failure.take().or(bad_report) {
@@ -499,20 +511,27 @@ impl Sim {
 
     /// Lets every source append what happened inside it to the current
     /// step, then requires every evidence source's checkpoint to name it.
+    /// A source that fails doesn't stop the later ones observing, so a
+    /// failure one of them records in the run's failure cell, such as a
+    /// reactor port panic, still outranks it. The first failure is returned.
     fn observe_sources(&mut self, st: &mut State) -> Result<(), HarnessFailure> {
+        let mut failed = None;
         for (index, source) in self.sources.iter_mut().enumerate() {
-            source
-                .observe(&mut st.log)
-                .map_err(|detail| HarnessFailure::SourceEvidence {
+            if let Err(detail) = source.observe(&mut st.log) {
+                failed.get_or_insert(HarnessFailure::SourceEvidence {
                     source: format!("source {index}"),
                     detail,
-                })?;
+                });
+            }
         }
-        self.check_evidence(st)
+        match failed {
+            Some(failure) => Err(failure),
+            None => self.check_evidence(st),
+        }
     }
 
     /// The evidence failure that ends a run which `end` didn't already end
-    /// at a harness failure, if any of its storage was dropped, or skipped
+    /// at a harness failure, if any of its evidence sources was dropped, or skipped
     /// a boundary, after its last observation. Checked before the log
     /// freezes, so the run's own shutdown, after it, never fails here.
     fn end_evidence(&self, end: &RunEnd, st: &State) -> Option<HarnessFailure> {
@@ -522,33 +541,42 @@ impl Sim {
         }
     }
 
-    /// Requires every storage checkpoint to name the current step, with the
-    /// run's own log holding exactly what it records.
+    /// Requires every evidence checkpoint to name the current step, with
+    /// its publisher healthy and the run's own log holding exactly what it
+    /// records.
     fn check_evidence(&self, st: &State) -> Result<(), HarnessFailure> {
-        for (instance, (service, checkpoint)) in (0..).zip(&self.evidence) {
+        for (instance, checkpoint) in &self.evidence {
+            let kind = checkpoint.kind();
+            let words = kind.words();
             let detail = match checkpoint.get() {
                 Mark::NotObserved => {
                     "NotObserved: the setup observation never completed".to_owned()
                 }
-                Mark::Dropped => "Dropped: the storage was dropped during the run".to_owned(),
+                Mark::Dropped => {
+                    format!("Dropped: the {} was dropped during the run", words.source)
+                }
                 Mark::Observed(delivered) if delivered.step != st.step => format!(
                     "BoundarySkipped: the last observation was at step {}, not {}",
                     delivered.step, st.step
                 ),
                 Mark::Observed(delivered) => {
-                    // The port is read live, since activity after the last
-                    // observation leaves the mark as it was.
-                    let port = checkpoint.port();
-                    let live = port.as_ref().map_or(0, |port| port.last_seq());
-                    // Exactly what storage delivered, payloads and order
-                    // included, so the checker reads what the model checked.
-                    let logged = storage_entries(st.log.of_step(st.step), service, instance);
-                    if port.as_ref().is_some_and(|port| port.refused_outside_run()) {
-                        "RefusedOutsideRun: the port refused use outside its run".to_owned()
-                    } else if live > delivered.through_seq {
+                    // The publisher is read live, since activity after the
+                    // last observation leaves the mark as it was.
+                    let live = checkpoint.live();
+                    let last = live.as_ref().map_or(0, |live| live.last_seq());
+                    // Exactly what the source delivered, payloads and order
+                    // included, so the checker reads what the source checked.
+                    let logged = kind.entries(st.log.of_step(st.step), *instance);
+                    if live.as_ref().is_some_and(|live| live.refused_outside_run()) {
+                        format!("RefusedOutsideRun: {}", words.refused)
+                    } else if let Some(health) = live.as_ref().and_then(|live| live.health()) {
+                        health.to_owned()
+                    } else if last > delivered.through_seq {
                         format!(
-                            "Unobserved: the port published facts {}..={live} after its last \
+                            "Unobserved: the {} published {} {}..={last} after its last \
                              observation",
+                            words.publisher,
+                            words.entries,
                             delivered.through_seq + 1
                         )
                     } else if logged.iter().copied().eq(&delivered.observations) {
@@ -560,17 +588,19 @@ impl Sim {
                             .position(|(logged, sent)| *logged != sent)
                             .unwrap_or(logged.len().min(delivered.observations.len()));
                         format!(
-                            "Undelivered: at step {} the run log holds {} storage entries and \
-                             storage delivered {}, first differing at entry {differs}",
+                            "Undelivered: at step {} the run log holds {} {} entries and \
+                             {} delivered {}, first differing at entry {differs}",
                             st.step,
                             logged.len(),
+                            words.source,
+                            words.source,
                             delivered.observations.len()
                         )
                     }
                 }
             };
             return Err(HarnessFailure::SourceEvidence {
-                source: format!("storage:{service}#{instance}"),
+                source: kind.source(*instance),
                 detail,
             });
         }

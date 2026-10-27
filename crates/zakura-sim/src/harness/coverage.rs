@@ -51,8 +51,8 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
     }
 }
 
-/// A race fixture's row: its test runs the fix to a pass and finds each
-/// planted variant.
+/// A race fixture's row: its witness test runs the fix to a pass and the
+/// planted race to its violation, both through the race's trigger history.
 const fn race(property: &'static str, test: &'static str) -> Coverage {
     Coverage {
         property,
@@ -76,15 +76,37 @@ pub static COVERAGE: &[Coverage] = &[
         passing: sim_test("tests/harness.rs", "a_moving_clock_holds_no_livelock"),
         bypass: Bypass::Test(sim_test("tests/harness.rs", "livelock_fires_before_budget")),
     },
-    race("race/lost-update", "lost_update"),
-    race("race/snapshot-reserve", "snapshot_reserve"),
-    race("race/missed-notify", "missed_notify"),
-    race("race/timer-cancel", "timer_cancel"),
-    race("race/ab-ba", "ab_ba"),
-    race("race/abort-without-join", "abort_without_join"),
+    race("race/lost-update", "lost_update_witness"),
+    race("race/snapshot-reserve", "snapshot_reserve_witness"),
+    race("race/missed-notify", "missed_notify_witness"),
+    race("race/timer-cancel", "timer_cancel_witness"),
+    race("race/ab-ba", "ab_ba_witness"),
+    race("race/abort-without-join", "abort_without_join_witness"),
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: sim_test("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
         bypass: Bypass::Planted("lost-wakeup"),
+    },
+    Coverage {
+        property: super::header_sync::OPERATION_IDS,
+        passing: sim_test(
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_node.rs",
+            "planted_operation_ids_violate_the_property",
+        )),
+    },
+    Coverage {
+        property: super::header_sync::DIRECT_DISPATCH,
+        passing: sim_test(
+            "tests/header_node.rs",
+            "node_syncs_from_a_mirror_on_controlled_storage",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_node.rs",
+            "direct_dispatch_guard_reports_a_violation",
+        )),
     },
 ];

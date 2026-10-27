@@ -40,6 +40,7 @@ impl Subsystem for Yielders {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = Tasks;
+    type Prepared = ();
 
     /// 2 workers and small stacks.
     fn config(_: &Tasks) -> RunConfig {
@@ -53,8 +54,11 @@ impl Subsystem for Yielders {
         }
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Tasks) {}
+
     /// Spawns the tasks, each yielding twice.
-    fn build(sim: &mut Sim, scenario: &Tasks) -> Self {
+    fn build(sim: &mut Sim, scenario: &Tasks, (): ()) -> Self {
         for _ in 0..scenario.tasks {
             sim.scheduler().spawn_root("yielder", async {
                 zakura_rt::task::yield_now().await;

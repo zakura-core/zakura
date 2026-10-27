@@ -76,6 +76,22 @@ pub enum Observation {
         /// The state.
         state: StorageState,
     },
+    /// One event a header-sync reactor reported through its tap, in the
+    /// order the reactor reported it.
+    Reactor {
+        /// The tap's registration index among the run's taps, an index space
+        /// apart from storage's.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The last fact the node's storage had published when the event
+        /// happened, 0 before any.
+        storage_seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened.
+        event: ReactorFact,
+    },
     /// A peer sent a frame on a tabled stream. The peer's role models
     /// labelled it when it was sent.
     PeerFrame {
@@ -97,8 +113,43 @@ pub enum Observation {
         rule_stream: StreamId,
         /// The frame's label.
         label: Label,
-        /// True if the frame emptied its row's cadence bucket. Such a frame
-        /// is still conformant.
+        /// True if charging the frame to its row's cadence bucket found it
+        /// empty: [`crate::model::CadenceModel`]'s charge returned
+        /// [`crate::model::Charge::Exhausted`]. Such a frame is still
+        /// conformant.
+        exhausted: bool,
+        /// The exchange or subscription the frame belongs to, as the peer's
+        /// role models key it: a request's own key, or the key a response,
+        /// page or update names. `None` for an announcement or a frame with
+        /// no key.
+        exchange: Option<u64>,
+        /// The payload's length in bytes, frame header excluded.
+        payload: u64,
+    },
+    /// A frame the node sent on a tabled stream reached a peer, whose role
+    /// models labelled it on arrival under the sender's rules: `OverMargin`
+    /// once the node's open requests exceed the highest limit the peer
+    /// advertised, and `OverLive` once the node's live subscriptions exceed
+    /// `max_live`, without the receiver's margin of twice those. A model
+    /// input, like [`Observation::CreditGranted`].
+    NodeFrame {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame's position among the node's frames on this stream,
+        /// from 0.
+        seq: u64,
+        /// The row whose rule `label` enforces, as for
+        /// [`Observation::PeerFrame`].
+        row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
+        /// The frame's label.
+        label: Label,
+        /// True if the peer's [`crate::model::CadenceModel`] charged the
+        /// frame to an empty bucket: its charge returned
+        /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
@@ -124,6 +175,101 @@ pub enum Observation {
         /// The connection.
         connection: u64,
     },
+    /// The node granted credit on a subscription it opened, as the peer's
+    /// subscription model applied the update. A model input: the peer's
+    /// harness emits it, never the node's.
+    CreditGranted {
+        /// The connection.
+        connection: u64,
+        /// The subscription row.
+        subscription: RowAt,
+        /// The subscription's key.
+        exchange: u64,
+        /// The objects the update added.
+        objects: u64,
+        /// The payload bytes the update added.
+        bytes: u64,
+        /// True if the update opened the subscription. A key the peer's
+        /// model has forgotten may open again, and its credit starts over.
+        opens: bool,
+    },
+    /// The peer opened an exchange with the node, owed this much, as the
+    /// peer's exchange model recorded it. A model input, like
+    /// [`Observation::CreditGranted`].
+    ExchangeOwed {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// Frames the node may send before the exchange's ending.
+        frames: u32,
+        /// Payload bytes the node may send, the ending's included.
+        bytes: u64,
+    },
+    /// The node retained, forwarded or handed storage work from one of the
+    /// peer's response or page frames: an actual effect, which the family's
+    /// adapter reads at the storage or forwarding boundary, whatever code
+    /// path produced it. Work counts once, at the first boundary it crosses:
+    /// an adapter that sees the same work retained and then forwarded
+    /// reports it once.
+    WorkAdmitted {
+        /// The connection.
+        connection: u64,
+        /// The row of the frame the work came from.
+        frame: RowAt,
+        /// That frame, as its [`Observation::PeerFrame`] numbers it on
+        /// `frame`'s stream: the frame whose body the work holds.
+        seq: u64,
+        /// The request or subscription row those frames answer.
+        request: RowAt,
+        /// The exchange or subscription key.
+        exchange: u64,
+        /// Objects, such as headers or blocks.
+        objects: u64,
+        /// Payload bytes.
+        bytes: u64,
+        /// True if `frame`'s row ends the exchange, as a subscription's
+        /// terminal outcome does.
+        ends: bool,
+    },
+    /// The node installed an owner for serving the peer's request: an actual
+    /// effect, read where the owner is created.
+    Serving {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// A serving owner from [`Observation::Serving`] retired: an actual
+    /// effect, read where the owner is dropped.
+    ServingEnded {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// The node wrote a response frame to the peer: an actual effect, read
+    /// at the writer.
+    NodeOutput {
+        /// The connection.
+        connection: u64,
+        /// The frame's row.
+        frame: RowAt,
+        /// The request row it answers.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// The payload's length in bytes.
+        payload: u64,
+        /// True if the row ends the exchange.
+        ends: bool,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -131,6 +277,21 @@ pub enum Observation {
         /// What happened.
         event: String,
     },
+}
+
+impl Observation {
+    /// The task whose run appended this observation, if a step that runs a
+    /// task appends it: a stop at a point, a wait, a park or an exit. Each
+    /// such step appends exactly one.
+    pub fn ran_task(&self) -> Option<&str> {
+        match self {
+            Observation::TaskReached { task, .. }
+            | Observation::TaskWaiting { task }
+            | Observation::TaskParked { task }
+            | Observation::TaskExited { task, .. } => Some(task),
+            _ => None,
+        }
+    }
 }
 
 /// A storage fact in plain fields: hashes and peers in hex, counters as
@@ -559,6 +720,157 @@ pub struct StorageContinuation {
     pub retained: u64,
 }
 
+/// A header-sync reactor event in plain fields: peers, sources and hashes
+/// in hex, owners as storage writes them, and names for every enum.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum ReactorFact {
+    /// The reactor pushed a port call's future.
+    Dispatched {
+        /// The call's number, from 1 per reactor.
+        call: u64,
+        /// What the call asks storage for.
+        port: ReactorCall,
+    },
+    /// A port call's future ended.
+    CallEnded {
+        /// The call's number.
+        call: u64,
+        /// How it ended: `replied`, `port-error`, `timed-out`,
+        /// `not-submitted` or `port-panicked`.
+        end: String,
+        /// The storage operation the call is paired with. The tap doesn't
+        /// pair calls, so it always logs `None`.
+        op: Option<u64>,
+    },
+    /// The reactor finished processing a call's completion.
+    Handled {
+        /// The call's number.
+        call: u64,
+        /// Whether the call's future was caught panicking.
+        panicked: bool,
+    },
+    /// An active request started.
+    Started {
+        /// The request.
+        request: ReactorRequest,
+        /// Why it started.
+        purpose: ReactorPurpose,
+    },
+    /// An active request was retired.
+    Retired {
+        /// The request.
+        request: ReactorRequest,
+        /// Its phase then: `receiving`, `preparing` or `applying`.
+        phase: String,
+        /// Why it started.
+        purpose: ReactorPurpose,
+        /// Why it was retired, as the reactor's traces name it, such as
+        /// `snapshot_obsolete`.
+        reason: String,
+    },
+    /// An offer was refused for local capacity and stays unspent.
+    OfferWaiting {
+        /// The offering peer.
+        peer: String,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target: String,
+        /// Which capacity refused it: `staging-full` or `locator-capacity`.
+        cause: String,
+    },
+}
+
+/// What a dispatched port call asks storage for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ReactorCall {
+    /// A continuation locator read.
+    Locator {
+        /// The peer whose offer needs it.
+        peer: String,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target: String,
+        /// The header authority it was read under.
+        scope: WorkScope,
+    },
+    /// A VCT repair context read.
+    VctContext {
+        /// The repair's owner.
+        owner: WorkOwner,
+        /// The height that needs repair.
+        height: u32,
+    },
+    /// A target preparation.
+    Prepare {
+        /// The supplying peer.
+        peer: String,
+        /// The supplier's source identity.
+        source: String,
+        /// The request that owns the target.
+        owner: WorkOwner,
+    },
+    /// A prepared target's application.
+    Apply {
+        /// The supplying peer.
+        peer: String,
+        /// The supplier's source identity.
+        source: String,
+        /// The request that owns the target.
+        owner: WorkOwner,
+    },
+}
+
+/// An active request's identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorRequest {
+    /// The peer whose session owns it.
+    pub peer: String,
+    /// The owning session.
+    pub session_id: u64,
+    /// Its correlation ID.
+    pub request_id: u64,
+    /// Its work owner.
+    pub owner: WorkOwner,
+    /// The advertised target it pursues.
+    pub target: String,
+}
+
+/// Why an active request started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "purpose", rename_all = "kebab-case")]
+pub enum ReactorPurpose {
+    /// To admit a complete branch target.
+    Normal,
+    /// To redeliver auxiliary metadata for a selected range.
+    SelectedAuxiliaryRepair {
+        /// The selected target the repair context fixes.
+        selected_target: StoragePoint,
+        /// The repair-signal generation that owns the attempt.
+        repair_generation: u64,
+    },
+}
+
+/// The events that reactor tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn reactor_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::Reactor { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
 /// The facts and states that storage `instance` of `service` logged in
 /// `observations`, in order.
 pub(crate) fn storage_entries<'o>(
@@ -597,6 +909,32 @@ impl std::fmt::Display for StreamId {
     /// Writes `s<kind>v<version>`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "s{}v{}", self.kind, self.version)
+    }
+}
+
+/// A row of a stream's message table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct RowAt {
+    /// The stream.
+    pub stream: StreamId,
+    /// The row's name.
+    pub row: String,
+}
+
+impl RowAt {
+    /// Row `row` of `stream`.
+    pub fn new(stream: StreamId, row: impl Into<String>) -> Self {
+        RowAt {
+            stream,
+            row: row.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RowAt {
+    /// Writes `s<kind>v<version>/<row>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.stream, self.row)
     }
 }
 

@@ -538,8 +538,8 @@ impl Stream {
     ///   tables passes the remaining rules trivially;
     /// - every table has a row, and each message type and each row name
     ///   appears in exactly one row of the layout;
-    /// - each row name is nonempty lowercase ASCII letters, digits, and
-    ///   hyphens;
+    /// - each row name is hyphen-separated words of lowercase ASCII letters
+    ///   and digits, with no empty word, as a property ID's segment;
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;

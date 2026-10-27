@@ -35,6 +35,9 @@ zakura-header-chain = { path = "../zakura-header-chain" }
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
 rand_10 = { workspace = true }
+# The run-thread test checks that header preparation never started rayon's
+# global pool.
+rayon = { workspace = true }
 # zakura-rpc turns this on in workspace builds, so the trace tests run with it
 # to check that equal records still write equal bytes.
 serde_json = { workspace = true, features = ["preserve_order"] }

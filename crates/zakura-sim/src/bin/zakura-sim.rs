@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
+//!     [--witness <property> --expect <holds|violated|applicable>]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe]
 //! ```
@@ -40,11 +41,12 @@ fn main() {
 mod cli {
     use std::{fmt::Write, path::PathBuf};
 
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use zakura_sim::{
-        harness::{self, RecordInput, HARNESSES},
+        harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
         trace::{self, ReplayOptions, TraceReader},
+        witness::Expect,
     };
 
     /// Why the command failed.
@@ -59,11 +61,14 @@ mod cli {
     pub fn usage() -> String {
         let mut text = String::from(
             "Usage:\n  \
-             zakura-sim record --sim <name> --input <file> --out <dir>\n  \
+             zakura-sim record --sim <name> --input <file> --out <dir>\n      \
+             [--witness <property> --expect <holds|violated|applicable>]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe]\n\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
+             `--witness` judges the run as a witness test of the property, writes the\n\
+             result to witness.json beside the trace, and exits 1 if the test fails.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -105,6 +110,8 @@ mod cli {
         scenario: Option<String>,
         plan: Option<PathBuf>,
         out: Option<PathBuf>,
+        witness: Option<String>,
+        expect: Option<String>,
     }
 
     /// `record`: runs one input on a harness and writes the trace.
@@ -122,16 +129,29 @@ mod cli {
             std::fs::read(path)
                 .map_err(|error| Error::Failed(format!("reading {}: {error}", path.display())))
         };
-        let trace = match (flags.input, flags.scenario, flags.plan) {
-            (Some(input), None, None) => {
-                let input = read(&input)?;
-                harness::record(entry, RecordInput::Input(&input), &out)
+        let witness = match (flags.witness, flags.expect) {
+            (None, None) => None,
+            (Some(property), Some(expect)) => {
+                Some((property, expect.parse::<Expect>().map_err(Error::Usage)?))
+            }
+            _ => {
+                return Err(Error::Usage(
+                    "--witness and --expect go together".to_owned(),
+                ))
+            }
+        };
+        let input = match (flags.input, flags.scenario, flags.plan) {
+            (Some(input), None, None) => read(&input)?,
+            (None, Some(_), Some(_)) if witness.is_some() => {
+                return Err(Error::Usage(
+                    "--witness takes a committed --input, not --scenario and --plan".to_owned(),
+                ))
             }
             (None, Some(scenario), Some(plan)) => {
                 let scenario: Value = serde_json::from_str(&scenario)
                     .map_err(|error| Error::Usage(format!("--scenario isn't JSON: {error}")))?;
                 let plan = read(&plan)?;
-                harness::record(
+                let trace = harness::record(
                     entry,
                     RecordInput::Plan {
                         scenario: &scenario,
@@ -139,14 +159,53 @@ mod cli {
                     },
                     &out,
                 )
+                .map_err(|error| Error::Failed(error.to_string()))?;
+                print_trace(&trace, &out);
+                return Ok(());
             }
             _ => {
                 return Err(Error::Usage(
                     "`record` takes either --input, or both --scenario and --plan".to_owned(),
                 ))
             }
+        };
+        let Some((property, expect)) = witness else {
+            let trace = harness::record(entry, RecordInput::Input(&input), &out)
+                .map_err(|error| Error::Failed(error.to_string()))?;
+            print_trace(&trace, &out);
+            return Ok(());
+        };
+        let (trace, result) =
+            harness::record_witness(entry, RecordInput::Input(&input), &out, &property, expect)
+                .map_err(|error| Error::Failed(error.to_string()))?;
+        print_trace(&trace, &out);
+        let error = result.as_ref().err().map(ToString::to_string);
+        let file = json!({
+            "property": property,
+            "expect": expect.name(),
+            "passed": result.is_ok(),
+            "error": error,
+        });
+        std::fs::write(out.join(WITNESS_FILE), format!("{file}\n"))
+            .map_err(|error| Error::Failed(format!("writing {WITNESS_FILE}: {error}")))?;
+        match error {
+            None => {
+                println!(
+                    "witness test of {property}, expecting {}: passed",
+                    expect.name()
+                );
+                Ok(())
+            }
+            Some(error) => Err(Error::Failed(format!(
+                "witness test of {property}, expecting {}: {error}",
+                expect.name()
+            ))),
         }
-        .map_err(|error| Error::Failed(error.to_string()))?;
+    }
+
+    /// Prints where `trace` went and how its run ended.
+    #[allow(clippy::print_stdout)]
+    fn print_trace(trace: &trace::Trace, out: &std::path::Path) {
         let end = trace
             .end
             .as_ref()
@@ -158,7 +217,6 @@ mod cli {
             outcome(end),
             end.steps
         );
-        Ok(())
     }
 
     /// How `end`'s run ended, in words.
@@ -276,6 +334,8 @@ mod cli {
                 "--scenario" => flags.scenario.replace(value).is_some(),
                 "--plan" => flags.plan.replace(value.into()).is_some(),
                 "--out" => flags.out.replace(value.into()).is_some(),
+                "--witness" => flags.witness.replace(value).is_some(),
+                "--expect" => flags.expect.replace(value).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
             if slot_taken {

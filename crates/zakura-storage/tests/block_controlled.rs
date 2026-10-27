@@ -1245,3 +1245,24 @@ async fn the_intake_task_drops_its_channel_when_the_driver_exits() {
     let late = harness.query_action(1, 4);
     assert!(sender.send(late).await.is_err(), "the channel is closed");
 }
+
+/// Bodies preload only before a block service binds the port: a preload
+/// past the service would skip its receipts and facts.
+#[test]
+#[should_panic(expected = "bodies preload only to a port no block service commits through")]
+fn a_preload_after_the_service_binds_panics() {
+    let harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(2_000)], 0);
+    let _ = harness
+        .engine
+        .preload_blocks(blocks.iter().map(|block| block.block.clone()));
+}
+
+/// A second block service on one port panics: the two would hand out the
+/// same operation IDs and receipts.
+#[test]
+#[should_panic(expected = "one block service commits through a port")]
+fn a_second_service_on_a_port_panics() {
+    let harness = Harness::new();
+    let _ = ControlledBlockService::new(harness.engine.clone(), harness.replies.clone(), LIMITS);
+}

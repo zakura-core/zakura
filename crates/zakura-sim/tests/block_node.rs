@@ -1,6 +1,6 @@
 //! A block-sync node on controlled block storage (BS1): the node's real
-//! reactor, routines, sequencer and serving send every block operation to
-//! one `ControlledBlockService`, and every completion comes from the `Plan`.
+//! reactor, routines and sequencer send every block operation to one
+//! `ControlledBlockService`, and every completion comes from the `Plan`.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -117,15 +117,7 @@ fn honest_sync_reaches_the_fixture_tip() {
         );
         for outcome in &outcomes {
             assert!(
-                [
-                    "answer",
-                    "admit",
-                    "apply",
-                    "serve",
-                    "committed",
-                    "duplicate"
-                ]
-                .contains(&outcome.as_str()),
+                ["answer", "admit", "apply", "committed", "duplicate"].contains(&outcome.as_str()),
                 "{outcome}"
             );
         }
@@ -141,6 +133,50 @@ fn the_default_scenario_converges() {
         let tip = ports.chain.last().expect("the chain has blocks").frontier();
         assert_eq!(ports.node.view().frontiers.verified_best, tip);
     }
+}
+
+/// A node that starts with the first four of eight bodies downloads and
+/// submits only the other four, and reaches the tip.
+#[test]
+fn a_node_with_bodies_submits_only_the_rest() {
+    let scenario = BlockScenario {
+        node_bodies: 4,
+        ..BlockScenario::default()
+    };
+    for input in inputs(4, 64) {
+        let (report, ports) = run(&scenario, input);
+        let tip = ports.chain.last().expect("the chain has blocks").frontier();
+        assert_eq!(ports.node.view().frontiers.verified_best, tip);
+        let mut heights: Vec<_> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Storage {
+                    fact:
+                        StorageFact::BlockSubmitted {
+                            request: StorageRequest::SubmitBlock { height, .. },
+                            ..
+                        },
+                    ..
+                } => *height,
+                _ => None,
+            })
+            .collect();
+        heights.sort_unstable();
+        heights.dedup();
+        assert_eq!(heights, [5, 6, 7, 8]);
+    }
+}
+
+/// A node can't hold more bodies than the chain has.
+#[test]
+#[should_panic(expected = "a node holds at most the scenario's 8 blocks, not 9")]
+fn a_node_holds_at_most_the_chain() {
+    Storage::prepare(&BlockScenario {
+        node_bodies: 9,
+        ..BlockScenario::default()
+    });
 }
 
 /// One planted block storage fact.
@@ -299,6 +335,11 @@ fn planted_block_operation_ids_violate_the_property() {
             vec![Submitted(1), Completed(2)],
             "a completion of a submitted operation, at most 1",
             "operation 2 completed before its submission",
+        ),
+        (
+            vec![Submitted(1), Completed(0)],
+            "a completion of a submitted operation, at most 1",
+            "operation 0 completed, an ID no operation gets",
         ),
         (
             vec![Submitted(1), Completed(1), Completed(1)],

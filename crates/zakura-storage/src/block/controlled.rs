@@ -724,11 +724,16 @@ fn replace_query(
 impl ControlledBlockService {
     /// A service over `engine` that replies through `replies`, admitting
     /// applies under `limits`.
+    ///
+    /// # Panics
+    ///
+    /// If another block service already commits through `engine`.
     pub fn new(
         engine: Arc<EnginePort>,
         replies: Arc<dyn BlockReplies>,
         limits: ApplyLimits,
     ) -> Self {
+        engine.bind_block_service();
         ControlledBlockService {
             inner: Arc::new(Inner {
                 engine,

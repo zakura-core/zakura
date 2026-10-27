@@ -28,6 +28,7 @@ use super::{
 use crate::{
     observe::StorageFact,
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
+    storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
 };
 
@@ -400,7 +401,7 @@ fn operation_fact<'o>(service: &str, obs: &'o Observation) -> Option<&'o Storage
 
 /// Checks [`OPERATION_IDS`] on the node's header storage.
 fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
-    check_service_operation_ids("header", cx)
+    check_service_operation_ids(HEADER_SERVICE, cx)
 }
 
 /// Checks that the node's `service` storage gives its operations rising
@@ -471,13 +472,18 @@ impl OperationIds {
                 })
             }
             StorageFact::Completed { id, .. } | StorageFact::BlockCompleted { id, .. } => {
-                if id > self.submitted {
+                if id == 0 || id > self.submitted {
+                    let actual = if id == 0 {
+                        "operation 0 completed, an ID no operation gets".to_owned()
+                    } else {
+                        format!("operation {id} completed before its submission")
+                    };
                     Some((
                         format!(
                             "a completion of a submitted operation, at most {}",
                             self.submitted
                         ),
-                        format!("operation {id} completed before its submission"),
+                        actual,
                     ))
                 } else if !self.completed.insert(id) {
                     Some((

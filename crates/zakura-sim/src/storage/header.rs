@@ -37,7 +37,7 @@ use crate::{
 };
 
 /// The service name in identities and observations.
-const SERVICE: &str = "header";
+pub(crate) const SERVICE: &str = "header";
 
 /// Every outcome, indexed by its code in a source-local action index.
 const OUTCOMES: [Outcome; 5] = [

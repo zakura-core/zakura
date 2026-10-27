@@ -10,7 +10,11 @@ use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::mpsc;
 use zakura_sim::{
     harness::{
-        header_node::{guard_dispatch, Chain, ControlAction, ControlStep, DispatchFlag, Fork},
+        header_node::{
+            guard_dispatch,
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            Chain, ControlAction, ControlStep, DispatchFlag, Fork, Policy,
+        },
         header_sync::{
             Dialer, MirrorSpec, NodeChecks, Ports, Storage, StorageScenario, DIRECT_DISPATCH,
         },
@@ -217,6 +221,7 @@ fn control_closes_and_relinks_a_mirror() {
             .map(|action| ControlStep {
                 peer: "mira".to_owned(),
                 action,
+                when: None,
             })
             .collect(),
         ..StorageScenario::default()
@@ -247,6 +252,7 @@ fn control_close_ends_both_sides_of_the_session() {
         controls: vec![ControlStep {
             peer: "mira".to_owned(),
             action: ControlAction::Close,
+            when: None,
         }],
         ..StorageScenario::default()
     };
@@ -277,6 +283,107 @@ fn control_close_ends_both_sides_of_the_session() {
         assert!(
             pipes.iter().all(|(step, _)| *step > close),
             "after the close at step {close}: {pipes:?}"
+        );
+    }
+}
+
+/// Each storage fact of Nora's for operations of `kind`, with the virtual
+/// time it was logged at in nanoseconds and its step.
+fn facts_of(report: &RunReport, kind: fn(&StorageRequest) -> bool) -> Vec<(u64, u64, StorageFact)> {
+    let (mut now, mut ids) = (0, std::collections::BTreeSet::new());
+    let mut out = Vec::new();
+    for entry in report.log.entries() {
+        match &entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => now = *to_ns,
+            Observation::Storage {
+                instance: 0, fact, ..
+            } => {
+                let id = match fact {
+                    StorageFact::Submitted { id, request, .. } if kind(request) => {
+                        ids.insert(*id);
+                        *id
+                    }
+                    StorageFact::Submitted { .. } => continue,
+                    StorageFact::Completed { id, .. } => *id,
+                    _ => continue,
+                };
+                if ids.contains(&id) {
+                    out.push((now, entry.step, fact.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Nora's first apply, held for 10 s of virtual time, completes no sooner
+/// than that, while every other operation follows the 5 s bound.
+#[test]
+fn held_apply_waits_for_its_virtual_time() {
+    let scenario = StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Apply, 1),
+                until: Trigger::VirtualTime(10_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    };
+    for input in inputs(8, 256) {
+        let (report, ports) = run(&scenario, input);
+        let applies = facts_of(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
+        });
+        let [(submitted, _, StorageFact::Submitted { .. }), (completed, _, StorageFact::Completed { .. }), ..] =
+            applies.as_slice()
+        else {
+            panic!("the apply is submitted and completes: {applies:?}");
+        };
+        assert!(
+            completed - submitted >= 10_000_000_000,
+            "held from {submitted} ns to {completed} ns"
+        );
+        assert_eq!(
+            ports.node.engine().snapshot().frontiers.header_best,
+            Chain::main(5).tip(&ports.fixture)
+        );
+    }
+}
+
+/// A `Control` step gated on Nora's first apply completing is never picked
+/// before that completion.
+#[test]
+fn control_step_waits_for_its_trigger() {
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "mira".to_owned(),
+            action: ControlAction::Close,
+            when: Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+        }],
+        ..StorageScenario::default()
+    };
+    for input in inputs(8, 256) {
+        let (report, _) = run(&scenario, input);
+        let applies = facts_of(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
+        });
+        let completed = applies.iter().find_map(|(_, step, fact)| {
+            matches!(fact, StorageFact::Completed { .. }).then_some(*step)
+        });
+        let close = report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == "peer:mira:close")
+            .expect("the close opens and is picked")
+            .step;
+        // An early close can also stop the sync, so no apply completes.
+        assert!(
+            completed.is_some_and(|completed| close > completed),
+            "close at {close}, apply completed at {completed:?}"
         );
     }
 }

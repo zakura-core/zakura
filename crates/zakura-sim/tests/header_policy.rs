@@ -1,0 +1,325 @@
+//! Outcome predicates (M4-B2), driven by scripted storage facts and pending
+//! operations, without a node.
+#![cfg(zakura_sim)]
+
+use std::time::Duration;
+
+use zakura_scheduler::SimInstant;
+use zakura_sim::{
+    harness::header_node::{
+        policy::{Allow, Hold, LinkEffect, OpKind, Predicates, Select, Trigger},
+        Base,
+    },
+    observe::{StorageBranch, StorageFact, StorageRequest, WorkOwner, WorkScope},
+    Boundary,
+};
+use zakura_storage::header::{
+    controlled::{OpId, PendingOp},
+    Fault, HeaderOp, Outcome,
+};
+
+/// Every outcome, the legal set of a pending operation past its timeout.
+const ALL: [Outcome; 4] = [
+    Outcome::Engine,
+    Outcome::Fault(Fault::Timeout),
+    Outcome::Fault(Fault::Unavailable),
+    Outcome::Fault(Fault::LocalResource),
+];
+
+/// A header owner in `session`.
+fn owner(session: u64) -> WorkOwner {
+    WorkOwner {
+        kind: "header".to_owned(),
+        scope: WorkScope {
+            header_generation: 1,
+            branch: StorageBranch {
+                anchor: "00".to_owned(),
+                target: "11".to_owned(),
+            },
+        },
+        verified_generation: None,
+        body_work_epoch: None,
+        session_id: session,
+        request_id: 1,
+    }
+}
+
+/// A request of `kind`, attributed to `session` where the kind carries one.
+fn request(kind: OpKind, session: u64) -> StorageRequest {
+    match kind {
+        OpKind::Locator => StorageRequest::ContinuationLocator,
+        OpKind::Membership => StorageRequest::SelectedChainContains {
+            hash: "11".to_owned(),
+        },
+        OpKind::Prepare => StorageRequest::PrepareHeaderTarget {
+            owner: owner(session),
+            source: "aa".to_owned(),
+            common_ancestor: zakura_sim::observe::StoragePoint {
+                height: 0,
+                hash: "00".to_owned(),
+            },
+            target: zakura_sim::observe::StoragePoint {
+                height: 1,
+                hash: "11".to_owned(),
+            },
+            headers: 1,
+        },
+        OpKind::Apply => StorageRequest::ApplyHeaderTarget {
+            owner: owner(session),
+            source: "aa".to_owned(),
+            parent: None,
+            target: "11".to_owned(),
+        },
+        other => panic!("these tests don't submit {other:?}"),
+    }
+}
+
+/// Operation `id` of `kind` was submitted in `session`.
+fn submitted(id: u64, kind: OpKind, session: u64) -> StorageFact {
+    StorageFact::Submitted {
+        id,
+        request: request(kind, session),
+        digest: String::new(),
+    }
+}
+
+/// Operation `id` of `kind`, pending for `since`.
+fn pending(id: u64, kind: OpKind, since: Duration) -> PendingOp {
+    PendingOp {
+        id: OpId(id),
+        op: match kind {
+            OpKind::Locator => HeaderOp::ContinuationLocator,
+            OpKind::Membership => HeaderOp::SelectedChainContains,
+            OpKind::Prepare => HeaderOp::PrepareHeaderTarget,
+            OpKind::Apply => HeaderOp::ApplyHeaderTarget,
+            other => panic!("these tests don't submit {other:?}"),
+        },
+        enabled: ALL.to_vec(),
+        since_submit: since,
+        caller_waiting: true,
+    }
+}
+
+/// A hold on `select` until `until`, then `engine`.
+fn hold(select: Select, until: Trigger) -> Hold {
+    Hold {
+        select,
+        until,
+        then: vec![Allow::Engine],
+        deadline_ms: None,
+    }
+}
+
+/// Every outcome `predicates` offers for `op` under `base`.
+fn offered(predicates: &Predicates, base: Base, op: &PendingOp) -> Vec<Outcome> {
+    ALL.into_iter()
+        .filter(|outcome| predicates.offers(base, op, *outcome))
+        .collect()
+}
+
+/// `op`'s boundaries at `now`, with a 5 s base bound.
+fn boundaries(predicates: &Predicates, op: &PendingOp, now: SimInstant) -> Vec<Boundary> {
+    let mut out = Vec::new();
+    predicates.boundaries(Some(Duration::from_secs(5)), op, now, &mut out);
+    out
+}
+
+const HOUR: Duration = Duration::from_secs(3_600);
+
+/// A locator held for 2 h stops time at its submission plus 2 h, offers
+/// nothing before then, and offers its late `engine` from that instant.
+#[test]
+fn virtual_time_trigger_opens_on_time() {
+    let two_hours = u64::try_from((2 * HOUR).as_millis()).unwrap();
+    let mut predicates = Predicates::new(vec![hold(
+        Select::nth(OpKind::Locator, 1),
+        Trigger::VirtualTime(two_hours),
+    )]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    // Submitted at 10 s, so 2 h later is 2 h 10 s.
+    let at = |d: Duration| SimInstant::from_start(Duration::from_secs(10) + d);
+
+    let early = pending(1, OpKind::Locator, HOUR);
+    assert_eq!(offered(&predicates, Base::Any, &early), []);
+    assert_eq!(
+        boundaries(&predicates, &early, at(HOUR)),
+        [Boundary::Opens(at(2 * HOUR))],
+        "time stops at the opening, and the held op ignores the bound"
+    );
+
+    let open = pending(1, OpKind::Locator, 2 * HOUR);
+    assert_eq!(offered(&predicates, Base::Any, &open), [Outcome::Engine]);
+    assert_eq!(boundaries(&predicates, &open, at(2 * HOUR)), []);
+}
+
+/// `Count(16, ...)` stays closed after 15 caller drops and opens on the
+/// 16th. `All` opens only once each part holds, in either order.
+#[test]
+fn count_and_all_wait_for_every_part() {
+    let locators = Select {
+        kind: Some(OpKind::Locator),
+        ..Select::default()
+    };
+    let mut predicates = Predicates::new(vec![hold(
+        Select::nth(OpKind::Apply, 1),
+        Trigger::Count(16, Box::new(Trigger::CallerDropped(locators))),
+    )]);
+    for id in 1..=16 {
+        predicates.record(&submitted(id, OpKind::Locator, 0));
+    }
+    predicates.record(&submitted(17, OpKind::Apply, 1));
+    let apply = pending(17, OpKind::Apply, Duration::ZERO);
+    for id in 1..=15 {
+        predicates.record(&StorageFact::CallerDropped { id });
+        assert_eq!(
+            offered(&predicates, Base::Any, &apply),
+            [],
+            "after {id} drops"
+        );
+    }
+    predicates.record(&StorageFact::CallerDropped { id: 16 });
+    assert_eq!(offered(&predicates, Base::Any, &apply), [Outcome::Engine]);
+
+    let both = Trigger::All(vec![
+        Trigger::ReplyTaken(Select::nth(OpKind::Membership, 1)),
+        Trigger::Closed("mira".to_owned()),
+    ]);
+    for link_first in [false, true] {
+        let mut predicates =
+            Predicates::new(vec![hold(Select::nth(OpKind::Prepare, 1), both.clone())]);
+        predicates.record(&submitted(1, OpKind::Prepare, 1));
+        predicates.record(&submitted(2, OpKind::Membership, 0));
+        let prepare = pending(1, OpKind::Prepare, Duration::ZERO);
+        let parts: [&dyn Fn(&mut Predicates); 2] =
+            [&|p| p.record(&StorageFact::ReplyTaken { id: 2 }), &|p| {
+                p.record_link(LinkEffect::Closed, "mira")
+            }];
+        let (first, second) = if link_first {
+            (parts[1], parts[0])
+        } else {
+            (parts[0], parts[1])
+        };
+        first(&mut predicates);
+        assert_eq!(offered(&predicates, Base::Any, &prepare), []);
+        // A link that was only made doesn't count as closed.
+        predicates.record_link(LinkEffect::Linked, "mira");
+        assert_eq!(offered(&predicates, Base::Any, &prepare), []);
+        second(&mut predicates);
+        assert_eq!(offered(&predicates, Base::Any, &prepare), [Outcome::Engine]);
+    }
+}
+
+/// A hold picks only its own instances. The second locator and an apply in
+/// another session follow the base's outcomes and its bound, while the
+/// held ones offer nothing and ignore the bound.
+#[test]
+fn unpicked_ops_follow_the_base() {
+    let never = Trigger::Closed("nobody".to_owned());
+    let mut predicates = Predicates::new(vec![
+        hold(Select::nth(OpKind::Locator, 1), never.clone()),
+        hold(
+            Select {
+                kind: Some(OpKind::Apply),
+                session: Some(2),
+                ..Select::default()
+            },
+            never,
+        ),
+    ]);
+    for (id, kind, session) in [
+        (1, OpKind::Locator, 0),
+        (2, OpKind::Locator, 0),
+        (3, OpKind::Apply, 1),
+        (4, OpKind::Apply, 2),
+    ] {
+        predicates.record(&submitted(id, kind, session));
+    }
+    let now = SimInstant::from_start(Duration::from_secs(1));
+    let since = Duration::from_secs(1);
+    let deadline = [Boundary::Deadline(SimInstant::from_start(
+        Duration::from_secs(5),
+    ))];
+    for (id, kind, held) in [
+        (1, OpKind::Locator, true),
+        (2, OpKind::Locator, false),
+        (3, OpKind::Apply, false),
+        (4, OpKind::Apply, true),
+    ] {
+        let op = pending(id, kind, since);
+        let (outcomes, bounds): (Vec<Outcome>, &[Boundary]) = if held {
+            (Vec::new(), &[])
+        } else {
+            (vec![Outcome::Engine], &deadline)
+        };
+        assert_eq!(
+            offered(&predicates, Base::SuccessOnly, &op),
+            outcomes,
+            "op {id}"
+        );
+        assert_eq!(boundaries(&predicates, &op, now), bounds, "op {id}");
+    }
+}
+
+/// Everything the predicates answer, for a fixed set of questions.
+fn answers(predicates: &Predicates) -> String {
+    let now = SimInstant::from_start(HOUR);
+    let mut out = Vec::new();
+    for (id, kind) in [(1, OpKind::Locator), (2, OpKind::Apply)] {
+        for since in [Duration::ZERO, HOUR] {
+            let op = pending(id, kind, since);
+            out.push(format!(
+                "{id}/{since:?}: {:?} {:?}",
+                offered(predicates, Base::SuccessOnly, &op),
+                boundaries(predicates, &op, now)
+            ));
+        }
+    }
+    let gate = Trigger::Count(2, Box::new(Trigger::Linked("mira".to_owned())));
+    let mut gate_bounds = Vec::new();
+    predicates.control_boundaries(&Trigger::VirtualTime(7_200_000), now, &mut gate_bounds);
+    out.push(format!(
+        "{:?} {gate_bounds:?}",
+        predicates.control_holds(&gate, now)
+    ));
+    out.join("\n")
+}
+
+/// Asking twice with nothing recorded between gives the same answers, and
+/// so does a fresh copy fed the same facts, so only recording changes them.
+#[test]
+fn policy_is_pure_between_steps() {
+    let holds = vec![
+        hold(
+            Select::nth(OpKind::Apply, 1),
+            Trigger::All(vec![
+                Trigger::Completed(Select::nth(OpKind::Locator, 1)),
+                Trigger::VirtualTime(1_000),
+            ]),
+        ),
+        hold(
+            Select::nth(OpKind::Locator, 1),
+            Trigger::CallerDropped(Select::held()),
+        ),
+    ];
+    let script: Vec<Box<dyn Fn(&mut Predicates)>> = vec![
+        Box::new(|p| p.record(&submitted(1, OpKind::Locator, 0))),
+        Box::new(|p| p.record(&submitted(2, OpKind::Apply, 1))),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+        Box::new(|p| p.record(&StorageFact::CallerDropped { id: 1 })),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+    ];
+    let mut predicates = Predicates::new(holds.clone());
+    let mut seen = vec![answers(&predicates)];
+    for (step, record) in script.iter().enumerate() {
+        record(&mut predicates);
+        let first = answers(&predicates);
+        assert_eq!(answers(&predicates), first, "asked twice after {step}");
+        let mut fresh = Predicates::new(holds.clone());
+        script[..=step].iter().for_each(|record| record(&mut fresh));
+        assert_eq!(answers(&fresh), first, "a replay of the same facts");
+        seen.push(first);
+    }
+    // The script moves the answers, so the comparisons above can fail.
+    seen.dedup();
+    assert!(seen.len() > 2, "{seen:#?}");
+}

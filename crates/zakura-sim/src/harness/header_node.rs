@@ -6,7 +6,10 @@
 //! completes. Mirror peers run the same code on a plain [`EnginePort`], whose
 //! calls finish on first poll. Each actor's chain is committed before
 //! `Sim::new` by [`preload`], since a run's scenario clock would otherwise
-//! decide whether the fixture headers validate.
+//! decide whether the fixture headers validate. [`policy`] holds individual
+//! operations, and gates `Control` steps, until chosen events happen.
+
+pub mod policy;
 
 use std::{
     cell::{Cell, RefCell},
@@ -35,7 +38,10 @@ use zakura_storage::header::{
     adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture, Outcome,
 };
 
-use crate::{storage::HeaderStorage, ActionSource, Boundary, Identity, ObservationLog, Sim};
+use self::policy::{Hold, LinkEffect, Predicates, Trigger};
+use crate::{
+    storage::HeaderStorage, ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
+};
 
 /// Frames each direction of a link buffers, enough for a page and control
 /// frames in flight.
@@ -125,7 +131,7 @@ pub fn preload(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
     }
 }
 
-/// Which outcomes the policy offers for operations no rule picks.
+/// Which outcomes the policy offers for operations no hold picks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Base {
@@ -136,9 +142,22 @@ pub enum Base {
     SuccessOnly,
 }
 
+impl Base {
+    /// Whether the base offers `outcome` for an operation whose legal
+    /// outcomes are `legal`.
+    pub fn offers(self, legal: &[Outcome], outcome: Outcome) -> bool {
+        match self {
+            Base::Any => true,
+            Base::SuccessOnly => {
+                outcome == Outcome::Engine || legal == [Outcome::Rejected].as_slice()
+            }
+        }
+    }
+}
+
 /// How the run completes the node's storage operations. The scenario
 /// records it, so a trace replays it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     /// The outcomes offered.
@@ -149,6 +168,10 @@ pub struct Policy {
     /// storage call can't close a session that nothing reconnects.
     #[serde(default)]
     pub bound_ms: Option<u64>,
+    /// Operations held apart from the base, each by the first hold that
+    /// picks it.
+    #[serde(default)]
+    pub holds: Vec<Hold>,
 }
 
 impl Policy {
@@ -157,9 +180,14 @@ impl Policy {
         Policy {
             base: Base::SuccessOnly,
             bound_ms: Some(5_000),
+            holds: Vec::new(),
         }
     }
 }
+
+/// The link effects tasks made, in order, for [`Trigger::Closed`] and
+/// [`Trigger::Linked`]. Sources read it only in `observe`.
+pub type LinkLog = Rc<RefCell<Vec<(LinkEffect, String)>>>;
 
 /// `t` plus `d`, saturating at the largest instant.
 fn after(t: SimInstant, d: Duration) -> SimInstant {
@@ -167,40 +195,45 @@ fn after(t: SimInstant, d: Duration) -> SimInstant {
         .unwrap_or(SimInstant::from_start(Duration::MAX))
 }
 
-/// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes nothing
-/// of its own, so `enabled` and `boundaries` stay pure.
+/// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
+/// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
+/// pure.
 pub struct PolicySource {
     storage: HeaderStorage,
     port: Arc<ControlledPort>,
-    policy: Policy,
+    base: Base,
+    bound: Option<Duration>,
+    predicates: Rc<RefCell<Predicates>>,
+    links: LinkLog,
+    /// How many of `links` are recorded.
+    seen: usize,
 }
 
 impl PolicySource {
     /// `port`'s storage under `policy`, with its checkpoint registered with
-    /// `sim`.
-    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy) -> Self {
+    /// `sim`. Its predicates count `links` too.
+    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, links: LinkLog) -> Self {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             port,
-            policy,
+            base: policy.base,
+            bound: policy.bound_ms.map(Duration::from_millis),
+            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
+            links,
+            seen: 0,
         }
     }
 
-    /// Whether the policy offers `outcome` for an operation whose legal
-    /// outcomes are `legal`.
-    fn offers(&self, legal: &[Outcome], outcome: Outcome) -> bool {
-        match self.policy.base {
-            Base::Any => true,
-            Base::SuccessOnly => {
-                outcome == Outcome::Engine || legal == [Outcome::Rejected].as_slice()
-            }
-        }
+    /// The predicates, for a [`Control`] gated by the same counts.
+    pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
+        self.predicates.clone()
     }
 }
 
 impl ActionSource for PolicySource {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
         let pending = self.port.pending();
+        let predicates = self.predicates.borrow();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
@@ -208,19 +241,15 @@ impl ActionSource for PolicySource {
             pending
                 .iter()
                 .find(|op| op.id == id)
-                .is_some_and(|op| self.offers(&op.enabled, outcome))
+                .is_some_and(|op| predicates.offers(self.base, op, outcome))
         }));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         self.storage.boundaries(now, out);
-        if let Some(bound) = self.policy.bound_ms.map(Duration::from_millis) {
-            for op in self.port.pending() {
-                out.push(Boundary::Deadline(after(
-                    now,
-                    bound.saturating_sub(op.since_submit),
-                )));
-            }
+        let predicates = self.predicates.borrow();
+        for op in self.port.pending() {
+            predicates.boundaries(self.bound, &op, now, out);
         }
     }
 
@@ -229,7 +258,20 @@ impl ActionSource for PolicySource {
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        self.storage.observe(log)
+        let before = log.entries().len();
+        self.storage.observe(log)?;
+        let mut predicates = self.predicates.borrow_mut();
+        // The storage source appends only its own port's facts.
+        for entry in &log.entries()[before..] {
+            if let Observation::Storage { fact, .. } = &entry.obs {
+                predicates.record(fact);
+            }
+        }
+        for (effect, peer) in &self.links.borrow()[self.seen..] {
+            predicates.record_link(*effect, peer);
+        }
+        self.seen = self.links.borrow().len();
+        Ok(())
     }
 }
 
@@ -346,19 +388,41 @@ pub struct Topology {
     /// The nodes, the node under test first.
     pub nodes: Vec<HeaderNode>,
     links: RefCell<Vec<Link>>,
+    /// Each link made or closed, by the peer of the node under test.
+    effects: LinkLog,
     /// The last connection and session ID handed out. A replacement needs
     /// both to be new, so one counter serves both.
     last_id: Cell<u64>,
 }
 
 impl Topology {
-    /// `nodes`, with no links yet.
-    pub fn new(nodes: Vec<HeaderNode>) -> Self {
+    /// `nodes`, with no links yet. Each link it makes or closes is recorded
+    /// in `effects`.
+    pub fn new(nodes: Vec<HeaderNode>, effects: LinkLog) -> Self {
         Topology {
             nodes,
             links: RefCell::default(),
+            effects,
             last_id: Cell::new(0),
         }
+    }
+
+    /// The name of the node under test's peer on `link`.
+    fn peer_of(&self, link: &Link) -> String {
+        let peer = if link.dialer == 0 {
+            link.listener
+        } else {
+            link.dialer
+        };
+        self.nodes[peer].name.clone()
+    }
+
+    /// Closes `link` and records it.
+    pub fn close(&self, link: &Link) {
+        link.close();
+        self.effects
+            .borrow_mut()
+            .push((LinkEffect::Closed, self.peer_of(link)));
     }
 
     /// Connects `dialer` to `listener` with a new connection and session,
@@ -404,6 +468,9 @@ impl Topology {
             tokens,
         };
         self.links.borrow_mut().push(link.clone());
+        self.effects
+            .borrow_mut()
+            .push((LinkEffect::Linked, self.peer_of(&link)));
         link
     }
 
@@ -453,23 +520,34 @@ pub struct ControlStep {
     pub peer: String,
     /// What to do.
     pub action: ControlAction,
+    /// Offered only once this holds. Always offered without one.
+    #[serde(default)]
+    pub when: Option<Trigger>,
 }
 
 /// Offers a scenario's scripted link actions in order, each once, as
-/// `peer:<peer>:<action>`, so the `Plan` decides when each happens. A
-/// harness task carries each one out on its next step, since linking takes
-/// locks that tasks hold across scheduling points, where only a task can
-/// wait.
+/// `peer:<peer>:<action>`, so the `Plan` decides when each happens, once
+/// its trigger holds. A harness task carries each one out on its next step,
+/// since linking takes locks that tasks hold across scheduling points, where
+/// only a task can wait. So a pick only queues the action, and triggers
+/// count the effect.
 pub struct Control {
     script: Vec<ControlStep>,
+    predicates: Rc<RefCell<Predicates>>,
     /// The next step to offer.
     next: usize,
     to_task: mpsc::Sender<ControlStep>,
 }
 
 impl Control {
-    /// A source for `script` on `topology`, with its task spawned on `sim`.
-    pub fn new(sim: &mut Sim, topology: Rc<Topology>, script: Vec<ControlStep>) -> Self {
+    /// A source for `script` on `topology`, gated by `predicates`, with its
+    /// task spawned on `sim`.
+    pub fn new(
+        sim: &mut Sim,
+        topology: Rc<Topology>,
+        script: Vec<ControlStep>,
+        predicates: Rc<RefCell<Predicates>>,
+    ) -> Self {
         let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
         sim.scheduler().spawn_root("control", async move {
             while let Some(step) = steps.recv().await {
@@ -477,7 +555,7 @@ impl Control {
                     .link_to(&step.peer)
                     .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer));
                 match step.action {
-                    ControlAction::Close => link.close(),
+                    ControlAction::Close => topology.close(&link),
                     ControlAction::Relink => {
                         topology.link(link.dialer, link.listener);
                     }
@@ -486,6 +564,7 @@ impl Control {
         });
         Control {
             script,
+            predicates,
             next: 0,
             to_task,
         }
@@ -493,8 +572,15 @@ impl Control {
 }
 
 impl ActionSource for Control {
-    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        if let Some(step) = self.script.get(self.next) {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        let Some(step) = self.script.get(self.next) else {
+            return;
+        };
+        let open = step
+            .when
+            .as_ref()
+            .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
+        if open {
             // A script is far shorter than u64.
             out.push((
                 Identity::peer(&step.peer, step.action.name()),
@@ -503,7 +589,15 @@ impl ActionSource for Control {
         }
     }
 
-    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(when) = self
+            .script
+            .get(self.next)
+            .and_then(|step| step.when.as_ref())
+        {
+            self.predicates.borrow().control_boundaries(when, now, out);
+        }
+    }
 
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         self.to_task

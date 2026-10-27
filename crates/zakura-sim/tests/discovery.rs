@@ -8,6 +8,7 @@ mod support;
 use std::{
     cell::RefCell,
     future::Future,
+    rc::Rc,
     task::{Context, Poll, Waker},
 };
 
@@ -15,10 +16,15 @@ use support::{inputs, recorded};
 use zakura_network::zakura::{ZakuraDiscoveryHandle, ZakuraNodeRecord};
 use zakura_quic::NodeId;
 use zakura_sim::{
+    check::after_step,
+    domain::discovery::{
+        is_source, wait_complete_wakes, WaitState, WAIT_COMPLETE_WAKES as PROPERTY,
+    },
     harness::{
-        discovery::{run_config, spawn, Spawned, WaitComplete, WaitCompleteWakes, PROPERTY},
+        discovery::{run_config, spawn, Spawned, WaitComplete},
         run_harness, HarnessError,
     },
+    property::{Assumptions, Registry, RegistryChecker, Source, Sources, Tee},
     record::DrawRecord,
     record::Record,
     MemorySink, NoChecks, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
@@ -35,19 +41,63 @@ fn run_wait_complete(plan: PlanInput) -> RunReport {
     }
 }
 
+/// The registry's check of [`PROPERTY`] alone, for runs outside the
+/// harness.
+fn wakes_checker() -> RegistryChecker<WaitComplete> {
+    RegistryChecker::new(
+        Registry::new(vec![wait_complete_wakes()]).expect("one property"),
+        Rc::new(WaitComplete),
+        Assumptions::none(),
+        &Sources::observed(&[Source::Schedule]),
+    )
+}
+
+/// Each step's enabled set, the index it picked, and the index that would
+/// hold the source back at its `notified`, for building inputs by hand.
+type Choices = Vec<(Vec<String>, usize, Option<usize>)>;
+
+/// The task an identity runs, if it runs one.
+fn task_of(identity: &str) -> Option<&str> {
+    let rest = identity.strip_prefix("task:")?;
+    Some(&rest[..rest.rfind(':')?])
+}
+
+/// An enabled action other than the source, when the source's next point is
+/// its `notified` in the waiting code and a mark is still to come.
+fn hold_source(state: &WaitState, enabled: &[String]) -> Option<usize> {
+    let source_enabled = enabled.iter().filter_map(|e| task_of(e)).any(is_source);
+    if !source_enabled || !state.source_at_notified() || state.all_marked() {
+        return None;
+    }
+    enabled
+        .iter()
+        .position(|e| !task_of(e).is_some_and(is_source))
+}
+
 /// Runs the scenario under `plan` with the check. Returns the report, the
-/// records, and the checker, whose choices build inputs by hand.
-fn run(plan: PlanInput) -> (RunReport, Vec<String>, WaitCompleteWakes) {
-    let mut checker = WaitCompleteWakes::new();
+/// records, and each step's choices.
+fn run(plan: PlanInput) -> (RunReport, Vec<String>, Choices) {
+    let mut choices = Choices::new();
+    let record = after_step(|cx| {
+        let enabled: Vec<String> = cx.enabled.iter().map(|e| e.identity.to_string()).collect();
+        let pick = cx.pick.to_string();
+        // The loop picks from the enabled set, so the pick is always in it.
+        let index = enabled.iter().position(|e| *e == pick).unwrap_or_default();
+        // The state before this step, as the pick saw it.
+        let before = cx.log.entries().partition_point(|e| e.step < cx.step);
+        let hold = hold_source(&WaitState::of(&cx.log.entries()[..before]), &enabled);
+        choices.push((enabled, index, hold));
+        None
+    });
     let (report, lines) = recorded(
         run_config(),
         plan,
         |sim| {
             spawn(sim);
         },
-        &mut checker,
+        &mut Tee(wakes_checker(), record),
     );
-    (report, lines, checker)
+    (report, lines, choices)
 }
 
 /// How many bytes choose among `range` values, as the `Plan` decodes them.
@@ -84,7 +134,7 @@ fn push_draw(bytes: &mut Vec<u8>, draw: &DrawRecord) {
 fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
     let mut bytes = Vec::new();
     for _ in 0..1_000 {
-        let (report, lines, checker) = run(Plan::from_fuzz(&bytes));
+        let (report, lines, choices) = run(Plan::from_fuzz(&bytes));
         if report.end.violation.is_some() {
             return Ok(bytes);
         }
@@ -93,8 +143,7 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
             Record::Meta(_) | Record::Init(_) | Record::End(_) => None,
         };
         let steps: Vec<_> = lines.iter().filter_map(step_of).collect();
-        let Some(deviation) = checker
-            .choices()
+        let Some(deviation) = choices
             .iter()
             .position(|(_, picked, hold)| hold.is_some_and(|h| h != *picked))
         else {
@@ -104,7 +153,7 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
         if let Ok(Record::Init(init)) = serde_json::from_str::<Record>(&lines[0]) {
             init.draws.iter().for_each(|d| push_draw(&mut next, d));
         }
-        for (step, (_, picked, hold)) in steps.iter().zip(checker.choices()).take(deviation + 1) {
+        for (step, (_, picked, hold)) in steps.iter().zip(&choices).take(deviation + 1) {
             let index = if step.step == steps[deviation].step {
                 hold.expect("the deviation holds the source")
             } else {
@@ -137,6 +186,11 @@ fn reverted_fix_misses_the_wakeup() {
     let report = run_wait_complete(Plan::from_fuzz(INPUT));
     let violation = report.end.violation.expect("the committed input violates");
     assert_eq!(violation.property, PROPERTY);
+    // The checker this property replaced reported this step and witness.
+    assert_eq!(
+        (violation.step, &violation.witness[..]),
+        (142, &[96, 139, 140][..])
+    );
     let [load, notify, notified] = violation.witness[..] else {
         panic!("the witness is load, final notify, notified: {violation:?}");
     };
@@ -229,12 +283,11 @@ fn book_record(handle: &ZakuraDiscoveryHandle, node: NodeId) -> Option<ZakuraNod
 #[test]
 fn the_peer_record_enters_the_book() {
     let spawned = RefCell::new(None);
-    let mut checker = WaitCompleteWakes::new();
     let (report, _) = recorded(
         run_config(),
         Plan::from_fuzz(INPUT),
         |sim| *spawned.borrow_mut() = Some(spawn(sim)),
-        &mut checker,
+        &mut wakes_checker(),
     );
     assert_wakes(&report);
     let Spawned { handle, peer } = spawned.into_inner().expect("the setup ran");

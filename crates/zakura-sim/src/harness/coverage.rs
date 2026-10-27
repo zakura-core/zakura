@@ -69,7 +69,7 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/ab-ba", "ab_ba"),
     race("race/abort-without-join", "abort_without_join"),
     Coverage {
-        property: super::discovery::PROPERTY,
+        property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: sim_test("tests/discovery.rs", "committed_input_wakes"),
         bypass: sim_test("tests/discovery.rs", "reverted_fix_misses_the_wakeup"),
     },

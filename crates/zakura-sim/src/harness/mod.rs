@@ -6,10 +6,9 @@
 //! scenario, so [`find`] and [`HarnessEntry::run`] can rerun any trace
 //! without knowing its type.
 //!
-//! Every harness checks its properties with the registry
-//! ([`registry_checker`]), plus the step loop's own: [`NO_TASK_PANIC`]
-//! always, and [`NO_LIVELOCK`] when the scenario declares
-//! [`Assume::BoundedAdversary`] ([`run_config`]).
+//! Every harness checks its properties with the registry, plus the step
+//! loop's own: [`NO_TASK_PANIC`] always, and [`NO_LIVELOCK`] when the
+//! scenario declares [`Assume::BoundedAdversary`] ([`run_config`]).
 
 pub mod coverage;
 pub mod discovery;
@@ -89,18 +88,6 @@ pub trait Subsystem: HasView + Sized + 'static {
         Assumptions::none()
     }
 
-    /// The run's checker: [`registry_checker`] by default. A harness
-    /// overrides it only to run a checker for properties the registry can't
-    /// express yet after the registry's, and lists those properties in
-    /// [`Subsystem::UNREGISTERED`].
-    fn checker(this: &Rc<Self>, scenario: &Self::Scenario) -> Box<dyn Checker> {
-        registry_checker(this, scenario)
-    }
-
-    /// The properties an overridden [`Subsystem::checker`] reports outside
-    /// the registry, with their statuses, in report order. None by default.
-    const UNREGISTERED: &'static [(&'static str, Status)] = &[];
-
     /// Decodes a scenario from exactly [`Subsystem::SCENARIO_BYTES`] bytes of
     /// fuzz input.
     fn draw(prefix: &[u8]) -> Self::Scenario;
@@ -153,7 +140,7 @@ pub fn run_harness<S: Subsystem>(
 ) -> Result<RunReport, HarnessError> {
     let mut sim = Sim::new(run_config::<S>(scenario), input);
     let this = Rc::new(S::build(&mut sim, scenario));
-    let mut checker = S::checker(&this, scenario);
+    let mut checker = registry_checker(&this, scenario);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
@@ -218,10 +205,10 @@ fn enforces_no_livelock<S>(assumptions: &Assumptions<S>) -> bool {
     assumptions.declares(Assume::BoundedAdversary)
 }
 
-/// The checker [`Subsystem::checker`] returns by default: the registry of
-/// the step loop's properties and `S`'s, with a report for [`NO_LIVELOCK`]
-/// after them when the scenario enforces it.
-pub fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> Box<dyn Checker> {
+/// The run's checker: the registry of the step loop's properties and `S`'s,
+/// with a report for [`NO_LIVELOCK`] after them when the scenario enforces
+/// it.
+fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> Box<dyn Checker> {
     let assumptions = S::assumptions(scenario);
     let livelock = enforces_no_livelock(&assumptions);
     let registry =
@@ -273,45 +260,27 @@ fn no_task_panic<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 }
 
 /// Every property a run of `scenario` reports, in report order, for
-/// `meta.properties`: the registry's, [`NO_LIVELOCK`] if the scenario
-/// enforces it, then [`Subsystem::UNREGISTERED`].
+/// `meta.properties`: the registry's, then [`NO_LIVELOCK`] if the scenario
+/// enforces it.
 fn reported<S: Subsystem>(scenario: &S::Scenario) -> Vec<PropertyRef> {
     let livelock = enforces_no_livelock(&S::assumptions(scenario)).then(|| PropertyRef {
         id: NO_LIVELOCK.to_owned(),
         status: Status::Active,
     });
-    let mut reported = registry_refs::<S>();
+    let mut reported = registered::<S>();
     reported.extend(livelock);
-    reported.extend(unregistered_refs::<S>());
     reported
 }
 
-/// Every property `S` checks in any scenario, except [`NO_LIVELOCK`].
+/// Every property `S` checks in any scenario, except [`NO_LIVELOCK`]: the
+/// registry's.
 fn registered<S: Subsystem>() -> Vec<PropertyRef> {
-    let mut registered = registry_refs::<S>();
-    registered.extend(unregistered_refs::<S>());
-    registered
-}
-
-/// The registry's properties.
-fn registry_refs<S: Subsystem>() -> Vec<PropertyRef> {
     registry::<S>()
         .properties()
         .iter()
         .map(|property| PropertyRef {
             id: property.id.to_string(),
             status: property.status,
-        })
-        .collect()
-}
-
-/// [`Subsystem::UNREGISTERED`].
-fn unregistered_refs<S: Subsystem>() -> Vec<PropertyRef> {
-    S::UNREGISTERED
-        .iter()
-        .map(|&(id, status)| PropertyRef {
-            id: id.to_owned(),
-            status,
         })
         .collect()
 }

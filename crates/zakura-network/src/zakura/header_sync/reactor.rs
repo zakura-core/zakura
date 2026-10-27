@@ -4560,7 +4560,7 @@ impl HeaderSyncReactor {
                         // Report the panic before this closure drops `capacity`,
                         // whose last lease release can reach a scheduling point.
                         #[cfg(any(test, zakura_sim))]
-                        panic_tap.end(observe::CallEnd::PortPanicked);
+                        panic_tap.end_after_catch(observe::CallEnd::PortPanicked);
                         PortOperationResult::Panicked(Box::new(panic_context))
                     }
                 }

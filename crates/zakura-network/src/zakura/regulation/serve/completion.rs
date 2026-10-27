@@ -63,7 +63,7 @@ impl Completions {
     #[cfg(test)]
     pub(crate) fn published(&self) -> Vec<CompletionId> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        state.completed.iter().copied().collect()
+        state.completed.to_vec()
     }
 
     /// Consume completed admissions under the publication lock.

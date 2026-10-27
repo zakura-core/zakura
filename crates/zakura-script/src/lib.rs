@@ -8,6 +8,8 @@
 mod encoding_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "experimental-wots")]
+pub mod wots;
 
 use core::fmt;
 use std::sync::Arc;
@@ -100,6 +102,8 @@ pub struct CachedFfiTransaction {
 
     /// The sighasher context to use to compute sighashes.
     sighasher: SigHasher,
+    #[cfg(feature = "experimental-wots")]
+    wots_active: bool,
 }
 
 impl CachedFfiTransaction {
@@ -116,7 +120,20 @@ impl CachedFfiTransaction {
             transaction,
             all_previous_outputs,
             sighasher,
+            #[cfg(feature = "experimental-wots")]
+            wots_active: false,
         })
+    }
+
+    /// Applies the immutable network and candidate-block height to experimental verification.
+    #[cfg(feature = "experimental-wots")]
+    pub fn with_wots_context(
+        mut self,
+        network: &zakura_chain::parameters::Network,
+        height: zakura_chain::block::Height,
+    ) -> Self {
+        self.wots_active = wots::active(network, height);
+        self
     }
 
     /// Returns the transparent inputs for this transaction.
@@ -148,7 +165,17 @@ impl CachedFfiTransaction {
     ///
     /// [`GetP2SHSigOpCount()`]: https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L840-L852
     pub fn p2sh_sigops(&self) -> u32 {
-        p2sh_sigop_count(&self.transaction, &self.all_previous_outputs)
+        let count = p2sh_sigop_count(&self.transaction, &self.all_previous_outputs);
+        #[cfg(feature = "experimental-wots")]
+        let count = if self.wots_active {
+            count.saturating_add(wots::sigop_cost(
+                &self.transaction,
+                &self.all_previous_outputs,
+            ))
+        } else {
+            count
+        };
+        count
     }
 
     /// Verify if the script in the input at `input_index` of a transaction correctly spends the
@@ -168,6 +195,12 @@ impl CachedFfiTransaction {
         let script_pub_key: &[u8] = lock_script.as_raw_bytes();
 
         let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
+        #[cfg(feature = "experimental-wots")]
+        let flags = if self.wots_active {
+            flags | Flags::CHECKWOTS
+        } else {
+            flags
+        };
 
         let lock_time = self.transaction.raw_lock_time();
         let is_final = self.transaction.inputs()[input_index].sequence() == u32::MAX;
@@ -225,6 +258,19 @@ impl CachedFfiTransaction {
             sighash: &calculate_sighash,
             lock_time: i64::from(lock_time),
             is_final,
+        };
+        #[cfg(feature = "experimental-wots")]
+        let checker = wots::Checker {
+            ecdsa: checker,
+            digest: (self.wots_active
+                && self.transaction.version() == 5
+                && !self.transaction.has_shielded_inputs()
+                && !self.transaction.has_shielded_outputs())
+            .then(|| {
+                self.sighasher()
+                    .sighash(HashType::ALL, Some((input_index, Vec::new())))
+                    .0
+            }),
         };
         match script.eval(flags, &checker) {
             Ok(true) => Ok(()),

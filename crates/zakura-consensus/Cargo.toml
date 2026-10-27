@@ -19,6 +19,8 @@ keywords.workspace = true
 categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [features]
+# Local regtest prototype; never enabled by default.
+experimental-wots = ["zakura-script/experimental-wots", "zcash_transparent/experimental-wots"]
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

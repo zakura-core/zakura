@@ -170,7 +170,12 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+# These prototype sources are pinned to exact revisions in Cargo.toml.
+allow-git = [
+    "https://github.com/zakura-core/common",
+    "https://github.com/p0mvn/zcash_script",
+    "https://github.com/p0mvn/wots-plus",
+]
 
 [sources.allow-org]
 github = [

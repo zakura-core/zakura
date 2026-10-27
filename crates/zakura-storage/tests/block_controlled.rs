@@ -1516,3 +1516,35 @@ fn a_commit_of_a_body_recorded_invalid_reports_a_storage_retry() {
         [HandleEvent::ApplyFinished { .. }]
     ));
 }
+
+/// ST4.3: a record's identity carries its retry episode's summary, so two
+/// records that differ only there are told apart.
+#[test]
+fn a_record_identity_carries_its_retry_episode() {
+    let hash = block::Hash([3; 32]);
+    let evidence = EvidenceId::from_digest([4; 32]);
+    let availability = zakura_header_chain::BodyUnavailableSummary {
+        attempts: 2,
+        suppliers: 1,
+        supplier_set_digest: [5; 32],
+        alarmed: true,
+        ..Default::default()
+    };
+    let unavailable = BlockSyncAction::RecordBodyUnavailable {
+        expected_version: StateVersion::new(1),
+        failure: zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence,
+            kind: zakura_header_chain::TransientBodyFailureKind::Timeout,
+            availability,
+        },
+    };
+    let RequestIdentity::Record {
+        availability: carried,
+        ..
+    } = RequestIdentity::of_action(&unavailable, ApplyClass::Full)
+    else {
+        panic!("a record's identity is a record");
+    };
+    assert_eq!(carried, Some(availability));
+}

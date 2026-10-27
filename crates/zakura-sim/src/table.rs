@@ -290,7 +290,8 @@ pub enum Effect {
     /// [`Observation::WorkAdmitted`], for `receiver-work-authorized` and
     /// `receiver-credit-conserved`.
     Work,
-    /// [`Observation::Serving`], for `receiver-serving-bounded`.
+    /// [`Observation::Serving`] and [`Observation::ServingEnded`], for
+    /// `receiver-serving-bounded`.
     Serving,
     /// [`Observation::NodeOutput`], for `sender-within-response-quantity`.
     Output,
@@ -320,10 +321,14 @@ pub fn downstream_properties<S: HasView>(
             let templates: &[(Effect, Template)] = match rule.role {
                 MessageRole::Announcement { .. } => &[],
                 MessageRole::Request { .. } => &[(Effect::Serving, Template::ServingBounded)],
-                MessageRole::Response { .. } => &[
+                // A request's exchange owes frames and bytes, which the
+                // output check reads. A subscription's pages spend credit,
+                // which it doesn't.
+                MessageRole::Response { request, .. } if answers_request(streams, request) => &[
                     (Effect::Work, Template::WorkAuthorized),
                     (Effect::Output, Template::SenderWithinResponseQuantity),
                 ],
+                MessageRole::Response { .. } => &[(Effect::Work, Template::WorkAuthorized)],
                 MessageRole::Subscription { .. } => &[(Effect::Work, Template::CreditConserved)],
             };
             for &(effect, template) in templates {
@@ -405,6 +410,18 @@ fn has_cadence(rule: &MessageRule) -> bool {
         }
         MessageRole::Response { .. } => false,
     }
+}
+
+/// True if `message_type` in `streams` is a Request row, not a
+/// Subscription row.
+fn answers_request(streams: &[Stream], message_type: u16) -> bool {
+    streams
+        .iter()
+        .filter_map(|stream| stream.messages)
+        .flatten()
+        .any(|rule| {
+            rule.message_type == message_type && matches!(rule.role, MessageRole::Request { .. })
+        })
 }
 
 /// The per-row templates of `rule`, in label order.
@@ -490,7 +507,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
         Template::WorkAuthorized => downstream::check(cx, &id, downstream::work_authorized),
         Template::CreditConserved => downstream::check(cx, &id, downstream::credit_conserved),
-        Template::ServingBounded => downstream::check(cx, &id, downstream::serving_bounded),
+        Template::ServingBounded => downstream::check_serving(cx, &id),
         Template::SenderWithinResponseQuantity => {
             downstream::check(cx, &id, downstream::within_response_quantity)
         }

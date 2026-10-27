@@ -186,15 +186,20 @@ pub enum Observation {
         /// Payload bytes the node may send, the ending's included.
         bytes: u64,
     },
-    /// The node retained, forwarded or handed storage work from the peer's
-    /// response or page frames: an actual effect, which the family's adapter
-    /// reads at the storage or forwarding boundary, whatever code path
-    /// produced it.
+    /// The node retained, forwarded or handed storage work from one of the
+    /// peer's response or page frames: an actual effect, which the family's
+    /// adapter reads at the storage or forwarding boundary, whatever code
+    /// path produced it. Work counts once, at the first boundary it crosses:
+    /// an adapter that sees the same work retained and then forwarded
+    /// reports it once.
     WorkAdmitted {
         /// The connection.
         connection: u64,
-        /// The row of the frames the work came from.
+        /// The row of the frame the work came from.
         frame: RowAt,
+        /// That frame, as its [`Observation::PeerFrame`] numbers it on
+        /// `frame`'s stream: the frame whose body the work holds.
+        seq: u64,
         /// The request or subscription row those frames answer.
         request: RowAt,
         /// The exchange or subscription key.
@@ -207,6 +212,16 @@ pub enum Observation {
     /// The node installed an owner for serving the peer's request: an actual
     /// effect, read where the owner is created.
     Serving {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// A serving owner from [`Observation::Serving`] retired: an actual
+    /// effect, read where the owner is dropped.
+    ServingEnded {
         /// The connection.
         connection: u64,
         /// The request row.

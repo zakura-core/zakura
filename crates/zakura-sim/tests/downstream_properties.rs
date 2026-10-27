@@ -111,12 +111,20 @@ fn closed(cause: &str) -> Observation {
     }
 }
 
-/// The node admitting `bytes` of work from `frame` rows answering
-/// `request` for `exchange`.
-fn work(frame: RowAt, request: RowAt, exchange: u64, objects: u64, bytes: u64) -> Observation {
+/// The node admitting `bytes` of work from the `frame` row frame `seq`,
+/// answering `request` for `exchange`.
+fn work(
+    frame: RowAt,
+    seq: u64,
+    request: RowAt,
+    exchange: u64,
+    objects: u64,
+    bytes: u64,
+) -> Observation {
     Observation::WorkAdmitted {
         connection: 1,
         frame,
+        seq,
         request,
         exchange,
         objects,
@@ -124,10 +132,11 @@ fn work(frame: RowAt, request: RowAt, exchange: u64, objects: u64, bytes: u64) -
     }
 }
 
-/// The node's `get` part work for exchange 7.
-fn part_work(bytes: u64) -> Observation {
+/// The node's `get` work for exchange 7 from part frame `seq`.
+fn part_work(seq: u64, bytes: u64) -> Observation {
     work(
         row(TEST_STREAM, "part"),
+        seq,
         row(TEST_STREAM, "get"),
         7,
         1,
@@ -183,6 +192,16 @@ fn every_row_yields_its_downstream_templates() {
         .map(|p| p.id.to_string())
         .collect();
     assert!(feed.iter().any(|id| id == CREDIT));
+    // Pages and terminal outcomes answer a subscription, which owes credit,
+    // not frames and bytes, so they get no output check.
+    assert_eq!(
+        feed,
+        [
+            CREDIT,
+            "feed/s64v1/item/receiver-work-authorized",
+            "feed/s64v1/ended/receiver-work-authorized",
+        ]
+    );
     assert_eq!(
         GeneratedId::parse(CREDIT).map(|id| id.template),
         Some(Template::CreditConserved)
@@ -212,8 +231,8 @@ fn authorized_work_holds() {
     let report = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 0)],
-        vec![part_work(12)],
-        vec![part_work(8)],
+        vec![part_work(0, 12)],
+        vec![part_work(0, 8)],
     ]);
     assert_eq!(report.end.violation, None);
     assert!(held(&report, WORK), "{:?}", report.properties);
@@ -228,7 +247,7 @@ fn work_from_a_rejected_frame_fails_despite_the_close() {
         vec![frame(TEST_STREAM, 0, "part", Label::Unsolicited, 7, 20)],
         vec![
             judged(TEST_STREAM, 0),
-            part_work(20),
+            part_work(0, 20),
             closed("service_protocol_reject"),
         ],
     ]);
@@ -243,8 +262,8 @@ fn work_from_a_rejected_frame_fails_despite_the_close() {
 fn work_beyond_what_was_delivered_fails() {
     let over = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
-        vec![judged(TEST_STREAM, 0), part_work(12)],
-        vec![part_work(12)],
+        vec![judged(TEST_STREAM, 0), part_work(0, 12)],
+        vec![part_work(0, 12)],
     ]);
     assert_eq!(
         over.end.violation.map(|v| v.property).as_deref(),
@@ -253,7 +272,7 @@ fn work_beyond_what_was_delivered_fails() {
 
     let unjudged = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
-        vec![part_work(1)],
+        vec![part_work(0, 1)],
     ]);
     assert_eq!(
         unjudged.end.violation.map(|v| v.property).as_deref(),
@@ -262,10 +281,47 @@ fn work_beyond_what_was_delivered_fails() {
 
     let other_exchange = run_script(vec![
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 8, 20)],
-        vec![judged(TEST_STREAM, 0), part_work(1)],
+        vec![judged(TEST_STREAM, 0), part_work(0, 1)],
     ]);
     assert_eq!(
         other_exchange.end.violation.map(|v| v.property).as_deref(),
+        Some(WORK)
+    );
+}
+
+/// Work names the frame it came from. A valid part's unused bytes don't
+/// cover work from a later part the models rejected, while a delayed
+/// callback for the valid part still holds. Work with no frame fails
+/// whatever its size.
+#[test]
+fn work_spends_only_its_own_frames_bytes() {
+    let script = |late_work| {
+        vec![
+            vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
+            vec![judged(TEST_STREAM, 0)],
+            vec![frame(TEST_STREAM, 1, "done", Label::Conformant, 7, 4)],
+            vec![judged(TEST_STREAM, 1)],
+            vec![frame(TEST_STREAM, 2, "part", Label::Unsolicited, 7, 10)],
+            vec![
+                judged(TEST_STREAM, 2),
+                late_work,
+                closed("service_protocol_reject"),
+            ],
+        ]
+    };
+    let rejected = run_script(script(part_work(2, 10)));
+    assert!(held(&rejected, UNSOLICITED), "{:?}", rejected.properties);
+    let violation = rejected.end.violation.expect("frame 2 was rejected");
+    assert_eq!(violation.property, WORK);
+    assert!(violation.actual.contains("Unsolicited"), "{violation:?}");
+
+    let delayed = run_script(script(part_work(0, 10)));
+    assert_eq!(delayed.end.violation, None);
+    assert!(held(&delayed, WORK), "{:?}", delayed.properties);
+
+    let no_frame = run_script(vec![vec![part_work(0, 0)]]);
+    assert_eq!(
+        no_frame.end.violation.map(|v| v.property).as_deref(),
         Some(WORK)
     );
 }
@@ -278,7 +334,7 @@ fn stale_owner_work_after_close_fails() {
         vec![frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20)],
         vec![judged(TEST_STREAM, 0)],
         vec![closed("idle_timeout")],
-        vec![part_work(4)],
+        vec![part_work(0, 4)],
     ]);
     let violation = report
         .end
@@ -298,7 +354,7 @@ fn missing_storage_observations_fail_the_run() {
     let report = run_under(
         downstream_properties("test", &[TEST_STREAM], &[Effect::Work]),
         &[Source::Frames, Source::Closes, Source::Schedule],
-        vec![vec![part_work(1)]],
+        vec![vec![part_work(0, 1)]],
     );
     assert_eq!(report.end.outcome, Outcome::Harness);
     assert!(
@@ -311,10 +367,12 @@ fn missing_storage_observations_fail_the_run() {
     );
 }
 
-/// The node's `watch` subscription 3: `objects` and `bytes` of item work.
+/// The node's `watch` subscription 3: `objects` and `bytes` of work from
+/// item frame 0.
 fn item_work(objects: u64, bytes: u64) -> Observation {
     work(
         row(FEED_STREAM, "item"),
+        0,
         row(FEED_STREAM, "watch"),
         3,
         objects,
@@ -380,6 +438,15 @@ fn serving(exchange: u64) -> Observation {
     }
 }
 
+/// The node retiring a serving owner of `get` request `exchange`.
+fn serving_ended(exchange: u64) -> Observation {
+    Observation::ServingEnded {
+        connection: 1,
+        request: row(TEST_STREAM, "get"),
+        exchange,
+    }
+}
+
 /// Serving a conformant, judged request once holds. Serving it twice, or
 /// serving an over-margin request the node closed for, fails; the ordinary
 /// over-margin check still holds.
@@ -387,7 +454,8 @@ fn serving(exchange: u64) -> Observation {
 fn serving_is_bounded_by_conformant_requests() {
     let report = run_script(vec![
         vec![frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4)],
-        vec![judged(TEST_STREAM, 0), serving(1)],
+        vec![judged(TEST_STREAM, 0), owed(2, 40), serving(1)],
+        vec![output("done", 4), serving_ended(1)],
     ]);
     assert_eq!(report.end.violation, None);
     assert!(held(&report, SERVING), "{:?}", report.properties);
@@ -417,6 +485,53 @@ fn serving_is_bounded_by_conformant_requests() {
     );
     assert_eq!(
         over_margin.end.violation.map(|v| v.property).as_deref(),
+        Some(SERVING)
+    );
+}
+
+/// An owner started after the node wrote the request's ending serves no
+/// open request, though the ending itself was within what was owed.
+#[test]
+fn serving_an_answered_request_fails() {
+    let report = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4)],
+        vec![judged(TEST_STREAM, 0), owed(2, 40)],
+        vec![output("done", 4)],
+        vec![serving(1)],
+    ]);
+    assert!(held(&report, QUANTITY_DONE), "{:?}", report.properties);
+    let violation = report.end.violation.expect("the request had ended");
+    assert_eq!(violation.property, SERVING);
+    assert!(
+        violation.actual.contains("no request open"),
+        "{violation:?}"
+    );
+}
+
+/// Once the run rests, an owner whose request ended must have retired. An
+/// owner that outlives its answered request fails, as does one that
+/// outlives its connection.
+#[test]
+fn owners_outliving_their_requests_fail() {
+    let leaked = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4)],
+        vec![judged(TEST_STREAM, 0), owed(2, 40), serving(1)],
+        vec![output("done", 4)],
+    ]);
+    let violation = leaked.end.violation.expect("the owner never retired");
+    assert_eq!(violation.property, SERVING);
+    assert!(
+        violation.actual.contains("1 owners are live for 0"),
+        "{violation:?}"
+    );
+
+    let closed_under = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4)],
+        vec![judged(TEST_STREAM, 0), serving(1)],
+        vec![closed("idle_timeout")],
+    ]);
+    assert_eq!(
+        closed_under.end.violation.map(|v| v.property).as_deref(),
         Some(SERVING)
     );
 }
@@ -460,10 +575,11 @@ fn output_within_what_is_owed_holds() {
 }
 
 /// Output above the owed frames or bytes fails, as does output for an
-/// exchange the peer never opened or that already ended.
+/// exchange the peer never opened, that already ended, or whose connection
+/// closed.
 #[test]
 fn output_above_what_is_owed_fails() {
-    let cases: [(&str, Vec<Vec<Observation>>, &str); 4] = [
+    let cases: [(&str, Vec<Vec<Observation>>, &str); 5] = [
         (
             "a third part",
             vec![
@@ -489,6 +605,15 @@ fn output_above_what_is_owed_fails() {
                 vec![owed(2, 20)],
                 vec![output("done", 4)],
                 vec![output("part", 1)],
+            ],
+            QUANTITY,
+        ),
+        (
+            "after the connection closed",
+            vec![
+                vec![owed(2, 40)],
+                vec![closed("idle_timeout")],
+                vec![output("part", 8)],
             ],
             QUANTITY,
         ),

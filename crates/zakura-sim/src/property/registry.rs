@@ -235,8 +235,7 @@ impl Sources {
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
 /// `Draft` violation is only recorded, so the run goes on. Each report
-/// keeps every expired obligation, and the check's first violation of each
-/// run of consecutive failing evaluations.
+/// keeps every violation its property had.
 pub struct RegistryChecker<S: HasView> {
     properties: Vec<Property<S>>,
     state: Vec<PropertyState>,
@@ -260,12 +259,8 @@ struct PropertyState {
     /// True once an evaluation returned `Holds` or `Violated`, and the
     /// `Applicable` event went out.
     announced: bool,
-    /// Every violation, in order: each expired obligation, and the check's
-    /// first violation of each run of consecutive failing evaluations.
+    /// Every violation, in order.
     violations: Vec<Violation>,
-    /// True if the check's last evaluation other than `NotApplicable`
-    /// returned `Violated`.
-    failing: bool,
     /// Open obligations, oldest first.
     open: Vec<Open>,
     /// The step and time after which all the property's assumptions have
@@ -397,6 +392,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 &self.handle,
                 self.holds,
                 &mut self.events,
+                &mut self.failure,
                 cx,
             );
             if property.status == Status::Active && first.is_none() {
@@ -428,21 +424,23 @@ impl<S: HasView> Checker for RegistryChecker<S> {
         std::mem::take(&mut self.events)
     }
 
-    /// The first missing source or stale view, once.
+    /// The first missing source, stale view, or missing evidence, once.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         self.failure.take()
     }
 }
 
 /// Steps one declared property, and returns its violations this step: the
-/// check's if the previous evaluation didn't fail, then each expired
-/// obligation's.
+/// verdict's, the ones the check recorded, then each expired obligation's.
+/// Evidence the check found missing becomes `failure` unless one is already
+/// pending.
 fn step_property<S: HasView>(
     property: &Property<S>,
     state: &mut PropertyState,
     handle: &S,
     holds: fn(&S, Assume) -> bool,
     events: &mut Vec<CheckEvent>,
+    failure: &mut Option<HarnessFailure>,
     cx: &StepCtx<'_>,
 ) -> Vec<Violation> {
     let event = |to| CheckEvent::Lifecycle {
@@ -475,25 +473,26 @@ fn step_property<S: HasView>(
     let mut violations = Vec::new();
     let mut ccx = CheckCtx::new(cx, handle, property);
     let verdict = (property.check)(&mut ccx);
-    if verdict != Verdict::NotApplicable && !state.announced {
+    let parts = ccx.into_parts();
+    if let Some(detail) = parts.missing {
+        failure.get_or_insert_with(|| HarnessFailure::MissingEvidence {
+            property: property.id.to_string(),
+            step: cx.step,
+            detail,
+        });
+    }
+    let failed = matches!(verdict, Verdict::Violated(_)) || !parts.recorded.is_empty();
+    if (verdict != Verdict::NotApplicable || failed) && !state.announced {
         state.announced = true;
         events.push(event(Lifecycle::Applicable));
     }
     match verdict {
-        Verdict::Holds => {
-            state.applicable = state.applicable.saturating_add(1);
-            state.failing = false;
-        }
-        Verdict::NotApplicable => {}
-        // A state that stays broken fails every step. Its first violation
-        // stands for the rest, so a long run's report stays bounded.
-        Verdict::Violated(v) => {
-            if !std::mem::replace(&mut state.failing, true) {
-                violations.push(v);
-            }
-        }
+        Verdict::Holds if !failed => state.applicable = state.applicable.saturating_add(1),
+        Verdict::Holds | Verdict::NotApplicable => {}
+        Verdict::Violated(v) => violations.push(v),
     }
-    for obligation in ccx.into_obligations() {
+    violations.extend(parts.recorded);
+    for obligation in parts.obliged {
         events.push(event(Lifecycle::Obliged));
         state.open.push(Open {
             obligation,

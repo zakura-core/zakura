@@ -5,37 +5,23 @@
 
 mod support;
 
-use std::{cell::RefCell, collections::BTreeSet, collections::VecDeque, rc::Rc};
+use std::collections::BTreeSet;
 
 use support::{
-    config,
     feed::{FEED, ITEM},
-    run,
+    script::{run_under, Node, OBSERVED},
 };
 use zakura_network::zakura::{
     testkit::regulation::{production_tables, TEST_FAMILY},
     MessageRole, MessageRule, Stream,
 };
-use zakura_rt::task::yield_now;
-use zakura_scheduler::SimInstant;
 use zakura_sim::{
     model::{consequence, is_fault_cause, Consequence, Label},
     observe::StreamId,
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
+    property::{Property, Source},
     table::{rule_row, table_properties, GeneratedId, Template},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Outcome, Plan, PropertyOutcome,
-    RunReport,
+    Observation, Outcome, PropertyOutcome, RunReport,
 };
-
-/// The node, which the scripted observations stand for.
-struct Node;
-
-impl HasView for Node {
-    type View = ();
-
-    /// Nothing. Generated properties read observations.
-    fn view(&self) {}
-}
 
 /// The `feed` stream: a subscription with its page and terminal outcome.
 const FEED_STREAM: Stream = Stream {
@@ -65,65 +51,12 @@ fn id(stream: Stream) -> StreamId {
     }
 }
 
-/// Emits one batch of observations per step.
-struct Script(Rc<RefCell<VecDeque<Vec<Observation>>>>);
-
-impl ActionSource for Script {
-    fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        if !self.0.borrow().is_empty() {
-            out.push((Identity::peer("script", "next"), 0));
-        }
-    }
-
-    fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
-
-    fn execute(&mut self, _: u64, log: &mut ObservationLog) {
-        for obs in self.0.borrow_mut().pop_front().unwrap_or_default() {
-            log.push(obs);
-        }
-    }
-}
-
 /// Runs `script`, one batch per step, under the generated properties of
-/// `feed` on `FEED_STREAM` and `test` on `TEST_STREAM`. A `node` task stays
-/// ready until the script ends, so the run reaches quiescence only after the
-/// last batch.
+/// `feed` on `FEED_STREAM` and `test` on `TEST_STREAM`.
 fn run_script(script: Vec<Vec<Observation>>) -> RunReport {
     let mut properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
     properties.extend(table_properties("test", &[TEST_STREAM]));
-    run_under(properties, script)
-}
-
-/// Runs `script` as [`run_script`] does, under `properties`.
-fn run_under(properties: Vec<Property<Node>>, script: Vec<Vec<Observation>>) -> RunReport {
-    let mut checker = RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
-        Rc::new(Node),
-        Assumptions::none(),
-        &Sources::observed(&[
-            Source::Frames,
-            Source::Closes,
-            Source::Storage,
-            Source::Schedule,
-        ]),
-    );
-    let batches = Rc::new(RefCell::new(VecDeque::from(script)));
-    // Each step offers the task first, then the script: byte 1 picks the
-    // script while it lasts.
-    run(
-        config(1, 1_000),
-        Plan::from_fuzz(&[1; 64]),
-        |sim| {
-            let left = Rc::clone(&batches);
-            sim.scheduler().spawn_root("node", async move {
-                while !left.borrow().is_empty() {
-                    yield_now().await;
-                }
-            });
-            sim.add_source(Box::new(Script(batches)));
-        },
-        &mut checker,
-    )
+    run_under(properties, OBSERVED, script)
 }
 
 /// A frame the peer sent on `stream`, labelled `label` under `row`.
@@ -136,6 +69,8 @@ fn frame(stream: Stream, seq: u64, row: Option<&str>, label: Label) -> Observati
         rule_stream: id(stream),
         label,
         exhausted: false,
+        exchange: None,
+        payload: 0,
     }
 }
 
@@ -339,6 +274,8 @@ fn a_fault_without_a_fault_close_is_a_violation() {
                 rule_stream: id(TEST_STREAM),
                 label: Label::ReservedFlags,
                 exhausted: false,
+                exchange: None,
+                payload: 0,
             },
             Observation::FrameJudged {
                 connection: 2,
@@ -444,6 +381,8 @@ fn emptying_a_cadence_bucket_is_never_punished() {
         rule_stream: id(TEST_STREAM),
         label: Label::Conformant,
         exhausted: true,
+        exchange: None,
+        payload: 0,
     };
     let report = run_script(vec![
         vec![exhausting, judged(TEST_STREAM, 0)],
@@ -498,6 +437,8 @@ fn every_unjustified_punishment_is_a_violation() {
             rule_stream,
             label,
             exhausted,
+            exchange,
+            payload,
             ..
         } => Observation::PeerFrame {
             connection,
@@ -507,6 +448,8 @@ fn every_unjustified_punishment_is_a_violation() {
             rule_stream,
             label,
             exhausted,
+            exchange,
+            payload,
         },
         Observation::FrameJudged { stream, seq, .. } => Observation::FrameJudged {
             connection,
@@ -666,9 +609,12 @@ fn an_over_credit_page_on_another_stream_belongs_to_its_subscription() {
         rule_stream: id(watch),
         label: Label::OverCredit,
         exhausted: false,
+        exchange: None,
+        payload: 0,
     };
     let report = run_under(
         table_properties("split", &layout),
+        OBSERVED,
         vec![vec![page, judged(pages, 0)], vec![closed("idle_timeout")]],
     );
     let violation = report.end.violation.expect("the page went unpunished");

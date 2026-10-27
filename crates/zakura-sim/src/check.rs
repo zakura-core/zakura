@@ -159,6 +159,14 @@ pub trait Checker {
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         None
     }
+
+    /// Whether the step loop's livelock limit applies after this step. A
+    /// checker returns false while a scenario's `BoundedAdversary`
+    /// assumption doesn't hold. The step loop then restarts its count, so
+    /// the limit covers only steps taken while the assumption holds.
+    fn bounds_livelock(&mut self) -> bool {
+        true
+    }
 }
 
 /// A checker that checks nothing.
@@ -240,5 +248,10 @@ impl<C: Checker + ?Sized> Checker for Box<C> {
     /// Forwards to the checker.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         (**self).harness_failure()
+    }
+
+    /// Forwards to the checker.
+    fn bounds_livelock(&mut self) -> bool {
+        (**self).bounds_livelock()
     }
 }

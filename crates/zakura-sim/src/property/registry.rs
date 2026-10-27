@@ -81,6 +81,12 @@ impl<A: Checker, B: Checker> Checker for Tee<A, B> {
             .harness_failure()
             .or_else(|| self.1.harness_failure())
     }
+
+    /// True only if both bound it. Asks both.
+    fn bounds_livelock(&mut self) -> bool {
+        let first = self.0.bounds_livelock();
+        self.1.bounds_livelock() && first
+    }
 }
 
 /// A harness's properties, with unique IDs.
@@ -244,6 +250,8 @@ pub struct RegistryChecker<S: HasView> {
     events: Vec<CheckEvent>,
     /// The first harness failure not yet reported.
     failure: Option<HarnessFailure>,
+    /// True if the scenario declares `BoundedAdversary`.
+    bounded: bool,
 }
 
 /// One property's progress through a run.
@@ -335,6 +343,7 @@ impl<S: HasView> RegistryChecker<S> {
             holds: assumptions.holds,
             events: Vec::new(),
             failure,
+            bounded: assumptions.declares(Assume::BoundedAdversary),
         }
     }
 
@@ -404,8 +413,22 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     }
 
     /// Reports each property's outcome. An obligation still open now leaves
-    /// the property `Inconclusive`, never `Held`.
-    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+    /// the property `Inconclusive`, never `Held`. A violation that ended the
+    /// run outside the registry, such as the step loop's `sim/no-livelock`,
+    /// belongs to the registered property with its ID.
+    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        if let Some(violation) = &end.violation {
+            let ended = self
+                .properties
+                .iter()
+                .zip(&mut self.state)
+                .find(|(property, _)| property.id.as_str() == violation.property);
+            if let Some((_, state)) = ended {
+                if !state.violations.contains(violation) {
+                    state.violations.push(violation.clone());
+                }
+            }
+        }
         self.properties
             .iter()
             .zip(&self.state)
@@ -427,6 +450,11 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// The first missing source, stale view, or missing evidence, once.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         self.failure.take()
+    }
+
+    /// False while a declared `BoundedAdversary` assumption doesn't hold.
+    fn bounds_livelock(&mut self) -> bool {
+        !self.bounded || (self.holds)(&self.handle, Assume::BoundedAdversary)
     }
 }
 

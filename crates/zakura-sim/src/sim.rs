@@ -368,6 +368,10 @@ impl Sim {
             if let Some(failure) = self.failure.take().or_else(|| checker.harness_failure()) {
                 return st.end_harness(failure);
             }
+            // Steps taken while the checker suspends the limit don't count.
+            if !checker.bounds_livelock() {
+                at_instant = 0;
+            }
             let violation = violation.or_else(|| {
                 let spinning = phase == Phase::Live
                     && self.config.enforce_no_livelock

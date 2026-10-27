@@ -8,8 +8,8 @@
 //!
 //! Every harness checks its properties with the registry
 //! ([`registry_checker`]), plus the step loop's own: [`NO_TASK_PANIC`]
-//! always, and [`NO_LIVELOCK`] when the scenario declares
-//! [`Assume::BoundedAdversary`] ([`run_config`]).
+//! always, and [`NO_LIVELOCK`] while the scenario's
+//! [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
 pub mod coverage;
 pub mod discovery;
@@ -25,7 +25,7 @@ use serde_json::Value;
 pub use record::{record, RecordError, RecordInput};
 
 use crate::{
-    check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
+    check::{Checker, Phase, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
     observe::Exit,
     property::{
@@ -188,7 +188,7 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
         budget: BudgetRecord::from(&config),
         rng: RNG.to_owned(),
         fixtures: Vec::new(),
-        properties: reported::<S>(scenario),
+        properties: registered::<S>(),
         input: None,
         derived_from: None,
     })
@@ -196,7 +196,8 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
 
 /// The run's limits for `scenario`: [`Subsystem::config`], with
 /// [`NO_LIVELOCK`] enforced when the scenario declares
-/// [`Assume::BoundedAdversary`].
+/// [`Assume::BoundedAdversary`]. The step loop counts only steps taken while
+/// the assumption holds ([`Checker::bounds_livelock`]).
 ///
 /// Hostile peers then act a bounded number of times per instant, so a node
 /// that keeps the clock from moving is spinning on its own. The limit sits
@@ -214,20 +215,14 @@ pub fn run_config<S: Subsystem>(scenario: &S::Scenario) -> RunConfig {
 }
 
 /// The checker [`Subsystem::checker`] returns by default: the registry of
-/// the step loop's properties and `S`'s, with a report for [`NO_LIVELOCK`]
-/// after them when the run enforces it.
+/// the step loop's properties and `S`'s.
 pub fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> Box<dyn Checker> {
-    let registry = RegistryChecker::new(
+    Box::new(RegistryChecker::new(
         registry::<S>(),
         Rc::clone(this),
         S::assumptions(scenario),
         &S::sources(),
-    );
-    if run_config::<S>(scenario).enforce_no_livelock {
-        Box::new(Tee(registry, LivelockReport::default()))
-    } else {
-        Box::new(registry)
-    }
+    ))
 }
 
 /// The step loop's properties, then `S`'s.
@@ -237,16 +232,28 @@ pub fn registry_checker<S: Subsystem>(this: &Rc<S>, scenario: &S::Scenario) -> B
 /// If two share an ID. `every_harness_names_its_statuses` builds every
 /// harness's registry.
 fn registry<S: Subsystem>() -> Registry<S> {
-    let mut properties = vec![Property {
-        id: PropertyId::new(NO_TASK_PANIC),
-        claim: "no task panics",
-        kind: Kind::Safety,
-        assumes: &[],
-        needs: &[Source::Schedule],
-        status: Status::Active,
-        check: no_task_panic::<S>,
-        witness: None,
-    }];
+    let mut properties = vec![
+        Property {
+            id: PropertyId::new(NO_TASK_PANIC),
+            claim: "no task panics",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Schedule],
+            status: Status::Active,
+            check: no_task_panic::<S>,
+            witness: None,
+        },
+        Property {
+            id: PropertyId::new(NO_LIVELOCK),
+            claim: "the clock moves within the step limit per instant",
+            kind: Kind::Safety,
+            assumes: &[Assume::BoundedAdversary],
+            needs: &[Source::Schedule],
+            status: Status::Active,
+            check: live_step::<S>,
+            witness: None,
+        },
+    ];
     properties.extend(S::properties());
     Registry::new(properties).unwrap_or_else(|error| panic!("{}: {error}", S::NAME))
 }
@@ -269,23 +276,18 @@ fn no_task_panic<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     }
 }
 
-/// Every property a run of `scenario` reports, in report order, for
-/// `meta.properties`: the registry's, [`NO_LIVELOCK`] if the run enforces
-/// it, then [`Subsystem::UNREGISTERED`].
-fn reported<S: Subsystem>(scenario: &S::Scenario) -> Vec<PropertyRef> {
-    let livelock = run_config::<S>(scenario)
-        .enforce_no_livelock
-        .then(|| PropertyRef {
-            id: NO_LIVELOCK.to_owned(),
-            status: Status::Active,
-        });
-    let mut reported = registry_refs::<S>();
-    reported.extend(livelock);
-    reported.extend(unregistered_refs::<S>());
-    reported
+/// Applies [`NO_LIVELOCK`] at each live step. The step loop finds the
+/// violation, and only while [`Assume::BoundedAdversary`] holds; the
+/// registry reports it as this property's.
+fn live_step<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    match cx.phase {
+        Phase::Live => Verdict::Holds,
+        Phase::Drain => Verdict::NotApplicable,
+    }
 }
 
-/// Every property `S` checks in any scenario, except [`NO_LIVELOCK`].
+/// Every property `S` checks, in report order, for `meta.properties`: the
+/// registry's, then [`Subsystem::UNREGISTERED`].
 fn registered<S: Subsystem>() -> Vec<PropertyRef> {
     let mut registered = registry_refs::<S>();
     registered.extend(unregistered_refs::<S>());
@@ -315,37 +317,6 @@ fn unregistered_refs<S: Subsystem>() -> Vec<PropertyRef> {
         .collect()
 }
 
-/// Reports [`NO_LIVELOCK`], which the step loop checks: violated if it ended
-/// the run, held at every live step otherwise.
-#[derive(Default)]
-struct LivelockReport {
-    live_steps: u32,
-}
-
-impl Checker for LivelockReport {
-    /// Counts the live steps.
-    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        if cx.phase == Phase::Live {
-            self.live_steps = self.live_steps.saturating_add(1);
-        }
-        None
-    }
-
-    /// Reports the property.
-    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
-        let outcome = match &end.violation {
-            Some(violation) if violation.property == NO_LIVELOCK => PropertyOutcome::Violated {
-                witness: violation.witness.clone(),
-            },
-            _ if self.live_steps > 0 => PropertyOutcome::Held {
-                applicable: self.live_steps,
-            },
-            _ => PropertyOutcome::NotApplicable,
-        };
-        vec![PropertyReport::new(NO_LIVELOCK, outcome)]
-    }
-}
-
 /// A harness by name, without its type, so a trace's `meta.sim` can pick
 /// it.
 pub struct HarnessEntry {
@@ -364,19 +335,14 @@ pub struct HarnessEntry {
     /// [`Subsystem::draw`], serialized. The prefix must be exactly
     /// `scenario_bytes` long.
     pub draw: fn(&[u8]) -> Value,
-    /// Every property the harness checks in any scenario, with its status,
-    /// except [`NO_LIVELOCK`], which only some scenarios enforce.
+    /// Every property the harness checks in any scenario, with its status.
     pub properties: fn() -> Vec<PropertyRef>,
 }
 
 impl HarnessEntry {
     /// Property `id`'s status in this harness, as the explorer's classifier
-    /// reads it. [`NO_LIVELOCK`] is always `Active`, in the scenarios that
-    /// enforce it. `None` if the harness never reports `id`.
+    /// reads it. `None` if the harness never reports `id`.
     pub fn status(&self, id: &str) -> Option<Status> {
-        if id == NO_LIVELOCK {
-            return Some(Status::Active);
-        }
         (self.properties)()
             .into_iter()
             .find(|property| property.id == id)
@@ -486,5 +452,10 @@ impl Checker for Dyn<'_> {
     /// Forwards to the checker.
     fn harness_failure(&mut self) -> Option<HarnessFailure> {
         self.0.harness_failure()
+    }
+
+    /// Forwards to the checker.
+    fn bounds_livelock(&mut self) -> bool {
+        self.0.bounds_livelock()
     }
 }

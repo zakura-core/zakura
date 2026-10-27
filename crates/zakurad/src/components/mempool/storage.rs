@@ -387,7 +387,20 @@ impl Storage {
         // Rule: outputs must be standard script kinds, with special handling for OP_RETURN.
         let mut data_out_count = 0u32;
 
+        // A transaction spending from an account passed the account rules, so its control
+        // outputs are the authorized successors and may carry no value.
+        #[cfg(feature = "experimental-pq-transparent")]
+        let spends_account = transaction
+            .inputs()
+            .iter()
+            .zip(spent_outputs.iter())
+            .any(|(input, output)| zakura_script::wots::standard_input(input, output));
+
         for output in transaction.outputs() {
+            #[cfg(feature = "experimental-pq-transparent")]
+            if spends_account && zakura_script::wots::is_control_output(output) {
+                continue;
+            }
             let lock_script = &output.lock_script;
             let script_len = lock_script.as_raw_bytes().len();
             let script_kind = policy::standard_script_kind(lock_script);

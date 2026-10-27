@@ -48,6 +48,9 @@ pub enum Error {
     },
     /// transaction is invalid according to zakura_chain (not a zcash_script error)
     TxInvalid(#[from] zakura_chain::Error),
+    /// The transaction breaks the post-quantum account rules.
+    #[cfg(feature = "experimental-pq-transparent")]
+    Accounts(zcash_transparent::wots::AccountError),
 }
 
 impl fmt::Display for Error {
@@ -62,6 +65,8 @@ impl fmt::Display for Error {
                 format!("{component:?} script failed: {error}")
             }
             Error::TxInvalid(e) => format!("tx is invalid: {e}"),
+            #[cfg(feature = "experimental-pq-transparent")]
+            Error::Accounts(e) => format!("account rules failed: {e}"),
         })
     }
 }
@@ -71,6 +76,10 @@ impl Error {
     ///
     /// Returns false for transaction preparation failures that prevent verification.
     pub fn is_script_failure(&self) -> bool {
+        #[cfg(feature = "experimental-pq-transparent")]
+        if matches!(self, Error::Accounts(_)) {
+            return true;
+        }
         matches!(self, Error::ScriptInvalid | Error::Interpreter { .. })
     }
 }
@@ -102,8 +111,12 @@ pub struct CachedFfiTransaction {
 
     /// The sighasher context to use to compute sighashes.
     sighasher: SigHasher,
+
+    /// The account rules' result for the whole transaction, or `None` before they activate.
     #[cfg(feature = "experimental-pq-transparent")]
-    wots_active: bool,
+    accounts: Option<
+        Result<zcash_transparent::wots::AccountCheck, zcash_transparent::wots::AccountError>,
+    >,
 }
 
 impl CachedFfiTransaction {
@@ -121,19 +134,38 @@ impl CachedFfiTransaction {
             all_previous_outputs,
             sighasher,
             #[cfg(feature = "experimental-pq-transparent")]
-            wots_active: false,
+            accounts: None,
         })
     }
 
-    /// Applies the immutable network and candidate-block height to experimental verification.
+    /// Applies the immutable network and candidate-block height to experimental verification,
+    /// running the account rules once if they are active.
     #[cfg(feature = "experimental-pq-transparent")]
     pub fn with_wots_context(
         mut self,
         network: &zakura_chain::parameters::Network,
         height: zakura_chain::block::Height,
     ) -> Self {
-        self.wots_active = wots::active(network, height);
+        self.accounts = wots::active(network, height).then(|| {
+            wots::check(
+                &self.transaction,
+                &self.all_previous_outputs,
+                &self.sighasher,
+            )
+        });
         self
+    }
+
+    /// Fails if the transaction breaks the account rules.
+    ///
+    /// This covers what per-input verification cannot see, such as a transaction with no
+    /// account inputs creating a control output, so it must run for every transaction.
+    #[cfg(feature = "experimental-pq-transparent")]
+    pub fn wots_accounts(&self) -> Result<(), Error> {
+        match &self.accounts {
+            Some(Err(error)) => Err(Error::Accounts(*error)),
+            _ => Ok(()),
+        }
     }
 
     /// Returns the transparent inputs for this transaction.
@@ -167,13 +199,13 @@ impl CachedFfiTransaction {
     pub fn p2sh_sigops(&self) -> u32 {
         let count = p2sh_sigop_count(&self.transaction, &self.all_previous_outputs);
         #[cfg(feature = "experimental-pq-transparent")]
-        let count = if self.wots_active {
-            count.saturating_add(wots::sigop_cost(
-                &self.transaction,
-                &self.all_previous_outputs,
-            ))
-        } else {
-            count
+        let count = match &self.accounts {
+            Some(Ok(check)) => count.saturating_add(
+                check
+                    .authorizations
+                    .saturating_mul(zcash_transparent::wots::WOTS_SIGOP_COST),
+            ),
+            _ => count,
         };
         count
     }
@@ -188,6 +220,14 @@ impl CachedFfiTransaction {
             .ok_or(Error::TxIndex)?
             .clone();
 
+        // The account rules fully verify account inputs; the interpreter would reject them.
+        #[cfg(feature = "experimental-pq-transparent")]
+        match &self.accounts {
+            Some(Ok(check)) if check.wots_inputs.contains(&input_index) => return Ok(()),
+            Some(Err(error)) => return Err(Error::Accounts(*error)),
+            _ => {}
+        }
+
         let transparent::Output {
             value: _,
             lock_script,
@@ -195,12 +235,6 @@ impl CachedFfiTransaction {
         let script_pub_key: &[u8] = lock_script.as_raw_bytes();
 
         let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
-        #[cfg(feature = "experimental-pq-transparent")]
-        let flags = if self.wots_active {
-            flags | Flags::CHECKWOTS
-        } else {
-            flags
-        };
 
         let lock_time = self.transaction.raw_lock_time();
         let is_final = self.transaction.inputs()[input_index].sequence() == u32::MAX;
@@ -258,19 +292,6 @@ impl CachedFfiTransaction {
             sighash: &calculate_sighash,
             lock_time: i64::from(lock_time),
             is_final,
-        };
-        #[cfg(feature = "experimental-pq-transparent")]
-        let checker = wots::Checker {
-            ecdsa: checker,
-            digest: (self.wots_active
-                && self.transaction.version() == 5
-                && !self.transaction.has_shielded_inputs()
-                && !self.transaction.has_shielded_outputs())
-            .then(|| {
-                self.sighasher()
-                    .sighash(HashType::ALL, Some((input_index, Vec::new())))
-                    .0
-            }),
         };
         match script.eval(flags, &checker) {
             Ok(true) => Ok(()),

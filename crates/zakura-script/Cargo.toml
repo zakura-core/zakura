@@ -15,7 +15,7 @@ keywords.workspace = true
 categories = ["cryptography::cryptocurrencies"]
 
 [features]
-experimental-pq-transparent = ["dep:zcash_transparent", "zcash_transparent/experimental-pq-transparent", "zcash_script/experimental-pq-transparent"]
+experimental-pq-transparent = ["dep:zcash_transparent", "zcash_transparent/experimental-pq-transparent"]
 
 [dependencies]
 zcash_transparent = { workspace = true, optional = true }
@@ -26,7 +26,6 @@ zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-getrandom = { version = "0.4", features = ["sys_rng"] }
 hex = { workspace = true }
 ripemd = { workspace = true }
 secp256k1 = { workspace = true }

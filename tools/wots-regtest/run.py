@@ -43,7 +43,7 @@ def metadata(manifest: Path, features: list[str]) -> list[dict]:
     return json.loads(result.stdout)["packages"]
 
 
-def run_scenario(command: list[str], timeout: float = 300) -> None:
+def run_scenario(command: list[str], timeout: float = 600) -> None:
     """Run the harness in a private Unix process group; stop its node on interruption."""
     process = subprocess.Popen(command, start_new_session=True)
     try:
@@ -78,7 +78,7 @@ def run_demo(node: Path) -> None:
     harness_packages = metadata(harness / "Cargo.toml", [])
     harness_names = {package["name"] for package in harness_packages}
     verify_sources(harness_packages, {name: source for name, source in expected.items() if name in harness_names})
-    for name in ("zcash_script", "zakura-transparent", "zakura-primitives"):
+    for name in ("zakura-zcash-script", "zakura-transparent", "zakura-primitives"):
         if name not in harness_names:
             raise ValueError(f"the harness is missing {name}")
     target = node / "target"

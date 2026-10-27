@@ -644,6 +644,10 @@ where
                     let cached = CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?;
                     #[cfg(feature = "experimental-pq-transparent")]
                     let cached = cached.with_wots_context(&network, req.height());
+                    // Account rules cover the whole transaction, including coinbase and
+                    // transactions without account inputs, so they can't wait for input scripts.
+                    #[cfg(feature = "experimental-pq-transparent")]
+                    cached.wots_accounts()?;
                     Arc::new(cached)
                 };
 

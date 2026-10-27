@@ -9,12 +9,11 @@ publish = false
 [workspace]
 
 [dependencies]
-zcash_address = { package = "zakura-address", git = "https://github.com/zakura-core/common", rev = "939261aa2897361e3769d2b5db5eba4472d5731c" }
-zcash_primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/common", rev = "939261aa2897361e3769d2b5db5eba4472d5731c", default-features = false, features = ["std", "backend-halo2"] }
-zcash_transparent = { package = "zakura-transparent", git = "https://github.com/zakura-core/common", rev = "939261aa2897361e3769d2b5db5eba4472d5731c", features = ["transparent-inputs", "experimental-pq-transparent"] }
-zcash_protocol = { package = "zakura-protocol", git = "https://github.com/zakura-core/common", rev = "939261aa2897361e3769d2b5db5eba4472d5731c" }
-zcash_script = { git = "https://github.com/zakura-core/common", rev = "939261aa2897361e3769d2b5db5eba4472d5731c", package = "zakura-zcash-script" }
-getrandom = { version = "0.4", features = ["sys_rng"] }
+zcash_address = { package = "zakura-address", git = "https://github.com/zakura-core/common", rev = "ae934a04f287c42688f8dd35913a6a0ea9df5e13" }
+zcash_primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/common", rev = "ae934a04f287c42688f8dd35913a6a0ea9df5e13", default-features = false, features = ["std", "backend-halo2"] }
+zcash_transparent = { package = "zakura-transparent", git = "https://github.com/zakura-core/common", rev = "ae934a04f287c42688f8dd35913a6a0ea9df5e13", features = ["transparent-inputs", "experimental-pq-transparent"] }
+zcash_protocol = { package = "zakura-protocol", git = "https://github.com/zakura-core/common", rev = "ae934a04f287c42688f8dd35913a6a0ea9df5e13" }
+zcash_script = { git = "https://github.com/zakura-core/common", rev = "ae934a04f287c42688f8dd35913a6a0ea9df5e13", package = "zakura-zcash-script" }
 secp256k1 = { version = "0.33", features = ["std"] }
 sha2 = "0.10"
 ripemd = "0.1"

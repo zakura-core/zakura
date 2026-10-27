@@ -1,8 +1,11 @@
-# WOTS-only regtest demo
+# Post-quantum account regtest demo
 
-This demo funds a P2SH output whose redeem script is
-`<32-byte WOTS key commitment> CHECKWOTS`. There is no EC fallback or branch
-selector. Ordinary EC outputs remain a separate, unchanged spending type.
+This demo spends from a post-quantum transparent account on an isolated regtest
+node. An account has one fixed P2SH address. The WOTS+ key allowed to spend
+from it changes on every spend: a zero-value control output names the current
+step's four keys, each spend is signed by one of them, and each spend creates
+the control output for the next step. Other payments to the address are spent
+alongside without signatures of their own.
 
 From the Zakura checkout, run:
 
@@ -16,40 +19,40 @@ exit. It does not use a wallet database or an existing node. Python 3.11+ and
 the repository's Rust toolchain are required. Git dependencies must be reachable
 or already present in Cargo's cache.
 
-The scenario mines an ordinary P2PKH EC spend before activation, a WOTS-only
-spend after activation, and another ordinary P2PKH EC spend afterward. It checks
-rejection before activation, altered WOTS signatures, malformed chunks, changed
-public seeds and signed outputs, and EC authorization supplied to a WOTS-only
-output. Transport failures never count as successful rejection.
+The scenario, with every key derived from a fixed test seed:
 
-The spend sends the 2,144-byte signature as four 512-byte chunks and one
-96-byte tail, followed by a single 32-byte public seed and the 34-byte redeem
-script. It never serializes the 67 public-key endpoints. Including push
-encodings, the scriptSig is 2,226 bytes; the complete input is 2,269 bytes.
-This requires 16 transparent input actions and an 80,000-zatoshi fee in the
-scenario.
+1. A first spend is rejected before the account rules activate. Ordinary P2PKH
+   spends are mined before activation and after the scenario.
+2. After activation, the first spend is accepted: one deposit carries the step-0
+   signature, a second deposit is covered by it, and the spend creates step 1.
+3. A late deposit arrives, and the step-1 key spends it while both it and the
+   first spend are still unmined. All three are then mined in one block.
+4. Several attempts at one step:
+   - at step 2, a second attempt by another spare is rejected while the first
+     is pending, and again after the first is mined;
+   - at step 3, an attempt with a short expiry is held back until it expires,
+     is then rejected, and a retry by another spare is mined;
+   - at step 4, a spare index outside the tree is rejected and the last spare
+     is mined.
+5. Forged spends at step 5 are rejected: a control output created without the
+   account's signature, successors at the wrong step, missing or doubled,
+   a deposit spent without any signature, an altered signature or spare path,
+   and a signature by the next step's key.
 
-Both the `experimental-pq-transparent` build feature and an explicit regtest activation
-height are required. Public-network configuration is rejected. Verification
-cost is charged per potential WOTS instruction, including unselected branches;
-the experimental cost is not a measured production cost model.
+Rejections must come from the node with the expected reason; transport failures
+never count.
 
-The `p0mvn/wots-plus` library provides signing and public-key reconstruction.
-The verifier reconstructs all 67 endpoints from the signature, public seed,
-and ordinary input-specific ZIP 244 SIGHASH_ALL digest, using RFC 8391
-section 3.1.6. It then compares
-`SHA256("Zakura/WOTS/key/v1" || public_seed || reconstructed_endpoints)`
-with the output's authenticated commitment. Reconstruction alone is not
-verification: arbitrary signature bytes also produce a candidate key.
-Acceptance relies on WOTS+ unforgeability and the binding of the SHA-256
-commitment. The public seed is included in the committed encoding.
-The full public key is reconstructible by anyone, even though its endpoints
-are absent from the transaction. The threat model is an untrusted spender
-supplying all authorization bytes. Acceptance requires the committed key and
-a valid signature for that transaction. This prototype makes no claim about
-production readiness or an independent cryptographic audit.
+A control input's script signature is 2,258 bytes: the 2,144-byte signature as
+four 512-byte chunks and one 96-byte tail, the 32-byte public seed, the spare
+index and the two 32-byte path hashes. On the first spend, the 36-byte account
+script follows. A covered deposit's script signature is the account script
+alone. Each signature is charged 100 sigops; this is not a measured production
+cost model.
 
-Every WOTS output uses fresh disposable key material. Signing consumes the key;
-retrying sends the same signed bytes. Failure abandons the key and test funds.
-Persistent key journals, seed restoration, rotation, multi-device use, sweeps,
-shielded transfers, PIR, and UI are outside this prototype.
+Both the `experimental-pq-transparent` build feature and an explicit regtest
+activation height are required. Public-network configuration is rejected.
+
+No spare signs two different transactions: the altered-signature and
+altered-path cases alter copies of one signature over the same transaction.
+Durable used-spare records, wallet retry automation, reorg handling, seed
+recovery, multi-device use and UI are outside this prototype.

@@ -100,6 +100,13 @@ pub enum Observation {
         /// True if the frame emptied its row's cadence bucket. Such a frame
         /// is still conformant.
         exhausted: bool,
+        /// The exchange or subscription the frame belongs to, as the peer's
+        /// role models key it: a request's own key, or the key a response,
+        /// page or update names. `None` for an announcement or a frame with
+        /// no key.
+        exchange: Option<u64>,
+        /// The payload's length in bytes, frame header excluded.
+        payload: u64,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
@@ -123,6 +130,80 @@ pub enum Observation {
     Misbehavior {
         /// The connection.
         connection: u64,
+    },
+    /// The node granted credit on a subscription it opened, as the peer's
+    /// subscription model applied the update. A model input: the peer's
+    /// harness emits it, never the node's.
+    CreditGranted {
+        /// The connection.
+        connection: u64,
+        /// The subscription row.
+        subscription: RowAt,
+        /// The subscription's key.
+        exchange: u64,
+        /// The objects the update added.
+        objects: u64,
+        /// The payload bytes the update added.
+        bytes: u64,
+    },
+    /// The peer opened an exchange with the node, owed this much, as the
+    /// peer's exchange model recorded it. A model input, like
+    /// [`Observation::CreditGranted`].
+    ExchangeOwed {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// Frames the node may send before the exchange's ending.
+        frames: u32,
+        /// Payload bytes the node may send, the ending's included.
+        bytes: u64,
+    },
+    /// The node retained, forwarded or handed storage work from the peer's
+    /// response or page frames: an actual effect, which the family's adapter
+    /// reads at the storage or forwarding boundary, whatever code path
+    /// produced it.
+    WorkAdmitted {
+        /// The connection.
+        connection: u64,
+        /// The row of the frames the work came from.
+        frame: RowAt,
+        /// The request or subscription row those frames answer.
+        request: RowAt,
+        /// The exchange or subscription key.
+        exchange: u64,
+        /// Objects, such as headers or blocks.
+        objects: u64,
+        /// Payload bytes.
+        bytes: u64,
+    },
+    /// The node installed an owner for serving the peer's request: an actual
+    /// effect, read where the owner is created.
+    Serving {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// The node wrote a response frame to the peer: an actual effect, read
+    /// at the writer.
+    NodeOutput {
+        /// The connection.
+        connection: u64,
+        /// The frame's row.
+        frame: RowAt,
+        /// The request row it answers.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// The payload's length in bytes.
+        payload: u64,
+        /// True if the row ends the exchange.
+        ends: bool,
     },
     /// An event from a test-only fake action source.
     Fake {
@@ -597,6 +678,32 @@ impl std::fmt::Display for StreamId {
     /// Writes `s<kind>v<version>`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "s{}v{}", self.kind, self.version)
+    }
+}
+
+/// A row of a stream's message table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct RowAt {
+    /// The stream.
+    pub stream: StreamId,
+    /// The row's name.
+    pub row: String,
+}
+
+impl RowAt {
+    /// Row `row` of `stream`.
+    pub fn new(stream: StreamId, row: impl Into<String>) -> Self {
+        RowAt {
+            stream,
+            row: row.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RowAt {
+    /// Writes `s<kind>v<version>/<row>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.stream, self.row)
     }
 }
 

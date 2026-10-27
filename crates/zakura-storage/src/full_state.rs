@@ -106,6 +106,8 @@ impl From<CommittedTransitionError> for StateError {
 #[derive(Clone, Debug)]
 struct Committed {
     block: Arc<block::Block>,
+    /// The block's hash, kept so lookups don't rehash its header.
+    hash: block::Hash,
     height: block::Height,
     /// The verifier's receipt order, which breaks ties between equal-work
     /// chains.
@@ -117,7 +119,7 @@ impl Committed {
     /// more work, then the earlier receipt, then the greater hash. Fixture
     /// blocks all carry the Regtest genesis difficulty, so work is height.
     fn rank(&self) -> (block::Height, Reverse<u64>, [u8; 32]) {
-        (self.height, Reverse(self.receipt), self.block.hash().0)
+        (self.height, Reverse(self.receipt), self.hash.0)
     }
 }
 
@@ -145,6 +147,7 @@ impl VerifiedChain {
             .expect("a genesis block encodes its height");
         VerifiedChain {
             genesis: Committed {
+                hash: genesis.hash(),
                 block: genesis,
                 height,
                 receipt: 0,
@@ -179,7 +182,7 @@ impl VerifiedChain {
     }
 
     fn get(&self, hash: block::Hash) -> Option<&Committed> {
-        if hash == self.genesis.block.hash() {
+        if hash == self.genesis.hash {
             Some(&self.genesis)
         } else {
             self.blocks.get(&hash.0)
@@ -239,7 +242,7 @@ impl VerifiedChain {
         loop {
             path.push(current);
             let parent = current.block.header.previous_block_hash;
-            if parent == self.genesis.block.hash() {
+            if parent == self.genesis.hash {
                 break;
             }
             current = self
@@ -265,12 +268,12 @@ impl VerifiedChain {
     /// `read::hash_by_height` reads it.
     pub fn hash_at(&self, height: block::Height) -> Option<block::Hash> {
         if height == self.genesis.height {
-            return Some(self.genesis.block.hash());
+            return Some(self.genesis.hash);
         }
         self.path_to(self.best_tip().hash)?
             .into_iter()
             .find(|committed| committed.height == height)
-            .map(|committed| committed.block.hash())
+            .map(|committed| committed.hash)
     }
 
     /// The hash of `tip`'s ancestor at `height`, `tip` itself included, or
@@ -284,7 +287,7 @@ impl VerifiedChain {
         while current.height > height {
             current = self.get(current.block.header.previous_block_hash)?;
         }
-        Some(current.block.hash())
+        Some(current.hash)
     }
 
     /// The serialized size of `hash` if it's on the best chain, as
@@ -316,6 +319,7 @@ impl VerifiedChain {
             inserted.0,
             Committed {
                 block,
+                hash: inserted,
                 height,
                 receipt,
             },
@@ -330,7 +334,7 @@ impl VerifiedChain {
                 .filter(|tip| *tip != inserted)
                 .filter_map(|tip| after.blocks.get(&tip.0))
                 .min_by_key(|committed| committed.rank())
-                .map(|committed| committed.block.hash())
+                .map(|committed| committed.hash)
                 .expect("the fork limit leaves room for the inserted chain");
             after.evict_branch(evicted);
         }
@@ -361,13 +365,13 @@ impl VerifiedChain {
 }
 
 fn frontier(committed: &Committed) -> zakura_header_chain::Frontier {
-    zakura_header_chain::Frontier::new(committed.height, committed.block.hash())
+    zakura_header_chain::Frontier::new(committed.height, committed.hash)
 }
 
 fn header_ref(committed: &Committed) -> VerifiedHeaderRef {
     VerifiedHeaderRef {
         height: committed.height,
-        hash: committed.block.hash(),
+        hash: committed.hash,
         header: committed.block.header.clone(),
     }
 }
@@ -1027,4 +1031,56 @@ pub(crate) fn combined_retention_references(
     references.sort_unstable_by_key(|hash| hash.0);
     references.dedup();
     references
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The driver's query reads 4,000 heights per chunk and fails when a
+    /// later chunk reads another anchor.
+    #[test]
+    fn a_query_fails_when_its_anchor_moves_between_chunks() {
+        let anchor =
+            |byte| zakura_header_chain::Frontier::new(block::Height(0), block::Hash([byte; 32]));
+        for moves in [false, true] {
+            let mut reads = Vec::new();
+            let result = query_needed_blocks(
+                block::Height(1),
+                MAX_HEADER_SYNC_HEIGHT_RANGE + 1,
+                |from, limit| {
+                    reads.push((from, limit));
+                    let byte = if moves {
+                        u8::try_from(reads.len()).expect("the query reads two chunks")
+                    } else {
+                        1
+                    };
+                    Ok(BodyMetadata {
+                        anchor: anchor(byte),
+                        blocks: vec![(from, block::Hash([byte; 32]), Some(0))],
+                    })
+                },
+            );
+            assert_eq!(
+                reads,
+                [
+                    (block::Height(1), MAX_HEADER_SYNC_HEIGHT_RANGE),
+                    (block::Height(MAX_HEADER_SYNC_HEIGHT_RANGE + 1), 1),
+                ]
+            );
+            match result {
+                Err(NeededBlocksError::AnchorChanged) => assert!(moves),
+                Ok((body_anchor, blocks)) => {
+                    assert!(!moves);
+                    assert_eq!(body_anchor, anchor(1));
+                    // A size of 0 isn't an estimate.
+                    assert!(blocks
+                        .iter()
+                        .all(|meta| meta.size == BlockSizeEstimate::Unknown));
+                    assert_eq!(blocks.len(), 2);
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
 }

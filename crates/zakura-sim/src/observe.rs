@@ -108,6 +108,31 @@ pub enum Observation {
         /// The payload's length in bytes, frame header excluded.
         payload: u64,
     },
+    /// A frame the node sent on a tabled stream reached a peer, whose role
+    /// models labelled it on arrival under the sender's rules: `OverMargin`
+    /// once the node's open requests exceed the highest limit the peer
+    /// advertised, and `OverLive` once the node's live subscriptions exceed
+    /// `max_live`, without the receiver's margin of twice those. A model
+    /// input, like [`Observation::CreditGranted`].
+    NodeFrame {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame's position among the node's frames on this stream,
+        /// from 0.
+        seq: u64,
+        /// The row whose rule `label` enforces, as for
+        /// [`Observation::PeerFrame`].
+        row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
+        /// The frame's label.
+        label: Label,
+        /// True if the frame emptied its row's cadence bucket in the peer's
+        /// [`crate::model::CadenceModel`].
+        exhausted: bool,
+    },
     /// The node's reader reached the bytes it needs to judge the peer's
     /// frame `seq`. A frame the reader hasn't reached has no judgement.
     FrameJudged {

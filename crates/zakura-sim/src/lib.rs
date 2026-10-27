@@ -25,6 +25,7 @@ pub mod observe;
 pub mod plan;
 pub mod property;
 pub mod record;
+mod sender;
 pub mod sim;
 pub mod storage;
 pub mod table;

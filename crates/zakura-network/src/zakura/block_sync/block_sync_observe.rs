@@ -101,8 +101,11 @@ pub enum BlockEvent {
     },
     /// The shared byte budget's counter changed.
     Budget(BudgetChange),
-    /// A routine handed a body to the sequencer's input. The body's request
-    /// charge stays on the byte budget until the matching [`HandoffEnded`].
+    /// A routine is about to send a body to the sequencer's input. The body's
+    /// request charge stays on the byte budget until the matching
+    /// [`HandoffEnded`]. The routine reports this before the send, and before
+    /// the body's `Queued` holder, because the sequencer can dequeue the body
+    /// as soon as the send succeeds.
     ///
     /// [`HandoffEnded`]: BlockEvent::HandoffEnded
     HandoffStarted {

@@ -3532,6 +3532,7 @@ dependencies = [
  "tokio",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-network",
  "zakura-node-services",
  "zakura-rt",
  "zakura-scheduler",

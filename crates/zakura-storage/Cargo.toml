@@ -17,6 +17,7 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 zakura-chain = { path = "../zakura-chain" }
 zakura-header-chain = { path = "../zakura-header-chain" }
+zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-rt = { path = "../zakura-rt" }
 
@@ -29,6 +30,12 @@ zakura-test = { path = "../zakura-test" }
 # points and act as the run would there.
 [target.'cfg(zakura_sim)'.dev-dependencies]
 zakura-scheduler = { path = "../zakura-scheduler" }
+
+# The block-sync routine's body checks and payload decoder, for the fixture
+# tests. The simulator build exposes them without the feature, which doesn't
+# compile there.
+[target.'cfg(not(zakura_sim))'.dev-dependencies]
+zakura-network = { path = "../zakura-network", features = ["zakura-testkit"] }
 
 [lints]
 workspace = true

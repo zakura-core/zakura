@@ -154,6 +154,13 @@ impl EnginePort {
         self.leases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The body size the engine's retained auxiliary deliveries advertise
+    /// for `hash`, which block sync's missing-body query reads as the body's
+    /// size estimate.
+    pub fn advertised_body_size(&self, hash: block::Hash) -> Option<std::num::NonZeroU32> {
+        AuxDelivery::advertised_body_size(self.engine().aux_deliveries(hash))
+    }
+
     /// How many retained-path leases are live, and so hold serving capacity.
     pub fn live_leases(&self) -> usize {
         self.leases().live()

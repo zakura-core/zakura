@@ -182,7 +182,7 @@ fn count_and_all_wait_for_every_part() {
 
     let both = Trigger::All(vec![
         Trigger::ReplyTaken(Select::nth(OpKind::Membership, 1)),
-        Trigger::Closed("mira".to_owned()),
+        Trigger::Closed("mirror-0".to_owned()),
     ]);
     for link_first in [false, true] {
         let mut predicates =
@@ -192,7 +192,7 @@ fn count_and_all_wait_for_every_part() {
         let prepare = pending(1, OpKind::Prepare, Duration::ZERO);
         let parts: [&dyn Fn(&mut Predicates); 2] =
             [&|p| p.record(&StorageFact::ReplyTaken { id: 2 }), &|p| {
-                p.record_link(LinkEffect::Closed, "mira")
+                p.record_link(LinkEffect::Closed, "mirror-0")
             }];
         let (first, second) = if link_first {
             (parts[1], parts[0])
@@ -202,7 +202,7 @@ fn count_and_all_wait_for_every_part() {
         first(&mut predicates);
         assert_eq!(offered(&predicates, Base::Any, &prepare), []);
         // A link that was only made doesn't count as closed.
-        predicates.record_link(LinkEffect::Linked, "mira");
+        predicates.record_link(LinkEffect::Linked, "mirror-0");
         assert_eq!(offered(&predicates, Base::Any, &prepare), []);
         second(&mut predicates);
         assert_eq!(offered(&predicates, Base::Any, &prepare), [Outcome::Engine]);
@@ -274,7 +274,7 @@ fn answers(predicates: &Predicates) -> String {
             ));
         }
     }
-    let gate = Trigger::Count(2, Box::new(Trigger::Linked("mira".to_owned())));
+    let gate = Trigger::Count(2, Box::new(Trigger::Linked("mirror-0".to_owned())));
     let mut gate_bounds = Vec::new();
     predicates.control_boundaries(&Trigger::VirtualTime(7_200_000), now, &mut gate_bounds);
     out.push(format!(
@@ -307,9 +307,9 @@ fn policy_is_pure_between_steps() {
     let script: Vec<Record> = vec![
         Box::new(|p| p.record(&submitted(1, OpKind::Locator, 0))),
         Box::new(|p| p.record(&submitted(2, OpKind::Apply, 1))),
-        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mirror-0")),
         Box::new(|p| p.record(&StorageFact::CallerDropped { id: 1 })),
-        Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),
+        Box::new(|p| p.record_link(LinkEffect::Linked, "mirror-0")),
     ];
     let mut predicates = Predicates::new(holds.clone());
     let mut seen = vec![answers(&predicates)];

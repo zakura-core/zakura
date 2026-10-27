@@ -282,7 +282,7 @@ fn control_close_ends_both_sides_of_the_session() {
     }
 }
 
-/// Each storage fact of Nora's for operations of `kind`, with the virtual
+/// Each storage fact of the node's for operations of `kind`, with the virtual
 /// time it was logged at in nanoseconds and its step.
 fn facts_of(report: &RunReport, kind: fn(&StorageRequest) -> bool) -> Vec<(u64, u64, StorageFact)> {
     let (mut now, mut ids) = (0, std::collections::BTreeSet::new());
@@ -312,7 +312,7 @@ fn facts_of(report: &RunReport, kind: fn(&StorageRequest) -> bool) -> Vec<(u64, 
     out
 }
 
-/// Nora's first apply, held for 10 s of virtual time, completes no sooner
+/// The node's first apply, held for 10 s of virtual time, completes no sooner
 /// than that, while every other operation follows the 5 s bound.
 #[test]
 fn held_apply_waits_for_its_virtual_time() {
@@ -349,13 +349,13 @@ fn held_apply_waits_for_its_virtual_time() {
     }
 }
 
-/// A `Control` step gated on Nora's first apply completing is never picked
+/// A `Control` step gated on the node's first apply completing is never picked
 /// before that completion.
 #[test]
 fn control_step_waits_for_its_trigger() {
     let scenario = StorageScenario {
         controls: vec![ControlStep {
-            peer: "mira".to_owned(),
+            peer: "mirror-0".to_owned(),
             action: ControlAction::Close,
             when: Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
         }],
@@ -372,7 +372,7 @@ fn control_step_waits_for_its_trigger() {
         let close = report
             .picks
             .iter()
-            .find(|pick| pick.identity == "peer:mira:close")
+            .find(|pick| pick.identity == "peer:mirror-0:close")
             .expect("the close opens and is picked")
             .step;
         // An early close can also stop the sync, so no apply completes.
@@ -386,13 +386,13 @@ fn control_step_waits_for_its_trigger() {
 /// A `Control` step on `peer`.
 fn step(action: ControlAction, when: Option<Trigger>) -> ControlStep {
     ControlStep {
-        peer: "mira".to_owned(),
+        peer: "mirror-0".to_owned(),
         action,
         when,
     }
 }
 
-/// `Closed` counts connections, not close calls. Closing Mira's link twice
+/// `Closed` counts connections, not close calls. Closing `mirror-0`'s link twice
 /// closes one connection, so a relink gated on two closures never opens.
 /// Closing a second, relinked connection does open it.
 #[test]
@@ -400,13 +400,13 @@ fn closing_twice_counts_one_closure() {
     let closures = |n| {
         Some(Trigger::Count(
             n,
-            Box::new(Trigger::Closed("mira".to_owned())),
+            Box::new(Trigger::Closed("mirror-0".to_owned())),
         ))
     };
     let links = |n| {
         Some(Trigger::Count(
             n,
-            Box::new(Trigger::Linked("mira".to_owned())),
+            Box::new(Trigger::Linked("mirror-0".to_owned())),
         ))
     };
     let twice = StorageScenario {
@@ -430,30 +430,30 @@ fn closing_twice_counts_one_closure() {
         let (report, _) = run(&twice, input.clone());
         let picks: Vec<&str> = report.picks.iter().map(|p| p.identity.as_str()).collect();
         let count = |action| picks.iter().filter(|pick| **pick == action).count();
-        assert_eq!(count("peer:mira:close"), 2);
-        assert_eq!(count("peer:mira:relink"), 0, "one connection closed");
+        assert_eq!(count("peer:mirror-0:close"), 2);
+        assert_eq!(count("peer:mirror-0:relink"), 0, "one connection closed");
 
         let (report, _) = run(&distinct, input);
         let relinks = report
             .picks
             .iter()
-            .filter(|pick| pick.identity == "peer:mira:relink")
+            .filter(|pick| pick.identity == "peer:mirror-0:relink")
             .count();
         assert_eq!(relinks, 2, "two connections closed");
     }
 }
 
-/// Mira grows to A6 mid-run, through her own port. Once the growth is
-/// witnessed, `Control` closes her link and relinks her, and Nora follows
-/// her to the new tip.
+/// `mirror-0` grows to A6 mid-run, through its own port. Once the growth is
+/// witnessed, `Control` closes its link and relinks it, and the node follows
+/// it to the new tip.
 #[test]
-fn a_grown_mirror_leads_nora_to_its_new_tip() {
-    let mira = || "mira".to_owned();
+fn a_grown_mirror_leads_the_node_to_its_new_tip() {
+    let mirror = || "mirror-0".to_owned();
     let scenario = StorageScenario {
         controls: vec![
             step(ControlAction::Grow { len: 1 }, None),
-            step(ControlAction::Close, Some(Trigger::Grown(mira()))),
-            step(ControlAction::Relink, Some(Trigger::Closed(mira()))),
+            step(ControlAction::Close, Some(Trigger::Grown(mirror()))),
+            step(ControlAction::Relink, Some(Trigger::Closed(mirror()))),
         ],
         ..StorageScenario::default()
     };
@@ -462,21 +462,21 @@ fn a_grown_mirror_leads_nora_to_its_new_tip() {
         let relinked = report
             .picks
             .iter()
-            .any(|pick| pick.identity == "peer:mira:relink");
+            .any(|pick| pick.identity == "peer:mirror-0:relink");
         assert!(relinked, "the growth, close and relink all happened");
         let a6 = Chain::main(6).tip(&ports.fixture);
         assert_eq!(ports.mirrors[0].snapshot().frontiers.header_best, a6);
         assert_eq!(
             ports.node.engine().snapshot().frontiers.header_best,
             a6,
-            "Nora reaches Mira's new tip"
+            "the node reaches mirror-0's new tip"
         );
     }
 }
 
 /// A `Grow` that storage can't admit fails the run instead of counting as
-/// grown. Mira starts 64,000 headers past A5 with finality at genesis, so
-/// growing her by 4,000 more passes the 65,536 retained-header limit, and
+/// grown. `mirror-0` starts 64,000 headers past A5 with finality at genesis,
+/// so growing it by 4,000 more passes the 65,536 retained-header limit, and
 /// the apply stalls without admitting the target.
 #[test]
 fn a_stalled_growth_fails_the_run() {
@@ -497,23 +497,23 @@ fn a_stalled_growth_fails_the_run() {
             step(ControlAction::Grow { len: 4_000 }, None),
             step(
                 ControlAction::Close,
-                Some(Trigger::Grown("mira".to_owned())),
+                Some(Trigger::Grown("mirror-0".to_owned())),
             ),
         ],
         ..StorageScenario::default()
     };
     let ports = Storage::prepare(&scenario);
-    let mira = &ports.mirrors[0];
+    let mirror = &ports.mirrors[0];
     for request_id in 1..=16 {
-        let tip: Frontier = mira.snapshot().frontiers.header_best;
+        let tip: Frontier = mirror.snapshot().frontiers.header_best;
         let headers = ports.fixture.extend(tip, 4_000, 0);
         let request = ports
             .fixture
-            .target_request(&mira.snapshot(), tip, &headers, request_id);
-        let prepared = ready(mira.prepare_header_target(request)).expect("a batch prepares");
-        ready(mira.apply_header_target(prepared)).expect("a batch applies");
+            .target_request(&mirror.snapshot(), tip, &headers, request_id);
+        let prepared = ready(mirror.prepare_header_target(request)).expect("a batch prepares");
+        ready(mirror.apply_header_target(prepared)).expect("a batch applies");
     }
-    let before = mira.snapshot().frontiers.header_best;
+    let before = mirror.snapshot().frontiers.header_best;
     assert_eq!(before.height.0, 64_005);
 
     let error = run_prepared::<Storage>(
@@ -530,15 +530,15 @@ fn a_stalled_growth_fails_the_run() {
     assert!(failure.to_string().contains("ControlFailed"), "{failure}");
     assert!(failure.to_string().contains("ResourceStalled"), "{failure}");
     assert_eq!(
-        mira.snapshot().frontiers.header_best,
+        mirror.snapshot().frontiers.header_best,
         before,
-        "Mira didn't grow"
+        "mirror-0 didn't grow"
     );
     assert!(
         !report
             .picks
             .iter()
-            .any(|pick| pick.identity == "peer:mira:close"),
+            .any(|pick| pick.identity == "peer:mirror-0:close"),
         "the gated close never opened"
     );
 }

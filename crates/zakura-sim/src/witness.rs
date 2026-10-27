@@ -170,15 +170,20 @@ fn judge(
         .find(|r| r.property == property)
         .ok_or(WitnessError::MissingReport)?
         .outcome;
-    // A violation that stopped the run, or that any other property reports,
-    // is unrelated to this one, except where the test expects violations
-    // only of properties that don't stop the run.
+    // Another property's violation is unrelated to this one: one that
+    // stopped the run fails every expectation, and one that didn't fails
+    // all but `Applicable`.
     let unrelated = report
         .properties
         .iter()
         .filter(|r| r.property != property)
         .find(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }));
-    let stopped_by = report.end.violation.as_ref().map(|v| v.property.as_str());
+    let stopped_by = report
+        .end
+        .violation
+        .as_ref()
+        .map(|v| v.property.as_str())
+        .filter(|p| *p != property);
     match expect {
         Expect::Holds | Expect::Applicable => {
             if let Some(stopped_by) = stopped_by {
@@ -197,7 +202,7 @@ fn judge(
             }
         }
         Expect::Violated => {
-            if let Some(stopped_by) = stopped_by.filter(|p| *p != property) {
+            if let Some(stopped_by) = stopped_by {
                 return Err(WitnessError::Unrelated {
                     property: stopped_by.to_owned(),
                 });
@@ -215,5 +220,59 @@ fn judge(
                 (outcome, _) => Err(WitnessError::Outcome(outcome.clone())),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{check::PropertyReport, RunEnd, Violation};
+
+    /// A report whose run `property` stopped with a violation.
+    fn stopped_by(property: &str) -> RunReport {
+        RunReport {
+            end: RunEnd {
+                outcome: Outcome::Violation,
+                steps: 3,
+                violation: Some(Violation {
+                    property: property.to_owned(),
+                    step: 3,
+                    witness: vec![3],
+                    expected: String::new(),
+                    actual: String::new(),
+                }),
+                drain: None,
+                harness: None,
+            },
+            properties: vec![PropertyReport::new(
+                property,
+                PropertyOutcome::Violated { witness: vec![3] },
+            )],
+            cleanup: Default::default(),
+            log: Default::default(),
+            picks: Vec::new(),
+            resolved: Default::default(),
+        }
+    }
+
+    /// A run the property itself stopped fails `Holds` and `Applicable`
+    /// with the property's own outcome, not as an unrelated violation, and
+    /// passes `Violated`.
+    #[test]
+    fn own_violation_is_the_outcome() {
+        let report = stopped_by("test/own");
+        for expect in [Expect::Holds, Expect::Applicable] {
+            assert_eq!(
+                judge(&report, "test/own", Status::Active, expect),
+                Err(WitnessError::Outcome(PropertyOutcome::Violated {
+                    witness: vec![3]
+                })),
+                "{expect:?}"
+            );
+        }
+        assert_eq!(
+            judge(&report, "test/own", Status::Active, Expect::Violated),
+            Ok(())
+        );
     }
 }

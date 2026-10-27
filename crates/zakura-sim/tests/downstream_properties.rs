@@ -129,6 +129,7 @@ fn work(
         exchange,
         objects,
         bytes,
+        ends: false,
     }
 }
 
@@ -382,12 +383,23 @@ fn item_work(objects: u64, bytes: u64) -> Observation {
 
 /// The node granting `objects` and `bytes` on subscription 3.
 fn granted(objects: u64, bytes: u64) -> Observation {
+    credit(objects, bytes, false)
+}
+
+/// The node opening subscription 3 with `objects` and `bytes` of credit.
+fn opened(objects: u64, bytes: u64) -> Observation {
+    credit(objects, bytes, true)
+}
+
+/// The node's update to subscription 3, adding `objects` and `bytes`.
+fn credit(objects: u64, bytes: u64, opens: bool) -> Observation {
     Observation::CreditGranted {
         connection: 1,
         subscription: row(FEED_STREAM, "watch"),
         exchange: 3,
         objects,
         bytes,
+        opens,
     }
 }
 
@@ -396,7 +408,7 @@ fn granted(objects: u64, bytes: u64) -> Observation {
 #[test]
 fn work_within_granted_credit_holds() {
     let report = run_script(vec![
-        vec![granted(2, 32)],
+        vec![opened(2, 32)],
         vec![
             frame(FEED_STREAM, 0, "item", Label::Conformant, 3, 30),
             judged(FEED_STREAM, 0),
@@ -414,7 +426,7 @@ fn work_within_granted_credit_holds() {
 fn work_beyond_granted_credit_fails() {
     for (objects, bytes) in [(5, 10), (1, 40)] {
         let report = run_script(vec![
-            vec![granted(4, 32)],
+            vec![opened(4, 32)],
             vec![
                 frame(FEED_STREAM, 0, "item", Label::Conformant, 3, 32),
                 judged(FEED_STREAM, 0),
@@ -427,6 +439,51 @@ fn work_beyond_granted_credit_fails() {
             report.properties
         );
     }
+}
+
+/// A terminal outcome spends no credit: pages that use all the granted
+/// bytes, then the `ended` frame's work, hold.
+#[test]
+fn terminal_work_spends_no_credit() {
+    let mut ended = work(
+        row(FEED_STREAM, "ended"),
+        1,
+        row(FEED_STREAM, "watch"),
+        3,
+        0,
+        8,
+    );
+    if let Observation::WorkAdmitted { ends, .. } = &mut ended {
+        *ends = true;
+    }
+    let report = run_script(vec![
+        vec![opened(1, 32)],
+        vec![
+            frame(FEED_STREAM, 0, "item", Label::Conformant, 3, 32),
+            frame(FEED_STREAM, 1, "ended", Label::Conformant, 3, 8),
+            judged(FEED_STREAM, 0),
+            judged(FEED_STREAM, 1),
+        ],
+        vec![item_work(1, 32), ended],
+    ]);
+    assert_eq!(report.end.violation, None);
+    assert!(held(&report, CREDIT), "{:?}", report.properties);
+}
+
+/// A key that opens again starts from its new grant: credit its earlier
+/// subscription left unused doesn't cover the new one's work.
+#[test]
+fn a_reopened_key_starts_from_its_new_grant() {
+    let report = run_script(vec![
+        vec![opened(4, 64)],
+        vec![opened(1, 64)],
+        vec![
+            frame(FEED_STREAM, 0, "item", Label::Conformant, 3, 32),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![item_work(2, 32)],
+    ]);
+    assert!(violated(&report, CREDIT), "{:?}", report.properties);
 }
 
 /// The node starting to serve `get` request `exchange`.
@@ -536,6 +593,16 @@ fn owners_outliving_their_requests_fail() {
     );
 }
 
+/// The peer's conformant `get` request 1, judged, owed `frames` parts and
+/// `bytes`.
+fn requested(frames: u32, bytes: u64) -> Vec<Observation> {
+    vec![
+        frame(TEST_STREAM, 0, "get", Label::Conformant, 1, 4),
+        judged(TEST_STREAM, 0),
+        owed(frames, bytes),
+    ]
+}
+
 /// The peer opening `get` exchange 1 with the node, owed `frames` parts
 /// and `bytes`.
 fn owed(frames: u32, bytes: u64) -> Observation {
@@ -564,7 +631,7 @@ fn output(response: &str, payload: u64) -> Observation {
 #[test]
 fn output_within_what_is_owed_holds() {
     let report = run_script(vec![
-        vec![owed(2, 40)],
+        requested(2, 40),
         vec![output("part", 16)],
         vec![output("part", 16)],
         vec![output("done", 4)],
@@ -572,6 +639,7 @@ fn output_within_what_is_owed_holds() {
     assert_eq!(report.end.violation, None);
     assert!(held(&report, QUANTITY), "{:?}", report.properties);
     assert!(held(&report, QUANTITY_DONE), "{:?}", report.properties);
+    assert!(held(&report, SERVING), "{:?}", report.properties);
 }
 
 /// Output above the owed frames or bytes fails, as does output for an
@@ -583,7 +651,7 @@ fn output_above_what_is_owed_fails() {
         (
             "a third part",
             vec![
-                vec![owed(2, 100)],
+                requested(2, 100),
                 vec![output("part", 1), output("part", 1)],
                 vec![output("part", 1)],
             ],
@@ -592,7 +660,7 @@ fn output_above_what_is_owed_fails() {
         (
             "bytes past the ending's room",
             vec![
-                vec![owed(2, 20)],
+                requested(2, 20),
                 vec![output("part", 18)],
                 vec![output("done", 4)],
             ],
@@ -602,7 +670,7 @@ fn output_above_what_is_owed_fails() {
         (
             "after the ending",
             vec![
-                vec![owed(2, 20)],
+                requested(2, 20),
                 vec![output("done", 4)],
                 vec![output("part", 1)],
             ],
@@ -611,7 +679,7 @@ fn output_above_what_is_owed_fails() {
         (
             "after the connection closed",
             vec![
-                vec![owed(2, 40)],
+                requested(2, 40),
                 vec![closed("idle_timeout")],
                 vec![output("part", 8)],
             ],
@@ -620,10 +688,55 @@ fn output_above_what_is_owed_fails() {
     ];
     for (case, script, property) in cases {
         let report = run_script(script);
-        assert_eq!(
-            report.end.violation.map(|v| v.property).as_deref(),
-            Some(property),
-            "{case}"
+        assert!(
+            violated(&report, property),
+            "{case}: {:?}",
+            report.properties
         );
     }
+}
+
+/// Output answers only an open conformant request. A node that answers an
+/// over-margin request without starting an owner fails, though the peer's
+/// model recorded what the exchange owes and the ordinary over-margin check
+/// holds.
+#[test]
+fn answering_an_over_margin_request_fails() {
+    let report = run_script(vec![
+        vec![frame(TEST_STREAM, 0, "get", Label::OverMargin, 1, 4)],
+        vec![
+            judged(TEST_STREAM, 0),
+            owed(2, 40),
+            output("done", 4),
+            closed("request_protocol_reject"),
+        ],
+    ]);
+    assert!(held(&report, OVER_MARGIN), "{:?}", report.properties);
+    assert!(held(&report, QUANTITY_DONE), "{:?}", report.properties);
+    let violation = report
+        .end
+        .violation
+        .expect("no conformant request was open");
+    assert_eq!(violation.property, SERVING);
+    assert!(
+        violation.actual.contains("no request open"),
+        "{violation:?}"
+    );
+}
+
+/// `receiver-serving-bounded` needs the node's outputs as well as its
+/// owners, since an ending closes a request: an adapter that observes only
+/// owners can't register it.
+#[test]
+fn serving_needs_outputs_too() {
+    let ids = |effects| {
+        downstream_properties::<Node>("test", &[TEST_STREAM], effects)
+            .into_iter()
+            .map(|p| p.id.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(!ids(&[Effect::Serving]).iter().any(|id| id == SERVING));
+    assert!(ids(&[Effect::Serving, Effect::Output])
+        .iter()
+        .any(|id| id == SERVING));
 }

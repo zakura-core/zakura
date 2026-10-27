@@ -53,7 +53,8 @@ pub enum Template {
     /// Per subscription row: the node's work from a subscription's pages
     /// stays within the credit it granted.
     CreditConserved,
-    /// Per request row: the node serves only conformant requests, once each.
+    /// Per request row: the node serves and answers only conformant
+    /// requests, with one owner each.
     ServingBounded,
     /// Per response row: the node's output for an exchange stays within
     /// what the peer's request owes.
@@ -106,7 +107,9 @@ impl Template {
             Template::CreditConserved => {
                 "the node's work from a subscription stays within the credit it granted"
             }
-            Template::ServingBounded => "the node serves only conformant requests, once each",
+            Template::ServingBounded => {
+                "the node serves and answers only conformant requests, with one owner each"
+            }
             Template::SenderWithinResponseQuantity => {
                 "the node's responses stay within what the request owes"
             }
@@ -236,7 +239,8 @@ pub enum Effect {
     /// [`Observation::Serving`] and [`Observation::ServingEnded`], for
     /// `receiver-serving-bounded`.
     Serving,
-    /// [`Observation::NodeOutput`], for `sender-within-response-quantity`.
+    /// [`Observation::NodeOutput`], for `sender-within-response-quantity`
+    /// and `receiver-serving-bounded`.
     Output,
 }
 
@@ -245,7 +249,8 @@ pub enum Effect {
 /// [`Effect::Work`] and `sender-within-response-quantity` with
 /// [`Effect::Output`]; per subscription row, `receiver-credit-conserved`
 /// with [`Effect::Work`]; per request row, `receiver-serving-bounded` with
-/// [`Effect::Serving`]. A stream with no table yields none.
+/// both [`Effect::Serving`] and [`Effect::Output`], since the node's
+/// endings close its requests. A stream with no table yields none.
 ///
 /// # Panics
 ///
@@ -261,21 +266,23 @@ pub fn downstream_properties<S: HasView>(
             continue;
         };
         for rule in rules {
-            let templates: &[(Effect, Template)] = match rule.role {
+            let templates: &[(&[Effect], Template)] = match rule.role {
                 MessageRole::Announcement { .. } => &[],
-                MessageRole::Request { .. } => &[(Effect::Serving, Template::ServingBounded)],
+                MessageRole::Request { .. } => {
+                    &[(&[Effect::Serving, Effect::Output], Template::ServingBounded)]
+                }
                 // A request's exchange owes frames and bytes, which the
                 // output check reads. A subscription's pages spend credit,
                 // which it doesn't.
                 MessageRole::Response { request, .. } if answers_request(streams, request) => &[
-                    (Effect::Work, Template::WorkAuthorized),
-                    (Effect::Output, Template::SenderWithinResponseQuantity),
+                    (&[Effect::Work], Template::WorkAuthorized),
+                    (&[Effect::Output], Template::SenderWithinResponseQuantity),
                 ],
-                MessageRole::Response { .. } => &[(Effect::Work, Template::WorkAuthorized)],
-                MessageRole::Subscription { .. } => &[(Effect::Work, Template::CreditConserved)],
+                MessageRole::Response { .. } => &[(&[Effect::Work], Template::WorkAuthorized)],
+                MessageRole::Subscription { .. } => &[(&[Effect::Work], Template::CreditConserved)],
             };
-            for &(effect, template) in templates {
-                if effects.contains(&effect) {
+            for &(needed, template) in templates {
+                if needed.iter().all(|effect| effects.contains(effect)) {
                     properties.push(generated(GeneratedId {
                         family,
                         stream: StreamId {

@@ -145,6 +145,9 @@ pub enum Observation {
         objects: u64,
         /// The payload bytes the update added.
         bytes: u64,
+        /// True if the update opened the subscription. A key the peer's
+        /// model has forgotten may open again, and its credit starts over.
+        opens: bool,
     },
     /// The peer opened an exchange with the node, owed this much, as the
     /// peer's exchange model recorded it. A model input, like
@@ -183,6 +186,9 @@ pub enum Observation {
         objects: u64,
         /// Payload bytes.
         bytes: u64,
+        /// True if `frame`'s row ends the exchange, as a subscription's
+        /// terminal outcome does.
+        ends: bool,
     },
     /// The node installed an owner for serving the peer's request: an actual
     /// effect, read where the owner is created.

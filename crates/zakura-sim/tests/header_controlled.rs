@@ -1165,6 +1165,32 @@ fn storage_the_run_never_observes_fails_at_setup() {
     assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
+/// Storage binds its port at setup, so a port used between its creation
+/// and the setup observation fails setup, rather than handing the run
+/// facts from before it was bound.
+#[test]
+fn a_port_used_before_setup_fails_it() {
+    let report = run(
+        storage_config(100),
+        PlanInput::Bytes(Vec::new()),
+        |sim| {
+            let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+            let storage = zakura_sim::storage::HeaderStorage::new(sim, Arc::clone(&port));
+            let mut call = port.selected_chain_contains(HeaderFixture::regtest().anchor().hash);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            sim.add_source(Box::new(storage));
+        },
+        &mut zakura_sim::NoChecks,
+    );
+    assert_eq!(report.end.outcome, Outcome::Harness);
+    assert_eq!(report.end.steps, 0, "setup fails");
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(detail.starts_with("activity before binding"), "{detail}");
+}
+
 /// A storage source that forwards everything to `inner`, but at step `at`
 /// observes into a copy of the log and logs what it delivered there after
 /// `edit` changes it, as a wrapper that normalizes or redacts might.

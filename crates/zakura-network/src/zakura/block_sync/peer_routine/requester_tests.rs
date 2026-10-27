@@ -743,7 +743,8 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let released = routine
         .work
         .release_answered_elsewhere(owner, height)
-        .expect("the request still owns its reserved height");
+        .expect("the request still owns its reserved height")
+        .released;
     routine.budget.release(released);
     assert!(routine
         .registry

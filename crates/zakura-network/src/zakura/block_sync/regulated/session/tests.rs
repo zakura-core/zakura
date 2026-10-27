@@ -304,11 +304,17 @@ async fn live_ranges_and_leases_follow_a_blocked_read() {
     session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
     assert_eq!(served(&mut output).await, done(1, 1));
-    let settled = |session: &mut ServingSession, ranges: &[(Height, Height)], slots| {
-        session.live_ranges() == ranges && serving.leases_held(&peer).0 == slots
+    let settled = |session: &ServingSession, ranges: &[(Height, Height)], slots| {
+        let live: Vec<_> = session
+            .admitted_ranges()
+            .iter()
+            .filter(|range| !range.ended)
+            .map(|range| (range.first, range.last))
+            .collect();
+        live == ranges && serving.leases_held(&peer).0 == slots
     };
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !settled(&mut session, &[(Height(2), Height(2))], 1) {
+        while !settled(&session, &[(Height(2), Height(2))], 1) {
             tokio::task::yield_now().await;
         }
     })
@@ -319,7 +325,7 @@ async fn live_ranges_and_leases_follow_a_blocked_read() {
     assert_eq!(served(&mut output).await, Served::Block(Height(2)));
     assert_eq!(served(&mut output).await, done(2, 1));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !settled(&mut session, &[], 0) {
+        while !settled(&session, &[], 0) {
             tokio::task::yield_now().await;
         }
     })
@@ -536,4 +542,34 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     session.admit(Range::new(Height(18), 1).unwrap()).unwrap();
     session.admit(Range::new(Height(1), 4).unwrap()).unwrap();
     cancel.cancel();
+}
+
+/// Review P5a-2: the range snapshot is read-only. A range whose ending is
+/// published stays recorded, marked ended, until the next admission removes
+/// it, and reading the snapshot changes neither the map nor the queue.
+#[tokio::test]
+async fn admitted_ranges_leave_owner_state_unchanged() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=1),
+        ..Default::default()
+    });
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+    assert_eq!(served(&mut output).await, done(1, 1));
+    let ranges = session.ranges.clone();
+    let published = session.completed.published();
+    let observed = session.admitted_ranges();
+    assert_eq!(session.admitted_ranges(), observed);
+    assert_eq!(session.ranges, ranges);
+    assert_eq!(session.completed.published(), published);
+    cancel.cancel();
+    assert_eq!(
+        observed,
+        [AdmittedRange {
+            first: Height(1),
+            last: Height(1),
+            ended: true,
+        }]
+    );
 }

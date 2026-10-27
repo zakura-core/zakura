@@ -2139,8 +2139,9 @@ impl PeerRoutine {
         // stale charge on the claimed height); released after the forward below.
         // A pending height's body is admitted on its wire size, so it carries no
         // request estimate. A body that answers a competing request carries that
-        // request's per-height charge, read above; the released total can also
-        // hold the bytes of a retired unsent request.
+        // request's per-height charge, read by the same owner-checked release
+        // that ends it; the released total can also hold the bytes of a retired
+        // unsent request.
         let (ended_reservation, admitted_estimate_bytes) = if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
@@ -2166,11 +2167,11 @@ impl PeerRoutine {
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
+            let Some(ended) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            (estimate, reserved_in_flight)
+            (ended.released, Some(ended.charge))
         };
 
         let decoded_attributed_memory_size_bytes =

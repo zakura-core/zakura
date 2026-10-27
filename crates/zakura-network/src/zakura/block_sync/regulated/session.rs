@@ -157,6 +157,17 @@ impl Serving {
     }
 }
 
+/// One range a serving session records, as an owner snapshot reads it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedRange {
+    pub(crate) first: Height,
+    pub(crate) last: Height,
+    /// The session published the range's ending. The next admission removes
+    /// the record.
+    pub(crate) ended: bool,
+}
+
 pub(crate) struct ServingSession {
     serve: Serve<Server<dyn Source>>,
     ranges: BTreeMap<Height, (Height, CompletionId)>,
@@ -190,15 +201,19 @@ impl ServingSession {
         Ok(())
     }
 
-    /// Each admitted range, as its first and last height, whose ending the
-    /// session hasn't published. Drains published endings first, as
-    /// [`Self::admit`] does.
+    /// Every range the session records, with whether its ending is
+    /// published. Reads the range map and the completion queue without
+    /// draining either, so cleanup stays with [`Self::admit`].
     #[cfg(test)]
-    pub(crate) fn live_ranges(&mut self) -> Vec<(Height, Height)> {
-        self.remove_completed();
+    pub(crate) fn admitted_ranges(&self) -> Vec<AdmittedRange> {
+        let published = self.completed.published();
         self.ranges
             .iter()
-            .map(|(start, (last, _))| (*start, *last))
+            .map(|(start, (last, id))| AdmittedRange {
+                first: *start,
+                last: *last,
+                ended: published.contains(id),
+            })
             .collect()
     }
 

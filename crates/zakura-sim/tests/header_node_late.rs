@@ -750,6 +750,11 @@ fn timed_out_locator_reply_is_dropped() {
         let late = history.completions()[&first];
         assert!(late.seq > seq, "it completed after the drop");
         assert!(!late.delivered, "the late reply reached no caller");
+        let second = nth(&ops, OpKind::Locator, 2).expect("Nora asked for a locator again");
+        assert!(
+            ops[&second].seq < late.seq && history.completions()[&second].seq > late.seq,
+            "a newer locator was waiting at the late completion"
+        );
 
         let (_, later) = history
             .calls()
@@ -760,10 +765,7 @@ fn timed_out_locator_reply_is_dropped() {
             .expect("Nora asked for Mira's locator again");
         let (.., end, op) = later.ended.expect("the later locator call ended");
         assert_eq!(end, "replied");
-        assert!(
-            op.is_some_and(|op| op > first),
-            "with a later operation: {op:?}"
-        );
+        assert_eq!(op, Some(second), "paired with the newer operation");
         assert!(
             history.bracket(&later).iter().any(|event| matches!(
                 event,

@@ -2153,6 +2153,8 @@ impl PeerRoutine {
             raw_block_payload,
             decoded_attributed_memory_size_bytes,
         );
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff_started(outstanding_owner, height, reserved_estimate);
         self.forward_body_to_sequencer(
             outstanding_owner,
             height,
@@ -2172,11 +2174,39 @@ impl PeerRoutine {
         // top of the next iteration.
     }
 
+    /// Reports that the routine is about to send the body at `height` to the
+    /// sequencer while its request still charges `charge` to the budget. The
+    /// report comes before the send, because the sequencer can dequeue the
+    /// body as soon as the send succeeds. Reports nothing when `charge` is 0,
+    /// because then the budget never counted the body.
+    ///
+    /// A cancelled `send().await` on the `None`-permit path would leave this
+    /// handoff without its end. Production always passes a permit.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_handoff_started(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        charge: u64,
+    ) {
+        if charge == 0 {
+            return;
+        }
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::HandoffStarted {
+                peer: self.peer.clone(),
+                owner,
+                height,
+                charge,
+            }
+        );
+    }
+
     /// Releases the request charge of the body at `height`, which the routine
-    /// just sent to the sequencer, and reports the handoff around the release:
-    /// `HandoffStarted` before it, and `HandoffEnded` after the counter changes
-    /// and before the release wakes any waiter. Reports nothing when `charge`
-    /// is 0, because then the budget never counted the body.
+    /// just sent to the sequencer, and reports `HandoffEnded` after the
+    /// counter changes and before the release wakes any waiter. Reports
+    /// nothing when `charge` is 0, like [`Self::observe_handoff_started`].
     #[cfg(any(test, zakura_sim))]
     fn release_handoff(
         &mut self,
@@ -2189,15 +2219,6 @@ impl PeerRoutine {
             return;
         }
         let (observer, peer) = (&self.observer, &self.peer);
-        observe!(
-            observer,
-            BlockEvent::HandoffStarted {
-                peer: peer.clone(),
-                owner,
-                height,
-                charge,
-            }
-        );
         self.budget.release_then(charge, || {
             observe!(
                 observer,
@@ -2422,6 +2443,8 @@ impl PeerRoutine {
             raw_block_payload,
             decoded_attributed_memory_size_bytes,
         );
+        #[cfg(any(test, zakura_sim))]
+        self.observe_handoff_started(owner, height, ended_reservation);
         self.forward_body_to_sequencer(
             owner,
             height,
@@ -3873,6 +3896,7 @@ mod tests {
         let owner = routine.window.outstanding.ownership()[0].owner;
         log.0.lock().unwrap().clear();
 
+        routine.observe_handoff_started(owner, block::Height(1), 0);
         routine.release_handoff(owner, block::Height(1), 0);
         let events = std::mem::take(&mut *log.0.lock().unwrap());
         assert_eq!(events, []);

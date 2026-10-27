@@ -14,7 +14,7 @@ use zakura_node_services::header_chain::{
     RetainedHeaderPath,
 };
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind},
+    controlled::{ControlledPort, Fact, FactKind, OpId},
     evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, StateField},
     fixture::HeaderFixture,
     Outcome,
@@ -352,6 +352,36 @@ fn an_engine_partial_read_is_an_unknown_continuation() {
         Err(ModelFailure::UnknownOwner {
             txn: None,
             owner: Owner::Continuation(lease),
+        })
+    );
+}
+
+/// D19: an unknown owner outranks an illegal head. The acquire's head
+/// claims a delivery that didn't happen, and its transaction also drops a
+/// permit storage never took.
+#[test]
+fn an_unknown_owner_outranks_an_illegal_head() {
+    let (port, chain) = chain(1);
+    let mut facts = lease_and_release(&port, chain[0]);
+    let head = facts
+        .iter()
+        .position(|fact| matches!(fact.kind, FactKind::Completed(_)))
+        .expect("the acquire completes");
+    let FactKind::Completed(completion) = &mut facts[head].kind else {
+        unreachable!("the head was matched above");
+    };
+    completion.delivered = !completion.delivered;
+    let stray = Fact {
+        kind: FactKind::PermitDropped { id: OpId(99) },
+        ..facts[head].clone()
+    };
+    let txn = stray.txn;
+    facts.insert(head, stray);
+    assert_eq!(
+        OwnerModel::new().apply(&renumbered(facts)),
+        Err(ModelFailure::UnknownOwner {
+            txn: Some(txn),
+            owner: Owner::Permit(OpId(99)),
         })
     );
 }

@@ -366,7 +366,8 @@ pub fn guard_dispatch<T: 'static>(
 
 /// One header-sync actor: a real reactor and service on its port.
 pub struct HeaderNode {
-    /// The actor's name, such as `nora`, which `Control` actions name.
+    /// The actor's role name, `node` or `mirror-<i>`, which `Control`
+    /// actions name.
     pub name: String,
     /// Its peer identity, which its links present.
     pub id: ZakuraPeerId,

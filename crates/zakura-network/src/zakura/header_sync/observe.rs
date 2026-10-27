@@ -279,36 +279,44 @@ impl PortTap {
         }
     }
 
-    /// Reports that the call ended with `end`.
+    /// Reports that the call ended with `end`, from inside the port future.
     ///
     /// The port future's panic catch would otherwise report an observer panic
     /// here as the port's own, after the observer may have recorded this end.
-    /// So the panic is rethrown as [`ObserverPanicked`], which
-    /// [`rethrow_observer_panic`] passes through the catch.
+    /// So the panic is rethrown wrapped in [`ObserverPanicked`], which
+    /// [`rethrow_observer_panic`] unwraps and resumes past the catch.
     pub(crate) fn end(&self, end: CallEnd) {
+        if let Err(payload) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| self.end_after_catch(end)))
+        {
+            std::panic::resume_unwind(Box::new(ObserverPanicked(payload)));
+        }
+    }
+
+    /// Reports that the call ended with `end`, from outside the port future's
+    /// panic catch, where an observer panic already unwinds the reactor.
+    pub(crate) fn end_after_catch(&self, end: CallEnd) {
         if let Some(observer) = &self.observer {
-            let event = ReactorEvent::CallEnded {
+            observer.observe(ReactorEvent::CallEnded {
                 call: self.call,
                 end,
-            };
-            if std::panic::catch_unwind(AssertUnwindSafe(|| observer.observe(event))).is_err() {
-                std::panic::resume_unwind(Box::new(ObserverPanicked));
-            }
+            });
         }
     }
 }
 
-/// The payload rethrown for an observer panic inside a port future. The panic
-/// hook already reported the original. See [`PortTap::end`].
-pub(crate) struct ObserverPanicked;
+/// An observer panic's original payload, carried through a port future's
+/// panic catch. See [`PortTap::end`].
+struct ObserverPanicked(Box<dyn Any + Send>);
 
-/// Rethrows `result`'s panic if a port future's observer raised it, so it
-/// unwinds the reactor instead of being reported as a port panic.
+/// Resumes `result`'s panic with the observer's original payload if a port
+/// future's observer raised it, so it unwinds the reactor instead of being
+/// reported as a port panic.
 pub(crate) fn rethrow_observer_panic<T>(
     result: Result<T, Box<dyn Any + Send>>,
 ) -> Result<T, Box<dyn Any + Send>> {
-    match result {
-        Err(payload) if payload.is::<ObserverPanicked>() => std::panic::resume_unwind(payload),
-        result => result,
-    }
+    result.map_err(|payload| match payload.downcast::<ObserverPanicked>() {
+        Ok(observer_panic) => std::panic::resume_unwind(observer_panic.0),
+        Err(payload) => payload,
+    })
 }

@@ -67,7 +67,7 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
         PlanInput::Bytes(Vec::new()),
         |sim| {
             let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-            let (observer, tap) = ReactorTap::new(sim, &port, "nora");
+            let (observer, tap) = ReactorTap::new(sim, &port, "node");
             if !twist.drop_port {
                 let caller = port.clone();
                 sim.scheduler().spawn_root("caller", async move {
@@ -286,7 +286,7 @@ fn a_tap_the_run_never_observes_fails_at_setup() {
     drop(kept);
     let (source, detail) = evidence_failure(&report);
     assert_eq!(report.end.steps, 0);
-    assert_eq!(source, "reactor:nora#0");
+    assert_eq!(source, "reactor:node#0");
     assert!(detail.starts_with("NotObserved"), "{detail}");
 }
 
@@ -420,7 +420,7 @@ fn a_tap_from_a_dropped_run_fails_a_later_one() {
     for wrapped in [true, false] {
         let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
         let mut first = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
-        let (observer, tap) = ReactorTap::new(&mut first, &port, "nora");
+        let (observer, tap) = ReactorTap::new(&mut first, &port, "node");
         drop(first);
         let mut second = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
         spawn_emitter(&mut second, observer);
@@ -449,7 +449,7 @@ fn two_tap_run(divert: Option<u64>) -> RunReport {
         tap_config(),
         PlanInput::Bytes(Vec::new()),
         |sim| {
-            for (instance, node) in [(0, "nora"), (1, "mira")] {
+            for (instance, node) in [(0, "node"), (1, "mirror-0")] {
                 let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
                 let (observer, tap) = ReactorTap::new(sim, &port, node);
                 observer.observe(handled(1));
@@ -498,7 +498,7 @@ fn each_tap_is_checked_on_its_own() {
         })
         .collect();
     assert_eq!(instances, BTreeSet::from([0, 1]));
-    for (divert, node) in [(0, "nora"), (1, "mira")] {
+    for (divert, node) in [(0, "node"), (1, "mirror-0")] {
         let report = two_tap_run(Some(divert));
         let (source, detail) = evidence_failure(&report);
         assert_eq!(report.end.steps, 0);
@@ -604,7 +604,7 @@ fn emit_outside_the_run(observer: &Arc<dyn HeaderSyncObserver>) {
 fn late_run(late: Late) -> RunReport {
     let mut sim = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let (observer, tap) = ReactorTap::new(&mut sim, &port, "nora");
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     observer.observe(handled(1));
     spawn_emitter(&mut sim, observer.clone());
     let shared: Shared = Rc::new(RefCell::new(Some(tap)));
@@ -680,7 +680,7 @@ impl<S: ActionSource> ActionSource for RefuseBefore<S> {
 fn an_emission_outside_the_run_fails_it() {
     let mut sim = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let (observer, tap) = ReactorTap::new(&mut sim, &port, "nora");
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     spawn_emitter(&mut sim, observer.clone());
     sim.add_source(Box::new(RefuseBefore {
         inner: tap,
@@ -751,9 +751,9 @@ fn an_event_after_the_port_is_gone_fails_port_gone() {
     assert!(detail.starts_with("PortGone"), "{detail}");
 }
 
-/// Nora at genesis syncing from Mira at A5 under the converging policy,
-/// with Nora's reactor tapped if `tapped`.
-fn nora_run(input: PlanInput, tapped: bool) -> RunReport {
+/// The node at genesis syncing from `mirror-0` at A5 under the converging
+/// policy, with the node's reactor tapped if `tapped`.
+fn node_run(input: PlanInput, tapped: bool) -> RunReport {
     let fixture = HeaderFixture::regtest();
     let node = Arc::new(ControlledPort::new(&fixture));
     let mirror = Arc::new(EnginePort::new(&fixture));
@@ -768,7 +768,7 @@ fn nora_run(input: PlanInput, tapped: bool) -> RunReport {
             let storage =
                 PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
             let (observer, storage) = if tapped {
-                let (observer, tap) = ReactorTap::new(sim, &node, "nora");
+                let (observer, tap) = ReactorTap::new(sim, &node, "node");
                 (Some(observer), storage.with_tap(tap))
             } else {
                 (None, storage)
@@ -777,7 +777,7 @@ fn nora_run(input: PlanInput, tapped: bool) -> RunReport {
             let nodes = vec![
                 HeaderNode::spawn(
                     sim,
-                    "nora",
+                    "node",
                     1,
                     node.clone(),
                     &fixture,
@@ -787,7 +787,7 @@ fn nora_run(input: PlanInput, tapped: bool) -> RunReport {
                 ),
                 HeaderNode::spawn(
                     sim,
-                    "mira",
+                    "mirror-0",
                     2,
                     mirror.clone(),
                     &fixture,
@@ -842,15 +842,15 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
         .collect()
 }
 
-/// Tapping Nora's reactor adds no scheduling point: under every plan, the
+/// Tapping the node's reactor adds no scheduling point: under every plan, the
 /// run with the tap makes the same picks and logs the same storage entries
-/// as the run without it, and Nora's dispatches, call ends, completions,
+/// as the run without it, and the node's dispatches, call ends, completions,
 /// starts and retirements all reach the log, in sequence.
 #[test]
 fn tap_adds_no_scheduling_point() {
     for input in inputs(16, 256) {
-        let bare = nora_run(input.clone(), false);
-        let tapped = nora_run(input, true);
+        let bare = node_run(input.clone(), false);
+        let tapped = node_run(input, true);
         assert_eq!(tapped.end, bare.end);
         assert_eq!(support::picks(&tapped), support::picks(&bare));
         assert_eq!(storage_entries(&tapped), storage_entries(&bare));

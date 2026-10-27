@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    ApplyResult, BodyRuleId, BodyWorkAuthority, BodyWorkEpoch, BodyWorkOwner,
-    CommittedHeaderChainView, EvidenceId, Frontier, SourceId, StateVersion,
+    ApplyResult, BodyRuleId, BodyUnavailableSummary, BodyWorkAuthority, BodyWorkEpoch,
+    BodyWorkOwner, CommittedHeaderChainView, EvidenceId, Frontier, SourceId, StateVersion,
     TransientBodyFailureKind, VerifiedChangeCause,
 };
 use zakura_network::zakura::{BlockApplyResult, BlockApplyToken, BlockSyncAction, ZakuraPeerId};
@@ -72,6 +72,9 @@ pub enum RequestIdentity {
         source: Option<SourceId>,
         /// The failure's kind, for an unavailable body.
         failure: Option<TransientBodyFailureKind>,
+        /// The retry episode's summary, for every record but an invalid
+        /// body.
+        availability: Option<BodyUnavailableSummary>,
     },
     /// A misbehavior report.
     Misbehavior {
@@ -145,6 +148,7 @@ impl RequestIdentity {
                 rule: None,
                 source: None,
                 failure: Some(failure.kind),
+                availability: Some(failure.availability),
             },
             BlockSyncAction::RecordBodyInvalid {
                 expected_version,
@@ -157,14 +161,25 @@ impl RequestIdentity {
                 rule: Some(invalid.rule.clone()),
                 source: Some(invalid.source),
                 failure: None,
+                availability: None,
             },
             BlockSyncAction::RestartBodyAvailability {
                 expected_version,
-                discovery: zakura_header_chain::BodySupplierDiscovered { hash, evidence, .. },
+                discovery:
+                    zakura_header_chain::BodySupplierDiscovered {
+                        hash,
+                        evidence,
+                        availability,
+                    },
             }
             | BlockSyncAction::RetryBodyAvailability {
                 expected_version,
-                retry: zakura_header_chain::OperatorBodyRetry { hash, evidence, .. },
+                retry:
+                    zakura_header_chain::OperatorBodyRetry {
+                        hash,
+                        evidence,
+                        availability,
+                    },
             } => RequestIdentity::Record {
                 op: BlockOp::of(action),
                 expected_version: *expected_version,
@@ -173,6 +188,7 @@ impl RequestIdentity {
                 rule: None,
                 source: None,
                 failure: None,
+                availability: Some(*availability),
             },
             BlockSyncAction::Misbehavior { peer, reason } => RequestIdentity::Misbehavior {
                 peer: peer.clone(),
@@ -573,18 +589,6 @@ impl OwnerModel {
                 }
                 self.exiting = false;
                 self.exited = true;
-            }
-            FactKind::CommitRefused { id, hash } => {
-                if !effects.is_empty() {
-                    return Err(bad_effects());
-                }
-                let op = self.ops.get(id).ok_or_else(unexpected)?;
-                if !matches!(op.stage, OperationStage::Admitted { .. })
-                    || op.request.submitted_hash() != Some(*hash)
-                    || self.driver_awaiting()
-                {
-                    return Err(unexpected());
-                }
             }
             FactKind::ShutDown { dropped, deferred } => {
                 if !effects.is_empty() || self.shut_down {

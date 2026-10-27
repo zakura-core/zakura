@@ -1504,43 +1504,68 @@ fn a_record_the_driver_would_fail_closed_on_panics() {
     harness.service.complete(record, BlockOutcome::Apply).ok();
 }
 
-/// ST4.7: the engine refuses to commit a body block sync recorded invalid,
-/// as zakura-state does. The service logs the refusal as a fact, the owner
-/// model accepts it, and nothing else changes.
+/// ST4.4: the engine refuses to commit a body block sync recorded invalid.
+/// zakura-state reports the refusal as `HeaderChainError`, so the verdict
+/// completes as a `Storage` retry and commits nothing.
 #[test]
-fn a_commit_of_a_body_recorded_invalid_is_refused_and_logged() {
+fn a_commit_of_a_body_recorded_invalid_reports_a_storage_retry() {
     let mut harness = Harness::new();
     let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
-    let hash = blocks[0].hash();
     let id = harness.submit(&blocks[0]);
     harness.complete(id, BlockOutcome::Admit);
     let record = harness.record_invalid(&blocks[0]);
     harness.complete(record, BlockOutcome::Apply);
     harness.replies.take();
-    assert!(harness.enabled(id).contains(&COMMITTED));
+    let before = (harness.engine.snapshot(), harness.engine.view());
 
-    let before = (
-        harness.service.owner_state().operations,
-        harness.engine.snapshot(),
-        harness.engine.view(),
+    let completion = harness.complete(id, COMMITTED);
+    assert_eq!(
+        completion.result,
+        ResultIdentity::Verdict {
+            verdict: Verdict::Retryable(RetryKind::Storage),
+            result: BlockApplyResult::Unavailable,
+        }
     );
-    let refused = harness.service.complete(id, COMMITTED);
-    assert!(
-        matches!(refused, Err(CompleteError::RecordedInvalid(refused)) if refused == hash),
-        "{refused:?}"
-    );
-    assert_eq!(harness.facts(), [FactKind::CommitRefused { id, hash }]);
     assert_eq!(
         before,
-        (
-            harness.service.owner_state().operations,
-            harness.engine.snapshot(),
-            harness.engine.view(),
-        ),
-        "the refusal changes nothing but the log"
+        (harness.engine.snapshot(), harness.engine.view()),
+        "the refused commit changes no state"
     );
-    assert!(harness.replies.take().is_empty());
+    assert!(harness.service.owner_state().operations.is_empty());
+    assert!(matches!(
+        harness.replies.take().as_slice(),
+        [HandleEvent::ApplyFinished { .. }]
+    ));
+}
 
-    // A verdict that commits nothing still completes it.
-    harness.complete(id, BlockOutcome::Verdict(Verdict::ConsensusInvalid));
+/// ST4.3: a record's identity carries its retry episode's summary, so two
+/// records that differ only there are told apart.
+#[test]
+fn a_record_identity_carries_its_retry_episode() {
+    let hash = block::Hash([3; 32]);
+    let evidence = EvidenceId::from_digest([4; 32]);
+    let availability = zakura_header_chain::BodyUnavailableSummary {
+        attempts: 2,
+        suppliers: 1,
+        supplier_set_digest: [5; 32],
+        alarmed: true,
+        ..Default::default()
+    };
+    let unavailable = BlockSyncAction::RecordBodyUnavailable {
+        expected_version: StateVersion::new(1),
+        failure: zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence,
+            kind: zakura_header_chain::TransientBodyFailureKind::Timeout,
+            availability,
+        },
+    };
+    let RequestIdentity::Record {
+        availability: carried,
+        ..
+    } = RequestIdentity::of_action(&unavailable, ApplyClass::Full)
+    else {
+        panic!("a record's identity is a record");
+    };
+    assert_eq!(carried, Some(availability));
 }

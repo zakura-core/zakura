@@ -869,6 +869,178 @@ mod tests {
         );
     }
 
+    /// Pins the block-sync observations, one of each event and holder
+    /// kind, and the format version that added them.
+    #[test]
+    fn block_sync_observation_encoding_is_pinned() {
+        use crate::observe::{
+            BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
+            BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission,
+            BlockSyncWorkItem, StorageBranch, WorkOwner, WorkScope,
+        };
+
+        let owner = || WorkOwner {
+            kind: "body".into(),
+            scope: WorkScope {
+                header_generation: 2,
+                branch: StorageBranch {
+                    anchor: "aa".into(),
+                    target: "bb".into(),
+                },
+            },
+            verified_generation: Some(5),
+            body_work_epoch: Some(6),
+            session_id: 7,
+            request_id: 8,
+        };
+        let body = || BlockSyncBody {
+            height: 3,
+            owner: owner(),
+            bytes: 900,
+        };
+        let holder = |holder| BlockSyncFact::Holder {
+            body: body(),
+            holder,
+            change: "retained".into(),
+        };
+        let events = [
+            BlockSyncFact::SessionAdmitted {
+                peer: "01".into(),
+                connection: 4,
+                session_id: 7,
+                generation: 1,
+                direction: "inbound".into(),
+            },
+            BlockSyncFact::FrameJudged {
+                peer: "01".into(),
+                connection: 4,
+                generation: 1,
+                seq: 2,
+                message_type: 3,
+                flags: 0,
+                payload_len: 900,
+            },
+            BlockSyncFact::Request {
+                owner: owner(),
+                heights: vec![3, 4],
+                estimated_bytes: 2_000,
+                step: "dropped-queued".into(),
+            },
+            BlockSyncFact::Budget {
+                change: "reserved".into(),
+                before: 0,
+                after: 2_000,
+            },
+            BlockSyncFact::HandoffStarted {
+                peer: "01".into(),
+                owner: owner(),
+                height: 3,
+                charge: 1_000,
+            },
+            BlockSyncFact::HandoffEnded {
+                peer: "01".into(),
+                owner: owner(),
+                height: 3,
+                charge: 1_000,
+            },
+            holder(BlockSyncHolder::Queued { allocation: 1 }),
+            holder(BlockSyncHolder::Reorder { allocation: 1 }),
+            holder(BlockSyncHolder::Applying { allocation: 1 }),
+            holder(BlockSyncHolder::Submitted { token: 9 }),
+            holder(BlockSyncHolder::Detached { token: 9 }),
+            BlockSyncFact::ServingLease {
+                peer: "01".into(),
+                start: 3,
+                count: 2,
+                step: "acquired".into(),
+            },
+            BlockSyncFact::ServingFrame {
+                peer: "01".into(),
+                start: 3,
+                message_type: 4,
+                body_bytes: 900,
+            },
+            BlockSyncFact::Routine {
+                peer: "01".into(),
+                connection: 4,
+                generation: 1,
+                requests: vec![BlockSyncRequest {
+                    owner: owner(),
+                    write: "written".into(),
+                    heights: vec![BlockSyncRequestedHeight {
+                        height: 3,
+                        estimated_bytes: 1_000,
+                        received: true,
+                    }],
+                }],
+                claims: vec![BlockSyncClaim {
+                    height: 3,
+                    owner: owner(),
+                    estimated_bytes: 1_000,
+                }],
+                serving: vec![BlockSyncRange {
+                    first: 3,
+                    last: 4,
+                    completed: false,
+                }],
+            },
+            BlockSyncFact::WorkQueue {
+                items: vec![
+                    BlockSyncWorkItem {
+                        height: 3,
+                        owner: Some(owner()),
+                        place: "in-flight".into(),
+                        estimated_bytes: 1_000,
+                        reserved_bytes: 1_000,
+                    },
+                    BlockSyncWorkItem {
+                        height: 5,
+                        owner: None,
+                        place: "pending".into(),
+                        estimated_bytes: 1_000,
+                        reserved_bytes: 0,
+                    },
+                ],
+            },
+            BlockSyncFact::Sequencer {
+                reorder: vec![BlockSyncRetained {
+                    body: body(),
+                    admitted_estimate_bytes: Some(1_000),
+                    allocation: 1,
+                }],
+                applying: vec![BlockSyncRetained {
+                    body: body(),
+                    admitted_estimate_bytes: None,
+                    allocation: 2,
+                }],
+                submissions: vec![BlockSyncSubmission {
+                    body: body(),
+                    token: 9,
+                    detached: false,
+                }],
+            },
+            BlockSyncFact::SequencerClosed,
+        ];
+        let obs: Vec<Observation> = (1..)
+            .zip(events)
+            .map(|(seq, event)| Observation::BlockSync {
+                instance: 0,
+                seq,
+                storage_seq: seq + 10,
+                node: "node".into(),
+                event,
+            })
+            .collect();
+        let bump = "a block-sync observation's encoding changed, which changes `obs` digests, \
+             so bump FORMAT_VERSION and update this test";
+        assert_eq!(FORMAT_VERSION, 5, "{bump}");
+        assert_eq!(
+            serde_json::to_string(&obs).unwrap(),
+            r#"[{"obs":"block-sync","instance":0,"seq":1,"storage_seq":11,"node":"node","event":{"event":"session-admitted","peer":"01","connection":4,"session_id":7,"generation":1,"direction":"inbound"}},{"obs":"block-sync","instance":0,"seq":2,"storage_seq":12,"node":"node","event":{"event":"frame-judged","peer":"01","connection":4,"generation":1,"seq":2,"message_type":3,"flags":0,"payload_len":900}},{"obs":"block-sync","instance":0,"seq":3,"storage_seq":13,"node":"node","event":{"event":"request","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"heights":[3,4],"estimated_bytes":2000,"step":"dropped-queued"}},{"obs":"block-sync","instance":0,"seq":4,"storage_seq":14,"node":"node","event":{"event":"budget","change":"reserved","before":0,"after":2000}},{"obs":"block-sync","instance":0,"seq":5,"storage_seq":15,"node":"node","event":{"event":"handoff-started","peer":"01","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3,"charge":1000}},{"obs":"block-sync","instance":0,"seq":6,"storage_seq":16,"node":"node","event":{"event":"handoff-ended","peer":"01","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3,"charge":1000}},{"obs":"block-sync","instance":0,"seq":7,"storage_seq":17,"node":"node","event":{"event":"holder","body":{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900},"holder":{"kind":"queued","allocation":1},"change":"retained"}},{"obs":"block-sync","instance":0,"seq":8,"storage_seq":18,"node":"node","event":{"event":"holder","body":{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900},"holder":{"kind":"reorder","allocation":1},"change":"retained"}},{"obs":"block-sync","instance":0,"seq":9,"storage_seq":19,"node":"node","event":{"event":"holder","body":{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900},"holder":{"kind":"applying","allocation":1},"change":"retained"}},{"obs":"block-sync","instance":0,"seq":10,"storage_seq":20,"node":"node","event":{"event":"holder","body":{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900},"holder":{"kind":"submitted","token":9},"change":"retained"}},{"obs":"block-sync","instance":0,"seq":11,"storage_seq":21,"node":"node","event":{"event":"holder","body":{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900},"holder":{"kind":"detached","token":9},"change":"retained"}},{"obs":"block-sync","instance":0,"seq":12,"storage_seq":22,"node":"node","event":{"event":"serving-lease","peer":"01","start":3,"count":2,"step":"acquired"}},{"obs":"block-sync","instance":0,"seq":13,"storage_seq":23,"node":"node","event":{"event":"serving-frame","peer":"01","start":3,"message_type":4,"body_bytes":900}},{"obs":"block-sync","instance":0,"seq":14,"storage_seq":24,"node":"node","event":{"event":"routine","peer":"01","connection":4,"generation":1,"requests":[{"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"write":"written","heights":[{"height":3,"estimated_bytes":1000,"received":true}]}],"claims":[{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"estimated_bytes":1000}],"serving":[{"first":3,"last":4,"completed":false}]}},{"obs":"block-sync","instance":0,"seq":15,"storage_seq":25,"node":"node","event":{"event":"work-queue","items":[{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"place":"in-flight","estimated_bytes":1000,"reserved_bytes":1000},{"height":5,"place":"pending","estimated_bytes":1000,"reserved_bytes":0}]}},{"obs":"block-sync","instance":0,"seq":16,"storage_seq":26,"node":"node","event":{"event":"sequencer","reorder":[{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900,"admitted_estimate_bytes":1000,"allocation":1}],"applying":[{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900,"allocation":2}],"submissions":[{"height":3,"owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"bytes":900,"token":9,"detached":false}]}},{"obs":"block-sync","instance":0,"seq":17,"storage_seq":27,"node":"node","event":{"event":"sequencer-closed"}}]"#,
+            "{bump}"
+        );
+    }
+
     #[test]
     fn records_round_trip_and_reject_unknown_fields() {
         for record in samples() {

@@ -131,6 +131,8 @@ pub struct Ports {
     pub probe: ProbeLog,
     /// The links made and the chain changes, as the run's tasks made them.
     pub effects: Effects,
+    /// The node's block-sync owner state, as its tap folds it.
+    pub view: Rc<RefCell<BlockSyncView>>,
 }
 
 /// The node under test, named `node`, on a controlled block service with
@@ -228,6 +230,7 @@ impl Subsystem for Storage {
             reads: MirrorReads::default(),
             probe: ProbeLog::default(),
             effects: Effects::default(),
+            view: Rc::default(),
         }
     }
 
@@ -242,8 +245,8 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             ports.effects.clone(),
         );
-        let (observer, tap) = BlockTap::new(sim, &ports.service, "node");
-        let view = tap.view();
+        let view = ports.view.clone();
+        let (observer, tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));

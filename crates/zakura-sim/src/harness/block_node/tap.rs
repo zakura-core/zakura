@@ -172,10 +172,10 @@ impl BlockSyncObserver for TapObserver {
 
 impl BlockTap {
     /// A tap on the block sync of the node named `node`, whose block storage
-    /// is `service`. Returns the observer, for block sync's startup and
-    /// nothing else, and the reader. Its checkpoint is registered with `sim`
-    /// now, so the run fails unless the reader observes every boundary,
-    /// however it's later wrapped or added.
+    /// is `service`, folding its events into `view`. Returns the observer,
+    /// for block sync's startup and nothing else, and the reader. Its
+    /// checkpoint is registered with `sim` now, so the run fails unless the
+    /// reader observes every boundary, however it's later wrapped or added.
     ///
     /// # Panics
     ///
@@ -184,6 +184,7 @@ impl BlockTap {
         sim: &mut Sim,
         service: &Arc<ControlledBlockService>,
         node: &str,
+        view: Rc<RefCell<BlockSyncView>>,
     ) -> (Arc<dyn BlockSyncObserver>, BlockTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         let observer = Arc::new_cyclic(|observer| {
@@ -214,15 +215,9 @@ impl BlockTap {
             pairer: Pairer::default(),
             facts: Vec::new(),
             allocations: Allocations::default(),
-            view: Rc::default(),
+            view,
         };
         (observer, tap)
-    }
-
-    /// The owner state this tap's events fold into, as of its last
-    /// observation.
-    pub fn view(&self) -> Rc<RefCell<BlockSyncView>> {
-        self.view.clone()
     }
 
     /// Hands over the node's block storage facts that this step's drain
@@ -268,7 +263,8 @@ impl BlockTap {
                 seq: *seq,
                 message_type: *message_type,
                 flags: *flags,
-                payload_len: u64::try_from(*payload_len).expect("a payload length fits in u64"),
+                // A usize is at most 64 bits on every target the simulator runs on.
+                payload_len: *payload_len as u64,
             },
             BlockEvent::Request {
                 owner,

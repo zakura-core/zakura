@@ -120,6 +120,13 @@ impl Serving {
         }
     }
 
+    /// `peer`'s live serving leases, as execution slots and output bytes
+    /// held, read from the slot budgets rather than from serving gauges.
+    #[cfg(test)]
+    pub(crate) fn leases_held(&self, peer: &ZakuraPeerId) -> (usize, u64) {
+        self.capacity.peer_held(peer)
+    }
+
     pub(crate) fn session(
         &self,
         peer: &ZakuraPeerId,
@@ -148,6 +155,19 @@ impl Serving {
             completed: Completions::default(),
         }
     }
+}
+
+/// One range a serving session records, as an owner snapshot reads it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedRange {
+    pub(crate) first: Height,
+    pub(crate) last: Height,
+    /// The range's completion is recorded: its ending was published, its
+    /// publication failed, or it was cancelled. The session doesn't tell
+    /// these apart, and the next admission removes the record either way.
+    /// Whether an ending reached the peer is the output's to say.
+    pub(crate) completed: bool,
 }
 
 pub(crate) struct ServingSession {
@@ -181,6 +201,22 @@ impl ServingSession {
             .map_err(SinkReject::protocol)?;
         self.ranges.insert(start, (last, id));
         Ok(())
+    }
+
+    /// Every range the session records, with whether its completion is
+    /// recorded. Reads the range map and the completion queue without
+    /// draining either, so cleanup stays with [`Self::admit`].
+    #[cfg(test)]
+    pub(crate) fn admitted_ranges(&self) -> Vec<AdmittedRange> {
+        let completed = self.completed.recorded();
+        self.ranges
+            .iter()
+            .map(|(start, (last, id))| AdmittedRange {
+                first: *start,
+                last: *last,
+                completed: completed.contains(id),
+            })
+            .collect()
     }
 
     /// Drain under the ending-publication lock before reusing any live range.

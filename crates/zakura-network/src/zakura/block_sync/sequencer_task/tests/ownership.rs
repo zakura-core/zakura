@@ -1,4 +1,8 @@
 use super::*;
+use std::collections::BTreeMap;
+
+use crate::zakura::block_sync::reorder::RetainedBody;
+
 use zakura_chain::serialization::ZcashSerialize;
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_5_BYTES};
 
@@ -6,8 +10,9 @@ use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_M
 /// admission reads, equal sums over the bodies the sequencer holds through
 /// out-of-order acceptance, drain, submission, detachment, completion, commit,
 /// and reset. The gauges are read before the view is published, so each must
-/// follow the sequencer on its own. Once the driver drops its submissions, no
-/// other holder keeps a body alive.
+/// follow the sequencer on its own. Each retained body keeps its request's
+/// admission estimate and its allocation's identity from reorder to applying.
+/// Once the driver drops its submissions, no other holder keeps a body alive.
 #[tokio::test]
 async fn byte_gauges_and_view_follow_sequencer_owners() {
     let recorder = super::super::super::tests::gauge_recorder::GaugeRecorder::default();
@@ -40,8 +45,8 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     );
     let check = |task: &mut SequencerTask, label: &str| {
         let owners = task.sequencer.ownership_snapshot();
-        let reorder: u64 = owners.reorder.iter().map(|(_, bytes)| bytes).sum();
-        let applying: u64 = owners.applying.iter().map(|(_, bytes)| bytes).sum();
+        let reorder: u64 = owners.reorder.iter().map(|body| body.bytes).sum();
+        let applying: u64 = owners.applying.iter().map(|body| body.bytes).sum();
         let submissions: u64 = owners.submissions.iter().map(|owner| owner.bytes).sum();
         assert_eq!(
             (
@@ -77,12 +82,16 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         (1, BLOCK_MAINNET_1_BYTES.as_slice()),
         (2, BLOCK_MAINNET_2_BYTES.as_slice()),
     ];
+    // Each request reserved a hint below the body's wire size.
+    let estimate = |height: u32| 1_000 + u64::from(height);
     let mut bodies = Vec::new();
+    let mut allocations = BTreeMap::new();
     for (index, (height, bytes)) in fixtures.into_iter().enumerate() {
         let height = block::Height(height);
         let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
         let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
         let wire_bytes = raw.len() as u64;
+        allocations.insert(height, Arc::as_ptr(&raw).cast::<u8>().addr());
         bodies.push((height, Arc::downgrade(&block), Arc::downgrade(&raw)));
         let mut body = SequencedBody::new_queued(
             super::super::test_work_owner(),
@@ -92,6 +101,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             block.header.previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, Some(raw)),
             wire_bytes,
+            Some(estimate(height.0)),
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
             Instant::now(),
             input_bytes.clone(),
@@ -107,10 +117,28 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     }
     // Height 2 drains heights 2 and 3 after height 1.
     let owners = check(&mut task, "drain");
-    assert_eq!(owners.applying.len(), 3);
     assert_eq!(
         owners.reorder,
-        [(block::Height(5), BLOCK_MAINNET_5_BYTES.len() as u64)]
+        [RetainedBody {
+            height: block::Height(5),
+            owner: super::super::test_work_owner(),
+            bytes: BLOCK_MAINNET_5_BYTES.len() as u64,
+            admitted_estimate_bytes: Some(estimate(5)),
+            allocation: allocations[&block::Height(5)],
+        }]
+    );
+    let applying: Vec<_> = owners
+        .applying
+        .iter()
+        .map(|body| (body.height, body.admitted_estimate_bytes, body.allocation))
+        .collect();
+    assert_eq!(
+        applying,
+        [1, 2, 3].map(|height| {
+            let height = block::Height(height);
+            (height, Some(estimate(height.0)), allocations[&height])
+        }),
+        "draining keeps each body's estimate and allocation"
     );
     let fixture_bytes: usize = fixtures
         .iter()

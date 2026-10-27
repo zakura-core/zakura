@@ -66,8 +66,12 @@ pub trait ActionSource {
     /// Appends what happened inside the source since the last call that no
     /// action of its own did, such as work a task submitted to it. The run
     /// calls it after setup and after every step, so each entry lands on the
-    /// step that caused it. The default appends nothing.
-    fn observe(&mut self, _log: &mut ObservationLog) {}
+    /// step that caused it. An `Err` says the source's evidence is
+    /// incomplete, which ends the run as a harness failure before that
+    /// step's checker runs. The default appends nothing.
+    fn observe(&mut self, _log: &mut ObservationLog) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// What one source offers at one step.

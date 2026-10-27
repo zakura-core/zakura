@@ -91,11 +91,21 @@ impl ActionSource for Script {
 fn run_script(script: Vec<Vec<Observation>>) -> RunReport {
     let mut properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
     properties.extend(table_properties("test", &[TEST_STREAM]));
+    run_under(properties, script)
+}
+
+/// Runs `script` as [`run_script`] does, under `properties`.
+fn run_under(properties: Vec<Property<Node>>, script: Vec<Vec<Observation>>) -> RunReport {
     let mut checker = RegistryChecker::new(
         Registry::new(properties).expect("generated IDs are unique"),
         Rc::new(Node),
         Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Schedule]),
+        &Sources::observed(&[
+            Source::Frames,
+            Source::Closes,
+            Source::Storage,
+            Source::Schedule,
+        ]),
     );
     let batches = Rc::new(RefCell::new(VecDeque::from(script)));
     // Each step offers the task first, then the script: byte 1 picks the
@@ -123,6 +133,7 @@ fn frame(stream: Stream, seq: u64, row: Option<&str>, label: Label) -> Observati
         stream: id(stream),
         seq,
         row: row.map(str::to_owned),
+        rule_stream: id(stream),
         label,
         exhausted: false,
     }
@@ -246,9 +257,14 @@ fn consequences_follow_the_table() {
 #[test]
 fn a_pages_over_credit_belongs_to_its_subscription_row() {
     let item = MessageRule::find(FEED, ITEM).unwrap();
-    assert_eq!(rule_row(FEED, item, Label::OverCredit).name, "watch");
-    assert_eq!(rule_row(FEED, item, Label::Unsolicited).name, "item");
-    assert_eq!(rule_row(FEED, item, Label::Conformant).name, "item");
+    let layout = [FEED_STREAM];
+    let rule = |label| {
+        let (stream, row) = rule_row(&layout, &FEED_STREAM, item, label);
+        (id(*stream), row.name)
+    };
+    assert_eq!(rule(Label::OverCredit), (id(FEED_STREAM), "watch"));
+    assert_eq!(rule(Label::Unsolicited), (id(FEED_STREAM), "item"));
+    assert_eq!(rule(Label::Conformant), (id(FEED_STREAM), "item"));
 }
 
 /// A conformant `feed` stream and a faulty `test` stream share one
@@ -310,11 +326,25 @@ fn a_fault_without_a_fault_close_is_a_violation() {
     let violation = report.end.violation.expect("the fault went unpunished");
     assert_eq!(violation.property, "feed/s64v1/undeclared-type-closes");
 
-    // Nor does a close of another connection.
+    // Nor does a close of another connection, justified by its own fault.
     let report = run_script(vec![
         vec![
             frame(FEED_STREAM, 0, Some("ended"), Label::OverOwed),
             judged(FEED_STREAM, 0),
+            Observation::PeerFrame {
+                connection: 2,
+                stream: id(TEST_STREAM),
+                seq: 0,
+                row: Some("ping".to_owned()),
+                rule_stream: id(TEST_STREAM),
+                label: Label::ReservedFlags,
+                exhausted: false,
+            },
+            Observation::FrameJudged {
+                connection: 2,
+                stream: id(TEST_STREAM),
+                seq: 0,
+            },
         ],
         vec![Observation::ConnectionClosed {
             connection: 2,
@@ -411,6 +441,7 @@ fn emptying_a_cadence_bucket_is_never_punished() {
         stream: id(TEST_STREAM),
         seq: 0,
         row: Some("status".to_owned()),
+        rule_stream: id(TEST_STREAM),
         label: Label::Conformant,
         exhausted: true,
     };
@@ -464,6 +495,7 @@ fn every_unjustified_punishment_is_a_violation() {
             stream,
             seq,
             row,
+            rule_stream,
             label,
             exhausted,
             ..
@@ -472,6 +504,7 @@ fn every_unjustified_punishment_is_a_violation() {
             stream,
             seq,
             row,
+            rule_stream,
             label,
             exhausted,
         },
@@ -504,4 +537,140 @@ fn every_unjustified_punishment_is_a_violation() {
         .map(|v| v.expected.split('\'').next().unwrap_or_default())
         .collect();
     assert_eq!(connections, ["connection 1", "connection 2"]);
+}
+
+/// Review (#1752): a punishment before the node judged anything on the
+/// connection is unjustified.
+#[test]
+fn punishment_before_any_judgement_is_a_violation() {
+    let report = run_script(vec![
+        vec![closed("header_peer_fault")],
+        vec![
+            frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+            judged(FEED_STREAM, 0),
+        ],
+    ]);
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("nothing justified the close");
+    assert!(
+        violation.property.ends_with("/conformant-never-closes"),
+        "{violation:?}"
+    );
+    for property in [
+        "feed/s64v1/conformant-never-closes",
+        "test/s65v2/conformant-never-closes",
+    ] {
+        assert!(
+            matches!(outcome(&report, property), PropertyOutcome::Violated { .. }),
+            "{property}"
+        );
+    }
+}
+
+/// Review (#1752): a fault whose rule has no `<label>-closes` fails the run
+/// as missing evidence instead of passing unchecked.
+#[test]
+fn an_unclaimed_fault_is_missing_evidence() {
+    for (row, label, claim) in [
+        (
+            Some("item"),
+            Label::OverCredit,
+            "feed/s64v1/item/over-credit-closes",
+        ),
+        (
+            None,
+            Label::ReservedFlags,
+            "feed/s64v1/reserved-flags-closes",
+        ),
+    ] {
+        let report = run_script(vec![vec![
+            frame(FEED_STREAM, 0, row, label),
+            judged(FEED_STREAM, 0),
+        ]]);
+        assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        let failure = report.end.harness.as_ref().expect("a harness failure");
+        assert!(
+            failure.to_string().ends_with(&format!("has no {claim}")),
+            "{failure}"
+        );
+    }
+}
+
+/// Review (#1752): a declared type sent to the wrong reader keeps its row,
+/// and the stream's `undeclared-type-closes` still claims it.
+#[test]
+fn an_undeclared_type_with_a_row_must_close() {
+    let report = run_script(vec![
+        vec![
+            frame(FEED_STREAM, 0, Some("item"), Label::UndeclaredType),
+            judged(FEED_STREAM, 0),
+        ],
+        vec![closed("idle_timeout")],
+    ]);
+    let violation = report.end.violation.expect("the fault went unpunished");
+    assert_eq!(violation.property, "feed/s64v1/undeclared-type-closes");
+}
+
+/// Review (#1752): the templates that read `Misbehavior` need storage, so a
+/// harness that doesn't observe it can't report them as held.
+#[test]
+fn misbehavior_readers_need_storage() {
+    let properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
+    let needs_storage = |id: &str| {
+        properties
+            .iter()
+            .find(|p| p.id.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is generated"))
+            .needs
+            .contains(&Source::Storage)
+    };
+    assert!(needs_storage("feed/s64v1/conformant-never-closes"));
+    assert!(needs_storage("feed/s64v1/watch/bad-content-closes"));
+    assert!(!needs_storage("feed/s64v1/watch/over-live-closes"));
+}
+
+/// `watch` alone on `s64v1`, and its pages and terminal outcome on `s66v1`
+/// of the same layout.
+fn split_layout() -> [Stream; 2] {
+    [
+        Stream {
+            messages: Some(&FEED[..1]),
+            ..FEED_STREAM
+        },
+        Stream {
+            kind: 66,
+            messages: Some(&FEED[1..]),
+            ..FEED_STREAM
+        },
+    ]
+}
+
+/// Review (#1752): a page's `OverCredit` belongs to its subscription row
+/// even when the pages sit on another stream of the layout.
+#[test]
+fn an_over_credit_page_on_another_stream_belongs_to_its_subscription() {
+    let layout = split_layout();
+    let [watch, pages] = layout;
+    let item = MessageRule::find(&FEED[1..], ITEM).unwrap();
+    let (stream, row) = rule_row(&layout, &pages, item, Label::OverCredit);
+    assert_eq!((id(*stream), row.name), (id(watch), "watch"));
+
+    let page = Observation::PeerFrame {
+        connection: 1,
+        stream: id(pages),
+        seq: 0,
+        row: Some("watch".to_owned()),
+        rule_stream: id(watch),
+        label: Label::OverCredit,
+        exhausted: false,
+    };
+    let report = run_under(
+        table_properties("split", &layout),
+        vec![vec![page, judged(pages, 0)], vec![closed("idle_timeout")]],
+    );
+    let violation = report.end.violation.expect("the page went unpunished");
+    assert_eq!(violation.property, "split/s64v1/watch/over-credit-closes");
 }

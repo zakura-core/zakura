@@ -64,6 +64,8 @@ pub struct CheckCtx<'a, S: HasView> {
     step: &'a StepCtx<'a>,
     handle: &'a S,
     property: &'a Property<S>,
+    /// Every property in the registry, this one included.
+    registered: &'a [Property<S>],
     obliged: Vec<Obligation>,
     recorded: Vec<Violation>,
     missing: Option<String>,
@@ -83,12 +85,19 @@ pub(crate) struct CheckParts {
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
-    /// The context for `property`'s check after `step`.
-    pub(crate) fn new(step: &'a StepCtx<'a>, handle: &'a S, property: &'a Property<S>) -> Self {
+    /// The context for `property`'s check after `step`, in a registry of
+    /// `registered`.
+    pub(crate) fn new(
+        step: &'a StepCtx<'a>,
+        handle: &'a S,
+        property: &'a Property<S>,
+        registered: &'a [Property<S>],
+    ) -> Self {
         CheckCtx {
             step,
             handle,
             property,
+            registered,
             obliged: Vec::new(),
             recorded: Vec::new(),
             missing: None,
@@ -104,6 +113,13 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             missing: self.missing,
             labelled: self.labelled,
         }
+    }
+
+    /// True if the registry holds a property with ID `id`.
+    pub fn is_registered(&self, id: &str) -> bool {
+        self.registered
+            .iter()
+            .any(|property| property.id.as_str() == id)
     }
 
     /// The property being checked.

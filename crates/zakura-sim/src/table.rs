@@ -11,8 +11,10 @@
 //! node's reader reaching the bytes that decide the label;
 //! [`Observation::ConnectionClosed`]; and [`Observation::Misbehavior`].
 //! Each judged frame needs exactly one earlier `PeerFrame` with its
-//! connection, stream and sequence number. A missing or repeated one fails
-//! the run as a harness failure, so a lost label can't hide an obligation.
+//! connection, stream and sequence number, and a judged fault needs a
+//! registered `<label>-closes` property for its rule. A missing or repeated
+//! label, or an unclaimed fault, fails the run as a harness failure, so it
+//! can't hide an obligation.
 
 use std::fmt;
 
@@ -78,6 +80,17 @@ impl Template {
         }
     }
 
+    /// The sources the check reads: frames and closes, and storage for the
+    /// templates that read `Misbehavior`.
+    fn needs(self) -> &'static [Source] {
+        match self {
+            Template::Closes(label) if consequence(label) != Consequence::FamilyContent => {
+                &[Source::Frames, Source::Closes]
+            }
+            _ => &[Source::Frames, Source::Closes, Source::Storage],
+        }
+    }
+
     /// The property's kind: a fault close is an obligation, and the rest
     /// hold at every step.
     fn kind(self) -> Kind {
@@ -139,8 +152,8 @@ impl fmt::Display for GeneratedId<'_> {
 /// The receiver properties of `family`'s tabled `streams`: per stream,
 /// `conformant-never-closes` and `undeclared-type-closes`; per row, the
 /// `<label>-closes` of each label the row's role can commit, including
-/// `bad-content-closes`, and `cadence-never-closes` for a row with a cadence. A stream with no table
-/// yields none.
+/// `bad-content-closes`, and `cadence-never-closes` for a row with a
+/// cadence. A stream with no table yields none.
 ///
 /// # Panics
 ///
@@ -215,27 +228,35 @@ fn generated<S: HasView>(id: GeneratedId<'_>) -> Property<S> {
         claim: id.template.sentence(),
         kind: id.template.kind(),
         assumes: &[],
-        needs: &[Source::Frames, Source::Closes],
+        needs: id.template.needs(),
         status: Status::Active,
         check: check_generated::<S>,
         witness: None,
     }
 }
 
-/// The row whose rule `label` enforces on a frame of `frame_row`, for
-/// [`Observation::PeerFrame::row`]: the frame's own row, except a page's
-/// `OverCredit`, which its subscription row enforces.
+/// The stream and row whose rule `label` enforces on a frame of
+/// `frame_row` on `frame_stream`, for [`Observation::PeerFrame`]'s
+/// `rule_stream` and `row`: the frame's own, except a page's `OverCredit`,
+/// which its subscription row enforces. That row may sit on another stream
+/// of `layout`.
 pub fn rule_row<'a>(
-    rules: &'a [MessageRule],
+    layout: &'a [Stream],
+    frame_stream: &'a Stream,
     frame_row: &'a MessageRule,
     label: Label,
-) -> &'a MessageRule {
-    match frame_row.role {
-        MessageRole::Response { request, .. } if label == Label::OverCredit => {
-            MessageRule::find(rules, request).unwrap_or(frame_row)
+) -> (&'a Stream, &'a MessageRule) {
+    if let MessageRole::Response { request, .. } = frame_row.role {
+        if label == Label::OverCredit {
+            let subscription = std::iter::once(frame_stream)
+                .chain(layout)
+                .find_map(|stream| Some((stream, MessageRule::find(stream.messages?, request)?)));
+            if let Some(found) = subscription {
+                return found;
+            }
         }
-        _ => frame_row,
     }
+    (frame_stream, frame_row)
 }
 
 /// Checks a generated property, from the template its ID names.
@@ -244,7 +265,13 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let id = GeneratedId::parse(id.as_str()).expect("table_properties wrote this ID");
     match id.template {
         Template::Closes(label) => check_closes(cx, &id, label),
-        Template::ConformantNeverCloses => check_never_closes(cx, &id, |_| true),
+        Template::ConformantNeverCloses => {
+            if let Some(unclaimed) = unclaimed_fault(cx, &id) {
+                cx.missing_evidence(unclaimed);
+                return Verdict::NotApplicable;
+            }
+            check_never_closes(cx, &id, |_| true)
+        }
         Template::CadenceNeverCloses => {
             check_never_closes(cx, &id, |frame| frame.exhausted && frame.row == id.row)
         }
@@ -256,6 +283,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 struct Sent<'a> {
     stream: StreamId,
     row: Option<&'a str>,
+    rule_stream: StreamId,
     label: Label,
     exhausted: bool,
 }
@@ -275,11 +303,13 @@ fn sent(
             stream: s,
             seq: q,
             row,
+            rule_stream,
             label,
             exhausted,
         } if (*c, *s, *q) == (connection, stream, seq) => Some(Sent {
             stream,
             row: row.as_deref(),
+            rule_stream: *rule_stream,
             label: *label,
             exhausted: *exhausted,
         }),
@@ -338,8 +368,42 @@ fn content_consequence(key: &ObligationKey, obs: &Observation) -> bool {
             if key.subject == session(*connection))
 }
 
-/// `<label>-closes`: each frame with `label` on the ID's stream and row that
-/// the node judges this step, on a connection still open, opens an
+/// The first fault judged on the ID's stream this step that no registered
+/// `<label>-closes` property claims, described. A label on a row whose role
+/// can't commit it, or a missing row, would otherwise open no obligation.
+fn unclaimed_fault<S: HasView>(cx: &CheckCtx<'_, S>, id: &GeneratedId<'_>) -> Option<String> {
+    let entries = cx.log.entries();
+    let start = entries.partition_point(|e| e.step < cx.step);
+    entries[start..].iter().enumerate().find_map(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream,
+            seq,
+        } = entry.obs
+        else {
+            return None;
+        };
+        if stream != id.stream {
+            return None;
+        }
+        let frame = sent(&entries[..start + at], connection, stream, seq).ok()?;
+        if consequence(frame.label) == Consequence::NoPunishment {
+            return None;
+        }
+        let claim = GeneratedId {
+            family: id.family,
+            stream: frame.rule_stream,
+            row: frame.row.filter(|_| frame.label != Label::UndeclaredType),
+            template: Template::Closes(frame.label),
+        };
+        (!cx.is_registered(&claim.to_string())).then(|| {
+            format!("connection {connection} judged frame {seq} on {stream} has no {claim}")
+        })
+    })
+}
+
+/// `<label>-closes`: each frame with `label` whose rule is the ID's stream
+/// and row (any row for `UndeclaredType`) that the node judges this step, on a connection still open, opens an
 /// obligation that the label's consequence discharges: a fault close of the
 /// connection, or [`content_consequence`] for `BadContent`. One discharge
 /// covers every obligation on its connection.
@@ -368,7 +432,10 @@ fn check_closes<S: HasView>(
                 return Verdict::NotApplicable;
             }
         };
-        let matches = stream == id.stream && frame.label == label && frame.row == id.row;
+        // `UndeclaredType` is per stream, whatever row the frame's type has
+        // elsewhere.
+        let row_matches = label == Label::UndeclaredType || frame.row == id.row;
+        let matches = frame.rule_stream == id.stream && frame.label == label && row_matches;
         if matches && !closed(before, connection) {
             obliged.push((at, connection));
         }
@@ -394,8 +461,9 @@ fn check_closes<S: HasView>(
 /// connection with such a frame, if every frame the node judged on that
 /// connection before the punishment, on any stream, is `Conformant`, the
 /// punishment is a violation. A fault on a sibling stream justifies it, but
-/// only one judged before it. Every unjustified punishment at the step is a
-/// violation of its own.
+/// only one judged before it. For `conformant-never-closes`, a punishment
+/// before the node judged any frame on the connection is a violation too.
+/// Every unjustified punishment at the step is a violation of its own.
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -438,7 +506,10 @@ fn check_never_closes<S: HasView>(
                 return Verdict::NotApplicable;
             }
         };
-        let covered = judged.iter().any(|f| f.stream == id.stream && applies(f));
+        // A punishment before the node judged anything on the connection is
+        // unjustified too: the peer had sent nothing wrong.
+        let nothing_judged = judged.is_empty() && id.template == Template::ConformantNeverCloses;
+        let covered = nothing_judged || judged.iter().any(|f| f.stream == id.stream && applies(f));
         if covered && judged.iter().all(|f| f.label == Label::Conformant) {
             unjustified.push((connection, punishment));
         }

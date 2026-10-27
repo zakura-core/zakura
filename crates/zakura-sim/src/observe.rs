@@ -72,8 +72,14 @@ pub enum Observation {
         /// from 0.
         seq: u64,
         /// The row whose rule `label` enforces, as [`crate::table::rule_row`]
-        /// picks it. `None` for a type the stream doesn't declare.
+        /// picks it. `None` for a type the stream doesn't declare. A declared
+        /// type sent to the wrong reader keeps its row, labelled
+        /// `UndeclaredType`.
         row: Option<String>,
+        /// The stream whose table holds `row`: `stream`, except where
+        /// [`crate::table::rule_row`] picks a row on another stream of the
+        /// layout.
+        rule_stream: StreamId,
         /// The frame's label.
         label: Label,
         /// True if the frame emptied its row's cadence bucket. Such a frame

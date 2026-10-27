@@ -208,8 +208,8 @@ fn peer_id(seed: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(node.as_bytes().to_vec()).expect("a node id is a valid peer id")
 }
 
-/// Two reactors, Nora and Mira, each behind its own service. Nora dials
-/// Mira, so each service gets one versioned session over a pair of
+/// Two reactors, `a` and `b`, each behind its own service. `a` dials
+/// `b`, so each service gets one versioned session over a pair of
 /// in-memory streams, one each way.
 #[test]
 fn two_reactors_meet_over_memory_streams() {
@@ -223,7 +223,7 @@ fn two_reactors_meet_over_memory_streams() {
     let shutdown = CancellationToken::new();
     let exits = Rc::new(RefCell::new(Vec::new()));
     let mut nodes = Vec::new();
-    for name in ["nora", "mira"] {
+    for name in ["a", "b"] {
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
         let exits = Rc::clone(&exits);
@@ -238,21 +238,13 @@ fn two_reactors_meet_over_memory_streams() {
         nodes.push((handle, actions, service));
     }
 
-    // Nora writes what Mira reads, and the other way round.
-    let (nora_send, mira_recv) = framed_channel(8);
-    let (mira_send, nora_recv) = framed_channel(8);
+    // `a` writes what `b` reads, and the other way round.
+    let (a_send, b_recv) = framed_channel(8);
+    let (b_send, a_recv) = framed_channel(8);
     let connections = [CancellationToken::new(), CancellationToken::new()];
     let sides = [
-        (
-            peer_id(2),
-            ServicePeerDirection::Outbound,
-            (nora_recv, nora_send),
-        ),
-        (
-            peer_id(1),
-            ServicePeerDirection::Inbound,
-            (mira_recv, mira_send),
-        ),
+        (peer_id(2), ServicePeerDirection::Outbound, (a_recv, a_send)),
+        (peer_id(1), ServicePeerDirection::Inbound, (b_recv, b_send)),
     ];
     for (((remote, direction, streams), (_, _, service)), connection) in
         sides.into_iter().zip(&nodes).zip(&connections)
@@ -305,7 +297,7 @@ fn two_reactors_meet_over_memory_streams() {
     );
 }
 
-/// Nora's session with Mira is replaced while its pipe still runs. The
+/// Reactor `a`'s session with peer `b` is replaced while its pipe still runs. The
 /// reactor matches a disconnect by peer and session ID alone, so the
 /// replacement's fresh session ID is what keeps the old session's late
 /// teardown from removing it.
@@ -321,7 +313,7 @@ fn a_replacement_session_outlives_the_old_teardown() {
     let shutdown = CancellationToken::new();
     let (handle, actions, reactor) =
         spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
-    sched.spawn_root("nora", async move {
+    sched.spawn_root("a", async move {
         reactor.await.expect("the reactor ends on shutdown");
     });
     let service = HeaderSyncService::new(handle.clone());
@@ -345,8 +337,8 @@ fn a_replacement_session_outlives_the_old_teardown() {
         ));
         let ended = Rc::new(RefCell::new(false));
         let flag = Rc::clone(&ended);
-        sched.spawn_root("mira", async move {
-            // Keeps Nora's reader open until the run ends.
+        sched.spawn_root("b", async move {
+            // Keeps `a`'s reader open until the run ends.
             let _far_send = far_send;
             while far_recv.recv().await.is_some() {}
             *flag.borrow_mut() = true;

@@ -23,7 +23,7 @@ use zakura_sim::{
     observe::StreamId,
     property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
     table::{rule_row, table_properties, GeneratedId, Template},
-    ActionSource, Boundary, Identity, Observation, ObservationLog, Plan, PropertyOutcome,
+    ActionSource, Boundary, Identity, Observation, ObservationLog, Outcome, Plan, PropertyOutcome,
     RunReport,
 };
 
@@ -399,4 +399,75 @@ fn emptying_a_cadence_bucket_is_never_punished() {
         outcome(&report, "test/s65v2/status/cadence-never-closes"),
         PropertyOutcome::Violated { .. }
     ));
+}
+
+/// Review P3b-1: a judged frame with no label, or with two, fails the run
+/// as a harness failure instead of dropping out of the checks.
+#[test]
+fn a_judged_frame_needs_exactly_one_label() {
+    let unlabelled = run_script(vec![vec![judged(FEED_STREAM, 0)]]);
+    let labelled_twice = run_script(vec![vec![
+        frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+        frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+        judged(FEED_STREAM, 0),
+    ]]);
+    for (report, detail) in [
+        (unlabelled, "has no PeerFrame label before it"),
+        (labelled_twice, "has more than one PeerFrame label"),
+    ] {
+        assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        let failure = report.end.harness.as_ref().expect("a harness failure");
+        assert!(failure.to_string().ends_with(detail), "{failure}");
+    }
+}
+
+/// Review P3b-2: two conformant connections punished at one boundary are
+/// two violations.
+#[test]
+fn every_unjustified_punishment_is_a_violation() {
+    let on = |connection, obs: Observation| match obs {
+        Observation::PeerFrame {
+            stream,
+            seq,
+            row,
+            label,
+            exhausted,
+            ..
+        } => Observation::PeerFrame {
+            connection,
+            stream,
+            seq,
+            row,
+            label,
+            exhausted,
+        },
+        Observation::FrameJudged { stream, seq, .. } => Observation::FrameJudged {
+            connection,
+            stream,
+            seq,
+        },
+        Observation::ConnectionClosed { cause, .. } => {
+            Observation::ConnectionClosed { connection, cause }
+        }
+        obs => obs,
+    };
+    let report = run_script(vec![vec![
+        frame(FEED_STREAM, 0, Some("watch"), Label::Conformant),
+        judged(FEED_STREAM, 0),
+        on(2, frame(FEED_STREAM, 0, Some("watch"), Label::Conformant)),
+        on(2, judged(FEED_STREAM, 0)),
+        closed("header_peer_fault"),
+        on(2, closed("header_peer_fault")),
+    ]]);
+    let property = report
+        .properties
+        .iter()
+        .find(|p| p.property == "feed/s64v1/conformant-never-closes")
+        .expect("the property reports");
+    let connections: Vec<&str> = property
+        .violations
+        .iter()
+        .map(|v| v.expected.split('\'').next().unwrap_or_default())
+        .collect();
+    assert_eq!(connections, ["connection 1", "connection 2"]);
 }

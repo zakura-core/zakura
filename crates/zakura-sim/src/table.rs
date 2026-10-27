@@ -10,6 +10,9 @@
 //! peer's role models label at send time; [`Observation::FrameJudged`], the
 //! node's reader reaching the bytes that decide the label;
 //! [`Observation::ConnectionClosed`]; and [`Observation::Misbehavior`].
+//! Each judged frame needs exactly one earlier `PeerFrame` with its
+//! connection, stream and sequence number. A missing or repeated one fails
+//! the run as a harness failure, so a lost label can't hide an obligation.
 
 use std::fmt;
 
@@ -253,9 +256,15 @@ struct Sent<'a> {
 }
 
 /// The frame `seq` the peer sent on `connection` and `stream`, from
-/// `entries`.
-fn sent(entries: &[Entry], connection: u64, stream: StreamId, seq: u64) -> Option<Sent<'_>> {
-    entries.iter().rev().find_map(|entry| match &entry.obs {
+/// `entries`. Every judged frame needs exactly one label there, so a missing
+/// or repeated `PeerFrame` is missing evidence, described in the error.
+fn sent(
+    entries: &[Entry],
+    connection: u64,
+    stream: StreamId,
+    seq: u64,
+) -> Result<Sent<'_>, String> {
+    let mut labels = entries.iter().filter_map(|entry| match &entry.obs {
         Observation::PeerFrame {
             connection: c,
             stream: s,
@@ -270,11 +279,18 @@ fn sent(entries: &[Entry], connection: u64, stream: StreamId, seq: u64) -> Optio
             exhausted: *exhausted,
         }),
         _ => None,
-    })
+    });
+    let frame = format!("connection {connection} judged frame {seq} on {stream}");
+    match (labels.next(), labels.next()) {
+        (Some(sent), None) => Ok(sent),
+        (None, _) => Err(format!("{frame} has no PeerFrame label before it")),
+        (Some(_), Some(_)) => Err(format!("{frame} has more than one PeerFrame label")),
+    }
 }
 
-/// Every frame the node judged on `connection` in `entries`, in order.
-fn judged(entries: &[Entry], connection: u64) -> Vec<Sent<'_>> {
+/// Every frame the node judged on `connection` in `entries`, in order, or
+/// the first one's missing evidence.
+fn judged(entries: &[Entry], connection: u64) -> Result<Vec<Sent<'_>>, String> {
     entries
         .iter()
         .enumerate()
@@ -283,7 +299,7 @@ fn judged(entries: &[Entry], connection: u64) -> Vec<Sent<'_>> {
                 connection: c,
                 stream,
                 seq,
-            } if c == connection => sent(&entries[..at], connection, stream, seq),
+            } if c == connection => Some(sent(&entries[..at], connection, stream, seq)),
             _ => None,
         })
         .collect()
@@ -329,9 +345,14 @@ fn check_closes<S: HasView>(
             continue;
         };
         let before = &entries[..start + at];
-        let matches = stream == id.stream
-            && sent(before, connection, stream, seq)
-                .is_some_and(|frame| frame.label == label && frame.row == id.row);
+        let frame = match sent(before, connection, stream, seq) {
+            Ok(frame) => frame,
+            Err(missing) => {
+                cx.missing_evidence(missing);
+                return Verdict::NotApplicable;
+            }
+        };
+        let matches = stream == id.stream && frame.label == label && frame.row == id.row;
         if matches && !closed(before, connection) {
             obliged.push((at, connection));
         }
@@ -353,7 +374,8 @@ fn check_closes<S: HasView>(
 /// connection with such a frame, if every frame the node judged on that
 /// connection before the punishment, on any stream, is `Conformant`, the
 /// punishment is a violation. A fault on a sibling stream justifies it, but
-/// only one judged before it.
+/// only one judged before it. Every unjustified punishment at the step is a
+/// violation of its own.
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -362,6 +384,7 @@ fn check_never_closes<S: HasView>(
     let entries = cx.log.entries();
     let start = entries.partition_point(|e| e.step < cx.step);
     let mut verdict = Verdict::NotApplicable;
+    let mut unjustified = Vec::new();
     for (at, entry) in entries[start..].iter().enumerate() {
         let before = &entries[..start + at];
         let (connection, punishment) = match &entry.obs {
@@ -370,10 +393,15 @@ fn check_never_closes<S: HasView>(
                 stream,
                 seq,
             } => {
-                if *stream == id.stream
-                    && sent(before, *connection, *stream, *seq).is_some_and(|f| applies(&f))
-                {
-                    verdict = Verdict::Holds;
+                match sent(before, *connection, *stream, *seq) {
+                    Ok(frame) if *stream == id.stream && applies(&frame) => {
+                        verdict = Verdict::Holds;
+                    }
+                    Ok(_) => {}
+                    Err(missing) => {
+                        cx.missing_evidence(missing);
+                        return Verdict::NotApplicable;
+                    }
                 }
                 continue;
             }
@@ -383,16 +411,27 @@ fn check_never_closes<S: HasView>(
             Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),
             _ => continue,
         };
-        let judged = judged(before, connection);
+        let judged = match judged(before, connection) {
+            Ok(judged) => judged,
+            Err(missing) => {
+                cx.missing_evidence(missing);
+                return Verdict::NotApplicable;
+            }
+        };
         let covered = judged.iter().any(|f| f.stream == id.stream && applies(f));
         if covered && judged.iter().all(|f| f.label == Label::Conformant) {
-            return cx.violated(
-                format!(
-                    "connection {connection}'s judged frames are all conformant, so no punishment"
-                ),
-                punishment,
-            );
+            unjustified.push((connection, punishment));
         }
     }
-    verdict
+    let expected = |connection| {
+        format!("connection {connection}'s judged frames are all conformant, so no punishment")
+    };
+    let mut unjustified = unjustified.into_iter();
+    let Some((connection, punishment)) = unjustified.next() else {
+        return verdict;
+    };
+    for (connection, punishment) in unjustified {
+        cx.record_violation(expected(connection), punishment);
+    }
+    cx.violated(expected(connection), punishment)
 }

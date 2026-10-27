@@ -97,13 +97,23 @@ fn try_main() -> Result<(), BoxError> {
             rt_imports::check(&repo_root()?)
         }
         Some("planted") => {
-            let property = args.next();
-            if args.next().is_some() {
-                return Err(Box::new(UsageError(
-                    "expected at most one property ID after `cargo xtask planted`",
-                )));
+            let mut changed_since = None;
+            let mut property = None;
+            while let Some(arg) = args.next() {
+                if arg == "--changed-since" {
+                    changed_since = Some(
+                        args.next()
+                            .ok_or(UsageError("expected a revision after `--changed-since`"))?,
+                    );
+                } else if property.is_none() {
+                    property = Some(arg);
+                } else {
+                    return Err(Box::new(UsageError(
+                        "expected at most one property ID after `cargo xtask planted`",
+                    )));
+                }
             }
-            planted::run(&repo_root()?, property.as_deref())
+            planted::run(&repo_root()?, property.as_deref(), changed_since.as_deref())
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
@@ -311,7 +321,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rt-imports")?;
-    writeln!(output, "  cargo xtask planted [<property-id>]")?;
+    writeln!(
+        output,
+        "  cargo xtask planted [--changed-since <rev>] [<property-id>]"
+    )?;
     writeln!(
         output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
@@ -363,6 +376,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "its committed input holds the property unpatched and violates exactly it patched."
+    )?;
+    writeln!(
+        output,
+        "With --changed-since, it runs only the cases the changes since that revision affect."
     )?;
     writeln!(output)?;
     writeln!(

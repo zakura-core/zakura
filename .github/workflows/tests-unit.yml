@@ -494,6 +494,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
+          # A pull request's checkout is its merge commit. Its first parent,
+          # the base branch, tells the planted runner what the PR changed.
+          fetch-depth: 2
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
@@ -517,9 +520,16 @@ jobs:
           RUSTFLAGS: --cfg zakura_sim
       # Each retained bypass patch under qa/planted/ must still make its
       # property fail. The runner applies each patch in its own scratch
-      # worktree under target/planted/, so the checkout stays clean.
+      # worktree under target/planted/, so the checkout stays clean. A pull
+      # request runs only the cases its changes affect; main and the merge
+      # queue run every case.
       - name: Check the planted bypass patches
-        run: cargo xtask planted
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            cargo xtask planted --changed-since HEAD^1
+          else
+            cargo xtask planted
+          fi
         env:
           RUSTFLAGS: --cfg zakura_sim
 

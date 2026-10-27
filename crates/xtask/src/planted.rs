@@ -25,6 +25,10 @@
 //! reports how many of its inputs caught the patch. It fails the case only
 //! on a run that fails, ends at a harness failure, or violates another
 //! property, so the gate stays the committed input.
+//!
+//! `--changed-since <rev>` runs only the cases a change since `rev` can
+//! affect: those whose patch, case file, input, patched files or listed
+//! checks changed, or every case if this runner changed.
 
 use std::{
     env,
@@ -42,6 +46,10 @@ use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
 
+/// This runner, relative to the repository root. A change to it affects
+/// every case.
+const RUNNER: &str = "crates/xtask/src/planted.rs";
+
 /// Fuzz inputs the short campaign records after the committed input.
 const CAMPAIGN_INPUTS: usize = 32;
 
@@ -58,6 +66,9 @@ struct Case {
     /// The committed fuzz input that must find it, relative to the
     /// repository root.
     input: PathBuf,
+    /// Other paths whose change can break the catch, relative to the
+    /// repository root.
+    checks: Vec<PathBuf>,
 }
 
 /// A case's `<name>.toml`.
@@ -66,6 +77,11 @@ struct Case {
 struct CaseFile {
     /// The committed fuzz input, relative to the repository root.
     input: PathBuf,
+    /// Files or directories, relative to the repository root, whose change
+    /// can break the catch besides the files the patch changes: the
+    /// property's check, its harness, and its trigger history.
+    #[serde(default)]
+    checks: Vec<PathBuf>,
 }
 
 /// A committed fuzz input's sidecar, as `zakura-sim`'s tests check it.
@@ -158,8 +174,13 @@ impl fmt::Display for Verdict {
 }
 
 /// Runs every planted case, or only `property`'s, and fails unless each is
-/// caught.
-pub(super) fn run(repo_root: &Path, property: Option<&str>) -> Result<(), BoxError> {
+/// caught. With `changed_since`, it runs only the cases a change since that
+/// revision affects, and passes if none is.
+pub(super) fn run(
+    repo_root: &Path,
+    property: Option<&str>,
+    changed_since: Option<&str>,
+) -> Result<(), BoxError> {
     let cases: Vec<Case> = cases(repo_root)?
         .into_iter()
         .filter(|case| property.is_none_or(|p| case.property == p))
@@ -170,6 +191,23 @@ pub(super) fn run(repo_root: &Path, property: Option<&str>) -> Result<(), BoxErr
             None => format!("no planted cases under {PLANTED_DIR}").into(),
         });
     }
+    let cases = match changed_since {
+        Some(rev) => {
+            let changed = changed_since_rev(repo_root, rev)?;
+            let mut affected = Vec::new();
+            for case in cases {
+                if is_affected(&watched(repo_root, &case)?, &changed) {
+                    affected.push(case);
+                }
+            }
+            if affected.is_empty() {
+                println!("no planted case is affected by the changes since {rev}");
+                return Ok(());
+            }
+            affected
+        }
+        None => cases,
+    };
     let work = repo_root.join("target").join("planted");
     let mut failed = 0;
     for (index, case) in cases.iter().enumerate() {
@@ -202,7 +240,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 .ok_or_else(|| format!("{} isn't under a property", patch.display()))?
                 .to_owned();
             let case_file = patch.with_extension("toml");
-            let CaseFile { input } = toml::from_str(
+            let CaseFile { input, checks } = toml::from_str(
                 &fs::read_to_string(&case_file)
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
@@ -211,9 +249,81 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 property,
                 patch,
                 input,
+                checks,
             })
         })
         .collect()
+}
+
+/// The paths `git diff` reports changed between `rev`'s merge base with
+/// `HEAD` and `HEAD`, relative to the repository root.
+fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxError> {
+    let output = git(repo_root)
+        .args(["diff", "--name-only", &format!("{rev}...HEAD")])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git diff {rev}...HEAD` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Every path whose change can break `case`'s catch, relative to
+/// `repo_root`: the patch and its case file, the input and its sidecar, the
+/// files the patch changes, the case's checks, and this runner.
+fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
+    let relative = |path: &Path| {
+        path.strip_prefix(repo_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| format!("{} isn't under the repository", path.display()))
+    };
+    let mut watched = vec![
+        relative(&case.patch)?,
+        relative(&case.patch.with_extension("toml"))?,
+        case.input.clone(),
+        case.input.with_extension("toml"),
+        PathBuf::from(RUNNER),
+    ];
+    watched.extend(patched_files(repo_root, &case.patch)?);
+    watched.extend(case.checks.iter().cloned());
+    Ok(watched)
+}
+
+/// The files `patch` changes, as `git apply --numstat` lists them without
+/// applying it.
+fn patched_files(repo_root: &Path, patch: &Path) -> Result<Vec<PathBuf>, BoxError> {
+    let output = git(repo_root)
+        .args(["apply", "--numstat"])
+        .arg(patch)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: {}",
+            patch.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    // Each line is `<added>\t<deleted>\t<path>`.
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.splitn(3, '\t').nth(2))
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// True if a path in `changed` is a watched path, or lies in a watched
+/// directory.
+fn is_affected(watched: &[PathBuf], changed: &[PathBuf]) -> bool {
+    changed
+        .iter()
+        .any(|path| watched.iter().any(|w| path.starts_with(w)))
 }
 
 /// Appends every `.patch` file under `dir` to `patches`.
@@ -688,6 +798,50 @@ mod tests {
             .to_string(),
             "caught; the campaign caught it on 5 of 32 inputs"
         );
+    }
+
+    /// A case is affected by a change to its patch's files, its checks, its
+    /// own files, or the runner, and not by an unrelated change.
+    #[test]
+    fn planted_runs_only_affected_cases() {
+        let watched = [
+            PathBuf::from("crates/x/src/lib.rs"),
+            PathBuf::from("crates/zakura-sim/src/domain"),
+            PathBuf::from(RUNNER),
+        ];
+        let affected = |path: &str| is_affected(&watched, &[PathBuf::from(path)]);
+        assert!(affected("crates/x/src/lib.rs"));
+        assert!(affected("crates/zakura-sim/src/domain/discovery.rs"));
+        assert!(affected(RUNNER));
+        assert!(!affected("crates/x/src/other.rs"));
+        assert!(!affected("crates/zakura-sim/src/domainx.rs"));
+        assert!(!is_affected(&watched, &[]));
+    }
+
+    /// Each committed case watches its patch's production files and its
+    /// listed checks, which all exist.
+    #[test]
+    fn committed_cases_watch_existing_files() {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        for case in cases(&repo_root).expect("the planted cases parse") {
+            let watched = watched(&repo_root, &case).expect("the case's files exist");
+            for path in &watched {
+                assert!(
+                    repo_root.join(path).exists(),
+                    "{}: {} doesn't exist",
+                    case.patch.display(),
+                    path.display()
+                );
+            }
+            assert!(!case.checks.is_empty(), "{}", case.patch.display());
+            assert!(
+                watched
+                    .iter()
+                    .any(|path| path.starts_with("crates/zakura-network")),
+                "{} watches the production file it patches",
+                case.patch.display()
+            );
+        }
     }
 
     /// The committed cases parse, and each names an input with a sidecar.

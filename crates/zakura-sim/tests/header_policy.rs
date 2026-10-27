@@ -284,6 +284,9 @@ fn answers(predicates: &Predicates) -> String {
     out.join("\n")
 }
 
+/// One scripted thing the run records.
+type Record = Box<dyn Fn(&mut Predicates)>;
+
 /// Asking twice with nothing recorded between gives the same answers, and
 /// so does a fresh copy fed the same facts, so only recording changes them.
 #[test]
@@ -301,7 +304,7 @@ fn policy_is_pure_between_steps() {
             Trigger::CallerDropped(Select::held()),
         ),
     ];
-    let script: Vec<Box<dyn Fn(&mut Predicates)>> = vec![
+    let script: Vec<Record> = vec![
         Box::new(|p| p.record(&submitted(1, OpKind::Locator, 0))),
         Box::new(|p| p.record(&submitted(2, OpKind::Apply, 1))),
         Box::new(|p| p.record_link(LinkEffect::Linked, "mira")),

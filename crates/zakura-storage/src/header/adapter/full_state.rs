@@ -93,10 +93,6 @@ impl EnginePort {
     ///
     /// If the commit would take the best chain past full state's
     /// non-finalized window. See [`VerifiedChain::with`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the controlled block service is its caller")
-    )]
     pub(crate) fn commit_block(
         &self,
         block: Arc<block::Block>,
@@ -140,10 +136,6 @@ impl EnginePort {
     /// # Errors
     ///
     /// If `request` carries another event, or the engine refuses it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the controlled block service is its caller")
-    )]
     pub(crate) fn record_body_evidence(
         &self,
         request: TransitionRequest,
@@ -196,10 +188,6 @@ impl EnginePort {
     }
 
     /// Closes the view watch, as service shutdown does.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the controlled block service is its caller")
-    )]
     pub(crate) fn close_views(&self) {
         let sender = {
             let _engine = self.engine();

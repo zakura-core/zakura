@@ -273,6 +273,20 @@ impl VerifiedChain {
             .map(|committed| committed.block.hash())
     }
 
+    /// The hash of `tip`'s ancestor at `height`, `tip` itself included, or
+    /// `None` if full state doesn't hold `tip` or `height` is above it.
+    pub fn ancestor(
+        &self,
+        tip: zakura_header_chain::Frontier,
+        height: block::Height,
+    ) -> Option<block::Hash> {
+        let mut current = self.get(tip.hash).filter(|tip| tip.height >= height)?;
+        while current.height > height {
+            current = self.get(current.block.header.previous_block_hash)?;
+        }
+        Some(current.block.hash())
+    }
+
     /// The serialized size of `hash` if it's on the best chain, as
     /// `read::block_info` reads it.
     fn best_chain_size(&self, hash: block::Hash) -> Option<u32> {

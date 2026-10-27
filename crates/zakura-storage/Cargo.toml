@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 chrono = { workspace = true }
+futures = { workspace = true }
 sha2 = { workspace = true }
 zakura-chain = { path = "../zakura-chain" }
 zakura-header-chain = { path = "../zakura-header-chain" }
@@ -32,8 +33,9 @@ zakura-test = { path = "../zakura-test" }
 zakura-scheduler = { path = "../zakura-scheduler" }
 
 # The block-sync routine's body checks and payload decoder, for the fixture
-# tests. The simulator build exposes them without the feature, which doesn't
-# compile there.
+# tests, and detached range-read leases, for the block service's tests. The
+# simulator build exposes them without the feature, which doesn't compile
+# there.
 [target.'cfg(not(zakura_sim))'.dev-dependencies]
 zakura-network = { path = "../zakura-network", features = ["zakura-testkit"] }
 

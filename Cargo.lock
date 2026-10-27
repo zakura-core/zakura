@@ -3528,6 +3528,7 @@ name = "zakura-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "sha2",
  "tokio",
  "zakura-chain",

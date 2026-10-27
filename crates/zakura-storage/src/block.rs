@@ -14,6 +14,11 @@
 //! was written against, and the source references below name the code it
 //! follows.
 //!
+//! [`controlled`] holds the block service that keeps this contract,
+//! [`evidence`] the facts it publishes and the models that check them, and
+//! [`range`] the range source serving reads through. [`fixture`] builds the
+//! blocks it serves.
+//!
 //! # Operations
 //!
 //! [`BlockOp`] lists one operation per action, plus the range read. A
@@ -169,7 +174,10 @@ use zakura_network::zakura::{
 };
 use zakura_node_services::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 
+pub mod controlled;
+pub mod evidence;
 pub mod fixture;
+pub mod range;
 
 /// How many times `persist_consensus_body_invalid` refreshes a stale
 /// version before it gives up.
@@ -680,6 +688,21 @@ impl BlockOp {
             BlockOp::Misbehavior => "misbehavior",
             BlockOp::ReadRange => "read_range",
         }
+    }
+
+    /// Whether the driver awaits this operation before it takes its next
+    /// action: a query or a record. It queues a submission, and awaits a
+    /// misbehavior report's enforcement only, which the simulator doesn't
+    /// run.
+    pub const fn awaited(self) -> bool {
+        matches!(
+            self,
+            BlockOp::QueryNeededBlocks
+                | BlockOp::RecordBodyUnavailable
+                | BlockOp::RecordBodyInvalid
+                | BlockOp::RestartBodyAvailability
+                | BlockOp::RetryBodyAvailability
+        )
     }
 
     /// This operation's contract.

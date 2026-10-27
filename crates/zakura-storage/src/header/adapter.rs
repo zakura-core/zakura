@@ -21,7 +21,10 @@
 //! glue from [`crate::full_state`]. A run without block sync commits no
 //! bodies, so full state stays at genesis and nothing changes for headers.
 
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+};
 
 use sha2::{Digest, Sha256};
 use zakura_chain::block;
@@ -152,6 +155,15 @@ impl EnginePort {
             full_state: StdMutex::new(VerifiedChain::new(fixture.genesis_block())),
             views: StdMutex::new(views),
         }
+    }
+
+    /// The port, planning each later transition with at most
+    /// `max_non_finalized_nodes` non-finalized graph nodes, as a node
+    /// configured with that limit plans its own. A protected path past the
+    /// limit stalls the engine.
+    pub fn with_max_non_finalized_nodes(mut self, max_non_finalized_nodes: NonZeroUsize) -> Self {
+        self.config.limits.max_non_finalized_nodes = max_non_finalized_nodes;
+        self
     }
 
     /// The key that seals this port's targets and path handles. The

@@ -9,7 +9,8 @@
 //! port over the real header-chain engine, the fixture chains it loads, and
 //! a port whose operations wait for the run to complete them. The block side
 //! is in [`block`]: the contract for the block-sync actions and range reads
-//! a block service answers, and the fixture blocks it serves. Both sides
+//! a block service answers, the fixture blocks it serves, and a block service
+//! whose operations wait for the run to complete them. Both sides
 //! run over zakura-state's full-state glue in [`full_state`], which the
 //! header side's engine port holds.
 

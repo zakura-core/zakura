@@ -14,11 +14,17 @@
 //!    violation of any property;
 //! 3. applies the patch and records the input again, which must violate
 //!    exactly the case's property;
-//! 4. removes the worktree, keeping both traces as evidence.
+//! 4. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
+//!    inputs, drawn from a seed that the property's ID fixes, each of which
+//!    must hold or violate only the case's property;
+//! 5. removes the worktree, keeping every trace as evidence.
 //!
 //! A patch that doesn't apply, a build that fails, a harness failure, a
 //! violation of another property, and a patch the input doesn't catch are
-//! each reported as their own failure, never as a catch.
+//! each reported as their own failure, never as a catch. The campaign
+//! reports how many of its inputs caught the patch. It fails the case only
+//! on a run that fails, ends at a harness failure, or violates another
+//! property, so the gate stays the committed input.
 
 use std::{
     env,
@@ -35,6 +41,12 @@ use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
 
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
+
+/// Fuzz inputs the short campaign records after the committed input.
+const CAMPAIGN_INPUTS: usize = 32;
+
+/// The campaign's longest input, in bytes.
+const CAMPAIGN_INPUT_BYTES: usize = 64;
 
 /// One retained bypass patch.
 #[derive(Clone, Debug)]
@@ -83,12 +95,21 @@ enum Run {
     Failed(String),
 }
 
+/// What a case's short campaign found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Campaign {
+    /// Inputs recorded.
+    inputs: usize,
+    /// Inputs whose run violated the case's property.
+    caught: usize,
+}
+
 /// How a case ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Verdict {
     /// The unpatched run holds the property, and the patched run violates
-    /// exactly it.
-    Caught,
+    /// exactly it. `None` before the campaign runs.
+    Caught(Option<Campaign>),
     /// The unpatched run doesn't hold the property cleanly.
     BaselineFails(String),
     /// The patch doesn't apply to `HEAD`.
@@ -101,12 +122,24 @@ enum Verdict {
     Unrelated(String),
     /// The patched run didn't violate the property.
     NotCaught(String),
+    /// A campaign input's patched run failed, ended at a harness failure,
+    /// or violated another property.
+    CampaignFails {
+        /// The input.
+        input: PathBuf,
+        /// Its run's verdict.
+        verdict: Box<Verdict>,
+    },
 }
 
 impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Verdict::Caught => f.write_str("caught"),
+            Verdict::Caught(None) => f.write_str("caught"),
+            Verdict::Caught(Some(Campaign { inputs, caught })) => write!(
+                f,
+                "caught; the campaign caught it on {caught} of {inputs} inputs"
+            ),
             Verdict::BaselineFails(why) => write!(f, "the unpatched baseline fails: {why}"),
             Verdict::PatchDoesntApply(why) => write!(f, "the patch doesn't apply: {why}"),
             Verdict::Failed(why) => write!(f, "the patched run failed: {why}"),
@@ -116,6 +149,9 @@ impl fmt::Display for Verdict {
             }
             Verdict::NotCaught(outcome) => {
                 write!(f, "the patched run didn't violate it: {outcome}")
+            }
+            Verdict::CampaignFails { input, verdict } => {
+                write!(f, "campaign input {}: {verdict}", input.display())
             }
         }
     }
@@ -140,7 +176,7 @@ pub(super) fn run(repo_root: &Path, property: Option<&str>) -> Result<(), BoxErr
         let scratch = work.join(format!("case-{index}"));
         let verdict = run_case(repo_root, &scratch, &work.join("target"), case)?;
         println!("{} {}: {verdict}", case.property, case.patch.display());
-        if verdict != Verdict::Caught {
+        if !matches!(verdict, Verdict::Caught(_)) {
             failed += 1;
         }
     }
@@ -234,15 +270,96 @@ fn check_case(
     case: &Case,
 ) -> Result<Verdict, BoxError> {
     let harness = harness_of(worktree, &case.input)?;
-    let baseline = record(worktree, target, &harness, case, &scratch.join("baseline"))?;
+    let input = worktree.join(&case.input);
+    let baseline = record(
+        cargo_run(worktree, target),
+        &harness,
+        &input,
+        &case.property,
+        &scratch.join("baseline"),
+    )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
     }
     if let Err(why) = apply(worktree, &case.patch) {
         return Ok(Verdict::PatchDoesntApply(why));
     }
-    let patched = record(worktree, target, &harness, case, &scratch.join("patched"))?;
-    Ok(classify(&case.property, &patched))
+    let patched = record(
+        cargo_run(worktree, target),
+        &harness,
+        &input,
+        &case.property,
+        &scratch.join("patched"),
+    )?;
+    match classify(&case.property, &patched) {
+        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign")),
+        verdict => Ok(verdict),
+    }
+}
+
+/// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
+/// build in `target`, which recording the committed input built. Each input
+/// and its trace go under `dir`.
+fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir_all(dir)?;
+    let binary = target.join("debug").join("zakura-sim");
+    let mut caught = 0;
+    for (index, bytes) in campaign_inputs(&case.property).into_iter().enumerate() {
+        let input = dir.join(format!("input-{index}.bin"));
+        fs::write(&input, bytes)?;
+        let run = record(
+            Command::new(&binary),
+            harness,
+            &input,
+            &case.property,
+            &dir.join(format!("run-{index}")),
+        )?;
+        match classify(&case.property, &run) {
+            Verdict::Caught(_) => caught += 1,
+            Verdict::NotCaught(_) => {}
+            verdict => {
+                return Ok(Verdict::CampaignFails {
+                    input,
+                    verdict: Box::new(verdict),
+                })
+            }
+        }
+    }
+    Ok(Verdict::Caught(Some(Campaign {
+        inputs: CAMPAIGN_INPUTS,
+        caught,
+    })))
+}
+
+/// The campaign's inputs for `property`: [`CAMPAIGN_INPUTS`] byte strings of
+/// up to [`CAMPAIGN_INPUT_BYTES`], from a SplitMix64 stream that the
+/// property's ID seeds, so a case's campaign is the same on every run and
+/// doesn't move when other cases are added.
+fn campaign_inputs(property: &str) -> Vec<Vec<u8>> {
+    // FNV-1a.
+    let mut state = property
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    (0..CAMPAIGN_INPUTS)
+        .map(|_| {
+            // The remainder is below CAMPAIGN_INPUT_BYTES + 1, so it fits.
+            let len = (next() % (CAMPAIGN_INPUT_BYTES as u64 + 1)) as usize;
+            // Each byte is the low 8 bits of a draw.
+            (0..len).map(|_| next() as u8).collect()
+        })
+        .collect()
 }
 
 /// The harness `input`'s sidecar names.
@@ -269,20 +386,12 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// Records `case`'s input on `harness` in `worktree`'s simulator build,
-/// writing the trace to `out`, and reads its `end` record.
-fn record(
-    worktree: &Path,
-    target: &Path,
-    harness: &str,
-    case: &Case,
-    out: &Path,
-) -> Result<Run, BoxError> {
-    if out.exists() {
-        fs::remove_dir_all(out)?;
-    }
+/// `zakura-sim`, built and run from `worktree`'s simulator build in
+/// `target`.
+fn cargo_run(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", target)
         .current_dir(worktree)
@@ -294,9 +403,25 @@ fn record(
             "--bin",
             "zakura-sim",
             "--",
-        ])
+        ]);
+    command
+}
+
+/// Records `input` on `harness` with `zakura_sim`, a `zakura-sim` command,
+/// writing the trace to `out`, and reads its `end` record for `property`.
+fn record(
+    mut zakura_sim: Command,
+    harness: &str,
+    input: &Path,
+    property: &str,
+    out: &Path,
+) -> Result<Run, BoxError> {
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    let status = zakura_sim
         .args(["record", "--sim", harness, "--input"])
-        .arg(worktree.join(&case.input))
+        .arg(input)
         .arg("--out")
         .arg(out)
         .status()?;
@@ -307,7 +432,7 @@ fn record(
     }
     let trace = fs::read_to_string(out.join("trace.jsonl"))?;
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
-    end_of(&case.property, end)
+    end_of(property, end)
 }
 
 /// Reads `line`, a trace's `end` record, for `property`.
@@ -388,8 +513,10 @@ fn classify(property: &str, patched: &Run) -> Verdict {
         } => Verdict::Unrelated(violated.clone()),
         Run::Ended {
             violation: Some(_), ..
-        } => Verdict::Caught,
-        Run::Ended { outcome, .. } if outcome.as_deref() == Some("violated") => Verdict::Caught,
+        } => Verdict::Caught(None),
+        Run::Ended { outcome, .. } if outcome.as_deref() == Some("violated") => {
+            Verdict::Caught(None)
+        }
         Run::Ended { outcome, .. } => Verdict::NotCaught(
             outcome
                 .clone()
@@ -440,10 +567,13 @@ mod tests {
     fn planted_passes_only_on_its_own_id() {
         assert_eq!(
             classify(ID, &run(Some(ID), &[(ID, VIOLATED)])),
-            Verdict::Caught
+            Verdict::Caught(None)
         );
         // A violation that didn't stop the run, as for a Known property.
-        assert_eq!(classify(ID, &run(None, &[(ID, VIOLATED)])), Verdict::Caught);
+        assert_eq!(
+            classify(ID, &run(None, &[(ID, VIOLATED)])),
+            Verdict::Caught(None)
+        );
         assert_eq!(
             classify(
                 ID,
@@ -523,6 +653,40 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.join("a.rs")).unwrap(),
             "fn c() {}\n"
+        );
+    }
+
+    /// A case's campaign inputs are fixed by its property's ID alone, stay
+    /// within the length bound, and differ between properties.
+    #[test]
+    fn campaign_inputs_follow_the_property() {
+        let inputs = campaign_inputs(ID);
+        assert_eq!(inputs.len(), CAMPAIGN_INPUTS);
+        assert!(inputs.iter().all(|i| i.len() <= CAMPAIGN_INPUT_BYTES));
+        assert!(inputs.iter().any(|i| !i.is_empty()));
+        assert_eq!(inputs, campaign_inputs(ID));
+        assert_ne!(inputs, campaign_inputs("race/lost-update"));
+    }
+
+    /// A campaign run that violates another property fails the case and
+    /// names the input; one that holds or catches the patch doesn't.
+    #[test]
+    fn campaign_failures_name_their_input() {
+        let verdict = Verdict::CampaignFails {
+            input: PathBuf::from("campaign/input-3.bin"),
+            verdict: Box::new(classify(ID, &run(Some("sim/no-task-panic"), &[(ID, HELD)]))),
+        };
+        assert_eq!(
+            verdict.to_string(),
+            "campaign input campaign/input-3.bin: the patched run violated sim/no-task-panic instead"
+        );
+        assert_eq!(
+            Verdict::Caught(Some(Campaign {
+                inputs: 32,
+                caught: 5
+            }))
+            .to_string(),
+            "caught; the campaign caught it on 5 of 32 inputs"
         );
     }
 

@@ -2,19 +2,22 @@
 //! and block sync sees the same events from it as from the simulator's
 //! controlled block service.
 //!
-//! The driver runs over fakes that share one zakura-storage engine. State
-//! reads answer from the engine's full state, records go to the engine, and
-//! the verifier waits for each case's verdict, committing the body to the
-//! engine, in the order the verifier received it, when the verdict commits
-//! it. Each verdict is an error the real
-//! verifier returns, so `block_verify_error_class` classifies it.
+//! A case with no verdict runs the driver over a real ephemeral zakura-state
+//! holding the case's headers. Its state reads and records go to that
+//! state. A case with verdicts runs the driver over fakes that share one
+//! zakura-storage engine. State reads answer from the engine's full state,
+//! and records go to the engine. In both, the verifier waits for each case's
+//! verdict, committing the body to the engine, in the order the verifier
+//! received it, when the verdict commits it. Each verdict is an error the
+//! real verifier returns, wrapped by its router, so
+//! `block_verify_error_class` classifies it.
 //! `zakura_storage::block::cases` lists the driver behavior the cases leave
 //! out.
 
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -28,7 +31,7 @@ use zakura_network::zakura::DetachedHandleEvents;
 use zakura_node_services::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 use zakura_storage::{
     block::{
-        cases::{cases, run_controlled, Case, Observed, Script, Step},
+        cases::{cases, insert_headers, run_controlled, Case, Observed, Script, Step},
         controlled::record_request,
         evidence::RecordResult,
         Commitment, HandleEvent, RetryKind, Verdict, MIN_APPLY_LIMIT, MIN_CHECKPOINT_APPLY_LIMIT,
@@ -36,7 +39,7 @@ use zakura_storage::{
     header::adapter::EnginePort,
 };
 
-use super::*;
+use super::{super::header_sync_driver::engine_comparison::ProductionState, *};
 
 /// A verifier reply.
 type Reply = Result<block::Hash, zakura_consensus::BoxError>;
@@ -57,6 +60,45 @@ struct Shared {
     invalid: Mutex<Vec<ConsensusBodyInvalid>>,
     /// Whether a query's later chunks see a moved anchor.
     anchor_moves: AtomicBool,
+    /// The state calls zakura-state hasn't answered yet.
+    in_flight: AtomicUsize,
+}
+
+/// Where the driver's state reads and records go.
+enum Backend {
+    /// The case's engine, through fakes.
+    Engine(Arc<EnginePort>),
+    /// A real zakura-state holding the case's headers.
+    State(Box<ProductionState>),
+}
+
+impl Backend {
+    /// The backend for `case`, over `script`'s chain.
+    async fn for_case(case: &Case, script: &Script) -> Self {
+        if case
+            .steps
+            .iter()
+            .any(|(step, _)| matches!(step, Step::Verdict(..)))
+        {
+            return Backend::Engine(script.engine.clone());
+        }
+        let state = ProductionState::start().await;
+        insert_headers(&*state.port(), &script.blocks).await;
+        Backend::State(Box::new(state))
+    }
+
+    /// The latest view of the state the driver runs on.
+    fn view(&self) -> zakura_header_chain::CommittedHeaderChainView {
+        match self {
+            Backend::Engine(engine) => engine.view(),
+            Backend::State(state) => state
+                .read_state
+                .subscribe_header_chain_views()
+                .borrow()
+                .clone()
+                .expect("an attached header runtime publishes its view"),
+        }
+    }
 }
 
 /// Locks `mutex`. A poisoned lock means a fake already panicked.
@@ -74,21 +116,35 @@ struct DriverRun {
 }
 
 impl DriverRun {
-    /// Spawns the driver for `case`, over `engine`.
-    fn spawn(case: &Case, engine: Arc<EnginePort>) -> Self {
+    /// Spawns the driver for `case`, over `backend`.
+    fn spawn(case: &Case, backend: &Backend) -> Self {
         let shared = Arc::new(Shared::default());
         let (block_sync, events) = BlockSyncHandle::detached();
         let (actions, action_rx) = mpsc::channel(64);
         let (shutdown, shutdown_rx) = oneshot::channel();
-        let authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let (read_state, writer, authority) = match backend {
+            Backend::Engine(engine) => {
+                let authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+                (
+                    read_state(engine.clone(), shared.clone()),
+                    writer(engine.clone(), shared.clone(), authority.clone()),
+                    authority,
+                )
+            }
+            Backend::State(state) => (
+                state_reads(state, shared.clone()),
+                state_writes(state, shared.clone()),
+                state.authority.clone(),
+            ),
+        };
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zakura_network::zakura::ZakuraSupervisorHandle::new(1),
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
-            read_state(engine.clone(), shared.clone()),
-            Some(writer(engine, shared.clone(), authority.clone())),
+            read_state,
+            Some(writer),
             Some(authority),
             verifier(shared.clone()),
             block::Height(case.limits.max_checkpoint_height),
@@ -113,9 +169,17 @@ impl DriverRun {
 
     /// Lets the driver run until it waits on something only the test can
     /// give it. The runtime has one thread, so the driver runs only here.
-    async fn settle() {
-        for _ in 0..256 {
-            tokio::task::yield_now().await;
+    /// zakura-state answers on its own threads, so this also waits until
+    /// it has answered every call.
+    async fn settle(&self) {
+        loop {
+            for _ in 0..256 {
+                tokio::task::yield_now().await;
+            }
+            if self.shared.in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 
@@ -184,21 +248,91 @@ fn read_state(
             let metadata = engine
                 .missing_block_body_metadata(from, limit)
                 .map_err(|error| format!("{error:?}"))?;
-            let mut anchor = metadata.anchor;
-            if shared.anchor_moves.load(Ordering::SeqCst)
-                && from.0 > zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
-            {
-                anchor = Frontier {
-                    height: anchor.height,
-                    hash: block::Hash([0xff; 32]),
-                };
-            }
             Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
-                zakura_state::BlockSyncBodyMetadata {
-                    anchor,
-                    blocks: metadata.blocks,
-                },
+                moved_anchor(
+                    &shared,
+                    from,
+                    zakura_state::BlockSyncBodyMetadata {
+                        anchor: metadata.anchor,
+                        blocks: metadata.blocks,
+                    },
+                ),
             ))
+        }
+    }))
+}
+
+/// `metadata`, read from `from`, with its anchor moved if the case moves
+/// the anchor of a query's later chunks.
+fn moved_anchor(
+    shared: &Shared,
+    from: block::Height,
+    mut metadata: zakura_state::BlockSyncBodyMetadata,
+) -> zakura_state::BlockSyncBodyMetadata {
+    if shared.anchor_moves.load(Ordering::SeqCst)
+        && from.0 > zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
+    {
+        metadata.anchor = Frontier {
+            height: metadata.anchor.height,
+            hash: block::Hash([0xff; 32]),
+        };
+    }
+    metadata
+}
+
+/// Counts `call` in flight until zakura-state answers it.
+async fn counted<T>(shared: &Shared, call: impl std::future::Future<Output = T>) -> T {
+    shared.in_flight.fetch_add(1, Ordering::SeqCst);
+    let answer = call.await;
+    shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+    answer
+}
+
+/// State reads, from zakura-state.
+fn state_reads(
+    state: &ProductionState,
+    shared: Arc<Shared>,
+) -> BoxCloneService<zakura_state::ReadRequest, zakura_state::ReadResponse, zakura_state::BoxError>
+{
+    let read_state = state.read_state.clone();
+    BoxCloneService::new(service_fn(move |request: zakura_state::ReadRequest| {
+        let read_state = read_state.clone();
+        let shared = shared.clone();
+        async move {
+            let zakura_state::ReadRequest::MissingBlockBodyMetadata { from, .. } = request else {
+                panic!("unexpected read request: {request:?}");
+            };
+            match counted(&shared, read_state.oneshot(request)).await? {
+                zakura_state::ReadResponse::MissingBlockBodyMetadata(metadata) => {
+                    Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                        moved_anchor(&shared, from, metadata),
+                    ))
+                }
+                response => panic!("unexpected read response: {response:?}"),
+            }
+        }
+    }))
+}
+
+/// State writes: invalid-body records, to zakura-state.
+fn state_writes(
+    state: &ProductionState,
+    shared: Arc<Shared>,
+) -> BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError> {
+    let writer = state.writer();
+    BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+        let writer = writer.clone();
+        let shared = shared.clone();
+        async move {
+            let zakura_state::Request::RecordHeaderChainBodyInvalid { .. } = request else {
+                panic!("unexpected write request: {request:?}");
+            };
+            let response = counted(&shared, writer.oneshot(request)).await?;
+            let zakura_state::Response::HeaderChainBodyInvalidRecorded(result) = &response else {
+                panic!("unexpected write response: {response:?}");
+            };
+            lock(&shared.records).push(RecordResult::of(result));
+            Ok(response)
         }
     }))
 }
@@ -277,19 +411,21 @@ fn verifier_reply(verdict: Verdict, block: &block::Block) -> Reply {
     use zakura_state::{CommitBlockError, ValidateContextError};
 
     let hash = block.hash();
-    let commit = |error: CommitBlockError| -> Reply { Err(VerifyBlockError::Commit(error).into()) };
+    let router = |error: VerifyBlockError| -> Reply {
+        Err(zakura_consensus::RouterError::from(error).into())
+    };
+    let commit = |error: CommitBlockError| router(VerifyBlockError::Commit(error));
     let context = |error: ValidateContextError| {
         commit(CommitBlockError::ValidateContextError(Box::new(error)))
     };
     match verdict {
         Verdict::Committed => Ok(hash),
-        Verdict::Duplicate => Err(VerifyBlockError::Block {
+        Verdict::Duplicate => router(VerifyBlockError::Block {
             source: zakura_consensus::BlockError::AlreadyInChain(
                 hash,
                 zakura_state::KnownBlock::BestChain,
             ),
-        }
-        .into()),
+        }),
         Verdict::PayloadMismatch(commitment) => {
             let (expected, actual) = ([1; 32], [2; 32]);
             context(ValidateContextError::InvalidBlockCommitment(
@@ -309,9 +445,7 @@ fn verifier_reply(verdict: Verdict, block: &block::Block) -> Reply {
                 },
             ))
         }
-        Verdict::ConsensusInvalid => {
-            Err(VerifyBlockError::Subsidy(SubsidyError::NoCoinbase).into())
-        }
+        Verdict::ConsensusInvalid => router(VerifyBlockError::Subsidy(SubsidyError::NoCoinbase)),
         Verdict::Retryable(RetryKind::MissingContext) => {
             commit(CommitBlockError::MissingMinedParent)
         }
@@ -334,9 +468,10 @@ fn verifier_reply(verdict: Verdict, block: &block::Block) -> Reply {
 /// each step.
 async fn run_driver(case: &Case) -> Vec<Observed> {
     let mut script = Script::new(case);
-    let mut run = DriverRun::spawn(case, script.engine.clone());
+    let backend = Backend::for_case(case, &script).await;
+    let mut run = DriverRun::spawn(case, &backend);
     // The driver waits on its channel before each step, as between steps.
-    DriverRun::settle().await;
+    run.settle().await;
     let mut unadmitted: HashMap<block::Hash, VecDeque<BlockApplyToken>> = HashMap::new();
     let mut observed = Vec::new();
     for (step, _) in &case.steps {
@@ -363,7 +498,7 @@ async fn run_driver(case: &Case) -> Vec<Observed> {
             );
             // Every action goes out before the driver runs, so a burst
             // arrives together.
-            for action in script.actions(step) {
+            for action in script.actions_in(step, &backend.view()) {
                 match &action {
                     BlockSyncAction::SubmitBlock { token, block, .. } => unadmitted
                         .entry(block.hash())
@@ -379,13 +514,13 @@ async fn run_driver(case: &Case) -> Vec<Observed> {
                     .expect("the action channel has room for every step");
             }
         }
-        DriverRun::settle().await;
+        run.settle().await;
         run.observe(&mut seen, &mut unadmitted);
         observed.push(seen);
     }
     // The driver waits on its channel after the last step, with nothing
     // more to send.
-    DriverRun::settle().await;
+    run.settle().await;
     let mut after = Observed::default();
     run.observe(&mut after, &mut unadmitted);
     assert_eq!(

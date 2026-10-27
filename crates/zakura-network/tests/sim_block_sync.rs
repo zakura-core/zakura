@@ -1155,12 +1155,16 @@ fn check_request_steps(events: &[BlockEvent]) -> Result<(), String> {
     Ok(())
 }
 
-/// Each handoff ends with the same body and charge. The budget's release of
-/// exactly that charge comes just before the end, because the routine
+/// Each handoff starts before the routine retains its body's `Queued`
+/// holder, so the handoff covers every moment the sequencer's input holds
+/// the body. Each ends with the same body and charge. The budget's release
+/// of exactly that charge comes just before the end, because the routine
 /// reports the end after the counter changes and before the release wakes
 /// any waiter. Returns the handoffs that ended.
 fn check_handoffs(events: &[BlockEvent]) -> Result<usize, String> {
+    // Each open handoff, and whether its body's `Queued` holder followed.
     let mut open = Vec::new();
+    let mut queued = Vec::new();
     let mut ended = 0;
     for (index, event) in events.iter().enumerate() {
         match event {
@@ -1169,7 +1173,25 @@ fn check_handoffs(events: &[BlockEvent]) -> Result<usize, String> {
                 owner,
                 height,
                 charge,
-            } => open.push((peer.clone(), *owner, *height, *charge)),
+            } => {
+                open.push((peer.clone(), *owner, *height, *charge));
+                queued.push(false);
+            }
+            BlockEvent::Holder {
+                body,
+                holder: Holder::Queued { .. },
+                change: HolderChange::Retained,
+            } => {
+                if let Some(position) =
+                    open.iter()
+                        .zip(&queued)
+                        .position(|((_, owner, height, _), queued)| {
+                            !queued && *owner == body.owner && *height == body.height
+                        })
+                {
+                    queued[position] = true;
+                }
+            }
             BlockEvent::HandoffEnded {
                 peer,
                 owner,
@@ -1181,6 +1203,11 @@ fn check_handoffs(events: &[BlockEvent]) -> Result<usize, String> {
                     return Err(format!("{height:?} ended a handoff it never started"));
                 };
                 open.remove(position);
+                if !queued.remove(position) {
+                    return Err(format!(
+                        "{height:?}'s handoff started after its body was queued"
+                    ));
+                }
                 match index.checked_sub(1).map(|previous| &events[previous]) {
                     Some(BlockEvent::Budget(BudgetChange {
                         kind: BudgetChangeKind::Released,

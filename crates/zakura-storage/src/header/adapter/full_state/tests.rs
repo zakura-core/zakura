@@ -202,6 +202,33 @@ fn a_resource_stall_installs_its_alarm_and_leaves_full_state() {
     });
 }
 
+/// ST4.3: a stalled reset installs only the stall alarm, so it reports no
+/// verified-chain change and keeps the body-work epoch.
+#[test]
+fn a_stalled_reset_reports_no_verified_change() {
+    let fixture = BlockFixture::regtest();
+    let mut port = EnginePort::new(fixture.headers());
+    let anchor = fixture.anchor();
+    let a = fixture.block(anchor, 0, BodySpec::exact(2_000));
+    let b = fixture.block(anchor, 1, BodySpec::exact(2_000));
+    insert(&port, anchor, std::slice::from_ref(&b));
+    commit(&port, &b, 2);
+    // A was received first, so its commit would reset to it. Its header
+    // goes to the engine with the commit, past a one-node graph.
+    port.config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("1 is nonzero");
+    let epoch = port.view().body_work_epoch;
+
+    let stalled = port
+        .commit_block(a.block.clone(), 1)
+        .expect("a stall is a result");
+    assert!(matches!(stalled.result, ApplyResult::ResourceStalled(_)));
+    assert_eq!(stalled.cause, None);
+    let installed = stalled.installed.expect("the alarm change installs");
+    assert!(!installed.effect.invalidates_body_work());
+    assert_eq!(installed.view.body_work_epoch, epoch);
+    assert_eq!(verified_best(&port), b.frontier());
+}
+
 /// ST4.3: the missing-body query lists the selected headers above the
 /// committed anchor, with their advertised sizes, and nothing for an
 /// unadvertised one.

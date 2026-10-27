@@ -11,8 +11,9 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    ApplyResult, BodyWorkEpoch, BodyWorkOwner, CommittedHeaderChainView, Frontier, SourceId,
-    StateVersion, VerifiedChangeCause,
+    ApplyResult, BodyRuleId, BodyWorkAuthority, BodyWorkEpoch, BodyWorkOwner,
+    CommittedHeaderChainView, EvidenceId, Frontier, SourceId, StateVersion,
+    TransientBodyFailureKind, VerifiedChangeCause,
 };
 use zakura_network::zakura::{BlockApplyResult, BlockApplyToken, BlockSyncAction, ZakuraPeerId};
 
@@ -33,6 +34,10 @@ pub enum RequestIdentity {
         from: block::Height,
         /// How many heights.
         limit: u32,
+        /// The body-work scope it was asked under.
+        scope: BodyWorkAuthority,
+        /// Block sync's best header height then.
+        best_header_tip: block::Height,
     },
     /// A submitted body.
     Submit {
@@ -59,6 +64,14 @@ pub enum RequestIdentity {
         expected_version: StateVersion,
         /// The header it's about.
         hash: block::Hash,
+        /// The record's evidence.
+        evidence: EvidenceId,
+        /// The broken rule, for an invalid body.
+        rule: Option<BodyRuleId>,
+        /// The supplier, for an invalid body.
+        source: Option<SourceId>,
+        /// The failure's kind, for an unavailable body.
+        failure: Option<TransientBodyFailureKind>,
     },
     /// A misbehavior report.
     Misbehavior {
@@ -82,60 +95,88 @@ impl RequestIdentity {
     /// The identity of `request`, whose submitted body is `class`.
     pub fn of(request: &BlockRequest, class: ApplyClass) -> Self {
         match request {
-            BlockRequest::Action(action) => match action {
-                BlockSyncAction::QueryNeededBlocks {
-                    query_id,
-                    from,
-                    limit,
-                    ..
-                } => RequestIdentity::Query {
-                    query_id: *query_id,
-                    from: *from,
-                    limit: *limit,
-                },
-                BlockSyncAction::SubmitBlock {
-                    owner,
-                    source,
-                    token,
-                    block,
-                } => RequestIdentity::Submit {
-                    owner: *owner,
-                    source: *source,
-                    token: *token,
-                    height: block.coinbase_height(),
-                    hash: block.hash(),
-                    parent: block.header.previous_block_hash,
-                    class,
-                },
-                BlockSyncAction::RecordBodyUnavailable {
-                    expected_version,
-                    failure: zakura_header_chain::TransientBodyFailure { hash, .. },
-                }
-                | BlockSyncAction::RecordBodyInvalid {
-                    expected_version,
-                    invalid: zakura_header_chain::ConsensusBodyInvalid { hash, .. },
-                }
-                | BlockSyncAction::RestartBodyAvailability {
-                    expected_version,
-                    discovery: zakura_header_chain::BodySupplierDiscovered { hash, .. },
-                }
-                | BlockSyncAction::RetryBodyAvailability {
-                    expected_version,
-                    retry: zakura_header_chain::OperatorBodyRetry { hash, .. },
-                } => RequestIdentity::Record {
-                    op: BlockOp::of(action),
-                    expected_version: *expected_version,
-                    hash: *hash,
-                },
-                BlockSyncAction::Misbehavior { peer, reason } => RequestIdentity::Misbehavior {
-                    peer: peer.clone(),
-                    reason: format!("{reason:?}"),
-                },
-            },
+            BlockRequest::Action(action) => Self::of_action(action, class),
             BlockRequest::ReadRange(read) => RequestIdentity::Read {
                 start_height: read.start_height,
                 count: read.count,
                 max_body_bytes: read.max_body_bytes,
+            },
+        }
+    }
+
+    /// The identity of `action`, whose submitted body is `class`.
+    pub fn of_action(action: &BlockSyncAction, class: ApplyClass) -> Self {
+        match action {
+            BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                from,
+                limit,
+                best_header_tip,
+                scope,
+            } => RequestIdentity::Query {
+                query_id: *query_id,
+                from: *from,
+                limit: *limit,
+                scope: *scope,
+                best_header_tip: *best_header_tip,
+            },
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => RequestIdentity::Submit {
+                owner: *owner,
+                source: *source,
+                token: *token,
+                height: block.coinbase_height(),
+                hash: block.hash(),
+                parent: block.header.previous_block_hash,
+                class,
+            },
+            BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            } => RequestIdentity::Record {
+                op: BlockOp::RecordBodyUnavailable,
+                expected_version: *expected_version,
+                hash: failure.hash,
+                evidence: failure.evidence,
+                rule: None,
+                source: None,
+                failure: Some(failure.kind),
+            },
+            BlockSyncAction::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            } => RequestIdentity::Record {
+                op: BlockOp::RecordBodyInvalid,
+                expected_version: *expected_version,
+                hash: invalid.hash,
+                evidence: invalid.evidence,
+                rule: Some(invalid.rule.clone()),
+                source: Some(invalid.source),
+                failure: None,
+            },
+            BlockSyncAction::RestartBodyAvailability {
+                expected_version,
+                discovery: zakura_header_chain::BodySupplierDiscovered { hash, evidence, .. },
+            }
+            | BlockSyncAction::RetryBodyAvailability {
+                expected_version,
+                retry: zakura_header_chain::OperatorBodyRetry { hash, evidence, .. },
+            } => RequestIdentity::Record {
+                op: BlockOp::of(action),
+                expected_version: *expected_version,
+                hash: *hash,
+                evidence: *evidence,
+                rule: None,
+                source: None,
+                failure: None,
+            },
+            BlockSyncAction::Misbehavior { peer, reason } => RequestIdentity::Misbehavior {
+                peer: peer.clone(),
+                reason: format!("{reason:?}"),
             },
         }
     }
@@ -308,6 +349,9 @@ pub struct OwnerState {
     pub through_seq: u64,
     /// Every held operation, in ID order.
     pub operations: Vec<OperationState>,
+    /// The actions the driver took off its channel and deferred, oldest
+    /// first. Each submission among them holds its block.
+    pub deferred: Vec<RequestIdentity>,
 }
 
 impl OwnerState {
@@ -384,6 +428,8 @@ pub struct OwnerModel {
     /// The last operation ID handed out, held or not.
     last_id: u64,
     ops: BTreeMap<OpId, OperationState>,
+    /// The driver's deferred actions.
+    deferred: Vec<RequestIdentity>,
     /// A query's reply found the handle closed, so the driver's exit comes
     /// next.
     exiting: bool,
@@ -404,6 +450,7 @@ impl OwnerModel {
         OwnerState {
             through_seq: self.applied_seq,
             operations: self.ops.values().cloned().collect(),
+            deferred: self.deferred.clone(),
         }
     }
 
@@ -504,10 +551,14 @@ impl OwnerModel {
                 }
                 self.ops.remove(id);
             }
-            FactKind::DriverExited { dropped } => {
+            FactKind::DriverExited { dropped, deferred } => {
                 if !effects.is_empty() {
                     return Err(bad_effects());
                 }
+                if *deferred != self.deferred {
+                    return Err(unexpected());
+                }
+                self.deferred.clear();
                 let actions: Vec<OpId> = self
                     .ops
                     .values()
@@ -523,14 +574,29 @@ impl OwnerModel {
                 self.exiting = false;
                 self.exited = true;
             }
-            FactKind::ShutDown { dropped } => {
+            FactKind::CommitRefused { id, hash } => {
+                if !effects.is_empty() {
+                    return Err(bad_effects());
+                }
+                let op = self.ops.get(id).ok_or_else(unexpected)?;
+                if !matches!(op.stage, OperationStage::Admitted { .. })
+                    || op.request.submitted_hash() != Some(*hash)
+                    || self.driver_awaiting()
+                {
+                    return Err(unexpected());
+                }
+            }
+            FactKind::ShutDown { dropped, deferred } => {
                 if !effects.is_empty() || self.shut_down {
                     return Err(bad_effects());
                 }
-                if !dropped.iter().copied().eq(self.ops.keys().copied()) {
+                if !dropped.iter().copied().eq(self.ops.keys().copied())
+                    || *deferred != self.deferred
+                {
                     return Err(unexpected());
                 }
                 self.ops.clear();
+                self.deferred.clear();
                 self.shut_down = true;
             }
             _ => unreachable!("only head kinds pass the check above"),
@@ -539,8 +605,9 @@ impl OwnerModel {
     }
 
     /// Checks an arrival and applies it. The driver takes an action only
-    /// while it awaits nothing, and coalescing drops only queries other than
-    /// the one it takes.
+    /// while it awaits nothing, coalescing drops only queries other than
+    /// the one it takes, and the step that takes it may leave a new
+    /// deferred queue.
     fn submit(
         &mut self,
         txn: u64,
@@ -552,9 +619,15 @@ impl OwnerModel {
         let unexpected = || ModelFailure::UnexpectedHead { txn };
         let read = matches!(request, RequestIdentity::Read { .. });
         let mut coalesced = Vec::new();
+        let mut deferred = None;
         for effect in effects {
             match effect {
-                FactKind::Coalesced { query_id } if !read => coalesced.push(*query_id),
+                FactKind::Coalesced { query_id } if !read && deferred.is_none() => {
+                    coalesced.push(*query_id)
+                }
+                FactKind::Deferred { queue } if !read && deferred.is_none() => {
+                    deferred = Some(queue)
+                }
                 _ => return Err(ModelFailure::Effects { txn }),
             }
         }
@@ -573,6 +646,9 @@ impl OwnerModel {
             return Err(unexpected());
         }
         self.last_id = id.0;
+        if let Some(queue) = deferred {
+            self.deferred = queue.clone();
+        }
         let stage = match stage {
             None => return Ok(()),
             Some(Stage::Queued) => OperationStage::Queued,
@@ -603,9 +679,11 @@ impl OwnerModel {
         let bad_effects = || ModelFailure::Effects { txn };
         let op = self.ops.get(&completion.id).ok_or_else(unexpected)?;
         let stage = op.stage.contract_stage().ok_or_else(unexpected)?;
+        // The driver takes a verdict only while it awaits nothing.
         if op.request != completion.request
             || op.request.op() != completion.op
             || stage == Stage::Queued
+            || (stage.needs_free_driver() && self.driver_awaiting())
         {
             return Err(unexpected());
         }
@@ -729,7 +807,7 @@ impl OwnerModel {
                 applied_seq: self.applied_seq,
             });
         }
-        if actual.operations != self.state().operations {
+        if actual.operations != self.state().operations || actual.deferred != self.deferred {
             return Err(ModelFailure::Mismatch);
         }
         Ok(())

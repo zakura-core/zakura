@@ -389,7 +389,12 @@ impl Sim {
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
-            let observed = executed.and_then(|()| self.observe_sources(st));
+            let observed = match chosen.action {
+                // `execute` observed right after the task ran, and nothing
+                // has run since.
+                Action::RunTask(_) => executed,
+                _ => executed.and_then(|()| self.observe_sources(st)),
+            };
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {

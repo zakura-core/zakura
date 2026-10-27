@@ -46,10 +46,10 @@ use zakura_chain::{
 use zakura_header_chain::{
     AuxDelivery, AuxDelta, BodySizeHint, BodySizeHintBatch, BodyWorkEpoch, ChangeSet,
     CommittedHeaderChainView, CommittedTransitionError, EngineSnapshot, EvidenceId,
-    FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry, StateVersion, StoreError,
-    TransitionEffect, TransitionEvent, TransitionFailure, TransitionFingerprint, TransitionRequest,
-    ValidationLease, VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedHeaderRef,
+    FullStateEvidenceAuthority, GraphError, HeaderChainEngine, OperatorBodyRetry, StateVersion,
+    StoreError, TransitionEffect, TransitionEvent, TransitionFailure, TransitionFingerprint,
+    TransitionRequest, ValidationLease, VerifiedBlockAccepted, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 use zakura_network::zakura::{BlockSizeEstimate, BlockSyncBlockMeta};
 use zakura_rt::sync::watch;
@@ -83,6 +83,19 @@ impl fmt::Display for StateError {
 }
 
 impl std::error::Error for StateError {}
+
+impl StateError {
+    /// Whether the engine refused because `hash`'s body is recorded
+    /// invalid, as zakura-state refuses to commit such a body.
+    pub fn refuses_recorded_invalid(&self, hash: block::Hash) -> bool {
+        matches!(
+            self,
+            StateError::Transition(TransitionFailure::Graph(
+                GraphError::PermanentBodyInvalidity(refused),
+            )) if *refused == hash
+        )
+    }
+}
 
 impl From<StoreError> for StateError {
     fn from(error: StoreError) -> Self {

@@ -246,6 +246,14 @@ pub enum FactKind {
         /// The deferred actions it dropped, oldest first.
         deferred: Vec<RequestIdentity>,
     },
+    /// Head: the engine refused to commit operation `id`'s body, which
+    /// block sync recorded invalid. Nothing else changed.
+    CommitRefused {
+        /// The operation.
+        id: OpId,
+        /// Its body.
+        hash: block::Hash,
+    },
     /// Head: the service shut down.
     ShutDown {
         /// The operations it dropped.
@@ -388,15 +396,21 @@ impl fmt::Display for BindError {
 impl std::error::Error for BindError {}
 
 /// Why [`ControlledBlockService::complete`] refused a completion. A refusal
-/// changes nothing.
+/// changes nothing apart from the fact [`CompleteError::RecordedInvalid`]
+/// logs.
 #[derive(Debug)]
 pub enum CompleteError {
     /// No operation with this ID is pending at a stage the run completes.
     NotPending(OpId),
     /// The contract doesn't allow this outcome for the operation now.
     Illegal(IllegalOutcome),
-    /// Full state or the engine refused the commit, which leaves both
-    /// unchanged. Fixture blocks at their own heights never cause this.
+    /// The engine refused to commit a body recorded invalid, as zakura-state
+    /// does. The contract doesn't track records, so `pending` offers the
+    /// commit. The service logs a [`FactKind::CommitRefused`] fact.
+    RecordedInvalid(block::Hash),
+    /// Full state or the engine refused the commit for another reason,
+    /// which leaves both unchanged. A run never offers such a commit, so
+    /// this is a service or fixture bug.
     State(StateError),
     /// The service is bound to another run.
     OutsideRun,
@@ -407,6 +421,9 @@ impl fmt::Display for CompleteError {
         match self {
             CompleteError::NotPending(id) => write!(f, "no block operation {} is pending", id.0),
             CompleteError::Illegal(illegal) => illegal.fmt(f),
+            CompleteError::RecordedInvalid(hash) => {
+                write!(f, "the engine refused to commit {hash}, recorded invalid")
+            }
             CompleteError::State(error) => write!(f, "full state refused the commit: {error}"),
             CompleteError::OutsideRun => f.write_str("the service is bound to another run"),
         }
@@ -442,6 +459,10 @@ struct Ops {
     /// The actions the driver took off its channel and deferred, oldest
     /// first. Only a step takes them out.
     deferred: VecDeque<BlockSyncAction>,
+    /// `deferred`'s identities as the last transaction left them. A step
+    /// holds `deferred` outside the lock while it reads the channel, so
+    /// the owner state and the drop facts read these.
+    published_deferred: Vec<RequestIdentity>,
     /// The intake task's waker while it waits for the driver to be free or
     /// for its channel.
     intake: Option<Waker>,
@@ -920,6 +941,7 @@ impl ControlledBlockService {
         }
         let queue = deferred_identities(&deferred, &self.inner.limits);
         ops.deferred = deferred;
+        ops.published_deferred.clone_from(&queue);
         let Some(action) = action else {
             debug_assert!(
                 coalesced.is_empty() && queue == before,
@@ -1095,7 +1117,14 @@ impl ControlledBlockService {
                     let mut ops = self.ops();
                     let slot = ops.slots.get_mut(&id).expect("a running slot stays");
                     slot.stage = SlotStage::Waiting { stage, request };
-                    return Err(CompleteError::State(error));
+                    let Some(hash) = identity
+                        .submitted_hash()
+                        .filter(|hash| error.refuses_recorded_invalid(*hash))
+                    else {
+                        return Err(CompleteError::State(error));
+                    };
+                    ops.publish(now, Vec::new(), |_| FactKind::CommitRefused { id, hash });
+                    return Err(CompleteError::RecordedInvalid(hash));
                 }
             };
         let state_version = self.inner.engine.snapshot().state_version;
@@ -1129,7 +1158,7 @@ impl ControlledBlockService {
             completion.txn = txn;
             FactKind::Completed(Box::new(completion.clone()))
         });
-        let exited = exits.then(|| exit_driver(&mut ops, &self.inner.limits, now));
+        let exited = exits.then(|| exit_driver(&mut ops, now));
         // The driver takes its next action once it stops awaiting this one.
         let intake = op.awaited().then(|| ops.intake.take()).flatten();
         drop(ops);
@@ -1473,7 +1502,7 @@ impl ControlledBlockService {
                     retained: slot.held_block(),
                 })
                 .collect(),
-            deferred: deferred_identities(&ops.deferred, &self.inner.limits),
+            deferred: ops.published_deferred.clone(),
         }
     }
 
@@ -1543,7 +1572,7 @@ impl ControlledBlockService {
             }
             let slots = mem::take(&mut ops.slots);
             let dropped = slots.keys().copied().collect();
-            let deferred = deferred_identities(&ops.deferred, &self.inner.limits);
+            let deferred = mem::take(&mut ops.published_deferred);
             ops.publish(now, Vec::new(), |_| FactKind::ShutDown {
                 dropped,
                 deferred,
@@ -1618,11 +1647,7 @@ impl ControlledBlockService {
 /// reads, and publishes the exit. Returns what it dropped, for the caller to
 /// drop outside the lock, and leaves the intake's waker for the caller to
 /// wake.
-fn exit_driver(
-    ops: &mut Ops,
-    limits: &ApplyLimits,
-    now: Instant,
-) -> (Vec<Slot>, VecDeque<BlockSyncAction>) {
+fn exit_driver(ops: &mut Ops, now: Instant) -> (Vec<Slot>, VecDeque<BlockSyncAction>) {
     ops.exited = true;
     let dropped: Vec<OpId> = ops
         .slots
@@ -1634,7 +1659,7 @@ fn exit_driver(
         .iter()
         .filter_map(|id| ops.slots.remove(id))
         .collect();
-    let deferred = deferred_identities(&ops.deferred, limits);
+    let deferred = mem::take(&mut ops.published_deferred);
     ops.publish(now, Vec::new(), |_| FactKind::DriverExited {
         dropped,
         deferred,

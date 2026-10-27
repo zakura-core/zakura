@@ -422,6 +422,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         // the log is frozen and is never observed.
         FactKind::ShutDown { dropped } => StorageFact::ShutDown {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
+            deferred: Vec::new(),
         },
     };
     Observation::Storage {

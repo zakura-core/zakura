@@ -574,6 +574,18 @@ impl OwnerModel {
                 self.exiting = false;
                 self.exited = true;
             }
+            FactKind::CommitRefused { id, hash } => {
+                if !effects.is_empty() {
+                    return Err(bad_effects());
+                }
+                let op = self.ops.get(id).ok_or_else(unexpected)?;
+                if !matches!(op.stage, OperationStage::Admitted { .. })
+                    || op.request.submitted_hash() != Some(*hash)
+                    || self.driver_awaiting()
+                {
+                    return Err(unexpected());
+                }
+            }
             FactKind::ShutDown { dropped, deferred } => {
                 if !effects.is_empty() || self.shut_down {
                     return Err(bad_effects());

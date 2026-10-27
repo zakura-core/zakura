@@ -87,8 +87,8 @@ impl LiveEvidence for ControlledBlockService {
 /// and the log entries it's compared with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EvidenceKind {
-    /// A storage source of `service`. Every storage source shares one index
-    /// space, whatever its service.
+    /// A storage source of `service`. Each service numbers its own
+    /// instances, as [`EvidenceKind::same_space`] says.
     Storage {
         /// The service, such as `header`.
         service: String,

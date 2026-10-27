@@ -486,7 +486,13 @@ mod tests {
                     state: "ab".into(),
                 },
             ),
-            storage(6, StorageFact::ShutDown { dropped: vec![1] }),
+            storage(
+                6,
+                StorageFact::ShutDown {
+                    dropped: vec![1],
+                    deferred: Vec::new(),
+                },
+            ),
             Observation::StorageState {
                 service: "header".into(),
                 instance: 1,
@@ -532,7 +538,7 @@ mod tests {
     #[test]
     fn block_storage_observation_encoding_is_pinned() {
         use crate::observe::{
-            BlockOperation, BlockStorageState, StorageBranch, StorageFact, StoragePoint,
+            BlockOperation, BlockStorageState, BodyScope, StorageBranch, StorageFact, StoragePoint,
             StorageRequest, StorageResult, StorageState, WorkOwner, WorkScope,
         };
 
@@ -559,6 +565,12 @@ mod tests {
                 query_id: 1,
                 from: 1,
                 limit: 16,
+                scope: BodyScope {
+                    scope: owner.scope.clone(),
+                    verified_generation: 5,
+                    body_work_epoch: 6,
+                },
+                best_header_tip: 3,
             },
             StorageRequest::SubmitBlock {
                 owner,
@@ -573,6 +585,10 @@ mod tests {
                 record: "record_body_invalid".into(),
                 expected_version: 1,
                 hash: "cc".into(),
+                evidence: "ee".into(),
+                rule: Some("block.subsidy".into()),
+                source: Some("07".into()),
+                failure: None,
             },
             StorageRequest::Misbehavior {
                 peer: "03".into(),
@@ -605,6 +621,15 @@ mod tests {
             },
             StorageResult::ReadFailed,
         ];
+        let unavailable = StorageRequest::RecordBody {
+            record: "record_body_unavailable".into(),
+            expected_version: 2,
+            hash: "cc".into(),
+            evidence: "ef".into(),
+            rule: None,
+            source: None,
+            failure: Some("timeout".into()),
+        };
         let storage = |seq, fact| Observation::Storage {
             service: "block".into(),
             instance: 1,
@@ -665,8 +690,33 @@ mod tests {
             storage(26, StorageFact::ReadTaken { id: 5 }),
             storage(27, StorageFact::ReadDropped { id: 5 }),
             storage(28, StorageFact::CallerDropped { id: 5 }),
-            storage(29, StorageFact::DriverExited { dropped: vec![3] }),
-            storage(30, StorageFact::ShutDown { dropped: vec![2] }),
+            storage(
+                19,
+                StorageFact::Deferred {
+                    queue: vec![unavailable.clone()],
+                },
+            ),
+            storage(
+                10,
+                StorageFact::CommitRefused {
+                    id: 2,
+                    hash: "cc".into(),
+                },
+            ),
+            storage(
+                29,
+                StorageFact::DriverExited {
+                    dropped: vec![3],
+                    deferred: vec![unavailable.clone()],
+                },
+            ),
+            storage(
+                30,
+                StorageFact::ShutDown {
+                    dropped: vec![2],
+                    deferred: vec![unavailable.clone()],
+                },
+            ),
             Observation::StorageState {
                 service: "block".into(),
                 instance: 1,
@@ -706,6 +756,7 @@ mod tests {
                             retained: None,
                         },
                     ],
+                    deferred: vec![unavailable],
                 }),
             },
         ]);
@@ -714,7 +765,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 4, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"storage","service":"block","instance":1,"seq":1,"txn":3,"fact":{"fact":"block-submitted","id":1,"request":{"op":"query_needed_blocks","query_id":1,"from":1,"limit":16},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":2,"txn":3,"fact":{"fact":"block-submitted","id":2,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":3,"txn":3,"fact":{"fact":"block-submitted","id":3,"request":{"op":"record_body","record":"record_body_invalid","expected_version":1,"hash":"cc"},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":4,"txn":3,"fact":{"fact":"block-submitted","id":4,"request":{"op":"misbehavior","peer":"03","reason":"StatusSpam"},"stage":null}},{"obs":"storage","service":"block","instance":1,"seq":5,"txn":3,"fact":{"fact":"block-submitted","id":5,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":11,"txn":3,"fact":{"fact":"block-completed","id":1,"outcome":"answer","result":{"result":"admitted"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":12,"txn":3,"fact":{"fact":"block-completed","id":2,"outcome":"answer","result":{"result":"needed-blocks","anchor":{"height":0,"hash":"cc"},"blocks":[{"height":1,"hash":"cc"}]},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":13,"txn":3,"fact":{"fact":"block-completed","id":3,"outcome":"answer","result":{"result":"needed-blocks-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":14,"txn":3,"fact":{"fact":"block-completed","id":4,"outcome":"answer","result":{"result":"verdict","verdict":"committed","reply":"committed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":15,"txn":3,"fact":{"fact":"block-completed","id":5,"outcome":"answer","result":{"result":"recorded","attempts":["stale","committed"]},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":16,"txn":3,"fact":{"fact":"block-completed","id":6,"outcome":"answer","result":{"result":"record-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":17,"txn":3,"fact":{"fact":"block-completed","id":7,"outcome":"answer","result":{"result":"served","heights":[1,2],"bytes":1800},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":18,"txn":3,"fact":{"fact":"block-completed","id":8,"outcome":"answer","result":{"result":"read-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":20,"txn":3,"fact":{"fact":"admitted","id":2}},{"obs":"storage","service":"block","instance":1,"seq":21,"txn":3,"fact":{"fact":"coalesced","query_id":1}},{"obs":"storage","service":"block","instance":1,"seq":22,"txn":3,"fact":{"fact":"transition-installed","state_version":4,"verified_best":{"height":1,"hash":"cc"},"epoch_before":1,"invalidates_body_work":true,"cause":"reset"}},{"obs":"storage","service":"block","instance":1,"seq":23,"txn":3,"fact":{"fact":"view-published","state_version":4,"epoch":1,"hint_revision":0,"verified_best":{"height":1,"hash":"cc"},"header_best":{"height":3,"hash":"cc"}}},{"obs":"storage","service":"block","instance":1,"seq":24,"txn":3,"fact":{"fact":"reply-delivered","id":2}},{"obs":"storage","service":"block","instance":1,"seq":25,"txn":3,"fact":{"fact":"handle-closed","id":2}},{"obs":"storage","service":"block","instance":1,"seq":26,"txn":3,"fact":{"fact":"read-taken","id":5}},{"obs":"storage","service":"block","instance":1,"seq":27,"txn":3,"fact":{"fact":"read-dropped","id":5}},{"obs":"storage","service":"block","instance":1,"seq":28,"txn":3,"fact":{"fact":"caller-dropped","id":5}},{"obs":"storage","service":"block","instance":1,"seq":29,"txn":3,"fact":{"fact":"driver-exited","dropped":[3]}},{"obs":"storage","service":"block","instance":1,"seq":30,"txn":3,"fact":{"fact":"shut-down","dropped":[2]}},{"obs":"storage-state","service":"block","instance":1,"through_seq":30,"state":{"operations":[{"id":2,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"admitted","replaced":false,"retained":"cc"},{"id":3,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"queued"},{"id":5,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"pending","caller_waiting":true},{"id":6,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"replied"}]}}]"#,
+            r#"[{"obs":"storage","service":"block","instance":1,"seq":1,"txn":3,"fact":{"fact":"block-submitted","id":1,"request":{"op":"query_needed_blocks","query_id":1,"from":1,"limit":16,"scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6},"best_header_tip":3},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":2,"txn":3,"fact":{"fact":"block-submitted","id":2,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":3,"txn":3,"fact":{"fact":"block-submitted","id":3,"request":{"op":"record_body","record":"record_body_invalid","expected_version":1,"hash":"cc","evidence":"ee","rule":"block.subsidy","source":"07"},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":4,"txn":3,"fact":{"fact":"block-submitted","id":4,"request":{"op":"misbehavior","peer":"03","reason":"StatusSpam"},"stage":null}},{"obs":"storage","service":"block","instance":1,"seq":5,"txn":3,"fact":{"fact":"block-submitted","id":5,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"pending"}},{"obs":"storage","service":"block","instance":1,"seq":11,"txn":3,"fact":{"fact":"block-completed","id":1,"outcome":"answer","result":{"result":"admitted"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":12,"txn":3,"fact":{"fact":"block-completed","id":2,"outcome":"answer","result":{"result":"needed-blocks","anchor":{"height":0,"hash":"cc"},"blocks":[{"height":1,"hash":"cc"}]},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":13,"txn":3,"fact":{"fact":"block-completed","id":3,"outcome":"answer","result":{"result":"needed-blocks-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":14,"txn":3,"fact":{"fact":"block-completed","id":4,"outcome":"answer","result":{"result":"verdict","verdict":"committed","reply":"committed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":15,"txn":3,"fact":{"fact":"block-completed","id":5,"outcome":"answer","result":{"result":"recorded","attempts":["stale","committed"]},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":16,"txn":3,"fact":{"fact":"block-completed","id":6,"outcome":"answer","result":{"result":"record-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":17,"txn":3,"fact":{"fact":"block-completed","id":7,"outcome":"answer","result":{"result":"served","heights":[1,2],"bytes":1800},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":18,"txn":3,"fact":{"fact":"block-completed","id":8,"outcome":"answer","result":{"result":"read-failed"},"delivered":true,"state_version":4}},{"obs":"storage","service":"block","instance":1,"seq":20,"txn":3,"fact":{"fact":"admitted","id":2}},{"obs":"storage","service":"block","instance":1,"seq":21,"txn":3,"fact":{"fact":"coalesced","query_id":1}},{"obs":"storage","service":"block","instance":1,"seq":22,"txn":3,"fact":{"fact":"transition-installed","state_version":4,"verified_best":{"height":1,"hash":"cc"},"epoch_before":1,"invalidates_body_work":true,"cause":"reset"}},{"obs":"storage","service":"block","instance":1,"seq":23,"txn":3,"fact":{"fact":"view-published","state_version":4,"epoch":1,"hint_revision":0,"verified_best":{"height":1,"hash":"cc"},"header_best":{"height":3,"hash":"cc"}}},{"obs":"storage","service":"block","instance":1,"seq":24,"txn":3,"fact":{"fact":"reply-delivered","id":2}},{"obs":"storage","service":"block","instance":1,"seq":25,"txn":3,"fact":{"fact":"handle-closed","id":2}},{"obs":"storage","service":"block","instance":1,"seq":26,"txn":3,"fact":{"fact":"read-taken","id":5}},{"obs":"storage","service":"block","instance":1,"seq":27,"txn":3,"fact":{"fact":"read-dropped","id":5}},{"obs":"storage","service":"block","instance":1,"seq":28,"txn":3,"fact":{"fact":"caller-dropped","id":5}},{"obs":"storage","service":"block","instance":1,"seq":19,"txn":3,"fact":{"fact":"deferred","queue":[{"op":"record_body","record":"record_body_unavailable","expected_version":2,"hash":"cc","evidence":"ef","failure":"timeout"}]}},{"obs":"storage","service":"block","instance":1,"seq":10,"txn":3,"fact":{"fact":"commit-refused","id":2,"hash":"cc"}},{"obs":"storage","service":"block","instance":1,"seq":29,"txn":3,"fact":{"fact":"driver-exited","dropped":[3],"deferred":[{"op":"record_body","record":"record_body_unavailable","expected_version":2,"hash":"cc","evidence":"ef","failure":"timeout"}]}},{"obs":"storage","service":"block","instance":1,"seq":30,"txn":3,"fact":{"fact":"shut-down","dropped":[2],"deferred":[{"op":"record_body","record":"record_body_unavailable","expected_version":2,"hash":"cc","evidence":"ef","failure":"timeout"}]}},{"obs":"storage-state","service":"block","instance":1,"through_seq":30,"state":{"operations":[{"id":2,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"admitted","replaced":false,"retained":"cc"},{"id":3,"request":{"op":"submit_block","owner":{"kind":"body","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":1,"request_id":1},"source":"07","token":1,"height":1,"hash":"cc","parent":"aa","class":"full"},"stage":"queued"},{"id":5,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"pending","caller_waiting":true},{"id":6,"request":{"op":"read_range","start_height":1,"count":3,"max_body_bytes":1900},"stage":"replied"}],"deferred":[{"op":"record_body","record":"record_body_unavailable","expected_version":2,"hash":"cc","evidence":"ef","failure":"timeout"}]}}]"#,
             "{bump}"
         );
     }

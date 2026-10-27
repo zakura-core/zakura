@@ -26,7 +26,7 @@ use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_rt::sync::mpsc;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
-    observe::{StorageFact, StorageState},
+    observe::{StorageFact, StorageResult, StorageState},
     storage::{BlockStorage, HeaderStorage},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Outcome,
     PlanInput, RunConfig, RunReport,
@@ -108,7 +108,8 @@ impl Blocks {
 
 /// Spawns block sync's stand-in, which sends a query, every body, a
 /// record and another query through the intake task, and a server that
-/// reads the committed range.
+/// reads the committed range until a read serves a body, at most eight
+/// times.
 fn spawn_sync(sim: &mut zakura_sim::Sim, blocks: &Blocks) {
     let service = blocks.service.clone();
     let chain: Vec<_> = blocks
@@ -156,15 +157,20 @@ fn spawn_sync(sim: &mut zakura_sim::Sim, blocks: &Blocks) {
 
     let source = blocks.service.range_source();
     sim.scheduler().spawn_root("server", async move {
-        let (lease, _session) = BlockRangeReadLease::detached();
-        let _ = source
-            .read(BlockRangeRead {
-                start_height: block::Height(1),
-                count: 3,
-                max_body_bytes: 10_000,
-                lease,
-            })
-            .await;
+        for _ in 0..8 {
+            let (lease, _session) = BlockRangeReadLease::detached();
+            let read = source
+                .read(BlockRangeRead {
+                    start_height: block::Height(1),
+                    count: 3,
+                    max_body_bytes: 10_000,
+                    lease,
+                })
+                .await;
+            if read.is_ok_and(|read| !read.blocks.is_empty()) {
+                return;
+            }
+        }
     });
 }
 
@@ -213,10 +219,12 @@ fn history(plan: PlanInput) -> String {
 }
 
 /// ST4.7: the run picks block outcomes as `storage:block:<id>:<outcome>`
-/// actions, and some plans commit every body and serve the range.
+/// actions, some plans commit past the first body, and some serve a
+/// non-empty range.
 #[test]
 fn the_plan_completes_block_operations() {
-    let mut committed_all = false;
+    let mut committed_past_first = false;
+    let mut served = false;
     for plan in inputs(16, 256) {
         let (report, blocks) = block_run(plan, 2_000);
         assert!(
@@ -229,11 +237,27 @@ fn the_plan_completes_block_operations() {
                 assert!(rest.starts_with("block:"), "{pick}");
             }
         }
-        committed_all |= blocks.engine.snapshot().frontiers.verified_best
+        served |= report.log.entries().iter().any(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Storage {
+                    fact: StorageFact::BlockCompleted {
+                        result: StorageResult::Served { heights, .. },
+                        ..
+                    },
+                    ..
+                } if !heights.is_empty()
+            )
+        });
+        committed_past_first |= blocks.engine.snapshot().frontiers.verified_best
             == blocks.chain[1].frontier()
             || blocks.engine.snapshot().frontiers.verified_best == blocks.chain[2].frontier();
     }
-    assert!(committed_all, "some plan commits past the first body");
+    assert!(
+        committed_past_first,
+        "some plan commits past the first body"
+    );
+    assert!(served, "some plan serves a non-empty range");
 }
 
 /// ST4.7: a plan's block storage history and final state repeat exactly,
@@ -277,7 +301,7 @@ fn block_shutdown_releases_everything_and_logs_nothing() {
         .map(|fact| fact.kind)
         .collect();
     assert!(
-        matches!(kinds.last(), Some(FactKind::ShutDown { dropped }) if !dropped.is_empty()),
+        matches!(kinds.last(), Some(FactKind::ShutDown { dropped, .. }) if !dropped.is_empty()),
         "shutdown dropped held operations: {kinds:?}"
     );
 }

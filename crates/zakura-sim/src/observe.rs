@@ -299,6 +299,12 @@ pub enum StorageFact {
         /// Block sync's query ID.
         query_id: u64,
     },
+    /// The step that took an action left these deferred actions, oldest
+    /// first.
+    Deferred {
+        /// The deferred actions.
+        queue: Vec<StorageRequest>,
+    },
     /// The engine installed a transition.
     TransitionInstalled {
         /// The state version after it.
@@ -347,16 +353,33 @@ pub enum StorageFact {
         /// The operation.
         id: u64,
     },
+    /// The engine refused to commit operation `id`'s body, which block
+    /// sync recorded invalid.
+    CommitRefused {
+        /// The operation.
+        id: u64,
+        /// Its body.
+        hash: String,
+    },
     /// A query's reply found block sync's handle closed, so the driver
-    /// returned, dropping these action operations.
+    /// returned, dropping these action operations and deferred actions.
     DriverExited {
         /// The operations dropped.
         dropped: Vec<u64>,
+        /// The deferred actions dropped, oldest first. Only block storage
+        /// defers actions.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        deferred: Vec<StorageRequest>,
     },
-    /// The service shut down, dropping these operations.
+    /// The service shut down, dropping these operations and deferred
+    /// actions.
     ShutDown {
         /// The operations dropped.
         dropped: Vec<u64>,
+        /// The deferred actions dropped, oldest first. Only block storage
+        /// defers actions.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        deferred: Vec<StorageRequest>,
     },
 }
 
@@ -378,6 +401,19 @@ pub struct WorkOwner {
     pub session_id: u64,
     /// Its request.
     pub request_id: u64,
+}
+
+/// A body work scope: a header scope, with the verified generation and
+/// body work epoch that scheduled the work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BodyScope {
+    /// The header scope.
+    #[serde(flatten)]
+    pub scope: WorkScope,
+    /// The verified generation.
+    pub verified_generation: u64,
+    /// The body work epoch.
+    pub body_work_epoch: u64,
 }
 
 /// A header work scope: a generation and the branch it pursues.
@@ -499,6 +535,10 @@ pub enum StorageRequest {
         from: u32,
         /// The number of heights.
         limit: u32,
+        /// The scope block sync saw.
+        scope: BodyScope,
+        /// The best header tip's height block sync saw.
+        best_header_tip: u32,
     },
     /// `SubmitBlock`.
     SubmitBlock {
@@ -525,6 +565,18 @@ pub enum StorageRequest {
         expected_version: u64,
         /// The header it's about.
         hash: String,
+        /// The record's evidence ID.
+        evidence: String,
+        /// The broken rule, for an invalid body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+        /// The supplier, for an invalid body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// The failure kind, for an unavailable body or an availability
+        /// retry.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
     },
     /// `Misbehavior`.
     Misbehavior {
@@ -684,6 +736,8 @@ pub enum StorageState {
 pub struct BlockStorageState {
     /// Every operation it holds.
     pub operations: Vec<BlockOperation>,
+    /// The actions the driver deferred, oldest first.
+    pub deferred: Vec<StorageRequest>,
 }
 
 /// One operation block storage holds.

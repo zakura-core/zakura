@@ -166,7 +166,7 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
-[policy.zcash_script]
+[policy.zakura-zcash-script]
 audit-as-crates-io = false
 
 [[exemptions.addchain]]
@@ -580,11 +580,6 @@ notes = "Coordinated Common v4.0.0 release; carry the existing exact-version for
 version = "4.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Common v4.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
-
-[[exemptions.zcash_script]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

@@ -582,7 +582,8 @@ fn checked_reports(
             }
             witness.retain(in_run);
         }
-        for violation in &mut report.violations {
+        // A violation at a step the run didn't take is dropped whole.
+        report.violations.retain_mut(|violation| {
             let mut steps = std::iter::once(&violation.step).chain(&violation.witness);
             if let Some(&step) = steps.find(|step| !in_run(step)) {
                 failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
@@ -591,7 +592,8 @@ fn checked_reports(
                 });
             }
             violation.witness.retain(in_run);
-        }
+            in_run(&violation.step)
+        });
     }
     (reports, failure)
 }
@@ -629,7 +631,15 @@ fn end_record(
         drain: end.drain,
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
-        properties: properties.to_vec(),
+        // The record holds what the trace writes, which leaves out each
+        // report's violations, so a replay compares like with like.
+        properties: properties
+            .iter()
+            .map(|report| PropertyReport {
+                violations: Vec::new(),
+                ..report.clone()
+            })
+            .collect(),
     }
 }
 

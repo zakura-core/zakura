@@ -29,9 +29,9 @@ use zakura_storage::header::{
 use crate::{
     evidence::{Checkpoint, StorageId},
     observe::{
-        storage_delivery, Entry, StorageBranch, StorageContinuation, StorageFact, StorageLease,
-        StorageLeaseState, StorageOperation, StoragePoint, StorageRequest, StorageResult,
-        StorageState, WorkOwner, WorkScope,
+        StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
+        StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
+        WorkScope,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -533,38 +533,6 @@ fn state(state: &OwnerState) -> StorageState {
     }
 }
 
-/// Checks that `appended`, the entries one observation of storage
-/// `instance` added, deliver exactly the `drained` sequence numbers,
-/// contiguous with the facts `delivered` before, and, if `with_state`, one
-/// state watermarked at the last of them. Returns the last fact delivered.
-fn check_delivery(
-    appended: &[Entry],
-    instance: u64,
-    drained: &[u64],
-    delivered: u64,
-    with_state: bool,
-) -> Result<u64, String> {
-    let (seqs, marks) =
-        storage_delivery(appended.iter().map(|entry| &entry.obs), SERVICE, instance);
-    let contiguous = drained
-        .first()
-        .is_none_or(|first| *first == delivered.saturating_add(1));
-    if seqs != drained || !contiguous {
-        return Err(format!(
-            "Undelivered: the log holds facts {seqs:?} after fact {delivered}, \
-             but {drained:?} were drained"
-        ));
-    }
-    let last = drained.last().copied().unwrap_or(delivered);
-    let expected = if with_state { vec![last] } else { Vec::new() };
-    if marks != expected {
-        return Err(format!(
-            "Undelivered: the log holds states through {marks:?}, expected {expected:?}"
-        ));
-    }
-    Ok(last)
-}
-
 impl ActionSource for HeaderStorage {
     fn enabled(&self, _: SimInstant, out: &mut Vec<(Identity, u64)>) {
         for op in self.port.pending() {
@@ -626,7 +594,7 @@ impl ActionSource for HeaderStorage {
             .map_err(|failure| format!("{failure:?}"))?;
         // After setup, the state is logged only when it may have changed.
         let with_state = self.delivered.is_none() || !facts.is_empty();
-        let drained: Vec<u64> = facts.iter().map(|fact| fact.seq).collect();
+        let last = facts.last().map_or(delivered, |fact| fact.seq);
         let mut sent: Vec<Observation> = facts
             .into_iter()
             .map(|fact| observation(fact, self.id.index))
@@ -639,17 +607,9 @@ impl ActionSource for HeaderStorage {
                 state: state(&actual),
             });
         }
-        let cursor = log.entries().len();
         for obs in &sent {
             log.push(obs.clone());
         }
-        let last = check_delivery(
-            &log.entries()[cursor..],
-            self.id.index,
-            &drained,
-            delivered,
-            with_state,
-        )?;
         self.delivered = Some(last);
         // The run checks its own log against this, since the log this source
         // was handed may not be the run's.
@@ -663,58 +623,5 @@ impl Drop for HeaderStorage {
         // Its shutdown facts are never observed, so a run still live fails.
         self.checkpoint.dropped();
         self.port.shut_down();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A header storage observation of fact `seq`.
-    fn fact(seq: u64) -> Observation {
-        Observation::Storage {
-            service: SERVICE.to_owned(),
-            instance: 0,
-            seq,
-            txn: seq,
-            fact: StorageFact::CallerDropped { id: 1 },
-        }
-    }
-
-    /// A header storage state through fact `seq`.
-    fn state_through(seq: u64) -> Observation {
-        Observation::StorageState {
-            service: SERVICE.to_owned(),
-            instance: 0,
-            through_seq: seq,
-            state: state(&OwnerState::default()),
-        }
-    }
-
-    /// `observations` as one step's entries.
-    fn entries(observations: Vec<Observation>) -> Vec<Entry> {
-        observations
-            .into_iter()
-            .map(|obs| Entry { step: 1, obs })
-            .collect()
-    }
-
-    /// A log edited to drop one accepted observation, interior or final,
-    /// or its state, no longer delivers what was drained.
-    #[test]
-    fn an_edited_log_is_undelivered() {
-        let whole = || vec![fact(3), fact(4), fact(5), state_through(5)];
-        assert_eq!(
-            check_delivery(&entries(whole()), 0, &[3, 4, 5], 2, true),
-            Ok(5)
-        );
-        for dropped in 0..4 {
-            let mut edited = whole();
-            edited.remove(dropped);
-            let failure = check_delivery(&entries(edited), 0, &[3, 4, 5], 2, true)
-                .expect_err("an edited log doesn't deliver the batch");
-            assert!(failure.starts_with("Undelivered"), "{failure}");
-        }
-        assert!(check_delivery(&entries(whole()), 0, &[3, 4, 5], 1, true).is_err());
     }
 }

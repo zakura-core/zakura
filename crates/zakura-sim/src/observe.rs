@@ -534,24 +534,6 @@ pub(crate) fn storage_entries<'o>(
         .collect()
 }
 
-/// The sequence numbers of the facts that storage `instance` of `service`
-/// logged in `observations`, and its states' watermarks, in order.
-pub(crate) fn storage_delivery<'o>(
-    observations: impl IntoIterator<Item = &'o Observation>,
-    service: &str,
-    instance: u64,
-) -> (Vec<u64>, Vec<u64>) {
-    let (mut facts, mut states) = (Vec::new(), Vec::new());
-    for obs in storage_entries(observations, service, instance) {
-        match obs {
-            Observation::Storage { seq, .. } => facts.push(*seq),
-            Observation::StorageState { through_seq, .. } => states.push(*through_seq),
-            _ => {}
-        }
-    }
-    (facts, states)
-}
-
 /// How a task ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

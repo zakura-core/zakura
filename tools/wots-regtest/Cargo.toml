@@ -1,0 +1,27 @@
+[package]
+name = "zakura-wots-regtest"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+# Keep the disposable-key experiment out of the production wallet dependency graph.
+[workspace]
+
+[dependencies]
+zcash_address = { package = "zakura-address", git = "https://github.com/zakura-core/common", rev = "4141bb0bdd6e5b94111ac8974658f0c0615b4c65" }
+zcash_primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/common", rev = "4141bb0bdd6e5b94111ac8974658f0c0615b4c65", default-features = false, features = ["std", "backend-halo2"] }
+zcash_transparent = { package = "zakura-transparent", git = "https://github.com/zakura-core/common", rev = "4141bb0bdd6e5b94111ac8974658f0c0615b4c65", features = ["transparent-inputs", "experimental-wots"] }
+zcash_protocol = { package = "zakura-protocol", git = "https://github.com/zakura-core/common", rev = "4141bb0bdd6e5b94111ac8974658f0c0615b4c65" }
+zcash_script = { git = "https://github.com/p0mvn/zcash_script", rev = "ec914a0f99703ab033af37e241be9b59e095043b" }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+secp256k1 = { version = "0.33", features = ["std"] }
+sha2 = "0.10"
+ripemd = "0.1"
+hex = "0.4"
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+tempfile = "3"
+
+[profile.dev]
+debug = 0

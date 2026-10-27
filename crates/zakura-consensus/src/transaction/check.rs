@@ -782,10 +782,25 @@ pub(super) fn count_script_push_ops(script_bytes: &[u8]) -> usize {
 /// Callers must ensure `spent_outputs.len()` matches the number of transparent inputs.
 /// If the lengths differ, `false` is returned.
 pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Output]) -> bool {
+    are_inputs_standard_with_wots(tx, spent_outputs, false)
+}
+
+/// Applies the narrowly scoped WOTS policy exception only after explicit activation.
+pub fn are_inputs_standard_with_wots(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    experimental: bool,
+) -> bool {
     if tx.inputs().len() != spent_outputs.len() {
         return false;
     }
     for (input, spent_output) in tx.inputs().iter().zip(spent_outputs.iter()) {
+        #[cfg(feature = "experimental-wots")]
+        if experimental && zakura_script::wots::standard_input(input, spent_output) {
+            continue;
+        }
+        #[cfg(not(feature = "experimental-wots"))]
+        let _ = experimental;
         let unlock_script = match input {
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
@@ -873,6 +888,15 @@ pub fn mempool_standard_input_scripts(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
 ) -> Result<(), TransactionError> {
+    mempool_standard_input_scripts_with_wots(tx, spent_outputs, false)
+}
+
+/// Checks input policy with an explicitly activated WOTS exception.
+pub fn mempool_standard_input_scripts_with_wots(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    experimental: bool,
+) -> Result<(), TransactionError> {
     if tx.inputs().len() != spent_outputs.len() {
         return Err(TransactionError::Other(format!(
             "spent_outputs must align with transaction inputs for non-coinbase txs: inputs={}, spent_outputs={}",
@@ -889,7 +913,12 @@ pub fn mempool_standard_input_scripts(
 
         // Rule: the scriptSig must be within the standard size limit.
         let size = unlock_script.as_raw_bytes().len();
-        if size > MAX_STANDARD_SCRIPTSIG_SIZE {
+        #[cfg(feature = "experimental-wots")]
+        let allowed =
+            experimental && zakura_script::wots::standard_input(input, &spent_outputs[input_index]);
+        #[cfg(not(feature = "experimental-wots"))]
+        let allowed = false;
+        if size > MAX_STANDARD_SCRIPTSIG_SIZE && !allowed {
             return Err(TransactionError::NonStandardScriptSigSize { input_index, size });
         }
 
@@ -901,7 +930,7 @@ pub fn mempool_standard_input_scripts(
 
     // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
     // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-    if !are_inputs_standard(tx, spent_outputs) {
+    if !are_inputs_standard_with_wots(tx, spent_outputs, experimental) {
         return Err(TransactionError::NonStandardInputs);
     }
 

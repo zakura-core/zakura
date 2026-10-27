@@ -14,7 +14,11 @@ keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["cryptography::cryptocurrencies"]
 
+[features]
+experimental-wots = ["dep:zcash_transparent", "zcash_transparent/experimental-wots", "zcash_script/experimental-wots"]
+
 [dependencies]
+zcash_transparent = { workspace = true, optional = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
@@ -22,6 +26,7 @@ zakura-chain = { path = "../zakura-chain", version = "11.0.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }
 hex = { workspace = true }
 ripemd = { workspace = true }
 secp256k1 = { workspace = true }

@@ -1,5 +1,46 @@
 //! Fixed test vectors for zakura-network configuration.
 
+#[test]
+fn experimental_wots_configuration_is_explicit_and_regtest_only() {
+    use crate::config::Config;
+    let configured =
+        "network = 'Regtest'\n[testnet_parameters]\nexperimental_wots_activation_height = 200\n";
+    let parsed = toml::from_str::<Config>(configured);
+    if cfg!(feature = "experimental-wots") {
+        let parsed = parsed.expect("the experimental build accepts explicit Regtest activation");
+        let serialized = toml::to_string(&parsed).expect("the configuration serializes");
+        let restored: Config =
+            toml::from_str(&serialized).expect("the serialized Regtest configuration parses");
+        let zakura_chain::parameters::Network::Testnet(params) = restored.network else {
+            panic!("Regtest uses test parameters")
+        };
+        assert_eq!(
+            params.experimental_wots_activation_height(),
+            Some(zakura_chain::block::Height(200))
+        );
+    } else {
+        assert!(parsed
+            .unwrap_err()
+            .to_string()
+            .contains("requires the experimental-wots build feature"));
+    }
+    for network in ["Mainnet", "Testnet"] {
+        let public = configured.replace("Regtest", network);
+        assert!(toml::from_str::<Config>(&public).is_err());
+    }
+    let public =
+        "[network]\nnetwork_name = 'WotsPublic'\nexperimental_wots_activation_height = 200\n";
+    assert!(toml::from_str::<Config>(public)
+        .unwrap_err()
+        .to_string()
+        .contains("only valid on Regtest"));
+    let default: Config = toml::from_str("network = 'Regtest'").expect("default Regtest parses");
+    let zakura_chain::parameters::Network::Testnet(params) = default.network else {
+        panic!("Regtest uses test parameters")
+    };
+    assert_eq!(params.experimental_wots_activation_height(), None);
+}
+
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
 use zakura_chain::{

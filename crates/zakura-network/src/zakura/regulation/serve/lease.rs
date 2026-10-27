@@ -93,3 +93,35 @@ impl WorkLease {
         self.cancelled.cancel();
     }
 }
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl WorkLease {
+    /// A lease outside any session, holding slots of its own one-slot
+    /// budgets, for a storage range source's tests.
+    pub(crate) fn detached() -> Self {
+        use crate::zakura::regulation::{OutputByteBudget, SlotBudget};
+
+        let budget = || SlotBudget::new(1).expect("one slot is a valid capacity");
+        let reserve = |budget: &SlotBudget| {
+            budget
+                .try_reserve()
+                .expect("a fresh one-slot budget has a free slot")
+        };
+        let (peer, node) = (budget(), budget());
+        Self::new(ExecutionSlots::new(
+            reserve(&peer),
+            reserve(&node),
+            PeerBudgets {
+                output_responses: budget(),
+                execution: peer,
+                output: OutputByteBudget::new(1).expect("one byte is a valid capacity"),
+            },
+        ))
+    }
+
+    /// Cancels a [`Self::detached`] lease, as a closed session cancels its
+    /// requests.
+    pub(crate) fn cancel_detached(&self) {
+        self.cancel();
+    }
+}

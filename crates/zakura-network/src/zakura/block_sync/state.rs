@@ -202,6 +202,74 @@ pub struct BlockSyncHandle {
     pub(super) routine_wiring: Option<RoutineWiring>,
 }
 
+/// What a detached [`BlockSyncHandle`] sends, for a test that stands in for
+/// the reactor. Control events and query failures arrive on separate
+/// channels, as they do at the reactor.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+#[derive(Debug)]
+pub struct DetachedHandleEvents {
+    lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
+    // Held so the handle's bounded queue and watches stay open.
+    _events: mpsc::Receiver<BlockSyncEvent>,
+    _peers: watch::Sender<ServicePeerSnapshot>,
+    _status: watch::Sender<BlockSyncStatus>,
+    _candidates: watch::Sender<ZakuraBlockSyncCandidateState>,
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl DetachedHandleEvents {
+    /// The next control event sent with [`BlockSyncHandle::send_control`],
+    /// if one is waiting.
+    pub fn try_next_control(&mut self) -> Option<BlockSyncEvent> {
+        self.lifecycle.try_recv().ok()
+    }
+
+    /// The next needed-blocks query failure, with its query and scope, if
+    /// one is waiting.
+    pub fn try_next_query_failure(
+        &mut self,
+    ) -> Option<(NonZeroU64, zakura_header_chain::BodyWorkAuthority)> {
+        self.needed_query_failures
+            .try_recv()
+            .ok()
+            .map(|failure| (failure.query_id, failure.scope))
+    }
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl BlockSyncHandle {
+    /// A handle with no reactor behind it, and the receiver of what it
+    /// sends. Peers added through it get no routines.
+    pub fn detached() -> (Self, DetachedHandleEvents) {
+        let config = ZakuraBlockSyncConfig::default();
+        let (events, events_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (needed_query_failures, needed_query_failures_rx) = mpsc::unbounded_channel();
+        let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let (status_tx, status) = watch::channel(config.initial_status());
+        let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        let handle = BlockSyncHandle {
+            events,
+            lifecycle,
+            needed_query_failures,
+            peers,
+            status,
+            candidates,
+            routine_wiring: None,
+        };
+        let receiver = DetachedHandleEvents {
+            lifecycle: lifecycle_rx,
+            needed_query_failures: needed_query_failures_rx,
+            _events: events_rx,
+            _peers: peers_tx,
+            _status: status_tx,
+            _candidates: candidates_tx,
+        };
+        (handle, receiver)
+    }
+}
+
 /// The shared download primitives a per-peer pipe-routine is constructed with.
 /// Created once in `spawn_block_sync_reactor` and threaded through the handle to
 /// `service::add_peer`.

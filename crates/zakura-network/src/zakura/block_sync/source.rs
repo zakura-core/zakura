@@ -70,6 +70,34 @@ pub struct BlockRangeReadLease {
     pub(super) _session: Option<FramedSend>,
 }
 
+/// The session end of a [`BlockRangeReadLease::detached`] lease. Dropping it
+/// cancels the read, as a closed serving session does.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+#[derive(Debug)]
+pub struct DetachedReadSession(WorkLease);
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl Drop for DetachedReadSession {
+    fn drop(&mut self) {
+        self.0.cancel_detached();
+    }
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl BlockRangeReadLease {
+    /// A lease outside any serving session, with its session end, for a
+    /// range source's own tests. Serving builds every other lease.
+    pub fn detached() -> (Self, DetachedReadSession) {
+        let work = WorkLease::detached();
+        let session = DetachedReadSession(work.clone());
+        let lease = BlockRangeReadLease {
+            work,
+            _session: None,
+        };
+        (lease, session)
+    }
+}
+
 impl BlockRangeReadLease {
     /// Claim the read immediately before its first storage lookup. Returns false
     /// after cancellation or an earlier claim, so a queued job need not start.

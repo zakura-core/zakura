@@ -226,6 +226,21 @@ fn transactions_match_header(block: &block::Block) -> bool {
     root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
 
+/// Whether a routine accepts a decoded body for `requested` at `height`: the
+/// coinbase height check and the transaction check on frame receipt, then the
+/// requested-hash check in `handle_body`. Controlled storage runs fixture
+/// bodies through these checks.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub fn routine_accepts_body(
+    block: &block::Block,
+    height: block::Height,
+    requested: block::Hash,
+) -> bool {
+    block.coinbase_height() == Some(height)
+        && transactions_match_header(block)
+        && block.hash() == requested
+}
+
 fn header_hash_payload_mismatch(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,

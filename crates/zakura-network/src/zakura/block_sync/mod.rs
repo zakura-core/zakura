@@ -68,6 +68,8 @@ pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
     BlockSyncEvent, BlockSyncMisbehavior,
 };
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
 #[cfg(any(test, zakura_sim))]
@@ -75,8 +77,14 @@ pub(crate) use service::block_sync_streams;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
 pub use service::{BlockSyncPeerSession, BlockSyncService};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use state::DetachedHandleEvents;
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use wire::decode_block_payload_for_test;
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,

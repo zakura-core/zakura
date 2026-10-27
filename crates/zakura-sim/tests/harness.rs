@@ -1,11 +1,23 @@
-//! The harness registry: every harness has a unique name and rebuilds from
-//! its serialized scenario.
+//! The harness registry: every harness has a unique name, rebuilds from its
+//! serialized scenario, and reports the step loop's properties, which the
+//! coverage manifest lists with the tests that show them working.
 #![cfg(zakura_sim)]
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zakura_sim::harness::{self, HarnessEntry, HarnessError, HARNESSES};
+use zakura_rt::{task::yield_now, time::sleep};
+use zakura_sim::{
+    harness::{
+        self,
+        coverage::{Witness, COVERAGE},
+        run_harness, HarnessEntry, HarnessError, Subsystem, HARNESSES, NO_TASK_PANIC,
+    },
+    property::{Assume, AssumeRecord, Assumptions, HasView, Status},
+    sim::NO_LIVELOCK,
+    MemorySink, Outcome, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
+};
 
 /// Every scenario prefix of `entry` worth trying: each first byte, with each
 /// second byte's low bit, cut to the harness's length.
@@ -66,5 +78,217 @@ fn a_scenario_that_does_not_fit_is_refused() {
             (entry.config)(&bad),
             Err(HarnessError::Scenario(_))
         ));
+    }
+}
+
+/// What [`Probe`]'s one task does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Behavior {
+    /// Yields forever, so the clock never moves.
+    Spin,
+    /// Sleeps forever, 1 ms at a time.
+    Sleep,
+    /// Panics on its first poll.
+    Panic,
+}
+
+/// One task that behaves as the scenario says, under a scenario that
+/// declares `BoundedAdversary`.
+struct Probe;
+
+impl HasView for Probe {
+    type View = ();
+
+    /// Nothing.
+    fn view(&self) {}
+}
+
+impl Subsystem for Probe {
+    const NAME: &'static str = "test/probe";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Behavior;
+
+    fn config(_: &Behavior) -> RunConfig {
+        RunConfig {
+            budget: 1_000,
+            drain_bound: 100,
+            ..RunConfig::default()
+        }
+    }
+
+    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+        let behavior = *behavior;
+        sim.scheduler().spawn_root("probe", async move {
+            match behavior {
+                Behavior::Spin => loop {
+                    yield_now().await;
+                },
+                Behavior::Sleep => loop {
+                    sleep(Duration::from_millis(1)).await;
+                },
+                Behavior::Panic => panic!("the probe panics"),
+            }
+        });
+        Probe
+    }
+
+    fn assumptions(_: &Behavior) -> Assumptions<Self> {
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::BoundedAdversary,
+            params: serde_json::json!({}),
+        }])
+    }
+
+    fn draw(_: &[u8]) -> Behavior {
+        Behavior::Sleep
+    }
+}
+
+/// Runs [`Probe`] on an empty plan, and checks that `meta.properties` names
+/// every property the run reports.
+fn probe(behavior: Behavior) -> RunReport {
+    let report = run_harness::<Probe>(
+        &behavior,
+        Plan::from_fuzz(&[]),
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{behavior:?}: {error}"));
+    let meta = harness::meta::<Probe>(&behavior).unwrap();
+    let declared: Vec<_> = meta.properties.iter().map(|p| p.id.as_str()).collect();
+    let reported: Vec<_> = report
+        .properties
+        .iter()
+        .map(|r| r.property.as_str())
+        .collect();
+    assert_eq!(declared, reported, "{behavior:?}");
+    assert_eq!(meta.assumptions, Probe::assumptions(&behavior).records());
+    report
+}
+
+/// `property`'s outcome in `report`.
+fn outcome<'a>(report: &'a RunReport, property: &str) -> &'a PropertyOutcome {
+    &report
+        .properties
+        .iter()
+        .find(|r| r.property == property)
+        .unwrap_or_else(|| panic!("the run reports {property}: {:?}", report.properties))
+        .outcome
+}
+
+#[test]
+fn livelock_fires_before_budget() {
+    let config = harness::run_config::<Probe>(&Behavior::Spin);
+    assert!(config.enforce_no_livelock);
+    assert!(config.max_steps_per_instant < config.budget);
+
+    let report = probe(Behavior::Spin);
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("the spin is a livelock");
+    assert_eq!(violation.property, NO_LIVELOCK);
+    assert_eq!(report.end.outcome, Outcome::Violation);
+    assert!(report.end.steps < config.budget, "{:?}", report.end);
+    assert!(matches!(
+        outcome(&report, NO_LIVELOCK),
+        PropertyOutcome::Violated { .. }
+    ));
+}
+
+#[test]
+fn a_moving_clock_holds_no_livelock() {
+    let report = probe(Behavior::Sleep);
+    assert_eq!(report.end.violation, None);
+    assert!(matches!(
+        outcome(&report, NO_LIVELOCK),
+        PropertyOutcome::Held { applicable } if *applicable > 0
+    ));
+}
+
+#[test]
+fn task_panic_violates_no_task_panic() {
+    let report = probe(Behavior::Panic);
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .expect("the panic is a violation");
+    assert_eq!(violation.property, NO_TASK_PANIC);
+    assert_eq!(violation.actual, "probe.1 panicked");
+    assert!(matches!(
+        outcome(&report, NO_TASK_PANIC),
+        PropertyOutcome::Violated { witness } if *witness == [violation.step]
+    ));
+}
+
+#[test]
+fn a_clean_run_holds_no_task_panic() {
+    let entry = harness::find("header-sync/smoke").unwrap();
+    let scenario = (entry.draw)(&[]);
+    let report = (entry.run)(&scenario, Plan::from_fuzz(&[]), &mut MemorySink::default()).unwrap();
+    assert_eq!(report.end.violation, None);
+    assert!(matches!(
+        outcome(&report, NO_TASK_PANIC),
+        PropertyOutcome::Held { applicable } if *applicable > 0
+    ));
+}
+
+#[test]
+fn every_harness_names_its_statuses() {
+    for entry in HARNESSES {
+        let properties = (entry.properties)();
+        assert_eq!(properties[0].id, NO_TASK_PANIC, "{}", entry.name);
+        for property in properties {
+            assert_eq!(entry.status(&property.id), Some(property.status));
+        }
+        assert_eq!(entry.status(NO_LIVELOCK), Some(Status::Active));
+        assert_eq!(entry.status("no/such-property"), None);
+    }
+}
+
+#[test]
+fn the_coverage_manifest_lists_every_reported_property() {
+    let mut reported: BTreeSet<String> = HARNESSES
+        .iter()
+        .flat_map(|entry| (entry.properties)())
+        .map(|property| property.id)
+        .collect();
+    reported.insert(NO_LIVELOCK.to_owned());
+    let listed: BTreeSet<String> = COVERAGE.iter().map(|row| row.property.to_owned()).collect();
+    assert_eq!(listed.len(), COVERAGE.len(), "one row per property");
+    assert_eq!(listed, reported);
+}
+
+#[test]
+fn every_coverage_witness_exists_and_ci_runs_it() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
+    let check = |property: &str, witness: Witness| {
+        let source = std::fs::read_to_string(crate_dir.join(witness.file))
+            .unwrap_or_else(|error| panic!("{property}: {}: {error}", witness.file));
+        let at = source
+            .find(&format!("fn {}()", witness.test))
+            .unwrap_or_else(|| panic!("{property}: {} has no {}", witness.file, witness.test));
+        let attributes = source[..at].rsplit("#[test]").next().unwrap_or_default();
+        assert!(
+            workflow.contains(&format!("name: {}", witness.ci)),
+            "{property}: no `{}` job",
+            witness.ci
+        );
+        if attributes.contains("#[ignore") {
+            assert!(
+                workflow.contains(witness.test),
+                "{property}: CI never runs the ignored {}",
+                witness.test
+            );
+        }
+    };
+    for row in COVERAGE {
+        check(row.property, row.passing);
+        check(row.property, row.bypass);
     }
 }

@@ -210,3 +210,30 @@ where
         (self.end)(end, log)
     }
 }
+
+impl<C: Checker + ?Sized> Checker for Box<C> {
+    /// Forwards to the checker.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        (**self).after_step(cx)
+    }
+
+    /// Forwards to the checker.
+    fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
+        (**self).at_end(end, log)
+    }
+
+    /// Forwards to the checker.
+    fn events(&mut self) -> Vec<CheckEvent> {
+        (**self).events()
+    }
+
+    /// Forwards to the checker.
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        (**self).observe_events(events);
+    }
+
+    /// Forwards to the checker.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        (**self).harness_failure()
+    }
+}

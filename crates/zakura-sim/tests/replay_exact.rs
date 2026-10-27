@@ -7,7 +7,6 @@ use std::{
     cell::Cell,
     path::Path,
     process::Command,
-    rc::Rc,
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -20,17 +19,14 @@ use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, HarnessEntry, RecordInput, Subsystem},
-    property::{
-        Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
-        Sources, Status, Verdict,
-    },
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, Verdict},
     record::OutcomeKind,
     trace::{
-        meta::PropertyRef, replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport,
-        Trace, TraceReader, OBSERVATIONS_FILE, TRACE_FILE,
+        replay, replay_with, Invalid, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader,
+        OBSERVATIONS_FILE, TRACE_FILE,
     },
-    ActionSource, Checker, Divergence, HarnessFailure, Identity, NoChecks, Observation,
-    ObservationLog, PropertyOutcome, RunConfig, Sim,
+    ActionSource, Divergence, HarnessFailure, Identity, Observation, ObservationLog,
+    PropertyOutcome, RunConfig, Sim,
 };
 
 /// Records `harness` on the full fuzz `input`.
@@ -571,16 +567,6 @@ impl Subsystem for Spinners {
         Spinners
     }
 
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
-    }
-
     /// The fixed scenario.
     fn draw(_: &[u8]) -> Fixed {
         Fixed {}
@@ -660,16 +646,6 @@ impl Subsystem for DuplicateIdentity {
     fn build(sim: &mut Sim, _: &Fixed) -> Self {
         sim.add_source(Box::new(Duplicates(Cell::new(false))));
         DuplicateIdentity
-    }
-
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The fixed scenario.
@@ -768,16 +744,6 @@ impl Subsystem for PlantedClock {
     fn build(sim: &mut Sim, _: &Fixed) -> Self {
         sim.add_source(Box::new(Clock(Cell::new(0))));
         PlantedClock
-    }
-
-    /// No checks.
-    fn checker(_: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        Box::new(NoChecks)
-    }
-
-    /// No properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
-        Vec::new()
     }
 
     /// The fixed scenario.
@@ -936,26 +902,9 @@ impl Subsystem for EffectsHarness {
         EffectsHarness
     }
 
-    /// The registry of both properties.
-    fn checker(this: &Rc<Self>, _: &Fixed) -> Box<dyn Checker> {
-        let registry = Registry::new(effects_properties()).expect("the two IDs differ");
-        Box::new(RegistryChecker::new(
-            registry,
-            Rc::clone(this),
-            Assumptions::none(),
-            &Sources::observed(&[]),
-        ))
-    }
-
     /// Both properties.
-    fn properties(_: &Fixed) -> Vec<PropertyRef> {
+    fn properties() -> Vec<Property<Self>> {
         effects_properties()
-            .into_iter()
-            .map(|p| PropertyRef {
-                id: p.id.to_string(),
-                status: p.status,
-            })
-            .collect()
     }
 
     /// The fixed scenario.

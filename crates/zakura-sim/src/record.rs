@@ -18,8 +18,9 @@ use crate::{
 
 /// The record shapes and field encodings. Any field or variant change bumps
 /// it. Version 2 replaced storage operation events with typed storage facts
-/// and states. Version 3 added header-sync reactor events.
-pub const FORMAT_VERSION: u32 = 3;
+/// and states. Version 3 added header-sync reactor events. Version 4 added
+/// the reactor's misbehavior event.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -663,13 +664,22 @@ mod tests {
                     cause: "staging-full".into(),
                 },
             ),
+            reactor(
+                11,
+                ReactorFact::Misbehavior {
+                    peer: "01".into(),
+                    reason: "invalid-header".into(),
+                    origin: Some(6),
+                    current: Some(7),
+                },
+            ),
         ];
         let bump = "a reactor observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test";
-        assert_eq!(FORMAT_VERSION, 3, "{bump}");
+        assert_eq!(FORMAT_VERSION, 4, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"reactor","instance":0,"seq":1,"storage_seq":11,"node":"node","event":{"event":"dispatched","call":1,"port":{"kind":"locator","peer":"01","session_id":7,"target":"bb","scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}}}}},{"obs":"reactor","instance":0,"seq":2,"storage_seq":12,"node":"node","event":{"event":"dispatched","call":2,"port":{"kind":"vct-context","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3}}},{"obs":"reactor","instance":0,"seq":3,"storage_seq":13,"node":"node","event":{"event":"dispatched","call":3,"port":{"kind":"prepare","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":4,"storage_seq":14,"node":"node","event":{"event":"dispatched","call":4,"port":{"kind":"apply","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":5,"storage_seq":15,"node":"node","event":{"event":"call-ended","call":1,"end":"timed-out","op":null}},{"obs":"reactor","instance":0,"seq":6,"storage_seq":16,"node":"node","event":{"event":"call-ended","call":3,"end":"replied","op":9}},{"obs":"reactor","instance":0,"seq":7,"storage_seq":17,"node":"node","event":{"event":"handled","call":1,"panicked":false}},{"obs":"reactor","instance":0,"seq":8,"storage_seq":18,"node":"node","event":{"event":"started","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"purpose":{"purpose":"normal"}}},{"obs":"reactor","instance":0,"seq":9,"storage_seq":19,"node":"node","event":{"event":"retired","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"phase":"applying","purpose":{"purpose":"selected-auxiliary-repair","selected_target":{"height":3,"hash":"cc"},"repair_generation":4},"reason":"snapshot_obsolete"}},{"obs":"reactor","instance":0,"seq":10,"storage_seq":20,"node":"node","event":{"event":"offer-waiting","peer":"01","session_id":7,"target":"bb","cause":"staging-full"}}]"#,
+            r#"[{"obs":"reactor","instance":0,"seq":1,"storage_seq":11,"node":"node","event":{"event":"dispatched","call":1,"port":{"kind":"locator","peer":"01","session_id":7,"target":"bb","scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}}}}},{"obs":"reactor","instance":0,"seq":2,"storage_seq":12,"node":"node","event":{"event":"dispatched","call":2,"port":{"kind":"vct-context","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3}}},{"obs":"reactor","instance":0,"seq":3,"storage_seq":13,"node":"node","event":{"event":"dispatched","call":3,"port":{"kind":"prepare","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":4,"storage_seq":14,"node":"node","event":{"event":"dispatched","call":4,"port":{"kind":"apply","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":5,"storage_seq":15,"node":"node","event":{"event":"call-ended","call":1,"end":"timed-out","op":null}},{"obs":"reactor","instance":0,"seq":6,"storage_seq":16,"node":"node","event":{"event":"call-ended","call":3,"end":"replied","op":9}},{"obs":"reactor","instance":0,"seq":7,"storage_seq":17,"node":"node","event":{"event":"handled","call":1,"panicked":false}},{"obs":"reactor","instance":0,"seq":8,"storage_seq":18,"node":"node","event":{"event":"started","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"purpose":{"purpose":"normal"}}},{"obs":"reactor","instance":0,"seq":9,"storage_seq":19,"node":"node","event":{"event":"retired","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"phase":"applying","purpose":{"purpose":"selected-auxiliary-repair","selected_target":{"height":3,"hash":"cc"},"repair_generation":4},"reason":"snapshot_obsolete"}},{"obs":"reactor","instance":0,"seq":10,"storage_seq":20,"node":"node","event":{"event":"offer-waiting","peer":"01","session_id":7,"target":"bb","cause":"staging-full"}},{"obs":"reactor","instance":0,"seq":11,"storage_seq":21,"node":"node","event":{"event":"misbehavior","peer":"01","reason":"invalid-header","origin":6,"current":7}}]"#,
             "{bump}"
         );
     }

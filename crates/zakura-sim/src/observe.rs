@@ -780,6 +780,17 @@ pub enum ReactorFact {
         /// Which capacity refused it: `staging-full` or `locator-capacity`.
         cause: String,
     },
+    /// The reactor dispatched a peer's violation to storage.
+    Misbehavior {
+        /// The violating peer.
+        peer: String,
+        /// What it did: `malformed-message` or `invalid-header`.
+        reason: String,
+        /// The session whose message or work showed it, if known.
+        origin: Option<u64>,
+        /// The peer's current session then, if it had one.
+        current: Option<u64>,
+    },
 }
 
 /// What a dispatched port call asks storage for.

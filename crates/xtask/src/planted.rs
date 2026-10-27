@@ -11,14 +11,22 @@
 //!    case builds in `target/planted/target`, apart from the checkout's own
 //!    target directory;
 //! 2. records the input unpatched, which must hold the property with no
-//!    violation of any property;
+//!    violation of any property and pass its witness test expecting
+//!    `holds`;
 //! 3. applies the patch and records the input again, which must violate
-//!    exactly the case's property;
+//!    exactly the case's property and pass its witness test expecting
+//!    `violated`;
 //! 4. removes the worktree, keeping both traces as evidence.
 //!
+//! A witness test passes only if the run reached the property's trigger
+//! history. `zakura-sim record --witness` judges it with the rule the
+//! simulator's own witness tests use, and writes the result beside the
+//! trace.
+//!
 //! A patch that doesn't apply, a build that fails, a harness failure, a
-//! violation of another property, and a patch the input doesn't catch are
-//! each reported as their own failure, never as a catch.
+//! violation of another property, a patch the input doesn't catch, and a
+//! catch that misses the trigger history are each reported as their own
+//! failure, never as a catch.
 
 use std::{
     env,
@@ -30,6 +38,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
 
@@ -60,6 +69,15 @@ struct CaseFile {
 #[derive(Deserialize)]
 struct Sidecar {
     harness: String,
+    sha256: String,
+}
+
+/// The `witness.json` that `zakura-sim record --witness` writes beside the
+/// trace.
+#[derive(Deserialize)]
+struct WitnessFile {
+    passed: bool,
+    error: Option<String>,
 }
 
 /// What one run of a case's input showed.
@@ -78,6 +96,8 @@ enum Run {
         outcome: Option<String>,
         /// The harness failure, for a run that ended at one.
         harness: Option<String>,
+        /// Why the witness test failed, or `None` if it passed.
+        witness: Option<String>,
     },
     /// The build or the `zakura-sim` command failed before writing a trace.
     Failed(String),
@@ -101,6 +121,9 @@ enum Verdict {
     Unrelated(String),
     /// The patched run didn't violate the property.
     NotCaught(String),
+    /// The patched run violated the property, but its witness test failed,
+    /// as when the run missed the trigger history.
+    WitnessFails(String),
 }
 
 impl fmt::Display for Verdict {
@@ -116,6 +139,9 @@ impl fmt::Display for Verdict {
             }
             Verdict::NotCaught(outcome) => {
                 write!(f, "the patched run didn't violate it: {outcome}")
+            }
+            Verdict::WitnessFails(why) => {
+                write!(f, "the patched run's witness test fails: {why}")
             }
         }
     }
@@ -234,24 +260,52 @@ fn check_case(
     case: &Case,
 ) -> Result<Verdict, BoxError> {
     let harness = harness_of(worktree, &case.input)?;
-    let baseline = record(worktree, target, &harness, case, &scratch.join("baseline"))?;
+    let baseline = record(
+        worktree,
+        target,
+        &harness,
+        case,
+        "holds",
+        &scratch.join("baseline"),
+    )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
     }
     if let Err(why) = apply(worktree, &case.patch) {
         return Ok(Verdict::PatchDoesntApply(why));
     }
-    let patched = record(worktree, target, &harness, case, &scratch.join("patched"))?;
+    let patched = record(
+        worktree,
+        target,
+        &harness,
+        case,
+        "violated",
+        &scratch.join("patched"),
+    )?;
     Ok(classify(&case.property, &patched))
 }
 
-/// The harness `input`'s sidecar names.
+/// The harness `input`'s sidecar names, once the sidecar's digest matches
+/// the input.
 fn harness_of(worktree: &Path, input: &Path) -> Result<String, BoxError> {
-    let sidecar = worktree.join(input).with_extension("toml");
+    let input = worktree.join(input);
+    let sidecar = input.with_extension("toml");
     let text =
         fs::read_to_string(&sidecar).map_err(|error| format!("{}: {error}", sidecar.display()))?;
-    let Sidecar { harness } =
+    let Sidecar { harness, sha256 } =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", sidecar.display()))?;
+    let bytes = fs::read(&input).map_err(|error| format!("{}: {error}", input.display()))?;
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest != sha256 {
+        return Err(format!(
+            "{}: the sidecar's sha256 isn't the input's",
+            sidecar.display()
+        )
+        .into());
+    }
     Ok(harness)
 }
 
@@ -269,13 +323,15 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// Records `case`'s input on `harness` in `worktree`'s simulator build,
-/// writing the trace to `out`, and reads its `end` record.
+/// Records `case`'s input on `harness` in `worktree`'s simulator build as a
+/// witness test of the case's property that expects `expect`, writing the
+/// trace to `out`, and reads its `end` record and the test's result.
 fn record(
     worktree: &Path,
     target: &Path,
     harness: &str,
     case: &Case,
+    expect: &str,
     out: &Path,
 ) -> Result<Run, BoxError> {
     if out.exists() {
@@ -299,15 +355,29 @@ fn record(
         .arg(worktree.join(&case.input))
         .arg("--out")
         .arg(out)
+        .args(["--witness", &case.property, "--expect", expect])
         .status()?;
-    if !status.success() {
+    // A failed witness test exits 1 too, but only after writing its result.
+    let Ok(witness) = fs::read_to_string(out.join("witness.json")) else {
         return Ok(Run::Failed(format!(
             "`zakura-sim record` exited with {status}"
         )));
-    }
+    };
+    let witness: WitnessFile = serde_json::from_str(&witness)?;
     let trace = fs::read_to_string(out.join("trace.jsonl"))?;
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
-    end_of(&case.property, end)
+    let mut run = end_of(&case.property, end)?;
+    if let Run::Ended {
+        witness: failed, ..
+    } = &mut run
+    {
+        *failed = (!witness.passed).then(|| {
+            witness
+                .error
+                .unwrap_or_else(|| "no reason given".to_owned())
+        });
+    }
+    Ok(run)
 }
 
 /// Reads `line`, a trace's `end` record, for `property`.
@@ -343,6 +413,7 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
             .find(|report| id(report) == property)
             .and_then(outcome_name),
         harness: text(end.get("harness")),
+        witness: None,
     })
 }
 
@@ -362,11 +433,14 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
             other_violated: Some(violated),
             ..
         } => Some(format!("{violated} is violated")),
-        Run::Ended { outcome, .. } if outcome.as_deref() == Some("held") => None,
-        Run::Ended { outcome, .. } => Some(format!(
+        Run::Ended { outcome, .. } if outcome.as_deref() != Some("held") => Some(format!(
             "{property} is {}",
             outcome.as_deref().unwrap_or("not reported")
         )),
+        Run::Ended {
+            witness: Some(why), ..
+        } => Some(format!("its witness test fails: {why}")),
+        Run::Ended { .. } => None,
     }
 }
 
@@ -387,14 +461,18 @@ fn classify(property: &str, patched: &Run) -> Verdict {
             ..
         } => Verdict::Unrelated(violated.clone()),
         Run::Ended {
-            violation: Some(_), ..
-        } => Verdict::Caught,
-        Run::Ended { outcome, .. } if outcome.as_deref() == Some("violated") => Verdict::Caught,
-        Run::Ended { outcome, .. } => Verdict::NotCaught(
+            violation: None,
+            outcome,
+            ..
+        } if outcome.as_deref() != Some("violated") => Verdict::NotCaught(
             outcome
                 .clone()
                 .unwrap_or_else(|| format!("{property} is not reported")),
         ),
+        Run::Ended {
+            witness: Some(why), ..
+        } => Verdict::WitnessFails(why.clone()),
+        Run::Ended { .. } => Verdict::Caught,
     }
 }
 
@@ -469,6 +547,47 @@ mod tests {
         assert_eq!(
             classify(ID, &Run::Failed("build".to_owned())),
             Verdict::Failed("build".to_owned())
+        );
+    }
+
+    /// A run's witness test result, as `record` reads it from
+    /// `witness.json`.
+    fn judged(run: Run, why: &str) -> Run {
+        match run {
+            Run::Ended {
+                violation,
+                other_violated,
+                outcome,
+                harness,
+                ..
+            } => Run::Ended {
+                violation,
+                other_violated,
+                outcome,
+                harness,
+                witness: Some(why.to_owned()),
+            },
+            failed => failed,
+        }
+    }
+
+    /// A violation that misses the trigger history isn't a catch, and a
+    /// baseline that misses it doesn't pass.
+    #[test]
+    fn planted_requires_the_trigger_history() {
+        let lost = "witness test lost its trigger history";
+        assert_eq!(
+            classify(ID, &judged(run(Some(ID), &[(ID, VIOLATED)]), lost)),
+            Verdict::WitnessFails(lost.to_owned())
+        );
+        assert_eq!(
+            baseline_failure(ID, &judged(run(None, &[(ID, HELD)]), lost)),
+            Some(format!("its witness test fails: {lost}"))
+        );
+        // The end record's own failures still name themselves first.
+        assert_eq!(
+            classify(ID, &judged(run(None, &[(ID, HELD)]), lost)),
+            Verdict::NotCaught("held".to_owned())
         );
     }
 

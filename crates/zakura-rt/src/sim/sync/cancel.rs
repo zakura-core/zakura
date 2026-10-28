@@ -22,18 +22,40 @@ use crate::sim::{point, Op};
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     inner: tokio_sync::CancellationToken,
-    /// This token's hooks and its children's, shared by its clones.
-    hooks: Arc<Hooks>,
+    /// This token's hooks, shared by its clones.
+    hooks: Arc<Handle>,
 }
 
-/// A token's cancellation hooks, and its children's, which its cancellation
-/// also runs.
+/// A token's node in the hook tree, held by the token's clones and by the
+/// futures that own its tokio token.
+///
+/// When the last holder drops, the token's own hooks are dropped unrun, since
+/// nothing can cancel it any more. Its node stays while a descendant lives,
+/// because tokio still cancels that descendant through its ancestors.
+#[derive(Default)]
+struct Handle(Arc<Hooks>);
+
+impl Drop for Handle {
+    /// Drops the token's pending hooks, outside the lock, since a hook's own
+    /// drop may touch other tokens.
+    fn drop(&mut self) {
+        let pending = mem::take(&mut *lock(&self.0.pending));
+        drop(pending);
+    }
+}
+
+/// A token's cancellation hooks, and the path to its children's, which its
+/// cancellation also runs.
 #[derive(Default)]
 struct Hooks {
     /// Hooks that haven't run, in the order they were added.
     pending: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
-    /// The children's hooks. A dropped child's entry is skipped and pruned.
+    /// The children's nodes. A node with no living token or descendant is
+    /// skipped and pruned.
     children: Mutex<Vec<Weak<Hooks>>>,
+    /// The parent's node, kept alive so the path from it to this node
+    /// survives the parent's own tokens being dropped.
+    _parent: Option<Arc<Hooks>>,
 }
 
 impl Hooks {
@@ -70,13 +92,16 @@ impl CancellationToken {
 
     /// A token that is cancelled with this one, but not the other way round.
     pub fn child_token(&self) -> Self {
-        let hooks = Arc::new(Hooks::default());
-        let mut children = lock(&self.hooks.children);
+        let hooks = Arc::new(Hooks {
+            _parent: Some(Arc::clone(&self.hooks.0)),
+            ..Hooks::default()
+        });
+        let mut children = lock(&self.hooks.0.children);
         children.retain(|child| child.strong_count() > 0);
         children.push(Arc::downgrade(&hooks));
         CancellationToken {
             inner: self.inner.child_token(),
-            hooks,
+            hooks: Arc::new(Handle(hooks)),
         }
     }
 
@@ -88,7 +113,7 @@ impl CancellationToken {
     /// Adding a hook is not a point, and neither is running one. Only the
     /// simulator build has this, for test observers.
     pub fn on_cancel(&self, hook: impl FnOnce() + Send + 'static) {
-        let mut pending = lock(&self.hooks.pending);
+        let mut pending = lock(&self.hooks.0.pending);
         // tokio's token marks itself cancelled before this wrapper runs the
         // hooks, so a token it reports cancelled already took or will never
         // take its hooks.
@@ -110,7 +135,7 @@ impl CancellationToken {
     fn cancel_at(&self, site: &'static Location<'static>) {
         point(Op::Cancel, site);
         self.inner.cancel();
-        self.hooks.run();
+        self.hooks.0.run();
     }
 
     /// True once cancelled.
@@ -135,6 +160,7 @@ impl CancellationToken {
     pub fn cancelled_owned(self) -> WaitForCancellationFutureOwned {
         WaitForCancellationFutureOwned {
             inner: self.inner.cancelled_owned(),
+            _hooks: self.hooks,
             site: Location::caller(),
             polled: false,
         }
@@ -192,6 +218,8 @@ pin_project_lite::pin_project! {
     pub struct WaitForCancellationFutureOwned {
         #[pin]
         inner: tokio_sync::WaitForCancellationFutureOwned,
+        // The token's hooks, which run while this future owns the token.
+        _hooks: Arc<Handle>,
         site: &'static Location<'static>,
         polled: bool,
     }

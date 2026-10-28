@@ -500,6 +500,48 @@ fn on_cancel_runs_from_a_drop_guard() {
     assert_eq!(runs, (1, 1, 0));
 }
 
+/// A grandchild's hook runs when the root is cancelled after the child
+/// between them was dropped, as tokio still cancels the grandchild. The
+/// dropped child's own hook never runs.
+#[test]
+fn on_cancel_survives_a_dropped_intermediate_token() {
+    let (runs, _) = run(async {
+        let middle_runs = Arc::new(counter::AtomicUsize::new(0));
+        let leaf_runs = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let middle = root.child_token();
+        let leaf = middle.child_token();
+        middle.on_cancel(counting_hook(&middle_runs));
+        leaf.on_cancel(counting_hook(&leaf_runs));
+        drop(middle);
+        root.cancel();
+        (
+            middle_runs.load(counter::Ordering::Relaxed),
+            leaf_runs.load(counter::Ordering::Relaxed),
+            leaf.is_cancelled(),
+        )
+    });
+    assert_eq!(runs, (0, 1, true));
+}
+
+/// A hook runs when the parent cancels a child whose last token became a
+/// `cancelled_owned` future, and that future still resolves.
+#[test]
+fn on_cancel_survives_cancelled_owned() {
+    let (runs, _) = run(async {
+        let count = Arc::new(counter::AtomicUsize::new(0));
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        child.on_cancel(counting_hook(&count));
+        let wait = child.cancelled_owned();
+        root.cancel();
+        let ran = count.load(counter::Ordering::Relaxed);
+        wait.await;
+        ran
+    });
+    assert_eq!(runs, 1);
+}
+
 /// Adding and running hooks adds no point and no draw.
 #[test]
 fn on_cancel_adds_no_point() {

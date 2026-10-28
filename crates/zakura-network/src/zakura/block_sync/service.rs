@@ -877,6 +877,11 @@ impl Service for BlockSyncService {
                     Some((wiring, generation, fence)) => {
                         let serving = wiring.serving.session(
                             &peer_id,
+                            #[cfg(any(test, zakura_sim))]
+                            super::block_sync_observe::SessionKey {
+                                conn_id,
+                                generation,
+                            },
                             block_sync_session.request_sender(),
                             run_cancel.clone(),
                             connection_cancel_token.clone(),

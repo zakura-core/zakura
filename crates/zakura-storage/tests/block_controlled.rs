@@ -951,6 +951,60 @@ fn an_admitted_body_keeps_its_block_until_its_verdict() {
     );
 }
 
+/// ST4.5: two admitted copies of a body can't both report a duplicate while
+/// neither commits. Full state either replaces the older copy in its queue
+/// or refuses the newer one, so once the newer copy reports a duplicate,
+/// the older one is unreplaced and must reach a verdict of its own.
+#[test]
+fn a_refused_copy_leaves_the_older_one_unreplaced() {
+    let duplicate = BlockOutcome::Verdict(Verdict::Duplicate);
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+    let first = harness.submit(&blocks[0]);
+    let copy = harness.submit(&blocks[0]);
+    harness.complete(first, BlockOutcome::Admit);
+    harness.complete(copy, BlockOutcome::Admit);
+    // Either copy may lose.
+    assert!(harness.enabled(first).contains(&duplicate));
+    assert!(harness.enabled(copy).contains(&duplicate));
+
+    harness.complete(copy, duplicate);
+    assert_eq!(
+        harness.service.owner_state().operations[0].stage,
+        OperationStage::Admitted { replaced: false }
+    );
+    let enabled = harness.enabled(first);
+    assert!(!enabled.contains(&duplicate), "{enabled:?}");
+    assert!(matches!(
+        harness.service.complete(first, duplicate),
+        Err(CompleteError::Illegal(_))
+    ));
+    harness.complete(first, COMMITTED);
+}
+
+/// ST4.5: a copy that a third admission replaced stays replaced when the
+/// copy between them reports a duplicate.
+#[test]
+fn a_refused_copy_leaves_other_replacements() {
+    let duplicate = BlockOutcome::Verdict(Verdict::Duplicate);
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+    let first = harness.submit(&blocks[0]);
+    let second = harness.submit(&blocks[0]);
+    let third = harness.submit(&blocks[0]);
+    harness.complete(first, BlockOutcome::Admit);
+    harness.complete(second, BlockOutcome::Admit);
+    // The full limit admits two bodies, so the third waits for the second.
+    harness.complete(second, duplicate);
+    assert!(!harness.enabled(first).contains(&duplicate));
+    harness.complete(third, BlockOutcome::Admit);
+    assert!(harness.enabled(first).contains(&duplicate));
+    harness.complete(first, duplicate);
+    // The older copies are gone, so the last must reach its own verdict.
+    assert!(!harness.enabled(third).contains(&duplicate));
+    harness.complete(third, COMMITTED);
+}
+
 /// ST4.5: a resubmission of a committed body can't fail a consensus rule,
 /// since the verifier reports the duplicate first. A body admitted before
 /// another submission commits it still can.

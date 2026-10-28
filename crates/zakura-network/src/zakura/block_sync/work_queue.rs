@@ -276,11 +276,16 @@ impl WorkQueue {
 
     /// Reports the queue's items to the observer, if one is installed. A task
     /// that changes the queue calls this after it handled an input.
+    ///
+    /// It reports under the queue's lock. Releasing the lock is a preemption
+    /// point under the simulator, so a snapshot read before it could land
+    /// after a newer one.
     #[cfg(any(test, zakura_sim))]
     pub(super) fn observe_items(&self) {
+        let inner = self.lock();
         observe!(
             self.observer,
-            super::block_sync_observe::BlockEvent::WorkQueue(self.ownership_snapshot())
+            super::block_sync_observe::BlockEvent::WorkQueue(Self::ownership(&inner))
         );
     }
 
@@ -1241,9 +1246,14 @@ impl WorkQueue {
 
     /// Every queued item with its owner and byte quantities, read from the
     /// queue maps rather than from the maintained tallies.
-    #[cfg(any(test, zakura_sim))]
+    #[cfg(test)]
     pub(super) fn ownership_snapshot(&self) -> Vec<WorkItemOwnership> {
-        let inner = self.lock();
+        Self::ownership(&self.lock())
+    }
+
+    /// The items of `inner`, as [`Self::ownership_snapshot`] reads them.
+    #[cfg(any(test, zakura_sim))]
+    fn ownership(inner: &WorkQueueInner) -> Vec<WorkItemOwnership> {
         let pending = inner
             .pending
             .iter()

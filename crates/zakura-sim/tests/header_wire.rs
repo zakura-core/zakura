@@ -231,6 +231,40 @@ fn remote(index: usize, dial: usize) -> String {
     peer_addr(index, dial).to_string()
 }
 
+/// Each scripted scenario, actions, refusals, the reopen and the redial
+/// included, replays the same picks and observations when one plan runs it
+/// twice in one process, so nothing process-wide, such as a QUIC
+/// connection's stable ID, leaks into the log.
+#[test]
+fn a_scripted_wire_run_replays_identically() {
+    let open = |kind, version| PeerAction::Open { kind, version };
+    let scenario = scenario(vec![
+        peer(
+            PeerSpec::dialing(),
+            BROAD,
+            vec![
+                open(ZAKURA_STREAM_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION),
+                PeerAction::Close,
+                PeerAction::Redial,
+            ],
+        ),
+        peer(
+            PeerSpec::listening(),
+            ZAKURA_CAP_HEADER_SYNC,
+            vec![PeerAction::FinishHeader],
+        ),
+        PeerSpec {
+            bad_nonce_echo: true,
+            ..PeerSpec::listening()
+        },
+    ]);
+    for plan in plans() {
+        let runs: Vec<_> = (0..2).map(|_| run(&scenario, plan.clone())).collect();
+        assert_eq!(runs[0].picks, runs[1].picks);
+        assert_eq!(runs[0].log.entries(), runs[1].log.entries());
+    }
+}
+
 /// The node advertises header sync and nothing else, whichever end dials:
 /// its mask, read from `Negotiated.local`, equals `ZAKURA_CAP_HEADER_SYNC`
 /// exactly, and so does what each connection negotiates, though both peers

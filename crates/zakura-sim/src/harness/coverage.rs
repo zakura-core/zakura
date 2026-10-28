@@ -112,9 +112,9 @@ pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: super::block_sync::OPERATION_IDS,
         passing: sim_test("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
-        bypass: sim_test(
+        bypass: Bypass::Test(sim_test(
             "tests/block_node.rs",
             "planted_block_operation_ids_violate_the_property",
-        ),
+        )),
     },
 ];

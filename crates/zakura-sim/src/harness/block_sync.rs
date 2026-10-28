@@ -14,8 +14,15 @@
 //! traces, the fail-closed shutdown when an invalid-body record isn't
 //! durable, the 30 s timeouts on state calls, and the tampered-body
 //! disconnect. No block property covers them.
+//!
+//! Every link carries a [`Wire`] relay that labels each frame with the
+//! stream-6 role models, and the node's tap writes its identities and
+//! effects beside the labels, so the harness checks stream 6's generated
+//! receiver, downstream and sender properties.
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+use zakura_network::zakura::block_sync_streams;
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SchedulerConfig;
@@ -32,6 +39,7 @@ use super::{
         control::{Control, ControlAction, ControlStep},
         default_limits, preload,
         probe::ProbeLog,
+        relay::Wire,
         tap::BlockTap,
         view::BlockSyncView,
         BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
@@ -45,12 +53,16 @@ use crate::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::BLOCK_SERVICE,
+    table::{downstream_properties, sender_properties, table_properties, Effect},
     RunConfig, Sim,
 };
 
 /// The node's block operations get rising IDs, each completes at most once,
 /// and only after its submission.
 pub const OPERATION_IDS: &str = "block-sync/storage-operation-ids";
+
+/// The family the stream-6 generated property IDs name.
+pub const FAMILY: &str = "block-sync";
 
 /// A mirror peer: real block-sync code on full state that holds the whole
 /// fixture chain. It's named `mirror-<i>` by its index in
@@ -246,7 +258,9 @@ impl Subsystem for Storage {
             ports.effects.clone(),
         );
         let view = ports.view.clone();
-        let (observer, tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
+        let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
+        let wire = Wire::default();
+        tap.label_with(wire.clone());
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -280,7 +294,7 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, ports.effects, ports.live));
+        let topology = Rc::new(Topology::new(nodes, ports.effects, ports.live).with_wire(wire));
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
@@ -298,9 +312,11 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`storage_properties`].
+    /// [`storage_properties`] and [`table_wiring_properties`].
     fn properties() -> Vec<Property<Self>> {
-        storage_properties()
+        let mut properties = storage_properties();
+        properties.extend(table_wiring_properties());
+        properties
     }
 
     /// [`storage_sources`].
@@ -359,10 +375,32 @@ pub fn storage_properties<S: HasView>() -> Vec<Property<S>> {
     }]
 }
 
-/// What [`storage_properties`] read: the node's storage facts, plus the step
-/// loop's task observations.
+/// Stream 6's generated properties: every receiver property, the
+/// downstream properties of the node's work, serving and output, and every
+/// sender property. A test harness that wraps [`Storage`] registers them
+/// too.
+pub fn table_wiring_properties<S: HasView>() -> Vec<Property<S>> {
+    let streams = block_sync_streams();
+    let mut properties = table_properties(FAMILY, streams);
+    properties.extend(downstream_properties(
+        FAMILY,
+        streams,
+        &[Effect::Work, Effect::Serving, Effect::Output],
+    ));
+    properties.extend(sender_properties(FAMILY, streams));
+    properties
+}
+
+/// What the harness's properties read: the node's storage facts, the
+/// relays' frames and the node's closes, plus the step loop's task
+/// observations.
 pub fn storage_sources() -> Sources {
-    Sources::observed(&[Source::Schedule, Source::Storage])
+    Sources::observed(&[
+        Source::Schedule,
+        Source::Storage,
+        Source::Frames,
+        Source::Closes,
+    ])
 }
 
 /// Checks [`OPERATION_IDS`] on the node's block storage.

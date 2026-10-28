@@ -61,6 +61,30 @@ const fn race(property: &'static str, test: &'static str) -> Coverage {
     }
 }
 
+/// A stream-6 generated property's row: its witness in
+/// `tests/block_table.rs`, and the scripted bypass there that violates
+/// every generated ID.
+const fn table(property: &'static str, passing: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: sim_test("tests/block_table.rs", passing),
+        bypass: Bypass::Test(sim_test(
+            "tests/block_table.rs",
+            "scripted_bypasses_violate_every_generated_id",
+        )),
+    }
+}
+
+/// An honest sync or honest serving holds it.
+const HONEST: &str = "honest_runs_hold_every_generated_id_they_reach";
+/// A probe fault outside the node's own exchanges reaches it.
+const PROBE_FAULT: &str = "each_probe_fault_reaches_its_exact_id";
+/// A probe fault inside the node's own exchange reaches it, and violates
+/// it: the close records no fault cause.
+const EXCHANGE_FAULT: &str = "faults_inside_the_nodes_exchange_close_without_a_fault_cause";
+/// No scenario reaches it.
+const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
@@ -112,9 +136,111 @@ pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: super::block_sync::OPERATION_IDS,
         passing: sim_test("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
-        bypass: sim_test(
+        bypass: Bypass::Test(sim_test(
             "tests/block_node.rs",
             "planted_block_operation_ids_violate_the_property",
-        ),
+        )),
     },
+    table("block-sync/s6v3/block/receiver-work-authorized", HONEST),
+    table("block-sync/s6v3/block/sender-answers-open", HONEST),
+    table(
+        "block-sync/s6v3/block/sender-within-response-quantity",
+        HONEST,
+    ),
+    table("block-sync/s6v3/blocks-done/sender-ends-once", HONEST),
+    table(
+        "block-sync/s6v3/blocks-done/sender-within-response-quantity",
+        HONEST,
+    ),
+    table("block-sync/s6v3/conformant-never-closes", HONEST),
+    table(
+        "block-sync/s6v3/get-blocks/receiver-serving-bounded",
+        HONEST,
+    ),
+    table("block-sync/s6v3/get-blocks/sender-within-limit", HONEST),
+    table("block-sync/s6v3/range-unavailable/sender-ends-once", HONEST),
+    table(
+        "block-sync/s6v3/range-unavailable/sender-within-response-quantity",
+        HONEST,
+    ),
+    table("block-sync/s6v3/status/sender-cadence", HONEST),
+    table("block-sync/s6v3/block/long-payload-closes", PROBE_FAULT),
+    table("block-sync/s6v3/block/reserved-flags-closes", PROBE_FAULT),
+    table("block-sync/s6v3/block/short-payload-closes", PROBE_FAULT),
+    table("block-sync/s6v3/block/unsolicited-closes", PROBE_FAULT),
+    table(
+        "block-sync/s6v3/blocks-done/long-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/blocks-done/reserved-flags-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/blocks-done/short-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/blocks-done/unsolicited-closes",
+        PROBE_FAULT,
+    ),
+    table("block-sync/s6v3/get-blocks/bad-content-closes", PROBE_FAULT),
+    table(
+        "block-sync/s6v3/get-blocks/long-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/get-blocks/reserved-flags-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/get-blocks/short-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/long-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/reserved-flags-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/short-payload-closes",
+        PROBE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/unsolicited-closes",
+        PROBE_FAULT,
+    ),
+    table("block-sync/s6v3/status/bad-content-closes", PROBE_FAULT),
+    table("block-sync/s6v3/status/cadence-never-closes", PROBE_FAULT),
+    table("block-sync/s6v3/status/long-payload-closes", PROBE_FAULT),
+    table("block-sync/s6v3/status/reserved-flags-closes", PROBE_FAULT),
+    table("block-sync/s6v3/status/short-payload-closes", PROBE_FAULT),
+    table("block-sync/s6v3/undeclared-type-closes", PROBE_FAULT),
+    table("block-sync/s6v3/block/bad-content-closes", EXCHANGE_FAULT),
+    table("block-sync/s6v3/block/over-owed-closes", EXCHANGE_FAULT),
+    table(
+        "block-sync/s6v3/blocks-done/bad-content-closes",
+        EXCHANGE_FAULT,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/bad-content-closes",
+        EXCHANGE_FAULT,
+    ),
+    table("block-sync/s6v3/blocks-done/over-owed-closes", UNREACHED),
+    table(
+        "block-sync/s6v3/blocks-done/receiver-work-authorized",
+        UNREACHED,
+    ),
+    table("block-sync/s6v3/get-blocks/over-margin-closes", UNREACHED),
+    table(
+        "block-sync/s6v3/range-unavailable/over-owed-closes",
+        UNREACHED,
+    ),
+    table(
+        "block-sync/s6v3/range-unavailable/receiver-work-authorized",
+        UNREACHED,
+    ),
 ];

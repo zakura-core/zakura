@@ -22,9 +22,11 @@
 //! facts, pairs them, and folds them into a [`view::BlockSyncView`].
 
 pub mod control;
+mod identity;
 mod pair;
 pub mod policy;
 pub mod probe;
+pub mod relay;
 pub mod tap;
 pub mod view;
 
@@ -879,6 +881,8 @@ pub struct Topology {
     probe: RefCell<Option<ProbeEnd>>,
     /// The last connection and session ID handed out.
     last_id: Cell<u64>,
+    /// Labels every frame on the node's links, if set.
+    wire: Option<relay::Wire>,
 }
 
 impl Topology {
@@ -891,7 +895,38 @@ impl Topology {
             chain,
             probe: RefCell::new(None),
             last_id: Cell::new(0),
+            wire: None,
         }
+    }
+
+    /// Puts a relay that labels every frame with `wire`'s role models on
+    /// each link it makes from now on.
+    pub fn with_wire(self, wire: relay::Wire) -> Self {
+        Topology {
+            wire: Some(wire),
+            ..self
+        }
+    }
+
+    /// A channel for frames from `sender` to `receiver` on connection `id`,
+    /// through a relay if the topology labels its links: the sender's end
+    /// and the receiver's.
+    fn pipe(
+        &self,
+        id: u64,
+        sender: usize,
+        receiver: usize,
+    ) -> (FramedSend, zakura_network::zakura::FramedRecv) {
+        let Some(wire) = &self.wire else {
+            return framed_channel(LINK_DEPTH);
+        };
+        let way = if receiver == 0 {
+            relay::Way::ToNode
+        } else {
+            debug_assert_eq!(sender, 0, "one side of every link is the node under test");
+            relay::Way::FromNode
+        };
+        wire.pipe(id, way, LINK_DEPTH)
     }
 
     /// The next connection and session ID.
@@ -933,8 +968,8 @@ impl Topology {
     /// in-memory channels. One side must be the node under test.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
         let id = self.next_id();
-        let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
-        let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
+        let (to_listener, from_dialer) = self.pipe(id, dialer, listener);
+        let (to_dialer, from_listener) = self.pipe(id, listener, dialer);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
         let dialed = self.admit(
             dialer,
@@ -957,6 +992,9 @@ impl Topology {
         } else {
             (dialer, listened)
         };
+        if let Some(wire) = &self.wire {
+            wire.watch(id, cause.clone());
+        }
         let link = Link {
             peer: self.nodes[peer].name.clone(),
             dialer: Some(dialer),
@@ -973,8 +1011,9 @@ impl Topology {
     /// dialer, with its reader spawned on `sim` logging to `log`.
     pub fn link_probe(&self, sim: &mut Sim, log: ProbeLog) -> Link {
         let id = self.next_id();
-        let (to_node, from_probe) = framed_channel(LINK_DEPTH);
-        let (to_probe, from_node) = framed_channel(LINK_DEPTH);
+        // The probe is never node 0, so `usize::MAX` stands for it.
+        let (to_node, from_probe) = self.pipe(id, usize::MAX, 0);
+        let (to_probe, from_node) = self.pipe(id, 0, usize::MAX);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
         let cause = self.admit(
             0,
@@ -984,6 +1023,9 @@ impl Topology {
             (from_probe, to_probe),
             &tokens[1],
         );
+        if let Some(wire) = &self.wire {
+            wire.watch(id, cause.clone());
+        }
         log.spawn_reader(sim, from_node);
         *self.probe.borrow_mut() = Some(ProbeEnd { send: to_node });
         let link = Link {
@@ -1040,10 +1082,7 @@ impl Topology {
             }
         };
         for frame in frames {
-            let frame = frame
-                .message(genesis, &blocks)
-                .encode_frame()
-                .expect("a probe frame encodes");
+            let frame = frame.frame(genesis, &blocks);
             if send.send(frame).await.is_err() {
                 return;
             }

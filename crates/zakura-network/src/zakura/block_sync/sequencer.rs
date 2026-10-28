@@ -118,6 +118,10 @@ pub struct SubmissionOwnership {
     pub token: BlockApplyToken,
     /// Wire bytes.
     pub bytes: u64,
+    /// The attributed size of the decoded block the driver can retain,
+    /// measured when the sequencer submitted it. An attached submission
+    /// shares its block with its `applying` body.
+    pub decoded_attributed_memory_bytes: u64,
     /// The body left `applying` while the driver can still retain it.
     pub detached: bool,
 }
@@ -378,6 +382,9 @@ impl Sequencer {
                     bytes: applying.bytes,
                     admitted_estimate_bytes: applying.admitted_estimate_bytes,
                     allocation: applying.body.allocation(),
+                    decoded_attributed_memory_bytes: applying
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
                 })
                 .collect(),
             submissions: self
@@ -388,6 +395,7 @@ impl Sequencer {
                     owner: submission.owner,
                     token: *token,
                     bytes: submission.bytes,
+                    decoded_attributed_memory_bytes: submission.decoded_attributed_memory_bytes,
                     detached: submission.detached,
                 })
                 .collect(),
@@ -537,11 +545,12 @@ impl Sequencer {
     /// advancing the floor. Returns the newly-covered heights so the reactor
     /// marks them covered in the download scheduler.
     ///
-    /// Bodies stay in their buffered form, which is serialized for every body
-    /// from the input queue. The front of the drain that will be submitted
-    /// immediately keeps any decoded copy it already holds. Bodies past the
-    /// free submission slots, or past the decoded-byte cap above the last
-    /// checkpoint, are demoted to raw bytes, so the decoded backlog stays
+    /// Bodies stay in their buffered (usually serialized) form. The only
+    /// exception is the front of the drain that will be submitted immediately:
+    /// those keep an already-present decoded copy so the common steady-state
+    /// path (receive next block → drain → submit) never decodes twice. Bodies
+    /// past the free submission slots, or past the decoded-byte cap above the
+    /// last checkpoint, are demoted to raw bytes, so the decoded backlog stays
     /// bounded by the submission window.
     pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
         let released = self

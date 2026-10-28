@@ -399,6 +399,9 @@ pub static COVERAGE: &[Coverage] = &[
             "tests/block_semantic_properties.rs",
             "the_stalled_reset_input_holds_input_decoded_bound",
         ),
-        bypass: Bypass::Planted("decoded-enqueue"),
+        bypass: Bypass::Test(sim_test(
+            "src/domain/block_sync_semantic.rs",
+            "a_decoded_handoff_past_the_cap_violates_input_decoded_bound",
+        )),
     },
 ];

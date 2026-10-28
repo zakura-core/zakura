@@ -186,12 +186,13 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
 }
 
 /// Under stalled storage, the mirror's bodies keep entering the
-/// sequencer's input queue, and each one holds raw bytes only. Before the
-/// #1522 fix, the peer routine queued its decoded block beside the raw
-/// bytes, and the first body to enter the queue violated the property.
-/// With `decoded-enqueue.patch`, an alternate enqueue path keeps the
-/// decoded block but charges no decoded bytes to the queue's gauge, and the
-/// same input violates it.
+/// sequencer's input queue. The decoded cap has room for these small
+/// bodies, so each one keeps its decoded block, and the check judges each
+/// handoff against the queue's and `applying`'s decoded bytes. A slow
+/// verifier fills the cap only with blocks far larger than any fixture
+/// chain's, so the routine's raw fallback is witnessed by
+/// `a_handoff_without_room_hands_over_raw_bytes` in zakura-network, and
+/// the check's catch by its scripted bypass.
 #[test]
 fn the_stalled_reset_input_holds_input_decoded_bound() {
     let ports = witnessed(
@@ -201,8 +202,8 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
     );
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
-    assert!(model.saw_queued);
-    assert_eq!(model.queued_decoded_peak, 0);
+    assert!(model.saw_decoded_queued);
+    assert!(model.queued_decoded_peak > 0);
 }
 
 /// The capacity-release input whose plan handles the detached commit's tip

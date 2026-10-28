@@ -295,12 +295,14 @@ impl BlockScenario {
         }
     }
 
-    /// The paused handoffs on 24 bodies, with the floor's other churn
-    /// (properties.md, P5.3): every mirror withholds height 7, so each
-    /// request for it times out; `mirror-3`'s link closes once the node has
-    /// asked storage to admit four bodies, which retires its routine; and
-    /// the chain resets to a fork from height 12 at 12 s of virtual time,
-    /// after the 8 s request timeout.
+    /// The paused handoffs on 24 bodies, pausing from height 6, with the
+    /// floor's other churn (properties.md, P5.3): every mirror withholds
+    /// height 7, so each request for it times out; `mirror-3`'s link closes
+    /// once the node has asked storage to admit four bodies, which retires
+    /// its routine; and the chain resets to a fork from height 12 at 12 s of
+    /// virtual time, after the 8 s request timeout. Pausing from height 6
+    /// leaves a routine free to ask for height 7 before the timeout under
+    /// the default plan.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(
@@ -333,6 +335,10 @@ impl BlockScenario {
                     when: Some(policy::Trigger::VirtualTime(12_000)),
                 },
             ],
+            handoff_pause: Some(HandoffPause {
+                from_height: 6,
+                steps: 20_000,
+            }),
             ..BlockScenario::paused_handoffs()
         };
         for mirror in &mut scenario.mirrors {

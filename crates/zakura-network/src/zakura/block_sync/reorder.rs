@@ -54,6 +54,9 @@ impl ReorderBuffer {
                 bytes: buffered.bytes,
                 admitted_estimate_bytes: buffered.admitted_estimate_bytes,
                 allocation: buffered.body.allocation(),
+                decoded_attributed_memory_bytes: buffered
+                    .body
+                    .measured_decoded_attributed_memory_bytes(),
             })
             .collect()
     }
@@ -257,6 +260,9 @@ pub struct RetainedBody {
     /// payload when one is kept, else its decoded block. Two holders that
     /// share one allocation report the same address.
     pub allocation: usize,
+    /// The attributed size of the decoded block the body holds, measured
+    /// from the block. 0 for raw bytes.
+    pub decoded_attributed_memory_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -309,6 +315,35 @@ impl BufferedBlockBody {
                 block,
                 decoded_attributed_memory_size_bytes,
             },
+        }
+    }
+
+    /// The body a peer routine hands the sequencer for `block`, which it
+    /// decoded from `raw_frame_payload`. The body keeps the decoded block only
+    /// while the decoded budget has room for it: `resident_decoded_bytes`, the
+    /// decoded bytes the input queue and `applying` hold, plus the block's
+    /// measured size fit under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
+    /// Otherwise the body keeps the raw frame payload alone, and the sequencer
+    /// decodes it when it submits it (#1522).
+    ///
+    /// One cap holds at every height, because the input queue is not the
+    /// checkpoint window.
+    pub(super) fn for_handoff(
+        block: Arc<block::Block>,
+        raw_frame_payload: Arc<[u8]>,
+        decoded_attributed_memory_size_bytes: u64,
+        resident_decoded_bytes: u64,
+    ) -> Self {
+        if resident_decoded_bytes.saturating_add(decoded_attributed_memory_size_bytes)
+            <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+        {
+            BufferedBlockBody::DecodedWithRawFramePayload {
+                block,
+                raw_frame_payload,
+                decoded_attributed_memory_size_bytes,
+            }
+        } else {
+            BufferedBlockBody::RawFramePayload(raw_frame_payload)
         }
     }
 

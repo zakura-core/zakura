@@ -39,10 +39,10 @@ const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
 ///
-/// The body is always the raw frame payload. A queue of decoded bodies could
-/// hold `submitted_apply_limit` decoded block graphs while a slow verifier
-/// blocks the task (#1522). The sequencer decodes a body only when it submits
-/// it, inside the submission window.
+/// The body keeps its decoded block only while the decoded budget had room
+/// for it at the handoff (see [`BufferedBlockBody::for_handoff`]). Otherwise
+/// it holds the raw frame payload, so a slow verifier can't fill the queue
+/// with `submitted_apply_limit` decoded block graphs (#1522).
 #[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -60,6 +60,23 @@ pub(super) struct SequencedBody {
     queue_accounting: SequencerInputAccounting,
 }
 
+/// The decoded bytes the input queue and `applying` hold, which a handoff's
+/// room check reads (see [`BufferedBlockBody::for_handoff`]).
+///
+/// The sequencer task publishes a body's decoded bytes in `applying` before it
+/// releases the body's input-queue charge. So reading the queue first never
+/// misses a body that moves between the two. Routines that check at once can
+/// each see the same room, so the queue can pass the cap by one body per
+/// routine.
+pub(super) fn handoff_resident_decoded_bytes(
+    input_decoded_attributed_memory_bytes: &AtomicU64,
+    view: &watch::Receiver<SequencerView>,
+) -> u64 {
+    input_decoded_attributed_memory_bytes
+        .load(Ordering::Acquire)
+        .saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+}
+
 impl SequencedBody {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
@@ -68,7 +85,7 @@ impl SequencedBody {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        raw_frame_payload: Arc<[u8]>,
+        body: BufferedBlockBody,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
@@ -76,7 +93,6 @@ impl SequencedBody {
         input_bytes: Arc<AtomicU64>,
         input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     ) -> Self {
-        let body = BufferedBlockBody::RawFramePayload(raw_frame_payload);
         let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
             owner,
@@ -99,8 +115,15 @@ impl SequencedBody {
     }
 
     /// Transfer this body out of queue ownership before processing it.
+    #[cfg(test)]
     pub(super) fn leave_queue(&mut self) {
         self.queue_accounting.release();
+    }
+
+    /// Move this body's input-queue charge out of it, so the caller releases
+    /// the charge once the body's next holder is published.
+    fn take_queue_charge(&mut self) -> SequencerInputAccounting {
+        self.queue_accounting.take()
     }
 
     /// The wire bytes this body charges to the input-queue counter: its size
@@ -145,6 +168,19 @@ impl SequencerInputAccounting {
             input_decoded_attributed_memory_bytes,
             decoded_attributed_memory_size_bytes,
             active: true,
+        }
+    }
+
+    /// Move the charge into the returned value, leaving this one released.
+    fn take(&mut self) -> Self {
+        Self {
+            input_bytes: self.input_bytes.clone(),
+            bytes: self.bytes,
+            input_decoded_attributed_memory_bytes: self
+                .input_decoded_attributed_memory_bytes
+                .clone(),
+            decoded_attributed_memory_size_bytes: self.decoded_attributed_memory_size_bytes,
+            active: std::mem::take(&mut self.active),
         }
     }
 
@@ -565,7 +601,10 @@ impl SequencerTask {
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
                         Some(mut body) => {
-                            body.leave_queue();
+                            // A routine's handoff room check reads the queue's charge,
+                            // then the view's `applying`. The charge outlives the view's
+                            // update, so the check never misses the body between them.
+                            let queue_charge = body.take_queue_charge();
                             #[cfg(any(test, zakura_sim))]
                             self.observe_dequeued(&body);
                             self.handle_accept_body(body);
@@ -574,6 +613,8 @@ impl SequencerTask {
                             // Publish the synchronous queue → reorder/applying ownership
                             // transfer before an action-channel send can await or time out.
                             // This updates observability without waking scheduling watchers.
+                            self.publish_decoded_ownership_view();
+                            drop(queue_charge);
                             self.publish_decoded_ownership_view();
                             self.submit_pending_blocks().await;
                             self.publish_view();
@@ -1184,6 +1225,9 @@ impl SequencerTask {
             )
             .record(queue_depth as f64);
             let send_started = time::Instant::now();
+            // Publish the decode before the send can wait on a slow verifier, so
+            // a routine's handoff room check counts it.
+            self.publish_decoded_ownership_view();
             #[cfg(any(test, zakura_sim))]
             self.observe_holders();
             let sent = self
@@ -1426,11 +1470,14 @@ fn add_atomic_bytes(counter: &AtomicU64, bytes: u64) {
     }
 }
 
+/// Releases `bytes` from `counter`. The release orders after the caller's
+/// earlier writes, such as a published view, for a reader that loads
+/// `counter` with `Acquire`.
 fn release_atomic_bytes(counter: &AtomicU64, bytes: u64) {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_sub(bytes);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match counter.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
@@ -1534,17 +1581,13 @@ mod tests {
     ) -> SequencedBody {
         let block = test_block();
         let previous_block_hash = block.header.previous_block_hash;
-        let raw_frame_payload: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
-            .encode()
-            .expect("test block encodes")
-            .into();
         SequencedBody::new_queued(
             super::super::test_work_owner(),
             zakura_header_chain::SourceId::from_digest([1; 32]),
             block::Height(1),
             block.hash(),
             previous_block_hash,
-            raw_frame_payload,
+            BufferedBlockBody::from_decoded_block(block, None),
             123,
             None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
@@ -1564,12 +1607,9 @@ mod tests {
         );
 
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 123);
-        assert_eq!(
-            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "the input queue holds raw bytes only"
+        assert!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0
         );
-        assert!(!body.body.is_decoded());
 
         body.leave_queue();
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -1671,15 +1711,13 @@ mod tests {
 
     // Use a real serialized block. Only the scheduling height is synthetic.
     fn received_test_body(task: &mut SequencerTask, height: u32, estimate: u64) -> SequencedBody {
+        use zakura_chain::serialization::ZcashSerialize;
         let block: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
                 .zcash_deserialize_into()
                 .unwrap(),
         );
-        let raw: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
-            .encode()
-            .unwrap()
-            .into();
+        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
         let bytes = u64::try_from(raw.len()).unwrap();
         let height = block::Height(height);
         task.work.extend(
@@ -1715,7 +1753,7 @@ mod tests {
             height,
             block.hash(),
             block.header.previous_block_hash,
-            raw,
+            BufferedBlockBody::from_decoded_block(block, Some(raw)),
             bytes,
             None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
@@ -2834,10 +2872,8 @@ mod tests {
         task.abort();
     }
 
-    /// The input queue hands `applying` raw bytes, so no stage holds a
-    /// decoded block before the sequencer submits the body.
     #[test]
-    fn handoff_keeps_the_body_raw_until_submission() {
+    fn handoff_publishes_applying_decoded_bytes_before_submission() {
         let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
@@ -2874,12 +2910,14 @@ mod tests {
         task.handle_accept_body(body);
         task.publish_decoded_ownership_view();
 
-        assert_eq!(task.sequencer.applying_len(), 1);
         let handoff = *view_rx.borrow();
         assert_eq!(handoff.sequencer_input_decoded_attributed_memory_bytes, 0);
-        assert_eq!(handoff.applying_decoded_attributed_memory_bytes, 0);
+        assert!(handoff.applying_decoded_attributed_memory_bytes > 0);
         assert_eq!(handoff.reorder_decoded_attributed_memory_bytes, 0);
-        assert_eq!(handoff.active_pipeline_decoded_attributed_memory_bytes, 0);
+        assert_eq!(
+            handoff.active_pipeline_decoded_attributed_memory_bytes,
+            handoff.applying_decoded_attributed_memory_bytes
+        );
     }
 
     #[test]

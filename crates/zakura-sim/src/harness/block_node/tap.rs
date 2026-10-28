@@ -565,6 +565,7 @@ impl BlockTap {
                             bytes: submission.bytes,
                         },
                         token: submission.token,
+                        decoded_attributed_memory_bytes: submission.decoded_attributed_memory_bytes,
                         detached: submission.detached,
                     })
                     .collect(),
@@ -628,6 +629,7 @@ impl Allocations {
             body: body(&held),
             admitted_estimate_bytes: retained.admitted_estimate_bytes,
             allocation: self.number(retained.allocation, held),
+            decoded_attributed_memory_bytes: retained.decoded_attributed_memory_bytes,
         }
     }
 }

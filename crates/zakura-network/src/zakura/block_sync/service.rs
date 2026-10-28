@@ -52,10 +52,18 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     ..Stream::PERSISTENT
 }];
 
-/// The block-sync stream layout.
+/// The block-sync stream layout, for the simulator's generated table checks.
 #[cfg(any(test, zakura_sim))]
-pub(crate) fn block_sync_streams() -> &'static [Stream] {
+pub fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
+}
+
+/// The request limit a node running `config` enforces and advertises on
+/// each block-sync connection from the connection's start, for the
+/// simulator's role models.
+#[cfg(any(test, zakura_sim))]
+pub fn block_sync_serving_limit(config: &ZakuraBlockSyncConfig) -> u32 {
+    super::regulated::session::serving_max_inflight_requests(config)
 }
 
 /// Cloneable typed stream-6 sender.
@@ -216,7 +224,7 @@ impl BlockSyncPeerSession {
 
 /// Native stream-6 block-sync service scaffold.
 #[derive(Debug)]
-pub(crate) struct BlockSyncService {
+pub struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
@@ -326,8 +334,10 @@ impl BlockSyncService {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
-    /// Serve with a reactor that already validated its config.
-    pub(crate) fn new_with_handle(handle: BlockSyncHandle) -> Self {
+    /// Builds the service that admits block-sync sessions for the reactor
+    /// behind `handle`, which already validated its config, with no
+    /// sync-lifecycle gate.
+    pub fn new_with_handle(handle: BlockSyncHandle) -> Self {
         let config = handle
             .routine_wiring
             .as_ref()
@@ -817,6 +827,19 @@ impl Service for BlockSyncService {
                 .lock()
                 .expect("block-sync gap-claim mutex is never poisoned")
                 .remove(&peer_id);
+            #[cfg(any(test, zakura_sim))]
+            if let Some((wiring, generation, _)) = &routine {
+                observe!(
+                    wiring.observer,
+                    super::block_sync_observe::BlockEvent::SessionAdmitted {
+                        peer: peer_id.clone(),
+                        conn_id,
+                        session_id,
+                        generation: *generation,
+                        direction: peer.direction,
+                    }
+                );
+            }
             // Queue the connect under the peer-map lock and before spawning. The
             // reactor then sees it after the disconnect of any session that ended
             // before this admission, and before this session's own disconnect.
@@ -862,6 +885,11 @@ impl Service for BlockSyncService {
                     Some((wiring, generation, fence)) => {
                         let serving = wiring.serving.session(
                             &peer_id,
+                            #[cfg(any(test, zakura_sim))]
+                            super::block_sync_observe::SessionKey {
+                                conn_id,
+                                generation,
+                            },
                             block_sync_session.request_sender(),
                             run_cancel.clone(),
                             connection_cancel_token.clone(),
@@ -895,6 +923,8 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
+                        #[cfg(any(test, zakura_sim))]
+                        let routine = routine.with_observer(wiring.observer);
                         zakura_rt::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),

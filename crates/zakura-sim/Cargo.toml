@@ -20,8 +20,10 @@ sha2 = { workspace = true }
 # O_NOFOLLOW and O_NONBLOCK, so the trace reader never follows a symlink or
 # blocks on a FIFO.
 libc = { workspace = true }
-# The harness registry's scenarios: the race fixtures, discovery and header
-# sync.
+# The harness registry's scenarios: the race fixtures, discovery, header
+# sync and block sync. Mirror storage returns block sync's boxed read
+# future.
+futures = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
 zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }

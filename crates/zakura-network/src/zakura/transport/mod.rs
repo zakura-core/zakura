@@ -14,14 +14,20 @@ mod pipe;
 mod registry;
 mod service;
 mod session;
+#[cfg(any(test, zakura_sim))]
+mod sim_reader;
 
 pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.
+#[cfg(any(test, zakura_sim))]
+pub(crate) use guard::BudgetObserver;
 #[allow(unused_imports)]
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
+#[cfg(any(test, zakura_sim))]
+pub use guard::{BudgetChange, BudgetChangeKind};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
@@ -47,6 +53,8 @@ pub(crate) use pipe::{
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
+#[cfg(any(test, zakura_sim))]
+pub use service::CloseCauseReader;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
@@ -54,6 +62,8 @@ pub use service::{
     StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};
+#[cfg(any(test, zakura_sim))]
+pub use sim_reader::{read_framed_channel, StreamReader};
 
 /// Reports the event that `$event` builds to `$observer`, an
 /// `Option<Arc<dyn TransportObserver>>`.

@@ -208,3 +208,95 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
         );
     }
 }
+
+/// Dropping the task reports that it closed before it releases the bodies
+/// left in its input, so those releases need no next holder. It then
+/// reports an empty sequencer.
+#[tokio::test]
+async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
+    use super::super::block_sync_observe::{
+        BlockEvent, BlockSyncObserver, HeldBody, Holder, HolderChange, ObserverSlot,
+        SequencerOwnership,
+    };
+
+    #[derive(Debug, Default)]
+    struct Log(std::sync::Mutex<Vec<BlockEvent>>);
+    impl BlockSyncObserver for Log {
+        fn observe(&self, event: BlockEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    let frontiers = genesis_frontiers();
+    let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(1);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions, _actions_rx) = mpsc::channel(8);
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    let log = Arc::new(Log::default());
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), 2),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
+        actions,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(super::super::test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        Arc::new(crate::zakura::block_sync::BlockSyncClock),
+        body_rx,
+        control_rx,
+        input_bytes.clone(),
+        input_decoded_bytes.clone(),
+        view_tx,
+        Duration::from_secs(60),
+        ZakuraTrace::noop(),
+    )
+    .with_observer(ObserverSlot(Some(log.clone())));
+
+    let block: Arc<block::Block> =
+        Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
+    let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+    let allocation = Arc::as_ptr(&raw).cast::<u8>().addr();
+    let bytes = raw.len() as u64;
+    body_tx
+        .try_send(SequencedBody::new_queued(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            block::Height(2),
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block, Some(raw)),
+            bytes,
+            None,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            Instant::now(),
+            input_bytes,
+            input_decoded_bytes,
+        ))
+        .unwrap_or_else(|_| panic!("the input has room"));
+    drop(task);
+
+    let events = std::mem::take(&mut *log.0.lock().unwrap());
+    assert_eq!(
+        events.last(),
+        Some(&BlockEvent::Sequencer(SequencerOwnership::default()))
+    );
+    assert_eq!(
+        events[..2],
+        [
+            BlockEvent::SequencerClosed,
+            BlockEvent::Holder {
+                body: HeldBody {
+                    height: block::Height(2),
+                    owner: super::super::test_work_owner(),
+                    bytes,
+                },
+                holder: Holder::Queued { allocation },
+                change: HolderChange::Released,
+            },
+        ]
+    );
+}

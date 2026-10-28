@@ -467,7 +467,7 @@ fn every_coverage_witness_exists_and_ci_runs_it() {
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
     for row in COVERAGE {
         let witnesses = match row.bypass {
-            Bypass::Test(bypass) => vec![row.passing, bypass],
+            Bypass::Test(bypass) => vec![row.passing.witness(), bypass],
             Bypass::Planted(name) => {
                 let patch = crate_dir
                     .join("../../qa/planted")
@@ -479,7 +479,19 @@ fn every_coverage_witness_exists_and_ci_runs_it() {
                     "{}: CI never runs `cargo xtask planted`",
                     row.property
                 );
-                vec![row.passing]
+                vec![row.passing.witness()]
+            }
+            Bypass::Pending(_) => {
+                let statuses: Vec<_> = HARNESSES
+                    .iter()
+                    .filter_map(|entry| entry.status(row.property))
+                    .collect();
+                assert!(
+                    !statuses.is_empty() && statuses.iter().all(|status| *status == Status::Draft),
+                    "{}: only a draft's bypass is pending, not {statuses:?}'s",
+                    row.property
+                );
+                vec![row.passing.witness()]
             }
         };
         for witness in witnesses {

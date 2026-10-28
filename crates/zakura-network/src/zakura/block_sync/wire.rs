@@ -219,6 +219,15 @@ pub(super) fn decode_block_payload(
     Ok((decode_block(&raw)?, raw))
 }
 
+/// [`decode_block_payload`] for controlled storage, which decodes fixture
+/// payloads as a routine does.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub fn decode_block_payload_for_test(
+    payload: Vec<u8>,
+) -> Result<(Arc<block::Block>, Arc<[u8]>), BlockSyncWireError> {
+    decode_block_payload(payload)
+}
+
 /// Decode a complete block after its type byte and reject trailing bytes.
 fn decode_block(payload: &[u8]) -> Result<Arc<block::Block>, BlockSyncWireError> {
     if payload.first() != Some(&MSG_BS_BLOCK) {

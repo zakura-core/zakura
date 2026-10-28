@@ -49,10 +49,11 @@ pub use constants::{
     MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
-    AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
-    HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    PreciousError, StateInitError, TransparentIndexesUnavailable, ValidateContextError,
+    AwaitBlockInfoError, BlockHeaderNotFound, BoxError, CloneError, CommitBlockError,
+    CommitCheckpointVerifiedError, CommitSemanticallyVerifiedError, DuplicateNullifierError,
+    HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
+    MissingSproutTipTree, PreciousError, StateInitError, TransparentIndexesUnavailable,
+    ValidateContextError,
 };
 pub use header_chain::*;
 pub use request::{

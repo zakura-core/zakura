@@ -23,8 +23,8 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects, HeaderNode,
-        Policy, PolicySource, Topology,
+        policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
+        HeaderNode, Policy, PolicySource, Topology,
     },
     wire_node::{TransportTap, WireNode},
     NetScenario, Subsystem,
@@ -36,6 +36,7 @@ use crate::{
         NODE_ADDR,
     },
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
+    storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
 };
 
@@ -238,7 +239,21 @@ impl Subsystem for Storage {
     }
 
     /// Commits each actor's chain to its port.
+    ///
+    /// # Panics
+    ///
+    /// If a hold or control step waits for a trigger the node never records
+    /// ([`policy::undriven`]).
     fn prepare(scenario: &StorageScenario) -> Ports {
+        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
+            scenario
+                .controls
+                .iter()
+                .filter_map(|step| step.when.as_ref()),
+        );
+        if let Some(why) = triggers.filter_map(policy::undriven).next() {
+            panic!("{why}");
+        }
         let fixture = HeaderFixture::regtest();
         let node = Arc::new(ControlledPort::new(&fixture));
         preload(node.engine(), &fixture, &scenario.node);
@@ -614,29 +629,46 @@ pub fn storage_sources() -> Sources {
     Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
 }
 
-/// A submission or completion on the node's storage, instance 0.
-fn operation_fact(obs: &Observation) -> Option<&StorageFact> {
+/// A submission or completion on the node's `service` storage, instance 0.
+fn operation_fact<'o>(service: &str, obs: &'o Observation) -> Option<&'o StorageFact> {
     match obs {
         Observation::Storage {
+            service: logged,
             instance: 0,
-            fact: fact @ (StorageFact::Submitted { .. } | StorageFact::Completed { .. }),
+            fact:
+                fact @ (StorageFact::Submitted { .. }
+                | StorageFact::Completed { .. }
+                | StorageFact::BlockSubmitted { .. }
+                | StorageFact::BlockCompleted { .. }),
             ..
-        } => Some(fact),
+        } if logged == service => Some(fact),
         _ => None,
     }
 }
 
-/// Checks [`OPERATION_IDS`] at each step that logs a submission or
-/// completion on the node's storage. A check keeps no state between steps,
-/// so it replays the node's facts from the run's start, and reports the
-/// first finding among this step's.
+/// Checks [`OPERATION_IDS`] on the node's header storage.
 fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
-    if !cx.observations().any(|obs| operation_fact(obs).is_some()) {
+    check_service_operation_ids(HEADER_SERVICE, cx)
+}
+
+/// Checks that the node's `service` storage gives its operations rising
+/// IDs and completes each at most once, after its submission, at each step
+/// that logs a submission or completion there. A check keeps no state
+/// between steps, so it replays the node's facts from the run's start, and
+/// reports the first finding among this step's.
+pub(crate) fn check_service_operation_ids<S: HasView>(
+    service: &str,
+    cx: &mut CheckCtx<'_, S>,
+) -> Verdict {
+    if !cx
+        .observations()
+        .any(|obs| operation_fact(service, obs).is_some())
+    {
         return Verdict::NotApplicable;
     }
     let mut ids = OperationIds::default();
     for entry in cx.log.entries() {
-        let Some(fact) = operation_fact(&entry.obs) else {
+        let Some(fact) = operation_fact(service, &entry.obs) else {
             continue;
         };
         if let Some((expected, actual)) = ids.check(fact) {
@@ -676,7 +708,7 @@ impl OperationIds {
     /// (expected, actual).
     fn check(&mut self, fact: &StorageFact) -> Option<(String, String)> {
         match *fact {
-            StorageFact::Submitted { id, .. } => {
+            StorageFact::Submitted { id, .. } | StorageFact::BlockSubmitted { id, .. } => {
                 let expected = self.submitted + 1;
                 self.submitted = id;
                 (id != expected).then(|| {
@@ -686,14 +718,19 @@ impl OperationIds {
                     )
                 })
             }
-            StorageFact::Completed { id, .. } => {
-                if id > self.submitted {
+            StorageFact::Completed { id, .. } | StorageFact::BlockCompleted { id, .. } => {
+                if id == 0 || id > self.submitted {
+                    let actual = if id == 0 {
+                        "operation 0 completed, an ID no operation gets".to_owned()
+                    } else {
+                        format!("operation {id} completed before its submission")
+                    };
                     Some((
                         format!(
                             "a completion of a submitted operation, at most {}",
                             self.submitted
                         ),
-                        format!("operation {id} completed before its submission"),
+                        actual,
                     ))
                 } else if !self.completed.insert(id) {
                     Some((

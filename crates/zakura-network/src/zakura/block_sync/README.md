@@ -80,7 +80,7 @@ separate serving/read reservation contract.
 | Purpose | unblock the contiguous prefix so the committer keeps moving | fill the look-ahead buffer so the bursty committer never starves |
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
-| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one request when `try_reserve` fails — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
+| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one body when `try_reserve` fails — reachable even at zero in-flight budget; liveness rule 3 bounds the total | non-blocking `try_reserve`; refused if the in-flight budget is spent |
 | Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
@@ -227,11 +227,15 @@ derives the whole-node bound. The plateau can still exceed the budget by:
    takes its first item regardless of the byte cap — so the floor block is taken even
    when the in-flight budget is exactly full, reaching the floor reservation path…
 3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
-   `reserve_request_budget`'s Floor path charges the reservation past the max — a
-   bounded overshoot of at most one request (the WorkQueue single-owner invariant
-   permits one floor reservation globally), repaid through the normal release
-   discipline. The floor is therefore never starved by speculative work, with no
-   cross-task funding round trip.
+   `reserve_request_budget`'s Floor path charges the reservation past the max `M`,
+   repaid through the normal release discipline. The overshoot is bounded: only a
+   request starting at the floor or the next height is floor-priority, and the
+   WorkQueue gives each height one owner, so at most two overdrafts are live, each
+   at most one body `B`. A routine that hands a body to the sequencer still holds
+   its charge while the floor can advance, so each such open handoff `h` adds at
+   most one more `B`: the budget stays within `M + 2·B + h·B`
+   (`block-sync/reserved-byte-bound`). The floor is therefore never starved by
+   speculative work, with no cross-task funding round trip.
 4. **In-window floor liveness never depends on budget size** — the clamps only stop
    sub-range configs from thrashing the speculative lane.
 

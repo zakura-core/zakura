@@ -95,25 +95,31 @@ struct InFlightSubmission {
 ///
 /// An attached submission and its `applying` entry share one body, so the two
 /// lists can name the same wire bytes. Sum each list on its own.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct SequencerOwnership {
+pub struct SequencerOwnership {
     /// Each reorder-buffer body.
-    pub(super) reorder: Vec<RetainedBody>,
+    pub reorder: Vec<RetainedBody>,
     /// Each `applying` body.
-    pub(super) applying: Vec<RetainedBody>,
+    pub applying: Vec<RetainedBody>,
     /// Each decoded submission the driver can still retain.
-    pub(super) submissions: Vec<SubmissionOwnership>,
+    pub submissions: Vec<SubmissionOwnership>,
 }
 
 /// One decoded submission and its wire bytes.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct SubmissionOwnership {
-    pub(super) height: block::Height,
-    pub(super) bytes: u64,
+pub struct SubmissionOwnership {
+    /// The submitted body's height.
+    pub height: block::Height,
+    /// The request the body answered.
+    pub owner: zakura_header_chain::BodyWorkOwner,
+    /// The submission's token.
+    pub token: BlockApplyToken,
+    /// Wire bytes.
+    pub bytes: u64,
     /// The body left `applying` while the driver can still retain it.
-    pub(super) detached: bool,
+    pub detached: bool,
 }
 
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
@@ -359,7 +365,7 @@ impl Sequencer {
     }
 
     /// Every body held in `applying` or by an in-flight submission.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn ownership_snapshot(&self) -> SequencerOwnership {
         SequencerOwnership {
             reorder: self.reorder.ownership(),
@@ -376,9 +382,11 @@ impl Sequencer {
                 .collect(),
             submissions: self
                 .in_flight_submissions
-                .values()
-                .map(|submission| SubmissionOwnership {
+                .iter()
+                .map(|(token, submission)| SubmissionOwnership {
                     height: submission.height,
+                    owner: submission.owner,
+                    token: *token,
                     bytes: submission.bytes,
                     detached: submission.detached,
                 })

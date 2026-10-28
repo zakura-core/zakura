@@ -13,6 +13,10 @@
 //! [`PolicySource`](super::PolicySource) hands it, and folds the events into
 //! the [`BlockSyncView`] the harness's checks read.
 //!
+//! A node's teardown ends its block sync on purpose. Once told of it through
+//! a [`TapTeardown`], the tap reports its observer's drop as unhealthy only
+//! until the reader has logged the sequencer's close.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to block sync. Installing
 //! an observer does add points: block sync's owners read their snapshots
@@ -89,6 +93,10 @@ struct TapState {
     /// Set when an event was recorded after the node's block service was
     /// dropped.
     service_gone: AtomicBool,
+    /// Set when the harness began tearing the node down.
+    teardown: AtomicBool,
+    /// Set when the reader logged the sequencer's close.
+    closed: AtomicBool,
     buffer: Mutex<Buffer>,
 }
 
@@ -107,6 +115,23 @@ impl TapState {
     fn buffer(&self) -> std::sync::MutexGuard<'_, Buffer> {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Whether the node was torn down and its sequencer's close logged, so
+    /// block sync ended as the harness asked.
+    fn torn_down(&self) -> bool {
+        self.teardown.load(Ordering::Relaxed) && self.closed.load(Ordering::Relaxed)
+    }
+}
+
+/// Tells a tap that the harness is tearing its node down.
+#[derive(Clone)]
+pub struct TapTeardown(Arc<TapState>);
+
+impl TapTeardown {
+    /// Marks the teardown begun. Call it before the node drops anything.
+    pub(crate) fn begin(&self) {
+        self.0.teardown.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A tap publishes block-sync events.
@@ -122,11 +147,12 @@ impl LiveEvidence for TapState {
     }
 
     /// `PortGone` once an event found the node's block service dropped, and
-    /// `ReactorGone` once the observer is.
+    /// `ReactorGone` once the observer is, unless the node was torn down and
+    /// the sequencer's close logged.
     fn health(&self) -> Option<&'static str> {
         if self.service_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's block service was dropped during the run")
-        } else if self.observer.strong_count() == 0 {
+        } else if self.observer.strong_count() == 0 && !self.torn_down() {
             Some("ReactorGone: the tapped node's block sync dropped its observer during the run")
         } else {
             None
@@ -194,6 +220,8 @@ impl BlockTap {
                 observer: observer.clone(),
                 refused: AtomicBool::new(false),
                 service_gone: AtomicBool::new(false),
+                teardown: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
                 buffer: Mutex::default(),
             }))
         });
@@ -218,6 +246,11 @@ impl BlockTap {
             view,
         };
         (observer, tap)
+    }
+
+    /// The notice the harness gives this tap when it tears the node down.
+    pub fn teardown(&self) -> TapTeardown {
+        TapTeardown(self.state.clone())
     }
 
     /// Hands over the node's block storage facts that this step's drain
@@ -576,6 +609,12 @@ impl ActionSource for BlockTap {
         }
         for obs in &sent {
             log.push(obs.clone());
+        }
+        if events
+            .iter()
+            .any(|(_, _, event)| matches!(event, BlockEvent::SequencerClosed))
+        {
+            self.state.closed.store(true, Ordering::Relaxed);
         }
         self.delivered = last;
         // The run checks its own log against this, since the log this tap

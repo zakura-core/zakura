@@ -18,6 +18,11 @@
 //! Mirrors hold every body, so they never ask the node for one. Only the
 //! probe exercises the node's serving.
 //!
+//! A `Control` step can also tear the node down mid-run, or write its block
+//! sync's owner state past the guard a property checks, as a bypass witness:
+//! work inserted without its block service's answer, or a verdict
+//! dispatched without its block service's commit.
+//!
 //! [`tap::BlockTap`] logs the node's block-sync events beside its storage
 //! facts, pairs them, and folds them into a [`view::BlockSyncView`].
 
@@ -34,7 +39,7 @@ use std::{
     future::Future,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -60,6 +65,7 @@ use zakura_scheduler::{hooks, SimInstant};
 use zakura_storage::{
     block::{
         controlled::{BlockReplies, ControlledBlockService, HandleClosed},
+        evidence::{OperationStage, RequestIdentity},
         fixture::{BlockFixture, BodySpec, FixtureBlock},
         ApplyLimits, BlockOutcome, HandleEvent, Verdict,
     },
@@ -70,7 +76,7 @@ use zakura_storage::{
 use self::{
     policy::{BlockKey, Hold, MirrorEvent, Predicates},
     probe::ProbeLog,
-    tap::BlockTap,
+    tap::{BlockTap, TapTeardown},
 };
 use super::header_node::LINK_DEPTH;
 use crate::{
@@ -380,29 +386,45 @@ impl ActionSource for PolicySource {
     }
 }
 
-/// Block sync's handle, set once its reactor starts. The node's service is
-/// built first, since its range source goes into the reactor's startup.
+/// Block sync's handle, set once its reactor starts and cleared when the
+/// node is torn down. The node's service is built first, since its range
+/// source goes into the reactor's startup.
 #[derive(Debug, Default)]
-pub struct LateHandle(OnceLock<BlockSyncHandle>);
+pub struct LateHandle(Mutex<Option<BlockSyncHandle>>);
 
 impl LateHandle {
+    /// The handle's slot. No caller panics while it holds the lock.
+    fn slot(&self) -> MutexGuard<'_, Option<BlockSyncHandle>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Sets the handle.
     ///
     /// # Panics
     ///
     /// If it's already set.
     pub fn set(&self, handle: BlockSyncHandle) {
-        assert!(self.0.set(handle).is_ok(), "a node's reactor starts once");
+        let mut slot = self.slot();
+        assert!(slot.is_none(), "a node's reactor starts once");
+        *slot = Some(handle);
+    }
+
+    /// Takes the handle out, so every later reply fails as a closed
+    /// handle's does. The caller drops it outside the lock.
+    fn clear(&self) -> Option<BlockSyncHandle> {
+        self.slot().take()
     }
 }
 
 impl BlockReplies for LateHandle {
+    /// Sends `event` through the handle, or fails once the node is torn
+    /// down. Only the step loop completes operations, so no task holds the
+    /// lock across a scheduling point.
     fn send(&self, event: HandleEvent) -> Result<(), HandleClosed> {
-        let handle = self
-            .0
-            .get()
-            .expect("only block sync's actions draw replies, so its reactor started");
-        BlockReplies::send(handle, event)
+        match self.slot().as_ref() {
+            Some(handle) => BlockReplies::send(handle, event),
+            None => Err(HandleClosed),
+        }
     }
 }
 
@@ -709,16 +731,29 @@ pub struct BlockNode {
     pub name: String,
     /// Its peer identity, which its links present.
     pub id: ZakuraPeerId,
-    /// The reactor's handle.
-    pub handle: BlockSyncHandle,
     /// Its engine, whose committed views its reactor follows.
     pub engine: Arc<EnginePort>,
+    /// Cancels its reactor.
+    shutdown: CancellationToken,
+    /// Its handle and service, until a teardown drops them.
+    live: RefCell<Option<Live>>,
+    /// Its block service and the service's replies, if the run completes
+    /// its operations.
+    controlled: Option<(Arc<ControlledBlockService>, Arc<LateHandle>)>,
+}
+
+/// The handles to a node's block sync that the harness holds outside its
+/// tasks.
+struct Live {
+    /// The reactor's handle.
+    handle: BlockSyncHandle,
+    /// The service its links join.
     service: BlockSyncService,
 }
 
 impl BlockNode {
     /// Starts a reactor and its service on `engine`'s committed views, as
-    /// zakurad wires them: production config, `engine`'s view watch as the
+    /// zakurad wires them: `config`, `engine`'s view watch as the
     /// committed views, the decoded-window cap above [`LAST_CHECKPOINT`],
     /// and `storage` answering its actions and range reads. Peer IDs come
     /// from `seed`.
@@ -732,6 +767,7 @@ impl BlockNode {
         seed: u8,
         engine: &Arc<EnginePort>,
         storage: NodeStorage,
+        config: ZakuraBlockSyncConfig,
         observer: Option<Arc<dyn BlockSyncObserver>>,
     ) -> Self {
         let view = engine.view();
@@ -744,10 +780,11 @@ impl BlockNode {
             },
             (frontiers.header_best.height, frontiers.header_best.hash),
             engine.subscribe_views(),
-            ZakuraBlockSyncConfig::default(),
+            config,
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
         startup.observer.0 = observer;
+        let shutdown = startup.shutdown.clone();
         let source: Arc<dyn BlockRangeSource> = match &storage {
             NodeStorage::Controlled { service, .. } => Arc::new(service.range_source()),
             NodeStorage::Mirror(mirror) => Arc::new(mirror.clone()),
@@ -758,22 +795,36 @@ impl BlockNode {
         sim.scheduler().spawn_root("block-node", async move {
             let _ = reactor.await;
         });
-        match storage {
+        let controlled = match storage {
             NodeStorage::Controlled { service, replies } => {
                 replies.set(handle.clone());
+                let actions_service = service.clone();
                 sim.scheduler().spawn_root("block-actions", async move {
-                    let _ = service.spawn(actions).await;
+                    let _ = actions_service.spawn(actions).await;
                 });
+                Some((service, replies))
             }
-            NodeStorage::Mirror(mirror) => mirror.spawn(sim, actions, handle.clone()),
-        }
+            NodeStorage::Mirror(mirror) => {
+                mirror.spawn(sim, actions, handle.clone());
+                None
+            }
+        };
         BlockNode {
             name: name.to_owned(),
             id: peer_id(seed),
-            service: BlockSyncService::new_with_handle(handle.clone()),
-            handle,
             engine: engine.clone(),
+            shutdown,
+            live: RefCell::new(Some(Live {
+                service: BlockSyncService::new_with_handle(handle.clone()),
+                handle,
+            })),
+            controlled,
         }
+    }
+
+    /// Whether a teardown dropped the node's handles.
+    fn torn_down(&self) -> bool {
+        self.live.borrow().is_none()
     }
 }
 
@@ -879,6 +930,8 @@ pub struct Topology {
     probe: RefCell<Option<ProbeEnd>>,
     /// The last connection and session ID handed out.
     last_id: Cell<u64>,
+    /// The node under test's tap, told of its teardown.
+    tap: Option<TapTeardown>,
 }
 
 impl Topology {
@@ -891,6 +944,16 @@ impl Topology {
             chain,
             probe: RefCell::new(None),
             last_id: Cell::new(0),
+            tap: None,
+        }
+    }
+
+    /// This topology, telling `tap`, the node under test's, of its
+    /// teardown.
+    pub fn with_tap(self, tap: TapTeardown) -> Self {
+        Topology {
+            tap: Some(tap),
+            ..self
         }
     }
 
@@ -924,7 +987,13 @@ impl Topology {
             token.clone(),
         );
         let cause = peer.close_cause_reader();
-        self.nodes[local].service.add_peer(peer);
+        self.nodes[local]
+            .live
+            .borrow()
+            .as_ref()
+            .expect("only setup and a relink add links, and a relink refuses a torn-down node")
+            .service
+            .add_peer(peer);
         cause
     }
 
@@ -1011,18 +1080,166 @@ impl Topology {
     }
 
     /// Links the mirror named `peer` again, in its newest link's
-    /// direction. The probe links only once, so relinking it is a failure.
+    /// direction. The probe links only once, and a torn-down node takes no
+    /// links, so either relink is a failure.
     fn relink(&self, peer: &str) {
         let link = self
             .link_to(peer)
             .unwrap_or_else(|| panic!("the scenario links `{peer}`"));
+        if self.nodes[0].torn_down() {
+            self.fail("a torn-down node takes no links");
+            return;
+        }
         match link.dialer {
             Some(dialer) => {
                 self.link(dialer, link.listener);
             }
-            None => {
-                *self.effects.failure.borrow_mut() = Some("the probe links only once".to_owned());
+            None => self.fail("the probe links only once"),
+        }
+    }
+
+    /// Records why a `Control` step couldn't take effect.
+    fn fail(&self, why: &str) {
+        *self.effects.failure.borrow_mut() = Some(why.to_owned());
+    }
+
+    /// Tears the node under test down, as zakurad's shutdown ends block
+    /// sync: tells its tap, closes every link, cancels its reactor, and
+    /// drops every handle the harness holds outside its tasks. Its routines
+    /// and reactor end, so the sequencer's inputs close and it releases what
+    /// it holds. A second teardown is a failure.
+    pub(crate) fn teardown(&self) {
+        let node = &self.nodes[0];
+        let Some(live) = node.live.borrow_mut().take() else {
+            self.fail("the node is already torn down");
+            return;
+        };
+        if let Some(tap) = &self.tap {
+            tap.begin();
+        }
+        // Cancelling can be a scheduling point, where a relink would add a
+        // link, so the links are copied first.
+        let links = self.effects.links.borrow().clone();
+        for link in &links {
+            link.close();
+        }
+        node.shutdown.cancel();
+        let replies = node
+            .controlled
+            .as_ref()
+            .and_then(|(_, replies)| replies.clear());
+        drop((live, replies));
+    }
+
+    /// The node under test's handle and its block service's owner state,
+    /// for a bypass. Records a failure, and returns `None`, once it's torn
+    /// down.
+    fn bypass_parts(&self) -> Option<(BlockSyncHandle, Vec<RequestIdentity>)> {
+        let node = &self.nodes[0];
+        let Some(handle) = node.live.borrow().as_ref().map(|live| live.handle.clone()) else {
+            self.fail("a torn-down node takes no bypass");
+            return None;
+        };
+        let pending = self
+            .node_service()
+            .owner_state()
+            .operations
+            .into_iter()
+            .filter(|op| !matches!(op.stage, OperationStage::Replied))
+            .map(|op| op.request)
+            .collect();
+        Some((handle, pending))
+    }
+
+    /// The node under test's block service.
+    fn node_service(&self) -> &ControlledBlockService {
+        let (service, _) = self.nodes[0]
+            .controlled
+            .as_ref()
+            .expect("the run completes the node under test's operations");
+        service
+    }
+
+    /// The bypass witness for direct work insertion: answers the node's
+    /// oldest pending needed-blocks query from its engine, as its block
+    /// service would, but straight through its handle. Block sync's work
+    /// queue takes work that its block service never answered, and the
+    /// service's query stays pending. Records a failure if no query is
+    /// pending. Only the step loop reads the node's engine, so only it may
+    /// call this.
+    pub(crate) fn insert_work(&self) {
+        let Some((handle, pending)) = self.bypass_parts() else {
+            return;
+        };
+        let Some((query_id, scope, from, limit)) =
+            pending.into_iter().find_map(|request| match request {
+                RequestIdentity::Query {
+                    query_id,
+                    scope,
+                    from,
+                    limit,
+                    ..
+                } => Some((query_id, scope, from, limit)),
+                _ => None,
+            })
+        else {
+            self.fail("no needed-blocks query is pending to answer");
+            return;
+        };
+        let engine = &self.nodes[0].engine;
+        let event = match query_needed_blocks(from, limit, |from, limit| {
+            engine.missing_block_body_metadata(from, limit)
+        }) {
+            Ok((body_anchor, blocks)) => HandleEvent::NeededBlocks {
+                query_id,
+                scope,
+                body_anchor,
+                blocks,
+            },
+            Err(error) => {
+                self.fail(&format!("the node's engine refused the query: {error:?}"));
+                return;
             }
+        };
+        if BlockReplies::send(&handle, event).is_err() {
+            self.fail("the node's reactor is gone");
+        }
+    }
+
+    /// The bypass witness for an alternate storage dispatch: sends block
+    /// sync a committed verdict for the node's oldest pending submission,
+    /// straight through its handle, without its block service. The
+    /// sequencer finishes a submission that its block service never
+    /// committed, and the service still holds it. Records a failure if no
+    /// submission is pending.
+    pub(crate) fn dispatch_verdict(&self) {
+        let Some((handle, pending)) = self.bypass_parts() else {
+            return;
+        };
+        let Some(event) = pending.into_iter().find_map(|request| match request {
+            RequestIdentity::Submit {
+                owner,
+                source,
+                token,
+                height: Some(height),
+                hash,
+                class,
+                ..
+            } => Some(HandleEvent::ApplyFinished {
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                outcome: Verdict::Committed.outcome(owner, source, hash, class),
+            }),
+            _ => None,
+        }) else {
+            self.fail("no submission is pending to finish");
+            return;
+        };
+        if BlockReplies::send(&handle, event).is_err() {
+            self.fail("the node's reactor is gone");
         }
     }
 

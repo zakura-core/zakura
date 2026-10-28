@@ -481,18 +481,26 @@ fn a_handshake_timeout_is_neutral() {
         .iter()
         .find(|d| d.outcome == DatagramOutcome::Sent)
         .expect("the node dialed peer-1");
-    assert!(
+    // Each send has its drop, and nothing else happened to any.
+    let outcomes = |outcome| {
         on_link
             .iter()
-            .filter(|d| d.outcome != DatagramOutcome::Sent)
-            .all(|d| d.outcome == DatagramOutcome::Lost),
+            .filter(|d| d.outcome == outcome)
+            .map(|d| d.id)
+            .collect::<std::collections::BTreeSet<u64>>()
+    };
+    let sends = outcomes(DatagramOutcome::Sent);
+    assert_eq!(
+        outcomes(DatagramOutcome::Lost),
+        sends,
         "every datagram to peer-1 was dropped: {on_link:?}"
     );
-    let sends = on_link
-        .iter()
-        .filter(|d| d.outcome == DatagramOutcome::Sent)
-        .count();
-    assert!(sends > 1, "the node retransmitted before it gave up");
+    assert_eq!(
+        on_link.len(),
+        2 * sends.len(),
+        "nothing else reached peer-1: {on_link:?}"
+    );
+    assert!(sends.len() > 1, "the node retransmitted before it gave up");
     assert!(
         !datagrams
             .iter()

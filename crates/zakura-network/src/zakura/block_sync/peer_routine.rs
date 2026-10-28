@@ -632,8 +632,6 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
-            #[cfg(any(test, zakura_sim))]
-            self.observe_owners(false);
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
@@ -692,8 +690,9 @@ impl PeerRoutine {
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             zakura_rt::pin!(outbound_queue_poll);
 
-            // The fill above may have reserved or released request bytes, and
-            // the routine can park below for a whole timeout. A snapshot here
+            // The routine's snapshot, once per iteration, after the deadlines
+            // and the fill above have reserved or released request bytes. The
+            // routine can park below for a whole timeout, so a snapshot here
             // lets an observer reconcile the budget with every routine's
             // outstanding estimates while the run rests.
             #[cfg(any(test, zakura_sim))]

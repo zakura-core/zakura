@@ -761,7 +761,8 @@ impl OwnerModel {
     }
 
     /// The routines that reported a snapshot and haven't ended. A routine
-    /// reports one at the top of each loop, so one in a handoff has.
+    /// reports one before each wait for input, and it hands a body over only
+    /// after such a wait, so one in a handoff has.
     pub fn live_routines(&self) -> u64 {
         u64::try_from(self.live.len()).unwrap_or(u64::MAX)
     }

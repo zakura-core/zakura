@@ -357,11 +357,15 @@ impl BlockTap {
             },
             BlockEvent::ServingLease {
                 peer: requesting,
+                conn_id,
+                generation,
                 start,
                 count,
                 step: leased,
             } => BlockSyncFact::ServingLease {
                 peer: peer(requesting),
+                connection: *conn_id,
+                generation: *generation,
                 start: start.0,
                 count: *count,
                 step: match leased {
@@ -372,11 +376,15 @@ impl BlockTap {
             },
             BlockEvent::ServingFrame {
                 peer: requesting,
+                conn_id,
+                generation,
                 start,
                 message_type,
                 body_bytes,
             } => BlockSyncFact::ServingFrame {
                 peer: peer(requesting),
+                connection: *conn_id,
+                generation: *generation,
                 start: start.0,
                 message_type: *message_type,
                 body_bytes: *body_bytes,

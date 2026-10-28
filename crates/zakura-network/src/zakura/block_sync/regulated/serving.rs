@@ -20,7 +20,7 @@ pub(super) use super::super::source::{
 };
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::{
-    block_sync::block_sync_observe::{LeaseStep, ObserverSlot, ServingReporter},
+    block_sync::block_sync_observe::{LeaseStep, ObserverSlot, ServingIdentity, ServingReporter},
     regulation::{ReleaseReport, ServeStep},
 };
 
@@ -56,15 +56,11 @@ impl<S: ?Sized> Server<S> {
         })
     }
 
-    /// This server, reporting its reads for `peer` to `observer`.
+    /// This server, reporting its reads for `session` to `observer`.
     #[cfg(any(test, zakura_sim))]
-    pub(super) fn with_observer(
-        self,
-        observer: ObserverSlot,
-        peer: crate::zakura::ZakuraPeerId,
-    ) -> Self {
+    pub(super) fn with_observer(self, observer: ObserverSlot, session: ServingIdentity) -> Self {
         Self {
-            observed: Some(ServingReporter::new(observer, peer)),
+            observed: Some(ServingReporter::new(observer, session)),
             ..self
         }
     }

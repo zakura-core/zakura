@@ -7,3 +7,6 @@ input = "crates/zakura-sim/tests/fixtures/block-sync-handoff.bin"
 # rest of block sync and the Zakura transport under it. A change there can
 # move the input off the handoff.
 checks = ["crates/zakura-network/src/zakura"]
+# Each leaked charge stays in the budget, so a run that leaks enough of them
+# takes the budget past `M + 2·B + h·B` too, often before it first rests.
+also_violates = ["block-sync/reserved-byte-bound"]

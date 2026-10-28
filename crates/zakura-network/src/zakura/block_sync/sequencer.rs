@@ -84,8 +84,10 @@ struct SubmittedApply {
     in_flight: usize,
     /// The decoded size its last submission measured. A raw copy of the same
     /// body is charged this instead of its raw estimate, so a retried parent
-    /// fits into the charge its failed attempt returned.
-    decoded_bytes: u64,
+    /// fits into the charge its failed attempt returned. `None` once state
+    /// rejects a body with this hash, because a different body with the same
+    /// hash can decode to a different size.
+    decoded_bytes: Option<u64>,
 }
 
 /// Accounting identity for a decoded body handed to the driver.
@@ -435,7 +437,24 @@ impl Sequencer {
             .get(&height)?
             .iter()
             .find(|entry| entry.hash == hash)
-            .map(|entry| entry.decoded_bytes)
+            .and_then(|entry| entry.decoded_bytes)
+    }
+
+    /// Stop charging raw copies of `hash` at `height` the size its rejected
+    /// body measured. Peers can send different bodies with the same hash, so
+    /// the next body's raw estimate applies until it is measured.
+    pub(super) fn forget_measured_decoded_bytes(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+    ) {
+        if let Some(entry) = self
+            .submitted_applies
+            .get_mut(&height)
+            .and_then(|entries| entries.iter_mut().find(|entry| entry.hash == hash))
+        {
+            entry.decoded_bytes = None;
+        }
     }
 
     /// Whether any reorder/applying/submitted body sits at or above `height`,
@@ -854,12 +873,12 @@ impl Sequencer {
         let entries = self.submitted_applies.entry(height).or_default();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.hash == hash) {
             entry.in_flight = entry.in_flight.saturating_add(1);
-            entry.decoded_bytes = decoded_bytes;
+            entry.decoded_bytes = Some(decoded_bytes);
         } else {
             entries.push(SubmittedApply {
                 hash,
                 in_flight: 1,
-                decoded_bytes,
+                decoded_bytes: Some(decoded_bytes),
             });
         }
     }
@@ -1145,8 +1164,10 @@ impl Sequencer {
 
     /// Destructively reset the commit pipeline to `new_tip` (reorg/rollback):
     /// clear the reorder buffer and all applying bodies (optionally preserving
-    /// duplicate-suppression records), and pin the floor and verified tip to
-    /// `new_tip`. Driver-retained submissions remain charged through their exact
+    /// duplicate suppression), and pin the floor and verified tip to `new_tip`.
+    /// Measured decoded sizes survive either way, so a parent requested again
+    /// after the reset still fits beside its detached successors.
+    /// Driver-retained submissions remain charged through their exact
     /// completions. Returns the freed bytes.
     pub(super) fn reset_to(&mut self, new_tip: block::Height, keep_submitted_applies: bool) -> u64 {
         self.verified_block_tip = new_tip;
@@ -1170,7 +1191,7 @@ impl Sequencer {
             }
         }
         if !keep_submitted_applies {
-            self.submitted_applies.clear();
+            self.clear_submitted_applies_from(block::Height::MIN);
         }
         self.applying.clear();
         self.set_applying_buffered_bytes(0);

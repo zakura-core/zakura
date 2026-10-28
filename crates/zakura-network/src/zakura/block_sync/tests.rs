@@ -5791,6 +5791,105 @@ async fn decoded_cap_charges_a_retried_raw_parent_its_measured_size() {
 }
 
 #[tokio::test]
+async fn decoded_cap_keeps_a_measured_size_through_an_epoch_reset() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // An epoch change detaches both submissions. Height 2 keeps its charge
+    // and never completes. Height 1 times out, which returns its charge.
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+    let changed_owner =
+        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
+    task.control_tx
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers: genesis_frontiers(),
+        })
+        .expect("epoch change queues");
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::TimedOut,
+        None,
+    );
+
+    // The new epoch requests height 1 again, and it arrives raw with an
+    // estimate that exceeds the room beside height 2. The reset kept the size
+    // height 1's first submission measured, so it still fits.
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(changed_owner, 1, &blocks[0], retried_wire_bytes)
+        .await;
+    task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_charges_a_raw_body_its_estimate_after_its_hash_is_rejected() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // State rejects height 1's body. Another body with the same hash can
+    // decode to a different size, so its measurement no longer applies.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Rejected,
+        Some(test_work_owner()),
+    );
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(test_work_owner(), 1, &blocks[0], retried_wire_bytes)
+        .await;
+    task.expect_no_submission("a raw body whose hash was rejected is charged its estimate")
+        .await;
+    task.task.abort();
+}
+
+#[tokio::test]
 async fn decoded_cap_rechecks_measured_size_between_batch_submissions() {
     let blocks = fake_sequential_blocks(3);
     // Each body claims one wire byte, so the projection charges a raw body only

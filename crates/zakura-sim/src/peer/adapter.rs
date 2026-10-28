@@ -22,9 +22,11 @@
 //!   node already ended, is `Unsolicited`.
 //! - A page past its subscription's unspent object or byte credit is
 //!   `OverCredit`, which the subscription row enforces.
-//! - A conformant frame of a row with a cadence is charged to the stream's
-//!   bucket when the peer reads it, and an empty bucket marks it
-//!   `exhausted`.
+//! - A conformant frame of a row with a cadence is charged to its
+//!   connection's bucket when the peer reads it, and an empty bucket marks
+//!   it `exhausted`. Every header stream of a connection shares the bucket,
+//!   as production's `Status` cadence does, so a reopened stream can't reset
+//!   it.
 //!
 //! A `Close` the node applied doesn't stop its pages: a page committed to
 //! the stream before the `Close` arrived is still within credit, so the
@@ -57,6 +59,8 @@ type StreamKey = (u64, u64);
 #[derive(Debug, Default)]
 pub struct SenderAdapter {
     streams: BTreeMap<StreamKey, Ledger>,
+    /// The cadence buckets, by connection, shared by its streams.
+    cadence: CadenceModel,
 }
 
 impl SenderAdapter {
@@ -146,7 +150,7 @@ impl SenderAdapter {
                 }
             }
         }
-        Ok(ledger.label(connection, quic_stream, seq, frame, at))
+        Ok(ledger.label(&mut self.cadence, connection, quic_stream, seq, frame, at))
     }
 }
 
@@ -236,7 +240,6 @@ struct Ledger {
     /// The node's live subscriptions on the peer, by ID.
     subscriptions: Vec<u64>,
     frames: FrameModel,
-    cadence: CadenceModel,
 }
 
 impl Default for Ledger {
@@ -246,7 +249,6 @@ impl Default for Ledger {
             publications: BTreeMap::new(),
             subscriptions: Vec::new(),
             frames: FrameModel::new(&RegtestMessage::ROWS, ReaderEnd::Persistent),
-            cadence: CadenceModel::new(),
         }
     }
 }
@@ -288,9 +290,10 @@ impl Ledger {
 
     /// The `NodeFrame` of `frame`, the node's `seq`-th on `connection`'s
     /// `quic_stream`, read at `at`. A conformant frame changes the model as
-    /// its sending does, and charges its row's cadence bucket.
+    /// its sending does, and charges its row's bucket in `cadence`.
     fn label(
         &mut self,
+        cadence: &mut CadenceModel,
         connection: u64,
         quic_stream: u64,
         seq: u64,
@@ -314,7 +317,7 @@ impl Ledger {
         let stream = &RegtestMessage::LAYOUT[0];
         let exhausted = row.is_some_and(|row| {
             label == Label::Conformant
-                && self.cadence.charge(connection, stream.version, row, at) == Charge::Exhausted
+                && cadence.charge(connection, stream.version, row, at) == Charge::Exhausted
         });
         let (rule_row, rule_stream) = match row {
             Some(row) => {

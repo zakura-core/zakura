@@ -307,10 +307,10 @@ fn node_frames_obey_the_sender_limits() {
     }
 }
 
-/// The connection crafted histories run on.
+/// The connection crafted histories start on.
 const CONNECTION: u64 = 1;
 
-/// The QUIC stream crafted histories run on.
+/// The QUIC stream crafted histories start on.
 const QUIC_STREAM: u64 = 4;
 
 /// The subscription crafted histories open.
@@ -322,6 +322,9 @@ struct History {
     adapter: SenderAdapter,
     /// The `NodeFrame`s so far.
     frames: Vec<Observation>,
+    /// The connection and QUIC stream the next events are on.
+    connection: u64,
+    quic_stream: u64,
     /// When the next read happens, since the run's start.
     at: Duration,
 }
@@ -332,16 +335,25 @@ impl History {
         History {
             adapter: SenderAdapter::new(),
             frames: Vec::new(),
+            connection: CONNECTION,
+            quic_stream: QUIC_STREAM,
             at: Duration::ZERO,
         }
+    }
+
+    /// Moves the next events to `connection`'s `quic_stream`.
+    fn on(&mut self, connection: u64, quic_stream: u64) -> &mut Self {
+        self.connection = connection;
+        self.quic_stream = quic_stream;
+        self
     }
 
     /// The node applied `transition`.
     fn applied(&mut self, transition: TransitionFact) -> &mut Self {
         self.adapter.node(
-            CONNECTION,
+            self.connection,
             &TransportFact::Regulated {
-                quic_stream: QUIC_STREAM,
+                quic_stream: self.quic_stream,
                 transition,
             },
         );
@@ -370,9 +382,9 @@ impl History {
     /// The node started writing `frame` as its `seq`-th.
     fn started(&mut self, seq: u64, frame: &Frame) -> &mut Self {
         self.adapter.node(
-            CONNECTION,
+            self.connection,
             &TransportFact::FrameWriteStarted {
-                quic_stream: QUIC_STREAM,
+                quic_stream: self.quic_stream,
                 seq,
                 message_type: frame.message_type,
             },
@@ -383,9 +395,9 @@ impl History {
     /// The node finished writing `frame` as its `seq`-th.
     fn written(&mut self, seq: u64, frame: &Frame) -> &mut Self {
         self.adapter.node(
-            CONNECTION,
+            self.connection,
             &TransportFact::FrameWritten {
-                quic_stream: QUIC_STREAM,
+                quic_stream: self.quic_stream,
                 seq,
                 message_type: frame.message_type,
             },
@@ -402,7 +414,7 @@ impl History {
     fn read(&mut self, seq: u64, frame: &Frame) -> Label {
         let node_frame = self
             .adapter
-            .received(CONNECTION, QUIC_STREAM, seq, frame, self.at)
+            .received(self.connection, self.quic_stream, seq, frame, self.at)
             .unwrap_or_else(|why| panic!("{why}"));
         let Observation::NodeFrame { label, .. } = node_frame else {
             panic!("the adapter logs a NodeFrame: {node_frame:?}");
@@ -545,12 +557,14 @@ fn fails(history: &History, label: Label, exhausted: bool, id: &str) {
 ///   fails the subscription row's `sender-within-credit`
 /// - a duplicate ending is `Unsolicited` and fails `sender-ends-once`
 /// - a `Status` past the bucket's capacity at one instant is `exhausted`
-///   and fails `sender-cadence`
+///   and fails `sender-cadence`, on the same header stream or a reopened
+///   one of the same connection
 /// - a page for a subscription never opened, and one after its terminal
 ///   outcome, are each `Unsolicited` and fail `headers/sender-answers-open`
 ///
-/// The controls: an `Open` after the first subscription's `end-claimed`,
-/// and a page for a live subscription, are `Conformant` and hold.
+/// The controls: an `Open` after the first subscription's `end-claimed`, a
+/// `Status` on a new connection or a refill interval later, and a page for
+/// a live subscription, are `Conformant` and hold.
 ///
 /// This fails if the adapter labels everything `Conformant`, or uses the
 /// receiver's margins: an adapter that allows twice `max_live` labels the
@@ -624,6 +638,34 @@ fn the_sender_adapter_labels_violations() {
     )));
     burst.sent(u64::from(cadence.capacity), &status);
     fails(&burst, Label::Conformant, true, CADENCE);
+    // The connection's bucket, which a reopened header stream shares.
+    let mut reopened = History::new();
+    for seq in 0..u64::from(cadence.capacity) {
+        reopened.sent(seq, &status);
+    }
+    reopened.on(CONNECTION, QUIC_STREAM + 4).sent(0, &status);
+    fails(&reopened, Label::Conformant, true, CADENCE);
+    // The controls: a new connection gets its own bucket, and a refill
+    // interval later the first bucket has a token again.
+    for (connection, at) in [
+        (CONNECTION + 1, Duration::ZERO),
+        (CONNECTION, cadence.refill_interval),
+    ] {
+        let mut later = History::new();
+        for seq in 0..u64::from(cadence.capacity) {
+            later.sent(seq, &status);
+        }
+        later.at = at;
+        let seq = if connection == CONNECTION {
+            u64::from(cadence.capacity)
+        } else {
+            0
+        };
+        later.on(connection, QUIC_STREAM).sent(seq, &status);
+        let report = later.check();
+        assert_eq!(report.end.violation, None, "{connection} at {at:?}");
+        assert!(held(&report, CADENCE));
+    }
 
     // A page for a subscription never opened.
     let mut never = History::new();

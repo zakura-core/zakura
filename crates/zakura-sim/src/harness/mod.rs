@@ -405,6 +405,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<fixtures::Race<fixtures::TimerCancel>>(),
     entry::<fixtures::Race<fixtures::AbBa>>(),
     entry::<fixtures::Race<fixtures::AbortWithoutJoin>>(),
+    entry::<fixtures::All>(),
+    entry::<fixtures::Fixed>(),
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),

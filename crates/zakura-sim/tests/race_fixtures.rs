@@ -11,8 +11,8 @@ use support::inputs;
 use zakura_sim::{
     harness::{
         fixtures::{
-            AbBa, AbortWithoutJoin, Fixture, LostUpdate, MissedNotify, Race, Scenario,
-            SnapshotReserve, TimerCancel, Variant,
+            AbBa, AbortWithoutJoin, All, Fixture, LostUpdate, MissedNotify, PickScenario, Race,
+            Scenario, SnapshotReserve, TimerCancel, Variant, Which,
         },
         run_harness,
     },
@@ -258,4 +258,72 @@ fn an_unwind_before_the_check_misses_the_trigger() {
         })
         .expect("some input unwinds the worker first");
     harmless_history::<AbortWithoutJoin>(plan);
+}
+
+/// How many of `count` inputs violate a property in `H`'s run of
+/// `scenario`, and every property they violate.
+fn pick_violations<H: zakura_sim::harness::Subsystem<Scenario = PickScenario>>(
+    scenario: PickScenario,
+    count: usize,
+) -> (usize, Vec<String>) {
+    let mut found = Vec::new();
+    let hits = inputs(count, 64)
+        .into_iter()
+        .filter(|plan| {
+            let report =
+                run_harness::<H>(&scenario, plan.clone(), &mut MemorySink::default(), None)
+                    .unwrap_or_else(|error| panic!("{}: {error}", H::NAME));
+            assert_eq!(report.cleanup.leaked, 0, "{scenario:?}");
+            let violated: Vec<String> = report
+                .properties
+                .iter()
+                .filter(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }))
+                .map(|r| r.property.clone())
+                .collect();
+            let hit = !violated.is_empty();
+            found.extend(violated);
+            hit
+        })
+        .count();
+    found.sort();
+    found.dedup();
+    (hits, found)
+}
+
+/// `fixtures::All`, the `race_fixtures` fuzz target's harness, finds each
+/// fixture's planted race under that fixture's own property only, and
+/// `fixtures::Fixed` never fails.
+#[test]
+fn the_picking_harnesses_find_each_race_and_hold_on_the_fix() {
+    for fixture in Which::ALL {
+        let base = PickScenario {
+            fixture,
+            variant: Variant::Base,
+            workers: 2,
+        };
+        let (hits, found) = pick_violations::<All>(base, FIND);
+        assert!(hits > 0, "{fixture:?}: no find in {FIND} inputs");
+        assert_eq!(found, [fixture.property()], "{fixture:?}");
+        let fixed = PickScenario {
+            variant: Variant::Fixed,
+            ..base
+        };
+        assert_eq!(
+            pick_violations::<zakura_sim::harness::fixtures::Fixed>(fixed, 200).0,
+            0,
+            "{fixture:?} fixed"
+        );
+    }
+}
+
+/// `fixtures::Fixed` draws only the fixed variant, whatever the prefix.
+#[test]
+fn the_fixed_harness_draws_only_the_fix() {
+    use zakura_sim::harness::{fixtures::Fixed, Subsystem};
+    for byte in 0..=u8::MAX {
+        assert_eq!(Fixed::draw(&[byte, byte, byte]).variant, Variant::Fixed);
+    }
+    assert!(Variant::ALL
+        .iter()
+        .all(|v| (0..=u8::MAX).any(|b| All::draw(&[0, b, 0]).variant == *v)));
 }

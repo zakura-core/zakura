@@ -333,6 +333,68 @@ fn a_reset_switches_the_node_to_the_fork() {
     }
 }
 
+/// A consensus-invalid body recorded between the node's two reset steps
+/// moves its header generation, which makes the preparation stale, so the
+/// node prepares the reset again and still switches to the fork. The
+/// invalid body is the old branch's, above the fork point, and its record
+/// waits for the last mirror's reset, so it races the node's steps. Long
+/// inputs keep the plan's choices fuzzed that late in the run. Few
+/// schedules win that race: of the first 48 seeded inputs, only the 12th
+/// does, so the test runs the first 12.
+#[test]
+fn an_invalid_body_between_the_reset_steps_prepares_it_again() {
+    let holds = vec![
+        Hold {
+            select: Select::nth(BlockKind::Apply, 8),
+            until: Trigger::VirtualTime(0),
+            then: vec![BlockAllow::ConsensusInvalid],
+            deadline_ms: None,
+        },
+        Hold {
+            select: Select::nth(BlockKind::Record, 1),
+            until: Trigger::Reset("mirror-1".to_owned()),
+            then: vec![BlockAllow::Apply],
+            deadline_ms: None,
+        },
+    ];
+    let control = vec![ControlStep {
+        action: ControlAction::Reset {
+            fork: Fork {
+                branch: 1,
+                at: 4,
+                len: 12,
+            },
+            node_first: false,
+        },
+        when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 8))),
+    }];
+    let scenario = BlockScenario {
+        mirrors: vec![
+            MirrorSpec {
+                dialer: Dialer::Mirror,
+            },
+            MirrorSpec {
+                dialer: Dialer::Node,
+            },
+        ],
+        ..scenario(12, holds, control)
+    };
+    let mut prepared_again = 0;
+    for input in inputs(12, 16_384) {
+        let (report, ports) = run(&scenario, input);
+        assert_converged(&ports);
+        let picks = picks(&report);
+        let prepares = picks.iter().filter(|p| **p == "peer:node:reset").count();
+        if prepares > 1 {
+            prepared_again += 1;
+        }
+    }
+    assert!(
+        prepared_again > 0,
+        "no schedule records the invalid body between the steps"
+    );
+}
+
 /// A node holding every body serves the probe's requests through its real
 /// routine, serving session and block service: the run serves its range
 /// reads, and the probe gets each body and each ending. The node advertises

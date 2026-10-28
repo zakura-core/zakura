@@ -48,7 +48,7 @@ use std::{
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use zakura_header_chain::Frontier;
+use zakura_header_chain::{ErrorCategory, Frontier};
 use zakura_network::{
     zakura::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
@@ -83,7 +83,7 @@ use self::{
 use super::header_node::LINK_DEPTH;
 use crate::{
     harness::policy::LinkEffect,
-    observe::StorageFact,
+    observe::{StorageFact, StorageRequest, StorageResult},
     storage::{decode_block, BlockStorage, BLOCK_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -215,6 +215,10 @@ pub struct Effects {
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
+    /// How many consensus-invalid bodies the node's engine has recorded.
+    /// Each one moves its header generation, which makes a preparation made
+    /// before it stale.
+    pub invalidated: Rc<Cell<u64>>,
 }
 
 /// The time since each operation's current stage began.
@@ -255,6 +259,8 @@ pub struct PolicySource {
     closed: BTreeSet<u64>,
     /// How many chain changes are recorded.
     changed: usize,
+    /// The node's `record_body_invalid` operations not yet completed.
+    invalid_records: BTreeSet<u64>,
 }
 
 impl PolicySource {
@@ -278,6 +284,7 @@ impl PolicySource {
             linked: 0,
             closed: BTreeSet::new(),
             changed: 0,
+            invalid_records: BTreeSet::new(),
         }
     }
 
@@ -357,8 +364,28 @@ impl ActionSource for PolicySource {
                     continue;
                 }
                 match fact {
-                    StorageFact::BlockSubmitted { id, .. } | StorageFact::Admitted { id } => {
+                    StorageFact::BlockSubmitted { id, request, .. } => {
+                        if matches!(
+                            request,
+                            StorageRequest::RecordBody { record, .. }
+                                if record == "record_body_invalid"
+                        ) {
+                            self.invalid_records.insert(*id);
+                        }
                         self.stages.start(BlockKey::Service(*id))
+                    }
+                    StorageFact::Admitted { id } => self.stages.start(BlockKey::Service(*id)),
+                    StorageFact::BlockCompleted { id, result, .. }
+                        if self.invalid_records.remove(id) =>
+                    {
+                        if matches!(
+                            result,
+                            StorageResult::Recorded { attempts }
+                                if attempts.last().is_some_and(|last| last == "committed")
+                        ) {
+                            let invalidated = &self.effects.invalidated;
+                            invalidated.set(invalidated.get() + 1);
+                        }
                     }
                     _ => {}
                 }
@@ -1396,7 +1423,7 @@ impl Topology {
     /// [`apply_node`](Self::apply_node). Records a failure, and returns
     /// `None`, if they don't prepare. Only the step loop reads the node's
     /// engine, so only it may call this.
-    pub(crate) fn prepare_node(&self, change: &ChainChange) -> Option<PreparedHeaderTarget> {
+    pub(crate) fn prepare_node(&self, change: &ChainChange) -> Option<NodeTarget> {
         let node = &self.nodes[0];
         let request = self.chain.fixture.target_request(
             &node.engine.snapshot(),
@@ -1405,7 +1432,10 @@ impl Topology {
             1,
         );
         match ready(node.engine.prepare_header_target(request)) {
-            Ok(prepared) => Some(prepared),
+            Ok(prepared) => Some(NodeTarget {
+                prepared,
+                invalidated: self.effects.invalidated.get(),
+            }),
             Err(error) => {
                 let tip = node.engine.view().frontiers.header_best;
                 self.settle(node, change, Err(error), Ok(()), tip);
@@ -1414,18 +1444,29 @@ impl Topology {
         }
     }
 
-    /// Applies `change`'s `prepared` headers on the node under test's
+    /// Applies `change`'s `target` headers on the node under test's
     /// engine, which reorganizes its selected chain through the real engine.
-    /// The node must download the bodies. Records a failure if they don't
-    /// apply, a stale preparation included: a body commit since the
-    /// preparation leaves it valid, and nothing else changes the node's
+    /// The node must download the bodies. Returns `false` if a
+    /// consensus-invalid body recorded since the preparation moved the
+    /// header generation and made it stale, so the caller prepares it again,
+    /// as header sync would. Records a failure if they don't apply for any
+    /// other reason, any other stale preparation included: a body commit
+    /// leaves the preparation valid, and nothing else changes the node's
     /// headers. Only the step loop reads the node's engine, so only it may
     /// call this.
-    pub(crate) fn apply_node(&self, change: &ChainChange, prepared: PreparedHeaderTarget) {
+    pub(crate) fn apply_node(&self, change: &ChainChange, target: NodeTarget) -> bool {
         let node = &self.nodes[0];
-        let applied = ready(node.engine.apply_header_target(prepared));
+        let applied = ready(node.engine.apply_header_target(target.prepared));
+        if target.invalidated != self.effects.invalidated.get()
+            && applied
+                .as_ref()
+                .is_err_and(|error| error.category == ErrorCategory::StaleTargetOrGeneration)
+        {
+            return false;
+        }
         let tip = node.engine.view().frontiers.header_best;
         self.settle(node, change, applied, Ok(()), tip);
+        true
     }
 
     /// Records `change`'s effect on `node` if it applied and moved the
@@ -1470,6 +1511,15 @@ pub(crate) struct ChainChange {
     blocks: Vec<FixtureBlock>,
     /// What the change records for each actor.
     pub(crate) effect: LinkEffect,
+}
+
+/// A chain change's headers, prepared on the node under test, for
+/// [`Topology::apply_node`].
+pub(crate) struct NodeTarget {
+    prepared: PreparedHeaderTarget,
+    /// How many consensus-invalid bodies the node's engine had recorded at
+    /// the preparation.
+    invalidated: u64,
 }
 
 /// The probe's name, which `Control` steps and link triggers use.

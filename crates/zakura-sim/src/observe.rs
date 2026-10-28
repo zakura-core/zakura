@@ -1239,6 +1239,10 @@ pub enum BlockSyncFact {
     ServingLease {
         /// The requesting peer.
         peer: String,
+        /// The serving session's connection.
+        connection: u64,
+        /// The serving session's routine generation.
+        generation: u64,
         /// The range's first height.
         start: u32,
         /// The range's requested count.
@@ -1262,6 +1266,10 @@ pub enum BlockSyncFact {
     ServingFrame {
         /// The requesting peer.
         peer: String,
+        /// The serving session's connection.
+        connection: u64,
+        /// The serving session's routine generation.
+        generation: u64,
         /// The range's first height.
         start: u32,
         /// The frame's message type.

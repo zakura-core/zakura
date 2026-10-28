@@ -12,10 +12,12 @@
 //! A chain change reaches the node under test in two steps of their own,
 //! one preparing its headers and one applying them, since the step loop
 //! alone reads the node's engine. A body commit can land between them, and
-//! leaves the preparation valid: only a header change makes it stale, and no
-//! other actor changes the node's headers, so a stale apply fails the run.
-//! The change reaches the mirrors before the node, or after it, as the
-//! action says. Chain changes run one stage at a time, in script order.
+//! leaves the preparation valid. A recorded consensus-invalid body can land
+//! there too, and moves the header generation, so the node prepares the
+//! change again, as header sync would. No other actor changes the node's
+//! headers, so any other stale apply fails the run. The change reaches the
+//! mirrors before the node, or after it, as the action says. Chain changes
+//! run one stage at a time, in script order.
 //!
 //! A teardown runs on the link task, since it closes links. The two bypass
 //! witnesses run in the step loop, since they read the node's engine and
@@ -24,14 +26,13 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use serde::{Deserialize, Serialize};
-use zakura_node_services::header_chain::PreparedHeaderTarget;
 use zakura_rt::sync::mpsc;
 use zakura_scheduler::SimInstant;
 
 use super::{
     policy::{Predicates, Trigger},
     probe::ProbeFrame,
-    ChainChange, Topology, PROBE,
+    ChainChange, NodeTarget, Topology, PROBE,
 };
 use crate::{harness::policy::LinkEffect, ActionSource, Boundary, Identity, ObservationLog, Sim};
 
@@ -157,7 +158,7 @@ enum Stage {
     /// The node prepares the change's headers, as a step of its own.
     NodePrepare(ChainChange),
     /// The node applies the prepared headers, as a step of its own.
-    NodeApply(ChainChange, PreparedHeaderTarget),
+    NodeApply(ChainChange, NodeTarget),
 }
 
 /// The chain changes' stages not yet done, in order, shared with the chain
@@ -320,10 +321,10 @@ impl ActionSource for Control {
                 Some(Stage::NodePrepare(change)) => self
                     .topology
                     .prepare_node(&change)
-                    .map(|prepared| Stage::NodeApply(change, prepared)),
-                Some(Stage::NodeApply(change, prepared)) => {
-                    self.topology.apply_node(&change, prepared);
-                    None
+                    .map(|target| Stage::NodeApply(change, target)),
+                Some(Stage::NodeApply(change, target)) => {
+                    (!self.topology.apply_node(&change, target))
+                        .then_some(Stage::NodePrepare(change))
                 }
                 _ => unreachable!("`enabled` offers only a node stage that comes first"),
             };

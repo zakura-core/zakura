@@ -1,4 +1,4 @@
-//! Storage services as action sources.
+//! Header storage as an action source.
 //!
 //! [`HeaderStorage`] offers each pending operation of a
 //! [`ControlledPort`] as `storage:header:<id>:<outcome>` actions, one per
@@ -15,10 +15,7 @@ use std::{
     time::Duration,
 };
 
-use zakura_chain::block;
-use zakura_header_chain::{
-    BodyWorkOwner, Frontier, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, SourceId,
-};
+use zakura_header_chain::{HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
     controlled::{ControlledPort, Fact, FactKind, OpId},
@@ -29,18 +26,18 @@ use zakura_storage::header::{
     Fault, Outcome,
 };
 
+use super::{after, body_owner, hash, hex, peer, point, scope};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        StorageBranch, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
-        StorageOperation, StoragePoint, StorageRequest, StorageResult, StorageState, WorkOwner,
-        WorkScope,
+        HeaderStorageState, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
+        StorageOperation, StorageRequest, StorageResult, StorageState, WorkOwner,
     },
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
 /// The service name in identities and observations.
-const SERVICE: &str = "header";
+pub(crate) const SERVICE: &str = "header";
 
 /// Every outcome, indexed by its code in a source-local action index.
 const OUTCOMES: [Outcome; 5] = [
@@ -138,52 +135,12 @@ impl HeaderStorage {
     }
 }
 
-/// `t` plus `d`, saturating at the largest instant.
-fn after(t: SimInstant, d: Duration) -> SimInstant {
-    t.checked_add(d)
-        .unwrap_or(SimInstant::from_start(Duration::MAX))
-}
-
-/// `bytes` as lowercase hex.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// `hash` as hex, in its byte order.
-pub(crate) fn hash(hash: block::Hash) -> String {
-    hex(&hash.0)
-}
-
-/// `peer` as hex.
-fn peer(peer: SourceId) -> String {
-    hex(&peer.digest())
-}
-
-/// `frontier` in plain fields.
-pub(crate) fn point(frontier: Frontier) -> StoragePoint {
-    StoragePoint {
-        height: frontier.height.0,
-        hash: hash(frontier.hash),
-    }
-}
-
 /// `key` in plain fields.
 fn lease(key: LeaseKey) -> StorageLease {
     StorageLease {
         peer: peer(key.peer),
         session_id: key.session_id,
         lease_id: key.lease_id,
-    }
-}
-
-/// `authority` in plain fields.
-pub(crate) fn scope(authority: HeaderWorkAuthority) -> WorkScope {
-    WorkScope {
-        header_generation: authority.header_generation.get(),
-        branch: StorageBranch {
-            anchor: hash(authority.branch.anchor_hash),
-            target: hash(authority.branch.target_tip_hash),
-        },
     }
 }
 
@@ -194,18 +151,6 @@ fn header_owner(owner: HeaderWorkOwner) -> WorkOwner {
         scope: scope(owner.authority),
         verified_generation: None,
         body_work_epoch: None,
-        session_id: owner.session_id,
-        request_id: owner.request_id.get(),
-    }
-}
-
-/// A body owner in plain fields.
-pub(crate) fn body_owner(owner: BodyWorkOwner) -> WorkOwner {
-    WorkOwner {
-        kind: "body-repair".to_owned(),
-        scope: scope(owner.authority.header),
-        verified_generation: Some(owner.authority.verified_generation.get()),
-        body_work_epoch: Some(owner.authority.body_work_epoch.get()),
         session_id: owner.session_id,
         request_id: owner.request_id.get(),
     }
@@ -477,6 +422,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         // the log is frozen and is never observed.
         FactKind::ShutDown { dropped } => StorageFact::ShutDown {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
+            deferred: Vec::new(),
         },
     };
     Observation::Storage {
@@ -490,7 +436,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
 
 /// `state` in plain fields.
 fn state(state: &OwnerState) -> StorageState {
-    StorageState {
+    StorageState::Header(HeaderStorageState {
         operations: state
             .operations
             .iter()
@@ -545,7 +491,7 @@ fn state(state: &OwnerState) -> StorageState {
         fallback_waiter: state.class_waiters.fallback,
         last_lease_id: state.last_lease_id,
         continuation_hits: state.continuation_hits,
-    }
+    })
 }
 
 impl ActionSource for HeaderStorage {

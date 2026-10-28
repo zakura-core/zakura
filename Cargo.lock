@@ -3452,6 +3452,7 @@ dependencies = [
 name = "zakura-sim"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "libc",
  "proptest",
  "rand 0.10.2",
@@ -3487,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.1"
+version = "11.1.0"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3530,10 +3531,12 @@ name = "zakura-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "sha2",
  "tokio",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-network",
  "zakura-node-services",
  "zakura-rt",
  "zakura-scheduler",

@@ -350,6 +350,18 @@ inherits = "release"
 opt-level = 2
 lto = "off"
 
+[profile.planted]
+# `cargo xtask planted` builds the simulator with this profile. A planted case
+# can run over a million simulated steps, which an unoptimized build takes
+# minutes for. The checks the dev profile makes, such as debug assertions and
+# overflow checks, stay on, so a patched build fails as a test build would.
+inherits = "dev"
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+# As in [profile.test]: panic messages still name the file and line.
+debug = 0
+
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [

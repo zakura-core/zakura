@@ -44,7 +44,7 @@ impl ReorderBuffer {
     }
 
     /// Each buffered body, read from the map.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn ownership(&self) -> Vec<RetainedBody> {
         self.blocks
             .iter()
@@ -241,17 +241,22 @@ pub(super) struct DrainedBlock {
 }
 
 /// One retained body, as the owner snapshots read it.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct RetainedBody {
-    pub(super) height: block::Height,
-    pub(super) owner: zakura_header_chain::BodyWorkOwner,
+pub struct RetainedBody {
+    /// The body's height.
+    pub height: block::Height,
+    /// The request the body answered.
+    pub owner: zakura_header_chain::BodyWorkOwner,
     /// Wire bytes.
-    pub(super) bytes: u64,
-    /// See [`BufferedBlock::admitted_estimate_bytes`].
-    pub(super) admitted_estimate_bytes: Option<u64>,
-    /// See [`BufferedBlockBody::allocation`].
-    pub(super) allocation: usize,
+    pub bytes: u64,
+    /// The size estimate the body's request reserved at admission. `None` for
+    /// a body admitted on its wire size with no request estimate.
+    pub admitted_estimate_bytes: Option<u64>,
+    /// The address of the allocation that identifies the body: its raw frame
+    /// payload when one is kept, else its decoded block. Two holders that
+    /// share one allocation report the same address.
+    pub allocation: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -360,7 +365,7 @@ impl BufferedBlockBody {
     /// payload when one is kept, else its decoded block. Demoting a body to its
     /// raw payload, or caching a decode, keeps the address, and two holders
     /// that share one allocation report the same address.
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn allocation(&self) -> usize {
         match self {
             BufferedBlockBody::RawFramePayload(raw_frame_payload)

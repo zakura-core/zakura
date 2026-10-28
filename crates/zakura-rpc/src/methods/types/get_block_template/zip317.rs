@@ -8,9 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rand::{
-    distributions::{Distribution, WeightedIndex},
-    prelude::thread_rng,
+use rand_10::{
+    distr::{weighted::WeightedIndex, Distribution},
+    rng as thread_rng,
 };
 
 use zakura_chain::{

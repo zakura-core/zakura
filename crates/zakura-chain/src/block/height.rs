@@ -1,6 +1,9 @@
 //! Block height.
 
-use std::ops::{Add, Sub};
+use std::{
+    fmt,
+    ops::{Add, Sub},
+};
 use thiserror::Error;
 use zcash_protocol::consensus::BlockHeight;
 
@@ -23,9 +26,20 @@ pub mod json_conversion;
 ///
 /// There are multiple formats for serializing a height, so we don't implement
 /// `ZcashSerialize` or `ZcashDeserialize` for `Height`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Default))]
 pub struct Height(pub u32);
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for Height {
+    // Small enough that rustc would otherwise inline it across crates anyway.
+    #[inline(never)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Height").field(&self.0).finish()
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum HeightError {

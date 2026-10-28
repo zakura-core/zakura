@@ -1,6 +1,6 @@
 use std::{future::Future, num::NonZeroU32, sync::Arc};
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
 use tower::{Service, ServiceExt};
 
@@ -101,6 +101,9 @@ where
         .unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
+        block_range_source: Arc::new(super::block_range_source::StateBlockRangeSource::new(
+            read_state.clone(),
+        )),
         frontiers: FullStateFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
@@ -108,7 +111,7 @@ where
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
-        committed_snapshots,
+        committed_snapshots: committed_snapshots.clone(),
         committed_views,
         retained_block_height: read_state.subscribe_retained_block_height(),
         service_demand: coordinator.subscribe_service_demand(),
@@ -118,6 +121,7 @@ where
             read_state,
             header_chain_authority,
             network.clone(),
+            committed_snapshots,
         )),
     })
 }
@@ -311,14 +315,18 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     network: zakura_chain::parameters::Network,
     adapter_key: port::AdapterKey,
+    selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
+    /// Build the port over the state services. `selected_chain` is state's
+    /// committed snapshot watch, which [`Port::selected_chain`] hands out.
     pub(crate) fn new(
         state: State,
         read_state: ReadState,
         authority: zakura_state::HeaderChainBodyEvidenceAuthority,
         network: zakura_chain::parameters::Network,
+        selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     ) -> Self {
         Self {
             state,
@@ -326,6 +334,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
             authority,
             network,
             adapter_key: port::AdapterKey::new(),
+            selected_chain,
         }
     }
 }
@@ -353,12 +362,13 @@ where
 {
     fn continuation_locator(
         &self,
+        permit: port::LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::HeaderLocator>, PortError>> {
         let read_state = self.read_state.clone();
         Box::pin(async move {
             match tokio::time::timeout(
                 ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
-                read_state.oneshot(zakura_state::ReadRequest::HeaderLocator),
+                read_state.oneshot(zakura_state::ReadRequest::HeaderLocator { permit }),
             )
             .await
             {
@@ -448,6 +458,20 @@ where
         let authority = self.authority.clone();
         let adapter_key = self.adapter_key.clone();
         Box::pin(async move { apply_header_target(state, authority, adapter_key, target).await })
+    }
+
+    fn selected_chain(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        self.selected_chain.clone()
+    }
+
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<port::SelectedChainMembership, PortError>> {
+        let read_state = self.read_state.clone();
+        Box::pin(async move { selected_chain_contains(read_state, hash).await })
     }
 }
 
@@ -714,7 +738,7 @@ where
             zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
         ))
     })?;
-    let owner = insert.owner;
+    let (owner, source, target_tip_hash) = (insert.owner, insert.source, insert.target_tip_hash);
     let prepared = authority.from_registered_header_attempt(insert);
     match wait_for_header_target_apply(
         owner,
@@ -743,33 +767,68 @@ where
                 "unexpected state response: {response:?}"
             )))),
         )),
-        Err(error) if error_chain_contains_auxiliary_capacity_refusal(error.as_ref()) => {
-            Err(Arc::new(
-                zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(error)),
-            ))
-        }
-        Err(error) => Err(header_target_apply_failure(
+        Err(error) => Err(classify_header_apply_failure(
+            error,
+            source,
             owner,
-            "state_error",
-            Some(error),
+            target_tip_hash,
         )),
     }
 }
 
-fn error_chain_contains_auxiliary_capacity_refusal(
-    error: &(dyn std::error::Error + 'static),
-) -> bool {
+/// Classify state's refusal of a prepared header target.
+///
+/// Only a contextual difficulty or time failure is the supplying peer's. The
+/// session reader and `prepare_headers` already checked everything else that
+/// the peer's headers control, so any other refusal, such as a pruned parent
+/// or a stale preparation, is local.
+fn classify_header_apply_failure(
+    error: zakura_state::BoxError,
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    target_tip_hash: block::Hash,
+) -> Arc<zakura_header_chain::HeaderChainError> {
+    use zakura_header_chain::{
+        HeaderValidationCheck, HeaderValidationSource, HeaderViolation, InvalidTransitionEvidence,
+        TransitionFailure,
+    };
+
+    match transition_failure(error.as_ref()) {
+        Some(TransitionFailure::AuxiliaryLimitExceeded) => Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(error)),
+        ),
+        Some(TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Validation {
+                source: HeaderValidationSource::Prepared,
+                check: HeaderValidationCheck::ContextualValidation,
+            },
+        ))) => {
+            let rule = zakura_header_chain::HeaderRule::ContextualDifficultyAndTime.rule_ids()[0];
+            Arc::new(zakura_header_chain::HeaderChainError::invalid_header(
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                rule,
+                header_failure_evidence(source, owner, target_tip_hash, rule),
+                source,
+                Some(error),
+            ))
+        }
+        _ => header_target_apply_failure(owner, "state_error", Some(error)),
+    }
+}
+
+/// Return the planner failure in `error`'s source chain, if state's
+/// transition planner refused the request.
+fn transition_failure<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a zakura_header_chain::TransitionFailure> {
     let mut current = Some(error);
     while let Some(error) = current {
-        if matches!(
-            error.downcast_ref::<zakura_header_chain::TransitionFailure>(),
-            Some(zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded)
-        ) {
-            return true;
+        if let Some(failure) = error.downcast_ref() {
+            return Some(failure);
         }
         current = error.source();
     }
-    false
+    None
 }
 
 async fn wait_for_header_target_apply<F>(
@@ -1239,10 +1298,43 @@ where
     }
 }
 
+/// Ask state whether its selected header chain contains `hash`, within the
+/// driver deadline.
+async fn selected_chain_contains<ReadState>(
+    read_state: ReadState,
+    hash: block::Hash,
+) -> Result<port::SelectedChainMembership, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::SelectedChainMembership { hash }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::SelectedChainMembership(membership))) => Ok(membership),
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
+            source: Some(Arc::from(error)),
+        }),
+        Err(_) => Err(PortError::Timeout),
+    }
+}
+
 #[cfg(test)]
 fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
     zakura_header_chain::SourceId::from_digest(peer.digest())
 }
+
+#[cfg(test)]
+mod engine_comparison;
 
 #[cfg(test)]
 mod tests {
@@ -1817,8 +1909,14 @@ mod tests {
         );
     }
 
+    /// Only a contextual failure of the peer's headers is the peer's. Every
+    /// other refusal stays local, and each is found through a wrapping error.
     #[test]
-    fn driver_recognizes_auxiliary_capacity_through_the_state_error_chain() {
+    fn driver_attributes_only_contextual_apply_failures_to_the_header_peer() {
+        use zakura_header_chain::{
+            ErrorCategory, HeaderValidationCheck, InvalidTransitionEvidence, TransitionFailure,
+        };
+
         #[derive(Debug)]
         struct Wrapped(zakura_header_chain::TransitionFailure);
 
@@ -1834,15 +1932,44 @@ mod tests {
             }
         }
 
-        let refusal = zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded;
-        assert!(error_chain_contains_auxiliary_capacity_refusal(&refusal));
+        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+        let classify = |error: zakura_state::BoxError| {
+            classify_header_apply_failure(error, source, owner(), block::Hash([2; 32]))
+        };
 
-        let wrapped = Wrapped(refusal);
-        assert!(error_chain_contains_auxiliary_capacity_refusal(&wrapped));
+        let contextual = classify(Box::new(Wrapped(
+            InvalidTransitionEvidence::prepared_header(HeaderValidationCheck::ContextualValidation)
+                .into(),
+        )));
+        assert_eq!(contextual.category, ErrorCategory::InvalidHeader);
+        assert_eq!(
+            contextual.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
+        assert!(
+            classify(Box::new(Wrapped(TransitionFailure::AuxiliaryLimitExceeded)))
+                .is_auxiliary_capacity_refusal()
+        );
 
-        let classified =
-            zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(Box::new(wrapped)));
-        assert!(classified.is_auxiliary_capacity_refusal());
+        for local in [
+            // A parent that local retention pruned.
+            TransitionFailure::Graph(zakura_header_chain::GraphError::UnknownParent {
+                header: block::Hash([2; 32]),
+                parent: block::Hash([1; 32]),
+            }),
+            TransitionFailure::StalePreparation,
+            TransitionFailure::MissingDurableFacts("retained predecessor context is incomplete"),
+            InvalidTransitionEvidence::prepared_header(
+                HeaderValidationCheck::IncompleteDifficultyContext,
+            )
+            .into(),
+        ] {
+            let error = classify(Box::new(Wrapped(local)));
+            assert_eq!(error.category, ErrorCategory::LocalResourceOrStorage);
+            assert!(!error.is_automatic_header_peer_fault());
+        }
+        let restart = classify("header-chain writer exited".into());
+        assert!(!restart.is_automatic_header_peer_fault());
     }
 
     #[test]
@@ -2007,5 +2134,34 @@ mod tests {
         let sizes = finalized_body_sizes_for_page(read_state, &[]).await;
 
         assert!(sizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_chain_membership_follows_the_state_reply() {
+        let hash = block::Hash([3; 32]);
+        let selected = zakura_header_chain::Frontier::new(block::Height(3), hash);
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::SelectedChainMembership { hash: asked } => {
+                    assert_eq!(asked, hash);
+                    zakura_state::ReadResponse::SelectedChainMembership(
+                        port::SelectedChainMembership::Selected(selected),
+                    )
+                }
+                request => panic!("unexpected membership state request: {request:?}"),
+            })
+        });
+        assert_eq!(
+            selected_chain_contains(read_state, hash).await.unwrap(),
+            port::SelectedChainMembership::Selected(selected)
+        );
+
+        let wrong_reply = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::BestHeaderTip(None))
+        });
+        assert!(matches!(
+            selected_chain_contains(wrong_reply, hash).await,
+            Err(PortError::Unavailable { source: None })
+        ));
     }
 }

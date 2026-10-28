@@ -1,6 +1,6 @@
 use super::super::trace::{
-    block_sync_message_label, elapsed_us, height as trace_height, peer as trace_peer,
-    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
+    elapsed_us, height as trace_height, peer as trace_peer, saturating_usize, BlockTraceEvent,
+    BlockTraceFields, BoolOrU64,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -32,12 +32,20 @@ impl PeerRoutine {
         });
     }
 
+    pub(super) fn trace_ending_timeout(&self) {
+        self.emit(bs_trace::BLOCK_PEER_ENDING_TIMEOUT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+        });
+    }
+
     /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
     /// now emitted in the routine that decoded it). Records the message kind only;
     /// the per-variant field detail lives on the reactor's heavier trace path.
-    pub(super) fn trace_message_received(&self, msg: &BlockSyncMessage) {
+    pub(super) fn trace_message_received(&self, kind: &'static str) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
-            row.kind = Some(block_sync_message_label(msg));
+            row.peer = Some(trace_peer(&self.peer));
+            row.kind = Some(kind);
         });
     }
 
@@ -217,7 +225,7 @@ impl PeerRoutine {
     /// a cwnd that keeps ramping up only to be pulled back by the reliability discount
     /// instead of settling near `r = 1.0`. A sample also follows each batch of expired
     /// requests, because those usually return without a trace row of their own.
-    pub(super) fn trace_bbr_sample(&self) {
+    pub(super) fn trace_bbr_sample(&mut self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.peer));
             row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));
@@ -227,9 +235,9 @@ impl PeerRoutine {
         });
         // Refresh the published slot diagnostics on the same cadence so the cross-peer
         // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
-        // past the horizon (→ `None` = worst floor server).
-        self.publish_outstanding();
+        // `publish_slot_diagnostics` re-reads `bbr_rtprop_ms(now)`, filtering out samples
+        // aged past the horizon (→ `None` = worst floor server).
+        self.publish_slot_diagnostics();
     }
 
     pub(super) fn trace_body_sequencer_sent(
@@ -259,18 +267,14 @@ impl PeerRoutine {
     pub(super) fn trace_range_unavailable(
         &self,
         start_height: block::Height,
-        range_count: Option<u32>,
-        request_elapsed_ms: Option<u64>,
+        range_count: u32,
+        request_elapsed_ms: u64,
     ) {
         self.emit(bs_trace::BLOCK_RANGE_UNAVAILABLE, |row| {
             row.peer = Some(trace_peer(&self.peer));
             row.range_start = Some(trace_height(start_height));
-            if let Some(range_count) = range_count {
-                row.range_count = Some(u64::from(range_count));
-            }
-            if let Some(request_elapsed_ms) = request_elapsed_ms {
-                row.request_elapsed_ms = Some(request_elapsed_ms);
-            }
+            row.range_count = Some(u64::from(range_count));
+            row.request_elapsed_ms = Some(request_elapsed_ms);
         });
     }
 }

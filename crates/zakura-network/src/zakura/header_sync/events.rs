@@ -1,16 +1,18 @@
 use std::{fmt, sync::Arc, time::Duration};
 
-use tokio::sync::{mpsc, watch};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{mpsc, oneshot, watch, CancellationToken, Mutex, PoisonError},
+};
 
 use super::{
-    AuxSchema, GetHeaders, HeaderEntry, HeaderSyncCodec, HeaderSyncMessage, HeadersOutcomeCode,
-    PeerSession, ZakuraHeaderSyncConfig,
+    v9::{Admitted, Ended, PageLimits},
+    HeaderEntry, Headers, PeerSession, Status, ZakuraHeaderSyncConfig,
 };
 use crate::zakura::{
-    HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState, ZakuraPeerId,
-    ZakuraTrace,
+    regulation::ServeCapacity, HeaderSyncServiceSummary, ServicePeerSnapshot, Stream,
+    ZakuraHeaderSyncCandidateState, ZakuraPeerId, ZakuraTrace,
 };
 
 /// Cached full-state frontiers used by header sync and block sync.
@@ -57,6 +59,9 @@ pub struct HeaderSyncStartup {
     pub shutdown: CancellationToken,
     /// Private fatal notifications consumed by the node root.
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
+    /// Receives the reactor's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::observe::ObserverSlot,
 }
 
 impl HeaderSyncStartup {
@@ -92,6 +97,8 @@ impl HeaderSyncStartup {
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             fatal_events: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: super::observe::ObserverSlot::default(),
         }
     }
 
@@ -145,16 +152,89 @@ pub(crate) enum PortDispatch {
     External,
 }
 
+/// A bounded lifecycle queue whose admitted sessions retain their cleanup capacity.
+#[derive(Clone, Debug)]
+pub(super) struct LifecycleSender {
+    sender: mpsc::Sender<LifecycleEvent>,
+    disconnects: Arc<Mutex<HashMap<(ZakuraPeerId, u64), mpsc::OwnedPermit<LifecycleEvent>>>>,
+}
+
+/// One lifecycle transition and its completion notification.
+#[derive(Debug)]
+pub(super) struct LifecycleEvent {
+    pub event: Event,
+    pub applied: oneshot::Sender<()>,
+}
+
+impl LifecycleSender {
+    /// Allocate two slots per configured peer, shared by pending admission and teardown.
+    pub(super) fn channel(peers: usize) -> (Self, mpsc::Receiver<LifecycleEvent>) {
+        let (sender, receiver) = mpsc::channel(peers.max(1).saturating_mul(2));
+        (
+            Self {
+                sender,
+                disconnects: Arc::new(Mutex::new(HashMap::new())),
+            },
+            receiver,
+        )
+    }
+
+    /// Reserve cleanup before queueing a connection; duplicate/stale teardown is harmless.
+    pub(super) fn send(
+        &self,
+        event: Event,
+    ) -> Result<oneshot::Receiver<()>, mpsc::error::SendError<Event>> {
+        let (applied, completion) = oneshot::channel();
+        let mut disconnects = self
+            .disconnects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &event {
+            Event::PeerConnected(session) => {
+                let key = (session.peer_id().clone(), session.session_id());
+                let Ok(connect) = self.sender.clone().try_reserve_owned() else {
+                    session.cancel_token().cancel();
+                    return Err(mpsc::error::SendError(event));
+                };
+                let Ok(disconnect) = self.sender.clone().try_reserve_owned() else {
+                    session.cancel_token().cancel();
+                    return Err(mpsc::error::SendError(event));
+                };
+                disconnects.insert(key, disconnect);
+                connect.send(LifecycleEvent { event, applied });
+            }
+            Event::PeerDisconnected {
+                peer, session_id, ..
+            } => {
+                if let Some(disconnect) = disconnects.remove(&(peer.clone(), *session_id)) {
+                    disconnect.send(LifecycleEvent { event, applied });
+                }
+            }
+            _ => return Err(mpsc::error::SendError(event)),
+        }
+        Ok(completion)
+    }
+}
+
 /// Cheap cloneable handle used by transport and discovery services.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncHandle {
     pub(super) events: mpsc::Sender<Event>,
-    pub(super) lifecycle: mpsc::UnboundedSender<Event>,
+    pub(super) lifecycle: LifecycleSender,
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
-    pub(super) codec: HeaderSyncCodec,
     pub(super) trace: ZakuraTrace,
+    /// The active network, which fixes the header size and stream layout.
+    pub(super) network: Network,
+    /// The stream layout for the network's header size.
+    pub(super) layout: &'static [Stream],
+    /// The header-chain port that publishers read pages from.
+    pub(super) port: Arc<dyn zakura_node_services::header_chain::Port>,
+    /// Node-wide capacity that every session's published pages share.
+    pub(super) serving: ServeCapacity,
+    /// The serving limits this node advertises in its `Status`.
+    pub(super) page_limits: PageLimits,
 }
 
 impl HeaderSyncHandle {
@@ -168,11 +248,17 @@ impl HeaderSyncHandle {
         self.events.try_send(event)
     }
 
-    /// Send a lifecycle event over the unbounded control channel.
+    /// Queue lifecycle work with a disconnect slot reserved at connection admission.
     pub fn send_lifecycle(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
-        self.lifecycle
-            .send(event)
-            .map_err(|error| mpsc::error::SendError(error.0))
+        self.lifecycle.send(event).map(drop)
+    }
+
+    /// Wait for reactor admission before forwarding this session's messages.
+    pub(super) fn connect_session(
+        &self,
+        session: PeerSession,
+    ) -> Result<oneshot::Receiver<()>, mpsc::error::SendError<Event>> {
+        self.lifecycle.send(Event::PeerConnected(session))
     }
 
     /// Subscribe to selected header-tip updates.
@@ -204,11 +290,6 @@ impl HeaderSyncHandle {
     pub fn candidate_state(&self) -> ZakuraHeaderSyncCandidateState {
         self.candidates.borrow().clone()
     }
-
-    /// Return the one codec used by every admitted header-sync stream.
-    pub(crate) fn codec(&self) -> HeaderSyncCodec {
-        self.codec.clone()
-    }
 }
 
 /// Facts accepted by the header-sync reactor.
@@ -232,25 +313,34 @@ pub enum Event {
         /// Advisory summary.
         summary: HeaderSyncServiceSummary,
     },
-    /// A message decoded on a canonical stream.
-    WireMessage {
+    /// A `Status` decoded on a canonical stream.
+    Status {
         /// Sending peer.
         peer: ZakuraPeerId,
         /// Ordered-stream generation.
         session_id: u64,
-        /// Decoded message.
-        msg: HeaderSyncMessage,
+        /// The peer's advertisement.
+        status: Status,
     },
-    /// A correlated response that the reactor decoded under the request's reserved scope.
-    SessionResponse {
+    /// A page that the session's subscriber admitted.
+    Page {
         /// Sending peer.
         peer: ZakuraPeerId,
         /// Ordered-stream generation.
         session_id: u64,
-        /// Durable generation and exact branch that owns the response reservation.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Decoded `Headers` or `HeadersOutcome` response.
-        msg: HeaderSyncMessage,
+        /// The decoded page.
+        page: Headers,
+        /// Where the page leaves its subscription.
+        admitted: Admitted,
+    },
+    /// A terminal outcome that the session's subscriber admitted.
+    Outcome {
+        /// Sending peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation.
+        session_id: u64,
+        /// The subscription the outcome ended.
+        ended: Ended,
     },
     /// State returned the selected-path locator for an advertised target.
     #[cfg(any(test, feature = "zakura-testkit"))]
@@ -274,36 +364,6 @@ pub enum Event {
         owner: zakura_header_chain::BodyWorkOwner,
         /// Exact state-read outcome.
         result: VctRepairContextResult,
-    },
-    /// State finished acquiring an immutable path for one inbound request.
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    PathLeaseReady {
-        /// Peer that sent the request.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that owns the request.
-        session_id: u64,
-        /// Exact generation and branch that owns the request.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Exact request whose state read completed.
-        request: GetHeaders,
-        /// Acquired lease or explicit wire outcome.
-        result: HeaderPathLeaseResult,
-    },
-    /// State finished reading one hash-keyed page from an immutable path.
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    HeaderPathPageReady {
-        /// Peer that owns the lease.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that owns the lease.
-        session_id: u64,
-        /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Exact request correlation identifier.
-        request_id: HeaderSyncRequestId,
-        /// Exact snapshot-bound target.
-        target_tip_hash: block::Hash,
-        /// Page data or an unavailable-lease outcome.
-        result: HeaderPathPageResult,
     },
     /// Requester validation completed outside the reactor.
     #[cfg(any(test, feature = "zakura-testkit"))]
@@ -348,75 +408,19 @@ impl Event {
             Self::PeerConnected(_) => "peer_connected",
             Self::PeerDisconnected { .. } => "peer_disconnected",
             Self::AdvisorySummary { .. } => "advisory_header_summary",
-            Self::WireMessage { .. } => "session_wire_message",
-            Self::SessionResponse { .. } => "session_response",
+            Self::Status { .. } => "status",
+            Self::Page { .. } => "page",
+            Self::Outcome { .. } => "outcome",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::VctRepairContextReady { .. } => "vct_repair_context_ready",
-            #[cfg(any(test, feature = "zakura-testkit"))]
-            Self::PathLeaseReady { .. } => "header_path_lease_ready",
-            #[cfg(any(test, feature = "zakura-testkit"))]
-            Self::HeaderPathPageReady { .. } => "header_path_page_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderTargetPrepared { .. } => "header_target_prepared",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderTargetAdmissionReady { .. } => "header_target_admission_ready",
         }
     }
-}
-
-/// Network-facing state result for one exact retained target lease.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeaderPathLeaseResult {
-    /// State acquired the immutable target path.
-    Acquired(HeaderPathLease),
-    /// State mapped the request to one explicit non-data protocol outcome.
-    Outcome(HeadersOutcomeCode),
-    /// State registered a notification for the occupied serving resource.
-    CapacityBusy(zakura_node_services::header_chain::ServingCapacitySignal),
-}
-
-/// Minimum immutable lease facts needed by the serving reactor.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderPathLease {
-    /// State-issued lease identity.
-    pub lease_id: u64,
-    /// First requester-order locator intersection.
-    pub common_ancestor: zakura_header_chain::Frontier,
-    /// Exact retained target fixed by the lease.
-    pub target: zakura_header_chain::Frontier,
-    /// Exact generation and branch fixed by the lease.
-    pub scope: zakura_header_chain::HeaderWorkAuthority,
-}
-
-/// Network-facing state result for one retained target page.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeaderPathPageResult {
-    /// One fully assembled hash-keyed page.
-    Page(Box<HeaderPathPage>),
-    /// The lease expired or became unavailable before the read.
-    Unavailable,
-}
-
-/// One count-bounded page read from an immutable retained target path.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeaderPathPage {
-    /// State-issued lease identity.
-    pub lease_id: u64,
-    /// Exact page ancestor: the initial intersection or previous page tip.
-    pub common_ancestor: zakura_header_chain::Frontier,
-    /// Exact retained target fixed by the lease.
-    pub target: zakura_header_chain::Frontier,
-    /// Exact generation and branch fixed by the lease.
-    pub scope: zakura_header_chain::HeaderWorkAuthority,
-    /// Requested schema when the server found every parallel record.
-    /// The server otherwise returns no schema.
-    pub tree_aux_schema: AuxSchema,
-    /// Canonical headers and parallel advisory metadata.
-    pub entries: Vec<HeaderEntry>,
-    /// Whether this page reaches the immutable target.
-    pub complete: bool,
 }
 
 /// Result of preparing and atomically applying one complete requester target.
@@ -460,49 +464,6 @@ pub enum HeaderPortOperation {
         owner: zakura_header_chain::BodyWorkOwner,
         /// Exact unavailable selected-header height.
         height: block::Height,
-    },
-    /// Acquire an immutable retained path for one inbound request.
-    AcquirePath {
-        /// Peer that sent the request.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that owns the request.
-        session_id: u64,
-        /// Exact generation and branch that owns the request.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Exact request to snapshot in state.
-        request: GetHeaders,
-    },
-    /// Read one bounded page from an already acquired retained path.
-    ReadPath {
-        /// Peer that owns the lease.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that owns the lease.
-        session_id: u64,
-        /// State-issued lease identity.
-        lease_id: u64,
-        /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Exact wire request identifier.
-        request_id: HeaderSyncRequestId,
-        /// Exact snapshot-bound target.
-        target_tip_hash: block::Hash,
-        /// Common ancestor or previous page tip.
-        after_hash: block::Hash,
-        /// Count cap after local, remote, and byte limits.
-        max_header_count: u32,
-        /// Auxiliary schema requested for this exact page.
-        tree_aux_schema: AuxSchema,
-    },
-    /// Release one retained path owned by an exact peer session.
-    ReleaseHeaderPath {
-        /// Peer that owns the lease.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that owns the lease.
-        session_id: u64,
-        /// State-issued lease identity.
-        lease_id: u64,
-        /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::HeaderWorkAuthority,
     },
     /// Validate all staged pages and submit exactly one complete-target insertion.
     PrepareHeaderTarget {

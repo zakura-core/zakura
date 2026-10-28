@@ -950,7 +950,7 @@ where
             len => {
                 // Choose 2 random peers, then return the least loaded of those 2 peers.
                 let (a, b) = {
-                    let idxs = rand::seq::index::sample(&mut rand::thread_rng(), len, 2);
+                    let idxs = rand_10::seq::index::sample(&mut rand_10::rng(), len, 2);
                     let a = idxs.index(0);
                     let b = idxs.index(1);
 
@@ -990,12 +990,12 @@ where
     ///
     /// The chosen peers are unique, but their order is not fully random.
     fn select_random_ready_peers(&self, max_peers: usize) -> Vec<D::Key> {
-        use rand::seq::IteratorRandom;
+        use rand_10::seq::IteratorRandom;
 
         self.ready_services
             .keys()
             .copied()
-            .choose_multiple(&mut rand::thread_rng(), max_peers)
+            .sample(&mut rand_10::rng(), max_peers)
     }
 
     /// Records the block gossip sender for the current ready or busy connection generation.
@@ -1358,7 +1358,7 @@ where
                 .cloned()
                 .collect(),
             mined,
-            &mut rand::thread_rng(),
+            &mut rand_10::rng(),
         );
         let slots = self.block_gossip_slots.clone();
         async move {
@@ -1710,6 +1710,10 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
+            Request::DisconnectPeer(addr) => {
+                self.remove(&addr);
+                async { Ok(Response::Nil) }.boxed()
+            }
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>

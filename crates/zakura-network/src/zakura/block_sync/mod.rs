@@ -4,25 +4,20 @@
 //! peer's stream-6 frames flow through the per-peer routine, the work queue, the
 //! commit pipeline, the registry, and the reactor.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io::{self, Cursor, Read, Write},
-    sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-    time,
-};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
+    task::JoinHandle,
+    time::{self, Instant},
 };
 
 use super::{
@@ -47,6 +42,7 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod source;
 mod state;
 mod status;
 #[cfg(test)]
@@ -67,25 +63,45 @@ pub use bench::{
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
-pub use error::BlockSyncWireError;
+pub use error::{BlockSyncStartError, BlockSyncWireError};
 pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
     BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 pub(crate) use service::block_sync_streams;
 pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
-    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_BLOCK_SYNC,
 };
+
+/// The current UTC time as chrono's type. Reads `zakura_rt::time::utc_now`,
+/// so a simulated run sees the scenario clock.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    time::utc_now().into()
+}
+
+/// A header-chain [`Clock`](zakura_header_chain::Clock) that reads [`utc_now`], so
+/// body-retry deadlines and their conversion to `Instant`s share one clock.
+#[derive(Copy, Clone, Debug, Default)]
+struct BlockSyncClock;
+
+impl zakura_header_chain::Clock for BlockSyncClock {
+    /// Returns [`utc_now`].
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        utc_now()
+    }
+}
 
 #[cfg(test)]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {

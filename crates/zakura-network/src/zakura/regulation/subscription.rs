@@ -46,8 +46,21 @@
 //! # Tombstones
 //!
 //! An ended subscription leaves a tombstone, so updates that crossed its
-//! terminal outcome are recognized. A crossed `Grant` is dropped and keeps the
-//! tombstone. A crossed `Close` is dropped and consumes it.
+//! terminal outcome are recognized. A tombstone checks the key and the update
+//! sequence, but not the acknowledgement. A crossed `Grant` is dropped and
+//! keeps the tombstone. A crossed `Close` is dropped and consumes it.
+//!
+//! The tombstone keeps the ended subscription's granted and consumed credit.
+//! A crossed `Grant` must add credit, as a live one must, and its credit
+//! counts toward the granted credit. Granted credit may exceed consumed credit
+//! by at most the row's [`Credit`], in objects and in bytes, so later crossed
+//! grants cannot reuse room an earlier one took. A conformant subscriber stays
+//! within that bound, because it acknowledges only pages sent before the end.
+//! A crossed `Grant` beyond it is a protocol violation.
+//!
+//! The tombstone also records whether the publisher received `Close` before
+//! the end. A conformant subscriber sends nothing after its `Close`, so every
+//! update that matches such a tombstone is a protocol violation.
 //!
 //! An `Open` proves the subscriber received some terminal outcomes. The
 //! subscriber held fewer than `max_live` subscriptions when it sent `Open`,
@@ -66,13 +79,16 @@
 //! | --- | --- |
 //! | Grants bound the window; consumption is cumulative; a failed grant changes nothing | `renewable_credit_histories_bound_the_window_and_preserve_consumption`, `credit_grant_overflow_and_limit_failure_are_atomic` |
 //! | Pages spend exact credit; pages crossing `Close` are admitted; a terminal spends none | `subscriber_operation_sequences_follow_the_model` |
-//! | Each publisher outcome row | `every_publisher_outcome_row`, `publisher_operation_sequences_follow_the_model` |
+//! | Each publisher outcome row | `every_publisher_outcome_row` |
+//! | A refused update changes nothing; slots, tombstones, and the cursor history stay bounded; each tombstoned update matches a model | `publisher_operation_sequences_keep_every_bound` |
 //! | Crossed updates and outcomes never fault a conformant peer; both ledgers agree | `crossed_updates_never_fault_a_conformant_peer` |
 //! | The cursor history never fills; a slow acknowledger never faults | `crossed_updates_never_fault_a_conformant_peer`, `a_slow_acknowledger_is_held_by_the_window` |
 //! | A grant beyond the window faults | `a_grant_beyond_the_window_faults` |
+//! | A crossed grant fits consumed credit plus the window, in each unit, and still counts | `a_crossed_grant_is_held_by_the_ended_window` |
 //! | An idle subscription holds no execution and needs no outcome | `an_idle_subscription_holds_nothing_and_needs_no_outcome` |
 //! | Closure needs no credit and no execution | `close_needs_no_credit_and_no_execution` |
 //! | Retiring a session with a live subscription closes the connection | `retirement_with_a_live_subscription_closes_the_connection` |
+//! | Pages a reader queues never exceed the unspent credit | `queued_pages_never_exceed_the_unspent_credit` |
 
 mod credit;
 mod publisher;
@@ -159,7 +175,13 @@ pub(crate) enum SubscriptionFault {
     /// A grant that would push the window past the row's credit.
     #[error("the grant exceeds the credit window")]
     AboveWindow,
-    /// A `Grant` or a second `Close` after `Close`.
+    /// A `Grant` that crossed its subscription's end and would raise the
+    /// tombstone's granted credit above its consumed credit plus the row's
+    /// credit.
+    #[error("the crossed grant exceeds the ended subscription's credit window")]
+    CrossedAboveWindow,
+    /// A `Grant` or a second `Close` after `Close`, before or after the
+    /// subscription ends.
     #[error("an update after Close")]
     AfterClose,
     /// An `Open` that reuses a live or tombstoned key.
@@ -185,6 +207,7 @@ impl SubscriptionFault {
             Self::UnknownAcknowledgement => "unknown_acknowledgement",
             Self::EmptyCredit => "empty_credit",
             Self::AboveWindow => "above_window",
+            Self::CrossedAboveWindow => "crossed_above_window",
             Self::AfterClose => "after_close",
             Self::ReusedKey => "reused_key",
             Self::NoSlot { .. } => "no_slot",

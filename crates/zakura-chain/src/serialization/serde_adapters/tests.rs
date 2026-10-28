@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::serialization::bincode_format;
+
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct ByteArray<const N: usize>(#[serde(with = "super::bytes")] [u8; N]);
 
@@ -19,8 +21,11 @@ fn check_byte_array<const N: usize>() {
 
     // Fixed tuples have no length prefix: the stored bytes are exactly the
     // array contents, including for the legacy history-tree entry width.
-    assert_eq!(bincode::serialize(&value).unwrap(), bytes);
-    assert_eq!(bincode::deserialize::<ByteArray<N>>(&bytes).unwrap(), value);
+    assert_eq!(bincode_format::serialize(&value).unwrap(), bytes);
+    assert_eq!(
+        bincode_format::deserialize::<ByteArray<N>>(&bytes).unwrap(),
+        value
+    );
 }
 
 #[test]
@@ -46,7 +51,7 @@ fn byte_arrays_reject_wrong_lengths_and_invalid_bytes() {
             "{json}"
         );
     }
-    assert!(bincode::deserialize::<ByteArray<2>>(&[0]).is_err());
+    assert!(bincode_format::deserialize::<ByteArray<2>>(&[0]).is_err());
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -61,17 +66,18 @@ struct OptionalDuration {
 #[test]
 fn duration_strings_and_binary_formats_are_unchanged() {
     let value = HumanDuration(Duration::new(15, 123));
-    let string = humantime::format_duration(value.0).to_string();
+    let string = "15s 123ns".to_string();
     assert_eq!(
         serde_json::to_string(&value).unwrap(),
         serde_json::to_string(&string).unwrap()
     );
     assert_eq!(
-        bincode::serialize(&value).unwrap(),
-        bincode::serialize(&string).unwrap()
+        bincode_format::serialize(&value).unwrap(),
+        bincode_format::serialize(&string).unwrap()
     );
     assert_eq!(
-        bincode::deserialize::<HumanDuration>(&bincode::serialize(&string).unwrap()).unwrap(),
+        bincode_format::deserialize::<HumanDuration>(&bincode_format::serialize(&string).unwrap())
+            .unwrap(),
         value
     );
     assert_eq!(
@@ -109,11 +115,11 @@ fn optional_durations_preserve_some_none_and_missing_fields() {
     );
     for duration in [None, Some(Duration::new(15, 123))] {
         let value = OptionalDuration { duration };
-        let old_format = duration.map(|value| humantime::format_duration(value).to_string());
-        let encoded = bincode::serialize(&old_format).unwrap();
-        assert_eq!(bincode::serialize(&value).unwrap(), encoded);
+        let old_format = duration.map(|_| "15s 123ns".to_string());
+        let encoded = bincode_format::serialize(&old_format).unwrap();
+        assert_eq!(bincode_format::serialize(&value).unwrap(), encoded);
         assert_eq!(
-            bincode::deserialize::<OptionalDuration>(&encoded).unwrap(),
+            bincode_format::deserialize::<OptionalDuration>(&encoded).unwrap(),
             value
         );
     }

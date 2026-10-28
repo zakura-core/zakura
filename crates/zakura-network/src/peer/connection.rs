@@ -10,7 +10,7 @@
 use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
 
 use futures::{future::Either, prelude::*};
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
 use tokio::time::{sleep, Sleep};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
@@ -1014,6 +1014,7 @@ where
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
 
         let new_handler = match (&self.state, request) {
+            (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,
@@ -1653,7 +1654,7 @@ where
 
         let drop_connection_probability = overload_drop_connection_probability(now, prev);
 
-        if thread_rng().gen::<f32>() < drop_connection_probability {
+        if thread_rng().random::<f32>() < drop_connection_probability {
             if matches!(error, PeerError::Overloaded) {
                 metrics::counter!("pool.closed.loadshed").increment(1);
             } else {

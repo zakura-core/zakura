@@ -23,18 +23,18 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::Batch;
+use crate::primitives::fallback::Fallback;
 use futures::future::join_all;
 use orchard::{
     builder::{Builder, BundleType},
     bundle::{Authorized, Bundle, BundleVersion, Flags, TxVersion},
     circuit::{OrchardCircuitVersion, ProvingKey},
-    keys::{FullViewingKey, Scope, SpendingKey},
+    keys::{Diversifier, FullViewingKey, Scope, SpendingKey},
     value::NoteValue,
     Anchor,
 };
 use tower::{Service, ServiceExt};
-use tower_batch_control::Batch;
-use tower_fallback::Fallback;
 use zakura_chain::{
     block::Block,
     parameters::NetworkUpgrade,
@@ -193,7 +193,7 @@ fn pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key() {
 /// [`lazy_verifier_for`] routes each upgrade to the service that holds the correct
 /// circuit era's key.
 ///
-/// Comparing the `Lazy` handles themselves proves the routing without building
+/// Comparing the `LazyLock` handles themselves proves the routing without building
 /// any verifying key or starting a batch worker.
 #[test]
 fn verifier_routes_each_network_upgrade_to_the_correct_key() {
@@ -915,7 +915,8 @@ fn prove_shielding_bundle(pk: &ProvingKey) -> (Bundle<Authorized, ZatBalance>, S
     let mut rng = rand_10::rng();
 
     let sk = SpendingKey::from_bytes([7; 32]).expect("hard-coded test key bytes are valid");
-    let recipient = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
+    let recipient =
+        FullViewingKey::from(&sk).address(Diversifier::from_bytes([0; 11]), Scope::External);
 
     let mut builder = Builder::new(
         BundleType::DEFAULT,
@@ -998,7 +999,8 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
     // again. Both proofs must verify under both the armed static and the
     // unarmed control key. Proving uses the post-NU6.3 circuit, the only
     // circuit the coinbase proving path still exercises.
-    let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
+    let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3)
+        .expect("the current Orchard circuit supports proving");
     let unarmed_prover_result = prove_shielding_bundle(&pk);
 
     let first_arming = pk.prepare_proving();

@@ -53,7 +53,7 @@ use crate::{
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
-    Config, SemanticallyVerifiedBlock,
+    Config, SemanticallyVerifiedBlock, StateInitError,
 };
 
 /// Options for rolling back the finalized state.
@@ -104,6 +104,10 @@ pub struct RollbackFinalizedStateSummary {
 /// Errors returned by finalized-state rollback.
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
+    /// The state database could not be opened for this configuration.
+    #[error("cannot open the state database to roll back: {0}")]
+    Database(#[from] StateInitError),
+
     /// The on-disk state database format does not match the running code.
     #[error(
         "state database format mismatch: on disk {on_disk:?}, running code {in_code}; \
@@ -266,7 +270,7 @@ pub fn preview_rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, true);
+    let db = open_rollback_db(&config, network, true)?;
     let bounds = validate_rollback(&db, &options)?;
 
     // A dry run only reports the plan, so it deliberately skips the genesis-to-target treestate
@@ -286,7 +290,7 @@ pub fn rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, false);
+    let db = open_rollback_db(&config, network, false)?;
     rollback_open_db(&db, network, options)
 }
 
@@ -363,7 +367,11 @@ fn check_format_version(
     }
 }
 
-fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> ZakuraDb {
+fn open_rollback_db(
+    config: &Config,
+    network: &Network,
+    read_only: bool,
+) -> Result<ZakuraDb, StateInitError> {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -378,7 +386,7 @@ fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> Zaku
             .iter()
             .map(ToString::to_string),
         read_only,
-    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
+    )
 }
 
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
@@ -485,6 +493,11 @@ fn prepare_rollback(
         .value_pools()
         .to_owned();
 
+    // Only the durable marker proves that committed index updates are incomplete. Before the
+    // first skipped commit, rollback must still reverse the complete indexes, even if the
+    // current configuration would stop updating them on the next block. Keep any marker intact.
+    let skip_transparent_indexes = db.transparent_indexes_skipped_from().is_some();
+
     let mut batch = DiskWriteBatch::new();
     let mut address_balances = HashMap::new();
     let mut removed_blocks = Vec::new();
@@ -507,6 +520,7 @@ fn prepare_rollback(
             &mut address_balances,
             height,
             &block,
+            skip_transparent_indexes,
         )?;
         delete_shielded_block(db, &mut batch, &block);
         delete_block_and_transaction_data(db, &mut batch, height, &block)?;
@@ -757,6 +771,11 @@ fn deferred_pool_balance_change(
     Ok(Some(DeferredPoolBalanceChange::new(deferred_amount)))
 }
 
+/// Reverses `block`'s transparent changes: the canonical UTXO set and, unless
+/// `skip_transparent_indexes` is set, the transparent address indexes and balances.
+///
+/// Transparent spender entries for the outputs `block` spent are always deleted. A database
+/// without transparent indexes never writes them, so deleting them is a no-op there.
 fn reverse_transparent_block(
     db: &ZakuraDb,
     network: &Network,
@@ -764,6 +783,7 @@ fn reverse_transparent_block(
     address_balances: &mut HashMap<transparent::Address, Option<AddressBalanceLocation>>,
     height: Height,
     block: &Arc<Block>,
+    skip_transparent_indexes: bool,
 ) -> Result<(), RollbackFinalizedStateError> {
     // Undo the forward write transaction-by-transaction in reverse order, un-crediting each
     // transaction's created outputs before un-debiting its spent inputs.
@@ -782,7 +802,10 @@ fn reverse_transparent_block(
             let created_output_location =
                 OutputLocation::from_usize(height, tx_index, output_index);
 
-            if let Some(address) = output.address(network) {
+            if let Some(address) = output
+                .address(network)
+                .filter(|_| !skip_transparent_indexes)
+            {
                 let address_location =
                     cached_address_balance(db, address_balances, &address)?.address_location();
 
@@ -809,7 +832,11 @@ fn reverse_transparent_block(
         for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
             let (spent_output_location, spent_utxo) = finalized_output(db, &spent_outpoint)?;
 
-            if let Some(address) = spent_utxo.output.address(network) {
+            if let Some(address) = spent_utxo
+                .output
+                .address(network)
+                .filter(|_| !skip_transparent_indexes)
+            {
                 let address_location =
                     cached_address_balance(db, address_balances, &address)?.address_location();
 
@@ -831,10 +858,12 @@ fn reverse_transparent_block(
                 spent_output_location,
                 &spent_utxo.output,
             );
-            batch.zs_delete(
-                db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
-                spent_output_location,
-            );
+            if !skip_transparent_indexes {
+                batch.zs_delete(
+                    db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
+                    spent_output_location,
+                );
+            }
         }
     }
 

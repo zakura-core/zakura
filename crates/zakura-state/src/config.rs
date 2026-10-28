@@ -79,14 +79,14 @@ pub struct Config {
 
     /// Whether to use an ephemeral database.
     ///
-    /// Ephemeral databases are stored in a temporary directory created using [`tempfile::tempdir()`].
+    /// Ephemeral databases are stored in a new temporary directory.
     /// They are deleted when Zebra exits successfully.
     /// (If Zebra panics or crashes, the ephemeral database won't be deleted.)
     ///
     /// Set to `false` by default. If this is set to `true`, [`cache_dir`] is ignored.
     ///
     /// Ephemeral directories are created in the [`std::env::temp_dir()`].
-    /// Zebra names each directory after the state version and network, for example: `zakura-state-v21-mainnet-XnyGnE`.
+    /// Zebra names each directory after the state version and network, for example: `zebra-state-v21-mainnet-12345.678901234.0`.
     ///
     /// [`cache_dir`]: struct.Config.html#structfield.cache_dir
     pub ephemeral: bool,
@@ -179,6 +179,12 @@ pub struct Config {
     /// to validate future spends. This is a one-way mode: once data has been
     /// pruned, the database cannot be reopened in [`StorageMode::Archive`] without
     /// re-syncing from genesis.
+    ///
+    /// With checkpoint sync enabled, pruned storage stops maintaining transparent address
+    /// balances, address UTXO and transaction lists, and transparent spender indexes in the
+    /// existing database. Existing rows are retained but never served as complete results.
+    /// The first skipped block records this permanently, including across restart and rollback.
+    /// Restoring complete address queries requires syncing a fresh indexed database.
     pub storage_mode: StorageMode,
 
     // Debug configs
@@ -208,14 +214,17 @@ pub struct Config {
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
+    zakura_chain::common::TempDir::new_in(std::env::temp_dir(), prefix)
         .expect("temporary directory is created successfully")
         .keep()
 }
 
 impl Config {
+    /// Whether this configuration stops optional transparent index updates.
+    pub(crate) fn skips_transparent_indexes(&self) -> bool {
+        self.pruning_config().is_some() && self.checkpoint_sync
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(

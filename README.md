@@ -49,7 +49,7 @@ The installer can set up either standard Zakura or its
 You can run Zakura using our [Docker
 image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 The zcashd-compatible split-container mode uses the
-[zakuracore/zcashd:v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd:v1.3.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 
 This command will run our latest release and sync it to the tip:
 
@@ -68,9 +68,8 @@ Testnet). For more information, see the image's
 
 ### Manual Install
 
-Building Zakura requires [Rust](https://www.rust-lang.org/tools/install),
-[libclang](https://clang.llvm.org/doxygen/group__CINDEX.html), and a C++
-compiler. Below are quick summaries for installing these dependencies.
+Building Zakura requires [Rust](https://www.rust-lang.org/tools/install) and a
+C++ compiler. Below are quick summaries for installing these dependencies.
 
 [//]: # "The empty lines in the `summary` tag below are required for correct Markdown rendering."
 
@@ -81,12 +80,8 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 1. Install [`cargo` and `rustc`](https://www.rust-lang.org/tools/install).
-2. Install Zakura's build dependencies:
-   - **libclang**, which is a library that comes under various names, typically
-     `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
-   - **clang** or another C++ compiler (`g++`, which is for all platforms, or
-     `Xcode`, which is for macOS);
-   - **[`protoc`](https://grpc.io/docs/protoc-installation/)** (optional).
+2. Install a C++ compiler, such as `g++` or `clang` on Linux, Xcode on macOS,
+   or Visual Studio's MSVC on Windows.
 
 </details>
 
@@ -99,10 +94,8 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 ```sh
-sudo pacman -S rust clang protobuf
+sudo pacman -S rust gcc
 ```
-
-Note that the package `clang` includes `libclang` as well.
 
 </details>
 
@@ -115,7 +108,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.6.1 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.7.0 zakura
 ```
 
 Native x86-64 builds automatically use Pasta field assembly when the build

@@ -8,6 +8,9 @@ Type=simple
 # No root. The journal group is the only extra permission: the node probe reads
 # the zakurad units' journals for the commit and node ID, and the kernel log for
 # OOM kills. Node configs and logs are world-readable, and RPC is on localhost.
+# Pre-create the dedicated system user matching this unit name on hosts whose
+# system D-Bus rejects transient UIDs; DynamicUser then reuses that unprivileged
+# identity, so real systemctl health remains available without root.
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
 # Observations from before the current network generation are not counted.

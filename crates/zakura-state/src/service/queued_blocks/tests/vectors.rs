@@ -100,23 +100,49 @@ fn dequeue_gives_right_children() -> Result<()> {
 }
 
 #[test]
-fn same_hash_replacement_keeps_the_new_body() -> Result<()> {
+fn same_hash_replacement_preserves_receipts_only_for_identical_bodies() -> Result<()> {
     let block: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
-    let replacement_block = Arc::new((*block).clone());
-    let mut queue = QueuedBlocks::default();
-    queue.queue(block.clone().into_queued());
+    for (original_order, different_body) in [(Some(1), false), (None, false), (Some(1), true)] {
+        let mut replacement_block = (*block).clone();
+        if different_body {
+            replacement_block
+                .transactions
+                .push(block.transactions[0].clone());
+        }
+        let replacement_block = Arc::new(replacement_block);
+        assert_eq!(block.hash(), replacement_block.hash());
+        let mut queue = QueuedBlocks::default();
+        let mut original = block.clone().into_queued();
+        original.0.receipt_order = original_order;
+        queue.queue(original);
 
-    let old = queue.replace(block.hash(), replacement_block.clone().into_queued());
-    assert!(Arc::ptr_eq(&old.0.block, &block));
-    assert!(Arc::ptr_eq(
-        &queue
-            .get_mut(&block.hash())
-            .expect("replacement remains queued")
-            .0
-            .block,
-        &replacement_block
-    ));
+        // Model a redelivery that received a new verifier receipt.
+        let mut replacement = replacement_block.clone().into_queued();
+        replacement.0.receipt_order = Some(9);
+        let old = queue.replace(block.hash(), replacement);
+        assert!(Arc::ptr_eq(&old.0.block, &block));
+        let retained = queue.get_mut(&block.hash()).unwrap();
+        assert!(Arc::ptr_eq(&retained.0.block, &replacement_block));
+        assert_eq!(
+            retained.0.receipt_order,
+            if different_body {
+                Some(9)
+            } else {
+                original_order
+            }
+        );
+        let children = queue.dequeue_children(block.header.previous_block_hash);
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].0.receipt_order,
+            if different_body {
+                Some(9)
+            } else {
+                original_order
+            }
+        );
+    }
     Ok(())
 }
 

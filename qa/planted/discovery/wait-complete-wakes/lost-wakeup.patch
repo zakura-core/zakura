@@ -1,0 +1,22 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index 608e81c55..8ff7cec47 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -1040,15 +1040,8 @@ impl DiscoveryExchangeProgress {
+     }
+ 
+     async fn wait_complete(&self) {
+-        loop {
+-            // Created before the check, so a mark that lands between the
+-            // check and the await still wakes it. `notify_waiters` stores no
+-            // permit for a future created after it.
+-            let notified = self.notify.notified();
+-            if self.complete() {
+-                return;
+-            }
+-            notified.await;
++        while !self.complete() {
++            self.notify.notified().await;
+         }
+     }
+ }

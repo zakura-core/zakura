@@ -20,7 +20,7 @@ use futures::{
     Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, timeout::Timeout, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
@@ -86,6 +86,14 @@ pub const GETDATA_MAX_BLOCK_COUNT: usize = 16;
 /// Minimum interval between zcashd-compat errors for requested pruned block bodies.
 const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+// Zakura requesters reject `FindBlocks` responses above their limit, so this
+// node must never answer with more.
+const _: () = assert!(
+    // A `u32` always fits `usize` on the 32- and 64-bit targets Zakura supports.
+    zs::constants::MAX_FIND_BLOCK_HASHES_RESULTS as usize
+        == zn::constants::MAX_FIND_BLOCKS_RESPONSE_HASHES
+);
+
 /// Actionable error emitted when a zcashd sidecar requests a pruned block body.
 pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
     "zcashd_compat: cannot serve block because its body has been pruned; a zcashd sidecar \
@@ -93,12 +101,16 @@ pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
      archive storage on Zakura side https://zakura.com/snapshots/ .";
 
 type BlockDownloadPeerSet =
-    Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
-type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
-type Mempool = Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type State =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
+type Mempool = Buffer<
+    mempool::Request,
+    futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+>;
 type SemanticBlockVerifier = Buffer<
-    BoxService<zakura_consensus::Request, block::Hash, RouterError>,
     zakura_consensus::Request,
+    futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>,
 >;
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
@@ -855,6 +867,7 @@ impl Service<zn::Request> for Inbound {
                 })
                     .boxed()
             }
+            zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

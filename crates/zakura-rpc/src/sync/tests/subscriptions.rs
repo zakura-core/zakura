@@ -347,3 +347,78 @@ async fn empty_new_session_clears_old_orders_and_tracks_finalized_tip() {
     .await
     .expect("a session reset must clear published receipts even without a block message");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_prefers_primary_receipt_over_delivery_order_and_hash() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, mut received) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(SubscriptionServer(requests))
+                .serve_with_incoming(TcpIncoming::from(listener))
+                .await
+                .unwrap();
+        });
+        let (network, genesis, block) = chain_fixture();
+        let mut alternative = block.as_ref().clone();
+        Arc::make_mut(&mut alternative.header).nonce.0[0] ^= 1;
+        let alternative = Arc::new(alternative);
+        let (early, late) = if block.hash().0 < alternative.hash().0 {
+            (block, alternative)
+        } else {
+            (alternative, block)
+        };
+        let mut finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(genesis).into(),
+                None,
+                None,
+                "receipt test",
+            )
+            .unwrap();
+        let (tip_sender, _tip, _tip_change) = ChainTipSender::new(None, &network);
+        let state = NonFinalizedState::new(&network);
+        let (state_sender, mut state_receiver) = watch::channel(state.clone());
+        let (started, _) = watch::channel(true);
+        let mut syncer = TrustedChainSync {
+            indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
+            db: finalized.db.clone(),
+            non_finalized_state: state,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: state_sender,
+            started_sync_sender: started,
+            finalized_tip_updater: None,
+            receipt_session: Some("primary".into()),
+        };
+        let sync = tokio::spawn(async move { syncer.sync().await });
+        let (_, response) = received.recv().await.unwrap();
+        let (blocks, stream) = mpsc::channel(2);
+        let mut reply = Response::new(ReceiverStream::new(stream));
+        reply.metadata_mut().insert(
+            crate::indexer::RECEIPT_SESSION_HEADER,
+            "primary".parse().unwrap(),
+        );
+        response.send(reply).unwrap();
+        // Deliver the higher-hash block first, opposite to the primary's order.
+        for (block, order) in [(late, 2), (early.clone(), 1)] {
+            let mut message = BlockAndHash::new(block.hash(), block);
+            message.receipt_order = Some(order);
+            blocks.send(Ok(message)).await.unwrap();
+        }
+        state_receiver
+            .wait_for(|state| state.chain_iter().count() == 2)
+            .await
+            .unwrap();
+        assert_eq!(state_receiver.borrow().best_tip().unwrap().1, early.hash());
+        sync.abort();
+        server.abort();
+    })
+    .await
+    .expect("the mirror must apply the primary's receipt order before timeout");
+}

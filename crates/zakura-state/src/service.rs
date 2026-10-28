@@ -43,6 +43,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::{
@@ -51,8 +52,8 @@ use crate::{
         MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{
-        AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
-        PreciousError, ReconsiderError,
+        AwaitBlockInfoError, BlockHeaderNotFound, CommitBlockError, CommitCheckpointVerifiedError,
+        InvalidateError, PreciousError, ReconsiderError,
     },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
@@ -438,7 +439,10 @@ impl StateService {
                     .unwrap_or_else(|error| match error {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
+                        error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::TransparentIndexesMissingInArchiveMode {
+                            ..
+                        }) => {
                             panic!("{error}")
                         }
                         error => panic!(
@@ -495,6 +499,7 @@ impl StateService {
                 .await;
 
         let non_finalized_block_write_sent_hashes = SentHashes::new(&non_finalized_state);
+        let finalized_tip_height = finalized_tip.as_ref().map(|tip| tip.height.0);
         let initial_tip = non_finalized_state
             .best_tip_block()
             .map(|cv_block| cv_block.block.clone())
@@ -502,7 +507,11 @@ impl StateService {
             .map(ChainTipBlock::from)
             .or(finalized_tip);
 
-        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
+        tracing::info!(
+            chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)),
+            finalized_tip_height,
+            "loaded Zakura state cache"
+        );
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
@@ -646,7 +655,7 @@ impl StateService {
 
         // Spawn a background task to periodically export RocksDB metrics to Prometheus
         let db_for_metrics = read_service.db.clone();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -2184,11 +2193,9 @@ impl Service<Request> for StateService {
 
             // Runs concurrently using the ReadStateService
             Request::Tip
-            | Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator
-            | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
@@ -2981,20 +2988,20 @@ impl Service<ReadRequest> for ReadStateService {
                     .height_or_else(|hash| {
                         read::find::height_by_hash(best_chain.clone(), &state.db, hash)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let hash = hash_or_height
                     .hash_or_else(|height| {
                         read::find::hash_by_height(best_chain.clone(), &state.db, height)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let next_height = height.next()?;
                 let next_block_hash =
                     read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
 
                 let header = read::block_header(best_chain, &state.db, height.into())
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 Ok(ReadResponse::BlockHeader {
                     header,
@@ -3038,7 +3045,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
+                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend)?,
             )),
 
             ReadRequest::CheckParentInputs { parent, outpoints } => {
@@ -3103,7 +3110,7 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeaderLocator => {
+            ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let locator = reader
                     .map(|reader| reader.committed_selected_locator())
@@ -3175,6 +3182,16 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::RetainedHeaderPathReleased(released))
             }
 
+            ReadRequest::SelectedChainMembership { hash } => {
+                let membership = match state.header_chain_reader_receiver.borrow().clone() {
+                    Some(reader) => reader.selected_chain_membership(hash)?,
+                    None => {
+                        zakura_node_services::header_chain::SelectedChainMembership::NotRetained
+                    }
+                };
+                Ok(ReadResponse::SelectedChainMembership(membership))
+            }
+
             ReadRequest::BlockRoots {
                 start_height,
                 count,
@@ -3242,7 +3259,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BlocksByHeightRange { start, count } => {
-                let best_chain = state.latest_best_chain();
+                let snapshot = state.block_range_snapshot()?;
                 let blocks = (0..count)
                     .map_while(|offset| {
                         start
@@ -3250,7 +3267,8 @@ impl Service<ReadRequest> for ReadStateService {
                             .checked_add(offset)
                             .map(block::Height)
                             .and_then(|height| {
-                                read::block_and_size(best_chain.clone(), &state.db, height.into())
+                                snapshot
+                                    .block_and_size(&state.db, height)
                                     .map(|(block, size)| (height, block, size))
                             })
                     })
@@ -3953,7 +3971,7 @@ pub fn spawn_init_read_only(
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_test(
     network: &Network,
-) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
+) -> Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
@@ -3972,7 +3990,7 @@ pub async fn init_test(
 pub async fn init_test_services(
     network: &Network,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     ReadStateService,
     LatestChainTip,
     ChainTipChange,

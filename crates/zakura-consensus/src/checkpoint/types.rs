@@ -75,12 +75,6 @@ impl Progress<block::Height> {
 }
 
 impl<HeightOrHash> Progress<HeightOrHash> {
-    /// Returns `true` if the progress is before the genesis block.
-    #[allow(dead_code)]
-    pub fn is_before_genesis(&self) -> bool {
-        matches!(self, BeforeGenesis)
-    }
-
     /// Returns `true` if the progress is at or after the final checkpoint block.
     pub fn is_final_checkpoint(&self) -> bool {
         matches!(self, FinalCheckpoint)

@@ -1,10 +1,12 @@
-use super::{error::*, wire::*, *};
+use super::{wire::*, *};
 
-/// Default number of blocks advertised per response.
+/// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
-/// Keep block-body ranges narrow so a missing response only holds one height at
-/// the body-download floor.
-pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
+/// Fixed at one. Multi-block requests don't raise throughput, they blunt
+/// per-block congestion control, and a missing response would hold several
+/// heights at the body-download floor. Serving still answers a peer's legal
+/// multi-block request with a one-block prefix.
+pub const BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Default advertised hard cap on concurrent in-flight block requests per peer.
 ///
 /// This is the safety ceiling the BBR-lite cwnd is clamped to, **not** the
@@ -62,6 +64,26 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 = 1536 * 1024 * 1024;
 /// maximum checkpoint gap plus the boundary block in flight.
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+/// Decoded-byte cap on the block-sync submission window above the last checkpoint.
+///
+/// Above the verifier's last checkpoint, blocks are not fixed history, so the
+/// count-only window could hold `submitted_apply_limit` worst-case decoded
+/// blocks. There the sequencer stops keeping decoded copies and stops
+/// submitting once the window's decoded heap would exceed this cap. Later
+/// bodies stay raw and decode at submit as earlier submissions finish. When
+/// none of the window's bodies is submitted, the next one is always allowed,
+/// so a single oversized block still progresses. Checkpoint heights are exempt
+/// because a whole checkpoint range must be co-resident (see
+/// [`MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES`]).
+///
+/// The cap gates new submissions and is not a hard ceiling. Submissions
+/// detached by a failure or reset stay charged but never block the next body,
+/// so after repeated resets the window can exceed the cap within the count
+/// limit.
+///
+/// 512 MiB is about 1.5x the 354 MiB decoded-window peak measured while
+/// syncing the Mainnet sandblasting range.
+pub const BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 /// The byte size of one full worst-case checkpoint range held in flight.
 ///
 /// The checkpoint verifier resolves a block's commit only once the entire
@@ -92,8 +114,8 @@ pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
-/// Default block-sync status refresh interval after local frontier changes.
-pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound tip-growth advertisements so peers can promptly request new block bodies.
+pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Default tolerated size-hint deviation percentage before a peer is reported.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
@@ -176,36 +198,13 @@ pub struct BlockSyncStatus {
     pub max_response_bytes: u32,
 }
 
-impl BlockSyncStatus {
-    pub(super) fn encode_to<W: Write>(&self, writer: &mut W) -> Result<(), BlockSyncWireError> {
-        write_height(writer, self.servable_low)?;
-        write_height(writer, self.servable_high)?;
-        self.tip_hash.zcash_serialize(&mut *writer)?;
-        writer.write_u32::<LittleEndian>(clamp_advertised_blocks(self.max_blocks_per_response))?;
-        writer.write_u32::<LittleEndian>(self.max_inflight_requests)?;
-        writer.write_u32::<LittleEndian>(self.max_response_bytes.max(1))?;
-        Ok(())
-    }
-
-    pub(super) fn decode_from<R: Read>(reader: &mut R) -> Result<Self, BlockSyncWireError> {
-        Ok(Self {
-            servable_low: read_height(reader)?,
-            servable_high: read_height(reader)?,
-            tip_hash: block::Hash::zcash_deserialize(&mut *reader)?,
-            max_blocks_per_response: clamp_advertised_blocks(reader.read_u32::<LittleEndian>()?),
-            max_inflight_requests: clamp_advertised_inflight(reader.read_u32::<LittleEndian>()?),
-            max_response_bytes: clamp_advertised_response_bytes(reader.read_u32::<LittleEndian>()?),
-        })
-    }
-}
-
 impl Default for BlockSyncStatus {
     fn default() -> Self {
         Self {
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
             tip_hash: block::Hash([0; 32]),
-            max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
+            max_blocks_per_response: BS_BLOCKS_PER_RESPONSE,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
         }
@@ -227,8 +226,15 @@ pub struct ZakuraBlockSyncConfig {
         deserialize_with = "deserialize_ignored_replace_legacy_syncer"
     )]
     pub replace_legacy_syncer: bool,
-    /// Maximum blocks this node advertises per `GetBlocks` response.
-    pub max_blocks_per_response: u32,
+    /// Deprecated compatibility key for older configs.
+    ///
+    /// Block sync always requests and advertises one block per `GetBlocks`
+    /// message (see [`BS_BLOCKS_PER_RESPONSE`]). Older configs that set this key
+    /// keep parsing. The value never affects block sync. It is kept only so the
+    /// reactor can warn about it once tracing is running.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub max_blocks_per_response: Option<u32>,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
     pub max_inflight_requests: u32,
     /// Initial per-peer BBR cwnd (cold-start point), in blocks; converges to the
@@ -269,7 +275,9 @@ pub struct ZakuraBlockSyncConfig {
     /// past it the peer gets no more work until it makes progress or the liveness
     /// deadline parks its block-sync session.
     pub max_requests_without_block_progress: u32,
-    /// How often this node sends unsolicited status refreshes after local frontier changes.
+    /// The minimum interval between `Status` messages this node sends on one connection.
+    /// The protocol's 30 s `Status` cadence applies first, so only a longer value slows
+    /// sends. The same interval also limits how often an inbound `Status` triggers a reply.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
@@ -331,7 +339,7 @@ impl Default for ZakuraBlockSyncConfig {
     fn default() -> Self {
         Self {
             replace_legacy_syncer: false,
-            max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
+            max_blocks_per_response: None,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
@@ -365,9 +373,29 @@ impl Default for ZakuraBlockSyncConfig {
 }
 
 impl ZakuraBlockSyncConfig {
-    /// Return the clamped block-count advertisement for wire status messages.
+    /// Return the block-count advertisement for wire status messages.
+    ///
+    /// Always [`BS_BLOCKS_PER_RESPONSE`]. It caps both our outbound request
+    /// count and how many blocks we serve per incoming request.
     pub fn advertised_max_blocks_per_response(&self) -> u32 {
-        clamp_advertised_blocks(self.max_blocks_per_response)
+        BS_BLOCKS_PER_RESPONSE
+    }
+
+    /// Warn when the deprecated `max_blocks_per_response` key asks for more
+    /// blocks than block sync requests.
+    ///
+    /// The reactor calls this when it starts, because config deserialization
+    /// runs before zakurad installs its tracing subscriber.
+    pub(super) fn warn_ignored_max_blocks_per_response(&self) {
+        if let Some(configured) = self
+            .max_blocks_per_response
+            .filter(|configured| *configured > BS_BLOCKS_PER_RESPONSE)
+        {
+            tracing::warn!(
+                "zakura.block_sync.max_blocks_per_response = {configured} is deprecated and \
+                 ignored; block sync always requests one block per GetBlocks message",
+            );
+        }
     }
 
     /// Return the locally capped in-flight advertisement for status messages.
@@ -466,6 +494,18 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        self.validate_serving()
+    }
+
+    /// Check the limits this node promises to GetBlocks peers. The reactor
+    /// requires this of every config, validated or not, before it serves.
+    pub fn validate_serving(&self) -> Result<(), &'static str> {
+        if !super::regulated::session::serving_sessions_fit_budget(self) {
+            return Err(
+                "max_inbound_peers plus max_outbound_peers must be at most 3,633 \
+                 so GetBlocks serving fits its bookkeeping budget",
+            );
+        }
         Ok(())
     }
 
@@ -538,11 +578,4 @@ pub fn clamp_advertised_inflight(count: u32) -> u32 {
 /// Clamp an advertised response byte target to the largest stream-6 message.
 pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
     bytes.clamp(1, MAX_BS_RESPONSE_BYTES)
-}
-
-/// Maximum inbound `GetBlocks.count` this node will serve before looking at body sizes.
-pub fn inbound_get_blocks_count_limit(config: &ZakuraBlockSyncConfig) -> u32 {
-    config
-        .advertised_max_blocks_per_response()
-        .clamp(1, MAX_BS_BLOCKS_PER_REQUEST)
 }

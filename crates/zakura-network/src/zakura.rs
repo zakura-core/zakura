@@ -1,14 +1,16 @@
 //! Zakura P2P dependency, identity, handshake, and protocol-handler scaffolding.
 //!
-//! This module reserves the iroh dependency, privacy-preserving endpoint posture,
-//! persistent identity storage surface, and bounded Zakura handshake wire types.
+//! This module holds the privacy-preserving endpoint posture, persistent
+//! identity storage surface, and bounded Zakura handshake wire types. The QUIC
+//! transport lives in `zakura-quic`.
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
+use zakura_node_services::task::spawn_erased_named;
+use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::sync::CancellationToken;
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -24,8 +26,9 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod peer_memory;
 mod regulation;
-#[cfg(any(test, feature = "zakura-testkit"))]
+#[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
 pub mod testkit;
 mod trace;
 pub mod transport;
@@ -38,11 +41,12 @@ pub use handshake::*;
 pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
+pub use peer_memory::*;
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
     BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
-    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
 
@@ -55,24 +59,25 @@ use std::sync::{
     Arc,
 };
 
-/// The pinned iroh version the Zakura P2P plan was verified against.
-pub const IROH_VERSION: &str = "0.92.0";
-
 /// Capability bit for the legacy gossip compatibility service.
 pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
 
-/// Capability bit for the native discovery service.
-pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
+/// Capability bit for the native discovery service (stream version 2).
+pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 9;
 
 /// Capability bit for the native header-sync service.
 ///
 /// Bit `1 << 4` belonged to the retired predecessor protocol and remains unused.
-pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 10;
 
 // Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
 // Do not assign it to another service.
-// Bit `1 << 3` identifies block sync in `block_sync::wire`.
+// Bit `1 << 3` identified the retired block-sync stream version 2. Do not reuse it.
 // Bit `1 << 4` identifies the retired predecessor header-sync protocol.
+// Bit `1 << 5` identified the retired header-sync stream version 8. Do not reuse it.
+// Bits 6 and 7 are reserved for spentness hints and wallet transaction submission.
+// Bit `1 << 8` identifies block sync (stream version 3) in `block_sync::wire`.
+// Bit `1 << 2` identified the retired discovery stream version 1. Do not reuse it.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;
@@ -126,10 +131,6 @@ pub enum ServiceAdmissionDecision {
     RejectFull,
     /// The peer is not useful for this service right now.
     RejectNotUseful,
-    /// The peer is still in a local retry backoff window.
-    RejectBackoff,
-    /// The peer does not support this service.
-    RejectUnsupported,
 }
 
 /// Direction of the underlying Zakura connection.
@@ -199,17 +200,6 @@ const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// so the `Responded` liveness never ages into a reconnection candidate while
 /// the Zakura connection is alive.
 const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
-
-/// Returns an iroh endpoint builder with relays and external address lookup disabled.
-///
-/// Callers must add explicit direct bind addresses before binding.
-pub fn direct_endpoint_builder(secret_key: SecretKey) -> endpoint::Builder {
-    Endpoint::builder(endpoint::presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .clear_ip_transports()
-        .secret_key(secret_key)
-}
 
 /// The result of routing a mutually P2P-v2-capable legacy handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -418,6 +408,9 @@ impl ZakuraHandshakeConnector {
     /// Only meaningful for outbound connections, where `book_addr` is the
     /// dialable remote address the crawler would otherwise reconnect to. Does
     /// nothing without a live endpoint.
+    ///
+    /// `address_book_updater` belongs to the legacy address book. Legacy code
+    /// stays on tokio, so it's tokio's sender in both builds.
     pub(crate) fn spawn_legacy_liveness_keeper(
         &self,
         peer_id: ZakuraPeerId,
@@ -430,12 +423,15 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
-        tokio::spawn(run_legacy_liveness_keeper(
-            book_addr,
-            address_book_updater,
-            dial_lifetime,
-            ZAKURA_LIVENESS_REFRESH_INTERVAL,
-        ));
+        spawn_erased_named(
+            "legacy_liveness_keeper",
+            run_legacy_liveness_keeper(
+                book_addr,
+                address_book_updater,
+                dial_lifetime,
+                ZAKURA_LIVENESS_REFRESH_INTERVAL,
+            ),
+        );
     }
 
     /// Returns the deterministic upgrade outcome injected for handshake routing
@@ -478,18 +474,17 @@ impl Drop for UpgradeDialCancelGuard<'_> {
     }
 }
 
-/// Builds an iroh dial address from the node id and direct-address hints a peer
+/// Builds a dial address from the node id and direct-address hints a peer
 /// advertised in a legacy upgrade prelude.
 ///
 /// Direct addresses are carried as `SocketAddr` strings (the same encoding used
 /// by configured bootstrap peers), so each entry is parsed back into a
 /// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
 /// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<EndpointAddr> {
-    let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
-    let node_id = EndpointId::from_bytes(&node_id_bytes).ok()?;
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+    let node_id = NodeId::try_from(node_id).ok()?;
 
-    let direct: Vec<std::net::SocketAddr> = direct_addresses
+    let mut direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
         .filter_map(|address| std::str::from_utf8(address).ok()?.parse().ok())
         .collect();
@@ -497,8 +492,11 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
     if direct.is_empty() {
         return None;
     }
+    // Keep the sorted, duplicate-free order Iroh's address set used to give.
+    direct.sort_unstable();
+    direct.dedup();
 
-    Some(EndpointAddr::new(node_id).with_addrs((direct).into_iter().map(iroh::TransportAddr::Ip)))
+    Some(NodeAddr::with_addrs(node_id, direct))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
@@ -516,7 +514,7 @@ async fn run_legacy_liveness_keeper(
     loop {
         // Refresh the peer's `Responded` liveness so the crawler treats it as a
         // live (Zakura) peer instead of re-dialing it over legacy TCP.
-        let sent = tokio::select! {
+        let sent = zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => return,
             sent = address_book_updater.send(MetaAddr::new_responded(book_addr, None)) => sent,
@@ -526,63 +524,32 @@ async fn run_legacy_liveness_keeper(
             break;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => break,
-            _ = tokio::time::sleep(refresh_interval) => {}
+            _ = zakura_rt::time::sleep(refresh_interval) => {}
         }
     }
 }
 
+/// Resumes a task's panic on the caller, and otherwise returns its result.
+///
+/// A cancelled task stays an `Err`. This is `zakura_chain`'s
+/// `check_for_panics_with(false)` for `zakura_rt`'s `JoinError`, which
+/// `zakura-chain` can't name.
+fn resume_task_panic<T>(
+    result: Result<T, zakura_rt::task::JoinError>,
+) -> Result<T, zakura_rt::task::JoinError> {
+    result.map_err(|error| match error.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(error) => error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        error::Error,
-        net::{Ipv4Addr, SocketAddrV4},
-    };
-
-    use iroh::{
-        endpoint::Connection,
-        protocol::{AcceptError, ProtocolHandler, Router},
-        SecretKey,
-    };
-
     use super::*;
     use crate::{CacheDir, Config};
-
-    #[derive(Debug, Clone)]
-    struct SmokeProtocolHandler;
-
-    impl ProtocolHandler for SmokeProtocolHandler {
-        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn iroh_endpoint_starts_without_relay_or_discovery() -> Result<(), Box<dyn Error>> {
-        let secret_key = SecretKey::from_bytes(&[7; 32]);
-
-        let endpoint = direct_endpoint_builder(secret_key)
-            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
-            .bind()
-            .await?;
-
-        let router = Router::builder(endpoint)
-            .accept(b"/zakura/smoke/0", SmokeProtocolHandler)
-            .spawn();
-
-        let addr = router.endpoint().addr();
-
-        assert_eq!(addr.id, router.endpoint().id());
-        assert!(addr.ip_addrs().next().is_some());
-        assert!(addr.relay_urls().next().is_none());
-        assert!(router.endpoint().address_lookup()?.is_empty());
-
-        router.shutdown().await?;
-
-        Ok(())
-    }
 
     #[test]
     fn zakura_secret_key_path_uses_identity_dir() {

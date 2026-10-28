@@ -19,7 +19,7 @@ cache_dir   = "@@FORK@@"
 p2p_stack   = "zakura"  # pure Zakura P2P v2: block/header sync + tree_aux -> VCT fast path
 
 [network.zakura]
-# Bind on all interfaces - iroh uses one UDP socket for send+recv, so a loopback
+# Bind on all interfaces - the QUIC endpoint uses one UDP socket for send+recv, so a loopback
 # bind breaks OUTBOUND to external peers.
 listen_addr     = "0.0.0.0:8234"
 # Public mainnet Zakura bootstrap peers. No dev_network is set, so discovery uses
@@ -60,6 +60,6 @@ debug_stop_at_height = @@STOP@@
 
 [tracing]
 # Full-pipeline tracing: Zakura block-sync (BLOCK_SYNC_STATE + limiter), checkpoint
-# verifier, and the committer at debug. iroh + byte-budget-guard WARN spam silenced.
+# verifier, and the committer at debug. QUIC UDP + byte-budget-guard WARN spam silenced.
 # Output lands in the run's log: /mnt/roman-dev-2-data/feedrun-<LABEL>.log
-filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zakurad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zakurad::commands::start::zakura=debug"

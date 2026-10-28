@@ -2,17 +2,22 @@
 //!
 //! The fuzz loop runs each input with a [`crate::NullSink`], so a failing
 //! run leaves no trace and no `obs` digests. [`record_failure`] reruns the
-//! input twice on this thread. The first rerun records the trace and must
-//! violate the same property at the same step: the failure-consistency
+//! input twice, each on a new thread. The first rerun records the trace and
+//! must violate the same property at the same step: the failure-consistency
 //! check. The second rerun replays that trace Exact: the determinism check.
 //! A trace that passes both is saved under the property's directory, named
 //! by its ID.
 
 use std::{
     env, fs, io,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
 };
 
 use serde_json::Value;
@@ -54,8 +59,10 @@ pub fn artifacts_root() -> PathBuf {
 /// `first` must report `property` `Violated` in its property reports, so a
 /// `Known` violation that didn't end the run is recorded too.
 ///
-/// Each rerun builds a fresh `Sim` on this thread, after the last one shut
-/// down:
+/// Each rerun builds a fresh `Sim` on a new thread. A thread whose run
+/// leaked tasks parks for good, because the leaked tasks can still hold its
+/// thread-local state (#1694). So a run that leaked tasks, on the caller's
+/// thread or in the first rerun, never breaks a later rerun:
 ///
 /// 1. The first rerun writes the trace, with `input` as its `input.bin`. It
 ///    must report `property` `Violated` at the step `first` did.
@@ -70,7 +77,7 @@ pub fn artifacts_root() -> PathBuf {
 /// holds the same trace, the new copy is deleted and the saved one is
 /// returned.
 pub fn record_failure(
-    harness: &HarnessEntry,
+    harness: &'static HarnessEntry,
     scenario: &Value,
     input: &[u8],
     property: &PropertyId,
@@ -108,27 +115,32 @@ pub fn record_failure(
 /// Records `input` to `partial`, checks that the recording run violates
 /// `property` at `step`, then replays the trace Exact.
 fn record_and_replay(
-    harness: &HarnessEntry,
+    harness: &'static HarnessEntry,
     scenario: &Value,
     input: &[u8],
     property: &PropertyId,
     step: u64,
     partial: &Path,
 ) -> Result<Trace, RecordError> {
-    let plan = Plan::from_fuzz(&input[harness.scenario_bytes.min(input.len())..]);
-    let (trace, recorded) = write_trace(
-        harness,
-        scenario,
-        plan,
-        Some(input),
-        None,
-        partial,
-        |scenario, plan, sink| match (harness.run)(scenario, plan, sink) {
-            Ok(report) => Ok(report),
-            Err(HarnessError::Run { report, .. }) => Ok(*report),
-            Err(error) => Err(RecordError::Harness(error)),
-        },
-    )?;
+    let (scenario, input, partial) = (scenario.clone(), input.to_vec(), partial.to_path_buf());
+    let (trace, recorded) = on_new_thread(move || {
+        let plan = Plan::from_fuzz(&input[harness.scenario_bytes.min(input.len())..]);
+        let written = write_trace(
+            harness,
+            &scenario,
+            plan,
+            Some(&input),
+            None,
+            &partial,
+            |scenario, plan, sink| match (harness.run)(scenario, plan, sink) {
+                Ok(report) => Ok(report),
+                Err(HarnessError::Run { report, .. }) => Ok(*report),
+                Err(error) => Err(RecordError::Harness(error)),
+            },
+        );
+        let clean = matches!(&written, Ok((_, recorded)) if recorded.cleanup.leaked == 0);
+        (written, clean)
+    })?;
     let found = violated_at(&recorded, property);
     if found != Some(step) {
         return Err(RecordError::Nondeterministic {
@@ -141,10 +153,15 @@ fn record_and_replay(
             ),
         });
     }
-    let replayed = replay_with(&trace, harness, ReplayOptions::default()).map_err(|error| {
-        RecordError::Nondeterministic {
-            detail: format!("the replay of the recording failed: {error}"),
-        }
+    let recording = trace.clone();
+    let replayed = on_new_thread(move || {
+        let replayed = replay_with(&recording, harness, ReplayOptions::default());
+        let clean = matches!(&replayed, Ok(report)
+            if report.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
+        (replayed, clean)
+    })
+    .map_err(|error| RecordError::Nondeterministic {
+        detail: format!("the replay of the recording failed: {error}"),
     })?;
     if !replayed.verified() {
         return Err(RecordError::Nondeterministic {
@@ -157,6 +174,35 @@ fn record_and_replay(
         });
     }
     Ok(trace)
+}
+
+/// Runs `job` on a new thread and returns its value. `job` also returns
+/// whether its run ended with no leaked task. If not, or if `job` panicked,
+/// the thread parks for good, so nothing the leaked tasks hold is dropped or
+/// reused. A panic resumes on the caller's thread.
+fn on_new_thread<T: Send + 'static>(job: impl FnOnce() -> (T, bool) + Send + 'static) -> T {
+    let (done, result) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("zakura-sim-record".to_owned())
+        .spawn(move || {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(job));
+            let clean = matches!(outcome, Ok((_, true)));
+            // The caller waits on this, so the send can't fail.
+            let _ = done.send(outcome.map(|(value, _)| value));
+            if !clean {
+                loop {
+                    thread::park();
+                }
+            }
+        })
+        .expect("the OS can start a thread");
+    match result
+        .recv()
+        .expect("the thread sends its result before it parks or exits")
+    {
+        Ok(value) => value,
+        Err(payload) => panic::resume_unwind(payload),
+    }
 }
 
 /// The step of `property`'s first violation in `report`, if `report` says

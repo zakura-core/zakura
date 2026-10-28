@@ -338,7 +338,9 @@ fn a_reset_switches_the_node_to_the_fork() {
 /// node prepares the reset again and still switches to the fork. The
 /// invalid body is the old branch's, above the fork point, and its record
 /// waits for the last mirror's reset, so it races the node's steps. Long
-/// inputs keep the plan's choices fuzzed that late in the run.
+/// inputs keep the plan's choices fuzzed that late in the run. Few
+/// schedules win that race: of the first 48 seeded inputs, only the 12th
+/// does, so the test runs the first 12.
 #[test]
 fn an_invalid_body_between_the_reset_steps_prepares_it_again() {
     let holds = vec![
@@ -378,7 +380,7 @@ fn an_invalid_body_between_the_reset_steps_prepares_it_again() {
         ..scenario(12, holds, control)
     };
     let mut prepared_again = 0;
-    for input in inputs(8, 16_384) {
+    for input in inputs(12, 16_384) {
         let (report, ports) = run(&scenario, input);
         assert_converged(&ports);
         let picks = picks(&report);

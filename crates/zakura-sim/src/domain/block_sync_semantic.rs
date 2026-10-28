@@ -295,8 +295,6 @@ pub struct SemanticModel {
     pub saw_queued: bool,
     /// Whether virtual time advanced while the input queue held a body.
     pub saw_queued_at_idle: bool,
-    /// The most bodies the input queue held when virtual time advanced.
-    pub queued_at_idle_peak: usize,
     /// The largest decoded block a queued body held, in attributed bytes.
     pub queued_decoded_peak: u64,
 }
@@ -427,7 +425,6 @@ impl SemanticModel {
             Observation::BlockSync { event, .. } => self.block_sync(event, at),
             Observation::TimeAdvanced { .. } if !self.queued.is_empty() => {
                 self.saw_queued_at_idle = true;
-                self.queued_at_idle_peak = self.queued_at_idle_peak.max(self.queued.len());
             }
             _ => {}
         }

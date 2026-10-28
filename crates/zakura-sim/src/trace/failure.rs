@@ -22,7 +22,9 @@ use std::{
 
 use serde_json::Value;
 
-use super::{replay_with, ReplayOptions, Trace, TraceReader, TRACE_FILE};
+use super::{
+    replay_with, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, TRACE_FILE,
+};
 use crate::{
     check::PropertyOutcome,
     harness::{write_trace, HarnessEntry, HarnessError, RecordError},
@@ -153,15 +155,10 @@ fn record_and_replay(
             ),
         });
     }
-    let recording = trace.clone();
-    let replayed = on_new_thread(move || {
-        let replayed = replay_with(&recording, harness, ReplayOptions::default());
-        let clean = matches!(&replayed, Ok(report)
-            if report.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
-        (replayed, clean)
-    })
-    .map_err(|error| RecordError::Nondeterministic {
-        detail: format!("the replay of the recording failed: {error}"),
+    let replayed = replay_on_new_thread(trace.clone(), harness).map_err(|error| {
+        RecordError::Nondeterministic {
+            detail: format!("the replay of the recording failed: {error}"),
+        }
     })?;
     if !replayed.verified() {
         return Err(RecordError::Nondeterministic {
@@ -176,14 +173,30 @@ fn record_and_replay(
     Ok(trace)
 }
 
+/// Replays `trace` Exact on `harness` on a new thread, with
+/// [`on_new_thread`]'s isolation.
+pub(super) fn replay_on_new_thread(
+    trace: Trace,
+    harness: &'static HarnessEntry,
+) -> Result<ReplayReport, ReplayError> {
+    on_new_thread(move || {
+        let replayed = replay_with(&trace, harness, ReplayOptions::default());
+        let clean = matches!(&replayed, Ok(report)
+            if report.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
+        (replayed, clean)
+    })
+}
+
 /// Runs `job` on a new thread and returns its value. `job` also returns
 /// whether its run ended with no leaked task. If not, or if `job` panicked,
 /// the thread parks for good, so nothing the leaked tasks hold is dropped or
 /// reused. A panic resumes on the caller's thread.
-fn on_new_thread<T: Send + 'static>(job: impl FnOnce() -> (T, bool) + Send + 'static) -> T {
+pub(super) fn on_new_thread<T: Send + 'static>(
+    job: impl FnOnce() -> (T, bool) + Send + 'static,
+) -> T {
     let (done, result) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("zakura-sim-record".to_owned())
+        .name("zakura-sim-run".to_owned())
         .spawn(move || {
             let outcome = panic::catch_unwind(AssertUnwindSafe(job));
             let clean = matches!(outcome, Ok((_, true)));

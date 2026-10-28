@@ -54,9 +54,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
+    failure::{on_new_thread, replay_on_new_thread},
     meta::{Derivation, DerivationTool},
     read::refuse_symlinked_dir,
-    replay_with, ReadError, ReplayError, ReplayOptions, Trace, BLOBS_DIR, INPUT_FILE, TRACE_FILE,
+    ReadError, ReplayError, Trace, BLOBS_DIR, INPUT_FILE, TRACE_FILE,
 };
 pub use crate::plan::Candidate;
 use crate::{
@@ -255,6 +256,11 @@ impl From<io::Error> for ShrinkError {
 
 /// Shrinks `trace` on the registered harness its `meta.sim` names, writing
 /// into `out`, which must be missing or empty.
+///
+/// Every run (the confirm replay, each candidate, and the re-record and its
+/// replay) builds its `Sim` on a new thread. A run that leaks tasks parks
+/// its thread for good, so the tasks' thread-local state never breaks a
+/// later run (#1694).
 pub fn shrink(
     trace: &Trace,
     budget: ShrinkBudget,
@@ -270,7 +276,7 @@ pub fn shrink(
 /// re-records the best candidate so far.
 pub fn shrink_with(
     trace: &Trace,
-    harness: &HarnessEntry,
+    harness: &'static HarnessEntry,
     budget: ShrinkBudget,
     out: &Path,
     interrupt: &AtomicBool,
@@ -279,8 +285,7 @@ pub fn shrink_with(
 
     // Pass 1: confirm. The replay also refuses a build that isn't
     // equivalent to the recording one.
-    let confirmed =
-        replay_with(trace, harness, ReplayOptions::default()).map_err(ShrinkError::Confirm)?;
+    let confirmed = replay_on_new_thread(trace.clone(), harness).map_err(ShrinkError::Confirm)?;
     let end = trace
         .end
         .as_ref()
@@ -568,7 +573,7 @@ enum Choice {
 
 /// The state of one shrink.
 struct Shrinker<'a> {
-    harness: &'a HarnessEntry,
+    harness: &'static HarnessEntry,
     scenario: &'a Value,
     property: String,
     budget: ShrinkBudget,
@@ -740,15 +745,26 @@ impl Shrinker<'_> {
     /// Runs `init` and `steps` as a [`SkipScript`], and judges the run as a
     /// `violated` witness test of the property.
     fn run(&self, init: Vec<DrawRecord>, steps: Vec<Candidate>) -> Result<Run, WitnessError> {
-        let mut sink = MemorySink::default();
-        (self.harness.witness)(
-            self.scenario,
-            PlanInput::Skip(SkipScript::new(init, steps)),
-            &self.property,
-            Expect::Violated,
-            &mut sink,
-        )?;
-        Ok(Run::from_records(sink))
+        let (witness, scenario, property) = (
+            self.harness.witness,
+            self.scenario.clone(),
+            self.property.clone(),
+        );
+        on_new_thread(move || {
+            let mut sink = MemorySink::default();
+            let judged = witness(
+                &scenario,
+                PlanInput::Skip(SkipScript::new(init, steps)),
+                &property,
+                Expect::Violated,
+                &mut sink,
+            );
+            let clean = sink
+                .records
+                .iter()
+                .any(|record| matches!(record, Record::End(end) if end.cleanup.leaked == 0));
+            (judged.map(|()| Run::from_records(sink)), clean)
+        })
     }
 
     /// Appends `reduction` to [`REDUCTIONS_FILE`].
@@ -846,22 +862,34 @@ fn defaulted(base: &Run, choice: Choice) -> (Vec<DrawRecord>, Vec<Candidate>, St
 /// by the shrinker, and checks that it violates `property` with its trigger
 /// history and replays Exact. Returns the trace, or why it failed.
 fn rerecord(
-    harness: &HarnessEntry,
+    harness: &'static HarnessEntry,
     scenario: &Value,
     plan: &Plan,
     derivation: &Derivation,
     property: &str,
     out: &Path,
 ) -> Result<Trace, String> {
-    let what = RecordInput::Script {
-        scenario,
-        plan,
-        derived_from: Some(derivation),
-    };
-    let (trace, judged) = harness::record_witness(harness, what, out, property, Expect::Violated)
-        .map_err(|error| format!("recording failed: {error}"))?;
+    let (scenario, plan, derivation, property, out) = (
+        scenario.clone(),
+        plan.clone(),
+        derivation.clone(),
+        property.to_owned(),
+        out.to_path_buf(),
+    );
+    let (trace, judged) = on_new_thread(move || {
+        let what = RecordInput::Script {
+            scenario: &scenario,
+            plan: &plan,
+            derived_from: Some(&derivation),
+        };
+        let recorded = harness::record_witness(harness, what, &out, &property, Expect::Violated);
+        let clean = matches!(&recorded, Ok((trace, _))
+            if trace.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
+        (recorded, clean)
+    })
+    .map_err(|error| format!("recording failed: {error}"))?;
     judged.map_err(|error| format!("the re-recorded run fails the acceptance rule: {error}"))?;
-    replay_with(&trace, harness, ReplayOptions::default())
+    replay_on_new_thread(trace.clone(), harness)
         .map_err(|error| format!("the re-recorded trace doesn't replay: {error}"))?;
     Ok(trace)
 }

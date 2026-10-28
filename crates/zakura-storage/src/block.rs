@@ -100,7 +100,11 @@
 //!   duplicate (`KnownBlock` in zakura-consensus's block verifier), and
 //!   state refuses a hash it has already sent to the writer
 //!   (`non_finalized_block_write_sent_hashes`). The older submission's own
-//!   verdict may still fail.
+//!   verdict may still fail. The two are either/or: state replaces a
+//!   queued older copy or refuses the newer one
+//!   (`queue_and_commit_to_non_finalized_state`), so a newer copy that
+//!   reports a duplicate replaced nothing, and the older copy must reach a
+//!   verdict of its own.
 //! * State checks a body's header commitments against its parent's trees,
 //!   after it checks for a duplicate, so `payload_mismatch` waits for the
 //!   parent too ([`Gate::ParentCommitted`]). Full state checks them once
@@ -544,7 +548,8 @@ pub struct Conditions {
     pub committed: bool,
     /// The body's hash was committed when the run admitted it.
     pub committed_at_admission: bool,
-    /// A later admission of the same hash replaced this one.
+    /// A later admission of the same hash replaced this one and didn't
+    /// report a duplicate itself.
     pub replaced: bool,
     /// An older admission of the same hash is in flight.
     pub older_in_flight: bool,

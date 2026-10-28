@@ -536,6 +536,40 @@ jobs:
         env:
           RUSTFLAGS: --cfg zakura_sim
 
+  # Some witness tests need a run of most of a million simulated steps, which
+  # a debug build takes over twenty minutes for. They're ignored in
+  # `sim-build`, and this job runs them in a release build beside it, with its
+  # own target directory and cache key.
+  sim-slow-witnesses:
+    name: zakura_sim slow witnesses
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: target/sim-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+          cache-shared-key: zakura-sim-release
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      # #1523: the frontier-first input violates capacity-release-wakes, and
+      # the reply-first input holds it.
+      - name: Run the slow witness tests
+        run: |
+          cargo test --locked --release -p zakura-sim --test block_semantic_properties -- --ignored \
+            the_frontier_first_input_violates_capacity_release_wakes \
+            the_reply_first_input_holds_capacity_release_wakes
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+
   # The scheduler switches coroutine stacks in unsafe code, so its tests also
   # run in release mode and under AddressSanitizer on Linux x86_64. Each mode
   # has its own target directory and cache key. The ASan build turns on
@@ -675,6 +709,7 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
+      - sim-slow-witnesses
       - sim-sanitizers
       - zakura-testkit
     timeout-minutes: 30
@@ -689,11 +724,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build skips with the same test-relevant filter as build-tests,
-          # and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
+          # sim-build and sim-slow-witnesses skip with the same test-relevant
+          # filter as build-tests, and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
           # their build inputs change.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-slow-witnesses, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

@@ -1,0 +1,7 @@
+# The committed fuzz input `block-sync-stalled-reset.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes, `ff 0a`, pick the stalled-reset scenario: storage never
+# answers a submission, and a reset detaches the first one.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "ec74e6608369dfa70231f388ed39813d3e5804c884de8d8891f6d95712ca2967"

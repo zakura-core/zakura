@@ -5,8 +5,9 @@
 //! link. It labels each frame as the peer at the link's far end would, with
 //! P3a's role models for stream 6, records the label, and forwards the
 //! frame unchanged. A peer's frame to the node becomes an
-//! [`Observation::PeerFrame`], and a request that opens an exchange with
-//! the node an [`Observation::ExchangeOwed`] too. The node's frame to the
+//! [`Observation::PeerFrame`], a request that opens an exchange with the
+//! node an [`Observation::ExchangeOwed`] too, and a body an
+//! [`Observation::PeerBody`] with its height and hash. The node's frame to the
 //! peer becomes an [`Observation::NodeFrame`], labelled under the sender's
 //! rules, and a response the node writes an [`Observation::NodeOutput`]
 //! with the frame's own payload length. The probe's link has relays too, so
@@ -68,6 +69,7 @@ use super::tap::TapClock;
 use crate::{
     model::{CadenceModel, Charge, ExchangeModel, FrameHeader, FrameModel, Label, Owed, ReaderEnd},
     observe::{RowAt, StreamId},
+    storage::hex,
     Observation,
 };
 
@@ -851,7 +853,8 @@ impl Wire {
             panic!("a relay's connection has models, since its pipe made them");
         };
         let (obs, extra) = labeller.label(way, frame, now);
-        let height = frame_height(frame);
+        let decoded = BlockSyncMessage::decode_frame(frame.clone()).ok();
+        let height = decoded.as_ref().and_then(frame_height);
         let output = match way {
             Way::FromNode => node_output(connection, frame, height, &extra, labeller),
             Way::ToNode => None,
@@ -872,6 +875,19 @@ impl Wire {
                 None => Record::Obs(obs),
             },
         ));
+        if let (Way::ToNode, Some(BlockSyncMessage::Block(body))) = (way, &decoded) {
+            if let Some(height) = body.coinbase_height() {
+                state.records.push((
+                    after,
+                    Record::Obs(Observation::PeerBody {
+                        connection,
+                        seq,
+                        height: height.0,
+                        hash: hex(&body.hash().0),
+                    }),
+                ));
+            }
+        }
         // An ending's output closes its exchange before the exchanges
         // queued behind it open, which may share its key.
         if let Some(output) = output {
@@ -1023,10 +1039,9 @@ fn untaken(delivery: &Delivery, before: u64) -> bool {
     delivery.after < before && !delivery.taken && delivery.delivered.exchange.is_some()
 }
 
-/// The height a body frame carries, or the start an ending names, if the
-/// frame decodes.
-fn frame_height(frame: &Frame) -> Option<u32> {
-    match BlockSyncMessage::decode_frame(frame.clone()).ok()? {
+/// The height a decoded body frame carries, or the start an ending names.
+fn frame_height(message: &BlockSyncMessage) -> Option<u32> {
+    match message {
         BlockSyncMessage::Block(body) => body.coinbase_height().map(|height| height.0),
         BlockSyncMessage::BlocksDone { start_height, .. }
         | BlockSyncMessage::RangeUnavailable { start_height, .. } => Some(start_height.0),

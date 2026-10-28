@@ -1,0 +1,8 @@
+# The committed fuzz input `block-sync-stale-beside-current.bin`: the
+# harness that runs it, the generator version it was built for, and its
+# SHA-256. Its first two bytes, `ff 06`, pick the stale-beside-current
+# scenario: a reset detaches a held submission, whose late verdict reaches
+# block sync while the fork's first submission waits in storage.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "7e4b9454fbe9854a1441ef03ace3bb06c62d74d022c23a2d21c53a8197831075"

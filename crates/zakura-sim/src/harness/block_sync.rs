@@ -48,6 +48,7 @@ use super::{
     Subsystem,
 };
 use crate::{
+    domain::block_sync_semantic::semantic_properties,
     property::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
     },
@@ -184,8 +185,8 @@ impl HasView for Storage {
 
 impl Subsystem for Storage {
     const NAME: &'static str = "block-sync/storage";
-    const GENERATOR: u32 = 1;
-    const SCENARIO_BYTES: usize = 0;
+    const GENERATOR: u32 = 2;
+    const SCENARIO_BYTES: usize = 2;
     type Scenario = BlockScenario;
     type Prepared = Ports;
 
@@ -340,10 +341,12 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`storage_properties`] and [`table_wiring_properties`].
+    /// [`storage_properties`], [`table_wiring_properties`] and the
+    /// [semantic properties](semantic_properties).
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
         properties.extend(table_wiring_properties());
+        properties.extend(semantic_properties());
         properties
     }
 
@@ -352,9 +355,10 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The default scenario.
-    fn draw(_: &[u8]) -> BlockScenario {
-        BlockScenario::default()
+    /// The scenario the prefix's tag names, or the default scenario
+    /// ([`BlockScenario::drawn`]).
+    fn draw(prefix: &[u8]) -> BlockScenario {
+        BlockScenario::drawn(prefix)
     }
 }
 
@@ -420,14 +424,15 @@ pub fn table_wiring_properties<S: HasView>() -> Vec<Property<S>> {
 }
 
 /// What the harness's properties read: the node's storage facts, the
-/// relays' frames and the node's closes, plus the step loop's task
-/// observations.
+/// relays' frames and the node's closes, the step loop's task
+/// observations, and the view.
 pub fn storage_sources() -> Sources {
     Sources::observed(&[
         Source::Schedule,
         Source::Storage,
         Source::Frames,
         Source::Closes,
+        Source::View,
     ])
 }
 

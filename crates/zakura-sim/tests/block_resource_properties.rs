@@ -294,6 +294,41 @@ fn holder_inputs_the_model_cannot_apply_are_gaps() {
     }
 }
 
+/// A sequencer snapshot must list every holder the model folded other than
+/// the input queue's. A snapshot that lists a body whose retain event was
+/// dropped, or omits one the events hold, leaves the holders unknown.
+#[test]
+fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
+    let held = |holder| OwnerInput::Held {
+        holder,
+        height: 5,
+        bytes: 3,
+    };
+    let snapshot = |holders: &[BodyHolder]| OwnerInput::Snapshot {
+        holders: holders.iter().map(|holder| (*holder, 5, 3)).collect(),
+    };
+    let mut owners = OwnerModel::new(small_limits());
+    owners.apply(held(BodyHolder::Queued(1)));
+    owners.apply(held(BodyHolder::Applying(2)));
+    owners.apply(held(BodyHolder::Submitted(9)));
+    owners.apply(snapshot(&[
+        BodyHolder::Submitted(9),
+        BodyHolder::Applying(2),
+    ]));
+    assert_eq!(owners.holder_gap(), None);
+
+    let mut dropped = OwnerModel::new(small_limits());
+    dropped.apply(snapshot(&[BodyHolder::Reorder(1)]));
+    assert_eq!(dropped.retained(), 0);
+    assert!(dropped.holder_gap().is_some());
+
+    let mut omitted = OwnerModel::new(small_limits());
+    omitted.apply(held(BodyHolder::Reorder(1)));
+    omitted.apply(snapshot(&[]));
+    assert!(omitted.holder_gap().is_some());
+    assert_eq!(omitted.budget_gap(), None);
+}
+
 /// The budget's changes chain from the empty budget, at the configured
 /// maximum. A change from another count, or at another maximum, leaves the
 /// counter unknown.

@@ -217,6 +217,9 @@ pub(super) enum SequencerControlInput {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        /// The body-work epoch of the committed view that judged
+        /// `semantic_completion`.
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     },
 }
 
@@ -651,6 +654,7 @@ impl SequencerTask {
                 eligible_sources,
                 persisted_availability,
                 semantic_completion,
+                committed_epoch,
             } => {
                 let (needs_reaction, allow_submit) = self
                     .handle_apply_finished(
@@ -663,6 +667,7 @@ impl SequencerTask {
                         eligible_sources,
                         persisted_availability,
                         semantic_completion,
+                        committed_epoch,
                     )
                     .await;
                 if allow_submit {
@@ -884,6 +889,7 @@ impl SequencerTask {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) -> (bool, bool) {
         let result = outcome.result();
         // Frontier updates can remove applying entries before their completions.
@@ -916,7 +922,16 @@ impl SequencerTask {
             // semantic owner, but its slot still frees room for waiting
             // `applying` work. Without this wake that work waits for an
             // unrelated event (#1523).
-            let room_for_waiting_work = released && self.sequencer.unsubmitted_applying_count() > 0;
+            //
+            // The reactor can queue that completion before the epoch change
+            // that made it stale. Until this task holds the epoch the reactor
+            // judged against, the waiting work belongs to an older epoch, and
+            // the queued epoch change resets it and wakes submission itself.
+            let holds_committed_epoch =
+                self.current_scope.map(|scope| scope.body_work_epoch) == committed_epoch;
+            let room_for_waiting_work = released
+                && self.sequencer.unsubmitted_applying_count() > 0
+                && (semantic_completion.is_some() || holds_committed_epoch);
             return (
                 false,
                 room_for_waiting_work || (released && verified && semantic_completion.is_some()),
@@ -2000,6 +2015,7 @@ mod tests {
                 BTreeSet::new(),
                 None,
                 None,
+                Some(owner.authority.body_work_epoch),
             )
             .await,
             (false, false),
@@ -2108,6 +2124,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((owner, zakura_header_chain::StateVersion::new(7))),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await;
             (task, result)
@@ -2221,6 +2238,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((owner, zakura_header_chain::StateVersion::new(8))),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await;
             (task, result)
@@ -2335,6 +2353,7 @@ mod tests {
             BTreeSet::new(),
             None,
             Some((owner, zakura_header_chain::StateVersion::new(8))),
+            Some(owner.authority.body_work_epoch),
         )
         .await;
         let after = Instant::now();
@@ -2496,6 +2515,7 @@ mod tests {
                         BTreeSet::new(),
                         None,
                         Some((owner, zakura_header_chain::StateVersion::default())),
+                        Some(owner.authority.body_work_epoch),
                     )
                     .await,
                     (true, true),
@@ -2597,6 +2617,7 @@ mod tests {
                 BTreeSet::new(),
                 None,
                 Some((owner, zakura_header_chain::StateVersion::default())),
+                Some(owner.authority.body_work_epoch),
             );
             tokio::pin!(finish);
             assert!(
@@ -2713,6 +2734,7 @@ mod tests {
                     BTreeSet::new(),
                     None,
                     Some((semantic_owner, zakura_header_chain::StateVersion::default(),)),
+                    Some(owner.authority.body_work_epoch),
                 )
                 .await,
                 (true, true)

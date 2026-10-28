@@ -731,7 +731,8 @@ impl BlockSyncReactor {
                 hash,
                 outcome,
             } => {
-                let semantic_completion = self.body_completion_authority(source, &owner);
+                let (semantic_completion, committed_epoch) =
+                    self.body_completion_authority(source, &owner);
                 self.handle_block_apply_finished(
                     owner,
                     source,
@@ -740,6 +741,7 @@ impl BlockSyncReactor {
                     hash,
                     outcome,
                     semantic_completion,
+                    committed_epoch,
                 )
                 .await
             }
@@ -1583,6 +1585,7 @@ impl BlockSyncReactor {
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
         )>,
+        committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) {
         // The whole commit-pipeline body (token validate, applying removal,
         // throughput record, rollback + misbehavior, drain + submit) runs on the
@@ -1615,6 +1618,7 @@ impl BlockSyncReactor {
                 eligible_sources: self.registry.eligible_sources(height),
                 persisted_availability,
                 semantic_completion,
+                committed_epoch,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -1766,14 +1770,20 @@ impl BlockSyncReactor {
         }
     }
 
+    /// Judges a body completion against the latest committed view, and returns
+    /// that view's body-work epoch. The epoch can be ahead of the last one this
+    /// reactor forwarded to the sequencer.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
         owner: &zakura_header_chain::BodyWorkOwner,
-    ) -> Option<(
-        zakura_header_chain::BodyWorkOwner,
-        zakura_header_chain::StateVersion,
-    )> {
+    ) -> (
+        Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
+        Option<zakura_header_chain::BodyWorkEpoch>,
+    ) {
         let current = self
             .startup
             .committed_views
@@ -1781,28 +1791,36 @@ impl BlockSyncReactor {
             .and_then(|snapshots| snapshots.borrow().clone());
         #[cfg(test)]
         if current.is_none() {
-            return (self.body_work_scope() == Some(owner.authority()))
-                .then_some((*owner, zakura_header_chain::StateVersion::default()));
+            let scope = self.body_work_scope();
+            return (
+                (scope == Some(owner.authority()))
+                    .then_some((*owner, zakura_header_chain::StateVersion::default())),
+                scope.map(|scope| scope.body_work_epoch),
+            );
         }
-        let current = current?;
+        let Some(current) = current else {
+            return (None, None);
+        };
         let mut pending = zakura_header_chain::PendingOwners::default();
         pending.insert(source, *owner);
-        match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
-            zakura_header_chain::BodyCompletionDecision::Current => {
-                Some((*owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
-                Some((owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
-                metrics::counter!(
-                    "sync.header_chain.stale_completion.total",
-                    "kind" => format!("body_{reason:?}")
-                )
-                .increment(1);
-                None
-            }
-        }
+        let semantic_completion =
+            match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
+                zakura_header_chain::BodyCompletionDecision::Current => {
+                    Some((*owner, current.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
+                    Some((owner, current.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
+                    metrics::counter!(
+                        "sync.header_chain.stale_completion.total",
+                        "kind" => format!("body_{reason:?}")
+                    )
+                    .increment(1);
+                    None
+                }
+            };
+        (semantic_completion, Some(current.body_work_epoch))
     }
 
     fn next_needed_block_query_start(&self) -> Option<block::Height> {

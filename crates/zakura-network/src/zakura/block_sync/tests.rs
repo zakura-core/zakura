@@ -27,7 +27,9 @@ use super::{
     reorder::*,
     request::*,
     sequencer::*,
-    sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerTask},
+    sequencer_task::{
+        initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
+    },
     state::*,
     work_queue::WorkQueue,
 };
@@ -5353,6 +5355,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 test_work_owner(),
                 zakura_header_chain::StateVersion::default(),
             )),
+            committed_epoch: Some(test_work_owner().authority.body_work_epoch),
         })
         .expect("height 1 completion queues");
 
@@ -5384,6 +5387,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                     test_work_owner(),
                     zakura_header_chain::StateVersion::default(),
                 )),
+                committed_epoch: Some(test_work_owner().authority.body_work_epoch),
             })
             .expect("stale checkpoint completion queues");
     }
@@ -5574,6 +5578,12 @@ impl CappedSequencerTask {
                 persisted_availability: None,
                 semantic_completion: semantic_completion
                     .map(|owner| (owner, zakura_header_chain::StateVersion::default())),
+                committed_epoch: Some(
+                    semantic_completion
+                        .unwrap_or(owner)
+                        .authority
+                        .body_work_epoch,
+                ),
             })
             .expect("apply completion queues");
     }
@@ -5870,6 +5880,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                 eligible_sources: BTreeSet::new(),
                 persisted_availability: None,
                 semantic_completion: None,
+                committed_epoch: Some(changed_authority.body_work_epoch),
             })
             .expect("detached duplicate completion queues");
     }
@@ -5912,6 +5923,221 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     task.abort();
 }
 
+/// A sequencer task whose full count window was submitted under body-work
+/// epoch 0 and then detached by an epoch change.
+struct DetachedWindow {
+    blocks: Vec<Arc<block::Block>>,
+    body_tx: mpsc::Sender<SequencedBody>,
+    control_tx: mpsc::UnboundedSender<SequencerControlInput>,
+    actions_rx: mpsc::Receiver<BlockSyncAction>,
+    view_rx: watch::Receiver<SequencerView>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// The epoch 0 submissions, by ascending height.
+    detached: Vec<(
+        zakura_header_chain::BodyWorkOwner,
+        zakura_header_chain::SourceId,
+        BlockApplyToken,
+        Arc<block::Block>,
+    )>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DetachedWindow {
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// Spawn a sequencer task, fill its count window with epoch 0
+    /// submissions, and detach them with a change to `epoch`.
+    async fn spawn(epoch: u64) -> Self {
+        let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+        let block_count = u32::try_from(submission_limit).expect("401 fits in u32");
+        let frontiers = genesis_frontiers();
+        let (body_tx, body_rx) = mpsc::channel(submission_limit);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, actions_rx) = mpsc::channel(2 * submission_limit);
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), submission_limit),
+            ByteBudget::new(1),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Self::CHANNEL_TIMEOUT,
+            ZakuraTrace::noop(),
+        );
+        let mut window = Self {
+            blocks: fake_sequential_blocks(block_count),
+            body_tx,
+            control_tx,
+            actions_rx,
+            view_rx,
+            body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
+            detached: Vec::with_capacity(submission_limit),
+            task: tokio::spawn(task.run()),
+        };
+
+        for index in 0..window.blocks.len() {
+            window.send_body(test_work_owner(), index).await;
+        }
+        while window.detached.len() < submission_limit {
+            let action = time::timeout(Self::CHANNEL_TIMEOUT, window.actions_rx.recv())
+                .await
+                .expect("epoch 0 submission arrives")
+                .expect("sequencer action channel remains live");
+            match action {
+                BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } => window.detached.push((owner, source, token, block)),
+                action => panic!("unexpected epoch 0 action: {action:?}"),
+            }
+        }
+        window.change_epoch(epoch);
+        window
+    }
+
+    /// The current owner for `epoch`.
+    fn owner(epoch: u64) -> zakura_header_chain::BodyWorkOwner {
+        Self::authority(epoch).bind(test_work_owner().session_id, test_work_owner().request_id)
+    }
+
+    fn authority(epoch: u64) -> zakura_header_chain::BodyWorkAuthority {
+        let mut authority = test_work_scope();
+        authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(epoch);
+        authority
+    }
+
+    async fn send_body(&self, owner: zakura_header_chain::BodyWorkOwner, index: usize) {
+        let block = &self.blocks[index];
+        self.body_tx
+            .send(SequencedBody::new_queued(
+                owner,
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                block.coinbase_height().expect("test block has height"),
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                None,
+                peer(1),
+                Instant::now(),
+                self.body_input_bytes.clone(),
+                self.body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("bodies queue");
+    }
+
+    fn change_epoch(&self, epoch: u64) {
+        self.control_tx
+            .send(SequencerControlInput::BodyWorkEpochChanged {
+                authority: Self::authority(epoch),
+                frontiers: genesis_frontiers(),
+            })
+            .expect("epoch change queues");
+    }
+
+    /// Queue `epoch`'s bodies for heights 1 to `count`, and wait until they
+    /// wait in `applying` behind the detached window.
+    async fn queue_waiting(&mut self, epoch: u64, count: u32) {
+        for index in 0..count as usize {
+            self.send_body(Self::owner(epoch), index).await;
+        }
+        time::timeout(Self::CHANNEL_TIMEOUT, async {
+            loop {
+                let view = *self.view_rx.borrow_and_update();
+                if view.unsubmitted_applying_count == u64::from(count) {
+                    break;
+                }
+                self.view_rx
+                    .changed()
+                    .await
+                    .expect("sequencer view remains live");
+            }
+        })
+        .await
+        .expect("the bodies wait behind the detached window");
+        self.expect_no_submission("the detached submissions fill the count window")
+            .await;
+    }
+
+    /// Finish the `count` highest detached submissions, which no `applying`
+    /// entry holds, as stale completions judged against `committed_epoch`.
+    fn finish_highest_detached(&mut self, count: u32, committed_epoch: u64) {
+        for _ in 0..count {
+            let (owner, source, token, block) =
+                self.detached.pop().expect("a detached submission remains");
+            let height = block.coinbase_height().expect("test block has height");
+            assert!(
+                height.0 > count,
+                "no applying entry holds height {height:?}"
+            );
+            self.control_tx
+                .send(SequencerControlInput::ApplyFinished {
+                    owner: Box::new(owner),
+                    source,
+                    token,
+                    height,
+                    hash: block.hash(),
+                    outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+                    eligible_sources: BTreeSet::new(),
+                    persisted_availability: None,
+                    semantic_completion: None,
+                    committed_epoch: Some(zakura_header_chain::BodyWorkEpoch::new(committed_epoch)),
+                })
+                .expect("detached completion queues");
+        }
+    }
+
+    /// Wait for the submission of `height` and return its owner.
+    async fn expect_submission(&mut self, height: u32) -> zakura_header_chain::BodyWorkOwner {
+        time::timeout(Self::CHANNEL_TIMEOUT, async {
+            loop {
+                let action = self
+                    .actions_rx
+                    .recv()
+                    .await
+                    .expect("sequencer action channel remains live");
+                if let BlockSyncAction::SubmitBlock { owner, block, .. } = action {
+                    assert_eq!(block.coinbase_height(), Some(block::Height(height)));
+                    return owner;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freed room wakes height {height}"))
+    }
+
+    async fn expect_no_submission(&mut self, reason: &str) {
+        assert!(
+            next_submission(&mut self.actions_rx, Self::MISSING_SUBMISSION_TIMEOUT)
+                .await
+                .is_none(),
+            "{reason}",
+        );
+    }
+}
+
 /// #1523: an epoch change detaches a full submission window. The new epoch's
 /// bodies for heights 1 to 3 wait in `applying`. Detached completions for
 /// heights 399 to 401, which no `applying` entry holds, each free a slot with
@@ -5919,147 +6145,49 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
 #[tokio::test]
 async fn stale_completions_without_applying_entries_wake_waiting_work() {
     const WAITING: u32 = 3;
-    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
 
-    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
-    let block_count = u32::try_from(submission_limit).expect("401 fits in u32");
-    let blocks = fake_sequential_blocks(block_count);
-    let frontiers = genesis_frontiers();
-    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (body_tx, body_rx) = mpsc::channel(submission_limit);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let (actions_tx, mut actions_rx) = mpsc::channel(2 * submission_limit);
-    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-    let task = SequencerTask::new(
-        Sequencer::new(block::Height(0), submission_limit),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
-        Arc::new(PeerRegistry::new()),
-        actions_tx,
-        ThroughputMeter::new(Instant::now()),
-        frontiers,
-        Some(test_work_scope()),
-        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
-        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
-        body_rx,
-        control_rx,
-        body_input_bytes.clone(),
-        body_input_decoded_attributed_memory_bytes.clone(),
-        view_tx,
-        CHANNEL_TIMEOUT,
-        ZakuraTrace::noop(),
-    );
-    let task = tokio::spawn(task.run());
-    let queued = |owner, block: &Arc<block::Block>| {
-        SequencedBody::new_queued(
-            owner,
-            zakura_header_chain::SourceId::from_digest([1; 32]),
-            block.coinbase_height().expect("test block has height"),
-            block.hash(),
-            block.header.previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block))),
-            u64::from(block_size(block)),
-            None,
-            peer(1),
-            Instant::now(),
-            body_input_bytes.clone(),
-            body_input_decoded_attributed_memory_bytes.clone(),
-        )
-    };
+    let mut window = DetachedWindow::spawn(1).await;
+    window.queue_waiting(1, WAITING).await;
 
-    for block in &blocks {
-        body_tx
-            .send(queued(test_work_owner(), block))
-            .await
-            .expect("old epoch bodies queue");
-    }
-    let mut detached = Vec::with_capacity(submission_limit);
-    while detached.len() < submission_limit {
-        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
-            .await
-            .expect("old epoch submission arrives")
-            .expect("sequencer action channel remains live");
-        match action {
-            BlockSyncAction::SubmitBlock {
-                owner,
-                source,
-                token,
-                block,
-            } => detached.push((owner, source, token, block)),
-            action => panic!("unexpected old epoch action: {action:?}"),
-        }
+    window.finish_highest_detached(WAITING, 1);
+    for height in 1..=WAITING {
+        window.expect_submission(height).await;
     }
 
-    let mut changed_authority = test_work_scope();
-    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
-    control_tx
-        .send(SequencerControlInput::BodyWorkEpochChanged {
-            authority: changed_authority,
-            frontiers,
-        })
-        .expect("scope transition queues");
-    let current_owner =
-        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
-    for block in blocks.iter().take(WAITING as usize) {
-        body_tx
-            .send(queued(current_owner, block))
-            .await
-            .expect("current epoch bodies queue");
-    }
-    time::timeout(CHANNEL_TIMEOUT, async {
-        loop {
-            let view = *view_rx.borrow_and_update();
-            if view.unsubmitted_applying_count == u64::from(WAITING) {
-                break;
-            }
-            view_rx
-                .changed()
-                .await
-                .expect("sequencer view remains live");
-        }
-    })
-    .await
-    .expect("the current epoch's bodies wait behind the detached window");
-    assert!(
-        next_submission(&mut actions_rx, Duration::from_millis(100))
-            .await
-            .is_none(),
-        "the detached submissions fill the count window",
-    );
+    window.task.abort();
+}
 
-    for (owner, source, token, block) in detached.into_iter().rev().take(WAITING as usize) {
-        let height = block.coinbase_height().expect("test block has height");
-        assert!(
-            height.0 > WAITING,
-            "no applying entry holds height {height:?}"
-        );
-        control_tx
-            .send(SequencerControlInput::ApplyFinished {
-                owner: Box::new(owner),
-                source,
-                token,
-                height,
-                hash: block.hash(),
-                outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-                eligible_sources: BTreeSet::new(),
-                persisted_availability: None,
-                semantic_completion: None,
-            })
-            .expect("detached completion queues");
-    }
+/// F-312: the reactor judges a completion against the latest committed view,
+/// but forwards that view's epoch change separately, so the completion can
+/// reach the sequencer first. Epoch 1's bodies wait behind the detached
+/// window when completions judged against epoch 2 free room. Epoch 1's work
+/// is already invalid, so none of it may be submitted. Epoch 2's change then
+/// resets it, and the freed room goes to epoch 2's bodies.
+#[tokio::test]
+async fn stale_completions_ahead_of_their_epoch_change_wake_no_invalid_work() {
+    const WAITING: u32 = 3;
 
-    for expected_height in 1..=WAITING {
-        let (_, block) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
-            .await
-            .unwrap_or_else(|| panic!("freed room wakes height {expected_height}"));
+    let mut window = DetachedWindow::spawn(1).await;
+    window.queue_waiting(1, WAITING).await;
+
+    window.finish_highest_detached(WAITING, 2);
+    window
+        .expect_no_submission("the freed room waits for epoch 2's change")
+        .await;
+
+    window.change_epoch(2);
+    for index in 0..WAITING as usize {
+        window.send_body(DetachedWindow::owner(2), index).await;
+    }
+    for height in 1..=WAITING {
+        let owner = window.expect_submission(height).await;
         assert_eq!(
-            block.coinbase_height(),
-            Some(block::Height(expected_height))
+            owner.authority.body_work_epoch,
+            zakura_header_chain::BodyWorkEpoch::new(2),
         );
     }
 
-    task.abort();
+    window.task.abort();
 }
 
 #[test]

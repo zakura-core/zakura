@@ -99,9 +99,21 @@
 //! * State decides `payload_mismatch` and a `Storage` retry after it checks
 //!   for a duplicate, so they need the hash not to be committed
 //!   ([`Gate::NotCommitted`]).
-//! * The verifier reaches `consensus_invalid` and the other retryable kinds
-//!   before state's duplicate check, so another submission of the same hash
-//!   can commit first. They are always legal after admission.
+//! * Both verifiers check for a committed hash before any consensus rule.
+//!   The full verifier asks state for the hash first and reports a
+//!   committed one as a duplicate (`KnownBlock` in zakura-consensus's block
+//!   verifier). The checkpoint verifier refuses a height at or below its
+//!   verified progress, which covers every committed block, before its body
+//!   checks (`check_height`'s `AlreadyVerified`). So `consensus_invalid`
+//!   needs the hash not to be committed when the verifier received it
+//!   ([`Gate::NewAtAdmission`]). The run admits lazily, so admission is
+//!   when the verifier receives the body. A commit by another submission
+//!   after admission doesn't close the gate: the verifier has passed its
+//!   check by then.
+//! * The other retryable kinds stay legal after admission
+//!   ([`RetryKind::gate`]). A failed duplicate check gives a retryable
+//!   verdict even for a committed hash (`Depth`), and the contract doesn't
+//!   narrow the kinds by their source.
 //!
 //! # Verdicts
 //!
@@ -499,6 +511,8 @@ pub enum Gate {
     KnownToState,
     /// The body's hash isn't committed.
     NotCommitted,
+    /// The body's hash wasn't committed when the verifier received it.
+    NewAtAdmission,
 }
 
 /// What the service knows about a pending operation when it lists its
@@ -513,6 +527,8 @@ pub struct Conditions {
     pub parent_committed: bool,
     /// The body's hash is committed.
     pub committed: bool,
+    /// The body's hash was committed when the run admitted it.
+    pub committed_at_admission: bool,
     /// A later admission of the same hash replaced this one.
     pub replaced: bool,
     /// An older admission of the same hash is in flight.
@@ -530,6 +546,7 @@ impl Gate {
                 conditions.committed || conditions.replaced || conditions.older_in_flight
             }
             Gate::NotCommitted => !conditions.committed,
+            Gate::NewAtAdmission => !conditions.committed_at_admission,
         }
     }
 }
@@ -612,7 +629,7 @@ static CONTRACTS: [OpContract; 8] = [
                     OutcomeFamily::PayloadMismatch,
                     OutcomeFamily::One(
                         BlockOutcome::Verdict(Verdict::ConsensusInvalid),
-                        Gate::Always,
+                        Gate::NewAtAdmission,
                     ),
                     OutcomeFamily::Retryable,
                     OutcomeFamily::One(

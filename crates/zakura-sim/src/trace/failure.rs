@@ -22,7 +22,7 @@ use crate::{
     check::PropertyOutcome,
     harness::{write_trace, HarnessEntry, HarnessError, RecordError},
     property::PropertyId,
-    RunReport,
+    Plan, RunReport,
 };
 
 /// The variable that names the directory saved failures go under.
@@ -115,12 +115,13 @@ fn record_and_replay(
     step: u64,
     partial: &Path,
 ) -> Result<Trace, RecordError> {
-    let plan = &input[harness.scenario_bytes.min(input.len())..];
+    let plan = Plan::from_fuzz(&input[harness.scenario_bytes.min(input.len())..]);
     let (trace, recorded) = write_trace(
         harness,
         scenario,
         plan,
         Some(input),
+        None,
         partial,
         |scenario, plan, sink| match (harness.run)(scenario, plan, sink) {
             Ok(report) => Ok(report),

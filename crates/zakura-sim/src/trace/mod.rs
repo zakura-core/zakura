@@ -4,7 +4,8 @@
 //! `init`, then one line per step and `end` last. Beside it, `input.bin`
 //! holds the fuzz input that produced the run, if bytes did, and `blobs/`
 //! holds fixtures by SHA-256. [`replay`] reruns a trace Exact on an
-//! equivalent build.
+//! equivalent build, and [`shrink`] reduces a failing trace to fewer
+//! non-default picks.
 //!
 //! A trace directory isn't a security boundary. The reader bounds what it
 //! allocates (see [`MAX_TRACE_BYTES`] and the limits beside it), and refuses
@@ -15,10 +16,12 @@
 //! own ancestors are followed, and on Windows a path can change between the
 //! check and the open.
 
+pub mod explain;
 pub mod failure;
 pub mod meta;
 pub mod read;
 pub mod replay;
+pub mod shrink;
 mod verify;
 pub mod write;
 
@@ -26,8 +29,10 @@ pub use failure::{artifacts_root, record_failure, ARTIFACTS_VAR, TRACES_DIR};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
 pub use replay::{
-    replay, replay_with, ReplayError, ReplayOptions, ReplayReport, OBSERVATIONS_FILE,
+    replay, replay_explained, replay_explained_with, replay_with, ReplayError, ReplayOptions,
+    ReplayReport, OBSERVATIONS_FILE,
 };
+pub use shrink::{shrink, shrink_with, Candidate, ShrinkBudget, ShrinkError, ShrinkReport};
 pub use write::{BlobStore, FileSink};
 
 /// The records, one JSON object per line.

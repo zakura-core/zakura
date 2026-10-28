@@ -10,11 +10,15 @@
 //! loop's own: [`NO_TASK_PANIC`] always, and [`NO_LIVELOCK`] while the
 //! scenario's [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
+pub mod block_node;
+pub mod block_semantic;
+pub mod block_sync;
 pub mod coverage;
 pub mod discovery;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod policy;
 mod record;
 
 use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
@@ -401,6 +405,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
+    entry::<block_sync::Storage>(),
 ];
 
 /// The harness named `name`.

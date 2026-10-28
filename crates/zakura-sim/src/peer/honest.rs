@@ -155,6 +155,12 @@ impl HonestChain {
         }
     }
 
+    /// The height of the header `hash` on this chain, the anchor's
+    /// included.
+    pub(super) fn height(&self, hash: block::Hash) -> Option<u32> {
+        self.heights.get(&hash.0).copied()
+    }
+
     /// The header at `height`, as a frontier.
     pub(super) fn at(&self, height: u32) -> Frontier {
         match height.checked_sub(1) {
@@ -233,8 +239,8 @@ impl Honest {
     ) -> Self {
         Honest {
             spec,
+            models: StreamModels::new(Instant::now(), chain.clone()),
             chain,
-            models: StreamModels::new(Instant::now()),
             serving: BTreeMap::new(),
             served: 0,
             subscribed: None,
@@ -252,7 +258,7 @@ impl Honest {
     /// opened on it, and its first `Status` if it announces.
     pub(crate) fn start_stream(&mut self) -> Vec<Outgoing> {
         let now = Instant::now();
-        self.models = StreamModels::new(now);
+        self.models = StreamModels::new(now, self.chain.clone());
         self.serving.clear();
         self.node_status = None;
         self.status_due = now + self.refresh;

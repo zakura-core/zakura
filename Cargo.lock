@@ -2752,6 +2752,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
+ "serde_json",
  "sha2",
  "syn",
  "tempfile",
@@ -3462,6 +3463,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "zakura-chain",
  "zakura-header-chain",
  "zakura-network",
@@ -3486,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.1"
+version = "11.1.0"
 dependencies = [
  "chrono",
  "derive-new",

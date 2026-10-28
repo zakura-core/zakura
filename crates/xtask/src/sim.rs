@@ -11,7 +11,7 @@ use std::{env, error::Error, ffi::OsString, fmt, path::Path, process::Command};
 use crate::{run_command, BoxError, CommandError};
 
 /// The simulator build's flag.
-const SIM_RUSTFLAGS: &str = "--cfg zakura_sim";
+pub(super) const SIM_RUSTFLAGS: &str = "--cfg zakura_sim";
 
 /// A `zakura-sim` run that exited with `code`, which xtask exits with too:
 /// the binary's codes are its contract, 2 for a usage error and 1 for a

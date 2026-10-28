@@ -20,8 +20,9 @@ use crate::{
 /// it. Version 2 replaced storage operation events with typed storage facts
 /// and states. Version 3 added header-sync reactor events. Version 4 added
 /// datagram observations. Version 5 added the reactor's misbehavior event.
-/// Version 6 added transport events and session identity rows.
-pub const FORMAT_VERSION: u32 = 6;
+/// Version 6 added transport events and session identity rows. Version 7
+/// added scripted peers' `peer-written` and `peer-received` records.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -676,7 +677,7 @@ mod tests {
         ];
         let bump = "a reactor observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test";
-        assert_eq!(FORMAT_VERSION, 6, "{bump}");
+        assert_eq!(FORMAT_VERSION, 7, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
             r#"[{"obs":"reactor","instance":0,"seq":1,"storage_seq":11,"node":"node","event":{"event":"dispatched","call":1,"port":{"kind":"locator","peer":"01","session_id":7,"target":"bb","scope":{"header_generation":2,"branch":{"anchor":"aa","target":"bb"}}}}},{"obs":"reactor","instance":0,"seq":2,"storage_seq":12,"node":"node","event":{"event":"dispatched","call":2,"port":{"kind":"vct-context","owner":{"kind":"body-repair","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"verified_generation":5,"body_work_epoch":6,"session_id":7,"request_id":8},"height":3}}},{"obs":"reactor","instance":0,"seq":3,"storage_seq":13,"node":"node","event":{"event":"dispatched","call":3,"port":{"kind":"prepare","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":4,"storage_seq":14,"node":"node","event":{"event":"dispatched","call":4,"port":{"kind":"apply","peer":"01","source":"02","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8}}}},{"obs":"reactor","instance":0,"seq":5,"storage_seq":15,"node":"node","event":{"event":"call-ended","call":1,"end":"timed-out","op":null}},{"obs":"reactor","instance":0,"seq":6,"storage_seq":16,"node":"node","event":{"event":"call-ended","call":3,"end":"replied","op":9}},{"obs":"reactor","instance":0,"seq":7,"storage_seq":17,"node":"node","event":{"event":"handled","call":1,"panicked":false}},{"obs":"reactor","instance":0,"seq":8,"storage_seq":18,"node":"node","event":{"event":"started","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"purpose":{"purpose":"normal"}}},{"obs":"reactor","instance":0,"seq":9,"storage_seq":19,"node":"node","event":{"event":"retired","request":{"peer":"01","session_id":7,"request_id":8,"owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":7,"request_id":8},"target":"bb"},"phase":"applying","purpose":{"purpose":"selected-auxiliary-repair","selected_target":{"height":3,"hash":"cc"},"repair_generation":4},"reason":"snapshot_obsolete"}},{"obs":"reactor","instance":0,"seq":10,"storage_seq":20,"node":"node","event":{"event":"offer-waiting","peer":"01","session_id":7,"target":"bb","cause":"staging-full"}},{"obs":"reactor","instance":0,"seq":11,"storage_seq":21,"node":"node","event":{"event":"misbehavior","peer":"01","reason":"invalid-header","origin":6,"current":7}}]"#,
@@ -705,7 +706,7 @@ mod tests {
         ];
         let bump = "a datagram observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test";
-        assert_eq!(FORMAT_VERSION, 6, "{bump}");
+        assert_eq!(FORMAT_VERSION, 7, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
             r#"[{"obs":"datagram","id":0,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"sent","sent_at":5000000},{"obs":"datagram","id":0,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"delivered","sent_at":5000000},{"obs":"datagram","id":1,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"lost","sent_at":5000000},{"obs":"datagram","id":2,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"unbound","sent_at":5000000}]"#,
@@ -916,10 +917,52 @@ mod tests {
         ];
         let bump = "a transport observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test";
-        assert_eq!(FORMAT_VERSION, 6, "{bump}");
+        assert_eq!(FORMAT_VERSION, 7, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
             r#"[{"obs":"transport","instance":0,"seq":1,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"negotiated","local":1024,"offered":1536,"negotiated":1024}},{"obs":"transport","instance":0,"seq":2,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"handshake-refused","reason":"duplicate"}},{"obs":"transport","instance":0,"seq":3,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"registered"}},{"obs":"transport","instance":0,"seq":4,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"admitted","quic_stream":4,"kind":5,"version":9,"session_id":7,"limits":{"max_frame_bytes":1,"max_message_bytes":2,"max_open_streams":3,"max_inbound_queue_depth":4,"idle_timeout_ms":5,"prelude_timeout_ms":6,"control_timeout_ms":7,"stream_open_rate_per_second":8,"message_rate_per_second":9},"inbound_depth":4,"outbound_depth":4096}},{"obs":"session","connection":1,"peer":"peer-0","quic_stream":4,"kind":5,"version":9,"session_id":7},{"obs":"transport","instance":0,"seq":5,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"header-read","quic_stream":4,"seq":0,"message_type":3,"flags":0,"payload_len":300}},{"obs":"transport","instance":0,"seq":6,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-read","quic_stream":4,"seq":0}},{"obs":"transport","instance":0,"seq":7,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":0,"outcome":{"outcome":"reserved","objects":1,"bytes":300}}}},{"obs":"transport","instance":0,"seq":8,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":1,"outcome":{"outcome":"admitted-terminal"}}}},{"obs":"transport","instance":0,"seq":9,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"header-checked","seq":2,"outcome":{"outcome":"refused","reason":"unsolicited"}}}},{"obs":"transport","instance":0,"seq":10,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"page-claimed","seq":0,"objects":1,"bytes":300}}},{"obs":"transport","instance":0,"seq":11,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"end-claimed","subscription":2}}},{"obs":"transport","instance":0,"seq":12,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"publication-ended","subscription":3}}},{"obs":"transport","instance":0,"seq":13,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-applied","subscription":3,"objects":250,"bytes":65750,"seq":null}}},{"obs":"transport","instance":0,"seq":14,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"close-applied","subscription":3}}},{"obs":"transport","instance":0,"seq":15,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-applied","subscription":3,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":16,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-issued","subscription":2,"objects":250,"bytes":65750}}},{"obs":"transport","instance":0,"seq":17,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"open-retracted","subscription":2}}},{"obs":"transport","instance":0,"seq":18,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"regulated","quic_stream":4,"transition":{"transition":"grant-issued","subscription":2,"objects":1,"bytes":263}}},{"obs":"transport","instance":0,"seq":19,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"stream-refused","quic_stream":8,"kind":4,"version":2,"reason":"unknown_kind"}},{"obs":"transport","instance":0,"seq":20,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-write-started","quic_stream":4,"seq":0,"message_type":1}},{"obs":"transport","instance":0,"seq":21,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"frame-written","quic_stream":4,"seq":0,"message_type":1}},{"obs":"transport","instance":0,"seq":22,"node":"node","connection":null,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":null}},{"obs":"transport","instance":0,"seq":23,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"close-decided","cause":"unexpected_stream"}},{"obs":"transport","instance":0,"seq":24,"node":"node","connection":1,"remote":"10.1.0.1:4000","event":{"event":"torn-down"}}]"#,
+            "{bump}"
+        );
+    }
+
+    /// Pins a scripted peer's write and receive records, with and without
+    /// credit, and the format version.
+    #[test]
+    fn peer_record_encoding_is_pinned() {
+        use crate::observe::PeerCredit;
+
+        let obs = [
+            Observation::PeerWritten {
+                connection: 1,
+                quic_stream: 4,
+                seq: 0,
+            },
+            Observation::PeerReceived {
+                connection: 1,
+                quic_stream: 4,
+                seq: 1,
+                message_type: 2,
+                payload: 139,
+                credit: Some(PeerCredit {
+                    objects: 250,
+                    bytes: 65_750,
+                }),
+            },
+            Observation::PeerReceived {
+                connection: 1,
+                quic_stream: 4,
+                seq: 2,
+                message_type: 3,
+                payload: 263,
+                credit: None,
+            },
+        ];
+        let bump = "a peer record's encoding changed, which changes `obs` digests, so bump \
+             FORMAT_VERSION and update this test";
+        assert_eq!(FORMAT_VERSION, 7, "{bump}");
+        assert_eq!(
+            serde_json::to_string(&obs).unwrap(),
+            r#"[{"obs":"peer-written","connection":1,"quic_stream":4,"seq":0},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":1,"message_type":2,"payload":139,"credit":{"objects":250,"bytes":65750}},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":2,"message_type":3,"payload":263,"credit":null}]"#,
             "{bump}"
         );
     }

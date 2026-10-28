@@ -6,13 +6,23 @@
 //! [`PeerSpec`] names, keeps the header stream it negotiated open and read,
 //! and carries out its scripted [`PeerAction`]s.
 //!
+//! A peer with an [`HonestSpec`] runs the [`Honest`] script on its header
+//! streams (M5-D). Every frame a peer sends there is labelled by its
+//! [`StreamModels`] before the write and logged as a `PeerFrame`, then as a
+//! `PeerWritten` once the write returns, and every frame it reads from the
+//! node is logged as a `PeerReceived`. Each record names its connection and
+//! QUIC stream from the identity map, never from draw order, so it waits in
+//! [`PeerControl`] until the node's transport has admitted its stream.
+//!
 //! Actions follow M4's `Control` pattern. [`PeerControl`] offers a peer's
 //! next action as `peer:<name>:<action>` only while the peer is settled and
 //! idle, so the `Plan` picks when it happens, `execute` only queues it, and
 //! the peer's task carries it out. So at most one action is queued per
 //! peer.
 
+mod evidence;
 pub(crate) mod handshake;
+pub mod honest;
 
 use std::{
     cell::{Cell, RefCell},
@@ -20,12 +30,15 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
-    v9::RegtestMessage, P2P_V2_ALPN, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    v9::{Message, Operation, RegtestMessage},
+    wire_codec::{decode_frame, encode_frame},
+    Frame, P2P_V2_ALPN, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
     ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_quic::{
@@ -33,11 +46,24 @@ use zakura_quic::{
     Acceptor, Admit, Conn, IncomingInfo, NodeAddr, QuicBindConfig, QuicConfig, QuicEndpoint,
     RecvStream, SendStream, VarInt,
 };
-use zakura_rt::sync::{mpsc, watch};
+use zakura_rt::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use zakura_scheduler::SimInstant;
 
-use self::handshake::{Echo, Local};
-use crate::{ActionSource, Boundary, Identity, ObservationLog};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody};
+use self::{
+    evidence::WireEvidence,
+    handshake::{Echo, Local},
+    honest::{Honest, HonestChain, HonestSpec},
+};
+use crate::{
+    model::{CadenceModel, Charge, FrameHeader, FrameModel, Labels, ReaderEnd, SubscriptionModel},
+    observe::{PeerCredit, StreamId},
+    table::rule_row,
+    ActionSource, Boundary, Identity, ObservationLog,
+};
 
 /// The node's address on the run's network.
 pub const NODE_ADDR: SocketAddr =
@@ -109,6 +135,9 @@ pub struct PeerSpec {
     /// Its actions, in order.
     #[serde(default)]
     pub script: Vec<PeerAction>,
+    /// If set, it runs the honest script on its header streams.
+    #[serde(default)]
+    pub honest: Option<HonestSpec>,
 }
 
 impl PeerSpec {
@@ -119,6 +148,7 @@ impl PeerSpec {
             capabilities: ZAKURA_CAP_HEADER_SYNC,
             bad_nonce_echo: false,
             script: Vec::new(),
+            honest: None,
         }
     }
 
@@ -152,6 +182,9 @@ pub enum PeerAction {
     /// After a [`PeerAction::Close`], dials again from a fresh address, once
     /// the production handshake timeout has passed. Only a dialing peer can.
     Redial,
+    /// Releases one held grant of an honest subscriber, offered once its
+    /// quiet time after the last page has passed.
+    Grant,
 }
 
 impl PeerAction {
@@ -162,6 +195,7 @@ impl PeerAction {
             PeerAction::FinishHeader => "finish-header",
             PeerAction::Close => "close",
             PeerAction::Redial => "redial",
+            PeerAction::Grant => "grant",
         }
     }
 }
@@ -227,14 +261,20 @@ struct Slot {
 pub struct PeerControl {
     slots: Vec<Slot>,
     failure: PeerFailure,
+    /// What the peers' tasks recorded, until the identity map places it.
+    records: PeerRecords,
+    evidence: WireEvidence,
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`.
-    pub(crate) fn new(failure: PeerFailure) -> Self {
+    /// No peers yet. Failures land in `failure`, and the peers' tasks
+    /// record into `records`.
+    pub(crate) fn new(failure: PeerFailure, records: PeerRecords) -> Self {
         PeerControl {
             slots: Vec::new(),
             failure,
+            records,
+            evidence: WireEvidence::default(),
         }
     }
 
@@ -289,12 +329,16 @@ impl ActionSource for PeerControl {
         slot.next += 1;
     }
 
-    /// Fails the run once a peer couldn't carry out an action.
-    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
-        match self.failure.borrow().as_ref() {
-            Some(failure) => Err(format!("PeerActionFailed: {failure}")),
-            None => Ok(()),
+    /// Fails the run once a peer couldn't carry out an action. Otherwise
+    /// logs the peers' records the identity map can place, and what the
+    /// node's evidence means for P3b's checks ([`WireEvidence`]). This
+    /// source is added after the transport tap, so the identity rows it
+    /// reads are logged first.
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if let Some(failure) = self.failure.borrow().as_ref() {
+            return Err(format!("PeerActionFailed: {failure}"));
         }
+        self.evidence.observe(&self.records, log)
     }
 }
 
@@ -315,6 +359,10 @@ pub(crate) struct PeerTask {
     pub(crate) failure: PeerFailure,
     /// Set once a listening peer serves, so the node's dial finds it.
     pub(crate) listening: watch::Sender<bool>,
+    /// Its chain, if it runs the honest script.
+    pub(crate) chain: Option<Arc<HonestChain>>,
+    /// Where it records its frames.
+    pub(crate) records: PeerRecords,
 }
 
 /// How a connection's service ended.
@@ -329,8 +377,220 @@ enum Ended {
 enum StreamEvent {
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
-    /// The node's first whole frame arrived on header stream `id`.
-    FirstFrame { id: u64 },
+    /// A whole frame from the node arrived on header stream `id`.
+    Frame { id: u64, frame: Frame },
+}
+
+/// The bytes of a plain `Headers` page's fixed fields: the subscription ID,
+/// the target, the parent's height and hash, the count, the marker and the
+/// schema.
+pub(crate) const PAGE_FIXED_BYTES: usize = 8 + 32 + 4 + 32 + 4 + 1 + 1;
+
+/// The bytes of one plain Regtest page entry: a 177-byte header and its
+/// 4-byte body-size hint.
+pub(crate) const ENTRY_BYTES: usize = 177 + 4;
+
+/// A labelled frame, encoded, for a peer to write.
+pub(crate) struct Outgoing {
+    /// The frame's bytes, header included.
+    bytes: Vec<u8>,
+    /// What its `PeerFrame` records.
+    record: RecordBody,
+}
+
+/// One header stream's role models, which label each frame a peer sends
+/// before the write and follow each frame it reads from the node (P3a).
+pub(crate) struct StreamModels {
+    /// When the stream started, the cadence model's origin.
+    start: Instant,
+    frames: FrameModel,
+    /// The header-sync subscription row, in both directions.
+    pub(crate) subscriptions: SubscriptionModel,
+    cadence: CadenceModel,
+    /// Frames labelled so far, the next one's `seq`.
+    sent: u64,
+}
+
+/// The model session of a header stream: each stream has models of its own.
+const SESSION: u64 = 0;
+
+/// The subscription row the models follow.
+fn subscription_row() -> u16 {
+    RegtestMessage::ROWS
+        .iter()
+        .find(|row| {
+            matches!(
+                row.role,
+                zakura_network::zakura::MessageRole::Subscription { .. }
+            )
+        })
+        .expect("header sync has a subscription row")
+        .message_type
+}
+
+impl StreamModels {
+    /// Fresh models for a stream that starts at `start`.
+    pub(crate) fn new(start: Instant) -> Self {
+        StreamModels {
+            start,
+            frames: FrameModel::new(&RegtestMessage::ROWS, ReaderEnd::Persistent),
+            subscriptions: SubscriptionModel::new(&RegtestMessage::ROWS, subscription_row())
+                .expect("the row is a subscription"),
+            cadence: CadenceModel::new(),
+            sent: 0,
+        }
+    }
+
+    /// Labels `message` with the models and encodes it. A conformant frame
+    /// changes the models as its sending does. One with a header fault
+    /// labels its role on a copy, so it changes nothing.
+    pub(crate) fn send(&mut self, message: &RegtestMessage) -> Outgoing {
+        let frame = encode_frame(message).expect("the honest script builds valid messages");
+        let header = FrameHeader {
+            message_type: frame.message_type,
+            flags: frame.flags,
+            payload_len: frame.payload.len(),
+        };
+        let header_labels = self.frames.labels(&header);
+        let mut copy;
+        let subscriptions = if header_labels.is_conformant() {
+            &mut self.subscriptions
+        } else {
+            copy = self.subscriptions.clone();
+            &mut copy
+        };
+        let (role, exchange) = match message {
+            Message::Status(_) => (Labels::NONE, None),
+            Message::SubscribeHeaders(update) => {
+                let (id, sequence) = (update.subscription_id, update.update_sequence);
+                let acknowledged = u64::from(update.acknowledged.height.0);
+                let labels = match update.operation {
+                    Operation::Open => subscriptions.open_frame(
+                        SESSION,
+                        id,
+                        sequence,
+                        update.added_credit,
+                        acknowledged,
+                    ),
+                    Operation::Grant => subscriptions.grant_frame(
+                        SESSION,
+                        id,
+                        sequence,
+                        acknowledged,
+                        update.added_credit,
+                    ),
+                    Operation::Close => {
+                        subscriptions.close_frame(SESSION, id, sequence, acknowledged)
+                    }
+                };
+                (labels, Some(id))
+            }
+            Message::Headers(page) => {
+                let id = page.subscription_id;
+                let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
+                let last = u64::from(page.common_ancestor_height.0) + u64::from(count);
+                let labels = subscriptions.page_frame(SESSION, id, count, header.payload_len, last);
+                (labels, Some(id))
+            }
+            Message::HeadersOutcome(outcome) => {
+                let id = outcome.subscription_id;
+                (subscriptions.ending_frame(SESSION, id), Some(id))
+            }
+        };
+        let label = header_labels.union(role).first();
+        let stream = &RegtestMessage::LAYOUT[0];
+        let id = |stream: &zakura_network::zakura::Stream| StreamId {
+            kind: stream.kind,
+            version: stream.version,
+        };
+        let (row, rule_stream) = match self.frames.row(header.message_type) {
+            Some(row) => {
+                let (rule_stream, rule) = rule_row(&RegtestMessage::LAYOUT, stream, row, label);
+                (Some(rule.name.to_owned()), id(rule_stream))
+            }
+            None => (None, id(stream)),
+        };
+        let exhausted = self.frames.row(header.message_type).is_some_and(|row| {
+            let now = Instant::now().saturating_duration_since(self.start);
+            self.cadence.charge(SESSION, stream.version, row, now) == Charge::Exhausted
+        });
+        let seq = self.sent;
+        self.sent += 1;
+        Outgoing {
+            bytes: frame
+                .encode(stream.frame_cap)
+                .expect("a valid message fits the frame cap"),
+            record: RecordBody::Frame {
+                seq,
+                row,
+                rule_stream,
+                label,
+                exhausted,
+                exchange,
+                // A frame's payload is under its 2 MiB cap.
+                payload: header.payload_len as u64,
+            },
+        }
+    }
+
+    /// Follows the node's `message`, `payload_len` bytes long, as the
+    /// models' node side: its own subscription updates, and its pages and
+    /// outcomes on this peer's subscription.
+    pub(crate) fn receive(&mut self, message: &RegtestMessage, payload_len: usize) {
+        let models = &mut self.subscriptions;
+        match message {
+            Message::Status(_) => {}
+            Message::SubscribeHeaders(update) => {
+                let id = update.subscription_id;
+                let acknowledged = u64::from(update.acknowledged.height.0);
+                match update.operation {
+                    Operation::Open => {
+                        models.subscribe(SESSION, id, update.added_credit, acknowledged);
+                    }
+                    Operation::Grant => {
+                        // The node grants once it accepted the pages through
+                        // the cursor it acknowledges.
+                        models.accept(SESSION, id, acknowledged);
+                        models.grant(SESSION, id, update.added_credit);
+                    }
+                    Operation::Close => {
+                        models.accept(SESSION, id, acknowledged);
+                        models.close(SESSION, id);
+                    }
+                }
+            }
+            Message::Headers(page) => {
+                let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
+                let last = u64::from(page.common_ancestor_height.0) + u64::from(count);
+                models.send_page(SESSION, page.subscription_id, count, payload_len, last);
+            }
+            Message::HeadersOutcome(outcome) => {
+                models.end(SESSION, outcome.subscription_id);
+                models.terminal_written(SESSION, outcome.subscription_id);
+            }
+        }
+    }
+}
+
+/// The credit `message` adds, if it's an `Open` or a `Grant`.
+fn credit(message: &RegtestMessage) -> Option<PeerCredit> {
+    match message {
+        Message::SubscribeHeaders(update) if update.operation != Operation::Close => {
+            Some(PeerCredit {
+                objects: update.added_credit.objects,
+                bytes: update.added_credit.bytes,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The header stream a peer writes on.
+struct HeaderStream {
+    id: u64,
+    send: SendStream,
+    /// Frames read from the node so far, the next one's `seq`.
+    read: u64,
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
@@ -371,11 +631,10 @@ impl Acceptor for Forward {
 }
 
 /// Reads frames from the node on header stream `id` until it ends, and
-/// reports the first whole one. Every read is drained, so the node's writer
+/// forwards each whole one. Every read is drained, so the node's writer
 /// never stalls on this peer.
 async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSender<StreamEvent>) {
     let cap = usize::try_from(RegtestMessage::LAYOUT[0].frame_cap).unwrap_or(usize::MAX);
-    let mut first = true;
     loop {
         let mut header = [0; 8];
         if recv.read_exact(&mut header).await.is_err() {
@@ -392,7 +651,12 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
         if recv.read_exact(&mut payload).await.is_err() {
             return;
         }
-        if std::mem::take(&mut first) && events.send(StreamEvent::FirstFrame { id }).is_err() {
+        let frame = Frame {
+            message_type: u16::from_le_bytes([header[0], header[1]]),
+            flags: u16::from_le_bytes([header[2], header[3]]),
+            payload,
+        };
+        if events.send(StreamEvent::Frame { id, frame }).is_err() {
             return;
         }
     }
@@ -430,12 +694,17 @@ impl PeerTask {
     /// Runs the peer until the run ends.
     pub(crate) async fn run(mut self) {
         let local = Local::regtest();
+        let mut honest = match (self.spec.honest.clone(), self.chain.clone()) {
+            (Some(spec), Some(chain)) => Some(Honest::new(spec, chain)),
+            (None, None) => None,
+            _ => unreachable!("the harness gives a chain to exactly the honest peers"),
+        };
         match self.spec.dialer {
-            Dialer::Peer => self.dial(&local).await,
+            Dialer::Peer => self.dial(&local, &mut honest).await,
             Dialer::Node if self.spec.script.contains(&PeerAction::Redial) => {
                 self.fail("only a dialing peer can redial");
             }
-            Dialer::Node => self.listen(&local).await,
+            Dialer::Node => self.listen(&local, &mut honest).await,
         }
         // The endpoint stays up, so nothing the node holds closes under it.
         std::future::pending::<()>().await;
@@ -468,7 +737,7 @@ impl PeerTask {
 
     /// Dials the node, from a fresh address each time, until a connection
     /// ends without a [`PeerAction::Redial`] after it.
-    async fn dial(&mut self, local: &Local) {
+    async fn dial(&mut self, local: &Local, honest: &mut Option<Honest>) {
         let mut dial = 0;
         loop {
             let quic = self.bind(dial);
@@ -480,7 +749,8 @@ impl PeerTask {
             else {
                 return;
             };
-            if let Ended::Failed = self.serve(&conn, negotiated).await {
+            let remote = peer_addr(self.index, dial);
+            if let Ended::Failed = self.serve(&conn, negotiated, remote, honest).await {
                 return;
             }
             // Only a redial may follow a closed connection.
@@ -505,7 +775,7 @@ impl PeerTask {
     }
 
     /// Listens for the node's dials, and answers each one's handshake.
-    async fn listen(&mut self, local: &Local) {
+    async fn listen(&mut self, local: &Local, honest: &mut Option<Honest>) {
         let quic = self.bind(0);
         let (forward, mut incoming) = mpsc::channel(4);
         quic.serve(Forward(forward))
@@ -521,7 +791,10 @@ impl PeerTask {
                 handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
                     .await;
             let ended = match answered {
-                Ok(negotiated) => self.serve(&conn, negotiated).await,
+                Ok(negotiated) => {
+                    self.serve(&conn, negotiated, peer_addr(self.index, 0), honest)
+                        .await
+                }
                 Err(_) => {
                     conn.closed().await;
                     Ended::Closed
@@ -533,16 +806,55 @@ impl PeerTask {
         }
     }
 
-    /// Serves one connection whose handshake negotiated `negotiated`, until
-    /// it closes. The peer is ready for an action while it's idle and
-    /// settled: no header stream is expected, or the node's first frame has
-    /// arrived on it, which the node sends once it admits the session.
-    async fn serve(&mut self, conn: &Conn, negotiated: u64) -> Ended {
+    /// Records `body` on `remote`'s QUIC stream `quic_stream`, for
+    /// [`PeerControl`] to place.
+    fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
+        self.records.borrow_mut().push_back(PeerRecord {
+            remote,
+            quic_stream,
+            body,
+        });
+    }
+
+    /// Writes `frames` on `stream` in order, recording each one's
+    /// `PeerFrame` before its write and its `PeerWritten` after. False once
+    /// a write fails, which leaves the rest unwritten.
+    async fn write(
+        &self,
+        remote: SocketAddr,
+        stream: &mut HeaderStream,
+        frames: Vec<Outgoing>,
+    ) -> bool {
+        for frame in frames {
+            let RecordBody::Frame { seq, .. } = frame.record else {
+                unreachable!("an outgoing frame records a PeerFrame");
+            };
+            self.record(remote, stream.id, frame.record);
+            if stream.send.write_all(&frame.bytes).await.is_err() {
+                return false;
+            }
+            self.record(remote, stream.id, RecordBody::Written { seq });
+        }
+        true
+    }
+
+    /// Serves one connection from `remote` whose handshake negotiated
+    /// `negotiated`, until it closes. The peer is ready for an action while
+    /// it's idle and settled: no header stream is expected, or the node's
+    /// first frame has arrived on it, which the node sends once it admits
+    /// the session, and the honest script, if it runs one, is settled too.
+    async fn serve(
+        &mut self,
+        conn: &Conn,
+        negotiated: u64,
+        remote: SocketAddr,
+        honest: &mut Option<Honest>,
+    ) -> Ended {
         let header_sync = negotiated & ZAKURA_CAP_HEADER_SYNC != 0;
         let (events, mut stream_events) = mpsc::unbounded_channel();
         zakura_rt::task::spawn_named("peer_accept", accept_streams(conn.clone(), events.clone()));
         // The header stream the peer writes on, and whether it's settled.
-        let mut header: Option<(u64, SendStream)> = None;
+        let mut header: Option<HeaderStream> = None;
         let mut settled = !header_sync;
         if header_sync && self.spec.dialer == Dialer::Peer {
             let Ok((mut send, recv)) = conn.open_bi().await else {
@@ -559,15 +871,58 @@ impl PeerTask {
             }
             let id = send.id();
             zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, events.clone()));
-            header = Some((id, send));
+            let mut stream = HeaderStream { id, send, read: 0 };
+            if let Some(honest) = honest.as_mut() {
+                let frames = honest.start_stream();
+                if !self.write(remote, &mut stream, frames).await {
+                    return Ended::Closed;
+                }
+            }
+            header = Some(stream);
         }
         loop {
-            self.readiness.set(settled);
+            let now = Instant::now();
+            let ready = settled && honest.as_ref().is_none_or(Honest::settled);
+            self.readiness.set(ready);
+            // The honest script's next timer: its refresh, or when it may
+            // become settled, which makes the peer ready.
+            let deadline = honest.as_ref().map(|honest| {
+                honest
+                    .wake()
+                    .filter(|wake| *wake > now)
+                    .map_or(honest.deadline(), |wake| wake.min(honest.deadline()))
+            });
+            let mut frames = Vec::new();
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
-                    StreamEvent::Header { id, send } => header = Some((id, send)),
-                    StreamEvent::FirstFrame { id } => {
-                        settled |= header.as_ref().is_some_and(|(current, _)| *current == id);
+                    StreamEvent::Header { id, send } => {
+                        header = Some(HeaderStream { id, send, read: 0 });
+                        if let Some(honest) = honest.as_mut() {
+                            frames = honest.start_stream();
+                        }
+                    }
+                    StreamEvent::Frame { id, frame } => {
+                        let Some(stream) = header.as_mut().filter(|stream| stream.id == id) else {
+                            continue;
+                        };
+                        settled = true;
+                        let seq = stream.read;
+                        stream.read += 1;
+                        let Ok(message) = decode_frame::<RegtestMessage>(&frame) else {
+                            return self.fail(format!(
+                                "the node's frame {seq} on stream {id} doesn't decode"
+                            ));
+                        };
+                        self.record(remote, id, RecordBody::Received {
+                            seq,
+                            message_type: frame.message_type,
+                            // A frame's payload is under its 2 MiB cap.
+                            payload: frame.payload.len() as u64,
+                            credit: credit(&message),
+                        });
+                        if let Some(honest) = honest.as_mut() {
+                            frames = honest.receive(&message, frame.payload.len());
+                        }
                     }
                 },
                 Some(action) = self.commands.recv() => {
@@ -575,10 +930,10 @@ impl PeerTask {
                     match action {
                         PeerAction::Open { kind, version } => open(conn, kind, version).await,
                         PeerAction::FinishHeader => {
-                            let Some((_, mut send)) = header.take() else {
+                            let Some(mut stream) = header.take() else {
                                 return self.fail("can't finish-header without a header stream");
                             };
-                            let _ = send.finish();
+                            let _ = stream.send.finish();
                             // A responder waits for the node to reopen it.
                             settled = self.spec.dialer == Dialer::Peer;
                         }
@@ -588,10 +943,27 @@ impl PeerTask {
                             return Ended::Closed;
                         }
                         PeerAction::Redial => return self.fail("can't redial a live connection"),
+                        PeerAction::Grant => {
+                            match honest.as_mut().map(Honest::release_grant) {
+                                Some(Ok(released)) => frames = released,
+                                Some(Err(why)) => return self.fail(why),
+                                None => return self.fail("can't grant without the honest script"),
+                            }
+                        }
+                    }
+                }
+                () = zakura_rt::time::sleep_until(deadline.unwrap_or(now)), if deadline.is_some() => {
+                    if let Some(honest) = honest.as_mut() {
+                        frames = honest.tick();
                     }
                 }
                 _ = conn.closed() => {
                     self.readiness.set(false);
+                    return Ended::Closed;
+                }
+            }
+            if let Some(stream) = header.as_mut() {
+                if !frames.is_empty() && !self.write(remote, stream, frames).await {
                     return Ended::Closed;
                 }
             }

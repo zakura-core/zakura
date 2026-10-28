@@ -526,6 +526,14 @@ impl SubscriptionModel {
         Labels::NONE
     }
 
+    /// The credit the node granted on its live subscription `key` and the
+    /// peer's conformant pages haven't spent, in each unit. `None` if `key`
+    /// isn't live.
+    pub fn unspent(&self, session: SessionId, key: ExchangeKey) -> Option<Totals> {
+        let live = self.subscribers.get(&session)?.live.get(&key)?;
+        Some(live.granted.minus(live.consumed).unwrap_or_default())
+    }
+
     /// Labels the peer's terminal outcome for `key` on `session`, and ends
     /// the subscription if conformant.
     pub fn ending_frame(&mut self, session: SessionId, key: ExchangeKey) -> Labels {

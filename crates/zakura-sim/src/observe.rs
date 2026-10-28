@@ -323,6 +323,33 @@ pub enum Observation {
         /// The node's session ID for it.
         session_id: u64,
     },
+    /// A scripted peer's write of one frame finished: `write_all` returned.
+    /// The frame's [`Observation::PeerFrame`] came first.
+    PeerWritten {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// The frame's position among the peer's writes on the stream, from
+        /// 0.
+        seq: u64,
+    },
+    /// A scripted peer read and decoded one frame the node wrote.
+    PeerReceived {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// The frame's position among the node's writes on the stream, from
+        /// 0, as the node's `frame-written` numbers it.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+        /// The payload's length in bytes, frame header excluded.
+        payload: u64,
+        /// The credit an update adds, for an `Open` or `Grant`.
+        credit: Option<PeerCredit>,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -1141,6 +1168,16 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+}
+
+/// The credit one subscription update adds, in
+/// [`Observation::PeerReceived`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PeerCredit {
+    /// Objects, such as headers.
+    pub objects: u32,
+    /// Payload bytes.
+    pub bytes: u32,
 }
 
 /// A connection's limits after negotiation, in [`TransportFact::Admitted`],

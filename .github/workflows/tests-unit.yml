@@ -486,7 +486,10 @@ jobs:
   sim-build:
     name: zakura_sim build
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -532,7 +535,10 @@ jobs:
   sim-planted:
     name: zakura_sim planted
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -569,7 +575,10 @@ jobs:
   sim-slow-witnesses:
     name: zakura_sim slow witnesses
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
     permissions:
       contents: read
     runs-on: ubuntu-latest

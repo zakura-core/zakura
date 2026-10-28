@@ -1631,9 +1631,10 @@ mod tests {
         SemanticModel::of(&history.log).input_findings
     }
 
-    /// The scripted bypass for [`INPUT_DECODED_BOUND`]: a lone routine keeps
+    /// A scripted history for [`INPUT_DECODED_BOUND`]: a lone routine keeps
     /// its decoded copies although `applying` already fills the cap, so its
-    /// second body passes the cap by more than one body.
+    /// second body passes the cap by more than one body. The property's
+    /// bypass is `no-room-check.patch`; this test pins the check's slack.
     #[test]
     fn a_decoded_handoff_past_the_cap_violates_input_decoded_bound() {
         let findings = decoded_handoffs(1, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, 2);

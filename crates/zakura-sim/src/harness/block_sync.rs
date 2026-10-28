@@ -318,9 +318,16 @@ impl BlockScenario {
     /// height 7, so each request for it times out; `mirror-3`'s link closes
     /// once the node has asked storage to admit four bodies, which retires
     /// its routine; and the chain resets to a fork from height 12 at 12 s of
-    /// virtual time, after the 8 s request timeout. Pausing from height 6
-    /// leaves a routine free to ask for height 7 before the timeout under
-    /// the default plan.
+    /// virtual time, after the 8 s request timeout.
+    ///
+    /// The pause starts at height 6, not 5. From height 5, some plans leave
+    /// free only a routine that never completed a request. That routine has
+    /// no RTprop sample, so it defers the floor to the paused routines,
+    /// which still publish free slots and measured RTprops. No routine then
+    /// asks for height 7 before the reset. Main shows the same deferral on
+    /// 7 of 24 plans. From height 6, the routine that delivered height 5
+    /// stays free and measured, and all 24 plans ask for height 7 before
+    /// the timeout.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(

@@ -65,5 +65,17 @@ priority_rules:
       - 'label~=^P-(Optional|Low)'
     allow_checks_interruption: true
     priority: low
+
+# Lockfile changes pull new or updated third-party code into the build, so they
+# need a second reviewer. This posts the "Mergify Merge Protections" check run,
+# which the main branch ruleset must list as required to block manual merges too.
+merge_protections:
+  - name: Cargo.lock changes need two approvals
+    description: Any pull request that modifies a Cargo.lock needs two approving reviews.
+    if:
+      - files ~= (^|/)Cargo\.lock$
+    success_conditions:
+      - "#approved-reviews-by >= 2"
+
 merge_protections_settings:
   reporting_method: check-runs

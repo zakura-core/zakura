@@ -17,15 +17,15 @@ use zakura_sim::{
     harness::{
         header_node::{Chain, Policy},
         header_sync::{HeaderWire, WireScenario},
-        run_prepared, HarnessError, Subsystem,
+        run_prepared, HarnessError, LinkEntry, LinkSpec, NetScenario, Subsystem,
     },
     model::{is_fault_cause, FrameModel, Label, ReaderEnd},
-    observe::TransportFact,
+    observe::{TransitionFact, TransportFact},
     peer::{
-        adversary::{Act, AdversarySpec, ContentRule, Row},
+        adversary::{Act, AdversarySpec, ContentRule, Row, CROSSING_LINK_MS},
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         limit::ADVERSARY_RATE,
-        PeerAction, PeerSpec,
+        peer_addr, PeerAction, PeerSpec, NODE_ADDR,
     },
     property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
     table::table_properties,
@@ -159,6 +159,7 @@ fn cases() -> Vec<Act> {
         Act::ExtraEnding,
         Act::ExtraEndingAhead,
         Act::AfterClose,
+        Act::UnretainedOpen,
         Act::OutcomeCrossing,
         Act::BadCursor,
         Act::StatusBurst,
@@ -275,11 +276,25 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
         }
         _ => (PRELOAD, adversary(PRELOAD, None, quiet, script)),
     };
+    let mut net = NetScenario::default();
+    if matches!(act, Act::UnretainedOpen | Act::OutcomeCrossing) {
+        // The node's ending takes longer to arrive than the crossing
+        // `Grant` waits, so the `Grant` crosses it in flight.
+        net.links.push(LinkEntry {
+            src: NODE_ADDR,
+            dst: peer_addr(0, 0),
+            model: LinkSpec {
+                min_delay_ms: CROSSING_LINK_MS,
+                max_delay_ms: CROSSING_LINK_MS + 100,
+                ..LinkSpec::default()
+            },
+        });
+    }
     WireScenario {
+        net,
         node: Chain::main(node),
         peers: vec![peer],
         policy: Policy::converging(),
-        ..WireScenario::default()
     }
 }
 
@@ -289,6 +304,7 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
 fn script(act: Act) -> Vec<Act> {
     match act {
         Act::OverLive => vec![Act::SecondOpen, Act::OverLive],
+        Act::OutcomeCrossing => vec![Act::UnretainedOpen, Act::OutcomeCrossing],
         // 602 tokens, in bursts of 40, with two more each second. The
         // default plan picks a burst opened by the rate limiter only after
         // its next timer, so bursts come in pairs 10 s apart, which drain
@@ -365,7 +381,7 @@ fn act_frame(report: &RunReport, act: Act) -> Sent {
     let on_row = |frame: &&Sent| frame.row.as_deref() == Some(logged_row(act));
     let found = match act {
         Act::StatusBurst => after.iter().find(|frame| frame.exhausted),
-        Act::OutcomeCrossing | Act::ExtraEndingAhead => after.iter().filter(on_row).nth(1),
+        Act::ExtraEndingAhead => after.iter().filter(on_row).nth(1),
         Act::UndeclaredType { .. } => after.iter().find(|frame| frame.row.is_none()),
         _ => after.iter().find(on_row),
     };
@@ -461,13 +477,14 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
     assert_eq!(frame.label, act.label(), "{act:?}");
     let (judged, read) = judged_and_read(&report, &frame);
     let judged = judged.unwrap_or_else(|| panic!("{act:?}: its frame was never judged"));
-    let at = match read {
-        Some(read) if read < judged => Stage::Frame,
-        _ => Stage::Header,
-    };
-    assert_eq!(at, stage(act), "{act:?}: judged at the wrong stage");
-    if at == Stage::Header {
-        assert_eq!(read, None, "{act:?}: a header-stage fault was read whole");
+    // A header-stage judgement's `FrameJudged` follows every reader event of
+    // its step, so only the absence of a read tells the stages apart.
+    match stage(act) {
+        Stage::Header => assert_eq!(read, None, "{act:?}: a header-stage fault was read whole"),
+        Stage::Frame => assert!(
+            read.is_some_and(|read| read < judged),
+            "{act:?}: judged before its payload was read"
+        ),
     }
     let property = judging_property(&frame);
     assert!(
@@ -485,8 +502,39 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
         let cause = cause.unwrap_or_else(|| panic!("{act:?}: no close"));
         assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
     }
+    if act == Act::OutcomeCrossing {
+        crossed(&report, &frame);
+    }
     assert_eq!(report.end.violation, None, "{act:?}");
     Checked { report, frame }
+}
+
+/// Requires that the crossing `Grant`, `frame`, crossed the node's ending
+/// in flight: the node wrote the ending before the peer sent the `Grant`,
+/// and the peer read it only after.
+fn crossed(report: &RunReport, frame: &Sent) {
+    let entries = report.log.entries();
+    let written = entries.iter().position(|entry| {
+        matches!(&entry.obs, Observation::Transport {
+            connection: Some(connection),
+            event: TransportFact::FrameWritten { quic_stream, message_type: 4, .. },
+            ..
+        } if (*connection, *quic_stream) == (frame.connection, frame.quic_stream))
+    });
+    let received = entries.iter().position(|entry| {
+        matches!(entry.obs, Observation::PeerReceived { connection, quic_stream, message_type: 4, .. }
+            if (connection, quic_stream) == (frame.connection, frame.quic_stream))
+    });
+    assert!(
+        written.is_some_and(|written| written < frame.at),
+        "the node wrote its ending before the Grant: {written:?}, {}",
+        frame.at
+    );
+    assert!(
+        received.is_some_and(|received| received > frame.at),
+        "the peer read the ending after the Grant: {received:?}, {}",
+        frame.at
+    );
 }
 
 /// Every act of the table, one focused plan each, with `SuccessOnly`
@@ -595,13 +643,33 @@ fn second_open_is_tolerated_and_third_is_not() {
             let (judged, read) = judged_and_read(&report, frame);
             assert!(judged.is_some() && read.is_some_and(|read| Some(read) < judged));
         }
-        let (second_judged, _) = judged_and_read(&report, &second);
-        let cause_at = report.log.entries().iter().position(|entry| {
+        let entries = report.log.entries();
+        let (third_judged, _) = judged_and_read(&report, &third);
+        let applied = entries.iter().position(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Transport {
+                    event: TransportFact::Regulated {
+                        transition: TransitionFact::OpenApplied {
+                            subscription: 2,
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            )
+        });
+        assert!(
+            applied.is_some_and(|at| Some(at) < third_judged),
+            "the node applied the second Open before the third was judged"
+        );
+        let closed_at = entries.iter().position(|entry| {
             matches!(entry.obs, Observation::ConnectionClosed { connection, .. } if connection == second.connection)
         });
         assert!(
-            cause_at.is_some_and(|at| Some(at) > second_judged),
-            "the close came after the second Open was judged"
+            closed_at.is_some_and(|at| Some(at) > third_judged),
+            "the close came only after the third Open was judged"
         );
         let cause = close_cause(&report, third.connection).expect("the third closed");
         assert!(is_fault_cause(&cause), "{cause}");

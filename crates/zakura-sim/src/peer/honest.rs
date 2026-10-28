@@ -310,17 +310,22 @@ impl Honest {
 
     /// Labels and encodes `message` with the stream's models.
     pub(super) fn send(&mut self, message: RegtestMessage) -> Outgoing {
-        self.active = Instant::now();
-        if let Message::HeadersOutcome(outcome) = &message {
-            self.last_ending = Some(*outcome);
-        }
-        self.models.send(&message)
+        self.send_crafted(super::Crafted::of(message))
     }
 
-    /// Labels and encodes a crafted `frame` with the stream's models.
+    /// Labels and encodes a crafted `frame` with the stream's models. A
+    /// conformant ending is the last one sent.
     pub(super) fn send_crafted(&mut self, frame: super::Crafted) -> Outgoing {
         self.active = Instant::now();
-        self.models.send_crafted(frame)
+        let ending = match &frame.message {
+            Message::HeadersOutcome(outcome) => Some(*outcome),
+            _ => None,
+        };
+        let outgoing = self.models.send_crafted(frame);
+        if outgoing.conformant() {
+            self.last_ending = ending.or(self.last_ending);
+        }
+        outgoing
     }
 
     /// The frames that answer the node's `message`.

@@ -5,23 +5,25 @@
 //! validator. It reads the frame, the table's own rows, and its own history
 //! of the stream's subscriptions, and labels each rule below:
 //!
-//! - `Status`: a `max_subscriptions` other than the subscription row's
-//!   `max_live`, an unknown schema bit, or a message cap outside one
-//!   smallest page under the advertised schemas to 2 MiB.
+//! - `Status`: a work anchor or retention floor above the selected tip, a
+//!   header cap outside 1 to 4,000, a `max_subscriptions` other than the
+//!   subscription row's `max_live`, an unknown schema bit, or a message cap
+//!   outside one smallest page under the advertised schemas to 2 MiB.
 //! - `SubscribeHeaders`: an `Open` with no locator or a repeated one, or
 //!   whose start cursor isn't its first locator with nothing consumed.
 //! - `Headers`: a page whose headers don't link from its parent, or whose
 //!   parent isn't a locator of the `Open` (the first page) or the last
 //!   header sent (each later one).
 //! - `HeadersOutcome`: an outcome its subscription's history doesn't
-//!   allow, such as `SubscriptionClosed` before the node's `Close`.
+//!   allow, such as `SubscriptionClosed` before the node's `Close`. A
+//!   subscription whose locators hold its target reached it at `Open`.
 
 use std::collections::BTreeMap;
 
 use zakura_chain::block;
 use zakura_network::zakura::{
     v9::{Headers, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status},
-    MessageRole, MAX_HS_MESSAGE_BYTES, TREE_AUX_SCHEMA_V1_BYTES,
+    MessageRole, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
 use crate::model::{Label, Labels};
@@ -38,7 +40,8 @@ struct Served {
     pages: u64,
     /// The last header sent, if a page was.
     last: Option<block::Hash>,
-    /// Whether a page carried the target marker.
+    /// Whether it reached its target: at `Open`, if a locator is the
+    /// target, or with a page that carried the target marker.
     reached: bool,
     /// Whether the node sent `Close`.
     close_received: bool,
@@ -77,7 +80,10 @@ fn bad_status(status: &Status) -> bool {
     let records = status.tree_aux_schema_mask & 1 != 0;
     let smallest = smallest_plain_page() + if records { TREE_AUX_SCHEMA_V1_BYTES } else { 0 };
     let cap = usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX);
-    status.max_subscriptions != max_live()
+    status.work_anchor_height > status.selected_tip_height
+        || status.oldest_retained_height > status.selected_tip_height
+        || !(1..=MAX_HS_RANGE).contains(&status.max_headers_per_response)
+        || status.max_subscriptions != max_live()
         || status.tree_aux_schema_mask & !KNOWN_SCHEMAS != 0
         || !(smallest..=MAX_HS_MESSAGE_BYTES).contains(&cap)
 }
@@ -179,7 +185,9 @@ impl ContentLabeller {
                         locators: update.locator_hashes.clone(),
                         pages: 0,
                         last: None,
-                        reached: false,
+                        reached: update
+                            .locator_hashes
+                            .contains(&update.initial_target_tip_hash),
                         close_received: false,
                     },
                 );
@@ -239,8 +247,67 @@ mod tests {
                 tree_aux_schema_mask: 1,
                 ..status()
             },
+            Status {
+                max_headers_per_response: 0,
+                ..status()
+            },
+            Status {
+                max_headers_per_response: 4_001,
+                ..status()
+            },
+            Status {
+                work_anchor_height: Height(2),
+                ..status()
+            },
+            Status {
+                oldest_retained_height: Height(2),
+                ..status()
+            },
         ] {
             assert_eq!(label(bad.clone()), Label::BadContent, "{bad:?}");
+        }
+    }
+
+    /// A subscription whose locators hold its target reached it at `Open`,
+    /// so `HistoryPruned` is outside its window before any page. Without
+    /// the target among them, it's allowed.
+    #[test]
+    fn a_target_locator_reaches_the_target_at_open() {
+        use zakura_network::zakura::{
+            v9::{Cursor, HeadersOutcome, SubscribeHeaders},
+            AuxSchema, Credit,
+        };
+
+        let (target, other) = (block::Hash([1; 32]), block::Hash([2; 32]));
+        let open = |locator| {
+            Message::SubscribeHeaders(SubscribeHeaders {
+                operation: Operation::Open,
+                subscription_id: 1,
+                update_sequence: 0,
+                initial_target_tip_hash: target,
+                acknowledged: Cursor {
+                    height: Height(1),
+                    hash: locator,
+                    headers: 0,
+                    bytes: 0,
+                },
+                locator_hashes: vec![locator],
+                added_credit: Credit {
+                    objects: 1,
+                    bytes: 263,
+                },
+                tree_aux_schema: AuxSchema::None,
+            })
+        };
+        let pruned = Message::HeadersOutcome(HeadersOutcome {
+            subscription_id: 1,
+            initial_target_tip_hash: target,
+            outcome: HeadersOutcomeCode::HistoryPruned,
+        });
+        for (locator, expected) in [(target, Label::BadContent), (other, Label::Conformant)] {
+            let mut labeller = ContentLabeller::default();
+            labeller.received(&open(locator));
+            assert_eq!(labeller.label(&pruned).first(), expected, "{locator:?}");
         }
     }
 }

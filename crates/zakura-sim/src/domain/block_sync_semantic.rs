@@ -178,9 +178,10 @@ struct Requested {
 /// A body that crossed into the node in an open exchange.
 #[derive(Clone, Debug)]
 struct Crossed {
-    connection: u64,
-    /// The exchange's key: its request's first height.
-    exchange: u64,
+    /// The request the exchange answered, by session and request ID: the
+    /// newest one published on the body's connection whose first height
+    /// keys the exchange. `None` if the node published no such request.
+    request: Option<(u64, u64)>,
     hash: String,
 }
 
@@ -206,6 +207,9 @@ pub struct SemanticModel {
     sessions: BTreeMap<u64, u64>,
     /// Each published request, by session and request ID.
     requests: BTreeMap<(u64, u64), Requested>,
+    /// The newest request published on each connection for each first
+    /// height, the key of its exchange, by session and request ID.
+    newest: BTreeMap<(u64, u64), (u64, u64)>,
     /// Each connection's latest peer frame: its number, and its exchange
     /// if a conformant label put it in one.
     last_frame: BTreeMap<u64, (u64, Option<u64>)>,
@@ -303,6 +307,10 @@ struct StepChanges {
     released: Vec<(BlockSyncHolder, usize, bool)>,
     /// Tokens the sequencer detached.
     detached: BTreeSet<u64>,
+    /// Tokens whose last holder the step released. The model keeps their
+    /// submissions and stale completions until [`STALE_COMPLETION_INERT`]
+    /// judges the step's releases.
+    emptied: BTreeSet<u64>,
     /// Whether storage's held tokens or the sequencer's submission holders
     /// changed.
     storage_changed: bool,
@@ -394,9 +402,13 @@ impl SemanticModel {
                     .get(connection)
                     .filter(|(frame, _)| frame == seq)
                 {
+                    // The node publishes a request before it writes its
+                    // frame, and the relay labels a request that overlaps
+                    // an open exchange `BadContent`, so the newest request
+                    // the exchange's key names is the one it answers.
+                    let request = self.newest.get(&(*connection, *exchange)).copied();
                     self.crossed.entry(*height).or_default().push(Crossed {
-                        connection: *connection,
-                        exchange: *exchange,
+                        request,
                         hash: hash.clone(),
                     });
                 }
@@ -528,6 +540,14 @@ impl SemanticModel {
                 if let Some(epoch) = owner.body_work_epoch {
                     self.note_epoch(epoch);
                 }
+                if let (Some(connection), Some(first)) =
+                    (self.sessions.get(&owner.session_id), heights.first())
+                {
+                    self.newest.insert(
+                        (*connection, u64::from(*first)),
+                        (owner.session_id, owner.request_id),
+                    );
+                }
                 self.requests.insert(
                     (owner.session_id, owner.request_id),
                     Requested {
@@ -589,10 +609,11 @@ impl SemanticModel {
                             self.pending
                                 .released
                                 .push((holder.clone(), at, past_frontier));
-                        }
-                        if *counts == (0, 0) {
+                            if *counts == (0, 0) {
+                                self.pending.emptied.insert(*token);
+                            }
+                        } else if *counts == (0, 0) && !self.pending.emptied.contains(token) {
                             self.submissions.remove(token);
-                            self.stale.remove(token);
                         }
                     }
                     BlockSyncHolder::Reorder { .. } => {}
@@ -617,6 +638,12 @@ impl SemanticModel {
             }
         }
         self.judge_stale(step, &changes);
+        for token in &changes.emptied {
+            if self.submissions.get(token) == Some(&(0, 0)) {
+                self.submissions.remove(token);
+                self.stale.remove(token);
+            }
+        }
         self.judge_room(step, &changes);
         if changes.storage_changed {
             self.judge_detached(step);
@@ -661,11 +688,9 @@ impl SemanticModel {
             )));
         }
         let crossed = self.crossed.get(&height).map_or(&[][..], Vec::as_slice);
-        let first = requested.heights.first().copied().map(u64::from);
-        let connection = self.sessions.get(&owner.session_id).copied();
-        let own = crossed.iter().any(|body| {
-            body.hash == hash && Some(body.connection) == connection && Some(body.exchange) == first
-        });
+        let own = crossed
+            .iter()
+            .any(|body| body.hash == hash && body.request == Some(request));
         // First-completion-wins: a body another exchange delivered may end
         // this request's reservation if it's the body this request's work
         // asked for.
@@ -698,13 +723,19 @@ impl SemanticModel {
     /// [`STALE_COMPLETION_INERT`] on `step`'s changes. A stale completion
     /// is a verdict that reached block sync for a submission the sequencer
     /// had detached, or whose owner's epoch the committed view had left.
+    /// A token the step fully released still counts: the model drops its
+    /// submission only after this judges the step.
     fn judge_stale(&mut self, step: u64, changes: &StepChanges) {
         for token in &changes.delivered {
             self.finished.insert(*token);
-            let detached = self
-                .submissions
-                .get(token)
-                .is_some_and(|(_, detached)| *detached > 0);
+            let detached =
+                self.submissions
+                    .get(token)
+                    .is_some_and(|(_, detached)| *detached > 0)
+                    || changes.detached.contains(token)
+                    || changes.released.iter().any(|(holder, _, _)| {
+                        *holder == BlockSyncHolder::Detached { token: *token }
+                    });
             let old_epoch = self
                 .token_epochs
                 .get(token)
@@ -1027,4 +1058,416 @@ fn reset_while_storage_held(log: &ObservationLog) -> bool {
 /// queue.
 fn queued_at_idle(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_queued_at_idle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::{
+        BlockSyncBody, BodyScope, StorageBranch, StoragePoint, StreamId, WorkScope,
+    };
+
+    /// A log built one step at a time.
+    #[derive(Default)]
+    struct History {
+        log: ObservationLog,
+        step: u64,
+        storage_seq: u64,
+        sync_seq: u64,
+    }
+
+    impl History {
+        /// Starts the next step.
+        fn step(&mut self) -> &mut History {
+            self.step += 1;
+            self.log.begin(self.step);
+            self
+        }
+
+        /// Block storage publishes `fact`.
+        fn storage(&mut self, fact: StorageFact) -> &mut History {
+            self.storage_seq += 1;
+            self.log.push(Observation::Storage {
+                service: BLOCK_SERVICE.to_owned(),
+                instance: 0,
+                seq: self.storage_seq,
+                txn: self.storage_seq,
+                fact,
+            });
+            self
+        }
+
+        /// Block sync reports `event`.
+        fn sync(&mut self, event: BlockSyncFact) -> &mut History {
+            self.sync_seq += 1;
+            self.log.push(Observation::BlockSync {
+                instance: 0,
+                seq: self.sync_seq,
+                storage_seq: self.storage_seq,
+                node: "node".to_owned(),
+                event,
+            });
+            self
+        }
+
+        /// Full state publishes a view of body-work epoch `epoch`.
+        fn view(&mut self, epoch: u64) -> &mut History {
+            self.storage(StorageFact::ViewPublished {
+                state_version: epoch,
+                epoch,
+                hint_revision: 0,
+                verified_best: point(0, "genesis"),
+                header_best: point(8, "header-tip"),
+            })
+        }
+
+        /// Storage takes submission `id` with apply `token`, for `owner`'s
+        /// body `hash` at `height`.
+        fn submit(&mut self, id: u64, token: u64, owner: WorkOwner, hash: &str) -> &mut History {
+            self.storage(StorageFact::BlockSubmitted {
+                id,
+                request: StorageRequest::SubmitBlock {
+                    owner,
+                    source: "peer".to_owned(),
+                    token,
+                    height: Some(HEIGHT),
+                    hash: hash.to_owned(),
+                    parent: "parent".to_owned(),
+                    class: "full".to_owned(),
+                },
+                stage: Some("queued".to_owned()),
+            })
+        }
+
+        /// Storage completes submission `id`, and its verdict reaches block
+        /// sync.
+        fn verdict(&mut self, id: u64) -> &mut History {
+            self.storage(StorageFact::BlockCompleted {
+                id,
+                outcome: "committed".to_owned(),
+                result: StorageResult::Verdict {
+                    verdict: "committed".to_owned(),
+                    reply: "committed".to_owned(),
+                },
+                delivered: true,
+                state_version: 0,
+            })
+        }
+
+        /// Block sync admits session `session` on `connection`.
+        fn session(&mut self, connection: u64, session: u64) -> &mut History {
+            self.sync(BlockSyncFact::SessionAdmitted {
+                peer: "peer".to_owned(),
+                connection,
+                session_id: session,
+                generation: 1,
+                direction: "outbound".to_owned(),
+            })
+        }
+
+        /// Block sync publishes `owner`'s request for the body at [`HEIGHT`].
+        fn request(&mut self, owner: WorkOwner) -> &mut History {
+            self.sync(BlockSyncFact::Request {
+                owner,
+                heights: vec![HEIGHT],
+                estimated_bytes: 100,
+                step: "published".to_owned(),
+            })
+        }
+
+        /// The peer on `connection` sends frame `seq`, body `hash` at
+        /// [`HEIGHT`], in the open exchange [`HEIGHT`] keys.
+        fn body(&mut self, connection: u64, seq: u64, hash: &str) -> &mut History {
+            let stream = StreamId {
+                kind: 1,
+                version: 1,
+            };
+            self.log.push(Observation::PeerFrame {
+                connection,
+                stream,
+                seq,
+                row: Some("block".to_owned()),
+                rule_stream: stream,
+                label: Label::Conformant,
+                exhausted: false,
+                exchange: Some(u64::from(HEIGHT)),
+                payload: 100,
+            });
+            self.log.push(Observation::PeerBody {
+                connection,
+                seq,
+                height: HEIGHT,
+                hash: hash.to_owned(),
+            });
+            self
+        }
+
+        /// Storage answers needed-blocks query `id` of epoch `epoch` with
+        /// body `hash` at [`HEIGHT`].
+        fn needed(&mut self, id: u64, epoch: u64, hash: &str) -> &mut History {
+            self.storage(StorageFact::BlockSubmitted {
+                id,
+                request: StorageRequest::QueryNeededBlocks {
+                    query_id: id,
+                    from: HEIGHT,
+                    limit: 1,
+                    scope: BodyScope {
+                        scope: owner(0, 0, epoch).scope,
+                        verified_generation: 1,
+                        body_work_epoch: epoch,
+                    },
+                    best_header_tip: 8,
+                },
+                stage: None,
+            })
+            .storage(StorageFact::BlockCompleted {
+                id,
+                outcome: "answered".to_owned(),
+                result: StorageResult::NeededBlocks {
+                    anchor: point(0, "genesis"),
+                    blocks: vec![point(HEIGHT, hash)],
+                },
+                delivered: true,
+                state_version: 0,
+            })
+        }
+
+        /// The sequencer's `holder` of `owner`'s body changes: `retained`
+        /// or `released`.
+        fn holder(
+            &mut self,
+            owner: WorkOwner,
+            holder: BlockSyncHolder,
+            change: &str,
+        ) -> &mut History {
+            self.sync(BlockSyncFact::Holder {
+                body: BlockSyncBody {
+                    height: HEIGHT,
+                    owner,
+                    bytes: 100,
+                },
+                holder,
+                change: change.to_owned(),
+            })
+        }
+    }
+
+    /// The height every body here has.
+    const HEIGHT: u32 = 3;
+
+    fn point(height: u32, hash: &str) -> StoragePoint {
+        StoragePoint {
+            height,
+            hash: hash.to_owned(),
+        }
+    }
+
+    /// Session `session`'s body request `request` in body-work epoch
+    /// `epoch`.
+    fn owner(session: u64, request: u64, epoch: u64) -> WorkOwner {
+        WorkOwner {
+            kind: "body".to_owned(),
+            scope: WorkScope {
+                header_generation: 1,
+                branch: StorageBranch {
+                    anchor: "genesis".to_owned(),
+                    target: "header-tip".to_owned(),
+                },
+            },
+            verified_generation: Some(1),
+            body_work_epoch: Some(epoch),
+            session_id: session,
+            request_id: request,
+        }
+    }
+
+    /// Token 1's submission, detached by a reset to epoch 2, and token 2's
+    /// current submission, which storage still holds.
+    fn stale_beside_current() -> History {
+        let mut history = History::default();
+        history
+            .step()
+            .view(1)
+            .submit(1, 1, owner(1, 1, 1), "old-fork")
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Submitted { token: 1 },
+                "retained",
+            )
+            .step()
+            .view(2)
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Detached { token: 1 },
+                "retained",
+            )
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Submitted { token: 1 },
+                "released",
+            )
+            .submit(2, 2, owner(1, 2, 2), "new-fork")
+            .holder(
+                owner(1, 2, 2),
+                BlockSyncHolder::Submitted { token: 2 },
+                "retained",
+            );
+        history
+    }
+
+    /// Releases token 1's detached holder and token 2's attached holder in
+    /// one step, token 1's first if `stale_first`.
+    fn release_both(history: &mut History, stale_first: bool) {
+        let stale = (owner(1, 1, 1), BlockSyncHolder::Detached { token: 1 });
+        let current = (owner(1, 2, 2), BlockSyncHolder::Submitted { token: 2 });
+        let order = if stale_first {
+            [stale, current]
+        } else {
+            [current, stale]
+        };
+        for (owner, holder) in order {
+            history.holder(owner, holder, "released");
+        }
+    }
+
+    /// The findings for [`STALE_COMPLETION_INERT`] in `history`'s log.
+    fn stale_findings(history: &History) -> Vec<Finding> {
+        SemanticModel::of(&history.log).stale_findings
+    }
+
+    /// Token 1's stale verdict arrives, and a later step releases token 2,
+    /// whose verdict storage still holds.
+    #[test]
+    fn releasing_a_held_submission_beside_a_stale_completion_is_found() {
+        let mut history = stale_beside_current();
+        history.step().verdict(1);
+        history.step().holder(
+            owner(1, 2, 2),
+            BlockSyncHolder::Submitted { token: 2 },
+            "released",
+        );
+        let findings = stale_findings(&history);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].step, 4);
+    }
+
+    /// The same release, in a step that releases the stale submission too,
+    /// in either order: the stale completion still counts while the step's
+    /// releases are judged.
+    #[test]
+    fn releasing_the_stale_submission_in_the_same_step_hides_nothing() {
+        for stale_first in [false, true] {
+            let mut history = stale_beside_current();
+            history.step().verdict(1);
+            release_both(history.step(), stale_first);
+            let findings = stale_findings(&history);
+            assert_eq!(
+                findings.len(),
+                1,
+                "stale first: {stale_first}: {findings:?}"
+            );
+            assert_eq!(findings[0].step, 4);
+        }
+    }
+
+    /// The stale verdict arrives in the step that releases both
+    /// submissions, in either order.
+    #[test]
+    fn a_stale_verdict_released_in_its_own_step_still_counts() {
+        for stale_first in [false, true] {
+            let mut history = stale_beside_current();
+            release_both(history.step().verdict(1), stale_first);
+            let findings = stale_findings(&history);
+            assert_eq!(
+                findings.len(),
+                1,
+                "stale first: {stale_first}: {findings:?}"
+            );
+            assert_eq!(findings[0].step, 3);
+        }
+    }
+
+    /// The stale submission's own release, with no other, is inert, and
+    /// the model forgets it once the step is judged.
+    #[test]
+    fn a_stale_completion_releasing_its_own_submission_holds() {
+        let mut history = stale_beside_current();
+        history.step().verdict(1).holder(
+            owner(1, 1, 1),
+            BlockSyncHolder::Detached { token: 1 },
+            "released",
+        );
+        let model = SemanticModel::of(&history.log);
+        assert_eq!(model.stale_findings, []);
+        assert!(model.stale.is_empty(), "{:?}", model.stale);
+        assert!(
+            !model.submissions.contains_key(&1),
+            "{:?}",
+            model.submissions
+        );
+    }
+
+    /// Session 1 on connection 10 asks for height 3 in epoch 1, and the
+    /// peer answers with `old-fork`. A reset to epoch 2 asks for height 3
+    /// again on the same session, and the needed-blocks answer authorizes
+    /// only `new-fork`.
+    fn asked_again_after_a_reset() -> History {
+        let mut history = History::default();
+        history
+            .step()
+            .view(1)
+            .session(10, 1)
+            .request(owner(1, 1, 1))
+            .step()
+            .body(10, 0, "old-fork")
+            .step()
+            .view(2)
+            .needed(5, 2, "new-fork")
+            .request(owner(1, 2, 2));
+        history
+    }
+
+    /// The findings for [`SUBMIT_ONLY_REQUESTED`] in `history`'s log.
+    fn submit_findings(history: &History) -> Vec<Finding> {
+        SemanticModel::of(&history.log).submit_findings
+    }
+
+    /// The later request's submission of the body the earlier request's
+    /// exchange delivered: the body never crossed in the later request's
+    /// exchange, and its epoch's work didn't ask for it.
+    #[test]
+    fn a_body_from_an_earlier_exchange_for_the_same_height_is_found() {
+        let mut history = asked_again_after_a_reset();
+        history.step().submit(6, 1, owner(1, 2, 2), "old-fork");
+        let findings = submit_findings(&history);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].actual.contains("crossed in another exchange"),
+            "{findings:?}"
+        );
+    }
+
+    /// The body that crosses in the later request's own exchange is that
+    /// request's, and the earlier request's body is the earlier one's.
+    #[test]
+    fn each_exchange_credits_the_request_that_opened_it() {
+        let mut history = History::default();
+        history
+            .step()
+            .view(1)
+            .session(10, 1)
+            .request(owner(1, 1, 1))
+            .step()
+            .body(10, 0, "old-fork")
+            .step()
+            .submit(6, 1, owner(1, 1, 1), "old-fork")
+            .step()
+            .view(2)
+            .request(owner(1, 2, 2))
+            .step()
+            .body(10, 1, "new-fork")
+            .step()
+            .submit(7, 2, owner(1, 2, 2), "new-fork");
+        assert_eq!(submit_findings(&history), []);
+    }
 }

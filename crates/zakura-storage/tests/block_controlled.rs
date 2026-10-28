@@ -951,6 +951,39 @@ fn an_admitted_body_keeps_its_block_until_its_verdict() {
     );
 }
 
+/// ST4.5: a resubmission of a committed body can't fail a consensus rule,
+/// since the verifier reports the duplicate first. A body admitted before
+/// another submission commits it still can.
+#[test]
+fn consensus_invalid_follows_the_hash_at_admission() {
+    let invalid = BlockOutcome::Verdict(Verdict::ConsensusInvalid);
+    let mut harness = Harness::new();
+    let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900)], 0);
+
+    // Admitted before the commit: the verifier passed its duplicate check.
+    let early = harness.submit(&blocks[0]);
+    let committer = harness.submit(&blocks[0]);
+    harness.complete(early, BlockOutcome::Admit);
+    harness.apply(committer, Verdict::Committed);
+    let enabled = harness.enabled(early);
+    assert!(enabled.contains(&invalid), "{enabled:?}");
+    assert!(enabled.contains(&BlockOutcome::Verdict(Verdict::Duplicate)));
+
+    // Admitted after it: only the duplicate and the verifier's retries.
+    let late = harness.submit(&blocks[0]);
+    harness.complete(late, BlockOutcome::Admit);
+    let enabled = harness.enabled(late);
+    assert!(!enabled.contains(&invalid), "{enabled:?}");
+    assert!(enabled.contains(&BlockOutcome::Verdict(Verdict::Duplicate)));
+    assert!(matches!(
+        harness.service.complete(late, invalid),
+        Err(CompleteError::Illegal(_))
+    ));
+
+    harness.complete(early, invalid);
+    harness.complete(late, BlockOutcome::Verdict(Verdict::Duplicate));
+}
+
 /// ST4.5: a verdict's reply for a closed handle is dropped, and the driver
 /// carries on, as it ignores that send's error.
 #[test]

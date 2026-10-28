@@ -689,6 +689,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
     let peer = |label: Label, exhausted: bool| Observation::PeerFrame {
         connection: 1,
         stream: STREAM,
+        quic_stream: None,
         seq: 0,
         row: row_name.clone().or(Some("status".to_owned())),
         rule_stream: STREAM,
@@ -711,6 +712,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
     let judged = Observation::FrameJudged {
         connection: 1,
         stream: STREAM,
+        quic_stream: None,
         seq: 0,
     };
     let fault_close = Observation::ConnectionClosed {

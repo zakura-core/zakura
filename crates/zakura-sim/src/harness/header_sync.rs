@@ -2,7 +2,8 @@
 //! loop with inert storage and no peers. `header-sync/storage` runs a node
 //! on controlled storage with mirror peers (M4), with the node's reactor
 //! tapped. `header-sync/wire` runs the same node behind its real transport
-//! on simulated QUIC, with scripted peers (M5-C).
+//! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
+//! adversaries (M5-E1).
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
@@ -32,10 +33,13 @@ use super::{
 use crate::{
     observe::StorageFact,
     peer::{
-        honest::HonestChain, Dialer as PeerDialer, PeerControl, PeerRecords, PeerSpec, PeerTask,
-        NODE_ADDR,
+        adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, Dialer as PeerDialer,
+        PeerAction, PeerControl, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
+    property::{
+        Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Source,
+        Sources, Status, Verdict,
+    },
     storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
 };
@@ -446,9 +450,24 @@ impl Subsystem for HeaderWire {
     type Scenario = WireScenario;
     type Prepared = WirePorts;
 
-    /// [`wire_config`].
-    fn config(_: &WireScenario) -> RunConfig {
-        wire_config()
+    /// [`wire_config`], with twice its budget for a scenario with status
+    /// bursts: emptying a `Status` bucket takes about 600 frames, and the
+    /// node about 40 steps to read each.
+    fn config(scenario: &WireScenario) -> RunConfig {
+        let burst = scenario.peers.iter().any(|peer| {
+            peer.script.contains(&PeerAction::Act {
+                act: Act::StatusBurst,
+            })
+        });
+        let config = wire_config();
+        RunConfig {
+            budget: if burst {
+                2 * config.budget
+            } else {
+                config.budget
+            },
+            ..config
+        }
     }
 
     /// Commits the node's chain to its port, and builds each honest peer's
@@ -461,6 +480,10 @@ impl Subsystem for HeaderWire {
             .peers
             .iter()
             .map(|peer| {
+                assert!(
+                    peer.adversary.is_none() || peer.honest.is_some(),
+                    "an adversary needs an honest chain"
+                );
                 peer.honest.as_ref().map(|honest| {
                     let start = honest.subscribe.as_ref().map_or(0, |spec| spec.start);
                     assert!(
@@ -523,7 +546,8 @@ impl Subsystem for HeaderWire {
         let failure = Rc::new(RefCell::new(None));
         let mut control = PeerControl::new(failure.clone(), ports.records.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
-            let (readiness, commands) = control.add(&name, spec.script.clone());
+            let (readiness, commands) =
+                control.add(&name, spec.script.clone(), spec.adversary.is_some());
             let (listening, listened) = zakura_rt::sync::watch::channel(false);
             let task = PeerTask {
                 name,
@@ -572,6 +596,20 @@ impl Subsystem for HeaderWire {
             Source::Frames,
             Source::Closes,
         ])
+    }
+
+    /// For a scenario with an adversary, `BoundedAdversary` at
+    /// [`ADVERSARY_RATE`] actions per virtual second, the budget
+    /// [`PeerControl`] holds every adversary to (M5-Q9). A scenario of
+    /// honest and scripted peers has no hostile peer to bound.
+    fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
+        if scenario.peers.iter().all(|peer| peer.adversary.is_none()) {
+            return Assumptions::none();
+        }
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::BoundedAdversary,
+            params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
+        }])
     }
 
     /// The default scenario.

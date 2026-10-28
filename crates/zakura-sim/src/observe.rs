@@ -115,6 +115,12 @@ pub enum Observation {
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, the same on both ends (M5-Q12), so a
+        /// reopened stream of one kind and version numbers its frames
+        /// apart. `None` on an in-memory link, which carries one stream of
+        /// each kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame's position among the peer's frames on this stream,
         /// from 0.
         seq: u64,
@@ -189,6 +195,10 @@ pub enum Observation {
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, as its [`Observation::PeerFrame`] has
+        /// it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame, as its [`Observation::PeerFrame`] numbers it.
         seq: u64,
     },

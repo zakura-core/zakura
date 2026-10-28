@@ -12,12 +12,12 @@
 //! log unseen.
 //!
 //! It also projects the node's evidence onto P3b's observations:
-//! `FrameJudged` at the node's `frame-read` of a frame labelled
-//! `Conformant`, `ConnectionClosed` for a close decided with a cause, and
-//! `Misbehavior` for the connection of the session a reactor misbehavior
-//! names. Judging any other label needs the reader stage its label decides
-//! at, which M5-E1 adds, so here a read of a frame labelled otherwise is a
-//! harness failure, and so is a misbehavior with no origin session.
+//! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
+//! [`super::stage`]), `ConnectionClosed` for a close decided with a cause,
+//! and `Misbehavior` for the connection of the session a reactor
+//! misbehavior names. A misbehavior with no origin session is a harness
+//! failure, and so is a frame the reader reached with no `PeerFrame`, or a
+//! response whose payload arrived before its precheck's checkpoint.
 
 use std::{
     cell::RefCell,
@@ -26,11 +26,26 @@ use std::{
     rc::Rc,
 };
 
+use zakura_network::zakura::{v9::RegtestMessage, MessageRole, MessageRule};
+
+use super::stage::{header_stage, NodeView, Stage};
 use crate::{
-    model::Label,
-    observe::{PeerCredit, ReactorFact, StreamId, TransportFact},
+    model::{FrameHeader, Label},
+    observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
     Observation, ObservationLog,
 };
+
+/// A frame the node's reader has the header of, by connection, QUIC stream
+/// and `seq`.
+type FrameKey = (u64, u64, u64);
+
+/// A frame whose header the reader has and whose judgement waits.
+#[derive(Clone, Copy, Debug)]
+struct Waiting {
+    stage: Stage,
+    row: Option<&'static MessageRule>,
+    payload_len: usize,
+}
 
 /// What the peers' tasks recorded and the identity map hasn't placed yet,
 /// oldest first.
@@ -94,6 +109,10 @@ pub(crate) struct WireEvidence {
     refused_streams: BTreeSet<(u64, u64)>,
     /// Connections the node tore down.
     torn_down: BTreeSet<u64>,
+    /// Each header session's reader ledger, by connection and QUIC stream.
+    views: BTreeMap<(u64, u64), NodeView>,
+    /// Frames whose header the reader has, not judged yet.
+    waiting: BTreeMap<FrameKey, Waiting>,
 }
 
 impl WireEvidence {
@@ -200,6 +219,7 @@ impl WireEvidence {
                 Observation::PeerFrame {
                     connection,
                     stream,
+                    quic_stream: Some(quic_stream),
                     seq,
                     row,
                     rule_stream,
@@ -253,50 +273,59 @@ impl WireEvidence {
     }
 
     /// The P3b observation `obs` means, if any.
-    fn project(&self, obs: &Observation) -> Result<Option<Observation>, String> {
+    fn project(&mut self, obs: &Observation) -> Result<Option<Observation>, String> {
         Ok(match obs {
             Observation::Transport {
                 connection: Some(connection),
-                event: TransportFact::FrameRead { quic_stream, seq },
+                event,
                 ..
-            } => {
-                let stream = self
-                    .streams
-                    .get(&(*connection, *quic_stream))
-                    .ok_or_else(|| {
-                        format!(
-                            "AmbiguousIdentity: connection {connection} read stream {quic_stream} \
-                         before its session row"
-                        )
-                    })?;
-                match self.labels.get(&(*connection, *quic_stream, *seq)) {
-                    Some(Label::Conformant) => Some(Observation::FrameJudged {
-                        connection: *connection,
-                        stream: *stream,
-                        seq: *seq,
-                    }),
-                    Some(label) => {
-                        return Err(format!(
-                            "UnjudgedLabel: connection {connection} read frame {seq} on stream \
-                             {quic_stream}, labelled {label}, whose judging stage M5-E1 decides"
-                        ))
-                    }
-                    None => {
-                        return Err(format!(
-                            "UnlabelledFrame: connection {connection} read frame {seq} on stream \
-                             {quic_stream} with no PeerFrame"
-                        ))
+            } => match event {
+                TransportFact::HeaderRead {
+                    quic_stream,
+                    seq,
+                    message_type,
+                    flags,
+                    payload_len,
+                } => {
+                    let header = FrameHeader {
+                        message_type: *message_type,
+                        flags: *flags,
+                        // A u32 fits usize on every supported target.
+                        payload_len: *payload_len as usize,
+                    };
+                    self.header_read((*connection, *quic_stream, *seq), header)?
+                }
+                TransportFact::Regulated {
+                    quic_stream,
+                    transition,
+                } => self.regulated(*connection, *quic_stream, transition)?,
+                TransportFact::FrameRead { quic_stream, seq } => {
+                    let key = (*connection, *quic_stream, *seq);
+                    match self.waiting.get(&key).map(|waiting| waiting.stage) {
+                        Some(Stage::Frame) => {
+                            self.waiting.remove(&key);
+                            Some(self.judged(key)?)
+                        }
+                        Some(Stage::Checkpoint) => {
+                            return Err(format!(
+                                "MissingCheckpoint: connection {connection} read frame {seq} \
+                                 on stream {quic_stream} before its response precheck's \
+                                 header-checked"
+                            ))
+                        }
+                        // Judged at its header already. Whether the reader
+                        // should have read it is for the close checks.
+                        Some(Stage::Header) | None => None,
                     }
                 }
-            }
-            Observation::Transport {
-                connection: Some(connection),
-                event: TransportFact::CloseDecided { cause: Some(cause) },
-                ..
-            } => Some(Observation::ConnectionClosed {
-                connection: *connection,
-                cause: cause.clone(),
-            }),
+                TransportFact::CloseDecided { cause: Some(cause) } => {
+                    Some(Observation::ConnectionClosed {
+                        connection: *connection,
+                        cause: cause.clone(),
+                    })
+                }
+                _ => None,
+            },
             Observation::Reactor {
                 event: ReactorFact::Misbehavior { origin, peer, .. },
                 ..
@@ -316,6 +345,131 @@ impl WireEvidence {
             _ => None,
         })
     }
+
+    /// The node's reader has `header` for frame `key`: judges it now if
+    /// the header alone has a fault, and otherwise waits for the stage that
+    /// decides it.
+    fn header_read(
+        &mut self,
+        key: FrameKey,
+        header: FrameHeader,
+    ) -> Result<Option<Observation>, String> {
+        let (connection, quic_stream, seq) = key;
+        let stream = self.stream(connection, quic_stream)?;
+        if !self.labels.contains_key(&key) {
+            return Err(format!(
+                "UnlabelledFrame: connection {connection} read frame {seq} on stream \
+                 {quic_stream} with no PeerFrame"
+            ));
+        }
+        let rules = rules(stream).ok_or_else(|| {
+            format!("UntabledStream: connection {connection} read a frame on untabled {stream}")
+        })?;
+        let (stage, row) = header_stage(rules, &header);
+        if stage == Stage::Header {
+            // The reader still runs a response's precheck for a header whose
+            // type, flags and minimum pass, so its checkpoint may follow.
+            if row.is_some_and(|row| matches!(row.role, MessageRole::Response { .. })) {
+                self.waiting.insert(
+                    key,
+                    Waiting {
+                        stage,
+                        row,
+                        payload_len: header.payload_len,
+                    },
+                );
+            }
+            return self.judged(key).map(Some);
+        }
+        self.waiting.insert(
+            key,
+            Waiting {
+                stage,
+                row,
+                payload_len: header.payload_len,
+            },
+        );
+        Ok(None)
+    }
+
+    /// Applies `transition` to the ledger of `connection`'s `quic_stream`,
+    /// and judges a response at its `header-checked` checkpoint if the
+    /// ledger, as it stood there, decides it.
+    fn regulated(
+        &mut self,
+        connection: u64,
+        quic_stream: u64,
+        transition: &TransitionFact,
+    ) -> Result<Option<Observation>, String> {
+        let view = self.views.entry((connection, quic_stream)).or_default();
+        let TransitionFact::HeaderChecked { seq, .. } = transition else {
+            view.apply(transition)?;
+            return Ok(None);
+        };
+        let key = (connection, quic_stream, *seq);
+        let Some(Waiting {
+            stage: stage @ (Stage::Checkpoint | Stage::Header),
+            row: Some(row),
+            payload_len,
+        }) = self.waiting.get(&key).copied()
+        else {
+            return Err(format!(
+                "MissingCheckpoint: connection {connection} checked frame {seq} on stream \
+                 {quic_stream}, which waits for no checkpoint"
+            ));
+        };
+        let decided = view.decidable_at_header(row, payload_len).is_some();
+        view.reserve(row, payload_len);
+        if stage == Stage::Header {
+            // Judged at its header already: only the ledger moves.
+            self.waiting.remove(&key);
+            return Ok(None);
+        }
+        if decided {
+            self.waiting.remove(&key);
+            return self.judged(key).map(Some);
+        }
+        self.waiting.insert(
+            key,
+            Waiting {
+                stage: Stage::Frame,
+                row: Some(row),
+                payload_len,
+            },
+        );
+        Ok(None)
+    }
+
+    /// The admitted stream of `connection`'s `quic_stream`.
+    fn stream(&self, connection: u64, quic_stream: u64) -> Result<StreamId, String> {
+        self.streams
+            .get(&(connection, quic_stream))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "AmbiguousIdentity: connection {connection} read stream {quic_stream} \
+                     before its session row"
+                )
+            })
+    }
+
+    /// `FrameJudged` for frame `key`.
+    fn judged(&self, (connection, quic_stream, seq): FrameKey) -> Result<Observation, String> {
+        Ok(Observation::FrameJudged {
+            connection,
+            stream: self.stream(connection, quic_stream)?,
+            quic_stream: Some(quic_stream),
+            seq,
+        })
+    }
+}
+
+/// The rows of a stream the wire harness runs, if it has a table.
+fn rules(stream: StreamId) -> Option<&'static [MessageRule]> {
+    RegtestMessage::LAYOUT
+        .iter()
+        .find(|layout| (layout.kind, layout.version) == (stream.kind, stream.version))
+        .and_then(|layout| layout.messages)
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ const SESSION: u64 = 0;
 /// for an action, so the node has handled the last frame it sent. A frame's
 /// datagrams are due within the link's delay, and time moves only once no
 /// task is ready.
-const SETTLE: Duration = Duration::from_secs(1);
+pub(super) const SETTLE: Duration = Duration::from_secs(1);
 
 /// What an honest peer holds and does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,11 +107,11 @@ pub struct HonestChain {
     /// The anchor, genesis.
     anchor: Frontier,
     /// The header at height `h` is `headers[h - 1]`.
-    headers: Vec<Arc<block::Header>>,
+    pub(super) headers: Vec<Arc<block::Header>>,
     /// Each header's height by its hash's bytes, the anchor's included.
     heights: BTreeMap<[u8; 32], u32>,
     /// The `Status` it advertises.
-    status: Status,
+    pub(super) status: Status,
 }
 
 impl HonestChain {
@@ -156,7 +156,7 @@ impl HonestChain {
     }
 
     /// The header at `height`, as a frontier.
-    fn at(&self, height: u32) -> Frontier {
+    pub(super) fn at(&self, height: u32) -> Frontier {
         match height.checked_sub(1) {
             None => self.anchor,
             Some(index) => {
@@ -169,8 +169,8 @@ impl HonestChain {
 
 /// A subscription the node opened on this peer.
 #[derive(Debug)]
-struct Serving {
-    target: block::Hash,
+pub(super) struct Serving {
+    pub(super) target: block::Hash,
     target_height: u32,
     /// The height of the last header sent, or of the page parent to come.
     position: u32,
@@ -178,38 +178,54 @@ struct Serving {
 
 /// This peer's subscription to the node.
 #[derive(Debug)]
-struct Subscribed {
-    id: u64,
+pub(super) struct Subscribed {
+    pub(super) id: u64,
     target: block::Hash,
     sequence: u32,
     /// The last page's cursor, or the start.
-    last: Cursor,
+    pub(super) last: Cursor,
     /// When the last page arrived, if one has.
-    paged_at: Option<Instant>,
-    close_sent: bool,
-    ended: bool,
+    pub(super) paged_at: Option<Instant>,
+    pub(super) close_sent: bool,
+    pub(super) ended: bool,
 }
 
 /// The honest script's state on one peer, across its header streams.
 pub(crate) struct Honest {
-    spec: HonestSpec,
-    chain: Arc<HonestChain>,
+    pub(super) spec: HonestSpec,
+    pub(super) chain: Arc<HonestChain>,
     /// The current header stream's models, labels and counts.
-    models: StreamModels,
-    serving: BTreeMap<u64, Serving>,
+    pub(super) models: StreamModels,
+    pub(super) serving: BTreeMap<u64, Serving>,
     /// Subscriptions the node opened that have ended, on any stream.
     served: u64,
-    subscribed: Option<Subscribed>,
+    pub(super) subscribed: Option<Subscribed>,
     /// When the next `Status` is due.
     status_due: Instant,
     refresh: Duration,
     /// When it last sent or read a frame.
-    active: Instant,
+    pub(super) active: Instant,
+    /// Whether it sends `Status`, so the node may subscribe. An adversary
+    /// may stay silent.
+    announce: bool,
+    /// Whether it serves the node's subscriptions with pages. An adversary
+    /// may hold each with its credit unspent.
+    serve: bool,
+    /// The node's latest `Status` on the current stream.
+    pub(super) node_status: Option<Status>,
+    /// The last ending it sent for a subscription the node opened.
+    pub(super) last_ending: Option<HeadersOutcome>,
 }
 
 impl Honest {
-    /// The script for `spec` on `chain`.
-    pub(crate) fn new(spec: HonestSpec, chain: Arc<HonestChain>) -> Self {
+    /// The script for `spec` on `chain`, sending `Status` only if
+    /// `announce`, and pages only if `serve`.
+    pub(crate) fn with(
+        spec: HonestSpec,
+        chain: Arc<HonestChain>,
+        announce: bool,
+        serve: bool,
+    ) -> Self {
         Honest {
             spec,
             chain,
@@ -220,16 +236,24 @@ impl Honest {
             status_due: Instant::now(),
             refresh: ZakuraHeaderSyncConfig::default().status_refresh_interval,
             active: Instant::now(),
+            announce,
+            serve,
+            node_status: None,
+            last_ending: None,
         }
     }
 
     /// A header stream started: fresh models, no subscriptions the node
-    /// opened on it, and its first `Status`.
+    /// opened on it, and its first `Status` if it announces.
     pub(crate) fn start_stream(&mut self) -> Vec<Outgoing> {
         let now = Instant::now();
         self.models = StreamModels::new(now);
         self.serving.clear();
+        self.node_status = None;
         self.status_due = now + self.refresh;
+        if !self.announce {
+            return Vec::new();
+        }
         vec![self.send(RegtestMessage::Status(self.chain.status.clone()))]
     }
 
@@ -245,6 +269,9 @@ impl Honest {
             return Vec::new();
         }
         self.status_due = now + self.refresh;
+        if !self.announce {
+            return Vec::new();
+        }
         vec![self.send(RegtestMessage::Status(self.chain.status.clone()))]
     }
 
@@ -264,7 +291,9 @@ impl Honest {
 
     /// When the peer may next become ready for `next`, its next scripted
     /// action: for a `grant`, the end of a held grant's quiet time, and for
-    /// any other, [`SETTLE`] after its last frame once nothing is live.
+    /// any other, [`SETTLE`] after its last frame once every subscription in
+    /// either direction has ended, its own included, after the node opened
+    /// at least one. `None` while that can't happen yet.
     pub(crate) fn wake(&self, next: Option<PeerAction>) -> Option<Instant> {
         if next == Some(PeerAction::Grant) {
             return self.grant_opens();
@@ -274,19 +303,19 @@ impl Honest {
         (own_ended && self.serving.is_empty() && self.served > 0).then(|| self.active + SETTLE)
     }
 
-    /// Whether the peer may be offered `next`, its next scripted action: a
-    /// held grant once its quiet time has passed, and any other action
-    /// [`SETTLE`] after its last frame once every subscription in either
-    /// direction has ended, its own included, after the node opened at
-    /// least one.
-    pub(crate) fn settled(&self, next: Option<PeerAction>) -> bool {
-        self.wake(next).is_some_and(|wake| Instant::now() >= wake)
+    /// Labels and encodes `message` with the stream's models.
+    pub(super) fn send(&mut self, message: RegtestMessage) -> Outgoing {
+        self.active = Instant::now();
+        if let Message::HeadersOutcome(outcome) = &message {
+            self.last_ending = Some(*outcome);
+        }
+        self.models.send(&message)
     }
 
-    /// Labels and encodes `message` with the stream's models.
-    fn send(&mut self, message: RegtestMessage) -> Outgoing {
+    /// Labels and encodes a crafted `frame` with the stream's models.
+    pub(super) fn send_crafted(&mut self, frame: super::Crafted) -> Outgoing {
         self.active = Instant::now();
-        self.models.send(&message)
+        self.models.send_crafted(frame)
     }
 
     /// The frames that answer the node's `message`.
@@ -298,7 +327,10 @@ impl Honest {
         self.active = Instant::now();
         self.models.receive(message, payload_len);
         match message {
-            Message::Status(status) => self.subscribe(status),
+            Message::Status(status) => {
+                self.node_status = Some(status.clone());
+                self.subscribe(status)
+            }
             Message::SubscribeHeaders(update) => match update.operation {
                 Operation::Open => self.open(update),
                 Operation::Grant => self.pump(),
@@ -421,7 +453,7 @@ impl Honest {
 
     /// The next update on this peer's subscription, acknowledging its last
     /// page: a `Grant` of `added`, or `Close` for `None`.
-    fn update(&mut self, added: Option<Credit>) -> RegtestMessage {
+    pub(super) fn update(&mut self, added: Option<Credit>) -> RegtestMessage {
         let sub = self
             .subscribed
             .as_mut()
@@ -501,9 +533,12 @@ impl Honest {
     }
 
     /// Every page the live subscriptions' unspent credit allows, toward
-    /// their targets, in subscription order.
+    /// their targets, in subscription order. Nothing if it doesn't serve.
     fn pump(&mut self) -> Vec<Outgoing> {
         let mut out = Vec::new();
+        if !self.serve {
+            return out;
+        }
         let ids: Vec<u64> = self.serving.keys().copied().collect();
         for id in ids {
             while let Some(page) = self.next_page(id) {
@@ -514,13 +549,23 @@ impl Honest {
     }
 
     /// Subscription `id`'s next page, sized as production's publisher sizes
-    /// one: at most the advertised caps, the unspent credit the models hold
-    /// in each unit, and the headers left to the target. `None` if no page
-    /// fits or the target is reached.
+    /// one: [`Self::page_room`]'s headers. `None` if no page fits or the
+    /// target is reached.
     fn next_page(&mut self, id: u64) -> Option<RegtestMessage> {
+        let count = self.page_room(id)?;
+        if count == 0 {
+            return None;
+        }
+        self.page_at(id, count)
+    }
+
+    /// The headers subscription `id`'s next page may carry: at most the
+    /// advertised caps, the unspent credit the models hold in each unit,
+    /// and the headers left to the target. `None` if it isn't live.
+    pub(super) fn page_room(&self, id: u64) -> Option<u32> {
         let unspent = self.models.subscriptions.unspent(SESSION, id)?;
-        let serving = self.serving.get_mut(&id)?;
-        let left = serving.target_height.checked_sub(serving.position)?;
+        let serving = self.serving.get(&id)?;
+        let left = serving.target_height.saturating_sub(serving.position);
         let entry = super::ENTRY_BYTES as u64;
         let fit = |bytes: u64| bytes.saturating_sub(super::PAGE_FIXED_BYTES as u64) / entry;
         let status = &self.chain.status;
@@ -529,8 +574,21 @@ impl Honest {
             .min(fit(u64::from(status.max_message_bytes)))
             .min(fit(unspent.bytes))
             .min(u64::from(left));
-        let count = u32::try_from(count).expect("the count is at most MAX_HS_RANGE");
-        if count == 0 {
+        Some(u32::try_from(count).expect("the count is at most MAX_HS_RANGE"))
+    }
+
+    /// The headers left to subscription `id`'s target.
+    pub(super) fn left(&self, id: u64) -> Option<u32> {
+        let serving = self.serving.get(&id)?;
+        Some(serving.target_height.saturating_sub(serving.position))
+    }
+
+    /// Subscription `id`'s next page of `count` headers from where it
+    /// stands, whatever its credit, which moves its position past them.
+    /// `None` if it isn't served or the chain ends first.
+    pub(super) fn page_at(&mut self, id: u64, count: u32) -> Option<RegtestMessage> {
+        let serving = self.serving.get_mut(&id)?;
+        if serving.position + count > u32::try_from(self.chain.headers.len()).ok()? {
             return None;
         }
         let parent = self.chain.at(serving.position);
@@ -591,7 +649,7 @@ mod tests {
                 },
             }),
         };
-        let mut honest = Honest::new(spec, Arc::new(HonestChain::new(&fixture, 50)));
+        let mut honest = Honest::with(spec, Arc::new(HonestChain::new(&fixture, 50)), true, true);
         honest.start_stream();
         let open = honest.receive(&Message::Status(node.status.clone()), 122);
         assert_eq!(open.len(), 1, "the peer subscribes");

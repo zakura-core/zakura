@@ -373,6 +373,15 @@ impl SubscriptionModel {
         true
     }
 
+    /// Subscriptions the peer holds on the node on `session`: live or
+    /// closing ones, and ended ones whose terminal outcome the node is still
+    /// writing. `OverLive` starts at twice `max_live` of them.
+    pub fn held(&self, session: SessionId) -> usize {
+        self.publishers.get(&session).map_or(0, |publisher| {
+            publisher.live.len() + publisher.writing.len()
+        })
+    }
+
     /// Tombstones the node holds on `session`.
     pub fn tombstones(&self, session: SessionId) -> usize {
         self.publishers

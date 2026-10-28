@@ -737,6 +737,12 @@ fn the_rate_limit_caps_adversary_actions() {
             .all(|count| *count == rate),
         "every second but the last is full: {seconds:?}"
     );
+    let occupied: Vec<u64> = seconds.keys().copied().collect();
+    assert!(
+        occupied.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "each second follows the last, so time moved to the limiter's boundary and no \
+         later one: {seconds:?}"
+    );
     for (second, picks) in seconds.iter().skip(1) {
         assert_eq!(
             picks[0],

@@ -178,9 +178,10 @@ struct Requested {
 /// A body that crossed into the node in an open exchange.
 #[derive(Clone, Debug)]
 struct Crossed {
-    connection: u64,
-    /// The exchange's key: its request's first height.
-    exchange: u64,
+    /// The request the exchange answered, by session and request ID: the
+    /// newest one published on the body's connection whose first height
+    /// keys the exchange. `None` if the node published no such request.
+    request: Option<(u64, u64)>,
     hash: String,
 }
 
@@ -206,6 +207,9 @@ pub struct SemanticModel {
     sessions: BTreeMap<u64, u64>,
     /// Each published request, by session and request ID.
     requests: BTreeMap<(u64, u64), Requested>,
+    /// The newest request published on each connection for each first
+    /// height, the key of its exchange, by session and request ID.
+    newest: BTreeMap<(u64, u64), (u64, u64)>,
     /// Each connection's latest peer frame: its number, and its exchange
     /// if a conformant label put it in one.
     last_frame: BTreeMap<u64, (u64, Option<u64>)>,
@@ -398,9 +402,13 @@ impl SemanticModel {
                     .get(connection)
                     .filter(|(frame, _)| frame == seq)
                 {
+                    // The node publishes a request before it writes its
+                    // frame, and the relay labels a request that overlaps
+                    // an open exchange `BadContent`, so the newest request
+                    // the exchange's key names is the one it answers.
+                    let request = self.newest.get(&(*connection, *exchange)).copied();
                     self.crossed.entry(*height).or_default().push(Crossed {
-                        connection: *connection,
-                        exchange: *exchange,
+                        request,
                         hash: hash.clone(),
                     });
                 }
@@ -531,6 +539,14 @@ impl SemanticModel {
             } if step == "published" => {
                 if let Some(epoch) = owner.body_work_epoch {
                     self.note_epoch(epoch);
+                }
+                if let (Some(connection), Some(first)) =
+                    (self.sessions.get(&owner.session_id), heights.first())
+                {
+                    self.newest.insert(
+                        (*connection, u64::from(*first)),
+                        (owner.session_id, owner.request_id),
+                    );
                 }
                 self.requests.insert(
                     (owner.session_id, owner.request_id),
@@ -672,11 +688,9 @@ impl SemanticModel {
             )));
         }
         let crossed = self.crossed.get(&height).map_or(&[][..], Vec::as_slice);
-        let first = requested.heights.first().copied().map(u64::from);
-        let connection = self.sessions.get(&owner.session_id).copied();
-        let own = crossed.iter().any(|body| {
-            body.hash == hash && Some(body.connection) == connection && Some(body.exchange) == first
-        });
+        let own = crossed
+            .iter()
+            .any(|body| body.hash == hash && body.request == Some(request));
         // First-completion-wins: a body another exchange delivered may end
         // this request's reservation if it's the body this request's work
         // asked for.
@@ -1049,7 +1063,9 @@ fn queued_at_idle(log: &ObservationLog) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::{BlockSyncBody, StorageBranch, StoragePoint, WorkScope};
+    use crate::observe::{
+        BlockSyncBody, BodyScope, StorageBranch, StoragePoint, StreamId, WorkScope,
+    };
 
     /// A log built one step at a time.
     #[derive(Default)]
@@ -1132,6 +1148,84 @@ mod tests {
                 result: StorageResult::Verdict {
                     verdict: "committed".to_owned(),
                     reply: "committed".to_owned(),
+                },
+                delivered: true,
+                state_version: 0,
+            })
+        }
+
+        /// Block sync admits session `session` on `connection`.
+        fn session(&mut self, connection: u64, session: u64) -> &mut History {
+            self.sync(BlockSyncFact::SessionAdmitted {
+                peer: "peer".to_owned(),
+                connection,
+                session_id: session,
+                generation: 1,
+                direction: "outbound".to_owned(),
+            })
+        }
+
+        /// Block sync publishes `owner`'s request for the body at [`HEIGHT`].
+        fn request(&mut self, owner: WorkOwner) -> &mut History {
+            self.sync(BlockSyncFact::Request {
+                owner,
+                heights: vec![HEIGHT],
+                estimated_bytes: 100,
+                step: "published".to_owned(),
+            })
+        }
+
+        /// The peer on `connection` sends frame `seq`, body `hash` at
+        /// [`HEIGHT`], in the open exchange [`HEIGHT`] keys.
+        fn body(&mut self, connection: u64, seq: u64, hash: &str) -> &mut History {
+            let stream = StreamId {
+                kind: 1,
+                version: 1,
+            };
+            self.log.push(Observation::PeerFrame {
+                connection,
+                stream,
+                seq,
+                row: Some("block".to_owned()),
+                rule_stream: stream,
+                label: Label::Conformant,
+                exhausted: false,
+                exchange: Some(u64::from(HEIGHT)),
+                payload: 100,
+            });
+            self.log.push(Observation::PeerBody {
+                connection,
+                seq,
+                height: HEIGHT,
+                hash: hash.to_owned(),
+            });
+            self
+        }
+
+        /// Storage answers needed-blocks query `id` of epoch `epoch` with
+        /// body `hash` at [`HEIGHT`].
+        fn needed(&mut self, id: u64, epoch: u64, hash: &str) -> &mut History {
+            self.storage(StorageFact::BlockSubmitted {
+                id,
+                request: StorageRequest::QueryNeededBlocks {
+                    query_id: id,
+                    from: HEIGHT,
+                    limit: 1,
+                    scope: BodyScope {
+                        scope: owner(0, 0, epoch).scope,
+                        verified_generation: 1,
+                        body_work_epoch: epoch,
+                    },
+                    best_header_tip: 8,
+                },
+                stage: None,
+            })
+            .storage(StorageFact::BlockCompleted {
+                id,
+                outcome: "answered".to_owned(),
+                result: StorageResult::NeededBlocks {
+                    anchor: point(0, "genesis"),
+                    blocks: vec![point(HEIGHT, hash)],
                 },
                 delivered: true,
                 state_version: 0,
@@ -1311,5 +1405,69 @@ mod tests {
             "{:?}",
             model.submissions
         );
+    }
+
+    /// Session 1 on connection 10 asks for height 3 in epoch 1, and the
+    /// peer answers with `old-fork`. A reset to epoch 2 asks for height 3
+    /// again on the same session, and the needed-blocks answer authorizes
+    /// only `new-fork`.
+    fn asked_again_after_a_reset() -> History {
+        let mut history = History::default();
+        history
+            .step()
+            .view(1)
+            .session(10, 1)
+            .request(owner(1, 1, 1))
+            .step()
+            .body(10, 0, "old-fork")
+            .step()
+            .view(2)
+            .needed(5, 2, "new-fork")
+            .request(owner(1, 2, 2));
+        history
+    }
+
+    /// The findings for [`SUBMIT_ONLY_REQUESTED`] in `history`'s log.
+    fn submit_findings(history: &History) -> Vec<Finding> {
+        SemanticModel::of(&history.log).submit_findings
+    }
+
+    /// The later request's submission of the body the earlier request's
+    /// exchange delivered: the body never crossed in the later request's
+    /// exchange, and its epoch's work didn't ask for it.
+    #[test]
+    fn a_body_from_an_earlier_exchange_for_the_same_height_is_found() {
+        let mut history = asked_again_after_a_reset();
+        history.step().submit(6, 1, owner(1, 2, 2), "old-fork");
+        let findings = submit_findings(&history);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].actual.contains("crossed in another exchange"),
+            "{findings:?}"
+        );
+    }
+
+    /// The body that crosses in the later request's own exchange is that
+    /// request's, and the earlier request's body is the earlier one's.
+    #[test]
+    fn each_exchange_credits_the_request_that_opened_it() {
+        let mut history = History::default();
+        history
+            .step()
+            .view(1)
+            .session(10, 1)
+            .request(owner(1, 1, 1))
+            .step()
+            .body(10, 0, "old-fork")
+            .step()
+            .submit(6, 1, owner(1, 1, 1), "old-fork")
+            .step()
+            .view(2)
+            .request(owner(1, 2, 2))
+            .step()
+            .body(10, 1, "new-fork")
+            .step()
+            .submit(7, 2, owner(1, 2, 2), "new-fork");
+        assert_eq!(submit_findings(&history), []);
     }
 }

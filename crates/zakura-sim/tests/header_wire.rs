@@ -576,7 +576,7 @@ fn only_the_dialer_opens_the_header_stream() {
 
 /// When the node dials and the responder's ack echoes a wrong nonce, the
 /// node refuses the connection in its handshake, before it negotiates or
-/// registers anything, so no session starts.
+/// registers anything, so no session starts, and its dial fails.
 #[test]
 fn a_bad_nonce_echo_is_refused() {
     let scenario = scenario(vec![PeerSpec {
@@ -589,15 +589,25 @@ fn a_bad_nonce_echo_is_refused() {
             .iter()
             .map(|event| (event.connection, event.remote.clone(), event.fact.clone()))
             .collect();
+        // The node's dial then fails with the same error.
         assert_eq!(
             seen,
-            [(
-                None,
-                remote(0, 0),
-                TransportFact::HandshakeRefused {
-                    reason: "Zakura control nonce mismatch".to_owned()
-                }
-            )]
+            [
+                (
+                    None,
+                    remote(0, 0),
+                    TransportFact::HandshakeRefused {
+                        reason: "Zakura control nonce mismatch".to_owned()
+                    }
+                ),
+                (
+                    None,
+                    remote(0, 0),
+                    TransportFact::DialFailed {
+                        error: "Zakura control nonce mismatch".to_owned()
+                    }
+                )
+            ]
         );
         assert_eq!(sessions, []);
     }

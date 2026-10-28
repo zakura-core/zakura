@@ -432,16 +432,11 @@ fn regtest_config() -> Config {
 
 /// Builds the node: a header-sync reactor on inert storage behind the real
 /// handler, which advertises header sync alone. Returns its QUIC endpoint,
-/// supervisor, handler and local limits.
+/// handler and local limits.
 fn bind_node(
     net: &SimNet,
     service: Arc<dyn Service>,
-) -> (
-    QuicEndpoint,
-    ZakuraSupervisorHandle,
-    ZakuraProtocolHandler,
-    ZakuraLocalLimits,
-) {
+) -> (QuicEndpoint, ZakuraProtocolHandler, ZakuraLocalLimits) {
     let config = regtest_config();
     let limits = ZakuraLocalLimits::from_config(&config);
     let quic = QuicEndpoint::bind_with(
@@ -455,7 +450,7 @@ fn bind_node(
     let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
     let registry = ServiceRegistry::new(vec![service]).expect("one service registers");
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
-        supervisor.clone(),
+        supervisor,
         config.network.clone(),
         ZakuraHandshakeConfig::for_network(&config.network),
         limits.clone(),
@@ -463,7 +458,7 @@ fn bind_node(
         ZakuraTrace::noop(),
     )
     .with_local_node_id(quic.local_id());
-    (quic, supervisor, handler, limits)
+    (quic, handler, limits)
 }
 
 /// `ZakuraEndpoint::new` and `ZakuraEndpoint::dial` build and run without
@@ -490,8 +485,8 @@ fn endpoint_new_builds_without_the_testkit() {
         let (net, dialed) = (net.clone(), Rc::clone(&dialed));
         sched.spawn_root("node", async move {
             let _actions = actions;
-            let (quic, supervisor, handler, limits) = bind_node(&net, service);
-            let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
+            let (quic, handler, limits) = bind_node(&net, service);
+            let endpoint = ZakuraEndpoint::new(quic, handler);
             let unreachable =
                 NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
             let result = endpoint.dial(unreachable, &limits).await;

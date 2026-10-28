@@ -327,7 +327,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
+            "the_above_window_input_holds_lookahead_overshoot_bound",
         ),
         bypass: Bypass::Planted("omit-outstanding-estimates"),
     },

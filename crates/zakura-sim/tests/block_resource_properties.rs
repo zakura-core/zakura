@@ -17,11 +17,11 @@ use zakura_sim::{
         RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND, TEARDOWN_RETURNS_BASELINE,
     },
     harness::{
-        block_sync::{BlockScenario, MirrorSpec, Storage},
+        block_sync::{BlockScenario, MirrorSpec, Ports, Storage},
         header_sync::Dialer,
         run_prepared, Subsystem,
     },
-    observe::{StorageBranch, WorkOwner, WorkScope},
+    observe::{BlockSyncFact, StorageBranch, WorkOwner, WorkScope},
     witness::{check_witness, Expect, WitnessScenario},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
 };
@@ -120,16 +120,17 @@ fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
 }
 
 /// The floor witness (P5.3): routines paused in their handoffs fill the
-/// budget past `M` with floor charges, then the floor's owners churn: a
-/// routine retires when its link closes, a withheld request times out and
-/// closes another, and the chain resets to a fork. The reserved bound holds
-/// after every step, and the ledgers at every rest. The overshoot past `M`
-/// is reported.
+/// budget past `M` with floor charges, then the floor's owners churn:
+/// `mirror-3`'s routine retires when its link closes, a request for height
+/// 7, which every mirror withholds, times out, and the chain resets to a
+/// fork. The reserved bound holds after
+/// every step, and the ledgers at every rest. The overshoot past `M` is
+/// reported.
 #[test]
 #[allow(clippy::print_stdout)]
 fn the_floor_churn_holds_the_reserved_bound() {
     let scenario = BlockScenario::floor_churn();
-    let report = node_run(&scenario, Plan::from_fuzz(&[]));
+    let (report, ports) = node_run_with_ports(&scenario, Plan::from_fuzz(&[]));
     for id in [
         RESERVED_BYTE_BOUND,
         BUDGET_LEDGERS_AGREE,
@@ -141,14 +142,82 @@ fn the_floor_churn_holds_the_reserved_bound() {
             "{id}: {outcome:?}"
         );
     }
-    let picked = |identity: &str| report.picks.iter().any(|pick| pick.identity == identity);
-    assert!(picked("peer:chain:reset"), "the chain resets");
-    let closed = report
+    let reset = report
+        .picks
+        .iter()
+        .find(|pick| pick.identity == "peer:chain:reset")
+        .map(|pick| pick.step)
+        .expect("the chain resets");
+    let retired = ports
+        .effects
+        .links
+        .borrow()
+        .iter()
+        .find(|link| link.peer == "mirror-3")
+        .map(|link| link.conn_id)
+        .expect("mirror-3 links");
+    let facts: Vec<_> = report
         .log
         .entries()
         .iter()
-        .any(|entry| matches!(&entry.obs, Observation::ConnectionClosed { .. }));
-    assert!(closed, "a withheld request closes its link");
+        .filter_map(|entry| match &entry.obs {
+            Observation::BlockSync { event, .. } => Some((entry.step, event)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        facts.iter().any(|(step, fact)| *step < reset
+            && matches!(fact, BlockSyncFact::Routine { connection, ended: true, .. }
+                if *connection == retired)),
+        "mirror-3's routine retires before the reset"
+    );
+    // Every mirror withholds height 7, so a request for it ends only at its
+    // timeout or its link's close. The first one goes out on a link the
+    // harness never closes, and once the 8 s request timeout passes, the
+    // work queue holds height 7 unowned again, before the reset.
+    let (asked, session) = facts
+        .iter()
+        .find_map(|(step, fact)| match fact {
+            BlockSyncFact::Request {
+                owner,
+                heights,
+                step: moved,
+                ..
+            } if moved == "written" && heights.contains(&7) => Some((*step, owner.session_id)),
+            _ => None,
+        })
+        .expect("the node asks for height 7");
+    let asked_on = facts
+        .iter()
+        .find_map(|(_, fact)| match fact {
+            BlockSyncFact::SessionAdmitted {
+                connection,
+                session_id,
+                ..
+            } if *session_id == session => Some(*connection),
+            _ => None,
+        })
+        .expect("the request's session is admitted");
+    assert_ne!(asked_on, retired, "height 7 is asked on a link that stays");
+    let timed_out = report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } if *to_ns >= 8_000_000_000 => Some(entry.step),
+            _ => None,
+        })
+        .expect("virtual time passes the request timeout");
+    assert!(asked < timed_out && timed_out < reset);
+    assert!(
+        facts
+            .iter()
+            .any(|(step, fact)| (timed_out..reset).contains(step)
+                && matches!(fact, BlockSyncFact::WorkQueue { items } if items
+                .iter()
+                .any(|item| item.height == 7 && item.owner.is_none()))),
+        "the request for height 7 times out before the reset"
+    );
     let limits = Limits::of(&scenario.node_config(), 4, 2_000);
     let peaks = &property(&report, RESERVED_BYTE_BOUND).peaks;
     let overshoot = peaks["past-budget-estimate-bytes"];
@@ -167,28 +236,33 @@ fn the_floor_churn_holds_the_reserved_bound() {
 /// above-window estimates `E` pass `L`: each worker's admission sees the
 /// others' requests only once they publish, so `E` can pass `L` by up to
 /// `(W + 1)·k·B`. With `omit-outstanding-estimates.patch`, admission
-/// ignores outstanding requests, and the same input violates it.
+/// ignores outstanding requests, and the same input violates it. A debug
+/// run takes about a minute, so the test runs the input once and reads the
+/// trigger from the peaks: an above-window estimate the bound counted. The
+/// planted runner judges the trigger history on the same input.
 #[test]
-#[ignore = "a debug run takes about 100 s; `cargo xtask planted` runs the committed input unpatched"]
 fn the_above_window_input_holds_lookahead_overshoot_bound() {
     let witness = committed(ABOVE_WINDOW_INPUT);
     assert_eq!(witness.scenario, BlockScenario::above_window());
-    let report = node_run(&witness.scenario, witness.input.clone());
-    let peaks = &property(&report, LOOKAHEAD_OVERSHOOT_BOUND).peaks;
+    let report = node_run(&witness.scenario, witness.input);
+    let lookahead = property(&report, LOOKAHEAD_OVERSHOOT_BOUND);
+    assert!(
+        matches!(lookahead.outcome, PropertyOutcome::Held { applicable } if applicable > 0),
+        "{lookahead:?}"
+    );
+    let peaks = &lookahead.peaks;
     let limits = Limits::of(&witness.scenario.node_config(), 2, 2_000);
     assert!(peaks["past-lookahead-bytes"] > 0, "{peaks:?}");
     assert!(
         peaks["above-window-estimate-bytes"] <= limits.lookahead_bound(0),
         "{peaks:?}"
     );
-    check_witness(witness, LOOKAHEAD_OVERSHOOT_BOUND, Expect::Holds);
 }
 
 /// `block_sync_teardown_returns_baseline`: both mirrors leave while the
-/// node owes them requests. Once every routine has ended and the run
-/// rests, the byte budget, the work queue's tally, the routines'
-/// unreceived estimates and the input queue are zero, and no handoff is
-/// open. With `skip-return-on-drop.patch`, a dropped routine keeps its
+/// node owes them requests. Once every routine has ended, the input queue
+/// is empty and the run rests, the byte budget, the work queue's tally and
+/// the routines' unreceived estimates are zero, and no handoff is open. With `skip-return-on-drop.patch`, a dropped routine keeps its
 /// requests, and the same input violates it.
 #[test]
 fn block_sync_teardown_returns_baseline() {
@@ -293,6 +367,11 @@ fn lookahead_estimate_to_wire_growth() {
 /// Runs `scenario` under `input`. The run must end with no violation and
 /// no harness failure, with every block storage operation paired.
 fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
+    node_run_with_ports(scenario, input).0
+}
+
+/// [`node_run`], returning the ports too.
+fn node_run_with_ports(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     let ports = Storage::prepare(scenario);
     let report = run_prepared::<Storage>(
         scenario,
@@ -304,9 +383,12 @@ fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
-    let view = ports.view.borrow();
-    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
-    report
+    assert!(
+        ports.view.borrow().pairing.is_empty(),
+        "{:?}",
+        ports.view.borrow().pairing
+    );
+    (report, ports)
 }
 
 /// Checks `witness` as a witness test of `property` that expects it to
@@ -347,8 +429,10 @@ fn history(report: &RunReport) -> Vec<String> {
         .collect()
 }
 
-/// Honest runs, BS5's two-mirror flow among them, hold all three bounds,
-/// each at least once. Plan A twice gives one history, and so does A, then
+/// Honest runs, BS5's two-mirror flow among them, hold each bound in
+/// [`IDS`] at least once. None reaches the window's top, so the look-ahead
+/// bound holds with nothing above the window; the above-window test is its
+/// real witness. Plan A twice gives one history, and so does A, then
 /// B, then A.
 #[test]
 fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {

@@ -24,8 +24,9 @@
 //! - [`LOOKAHEAD_OVERSHOOT_BOUND`]: at rest, above-window retained bytes
 //!   plus outstanding above-window estimates stay within
 //!   `L + H + (W + 1)·B`;
-//! - [`TEARDOWN_RETURNS_BASELINE`]: once every peer has left and every
-//!   routine has ended, at rest, every charge is back to zero.
+//! - [`TEARDOWN_RETURNS_BASELINE`]: once every peer has left, every
+//!   routine has ended and the sequencer's input queue is empty, at rest,
+//!   every charge is back to zero.
 //!
 //! D2's `2·B` assumes each request asks for one body
 //! (`BS_BLOCKS_PER_RESPONSE = 1`). [`Limits::reserved_bound`] and
@@ -940,8 +941,8 @@ where
         },
         Property {
             id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-            claim: "once every peer has left and every routine has ended, at rest, no \
-                    block-sync charge remains",
+            claim: "once every peer has left, every routine has ended and the input \
+                    queue is empty, at rest, no block-sync charge remains",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View, Source::Schedule],
@@ -1133,19 +1134,25 @@ where
 /// The trigger is every link the harness made having closed. Settlement is
 /// established apart from the charges: every admitted session's routine,
 /// and every routine that reported a snapshot, has reported its last one,
-/// and the run is at rest. Then the budget, the work queue's tally, the
-/// routines' unreceived estimates and the input queue must all be zero, and
-/// no handoff may be open. Before settlement the property is unsettled, so
-/// a run that ends there is `Inconclusive { TeardownOpen }`.
+/// the sequencer's input queue is empty, and the run is at rest. The input
+/// queue is part of settlement because the sequencer can rest in a submit,
+/// waiting for storage, with bodies still queued: those bodies are the
+/// sequencer's work, which no peer's leaving ends. Then the budget, the
+/// work queue's tally and the routines' unreceived estimates must all be
+/// zero, and no handoff may be open. Before settlement the property is
+/// unsettled, so a run that ends there, including one with a leaked
+/// routine or queued body, is `Inconclusive { TeardownOpen }`, not a
+/// violation.
 fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {
     let status = cx.status;
-    let (left, unended, charges, gap) = cx.view().read_owners(|owners| {
+    let (left, unended, queued, charges, gap) = cx.view().read_owners(|owners| {
         (
             owners.peers_left(),
             owners.unended(),
+            owners.queued(),
             [
                 ("the byte budget", owners.reserved()),
                 ("the work queue's tally", owners.queue_reserved()),
@@ -1153,7 +1160,6 @@ where
                     "the routines' unreceived estimates",
                     owners.unreceived_estimates(),
                 ),
-                ("the sequencer's input queue", owners.queued()),
                 (
                     "open handoffs",
                     u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX),
@@ -1169,7 +1175,7 @@ where
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
-    if unended > 0 || !at_rest(status) {
+    if unended > 0 || queued > 0 || !at_rest(status) {
         cx.unsettled(Inconclusive::TeardownOpen);
         return Verdict::NotApplicable;
     }

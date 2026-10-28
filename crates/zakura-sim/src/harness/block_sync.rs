@@ -293,11 +293,11 @@ impl BlockScenario {
     }
 
     /// The paused handoffs on 24 bodies, with the floor's other churn
-    /// (properties.md, P5.3): `mirror-0` never serves a read from height 7,
-    /// so a request for it times out; `mirror-3`'s link closes once the node
-    /// has asked storage to admit ten bodies, which retires its routine; and
-    /// the chain resets to a fork from height 12 once it has asked for
-    /// fourteen.
+    /// (properties.md, P5.3): every mirror withholds height 7, so each
+    /// request for it times out; `mirror-3`'s link closes once the node has
+    /// asked storage to admit four bodies, which retires its routine; and
+    /// the chain resets to a fork from height 12 at 12 s of virtual time,
+    /// after the 8 s request timeout.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(
@@ -315,7 +315,7 @@ impl BlockScenario {
                     action: ControlAction::Close {
                         peer: "mirror-3".to_owned(),
                     },
-                    when: after(10),
+                    when: after(4),
                 },
                 ControlStep {
                     action: ControlAction::Reset {
@@ -326,12 +326,14 @@ impl BlockScenario {
                         },
                         node_first: false,
                     },
-                    when: after(14),
+                    when: Some(policy::Trigger::VirtualTime(12_000)),
                 },
             ],
             ..BlockScenario::paused_handoffs()
         };
-        scenario.mirrors[0].withheld = vec![7];
+        for mirror in &mut scenario.mirrors {
+            mirror.withheld = vec![7];
+        }
         scenario
     }
 
@@ -595,8 +597,18 @@ impl Subsystem for Storage {
             .checked_sub(1)
             .and_then(|last| ports.chain.get(usize::try_from(last).ok()?))
             .map_or(0, |block| block.height.0);
-        ports.view.borrow_mut().owners =
-            OwnerModel::new(Limits::of(&config, workers, largest_body), verified_tip);
+        let limits = Limits::of(&config, workers, largest_body);
+        // With one body per request, a revocation takes a request's only
+        // height, so the routine retires the whole request. With more, a
+        // request can lose some heights and keep the rest
+        // (`gc_obsolete_outstanding`), a path no scenario reaches. The
+        // ledger reconciliation and the bounds' `k` terms need a scenario
+        // for it before anyone relies on them there.
+        assert_eq!(
+            limits.per_request, 1,
+            "block-sync properties are checked only at one body per request"
+        );
+        ports.view.borrow_mut().owners = OwnerModel::new(limits, verified_tip);
         let view = ports.view.clone();
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::new(block_sync_serving_limit(&config));

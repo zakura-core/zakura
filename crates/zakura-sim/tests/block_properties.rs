@@ -571,15 +571,16 @@ fn a_stale_query_after_a_reset_is_asked_again() {
 /// replaces that height, so the sequencer detaches it and keeps it charged.
 /// Its late verdict releases the detached holder.
 ///
-/// The late verdict commits the replaced block, so the verified tip moves
-/// off the fork. If the fork's height 3 reaches storage first, the node
-/// commits the fork's tip. Otherwise the run ends in the known stall
+/// The late verdict commits the replaced block. Some schedules still reach
+/// the fork's tip. The others end in the known stall
 /// (`lane3-issues/case3-stall.md`): the engine keeps the body-work epoch,
-/// since the verified chain only grew, and the work queue retires the
-/// fork's height 3 by height as the verified tip passes it. The tip then
-/// stays at the replaced block, and nothing requests the fork's height 3
-/// again. Every input must end in one of those two shapes. Once the planned
-/// fix lands, a verified tip that leaves the selected branch starts a new
+/// since the commit only extends the verified chain and leaves the selected
+/// chain as it was, and the work queue retires the fork's height 3 by
+/// height as the verified tip passes it. The tip then stays at the replaced
+/// block, and nothing requests the fork's height 3 again, while the fork's
+/// heights above it are submitted or held. Every input must end in one of
+/// those two shapes, and at least one must converge. Once the planned fix
+/// lands, a verified tip that leaves the selected branch starts a new
 /// body-work epoch, and every input must converge.
 #[test]
 #[allow(clippy::print_stdout)]
@@ -599,17 +600,17 @@ fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {
                 _ => None,
             })
             .expect("height 3 is submitted");
-        let replacement = ports
+        let fork: Vec<(u32, String)> = ports
             .live
             .blocks()
             .into_iter()
-            .find(|block| block.height.0 == 3)
+            .map(|block| (block.height.0, storage_hash(block.hash())))
+            .collect();
+        let replacement = fork
+            .iter()
+            .find(|(height, _)| *height == 3)
             .expect("the fork holds height 3");
-        assert_ne!(
-            replacement.hash().to_string(),
-            hash,
-            "the fork replaces height 3"
-        );
+        assert_ne!(replacement.1, hash, "the fork replaces height 3");
         let retained = detached(&report, token, "retained").expect("the reset detaches it");
         let verdict = completed(&report, op).expect("the delayed verdict arrives");
         let released = detached(&report, token, "released").expect("the verdict releases it");
@@ -623,18 +624,69 @@ fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {
             assert_settled(&view);
         } else {
             stalled += 1;
-            assert_stalled_at_replaced_height(&report, &ports.view.borrow(), &hash);
+            assert_stalled_at_replaced_height(&report, &ports.view.borrow(), &hash, &fork, verdict);
         }
     }
     println!("case 3: {converged} inputs converged, {stalled} stalled at the replaced height");
+    assert!(converged > 0, "some input converges");
+}
+
+/// `hash` as block storage's facts write it: hex in its byte order.
+fn storage_hash(hash: zakura_chain::block::Hash) -> String {
+    hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The known case-3 stall: the run spent its step budget with the last
 /// published verified tip at the replaced height-3 block `replaced`, and no
 /// holder or work item remains at height 3, so nothing can bring the fork's
-/// height 3 back.
-fn assert_stalled_at_replaced_height(report: &RunReport, view: &BlockSyncView, replaced: &str) {
+/// height 3 back. Sync went on above it: the node submitted, or still
+/// holds, each of the fork's heights 4 to 10 (`fork` lists the live chain
+/// by height and storage hash). No installed transition after the stale
+/// verdict, at step `verdict`, invalidated body work, so the epoch stayed.
+fn assert_stalled_at_replaced_height(
+    report: &RunReport,
+    view: &BlockSyncView,
+    replaced: &str,
+    fork: &[(u32, String)],
+    verdict: u64,
+) {
     assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
+    let invalidated = facts(report).into_iter().find(|(step, fact)| {
+        *step >= verdict
+            && matches!(
+                fact,
+                StorageFact::TransitionInstalled {
+                    invalidates_body_work: true,
+                    ..
+                }
+            )
+    });
+    assert_eq!(invalidated, None, "the stale commit keeps the epoch");
+    let submitted: BTreeSet<&str> = submissions(report)
+        .into_iter()
+        .filter_map(|(_, request, _)| match request {
+            StorageRequest::SubmitBlock { hash, .. } => Some(hash.as_str()),
+            _ => None,
+        })
+        .collect();
+    let held = |height: u32| {
+        view.sequencer
+            .reorder
+            .iter()
+            .chain(&view.sequencer.applying)
+            .any(|body| body.height.0 == height)
+    };
+    let above: Vec<_> = fork
+        .iter()
+        .filter(|(height, _)| (4..=10).contains(height))
+        .collect();
+    assert_eq!(above.len(), 7, "the fork holds heights 4 to 10");
+    for (height, hash) in above {
+        assert!(
+            submitted.contains(hash.as_str()) || held(*height),
+            "the node submitted or holds the fork's height {height}"
+        );
+    }
     let tip = facts(report)
         .into_iter()
         .rev()

@@ -768,7 +768,12 @@ fn judging(label: Label, row: &str) -> String {
 fn saved_plans_replay_their_end_records() {
     for plan in SavedPlan::ALL {
         let (input, pinned) = committed(plan);
-        assert_eq!(HeaderWire::draw(&input[..2]), plan.scenario(), "{}", plan.name());
+        assert_eq!(
+            HeaderWire::draw(&input[..2]),
+            plan.scenario(),
+            "{}",
+            plan.name()
+        );
         let (report, end, ports) = replay(&input);
         assert_eq!(
             report.end.harness,

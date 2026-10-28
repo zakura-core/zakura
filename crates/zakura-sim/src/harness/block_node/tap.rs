@@ -10,8 +10,9 @@
 //!
 //! Before it logs a drain, the reader pairs the node's storage operations
 //! with its events, as [`super::pair`] describes, from the facts
-//! [`PolicySource`](super::PolicySource) hands it, and folds the events into
-//! the [`BlockSyncView`] the harness's checks read.
+//! [`PolicySource`](super::PolicySource) hands it, and folds the events and
+//! the operations that didn't pair into the [`BlockSyncView`] the harness's
+//! checks read.
 //!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to block sync. Installing
@@ -223,10 +224,9 @@ impl BlockTap {
     /// Hands over the node's block storage facts that this step's drain
     /// logged, as `(seq, fact)` in order, so the next
     /// [`observe`](ActionSource::observe) can pair operations with events.
-    pub(crate) fn storage_facts<'f>(
-        &mut self,
-        facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
-    ) {
+    /// [`PolicySource`](super::PolicySource) hands over every fact its
+    /// block service logs.
+    pub fn storage_facts<'f>(&mut self, facts: impl IntoIterator<Item = (u64, &'f StorageFact)>) {
         self.facts
             .extend(facts.into_iter().map(|(seq, fact)| (seq, fact.clone())));
     }
@@ -552,9 +552,10 @@ impl ActionSource for BlockTap {
 
     /// Logs every event recorded since the last observation, in order,
     /// records what it delivered in the checkpoint, pairs the drain with
-    /// the handed-over storage facts, and folds it into the view. A drain
-    /// that doesn't pair is still logged, then fails, unless the tap is
-    /// unhealthy, which the run reports instead.
+    /// the handed-over storage facts, and folds it into the view, with every
+    /// operation that didn't pair. A drain whose sequence numbers skip or go
+    /// back is still logged, then fails, unless the tap is unhealthy, which
+    /// the run reports instead.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -597,8 +598,9 @@ impl ActionSource for BlockTap {
         }
         view.step = Some(log.step());
         match paired {
-            Ok(pairings) => {
-                for pairing in pairings {
+            Ok(drain) => {
+                view.pairing.extend(drain.anomalies);
+                for pairing in drain.paired {
                     match pairing {
                         Paired::Submission { token, op } => {
                             view.submissions.insert(token, op);
@@ -610,8 +612,9 @@ impl ActionSource for BlockTap {
                 }
                 Ok(())
             }
-            // A block sync that unwound leaves its last events unpaired. The
-            // run's evidence check then reports the tap's own health.
+            // An unhealthy tap's events may carry no watermark, such as
+            // those recorded after the block service was dropped. The run's
+            // evidence check then reports the tap's own health.
             Err(_) if self.state.health().is_some() => Ok(()),
             Err(detail) => Err(detail),
         }

@@ -249,8 +249,8 @@ impl Honest {
     }
 
     /// When a held grant may next be offered, if one is waiting: never once
-    /// the subscription ended or this peer sent its `Close`, which
-    /// [`Honest::release_grant`] refuses.
+    /// the subscription ended or this peer sent its `Close`, when
+    /// [`Honest::release_grant`] has nothing to release.
     pub(crate) fn grant_opens(&self) -> Option<Instant> {
         let GrantPolicy::Held { quiet_ms, .. } = self.spec.subscribe.as_ref()?.grants else {
             return None;
@@ -396,7 +396,12 @@ impl Honest {
         vec![self.send(update)]
     }
 
-    /// Releases one held grant.
+    /// Releases one held grant. Once this peer has sent its `Close` or its
+    /// subscription has ended, nothing is held, so the release sends
+    /// nothing. That's the rule, not [`Honest::grant_opens`]'s readiness: a
+    /// grant the `Plan` queued while the subscription was live can still be
+    /// taken after a page that reaches the target made the peer close.
+    /// Only a peer with no held grant policy can't release.
     pub(crate) fn release_grant(&mut self) -> Result<Vec<Outgoing>, String> {
         let Some(GrantPolicy::Held { grant, .. }) =
             self.spec.subscribe.as_ref().map(|spec| spec.grants)
@@ -408,7 +413,7 @@ impl Honest {
             .as_ref()
             .is_none_or(|sub| sub.ended || sub.close_sent)
         {
-            return Err("can't grant without a live subscription".to_owned());
+            return Ok(Vec::new());
         }
         let update = self.update(Some(grant.into()));
         Ok(vec![self.send(update)])
@@ -555,6 +560,61 @@ mod tests {
     use zakura_network::zakura::v9::RegtestMessage;
 
     use super::super::{ENTRY_BYTES, PAGE_FIXED_BYTES};
+
+    /// A grant released after the page that reaches the target, as a grant
+    /// the `Plan` queued before that page arrived would be, sends nothing:
+    /// the peer has sent its `Close`, so nothing is held.
+    #[test]
+    fn a_grant_released_after_close_sends_nothing() {
+        use zakura_network::zakura::{
+            v9::{Headers, Message},
+            AuxSchema, HeaderEntry,
+        };
+        use zakura_storage::header::fixture::HeaderFixture;
+
+        use super::*;
+
+        let fixture = HeaderFixture::regtest();
+        let node = HonestChain::new(&fixture, 51);
+        let credit = CreditSpec {
+            objects: 1,
+            bytes: 263,
+        };
+        let spec = HonestSpec {
+            chain: 50,
+            subscribe: Some(SubscribeSpec {
+                start: 50,
+                open: credit,
+                grants: GrantPolicy::Held {
+                    grant: credit,
+                    quiet_ms: 0,
+                },
+            }),
+        };
+        let mut honest = Honest::new(spec, Arc::new(HonestChain::new(&fixture, 50)));
+        honest.start_stream();
+        let open = honest.receive(&Message::Status(node.status.clone()), 122);
+        assert_eq!(open.len(), 1, "the peer subscribes");
+        let parent = node.at(50);
+        let page = Message::Headers(Headers {
+            subscription_id: 1,
+            initial_target_tip_hash: node.status.selected_tip_hash,
+            common_ancestor_height: parent.height,
+            common_ancestor_hash: parent.hash,
+            reaches_initial_target: true,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header: node.headers[50].clone(),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        });
+        let close = honest.receive(&page, 263);
+        assert_eq!(close.len(), 1, "the target page makes the peer close");
+        assert_eq!(honest.grant_opens(), None, "no grant is offered");
+        let released = honest.release_grant().expect("a held policy releases");
+        assert!(released.is_empty(), "nothing is held after Close");
+    }
 
     /// The page sizes the honest publisher uses are the table's: its
     /// smallest `headers` page is one plain entry, 263 bytes on Regtest.

@@ -86,6 +86,8 @@ pub(crate) enum RecordBody {
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
+    /// [`Observation::PeerClosed`].
+    Closed,
     /// [`Observation::PeerReceived`], with the frame and when the peer
     /// read it, since the run's start, for its `NodeFrame`.
     Received {
@@ -285,6 +287,10 @@ impl WireEvidence {
                 connection,
                 quic_stream,
                 seq,
+            },
+            RecordBody::Closed => Observation::PeerClosed {
+                connection,
+                quic_stream,
             },
             RecordBody::Received {
                 seq,

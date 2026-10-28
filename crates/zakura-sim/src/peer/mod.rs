@@ -11,7 +11,8 @@
 //! [`StreamModels`] before the write and logged as a `PeerFrame`, then as a
 //! `PeerWritten` once the write returns, and every frame it reads from the
 //! node is logged as a `PeerReceived`, then as a `NodeFrame` labelled under
-//! the sender's rules by the [`adapter`] (M5-E2). Each record names its
+//! the sender's rules by the [`adapter`] (M5-E2). A peer that closes its
+//! connection with a header stream open logs a `PeerClosed` (M5-F). Each record names its
 //! connection and QUIC stream from the identity map, never from draw order,
 //! so it waits in [`PeerControl`] until the node's transport has admitted
 //! its stream.
@@ -1336,6 +1337,9 @@ impl PeerTask {
                         }
                         PeerAction::Close | PeerAction::Disconnect => {
                             conn.close(VarInt::from_u32(0), b"close");
+                            if let Some(stream) = &header {
+                                self.record(remote, stream.id, RecordBody::Closed);
+                            }
                             conn.closed().await;
                             return Ended::Closed;
                         }

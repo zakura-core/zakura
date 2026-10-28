@@ -31,7 +31,7 @@ use crate::{
 /// 13 added scripted peers' `peer-written` and `peer-received` records.
 /// Version 14 added the QUIC stream to `peer-frame` and `frame-judged`.
 /// Version 15 added it to `node-frame`. Version 16 added the wire node's
-/// `dial-failed` event.
+/// `dial-failed` event and scripted peers' `peer-closed` record.
 pub const FORMAT_VERSION: u32 = 16;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
@@ -1394,9 +1394,9 @@ mod tests {
         );
     }
 
-    /// Pins a scripted peer's frame, write and receive records, with and
-    /// without credit, a judgement and a node frame with and without a QUIC
-    /// stream, and the format version.
+    /// Pins a scripted peer's frame, write, close and receive records, with
+    /// and without credit, a judgement and a node frame with and without a
+    /// QUIC stream, and the format version.
     #[test]
     fn peer_record_encoding_is_pinned() {
         use crate::{
@@ -1437,6 +1437,10 @@ mod tests {
                 connection: 1,
                 quic_stream: 4,
                 seq: 0,
+            },
+            Observation::PeerClosed {
+                connection: 1,
+                quic_stream: 4,
             },
             Observation::PeerReceived {
                 connection: 1,
@@ -1483,7 +1487,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 16, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"peer-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0,"row":"headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1,"payload":263},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"seq":0},{"obs":"peer-written","connection":1,"quic_stream":4,"seq":0},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":1,"message_type":2,"payload":139,"credit":{"objects":250,"bytes":65750}},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":2,"message_type":3,"payload":263,"credit":null},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":2,"row":"subscribe-headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"seq":3,"row":"status","rule_stream":{"kind":5,"version":9},"label":"conformant","exhausted":true}]"#,
+            r#"[{"obs":"peer-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0,"row":"headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1,"payload":263},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":0},{"obs":"frame-judged","connection":1,"stream":{"kind":5,"version":9},"seq":0},{"obs":"peer-written","connection":1,"quic_stream":4,"seq":0},{"obs":"peer-closed","connection":1,"quic_stream":4},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":1,"message_type":2,"payload":139,"credit":{"objects":250,"bytes":65750}},{"obs":"peer-received","connection":1,"quic_stream":4,"seq":2,"message_type":3,"payload":263,"credit":null},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"quic_stream":4,"seq":2,"row":"subscribe-headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false},{"obs":"node-frame","connection":1,"stream":{"kind":5,"version":9},"seq":3,"row":"status","rule_stream":{"kind":5,"version":9},"label":"conformant","exhausted":true}]"#,
             "{bump}"
         );
     }

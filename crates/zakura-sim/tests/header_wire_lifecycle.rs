@@ -400,7 +400,13 @@ fn replacement_while_storage_is_pending() {
             matches!(fact, TransportFact::Registered)
         })
         .expect("the redial registered");
-        assert!(closed <= decided && decided < torn && torn < registered);
+        let peer_closed = find(entries, |obs| {
+            matches!(obs, Observation::PeerClosed { connection, .. } if *connection == old_conn)
+        })
+        .expect("the peer closed the old connection");
+        assert!(
+            closed <= peer_closed && peer_closed < decided && decided < torn && torn < registered
+        );
 
         // 3. Session 2 was admitted, then submitted its own prepare.
         assert!(new_admitted < p2.submitted);
@@ -473,7 +479,6 @@ const DATA_DATAGRAM: u64 = 1_000;
 #[derive(Clone, Copy, Debug)]
 struct Sent {
     at: usize,
-    step: u64,
     id: u64,
     len: u64,
     /// Whether it's still in the network at the end of the entries read.
@@ -498,7 +503,6 @@ fn sent_on(entries: &[Entry], link: &str) -> Vec<Sent> {
             if *outcome == DatagramOutcome::Sent {
                 sent.push(Sent {
                     at,
-                    step: entry.step,
                     id: *id,
                     len: *len,
                     in_flight: true,
@@ -511,16 +515,22 @@ fn sent_on(entries: &[Entry], link: &str) -> Vec<Sent> {
     sent
 }
 
-/// `peer-0` serves the node from 1,200 headers. Once a full datagram the
-/// peer sent after writing its first page is still in the network, a
-/// focused Plan has `peer-0` close its connection. The datagrams it sent
-/// before the close then wait until one it sent after, which carries the
-/// close, has reached the node, so the node learns of the close with page
-/// bytes still undelivered.
+/// `peer-0` serves the node from 1,200 headers, and a focused Plan has it
+/// close its connection with page bytes still in the network:
 ///
-/// The node decides the close with a neutral cause and tears it down, no
-/// task leaks at shutdown, and no page the node never read whole has a
-/// `FrameJudged`: there's at least one, and none of them is judged.
+/// 1. From the peer's first page on, its datagrams to the node wait.
+/// 2. Once three full-size ones are waiting, the Plan picks `disconnect`.
+///    Acknowledgements and the close are small, and the peer's MTU probes
+///    go one at a time, so at least two of them carry page bytes.
+/// 3. The peer's task closes the connection and logs `PeerClosed`, with
+///    those datagrams still in the network, and then they may go.
+///
+/// The peer sends nothing after its close but the close itself, so a page
+/// whose bytes it hadn't sent yet never reaches the node whole. The node
+/// decides the close with a neutral cause after the peer's `PeerClosed`,
+/// and tears the connection down. No task leaks at shutdown, and no page
+/// the node never read whole has a `FrameJudged`: there's at least one, and
+/// none of them is judged.
 ///
 /// This fails if the close came with no page bytes in flight, if every
 /// page was read anyway, or if a page the node never read is judged.
@@ -540,25 +550,23 @@ fn disconnect_while_pages_are_in_flight() {
     let to_node = format!("{peer}->{NODE_ADDR}");
     let deliver = format!("deliver:{to_node}:");
     let disconnect = "peer:peer-0:disconnect";
-    // The step the plan disconnected at, in the run the rule is judging.
-    let disconnected: Cell<Option<u64>> = Cell::new(None);
+    // Whether the plan has disconnected, in the run the rule is judging.
+    let disconnected = Cell::new(false);
     let rule = |cx: &StepCtx<'_>| {
         if cx.step == 1 {
-            disconnected.set(None);
+            disconnected.set(false);
         }
         let entries = before(cx);
-        let paged = find(
-            entries,
-            |obs| matches!(obs, Observation::PeerFrame { row: Some(row), .. } if row == "headers"),
-        );
-        let sent = sent_on(entries, &to_node);
+        let marks = Marks::of(entries, &to_node);
         let pick = cx.pick.to_string();
-        let id_of = |identity: &str| -> Option<u64> {
-            identity
-                .strip_prefix(&deliver)
-                .map(|id| id.parse().expect("a datagram's id"))
+        // A datagram to the node that waits now.
+        let held = |identity: &str| {
+            let Some(id) = identity.strip_prefix(&deliver) else {
+                return false;
+            };
+            let id: u64 = id.parse().expect("a datagram's id");
+            marks.sent.iter().any(|d| d.id == id && marks.waits(d))
         };
-        let datagram = |id: u64| sent.iter().find(|d| d.id == id).copied();
         let other = |keep: &dyn Fn(&str) -> bool| {
             cx.enabled
                 .iter()
@@ -567,51 +575,27 @@ fn disconnect_while_pages_are_in_flight() {
                 .map(Steer::Pick)
                 .ok_or_else(|| "only held actions are enabled".to_owned())
         };
-        let want = match disconnected.get() {
-            None => {
-                let in_flight = paged.is_some_and(|paged| {
-                    sent.iter()
-                        .any(|d| d.at > paged && d.in_flight && d.len >= DATA_DATAGRAM)
-                });
-                let offered = cx
-                    .enabled
-                    .iter()
-                    .any(|e| e.identity.to_string() == disconnect);
-                if in_flight && offered {
-                    Steer::Pick(disconnect.to_owned())
-                } else if pick == disconnect {
-                    other(&|identity| identity != disconnect)?
-                } else {
-                    Steer::Fine
-                }
+        let want = if disconnected.get() {
+            if held(&pick) {
+                other(&|identity| !held(identity))?
+            } else {
+                Steer::Fine
             }
-            Some(step) => {
-                let closing = sent.iter().any(|d| d.step >= step && !d.in_flight);
-                let held = |identity: &str| {
-                    !closing
-                        && id_of(identity)
-                            .and_then(datagram)
-                            .is_some_and(|d| d.step < step)
-                };
-                if held(&pick) {
-                    let close = sent
-                        .iter()
-                        .find(|d| d.step >= step && d.in_flight)
-                        .map(|d| format!("{deliver}{}", d.id))
-                        .filter(|close| {
-                            cx.enabled.iter().any(|e| e.identity.to_string() == *close)
-                        });
-                    match close {
-                        Some(close) => Steer::Pick(close),
-                        None => other(&|identity| !held(identity))?,
-                    }
-                } else {
-                    Steer::Fine
-                }
+        } else {
+            let offered = cx
+                .enabled
+                .iter()
+                .any(|e| e.identity.to_string() == disconnect);
+            if offered && marks.full_waiting() >= 3 {
+                Steer::Pick(disconnect.to_owned())
+            } else if pick == disconnect || held(&pick) {
+                other(&|identity| identity != disconnect && !held(identity))?
+            } else {
+                Steer::Fine
             }
         };
-        if pick == disconnect && matches!(&want, Steer::Fine) {
-            disconnected.set(Some(cx.step));
+        if pick == disconnect && (want == Steer::Fine || want == Steer::Pick(pick.clone())) {
+            disconnected.set(true);
         }
         Ok(want)
     };
@@ -627,35 +611,31 @@ fn disconnect_while_pages_are_in_flight() {
         assert_eq!(report.end.violation, None, "{:?}", report.end);
         assert_eq!(report.cleanup.leaked, 0, "shutdown leaked no task");
         let entries = report.log.entries();
-        let connection = entries
-            .iter()
-            .find_map(|entry| match entry.obs {
-                Observation::Session { connection, .. } => Some(connection),
-                _ => None,
-            })
-            .expect("the peer connected");
-        let closed = at_step(entries, picked(&report, disconnect));
-        // Page bytes were in flight when the peer closed.
-        let first_page = find(
-            entries,
-            |obs| matches!(obs, Observation::PeerFrame { row: Some(row), .. } if row == "headers"),
-        )
-        .expect("the peer sent a page");
+        let marks = Marks::of(entries, &to_node);
+        let connection = marks.connection.expect("the peer connected");
+        let picked = at_step(entries, picked(&report, disconnect));
+        let peer_closed = marks.peer_closed.expect("the peer closed");
+        let decided = marks.node_closed.expect("the node decided the close");
         assert!(
-            sent_on(&entries[..closed], &to_node)
-                .iter()
-                .any(|d| d.at > first_page && d.in_flight && d.len >= DATA_DATAGRAM),
-            "page bytes were undelivered at the close"
+            marks.paged.is_some_and(|paged| paged < picked) && picked <= peer_closed,
+            "the peer paged, then disconnected, then closed"
         );
-        // The node closed neutrally and tore down.
-        let cause = entries[closed..].iter().find_map(|entry| match &entry.obs {
-            Observation::Transport {
-                connection: Some(c),
-                event: TransportFact::CloseDecided { cause },
-                ..
-            } if *c == connection => Some(cause.clone()),
-            _ => None,
-        });
+        assert!(peer_closed < decided, "the node decided the close after it");
+        // Page bytes were still in the network when the peer closed.
+        let waiting = Marks::of(&entries[..peer_closed], &to_node).full_waiting();
+        assert!(
+            waiting >= 2,
+            "{waiting} full-size datagrams sent after the first page were in flight at the close"
+        );
+        let cause = entries[decided..]
+            .iter()
+            .find_map(|entry| match &entry.obs {
+                Observation::Transport {
+                    event: TransportFact::CloseDecided { cause },
+                    ..
+                } => Some(cause.clone()),
+                _ => None,
+            });
         let cause = cause.expect("the node decided the close");
         assert!(
             cause.as_deref().is_none_or(|cause| !is_fault_cause(cause)),
@@ -715,6 +695,64 @@ fn disconnect_while_pages_are_in_flight() {
             );
         }
         assert_eq!(ports.unplaced_records(), 0);
+    }
+}
+
+/// Where the disconnect run's milestones sit among some log entries: the
+/// peer's connection, its first page, its `PeerClosed`, the node's close
+/// decision, and every datagram the peer sent to the node.
+struct Marks {
+    connection: Option<u64>,
+    paged: Option<usize>,
+    peer_closed: Option<usize>,
+    node_closed: Option<usize>,
+    sent: Vec<Sent>,
+}
+
+impl Marks {
+    /// The marks among `entries`, for datagrams on `link`.
+    fn of(entries: &[Entry], link: &str) -> Self {
+        Marks {
+            connection: entries.iter().find_map(|entry| match entry.obs {
+                Observation::Session { connection, .. } => Some(connection),
+                _ => None,
+            }),
+            paged: find(
+                entries,
+                |obs| matches!(obs, Observation::PeerFrame { row: Some(row), .. } if row == "headers"),
+            ),
+            peer_closed: find(entries, |obs| matches!(obs, Observation::PeerClosed { .. })),
+            node_closed: find(entries, |obs| {
+                matches!(
+                    obs,
+                    Observation::Transport {
+                        event: TransportFact::CloseDecided { .. },
+                        ..
+                    }
+                )
+            }),
+            sent: sent_on(entries, link),
+        }
+    }
+
+    /// Whether datagram `d` waits: it's in flight, sent after the first
+    /// page, and the peer hasn't closed yet.
+    fn waits(&self, d: &Sent) -> bool {
+        self.peer_closed.is_none() && d.in_flight && self.paged.is_some_and(|paged| d.at > paged)
+    }
+
+    /// How many full-size datagrams sent after the first page and before
+    /// the peer's close are in flight at the end of the entries read.
+    fn full_waiting(&self) -> usize {
+        self.sent
+            .iter()
+            .filter(|d| {
+                d.in_flight
+                    && d.len >= DATA_DATAGRAM
+                    && self.paged.is_some_and(|paged| d.at > paged)
+                    && self.peer_closed.is_none_or(|closed| d.at < closed)
+            })
+            .count()
     }
 }
 

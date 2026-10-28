@@ -22,9 +22,8 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use zakura_network::zakura::block_sync_streams;
-
 use serde::{Deserialize, Serialize};
+use zakura_network::zakura::{block_sync_streams, ZakuraBlockSyncConfig};
 use zakura_scheduler::SchedulerConfig;
 use zakura_storage::{
     block::{
@@ -93,6 +92,12 @@ pub struct BlockScenario {
     /// mirrors. Only `Control` steps make it send anything.
     #[serde(default)]
     pub probe: bool,
+    /// The node's configured limit on the requests a peer may have in
+    /// flight, which caps what it advertises and serves. It also caps the
+    /// node's own outbound requests per peer and its refill target. `None`
+    /// keeps production's.
+    #[serde(default)]
+    pub serving_limit: Option<u32>,
     /// How the run completes the node's block operations and the mirrors'
     /// range reads.
     pub policy: Policy,
@@ -113,6 +118,7 @@ impl Default for BlockScenario {
                 dialer: Dialer::Mirror,
             }],
             probe: false,
+            serving_limit: None,
             policy: Policy::converging(),
             control: Vec::new(),
         }
@@ -154,7 +160,7 @@ pub struct Storage {
     /// The node's owner state, as its tap folds it.
     view: Rc<RefCell<BlockSyncView>>,
     /// The nodes and links. They live until the run ends, so no reactor sees
-    /// its inputs close.
+    /// its inputs close unless a `Teardown` step drops the node's.
     _topology: Rc<Topology>,
 }
 
@@ -247,9 +253,9 @@ impl Subsystem for Storage {
     }
 
     /// Spawns the node on its controlled service under the scenario's
-    /// policy, with its block sync tapped, then each mirror, links each mirror to the node once, then
-    /// the probe if the scenario has one, and offers the scenario's control
-    /// steps.
+    /// policy, with its block sync tapped, then each mirror, links each
+    /// mirror to the node once, then the probe if the scenario has one, and
+    /// offers the scenario's control steps.
     fn build(sim: &mut Sim, scenario: &BlockScenario, ports: Ports) -> Self {
         let storage = PolicySource::new(
             sim,
@@ -261,6 +267,7 @@ impl Subsystem for Storage {
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::default();
         tap.label_with(wire.clone());
+        let teardown = tap.teardown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -268,6 +275,10 @@ impl Subsystem for Storage {
             ports.reads.clone(),
             predicates.clone(),
         )));
+        let mut config = ZakuraBlockSyncConfig::default();
+        if let Some(limit) = scenario.serving_limit {
+            config.max_inflight_requests = limit;
+        }
         let mut nodes = vec![BlockNode::spawn(
             sim,
             "node",
@@ -277,6 +288,7 @@ impl Subsystem for Storage {
                 service: ports.service,
                 replies: ports.replies,
             },
+            config,
             Some(observer),
         )];
         for ((index, engine), seed) in ports.mirrors.iter().enumerate().zip(2..) {
@@ -291,10 +303,15 @@ impl Subsystem for Storage {
                     engine.clone(),
                     ports.reads.clone(),
                 )),
+                ZakuraBlockSyncConfig::default(),
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, ports.effects, ports.live).with_wire(wire));
+        let topology = Rc::new(
+            Topology::new(nodes, ports.effects, ports.live)
+                .with_wire(wire)
+                .with_tap(teardown),
+        );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),

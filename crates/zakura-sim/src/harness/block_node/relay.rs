@@ -935,19 +935,67 @@ impl Wire {
     /// `before`: the oldest one a range took that no work named yet, else
     /// the newest.
     pub(crate) fn body(&self, connection: u64, height: u32, before: u64) -> Option<Delivered> {
+        self.untaken_body(connection, height, before, &|_, _| true)
+            .or_else(|| {
+                self.0
+                    .borrow()
+                    .bodies
+                    .get(&(connection, height))?
+                    .iter()
+                    .rev()
+                    .find(|delivery| delivery.after < before)
+                    .map(|delivery| delivery.delivered)
+            })
+    }
+
+    /// The oldest body frame at `height` on `connection` that a range took
+    /// and no work named yet, of those that crossed before the tap's event
+    /// `before` and pass `judged`, which it marks named.
+    pub(crate) fn untaken_body(
+        &self,
+        connection: u64,
+        height: u32,
+        before: u64,
+        judged: &dyn Fn(u64, u64) -> bool,
+    ) -> Option<Delivered> {
         let mut state = self.0.borrow_mut();
-        let deliveries = state.bodies.get_mut(&(connection, height))?;
-        if let Some(delivery) = deliveries.iter_mut().find(|delivery| {
-            delivery.after < before && !delivery.taken && delivery.delivered.exchange.is_some()
-        }) {
-            delivery.taken = true;
-            return Some(delivery.delivered);
-        }
-        deliveries
-            .iter()
-            .rev()
-            .find(|delivery| delivery.after < before)
-            .map(|delivery| delivery.delivered)
+        let delivery = state
+            .bodies
+            .get_mut(&(connection, height))?
+            .iter_mut()
+            .find(|delivery| {
+                untaken(delivery, before) && judged(connection, delivery.delivered.seq)
+            })?;
+        delivery.taken = true;
+        Some(delivery.delivered)
+    }
+
+    /// [`Wire::untaken_body`] on any connection but `owner`: the oldest such
+    /// frame, with its connection. Block sync's first-completion-wins
+    /// credits such a body to a request on `owner`'s session.
+    pub(crate) fn body_elsewhere(
+        &self,
+        owner: u64,
+        height: u32,
+        before: u64,
+        judged: &dyn Fn(u64, u64) -> bool,
+    ) -> Option<(u64, Delivered)> {
+        let mut state = self.0.borrow_mut();
+        let (connection, delivery) = state
+            .bodies
+            .iter_mut()
+            .filter(|((connection, at), _)| *connection != owner && *at == height)
+            .flat_map(|((connection, _), deliveries)| {
+                deliveries
+                    .iter_mut()
+                    .map(move |delivery| (*connection, delivery))
+            })
+            .filter(|(connection, delivery)| {
+                untaken(delivery, before) && judged(*connection, delivery.delivered.seq)
+            })
+            .min_by_key(|(_, delivery)| delivery.after)?;
+        delivery.taken = true;
+        Some((connection, delivery.delivered))
     }
 
     /// Each connection that closed since the last call, with its cause.
@@ -967,6 +1015,12 @@ impl Wire {
         }
         closed
     }
+}
+
+/// Whether `delivery` crossed before the tap's event `before`, a range
+/// took it, and no work named it yet.
+fn untaken(delivery: &Delivery, before: u64) -> bool {
+    delivery.after < before && !delivery.taken && delivery.delivered.exchange.is_some()
 }
 
 /// The height a body frame carries, or the start an ending names, if the

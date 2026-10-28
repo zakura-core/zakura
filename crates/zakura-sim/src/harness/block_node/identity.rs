@@ -13,7 +13,9 @@
 //!   relay numbers the peer's frames, after the label of a request that
 //!   waited for it;
 //! - a body entering the sequencer's input queue becomes
-//!   [`Observation::WorkAdmitted`], from the frame that delivered it;
+//!   [`Observation::WorkAdmitted`], from the frame that delivered it: on
+//!   its owner's connection, or, when first-completion-wins credits it to
+//!   that owner, on the connection whose range delivered it;
 //! - a serving lease's acquisition and release become
 //!   [`Observation::Serving`] and [`Observation::ServingEnded`];
 //! - a serving admission settles the label of a request that waited for
@@ -46,7 +48,7 @@ use zakura_network::zakura::{
     ZakuraPeerId, MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
 };
 
-use super::relay::{row, row_name, stream, Record, Settle, Wire};
+use super::relay::{row, row_name, stream, Delivered, Record, Settle, Wire};
 use crate::{
     model::Label,
     observe::{StorageFact, StorageRequest},
@@ -83,6 +85,8 @@ pub(crate) struct Adapter {
     /// Requests that waited, by connection and frame number, and whether
     /// each settled `Conformant`.
     settled: BTreeMap<(u64, u64), bool>,
+    /// Each frame the node judged, by connection and frame number.
+    judged_frames: BTreeSet<(u64, u64)>,
 }
 
 impl Adapter {
@@ -97,6 +101,7 @@ impl Adapter {
             held: BTreeMap::new(),
             admitting: BTreeMap::new(),
             settled: BTreeMap::new(),
+            judged_frames: BTreeSet::new(),
         }
     }
 
@@ -233,6 +238,7 @@ impl Adapter {
     /// Writes that the node judged the peer's frame `seq` on `connection`,
     /// or, for a held request, waits for its serving session to judge it.
     fn judged(&mut self, connection: u64, seq: u64, log: &mut ObservationLog) {
+        self.judged_frames.insert((connection, seq));
         if let Some(held) = self.held.remove(&(connection, seq)) {
             self.admitting.insert(connection, (seq, held));
             return;
@@ -285,6 +291,30 @@ impl Adapter {
         }
     }
 
+    /// The connection and frame that delivered a body at `height` that
+    /// block sync queued for a request on connection `owner`, as of the
+    /// tap's event `before`. A frame the node judged comes first, then one
+    /// on `owner`: block sync's first-completion-wins credits a body
+    /// another connection's range delivered to a request on `owner`'s
+    /// session. With no frame a range took left, it's `owner`'s newest
+    /// body frame at `height`, if any.
+    fn delivery(&self, owner: u64, height: u32, before: u64) -> (u64, Option<Delivered>) {
+        let judged = |connection: u64, seq: u64| self.judged_frames.contains(&(connection, seq));
+        let any = |_: u64, _: u64| true;
+        if let Some(delivered) = self.wire.untaken_body(owner, height, before, &judged) {
+            return (owner, Some(delivered));
+        }
+        if let Some((connection, delivered)) =
+            self.wire.body_elsewhere(owner, height, before, &judged)
+        {
+            return (connection, Some(delivered));
+        }
+        if let Some(delivered) = self.wire.untaken_body(owner, height, before, &any) {
+            return (owner, Some(delivered));
+        }
+        (owner, self.wire.body(owner, height, before))
+    }
+
     /// The newest connection of `peer`.
     fn connection(&self, peer: &ZakuraPeerId) -> Option<u64> {
         self.peers.get(&hex(peer.as_bytes())).copied()
@@ -323,12 +353,12 @@ impl Adapter {
                 holder: Holder::Queued { .. },
                 change: HolderChange::Retained,
             } => {
-                let Some(connection) = self.sessions.get(&body.owner.session_id).copied() else {
+                let Some(owner) = self.sessions.get(&body.owner.session_id).copied() else {
                     return;
                 };
                 // Work from a body no frame delivered names no frame the
                 // check can find.
-                let delivered = self.wire.body(connection, body.height.0, seq);
+                let (connection, delivered) = self.delivery(owner, body.height.0, seq);
                 log.push(Observation::WorkAdmitted {
                     connection,
                     frame: row(row_name(u16::from(MSG_BS_BLOCK))),

@@ -83,8 +83,9 @@ pub struct BlockScenario {
     #[serde(default)]
     pub probe: bool,
     /// The node's configured limit on the requests a peer may have in
-    /// flight, which caps what it advertises and serves. `None` keeps
-    /// production's.
+    /// flight, which caps what it advertises and serves. It also caps the
+    /// node's own outbound requests per peer and its refill target. `None`
+    /// keeps production's.
     #[serde(default)]
     pub serving_limit: Option<u32>,
     /// How the run completes the node's block operations and the mirrors'

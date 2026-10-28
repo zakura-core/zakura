@@ -11,13 +11,15 @@
 mod support;
 
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
     process::{Command, Output},
+    rc::Rc,
 };
 
 use support::inputs;
 use tempfile::TempDir;
-use zakura_network::zakura::{BlockSyncMessage, MSG_BS_BLOCK};
+use zakura_network::zakura::{block_sync_observe::Holder, BlockSyncMessage, MSG_BS_BLOCK};
 use zakura_sim::{
     harness::{
         block_node::{
@@ -32,7 +34,8 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{BlockSyncFact, BlockSyncHolder, StorageFact, StorageRequest},
-    MemorySink, Observation, PlanInput, RunReport,
+    Checker, MemorySink, Observation, ObservationLog, PlanInput, PropertyReport, RunEnd, RunReport,
+    StepCtx, Violation,
 };
 
 /// Runs `scenario` under `input`, and returns the report with the ports,
@@ -46,6 +49,47 @@ fn node_run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
         input,
         &mut MemorySink::default(),
         None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    (report, ports)
+}
+
+/// A checker that hands `sample` the node's view after every step.
+struct Sampler<F> {
+    view: Rc<RefCell<BlockSyncView>>,
+    sample: F,
+}
+
+impl<F: FnMut(u64, &BlockSyncView)> Checker for Sampler<F> {
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        (self.sample)(cx.step, &self.view.borrow());
+        None
+    }
+
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+}
+
+/// [`node_run`], handing `sample` the node's view after every step.
+fn sampled_run(
+    scenario: &BlockScenario,
+    input: PlanInput,
+    sample: impl FnMut(u64, &BlockSyncView),
+) -> (RunReport, Ports) {
+    let ports = Storage::prepare(scenario);
+    let mut sampler = Sampler {
+        view: ports.view.clone(),
+        sample,
+    };
+    let report = run_prepared::<Storage>(
+        scenario,
+        ports.clone(),
+        input,
+        &mut MemorySink::default(),
+        Some(&mut sampler),
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
@@ -93,14 +137,18 @@ fn honest_flow() -> BlockScenario {
 }
 
 /// Case 2: the node's first query waits until a fork at height 4 has reset
-/// the node's headers, so its answer comes under a scope that's gone.
+/// the node's headers, and two more seconds, so block sync has seen the new
+/// scope before the answer under the old one arrives.
 fn stale_query() -> BlockScenario {
     BlockScenario {
         blocks: 8,
         policy: Policy {
             holds: vec![hold(
                 Select::nth(BlockKind::Query, 1),
-                Trigger::Reset("node".to_owned()),
+                Trigger::All(vec![
+                    Trigger::Reset("node".to_owned()),
+                    Trigger::VirtualTime(2_000),
+                ]),
                 vec![BlockAllow::Answer],
             )],
             ..Policy::converging()
@@ -121,8 +169,13 @@ fn stale_query() -> BlockScenario {
 }
 
 /// Case 3: the node holds two bodies, and its first submission, height 3,
-/// waits five seconds for its verdict. A fork at height 3 resets the node's
-/// headers meanwhile, which detaches the waiting submission.
+/// waits five seconds for its verdict. A fork at height 2 replaces height 3
+/// meanwhile, which detaches the waiting submission.
+///
+/// The mirror switches to the fork first, so it answers the node's old
+/// requests with fork bodies. Block sync rejects those as incompatible and
+/// closes the link with an unfinished exchange. The harness models no
+/// transport, so a `Relink` on that close stands in for production's redial.
 fn delayed_apply() -> BlockScenario {
     BlockScenario {
         blocks: 8,
@@ -139,28 +192,49 @@ fn delayed_apply() -> BlockScenario {
             )],
             ..Policy::converging()
         },
-        control: vec![ControlStep {
-            action: ControlAction::Reset {
-                fork: Fork {
-                    branch: 1,
-                    at: 3,
-                    len: 8,
+        control: vec![
+            ControlStep {
+                action: ControlAction::Reset {
+                    fork: Fork {
+                        branch: 1,
+                        at: 2,
+                        len: 8,
+                    },
+                    node_first: false,
                 },
-                node_first: false,
+                when: Some(Trigger::Submitted(Select::nth(BlockKind::Apply, 1))),
             },
-            when: Some(Trigger::Submitted(Select::nth(BlockKind::Apply, 1))),
-        }],
+            relink_on_close(),
+        ],
         ..BlockScenario::default()
     }
 }
 
-/// Case 4: two mirrors, and the first range read either serves waits ten
-/// seconds, past block sync's 8 s request timeout, so its body arrives
-/// after the node's request for it timed out.
+/// Mirror 0 links again each time a link to it closes.
+fn relink_on_close() -> ControlStep {
+    ControlStep {
+        action: ControlAction::Relink {
+            peer: "mirror-0".to_owned(),
+        },
+        when: Some(Trigger::Closed("mirror-0".to_owned())),
+    }
+}
+
+/// When the late-body case links its mirror again: past the 180 s
+/// no-progress cooldown that parks the session after the late request.
+const RELINK_MS: u64 = 215_000;
+
+/// Case 4: one mirror, whose first range read waits ten seconds, past block
+/// sync's 8 s request timeout, so its body arrives after the node's request
+/// for it timed out.
+///
+/// The timed-out request leaves the session's probe cap spent, so block
+/// sync parks the session for its no-progress cooldown. Production then
+/// reopens the session when the service asks for one; the harness models
+/// no transport, so a `Relink` after the cooldown stands in for that.
 fn late_body() -> BlockScenario {
     BlockScenario {
         blocks: 8,
-        mirrors: two_mirrors(),
         policy: Policy {
             holds: vec![hold(
                 Select::nth(BlockKind::MirrorRead, 1),
@@ -169,6 +243,12 @@ fn late_body() -> BlockScenario {
             )],
             ..Policy::converging()
         },
+        control: vec![ControlStep {
+            action: ControlAction::Relink {
+                peer: "mirror-0".to_owned(),
+            },
+            when: Some(Trigger::VirtualTime(RELINK_MS)),
+        }],
         ..BlockScenario::default()
     }
 }
@@ -351,6 +431,16 @@ fn submissions(report: &RunReport) -> Vec<(u64, &StorageRequest, u64)> {
         .collect()
 }
 
+/// The ID of block storage's first needed-blocks query in `report`.
+fn first_query(report: &RunReport) -> u64 {
+    submissions(report)
+        .into_iter()
+        .find_map(|(id, request, _)| {
+            matches!(request, StorageRequest::QueryNeededBlocks { .. }).then_some(id)
+        })
+        .expect("block sync queries its needed blocks first")
+}
+
 /// The step of the first event about the detached holder of `token` that
 /// made `change`.
 fn detached(report: &RunReport, token: u64, change: &str) -> Option<u64> {
@@ -431,9 +521,11 @@ fn an_honest_block_flow_submits_only_what_it_requested() {
     }
 }
 
-/// Case 2: the first query is answered only after the node's headers
-/// switched to the fork, so its answer carries the old body-work epoch.
-/// Block sync asks again under the new one, and the node commits the fork.
+/// Case 2: the first query is answered after block sync saw the fork's
+/// headers, so its answer carries the old scope. Block sync drops it: the
+/// work queue stays empty until a second query, under the new body-work
+/// epoch, is answered. No request goes out under the old epoch, and the
+/// node commits the fork.
 #[test]
 fn a_stale_query_after_a_reset_is_asked_again() {
     for input in inputs(4, 256) {
@@ -443,91 +535,165 @@ fn a_stale_query_after_a_reset_is_asked_again() {
         let reset = picked(&report, "peer:node:reset-apply").expect("the node resets");
         let queries: Vec<_> = submissions(&report)
             .into_iter()
-            .filter_map(|(id, request, _)| match request {
-                StorageRequest::QueryNeededBlocks { scope, .. } => Some((id, scope)),
+            .filter_map(|(id, request, step)| match request {
+                StorageRequest::QueryNeededBlocks { scope, .. } => Some((id, scope, step)),
                 _ => None,
             })
             .collect();
-        let (first, scope) = queries[0];
+        let (first, stale, _) = queries[0];
+        let (second, fresh, asked) = queries[1];
+        let answered = completed(&report, first).expect("the held query is answered");
+        let renewed = completed(&report, second).expect("the second query is answered");
         assert!(
-            completed(&report, first).expect("the held query is answered") > reset,
-            "the first query is answered after the reset"
+            reset < answered && answered < asked,
+            "{reset} {answered} {asked}"
+        );
+        assert!(fresh.body_work_epoch > stale.body_work_epoch);
+        let events = events(&report);
+        assert!(
+            !events
+                .iter()
+                .any(|(step, event)| (answered..renewed).contains(step)
+                    && matches!(event, BlockSyncFact::WorkQueue { items } if !items.is_empty())),
+            "the stale answer adds no work"
         );
         assert!(
-            queries[1..]
-                .iter()
-                .any(|(_, later)| later.body_work_epoch > scope.body_work_epoch),
-            "block sync asks again under the new epoch"
+            !events.iter().any(|(_, event)| matches!(
+                event,
+                BlockSyncFact::Request { owner, step, .. }
+                    if step == "published" && owner.body_work_epoch == Some(stale.body_work_epoch)
+            )),
+            "no request goes out under the old epoch"
         );
         assert_settled(&ports.view.borrow());
     }
 }
 
-/// Case 3: the submission of height 3 waits for its verdict when the reset
-/// lands, so the sequencer detaches it and keeps it charged. Its late
-/// verdict releases the detached holder, and the view ends settled.
-///
-/// The node then stops downloading the fork: its work queue keeps the
-/// fork's heights pending and no routine requests them, under every plan
-/// and verdict tried. So the case doesn't claim convergence.
+/// Case 3: the submission of height 3 waits for its verdict when the fork
+/// replaces that height, so the sequencer detaches it and keeps it charged.
+/// Its late verdict releases the detached holder. The node commits the
+/// fork's tip, and the late verdict on the replaced block leaves it there.
 #[test]
 fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {
     for input in inputs(4, 256) {
         let (report, ports) = node_run(&delayed_apply(), input);
-        let (op, token) = submissions(&report)
+        let (op, token, hash) = submissions(&report)
             .into_iter()
             .find_map(|(id, request, _)| match request {
                 StorageRequest::SubmitBlock {
                     height: Some(3),
                     token,
+                    hash,
                     ..
-                } => Some((id, *token)),
+                } => Some((id, *token, hash.clone())),
                 _ => None,
             })
             .expect("height 3 is submitted");
+        let replacement = ports
+            .live
+            .blocks()
+            .into_iter()
+            .find(|block| block.height.0 == 3)
+            .expect("the fork holds height 3");
+        assert_ne!(
+            replacement.hash().to_string(),
+            hash,
+            "the fork replaces height 3"
+        );
         let retained = detached(&report, token, "retained").expect("the reset detaches it");
         let verdict = completed(&report, op).expect("the delayed verdict arrives");
         let released = detached(&report, token, "released").expect("the verdict releases it");
         assert!(retained < verdict && verdict <= released);
+        assert_eq!(ports.live.tip().height.0, 10);
+        assert_converged(&ports);
         let view = ports.view.borrow();
         assert!(view.sequencer.submissions.is_empty());
         assert_settled(&view);
     }
 }
 
-/// Case 4: the held read's body reaches the node after its request timed
-/// out. The node judges the late body on its connection, closes no link
-/// for it, and commits every body.
+/// Case 4: the node's first request times out before the held read is
+/// served, which returns its height to the work queue unowned. The late
+/// body still reaches the node on the request's connection, which stays
+/// open, with no other request on that session between. After the relink,
+/// a new session requests the height again, and the node commits every
+/// body.
 #[test]
 fn a_late_body_is_judged_without_closing_its_link() {
     for input in inputs(4, 256) {
         let (report, ports) = node_run(&late_body(), input);
         assert_converged(&ports);
-        let (served, mirror) = report
-            .picks
+        let served = picked(&report, "storage:mirror-0:1:serve").expect("the held read is served");
+        let events = events(&report);
+        let (asked, session, height) = events
             .iter()
-            .find_map(|pick| {
-                let index = pick
-                    .identity
-                    .strip_prefix("storage:mirror-")?
-                    .strip_suffix(":1:serve")?;
-                Some((pick.step, format!("mirror-{index}")))
+            .find_map(|(step, event)| match event {
+                BlockSyncFact::Request {
+                    owner,
+                    heights,
+                    step: moved,
+                    ..
+                } if moved == "published" => Some((*step, owner.session_id, heights[0])),
+                _ => None,
             })
-            .expect("the held read is served");
-        let links = ports.effects.links.borrow();
-        let link = links
-            .iter()
-            .find(|link| link.peer == mirror)
-            .expect("the mirror links");
+            .expect("the node requests a body");
         assert!(
-            events(&report).into_iter().any(|(step, event)| matches!(
-                event,
-                BlockSyncFact::FrameJudged { connection, message_type, .. }
-                    if *connection == link.conn_id && *message_type == u16::from(MSG_BS_BLOCK) && step > served
-            )),
-            "the late body reaches the node"
+            events
+                .iter()
+                .any(|(step, event)| (asked..served).contains(step)
+                    && matches!(event, BlockSyncFact::WorkQueue { items } if items
+                    .iter()
+                    .any(|item| item.height == height && item.owner.is_none()))),
+            "the request times out before the late body"
         );
-        assert!(links.iter().all(|link| !link.is_closed()), "{links:?}");
+        let connection = events
+            .iter()
+            .find_map(|(_, event)| match event {
+                BlockSyncFact::SessionAdmitted {
+                    connection,
+                    session_id,
+                    ..
+                } if *session_id == session => Some(*connection),
+                _ => None,
+            })
+            .expect("the session was admitted");
+        let judged = events
+            .iter()
+            .find_map(|(step, event)| match event {
+                BlockSyncFact::FrameJudged {
+                    connection: on,
+                    message_type,
+                    ..
+                } if *on == connection
+                    && *message_type == u16::from(MSG_BS_BLOCK)
+                    && *step > served =>
+                {
+                    Some(*step)
+                }
+                _ => None,
+            })
+            .expect("the late body reaches the node");
+        let published_on = |range: std::ops::Range<u64>, on: &dyn Fn(u64) -> bool| {
+            events.iter().any(|(step, event)| {
+                range.contains(step)
+                    && matches!(event, BlockSyncFact::Request { owner, heights, step: moved, .. }
+                        if moved == "published" && on(owner.session_id) && heights.contains(&height))
+            })
+        };
+        assert!(
+            !published_on(asked + 1..judged, &|id| id == session),
+            "the late body answers the held request"
+        );
+        assert!(
+            published_on(judged..report.end.steps + 1, &|id| id != session),
+            "a new session asks for the height again"
+        );
+        let links = ports.effects.links.borrow();
+        let held = links
+            .iter()
+            .find(|link| link.conn_id == connection)
+            .expect("the held request's link");
+        assert!(!held.is_closed(), "{links:?}");
         assert_settled(&ports.view.borrow());
     }
 }
@@ -573,8 +739,9 @@ fn a_serving_overflow_closes_the_flooding_peer() {
 
 /// Case 6: tearing the node down ends its block sync while its sequencer
 /// holds two bodies. The sequencer reports its close, releases every body
-/// it holds, and publishes an empty snapshot. The tap expects the observer
-/// to go, so the run ends healthy, and the view ends at zero.
+/// it holds, and publishes an empty snapshot. The node's reactor,
+/// sequencer and action tasks exit. The tap expects the observer to go, so
+/// the run ends healthy, and the view ends at zero.
 #[test]
 fn a_teardown_returns_the_node_to_zero() {
     for input in inputs(4, 256) {
@@ -607,6 +774,24 @@ fn a_teardown_returns_the_node_to_zero() {
             })
             .expect("the sequencer publishes a final snapshot");
         assert!(last, "the final snapshot is empty");
+        let exited: BTreeSet<_> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::TaskExited { task, .. } if entry.step > torn => Some(task.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The node spawns first, so its tasks are each name's first.
+        for task in [
+            "block-node.1",
+            "block-actions.1",
+            "block_sync_reactor.1",
+            "block_sync_sequencer.1",
+        ] {
+            assert!(exited.contains(task), "{task} outlives the teardown");
+        }
         let view = ports.view.borrow();
         assert!(view.sequencer_closed);
         assert_settled(&view);
@@ -650,17 +835,25 @@ fn a_relink_after_a_teardown_fails_the_run() {
 }
 
 /// Bypass 1, direct work insertion: block sync's routines request bodies
-/// before its block service answers the query, so the work queue holds
-/// work that no storage answer backs. The service's late answer is stale,
-/// and the node still commits every body.
+/// before its block service answers the query, so the work queue, in the
+/// events and in the view, holds work that no storage answer backs. The
+/// service's late answer is stale, and the node still commits every body.
 #[test]
 fn inserted_work_reaches_the_work_queue_without_an_answer() {
     for input in inputs(4, 256) {
-        let (report, ports) = node_run(&insert_work(), input);
+        let mut queued = None;
+        let (report, ports) = sampled_run(&insert_work(), input, |step, view| {
+            if queued.is_none() && !view.work_queue.is_empty() {
+                queued = Some(step);
+            }
+        });
         assert_converged(&ports);
         let inserted = picked(&report, "peer:node:insert-work").expect("the work goes in");
-        let answered = completed(&report, 1).expect("the held query is answered");
+        let answered =
+            completed(&report, first_query(&report)).expect("the held query is answered");
         assert!(inserted < answered);
+        let queued = queued.expect("the view's work queue fills");
+        assert!(inserted <= queued && queued < answered, "{queued}");
         let events = events(&report);
         assert!(
             events.iter().any(|(step, event)| *step < answered
@@ -677,13 +870,24 @@ fn inserted_work_reaches_the_work_queue_without_an_answer() {
 }
 
 /// Bypass 2, an alternate storage dispatch: the sequencer finishes the
-/// first submission, releasing its holder, while block storage still holds
-/// the operation uncommitted. Storage's own commit comes later, and the
-/// node still commits every body.
+/// first submission, releasing its holder in the events and in the view,
+/// while block storage still holds the operation uncommitted. Storage's
+/// own commit comes later, and the node still commits every body.
 #[test]
 fn a_dispatched_verdict_releases_a_submission_storage_still_holds() {
     for input in inputs(4, 256) {
-        let (report, ports) = node_run(&dispatch_verdict(), input);
+        let mut submitted = Vec::new();
+        let (report, ports) = sampled_run(&dispatch_verdict(), input, |step, view| {
+            let tokens: Vec<_> = view
+                .holders
+                .iter()
+                .filter_map(|(holder, _)| match holder {
+                    Holder::Submitted { token } => Some(*token),
+                    _ => None,
+                })
+                .collect();
+            submitted.push((step, tokens));
+        });
         assert_converged(&ports);
         let (op, token) = submissions(&report)
             .into_iter()
@@ -707,6 +911,14 @@ fn a_dispatched_verdict_releases_a_submission_storage_still_holds() {
             .expect("the sequencer releases the submission");
         let committed = completed(&report, op).expect("storage commits it later");
         assert!(dispatched <= released && released < committed);
+        let held_at = |step: u64| {
+            submitted
+                .iter()
+                .find(|(at, _)| *at == step)
+                .is_some_and(|(_, tokens)| tokens.contains(&token))
+        };
+        assert!(held_at(dispatched - 1), "the view holds the submission");
+        assert!(!held_at(released), "the view releases it before the commit");
         assert_settled(&ports.view.borrow());
     }
 }

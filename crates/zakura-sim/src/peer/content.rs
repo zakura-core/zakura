@@ -10,9 +10,19 @@
 //!   header cap outside 1 to 4,000, a `max_subscriptions` other than the
 //!   subscription row's `max_live`, an unknown schema bit, or a message cap
 //!   outside one smallest page under the advertised schemas to 2 MiB.
-//! - `SubscribeHeaders`: an `Open` with no locator or a repeated one, or
-//!   whose start cursor isn't its first locator with nothing consumed.
-//! - `Headers`, for a subscription the node opened: a page naming another
+//! - `SubscribeHeaders`: subscription ID 0. An `Open` with no locator, a
+//!   repeated one or more than 13, a start cursor that isn't its first
+//!   locator with nothing consumed, credit without a header
+//!   or a smallest page of bytes, or a schema the node didn't advertise. A
+//!   `Grant` or `Close` with locators, a `Grant` that adds neither a header
+//!   nor a smallest page of bytes, a `Close` that adds credit, or an update
+//!   that changes its own `Open`'s target or schema before the node ends
+//!   that subscription. Rules only the sender can check, such as a start
+//!   height or a target chosen from a received `Status`, aren't labelled:
+//!   the receiver owes no consequence for them.
+//! - `Headers`: subscription ID 0, a body-size hint above the largest
+//!   block, or auxiliary records that don't match its schema. For a
+//!   subscription the node opened, also a page naming another
 //!   target or schema, or above the caps of the last `Status` the peer
 //!   sent. Its parent, by height and hash, must be the last header sent,
 //!   or for the first page a locator of the `Open`, the target if a
@@ -21,7 +31,8 @@
 //!   a page that doesn't end at the target must end below its height, and
 //!   one that does must end at that height. The marker is set on exactly
 //!   the page that reaches the target. Any page must link from its parent.
-//! - `HeadersOutcome`: an outcome naming another target, or one its
+//! - `HeadersOutcome`: subscription ID 0, an outcome naming another
+//!   target, or one its
 //!   subscription's history doesn't allow, such as `SubscriptionClosed`
 //!   before the node's `Close`. A subscription whose locators hold its
 //!   target reached it at `Open`.
@@ -31,7 +42,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    v9::{Headers, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status},
+    v9::{
+        Headers, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status, SubscribeHeaders,
+    },
     AuxSchema, MessageRole, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
@@ -74,6 +87,24 @@ pub(crate) struct ContentLabeller {
     caps: Option<(u32, u32)>,
     /// The subscriptions the node opened that haven't ended, by ID.
     served: BTreeMap<u64, Served>,
+    /// The schema mask of the last `Status` the node sent.
+    node_schemas: Option<u32>,
+    /// The target and schema of each `Open` the peer sent, by ID, until
+    /// the node's ending for it arrives. The node matches a later update by
+    /// key alone.
+    opened: BTreeMap<u64, (block::Hash, AuxSchema)>,
+}
+
+/// The most locators an `Open` carries.
+const MAX_LOCATORS: usize = 13;
+
+/// `schema`'s bit in a `Status` mask: none for no schema, bit `n - 1` for
+/// schema `n`.
+fn schema_bit(schema: AuxSchema) -> u32 {
+    match schema {
+        AuxSchema::None => 0,
+        AuxSchema::V1 => 1,
+    }
 }
 
 /// The subscription row's `max_live`, which every `Status` advertises.
@@ -163,41 +194,91 @@ impl ContentLabeller {
     pub(crate) fn label(&self, message: &RegtestMessage, payload_len: usize) -> Labels {
         let bad = match message {
             Message::Status(status) => bad_status(status),
-            Message::SubscribeHeaders(update) => {
-                update.operation == Operation::Open && {
-                    let locators = &update.locator_hashes;
-                    let repeated = locators
-                        .iter()
-                        .enumerate()
-                        .any(|(index, hash)| locators[..index].contains(hash));
-                    let cursor = update.acknowledged;
-                    let start = locators.first() == Some(&cursor.hash)
-                        && cursor.headers == 0
-                        && cursor.bytes == 0;
-                    locators.is_empty() || repeated || !start
-                }
-            }
+            Message::SubscribeHeaders(update) => self.bad_update(update),
             Message::Headers(page) => {
                 let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
                 let over_caps = self.caps.is_some_and(|(headers, bytes)| {
                     count > headers || payload_len > usize::try_from(bytes).unwrap_or(usize::MAX)
                 });
-                unlinked(page)
+                let records = page.tree_aux_schema == AuxSchema::V1;
+                let bad_entry = page.entries.iter().any(|entry| {
+                    u64::from(entry.body_size) > block::MAX_BLOCK_BYTES
+                        || entry.tree_aux.is_some() != records
+                });
+                page.subscription_id == 0
+                    || bad_entry
+                    || unlinked(page)
                     || over_caps
                     || self
                         .served
                         .get(&page.subscription_id)
                         .is_some_and(|served| self.bad_page(page, served))
             }
-            Message::HeadersOutcome(outcome) => self
-                .served
-                .get(&outcome.subscription_id)
-                .is_some_and(|served| {
-                    outcome.initial_target_tip_hash != served.target
-                        || !allowed(outcome.outcome, served)
-                }),
+            Message::HeadersOutcome(outcome) => {
+                self.served
+                    .get(&outcome.subscription_id)
+                    .is_some_and(|served| {
+                        outcome.initial_target_tip_hash != served.target
+                            || !allowed(outcome.outcome, served)
+                    })
+                    || outcome.subscription_id == 0
+            }
         };
         Labels::NONE.with_if(bad, Label::BadContent)
+    }
+
+    /// True if the peer's `update` breaks a content rule.
+    fn bad_update(&self, update: &SubscribeHeaders) -> bool {
+        let added = update.added_credit;
+        let smallest = |schema| {
+            let records = if schema == AuxSchema::V1 {
+                TREE_AUX_SCHEMA_V1_BYTES
+            } else {
+                0
+            };
+            u64::try_from(smallest_plain_page() + records).unwrap_or(u64::MAX)
+        };
+        let bytes = u64::from(added.bytes);
+        let bad = match update.operation {
+            Operation::Open => {
+                let locators = &update.locator_hashes;
+                let repeated = locators
+                    .iter()
+                    .enumerate()
+                    .any(|(index, hash)| locators[..index].contains(hash));
+                let cursor = update.acknowledged;
+                // The start height is the sender's to get right: the node
+                // takes it as given, since it may not hold the locator.
+                let start = locators.first() == Some(&cursor.hash)
+                    && cursor.headers == 0
+                    && cursor.bytes == 0;
+                let unadvertised = self.node_schemas.is_some_and(|mask| {
+                    let bit = schema_bit(update.tree_aux_schema);
+                    mask & bit != bit
+                });
+                locators.is_empty()
+                    || locators.len() > MAX_LOCATORS
+                    || repeated
+                    || !start
+                    || added.objects == 0
+                    || bytes < smallest(update.tree_aux_schema)
+                    || unadvertised
+            }
+            Operation::Grant | Operation::Close => {
+                let changed = self
+                    .opened
+                    .get(&update.subscription_id)
+                    .is_some_and(|fixed| {
+                        *fixed != (update.initial_target_tip_hash, update.tree_aux_schema)
+                    });
+                let credit = match update.operation {
+                    Operation::Grant => added.objects == 0 && bytes < smallest(AuxSchema::None),
+                    _ => added.objects != 0 || added.bytes != 0,
+                };
+                !update.locator_hashes.is_empty() || credit || changed
+            }
+        };
+        bad || update.subscription_id == 0
     }
 
     /// True if `page` breaks a rule of its subscription `served`'s history,
@@ -246,6 +327,12 @@ impl ContentLabeller {
     /// The peer sent `message`, which the node takes as conformant.
     pub(crate) fn sent(&mut self, message: &RegtestMessage) {
         match message {
+            Message::SubscribeHeaders(update) if update.operation == Operation::Open => {
+                self.opened.insert(
+                    update.subscription_id,
+                    (update.initial_target_tip_hash, update.tree_aux_schema),
+                );
+            }
             Message::Status(status) => {
                 self.caps = Some((status.max_headers_per_response, status.max_message_bytes));
             }
@@ -270,8 +357,15 @@ impl ContentLabeller {
     }
 
     /// The node sent `message`: an `Open` starts a subscription's history
-    /// and a `Close` marks it.
+    /// and a `Close` marks it, and a `Status` advertises its schemas.
     pub(crate) fn received(&mut self, message: &RegtestMessage) {
+        match message {
+            Message::Status(status) => self.node_schemas = Some(status.tree_aux_schema_mask),
+            Message::HeadersOutcome(outcome) => {
+                self.opened.remove(&outcome.subscription_id);
+            }
+            Message::SubscribeHeaders(_) | Message::Headers(_) => {}
+        }
         let Message::SubscribeHeaders(update) = message else {
             return;
         };
@@ -521,5 +615,94 @@ mod tests {
             Label::BadContent,
             "the target without its marker"
         );
+    }
+
+    /// Each update rule labels, and the update it breaks is otherwise
+    /// conformant.
+    #[test]
+    fn update_rules() {
+        use zakura_network::zakura::{v9::Cursor, Credit};
+
+        let hash = block::Hash([3; 32]);
+        let open = SubscribeHeaders {
+            operation: Operation::Open,
+            subscription_id: 1,
+            update_sequence: 0,
+            initial_target_tip_hash: block::Hash([1; 32]),
+            acknowledged: Cursor {
+                height: Height(5),
+                hash,
+                headers: 0,
+                bytes: 0,
+            },
+            locator_hashes: vec![hash],
+            added_credit: Credit {
+                objects: 1,
+                bytes: 263,
+            },
+            tree_aux_schema: AuxSchema::None,
+        };
+        let grant = SubscribeHeaders {
+            operation: Operation::Grant,
+            update_sequence: 1,
+            locator_hashes: Vec::new(),
+            ..open.clone()
+        };
+        let mut labeller = ContentLabeller::default();
+        labeller.received(&Message::Status(status()));
+        labeller.sent(&Message::SubscribeHeaders(open.clone()));
+        let label = |update: SubscribeHeaders| {
+            labeller
+                .label(&Message::SubscribeHeaders(update), 139)
+                .first()
+        };
+        assert_eq!(label(open.clone()), Label::Conformant);
+        assert_eq!(label(grant.clone()), Label::Conformant);
+        for bad in [
+            SubscribeHeaders {
+                subscription_id: 0,
+                ..open.clone()
+            },
+            SubscribeHeaders {
+                locator_hashes: (0..14).map(|n| block::Hash([n; 32])).collect(),
+                ..open.clone()
+            },
+            SubscribeHeaders {
+                added_credit: Credit {
+                    objects: 1,
+                    bytes: 262,
+                },
+                ..open.clone()
+            },
+            SubscribeHeaders {
+                tree_aux_schema: AuxSchema::V1,
+                added_credit: Credit {
+                    objects: 1,
+                    bytes: 1_000,
+                },
+                ..open.clone()
+            },
+            SubscribeHeaders {
+                locator_hashes: vec![hash],
+                ..grant.clone()
+            },
+            SubscribeHeaders {
+                added_credit: Credit {
+                    objects: 0,
+                    bytes: 262,
+                },
+                ..grant.clone()
+            },
+            SubscribeHeaders {
+                operation: Operation::Close,
+                ..grant.clone()
+            },
+            SubscribeHeaders {
+                initial_target_tip_hash: block::Hash([2; 32]),
+                ..grant.clone()
+            },
+        ] {
+            assert_eq!(label(bad.clone()), Label::BadContent, "{bad:?}");
+        }
     }
 }

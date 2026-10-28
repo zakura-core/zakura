@@ -22,7 +22,7 @@ use zakura_sim::{
     model::{is_fault_cause, FrameModel, Label, ReaderEnd},
     observe::{TransitionFact, TransportFact},
     peer::{
-        adversary::{Act, AdversarySpec, ContentRule, Row, CROSSING_LINK_MS},
+        adversary::{Act, AdversarySpec, ContentRule, CursorField, Row, CROSSING_LINK_MS},
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         limit::ADVERSARY_RATE,
         peer_addr, PeerAction, PeerSpec, NODE_ADDR,
@@ -161,9 +161,9 @@ fn cases() -> Vec<Act> {
         Act::AfterClose,
         Act::UnretainedOpen,
         Act::OutcomeCrossing,
-        Act::BadCursor,
         Act::StatusBurst,
     ]);
+    acts.extend(CursorField::ALL.map(|field| Act::BadCursor { field }));
     acts.extend(ContentRule::ALL.map(|rule| Act::BadContent { rule }));
     acts.dedup();
     acts
@@ -248,7 +248,7 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
         ),
         Act::SecondOpen
         | Act::OverLive
-        | Act::BadCursor
+        | Act::BadCursor { .. }
         | Act::MinPayload {
             row: Row::SubscribeHeaders,
         } => (
@@ -466,8 +466,10 @@ struct Checked {
 /// asserted precondition held (no harness failure), its frame got the
 /// act's label, and the node judged it at the act's stage, with a header
 /// stage fault never read whole. Then a fault's `<label>-closes` holds with
-/// an obligation it discharged, by a fault close, or for `BadContent` by a
-/// fault close or a `Misbehavior`. A conformant act's
+/// an obligation it discharged, and the node closed the connection with a
+/// fault cause: header sync's consequence for every fault, content
+/// included, though `bad-content-closes` would also take a `Misbehavior`.
+/// A conformant act's
 /// `conformant-never-closes` holds, applied, with no fault close. No
 /// property of the table is violated.
 fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
@@ -498,7 +500,8 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
             cause.as_deref().is_none_or(|cause| !is_fault_cause(cause)),
             "{act:?}: a conformant peer was closed with {cause:?}"
         );
-    } else if frame.label != Label::BadContent {
+    } else {
+        // Header sync's content consequence is a fault close too.
         let cause = cause.unwrap_or_else(|| panic!("{act:?}: no close"));
         assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
     }
@@ -594,7 +597,9 @@ fn the_intended_guard_decides() {
         Act::OverLive,
         Act::OverCreditObjects,
         Act::ExtraEndingAhead,
-        Act::BadCursor,
+        Act::BadCursor {
+            field: CursorField::Hash,
+        },
         Act::BadContent {
             rule: ContentRule::Linkage,
         },

@@ -110,7 +110,7 @@ fn v5_tx_strategy(
                 expiry_height,
                 inputs,
                 outputs,
-                sapling_shielded_data,
+                sapling_shielded_data: sapling_shielded_data.map(Box::new),
                 orchard_shielded_data,
             },
         )
@@ -146,7 +146,7 @@ fn v6_tx_strategy(
                 expiry_height,
                 inputs,
                 outputs,
-                sapling_shielded_data,
+                sapling_shielded_data: sapling_shielded_data.map(Box::new),
                 orchard_shielded_data,
                 ironwood_shielded_data,
             },

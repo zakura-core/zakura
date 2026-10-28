@@ -2962,7 +2962,7 @@ mod zip218_shielded_action_limits {
             outputs: Vec::new(),
             lock_time: LockTime::unlocked(),
             expiry_height: Height(100),
-            joinsplit_data,
+            joinsplit_data: joinsplit_data.map(Box::new),
             sapling_shielded_data: None,
         })
     }

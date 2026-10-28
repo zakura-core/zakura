@@ -76,6 +76,69 @@ fn attributed_memory_size_counts_orchard_proof_capacity() {
     );
 }
 
+#[test]
+fn transaction_inline_size_excludes_sprout_and_sapling_bundles() {
+    // Allow the inline Orchard and Ironwood bundles, but not the legacy Sprout
+    // bundle that previously made every transaction occupy about 2 KB.
+    assert!(
+        std::mem::size_of::<Transaction>() <= 512,
+        "size_of::<Transaction>() is {} bytes",
+        std::mem::size_of::<Transaction>()
+    );
+}
+
+#[test]
+fn attributed_memory_size_counts_boxed_sprout_and_sapling_bundles() {
+    fn bundle_bytes<T: AttributedMemorySize>(bundle: Box<T>) -> u64 {
+        u64::try_from(std::mem::size_of::<T>()).unwrap()
+            + bundle.as_ref().attributed_memory_size_bytes()
+    }
+
+    let mut seen = [false; 4];
+    for (_, transaction) in
+        Network::iter().flat_map(|network| arbitrary::test_transactions(&network))
+    {
+        let mut without_bundles = transaction.as_ref().clone();
+        let removed_bytes = match &mut without_bundles {
+            Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
+                seen[0] |= joinsplit_data.is_some();
+                joinsplit_data.take().map_or(0, bundle_bytes)
+            }
+            Transaction::V4 {
+                joinsplit_data,
+                sapling_shielded_data,
+                ..
+            } => {
+                seen[1] |= joinsplit_data.is_some();
+                seen[2] |= sapling_shielded_data.is_some();
+                joinsplit_data.take().map_or(0, bundle_bytes)
+                    + sapling_shielded_data.take().map_or(0, bundle_bytes)
+            }
+            Transaction::V5 {
+                sapling_shielded_data,
+                ..
+            } => {
+                seen[3] |= sapling_shielded_data.is_some();
+                sapling_shielded_data.take().map_or(0, bundle_bytes)
+            }
+            _ => continue,
+        };
+
+        assert_eq!(
+            transaction.attributed_memory_size_bytes()
+                - without_bundles.attributed_memory_size_bytes(),
+            removed_bytes,
+        );
+        if seen.into_iter().all(|present| present) {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, [true; 4],
+        "vectors cover both Sprout proofs and Sapling anchors"
+    );
+}
+
 /// Build a mock output list for pre-V5 transactions, with (index+1)
 /// copies of `output`, which is used to computed the sighash.
 ///
@@ -2521,7 +2584,7 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(shielded_data),
+            sapling_shielded_data: Some(Box::new(shielded_data)),
             orchard_shielded_data: None,
         };
 
@@ -2616,13 +2679,13 @@ fn sapling_lazy_cv_epk_edge_cases() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::SharedAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::JustOutputs {
                     outputs: at_least_one![output],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
             orchard_shielded_data: None,
         }
     };
@@ -2756,7 +2819,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
             },
             Transaction::V6 {
@@ -2765,7 +2828,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
                 ironwood_shielded_data: None,
             },
@@ -2956,7 +3019,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
         }
     };
@@ -3001,7 +3064,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
             ironwood_shielded_data: None,
         }
@@ -3058,7 +3121,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
             inputs: vec![],
             outputs: vec![],
             joinsplit_data: None,
-            sapling_shielded_data: Some(ShieldedData::<sapling::PerSpendAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::PerSpendAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::SpendsAndMaybeOutputs {
                     shared_anchor: sapling::FieldNotPresent,
@@ -3066,7 +3129,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
                     maybe_outputs: vec![],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
         }
     };
 

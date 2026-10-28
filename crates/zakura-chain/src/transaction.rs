@@ -71,6 +71,9 @@ use crate::{
 /// Zcash has a number of different transaction formats. They are represented
 /// internally by different enum variants. Because we checkpoint on Canopy
 /// activation, we do not validate any pre-Sapling transaction types.
+///
+/// Sprout and Sapling bundles are boxed so their inline storage does not enlarge
+/// every transaction. Orchard and Ironwood bundles remain inline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub enum Transaction {
@@ -94,7 +97,7 @@ pub enum Transaction {
         /// chain.
         lock_time: LockTime,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Bctv14Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Bctv14Proof>>>,
     },
     /// An Overwinter transaction (`version = 3`).
     V3 {
@@ -108,7 +111,7 @@ pub enum Transaction {
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Bctv14Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Bctv14Proof>>>,
     },
     /// A Sapling transaction (`version = 4`).
     V4 {
@@ -122,9 +125,9 @@ pub enum Transaction {
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
         /// The JoinSplit data for this transaction, if any.
-        joinsplit_data: Option<JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<Box<JoinSplitData<Groth16Proof>>>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::PerSpendAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::PerSpendAnchor>>>,
     },
     /// A `version = 5` transaction , which supports Orchard, Sapling, and transparent, but not Sprout.
     V5 {
@@ -142,7 +145,7 @@ pub enum Transaction {
         /// The transparent outputs from the transaction.
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
         orchard_shielded_data: Option<orchard::ShieldedData>,
     },
@@ -163,7 +166,7 @@ pub enum Transaction {
         /// The transparent outputs from the transaction.
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
-        sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+        sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
         orchard_shielded_data: Option<orchard::ShieldedData>,
         /// The Ironwood data for this transaction, if any.
@@ -1016,11 +1019,11 @@ impl Transaction {
             Transaction::V5 {
                 sapling_shielded_data,
                 ..
-            } => sapling_shielded_data.as_ref(),
+            } => sapling_shielded_data.as_deref(),
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
-            } => sapling_shielded_data.as_ref(),
+            } => sapling_shielded_data.as_deref(),
             _ => None,
         }
     }

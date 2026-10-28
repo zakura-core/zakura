@@ -63,7 +63,7 @@ impl Transaction {
                     inputs,
                     outputs,
                     lock_time,
-                    joinsplit_data,
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 },
             )
             .boxed()
@@ -84,7 +84,7 @@ impl Transaction {
                     outputs,
                     lock_time,
                     expiry_height,
-                    joinsplit_data,
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 },
             )
             .boxed()
@@ -118,13 +118,13 @@ impl Transaction {
                             // The genesis block should not contain any joinsplits.
                             None
                         } else {
-                            joinsplit_data
+                            joinsplit_data.map(Box::new)
                         },
                         sapling_shielded_data: if ledger_state.height.is_min() {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            sapling_shielded_data
+                            sapling_shielded_data.map(Box::new)
                         },
                     }
                 },
@@ -167,7 +167,7 @@ impl Transaction {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            sapling_shielded_data
+                            sapling_shielded_data.map(Box::new)
                         },
                         orchard_shielded_data: if ledger_state.height.is_min() {
                             // The genesis block should not contain any shielded data.
@@ -949,8 +949,10 @@ pub fn transaction_to_fake_v5(
             lock_time: *lock_time,
             expiry_height: height,
             sapling_shielded_data: sapling_shielded_data
-                .clone()
-                .and_then(sapling_shielded_v4_to_fake_v5),
+                .as_deref()
+                .cloned()
+                .and_then(sapling_shielded_v4_to_fake_v5)
+                .map(Box::new),
             orchard_shielded_data: None,
         },
         v5 @ V5 { .. } => v5.clone(),
@@ -1158,7 +1160,7 @@ pub fn fake_v5_with_sapling_outputs(count: usize) -> Arc<Transaction> {
         Transaction::V5 {
             sapling_shielded_data,
             ..
-        } => *sapling_shielded_data = Some(shielded_data),
+        } => *sapling_shielded_data = Some(Box::new(shielded_data)),
         _ => unreachable!("empty_v5_transaction returns a V5 transaction"),
     }
 

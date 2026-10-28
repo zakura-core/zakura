@@ -26,7 +26,7 @@ use zakura_network::zakura::{
 use zakura_rt::time::Instant;
 use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
 
-use super::{Outgoing, StreamModels};
+use super::{Outgoing, PeerAction, StreamModels};
 use crate::harness::header_node::{preload, Chain};
 
 /// The model session of a peer's header stream: each stream has models of
@@ -257,23 +257,25 @@ impl Honest {
         Some(subscribed.paged_at? + Duration::from_millis(quiet_ms))
     }
 
-    /// When the peer may next become settled: the end of a held grant's
-    /// quiet time, or [`SETTLE`] after its last frame once nothing is live.
-    pub(crate) fn wake(&self) -> Option<Instant> {
-        if let Some(opens) = self.grant_opens() {
-            return Some(opens);
+    /// When the peer may next become ready for `next`, its next scripted
+    /// action: for a `grant`, the end of a held grant's quiet time, and for
+    /// any other, [`SETTLE`] after its last frame once nothing is live.
+    pub(crate) fn wake(&self, next: Option<PeerAction>) -> Option<Instant> {
+        if next == Some(PeerAction::Grant) {
+            return self.grant_opens();
         }
         let own_ended =
             self.spec.subscribe.is_none() || self.subscribed.as_ref().is_some_and(|sub| sub.ended);
         (own_ended && self.serving.is_empty() && self.served > 0).then(|| self.active + SETTLE)
     }
 
-    /// Whether the peer may be offered its next action: a held grant once
-    /// its quiet time has passed, or otherwise [`SETTLE`] after its last
-    /// frame once every subscription in either direction has ended, its own
-    /// included, after the node opened at least one.
-    pub(crate) fn settled(&self) -> bool {
-        self.wake().is_some_and(|wake| Instant::now() >= wake)
+    /// Whether the peer may be offered `next`, its next scripted action: a
+    /// held grant once its quiet time has passed, and any other action
+    /// [`SETTLE`] after its last frame once every subscription in either
+    /// direction has ended, its own included, after the node opened at
+    /// least one.
+    pub(crate) fn settled(&self, next: Option<PeerAction>) -> bool {
+        self.wake(next).is_some_and(|wake| Instant::now() >= wake)
     }
 
     /// Labels and encodes `message` with the stream's models.

@@ -6,7 +6,10 @@
 //! record until the transport tap has logged the connection's `registered`
 //! event and the stream's `Session` row, then logs it as a `PeerFrame`,
 //! `PeerWritten` or `PeerReceived` with that connection (M5-Q4). Records of
-//! one stream keep their order.
+//! one stream keep their order. A record whose stream can no longer be
+//! admitted, because the node refused it or its handshake, or tore its
+//! connection down, fails the run, so a peer's frames can't drop out of the
+//! log unseen.
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the node's `frame-read` of a frame labelled
@@ -18,7 +21,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     rc::Rc,
 };
@@ -85,6 +88,12 @@ pub(crate) struct WireEvidence {
     /// Each logged `PeerFrame`'s label, by connection, QUIC stream and
     /// `seq`.
     labels: BTreeMap<(u64, u64, u64), Label>,
+    /// Remote addresses whose handshake the node refused.
+    refused_handshakes: BTreeSet<String>,
+    /// Streams the node refused, by connection and QUIC stream.
+    refused_streams: BTreeSet<(u64, u64)>,
+    /// Connections the node tore down.
+    torn_down: BTreeSet<u64>,
 }
 
 impl WireEvidence {
@@ -105,6 +114,28 @@ impl WireEvidence {
                     ..
                 } => {
                     self.connections.insert(remote.clone(), *connection);
+                }
+                Observation::Transport {
+                    connection: None,
+                    remote,
+                    event: TransportFact::HandshakeRefused { .. },
+                    ..
+                } => {
+                    self.refused_handshakes.insert(remote.clone());
+                }
+                Observation::Transport {
+                    connection: Some(connection),
+                    event: TransportFact::StreamRefused { quic_stream, .. },
+                    ..
+                } => {
+                    self.refused_streams.insert((*connection, *quic_stream));
+                }
+                Observation::Transport {
+                    connection: Some(connection),
+                    event: TransportFact::TornDown,
+                    ..
+                } => {
+                    self.torn_down.insert(*connection);
                 }
                 Observation::Session {
                     connection,
@@ -134,6 +165,9 @@ impl WireEvidence {
                 }
                 None => true,
             });
+        if let Some(lost) = records.borrow().iter().find_map(|record| self.lost(record)) {
+            return Err(lost);
+        }
         let mut projected = Vec::new();
         for entry in &log.entries()[start..] {
             if let Some(obs) = self.project(&entry.obs)? {
@@ -193,6 +227,28 @@ impl WireEvidence {
                 payload,
                 credit,
             },
+        })
+    }
+
+    /// Why `record`, still unplaced, never will be, if the node refused its
+    /// handshake or stream or tore its connection down.
+    fn lost(&self, record: &PeerRecord) -> Option<String> {
+        let remote = record.remote.to_string();
+        let gone = match self.connections.get(&remote) {
+            None => self.refused_handshakes.contains(&remote),
+            Some(connection) => {
+                self.torn_down.contains(connection)
+                    || self
+                        .refused_streams
+                        .contains(&(*connection, record.quic_stream))
+            }
+        };
+        gone.then(|| {
+            format!(
+                "UnplacedRecord: {remote}'s record on stream {} can't get an identity, since the \
+                 node refused or closed it before admitting the stream: {:?}",
+                record.quic_stream, record.body
+            )
         })
     }
 
@@ -259,5 +315,70 @@ impl WireEvidence {
             }
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::peer_addr;
+
+    /// A transport event on `connection` from peer 0's first address.
+    fn transport(seq: u64, connection: Option<u64>, event: TransportFact) -> Observation {
+        Observation::Transport {
+            instance: 0,
+            seq,
+            node: "node".to_owned(),
+            connection,
+            remote: peer_addr(0, 0).to_string(),
+            event,
+        }
+    }
+
+    /// Peer 0's `PeerFrame` record for its first frame on QUIC stream 4.
+    fn status_record() -> PeerRecords {
+        Rc::new(RefCell::new(VecDeque::from([PeerRecord {
+            remote: peer_addr(0, 0),
+            quic_stream: 4,
+            body: RecordBody::Written { seq: 0 },
+        }])))
+    }
+
+    /// A record waits while its stream may still be admitted, and fails the
+    /// run once the node refuses the stream or the handshake, or tears the
+    /// connection down first, so it can't drop out of the log unseen.
+    #[test]
+    fn a_record_that_can_never_be_placed_fails_the_run() {
+        let refused = TransportFact::StreamRefused {
+            quic_stream: 4,
+            kind: 5,
+            version: 9,
+            reason: "unnegotiated_capability".to_owned(),
+        };
+        let handshake = TransportFact::HandshakeRefused {
+            reason: "Zakura control nonce mismatch".to_owned(),
+        };
+        let cases = [
+            (Some(1), refused),
+            (Some(1), TransportFact::TornDown),
+            (None, handshake),
+        ];
+        for (connection, ending) in cases {
+            let records = status_record();
+            let mut evidence = WireEvidence::default();
+            let mut log = ObservationLog::default();
+            if connection.is_some() {
+                log.push(transport(1, connection, TransportFact::Registered));
+            }
+            evidence
+                .observe(&records, &mut log)
+                .expect("the stream may still be admitted");
+            assert_eq!(records.borrow().len(), 1, "it waits");
+            log.push(transport(2, connection, ending.clone()));
+            let error = evidence
+                .observe(&records, &mut log)
+                .expect_err("the record can never be placed");
+            assert!(error.starts_with("UnplacedRecord"), "{ending:?}: {error}");
+        }
     }
 }

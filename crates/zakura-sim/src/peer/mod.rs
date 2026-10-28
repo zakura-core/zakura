@@ -363,6 +363,9 @@ pub(crate) struct PeerTask {
     pub(crate) chain: Option<Arc<HonestChain>>,
     /// Where it records its frames.
     pub(crate) records: PeerRecords,
+    /// How many scripted actions it has taken, so its next is
+    /// `spec.script[taken]`.
+    pub(crate) taken: usize,
 }
 
 /// How a connection's service ended.
@@ -757,6 +760,7 @@ impl PeerTask {
             self.readiness.set(true);
             let next = self.commands.recv().await;
             self.readiness.taken();
+            self.taken += 1;
             match next {
                 Some(PeerAction::Redial) => {}
                 Some(action) => {
@@ -882,13 +886,14 @@ impl PeerTask {
         }
         loop {
             let now = Instant::now();
-            let ready = settled && honest.as_ref().is_none_or(Honest::settled);
+            let next = self.spec.script.get(self.taken).copied();
+            let ready = settled && honest.as_ref().is_none_or(|honest| honest.settled(next));
             self.readiness.set(ready);
             // The honest script's next timer: its refresh, or when it may
             // become settled, which makes the peer ready.
             let deadline = honest.as_ref().map(|honest| {
                 honest
-                    .wake()
+                    .wake(next)
                     .filter(|wake| *wake > now)
                     .map_or(honest.deadline(), |wake| wake.min(honest.deadline()))
             });
@@ -927,6 +932,7 @@ impl PeerTask {
                 },
                 Some(action) = self.commands.recv() => {
                     self.readiness.taken();
+                    self.taken += 1;
                     match action {
                         PeerAction::Open { kind, version } => open(conn, kind, version).await,
                         PeerAction::FinishHeader => {

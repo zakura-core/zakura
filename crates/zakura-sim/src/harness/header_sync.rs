@@ -396,6 +396,8 @@ pub struct WirePorts {
     pub chains: Vec<Option<Arc<HonestChain>>>,
     /// What the node's reactor was started with, once the run builds it.
     pub startup: Rc<RefCell<Option<StartupFacts>>>,
+    /// The peers' records the identity map hasn't placed yet.
+    records: PeerRecords,
 }
 
 impl WirePorts {
@@ -403,6 +405,14 @@ impl WirePorts {
     /// check that sync converged, as M4's tests read it.
     pub fn selected_tip(&self) -> Frontier {
         self.node.engine().snapshot().frontiers.header_best
+    }
+
+    /// How many peer records are still waiting for their stream's identity
+    /// rows. A run ends with some only if a peer wrote on a stream the node
+    /// hasn't admitted yet, so a test whose streams all reach admission
+    /// requires none.
+    pub fn unplaced_records(&self) -> usize {
+        self.records.borrow().len()
     }
 }
 
@@ -466,6 +476,7 @@ impl Subsystem for HeaderWire {
             node,
             chains,
             startup: Rc::default(),
+            records: PeerRecords::default(),
         }
     }
 
@@ -510,8 +521,7 @@ impl Subsystem for HeaderWire {
             observer,
         );
         let failure = Rc::new(RefCell::new(None));
-        let records = PeerRecords::default();
-        let mut control = PeerControl::new(failure.clone(), records.clone());
+        let mut control = PeerControl::new(failure.clone(), ports.records.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) = control.add(&name, spec.script.clone());
             let (listening, listened) = zakura_rt::sync::watch::channel(false);
@@ -530,7 +540,8 @@ impl Subsystem for HeaderWire {
                 failure: failure.clone(),
                 listening,
                 chain: ports.chains[index].clone(),
-                records: records.clone(),
+                records: ports.records.clone(),
+                taken: 0,
             };
             sim.scheduler().spawn_root("peer", task.run());
             if spec.dialer == PeerDialer::Node {

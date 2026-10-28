@@ -85,6 +85,7 @@ fn run_with(
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert_eq!(ports.unplaced_records(), 0, "every peer record was logged");
     (report, ports)
 }
 
@@ -95,11 +96,18 @@ fn run(scenario: &WireScenario, plan: PlanInput) -> (RunReport, WirePorts) {
 
 /// Runs `scenario` under `plan`, and returns the report even of a run that
 /// ended in a harness failure, so a test can check what happened first.
-fn run_to_end(scenario: &WireScenario, plan: PlanInput) -> RunReport {
+fn run_to_end(scenario: &WireScenario, plan: PlanInput) -> (RunReport, WirePorts) {
     let ports = HeaderWire::prepare(scenario);
-    match run_prepared::<HeaderWire>(scenario, ports, plan, &mut MemorySink::default(), None) {
-        Ok(report) => report,
-        Err(HarnessError::Run { report, .. }) => *report,
+    let ran = run_prepared::<HeaderWire>(
+        scenario,
+        ports.clone(),
+        plan,
+        &mut MemorySink::default(),
+        None,
+    );
+    match ran {
+        Ok(report) => (report, ports),
+        Err(HarnessError::Run { report, .. }) => (*report, ports),
         Err(error) => panic!("{error}"),
     }
 }
@@ -597,7 +605,7 @@ fn a_slow_subscriber_stops_the_publisher() {
             ..scenario(vec![peer], Policy::converging())
         };
         for plan in plans() {
-            let report = run_to_end(&scenario, plan);
+            let (report, ports) = run_to_end(&scenario, plan);
             let entries = timed(&report);
             let pages: Vec<&At> = entries
                 .iter()
@@ -648,8 +656,49 @@ fn a_slow_subscriber_stops_the_publisher() {
             // the peer's next update, which its models then refuse.
             assert_eq!(report.end.harness, None);
             assert_eq!(report.end.violation, None);
+            assert_eq!(ports.unplaced_records(), 0);
         }
     }
+}
+
+/// A held grant's quiet time readies the peer for its `grant` only. With
+/// `finish-header` next instead, the peer waits for every subscription to
+/// end, which a held subscription never does, so the stream is never
+/// retired with the exchange open.
+///
+/// This fails if the quiet time readies any next action.
+#[test]
+fn a_held_grant_readies_only_the_grant() {
+    let credit = CreditSpec {
+        objects: 1,
+        bytes: 526,
+    };
+    let subscribe = SubscribeSpec {
+        start: PRELOAD,
+        open: credit,
+        grants: GrantPolicy::Held {
+            grant: credit,
+            quiet_ms: 5_000,
+        },
+    };
+    let mut peer = honest(PeerSpec::dialing(), PRELOAD, Some(subscribe));
+    peer.script = vec![PeerAction::FinishHeader];
+    let scenario = WireScenario {
+        node: Chain::main(1_200),
+        ..scenario(vec![peer], Policy::converging())
+    };
+    let (report, _) = run(&scenario, Plan::from_fuzz(&[]));
+    assert!(
+        !report
+            .picks
+            .iter()
+            .any(|pick| pick.identity.starts_with("peer:")),
+        "no action was offered"
+    );
+    assert!(report.log.entries().iter().any(|entry| matches!(
+        entry.obs,
+        Observation::PeerReceived { message_type, .. } if message_type == HEADERS
+    )));
 }
 
 /// M5-C's reopen, after real subscriptions. The node dials `peer-0`, each

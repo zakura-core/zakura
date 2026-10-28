@@ -63,6 +63,8 @@ pub struct BudgetChange {
     pub before: u64,
     /// The counter after the change.
     pub after: u64,
+    /// The budget's maximum, which a reservation may not pass.
+    pub limit: u64,
 }
 
 /// Which [`ByteBudget`] operation changed its counter.
@@ -119,6 +121,7 @@ impl ByteBudget {
                 kind,
                 before,
                 after,
+                limit: self.inner.max_bytes,
             });
         }
     }

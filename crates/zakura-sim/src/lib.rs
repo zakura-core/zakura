@@ -39,4 +39,4 @@ pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};
 pub use plan::{By, Divergence, HexU64, Plan, PlanChoice, PlanError, PlanInput, TraceScript};
 pub use record::{MemorySink, Record, RecordSink};
-pub use sim::{RunConfig, RunReport, Sim};
+pub use sim::{RunConfig, RunReport, Sim, TaskHold};

@@ -30,7 +30,8 @@ use zakura_network::zakura::{
     ServicePeerDirection, ZakuraConnId, ZakuraPeerId,
 };
 
-use crate::domain::block_sync_semantic::{SemanticModel, SemanticView};
+use crate::domain::block_sync::OwnerModel;
+use crate::domain::block_sync_semantic::SemanticModel;
 
 /// An admitted session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,13 +136,9 @@ pub struct BlockSyncView {
     /// The semantic checks' model of the run's log, which every clone of
     /// the view shares.
     pub semantic: Rc<RefCell<SemanticModel>>,
-}
-
-impl SemanticView for BlockSyncView {
-    /// The shared model.
-    fn semantic(&self) -> Rc<RefCell<SemanticModel>> {
-        self.semantic.clone()
-    }
+    /// The resource properties' owner model, which folds the events as the
+    /// tap logs them.
+    pub owners: OwnerModel,
 }
 
 impl BlockSyncView {
@@ -392,12 +389,14 @@ mod tests {
             kind: BudgetChangeKind::Reserved,
             before: 0,
             after: 100,
+            limit: 1_000,
         }));
         assert!(view.anomalies.is_empty());
         view.fold(&BlockEvent::Budget(BudgetChange {
             kind: BudgetChangeKind::Released,
             before: 50,
             after: 0,
+            limit: 1_000,
         }));
         assert_eq!(view.anomalies.len(), 1, "{:?}", view.anomalies);
         assert_eq!(view.reserved, 0);

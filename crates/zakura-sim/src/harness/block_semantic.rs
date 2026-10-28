@@ -24,7 +24,7 @@ use super::{
 };
 
 /// The fuzz prefix that draws [`BlockScenario::reset_mid_flight`].
-pub const RESET_MID_FLIGHT_TAG: [u8; 2] = [0xFF, 0x04];
+pub const RESET_MID_FLIGHT_TAG: [u8; 2] = [0xFF, 0x0C];
 
 /// The fuzz prefix that draws [`BlockScenario::stale_beside_current`].
 pub const STALE_BESIDE_CURRENT_TAG: [u8; 2] = [0xFF, 0x06];
@@ -72,12 +72,8 @@ impl BlockScenario {
         BlockScenario {
             blocks: 16,
             mirrors: vec![
-                MirrorSpec {
-                    dialer: Dialer::Mirror,
-                },
-                MirrorSpec {
-                    dialer: Dialer::Node,
-                },
+                MirrorSpec::new(Dialer::Mirror),
+                MirrorSpec::new(Dialer::Node),
             ],
             control: vec![
                 ControlStep {
@@ -267,15 +263,15 @@ impl BlockScenario {
         }
     }
 
-    /// The scenario a fuzz input's 2-byte prefix names: one of the tags
-    /// above, or else the default scenario.
-    pub fn drawn(prefix: &[u8]) -> Self {
-        match <[u8; 2]>::try_from(prefix) {
-            Ok(RESET_MID_FLIGHT_TAG) => BlockScenario::reset_mid_flight(),
-            Ok(STALE_BESIDE_CURRENT_TAG) => BlockScenario::stale_beside_current(),
-            Ok(CAPACITY_RELEASE_TAG) => BlockScenario::capacity_release(),
-            Ok(STALLED_RESET_TAG) => BlockScenario::stalled_reset(),
-            _ => BlockScenario::default(),
+    /// The semantic scenario a fuzz input's 2-byte prefix names, if it
+    /// starts with one of the tags above.
+    pub fn semantic_drawn(prefix: &[u8]) -> Option<Self> {
+        match prefix.get(..2)? {
+            tag if tag == RESET_MID_FLIGHT_TAG => Some(BlockScenario::reset_mid_flight()),
+            tag if tag == STALE_BESIDE_CURRENT_TAG => Some(BlockScenario::stale_beside_current()),
+            tag if tag == CAPACITY_RELEASE_TAG => Some(BlockScenario::capacity_release()),
+            tag if tag == STALLED_RESET_TAG => Some(BlockScenario::stalled_reset()),
+            _ => None,
         }
     }
 }

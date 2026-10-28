@@ -1,8 +1,8 @@
 # The committed fuzz input `block-sync-reset-mid-flight.bin`: the harness
 # that runs it, the generator version it was built for, and its SHA-256. Its
-# first two bytes, `ff 04`, pick the reset-mid-flight scenario: two mirrors
+# first two bytes, `ff 0c`, pick the reset-mid-flight scenario: two mirrors
 # serve sixteen bodies, and the chain resets to a fork from height 8 once the
 # node submits its third body.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "ac77a39d8c81de028145801aa760f53b7d98f251e500508da06817c38954de85"
+sha256 = "eced106295cd11bbbe20700bef6774e774a350f9d7898e23f9b41183d8cc2a00"

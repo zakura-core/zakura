@@ -550,17 +550,43 @@ impl PeerRoutine {
     }
 
     /// Reports the routine's owner state and the work queue's items, if an
-    /// observer is installed.
+    /// observer is installed. `ended` marks the routine's last snapshot.
+    ///
+    /// Each request lists its received heights and the unreceived heights
+    /// the work queue still assigns to it. Another actor's revocation
+    /// releases a height's charge at once, but the routine drops the height
+    /// only at its next fill (`gc_obsolete_outstanding`), which a full
+    /// outbound queue skips. The snapshot applies the same check now, so it
+    /// lists only heights the budget still counts.
     #[cfg(any(test, zakura_sim))]
-    fn observe_owners(&self) {
+    fn observe_owners(&self, ended: bool) {
         use super::block_sync_observe::{BlockEvent, RegistryClaim, RoutineSnapshot};
+        let mut requests = self.window.outstanding.ownership();
+        let unreceived: Vec<_> = requests
+            .iter()
+            .flat_map(|request| {
+                request
+                    .heights
+                    .iter()
+                    .filter(|height| !height.received)
+                    .map(|height| (height.height, request.owner))
+            })
+            .collect();
+        if !unreceived.is_empty() {
+            let disowned = self.work.disowned(&unreceived, |owner| *owner);
+            for request in &mut requests {
+                request
+                    .heights
+                    .retain(|height| !disowned.contains(&(height.height, request.owner)));
+            }
+        }
         observe!(
             self.observer,
             BlockEvent::Routine(RoutineSnapshot {
                 peer: self.peer.clone(),
                 conn_id: self.conn_id,
                 generation: self.generation,
-                requests: self.window.outstanding.ownership(),
+                requests,
                 claims: self
                     .registry
                     .outstanding_snapshot(&self.peer, self.generation)
@@ -572,6 +598,7 @@ impl PeerRoutine {
                     })
                     .collect(),
                 serving: self.serving.admitted_ranges(),
+                ended,
             })
         );
         self.work.observe_items();
@@ -631,8 +658,6 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
-            #[cfg(any(test, zakura_sim))]
-            self.observe_owners();
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
@@ -691,6 +716,13 @@ impl PeerRoutine {
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             zakura_rt::pin!(outbound_queue_poll);
 
+            // The routine's snapshot, once per iteration, after the deadlines
+            // and the fill above have reserved or released request bytes. The
+            // routine can park below for a whole timeout, so a snapshot here
+            // lets an observer reconcile the budget with every routine's
+            // outstanding estimates while the run rests.
+            #[cfg(any(test, zakura_sim))]
+            self.observe_owners(false);
             zakura_rt::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
@@ -1634,9 +1666,17 @@ impl PeerRoutine {
             return true;
         }
         if priority == RequestPriority::Floor {
-            // The WorkQueue owns each height once, so there can only be one
-            // floor-priority overdraft globally. Its charge is released by the
-            // normal reservation paths: receipt, timeout, watchdog, or reset.
+            // Only a request that starts at the download floor or the next
+            // height gets here. The WorkQueue owns each height once, so at
+            // most two such overdrafts are live, each past the max by at most
+            // one request's estimate. A request asks for one body
+            // (`BS_BLOCKS_PER_RESPONSE`), so that is `B` (`MAX_BLOCK_BYTES`);
+            // more bodies per request would scale it. A routine handing a
+            // body to the sequencer still holds its charge, and the floor can
+            // advance meanwhile, so each open handoff adds at most one more
+            // `B`: the budget stays within `M + 2·B + h·B`. The normal
+            // reservation paths release the charge: receipt, timeout,
+            // watchdog, or reset.
             self.budget.charge(reserved_bytes);
             metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
             return true;
@@ -2836,7 +2876,7 @@ impl Drop for PeerRoutine {
         self.return_unreceived_requests("peer_routine_drop");
         // The routine's last snapshot, after it returned its work.
         #[cfg(any(test, zakura_sim))]
-        self.observe_owners();
+        self.observe_owners(true);
     }
 }
 

@@ -377,6 +377,11 @@ impl ActionSource for PolicySource {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
             }
         }
+        if let Some(tap) = &self.tap {
+            let made = u64::try_from(links.len()).unwrap_or(u64::MAX);
+            let open = links.iter().filter(|link| !link.is_closed()).count();
+            tap.fold_links(made, u64::try_from(open).unwrap_or(u64::MAX));
+        }
         let chains = self.effects.chains.borrow();
         for (effect, actor) in &chains[self.changed..] {
             predicates.record_link(*effect, actor);
@@ -439,6 +444,9 @@ struct PendingRead {
     engine: Arc<EnginePort>,
     /// The read.
     request: BlockRangeRead,
+    /// Whether the mirror withholds the read's first height, so the run
+    /// never serves it.
+    withheld: bool,
     /// Whether the run has served it, which lets its caller read full state.
     served: bool,
     /// The caller's waker.
@@ -554,6 +562,8 @@ pub struct MirrorStorage {
     name: String,
     engine: Arc<EnginePort>,
     reads: MirrorReads,
+    /// Heights whose range reads the run never serves.
+    withheld: Vec<u32>,
 }
 
 impl MirrorStorage {
@@ -564,7 +574,15 @@ impl MirrorStorage {
             name: name.to_owned(),
             engine,
             reads,
+            withheld: Vec::new(),
         }
+    }
+
+    /// The same storage, except that the run never serves a range read that
+    /// starts at one of `heights`. The read waits until its caller drops it.
+    pub fn withholding(mut self, heights: &[u32]) -> Self {
+        self.withheld = heights.to_vec();
+        self
     }
 
     /// Spawns a task that answers each of `actions` until the channel
@@ -632,6 +650,7 @@ impl BlockRangeSource for MirrorStorage {
             PendingRead {
                 mirror: self.name.clone(),
                 engine: self.engine.clone(),
+                withheld: self.withheld.contains(&request.start_height.0),
                 request,
                 served: false,
                 waker: None,
@@ -671,7 +690,7 @@ impl ActionSource for MirrorReadSource {
         let predicates = self.predicates.borrow();
         for (id, read) in &queue.pending {
             let since = self.stages.since(BlockKey::Mirror(*id), now);
-            if !read.served && predicates.serves(*id, since) {
+            if !read.served && !read.withheld && predicates.serves(*id, since) {
                 out.push((Identity::storage(&read.mirror, *id, "serve"), *id));
             }
         }

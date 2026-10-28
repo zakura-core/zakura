@@ -82,12 +82,8 @@ fn honest_sync_reaches_the_fixture_tip() {
     let scenario = BlockScenario {
         blocks: 64,
         mirrors: vec![
-            MirrorSpec {
-                dialer: Dialer::Mirror,
-            },
-            MirrorSpec {
-                dialer: Dialer::Node,
-            },
+            MirrorSpec::new(Dialer::Mirror),
+            MirrorSpec::new(Dialer::Node),
         ],
         ..BlockScenario::default()
     };

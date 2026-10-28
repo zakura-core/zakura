@@ -309,6 +309,52 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
+    // The stuck floor's witness test is ignored, since one debug run takes
+    // minutes. `cargo xtask planted` runs its committed input unpatched as a
+    // witness test that expects a hold, before it runs the patch.
+    Coverage {
+        property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
+        ),
+        bypass: Bypass::Planted("wide-commit-window"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::RESERVED_BYTE_BOUND,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_paused_handoffs_input_holds_reserved_byte_bound",
+        ),
+        bypass: Bypass::Planted("above-floor-charge"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::BUDGET_LEDGERS_AGREE,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_budget_ledgers_agree",
+        ),
+        bypass: Bypass::Planted("handoff-keeps-charge"),
+    },
+    // The above-window witness test is ignored, since one debug run takes
+    // about 100 s. `cargo xtask planted` runs its committed input unpatched
+    // as a witness test that expects a hold, before it runs the patch.
+    Coverage {
+        property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_above_window_input_holds_lookahead_overshoot_bound",
+        ),
+        bypass: Bypass::Planted("omit-outstanding-estimates"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "block_sync_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("skip-return-on-drop"),
+    },
     Coverage {
         property: crate::domain::block_sync_semantic::SUBMIT_ONLY_REQUESTED,
         passing: passes(
@@ -325,7 +371,7 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("release-by-height"),
     },
-    // Both capacity witnesses are ignored, since each release run takes
+    // Both capacity tests are ignored, since each optimized run takes
     // minutes. The `zakura_sim slow witnesses` job runs them. Main's
     // sequencer is the bypass: the frontier-first input violates it (#1523).
     Coverage {

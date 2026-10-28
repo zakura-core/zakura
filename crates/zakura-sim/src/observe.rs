@@ -1217,6 +1217,8 @@ pub enum BlockSyncFact {
         before: u64,
         /// The counter after it.
         after: u64,
+        /// The budget's maximum, `M`.
+        limit: u64,
     },
     /// A routine handed a body to the sequencer, keeping its charge.
     HandoffStarted {
@@ -1297,6 +1299,8 @@ pub enum BlockSyncFact {
         claims: Vec<BlockSyncClaim>,
         /// The ranges its serving session records.
         serving: Vec<BlockSyncRange>,
+        /// True for the routine's last snapshot, after it returned its work.
+        ended: bool,
     },
     /// The work queue's items.
     WorkQueue {

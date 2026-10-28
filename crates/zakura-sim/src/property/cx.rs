@@ -70,6 +70,7 @@ pub struct CheckCtx<'a, S: HasView> {
     recorded: Vec<Violation>,
     missing: Option<String>,
     labelled: Vec<LabelledFrame>,
+    peaks: Vec<(&'static str, u64)>,
 }
 
 /// What a check left behind besides its verdict.
@@ -82,6 +83,8 @@ pub(crate) struct CheckParts {
     pub(crate) missing: Option<String>,
     /// The frames it labelled, in order.
     pub(crate) labelled: Vec<LabelledFrame>,
+    /// The quantities it measured, by name.
+    pub(crate) peaks: Vec<(&'static str, u64)>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -102,6 +105,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             recorded: Vec::new(),
             missing: None,
             labelled: Vec::new(),
+            peaks: Vec::new(),
         }
     }
 
@@ -112,6 +116,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             recorded: self.recorded,
             missing: self.missing,
             labelled: self.labelled,
+            peaks: self.peaks,
         }
     }
 
@@ -223,6 +228,13 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     pub fn record_violation(&mut self, expected: impl Into<String>, actual: impl Into<String>) {
         let violation = self.violation(expected.into(), actual.into());
         self.recorded.push(violation);
+    }
+
+    /// Records the value `quantity` reached by this step. The property's
+    /// report keeps each quantity's largest value over the run, such as the
+    /// most bytes an allowance held (properties.md, Retained bytes).
+    pub fn peak(&mut self, quantity: &'static str, value: u64) {
+        self.peaks.push((quantity, value));
     }
 
     /// Records that a source the property needs lacks evidence the check

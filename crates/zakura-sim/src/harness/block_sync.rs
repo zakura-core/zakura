@@ -171,9 +171,11 @@ impl BlockScenario {
     /// Sixteen bodies whose headers advertise no size, from four mirrors.
     /// Each request reserves the most a body can be, `B`, against a byte
     /// budget of `1.5·B`, so one request leaves the budget short of the
-    /// next: only a floor request may charge past it. The node advertises a
-    /// response target of `B`, so zakurad's validation accepts that budget.
-    pub fn overdraft() -> Self {
+    /// next. Only a floor request may then charge past it, but no run has
+    /// been seen to: the floor request's own reservation fits first. The
+    /// node advertises a response target of `B`, so zakurad's validation
+    /// accepts that budget.
+    pub fn short_budget() -> Self {
         BlockScenario {
             blocks: 16,
             size_hint: Some(0),
@@ -197,7 +199,7 @@ impl BlockScenario {
     /// exempts above the floor. 840 bodies are more than `L + 401·b + Q·b`
     /// allows. The window fills in about 340,000 steps. A node whose window
     /// let it keep 805 bodies would pass the bound near step 1,060,000, so
-    /// the run stops at 1,200,000.
+    /// the run stops at 1,500,000.
     pub fn stuck_floor() -> Self {
         BlockScenario {
             blocks: 840,
@@ -206,7 +208,7 @@ impl BlockScenario {
                 withheld: vec![3],
             }],
             max_reorder_lookahead_bytes: Some(4_000),
-            steps: Some(1_200_000),
+            steps: Some(1_500_000),
             ..BlockScenario::default()
         }
     }
@@ -309,7 +311,7 @@ impl HasView for Storage {
 impl Subsystem for Storage {
     const NAME: &'static str = "block-sync/storage";
     const GENERATOR: u32 = 2;
-    const SCENARIO_BYTES: usize = 1;
+    const SCENARIO_BYTES: usize = 2;
     type Scenario = BlockScenario;
     type Prepared = Ports;
 
@@ -475,18 +477,23 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The scenario the prefix's byte picks: 2 picks the stuck floor, any
-    /// other odd byte the overdraft, and any other even byte the default.
-    /// The stuck floor's run takes over a million steps, so fuzzing draws
-    /// it only on that one byte.
+    /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`] picks
+    /// the stuck floor; otherwise an odd first byte picks the short budget,
+    /// and an even one the default. The stuck floor's run takes over a
+    /// million steps, so fuzzing draws it on one prefix in 65,536.
     fn draw(prefix: &[u8]) -> BlockScenario {
-        match prefix.first().copied().unwrap_or(0) {
-            2 => BlockScenario::stuck_floor(),
-            byte if byte % 2 == 1 => BlockScenario::overdraft(),
+        match prefix {
+            [first, second, ..] if [*first, *second] == STUCK_FLOOR_TAG => {
+                BlockScenario::stuck_floor()
+            }
+            [first, ..] if first % 2 == 1 => BlockScenario::short_budget(),
             _ => BlockScenario::default(),
         }
     }
 }
+
+/// The scenario prefix that picks [`BlockScenario::stuck_floor`].
+pub const STUCK_FLOOR_TAG: [u8; 2] = [0xFF, 0x02];
 
 /// The resource properties read the owner model in the node's view.
 impl OwnerView for Rc<RefCell<BlockSyncView>> {

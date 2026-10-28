@@ -293,11 +293,14 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
+    // The stuck floor's witness test is ignored, since one debug run takes
+    // minutes. `cargo xtask planted` runs its committed input unpatched as a
+    // witness test that expects a hold, before it runs the patch.
     Coverage {
         property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound",
+            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
         ),
         bypass: Bypass::Planted("wide-commit-window"),
     },
@@ -305,7 +308,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::RESERVED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "the_overdraft_input_holds_reserved_byte_bound",
+            "the_short_budget_input_holds_reserved_byte_bound",
         ),
         bypass: Bypass::Planted("above-floor-charge"),
     },

@@ -1,7 +1,0 @@
-# The committed fuzz input `block-sync-overdraft.bin`: the harness that runs
-# it, the generator version it was built for, and its SHA-256. Its first
-# byte picks the overdraft scenario: four mirrors serve sixteen
-# bodies of unknown size against a byte budget of `1.5·B`.
-harness = "block-sync/storage"
-generator = 2
-sha256 = "f78aa2dd92722ad11a90646e4dcf863e4efc6de23cf08436e9db6a2701e7f3e4"

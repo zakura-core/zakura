@@ -1285,6 +1285,8 @@ pub enum BlockSyncFact {
         claims: Vec<BlockSyncClaim>,
         /// The ranges its serving session records.
         serving: Vec<BlockSyncRange>,
+        /// True for the routine's last snapshot, after it returned its work.
+        ended: bool,
     },
     /// The work queue's items.
     WorkQueue {

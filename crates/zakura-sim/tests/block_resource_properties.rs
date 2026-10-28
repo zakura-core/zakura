@@ -9,10 +9,11 @@
 mod support;
 
 use support::inputs;
+use zakura_scheduler::Status as SchedulerStatus;
 use zakura_sim::{
     domain::block_sync::{
-        BodyHolder, Limits, OpenRequest, OwnerInput, OwnerModel, BUDGET_LEDGERS_AGREE,
-        ESTIMATE_CEILING, RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND,
+        BodyHolder, Limits, OwnerInput, OwnerModel, BUDGET_LEDGERS_AGREE, ESTIMATE_CEILING,
+        RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND,
     },
     harness::{
         block_sync::{BlockScenario, MirrorSpec, Storage},
@@ -21,12 +22,12 @@ use zakura_sim::{
     },
     observe::{StorageBranch, WorkOwner, WorkScope},
     witness::{check_witness, Expect, WitnessScenario},
-    MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
 };
 
-/// The committed input that picks the overdraft scenario: one request
+/// The committed input that picks the short-budget scenario: one request
 /// leaves the byte budget short of the next.
-const OVERDRAFT_INPUT: &[u8] = include_bytes!("fixtures/block-sync-overdraft.bin");
+const SHORT_BUDGET_INPUT: &[u8] = include_bytes!("fixtures/block-sync-short-budget.bin");
 
 /// The committed input that picks the stuck-floor scenario: the commit
 /// window fills while height 3 never arrives.
@@ -52,12 +53,14 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
     }
 }
 
-/// The overdraft input holds the reserved bound after its budget runs
+/// The short-budget input holds the reserved bound after its budget runs
 /// short. With `above-floor-charge.patch`, above-floor requests charge
-/// past `M` too, and the same input violates it.
+/// past `M` too, and the same input violates it. With
+/// `handoff-keeps-charge.patch`, leaked charges pile up past `M + 2·B`
+/// once the run rests, and the same input violates it too.
 #[test]
-fn the_overdraft_input_holds_reserved_byte_bound() {
-    holds(committed(OVERDRAFT_INPUT), RESERVED_BYTE_BOUND);
+fn the_short_budget_input_holds_reserved_byte_bound() {
+    holds(committed(SHORT_BUDGET_INPUT), RESERVED_BYTE_BOUND);
 }
 
 /// The handoff input holds the ledgers at every quiescence boundary after
@@ -69,10 +72,11 @@ fn the_handoff_input_holds_budget_ledgers_agree() {
 }
 
 /// The stuck-floor scenario fills the commit window and holds the retained
-/// bound. The committed input runs 1,200,000 steps, which
+/// bound. The committed input runs 1,500,000 steps, which
 /// `wide-commit-window.patch` needs to retain 805 bodies. The window fills
 /// within 400,000, so this test stops there.
 #[test]
+#[ignore = "a debug run takes minutes; `cargo xtask planted` runs the committed input unpatched"]
 fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
     let mut witness = committed(STUCK_FLOOR_INPUT);
     assert_eq!(witness.scenario, BlockScenario::stuck_floor());
@@ -107,14 +111,18 @@ fn holds(witness: WitnessScenario<Storage>, property: &str) {
     check_witness(witness, property, Expect::Holds);
 }
 
-/// `id`'s outcome in `report`.
-fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
-    &report
+/// `id`'s report in `report`.
+fn property<'a>(report: &'a RunReport, id: &str) -> &'a PropertyReport {
+    report
         .properties
         .iter()
         .find(|property| property.property == id)
         .unwrap_or_else(|| panic!("{id} has no report"))
-        .outcome
+}
+
+/// `id`'s outcome in `report`.
+fn outcome<'a>(report: &'a RunReport, id: &str) -> &'a PropertyOutcome {
+    &property(report, id).outcome
 }
 
 /// Every pick and every observation of `report`, in order.
@@ -150,7 +158,7 @@ fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
     for (name, scenario) in [
         ("default", BlockScenario::default()),
         ("two mirrors", two_mirrors),
-        ("overdraft", BlockScenario::overdraft()),
+        ("short budget", BlockScenario::short_budget()),
     ] {
         let reports: Vec<_> = [&plans[0], &plans[0], &plans[1], &plans[0]]
             .into_iter()
@@ -164,6 +172,17 @@ fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
                     "{name}: {id}: {outcome:?}"
                 );
             }
+            let peaks = |id| &property(report, id).peaks;
+            assert!(
+                peaks(RESERVED_BYTE_BOUND)["reserved-estimate-bytes"] > 0,
+                "{name}: {:?}",
+                peaks(RESERVED_BYTE_BOUND)
+            );
+            assert!(
+                peaks(RETAINED_BYTE_BOUND)["retained-wire-bytes"] > 0,
+                "{name}: {:?}",
+                peaks(RETAINED_BYTE_BOUND)
+            );
         }
         let histories: Vec<_> = reports.iter().map(history).collect();
         assert!(histories[0] == histories[1], "{name}: plan A, then A");
@@ -178,12 +197,14 @@ fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
 /// `B`, the largest estimate.
 const B: u64 = ESTIMATE_CEILING;
 
-/// Limits with `M` = 10, `L` = 5, `Q` = 401 and bodies of at most 3 bytes.
+/// Limits with `M` = 10, `L` = 5, `Q` = 401, one body per request, and
+/// bodies of at most 3 bytes.
 fn small_limits() -> Limits {
     Limits {
         budget: 10,
         lookahead: 5,
         queue: 401,
+        per_request: 1,
         largest_body: 3,
     }
 }
@@ -206,7 +227,7 @@ fn owner(request_id: u64) -> WorkOwner {
     }
 }
 
-/// The reserved bound adds `B` per open handoff to `M + 2·B`, and the
+/// The reserved bound adds `B` per open handoff to `M + 2·k·B`, and the
 /// retained bound is `L + 401·b + Q·b`.
 #[test]
 fn the_bounds_add_up_their_allowances() {
@@ -214,6 +235,11 @@ fn the_bounds_add_up_their_allowances() {
     assert_eq!(limits.reserved_bound(0), 10 + 2 * B);
     assert_eq!(limits.reserved_bound(3), 10 + 5 * B);
     assert_eq!(limits.retained_bound(), 5 + (401 + 401) * 3);
+    let two_per_request = Limits {
+        per_request: 2,
+        ..limits
+    };
+    assert_eq!(two_per_request.reserved_bound(1), 10 + 5 * B);
 }
 
 /// A body counts once while the input queue, the reorder buffer or
@@ -295,10 +321,10 @@ fn budget_changes_chain_at_the_configured_maximum() {
     assert!(other_maximum.budget_gap().is_some());
 }
 
-/// A handoff stays open from its start to its matching end, and a routine's
-/// snapshot replaces its outstanding requests.
+/// A handoff stays open from its start to its matching end, and a routine
+/// stays live from its first snapshot to its last.
 #[test]
-fn handoffs_and_requests_follow_their_inputs() {
+fn handoffs_and_routines_follow_their_inputs() {
     let mut owners = OwnerModel::new(small_limits());
     owners.apply(OwnerInput::HandoffStarted {
         owner: owner(1),
@@ -314,17 +340,48 @@ fn handoffs_and_requests_follow_their_inputs() {
     assert!(owners.handoffs().is_empty());
     assert_eq!(owners.peaks().handoffs, 1);
 
-    let snapshot = |requests| OwnerInput::Requests {
+    let snapshot = |ended| OwnerInput::Routine {
         connection: 4,
         generation: 1,
-        requests,
+        ended,
     };
-    owners.apply(snapshot(vec![OpenRequest {
-        owner: owner(2),
-        heights: vec![(5, 100, true), (6, 200, false)],
-    }]));
-    assert_eq!(owners.outstanding_estimates(), 200);
-    owners.apply(snapshot(Vec::new()));
-    assert_eq!(owners.requests().count(), 0);
+    owners.apply(snapshot(false));
+    owners.apply(snapshot(false));
+    assert_eq!(owners.live_routines(), 1);
+    owners.apply(snapshot(true));
+    assert_eq!(owners.live_routines(), 0);
     assert_eq!(owners.holder_gap(), None);
+}
+
+/// D2's `h` counts open handoffs only while a step leaves a task ready, and
+/// at most one per live routine, so leaked handoffs can't widen the
+/// reserved bound.
+#[test]
+fn counted_handoffs_stop_at_live_routines_and_rest() {
+    let mut owners = OwnerModel::new(small_limits());
+    let routine = |generation, ended| OwnerInput::Routine {
+        connection: 4,
+        generation,
+        ended,
+    };
+    owners.apply(routine(1, false));
+    owners.apply(routine(2, false));
+    for request_id in 1..=3 {
+        owners.apply(OwnerInput::HandoffStarted {
+            owner: owner(request_id),
+            height: 5,
+            charge: 7,
+        });
+    }
+    assert_eq!(owners.counted_handoffs(SchedulerStatus::Running), 2);
+    assert_eq!(owners.counted_handoffs(SchedulerStatus::WorkerStarved), 2);
+    owners.apply(routine(2, true));
+    assert_eq!(owners.counted_handoffs(SchedulerStatus::Running), 1);
+    for status in [
+        SchedulerStatus::Quiescent,
+        SchedulerStatus::WaitingOnTime,
+        SchedulerStatus::WaitingOnExternal,
+    ] {
+        assert_eq!(owners.counted_handoffs(status), 0, "{status:?}");
+    }
 }

@@ -456,6 +456,7 @@ impl BlockTap {
                         completed: range.completed,
                     })
                     .collect(),
+                ended: snapshot.ended,
             },
             BlockEvent::WorkQueue(items) => BlockSyncFact::WorkQueue {
                 items: items

@@ -1,7 +1,7 @@
 //! Block sync's resource bounds (properties.md, Block sync and Resource
 //! allowances).
 //!
-//! [`OwnerModel`] is one owner model of block sync's requests, estimates,
+//! [`OwnerModel`] is one owner model of block sync's budget, handoffs,
 //! holders and releases. It folds [`OwnerInput`]s, the seam its evidence
 //! comes through, and never reads a production acceptance result. Today
 //! every input is an effect the block-sync observer reports and the tap
@@ -13,12 +13,21 @@
 //! - [`RETAINED_BYTE_BOUND`]: retained wire bytes stay within
 //!   `L + 401·b + Q·b`, after every step;
 //! - [`RESERVED_BYTE_BOUND`]: the byte budget stays within `M + 2·B + h·B`,
-//!   after every step, where `h` counts the charged handoffs open then
-//!   (D2 in the lane 3 plan);
-//! - [`BUDGET_LEDGERS_AGREE`]: at each post-step quiescence boundary, the
-//!   byte budget equals the work queue's reserved tally.
+//!   after every step, where `h` counts the charged handoffs open then, at
+//!   most one per live routine and none at rest (D2 in the lane 3 plan);
+//! - [`BUDGET_LEDGERS_AGREE`]: at each post-step quiescence boundary, no
+//!   handoff is open, and the byte budget equals the work queue's reserved
+//!   tally.
+//!
+//! D2's `2·B` assumes each request asks for one body
+//! (`BS_BLOCKS_PER_RESPONSE = 1`). [`Limits::reserved_bound`] allows one
+//! request's estimate, `advertised_max_blocks_per_response()·B`, per
+//! overdraft, so the bound stays sound if that constant grows.
+//!
+//! Each check records its quantities' peaks in the run's report, since
+//! properties.md asks the report for each allowance's largest value.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::{block::MAX_BLOCK_BYTES, parameters::checkpoint::constants};
 use zakura_network::zakura::ZakuraBlockSyncConfig;
@@ -61,6 +70,9 @@ pub struct Limits {
     /// `Q`, the sequencer input queue's depth in bodies:
     /// `submitted_apply_limit()`.
     pub queue: u64,
+    /// The most bodies one request asks for:
+    /// `advertised_max_blocks_per_response()`.
+    pub per_request: u64,
     /// The largest body the run can retain, in wire bytes. The routine keeps
     /// only a body that hashes to a header it requested, and every header
     /// the node holds comes from the fixture, so the fixture's largest body
@@ -76,23 +88,28 @@ impl Limits {
             budget: config.max_inflight_block_bytes,
             lookahead: config.effective_max_reorder_lookahead_bytes(),
             queue: u64::try_from(config.submitted_apply_limit()).unwrap_or(u64::MAX),
+            per_request: u64::from(config.advertised_max_blocks_per_response()),
             largest_body,
         }
     }
 
-    /// `M + 2·B + h·B`, the most the byte budget may count while `handoffs`
-    /// charged handoffs are open (properties.md, Reserved bytes).
+    /// `M + 2·k·B + h·B`, the most the byte budget may count while
+    /// `handoffs` charged handoffs are open, with `k` the most bodies one
+    /// request asks for (properties.md, Reserved bytes).
     ///
     /// Only a floor request may charge past `M`, and only one that starts at
     /// the download floor or the next height. Each height has one owner, so
-    /// at most two such charges are live, each at most `B`. While a routine
-    /// hands a body to the sequencer, both the sequencer and the budget
-    /// count it, and the sequencer can advance the floor, so another routine
-    /// can overdraft for the new floor's next height. Each open handoff adds
-    /// one more `B`.
+    /// at most two such charges are live, each at most one request's
+    /// estimate, `k·B`. D2 writes `2·B` because `k` is 1
+    /// (`BS_BLOCKS_PER_RESPONSE`). While a routine hands a body to the
+    /// sequencer, both the sequencer and the budget count it, and the
+    /// sequencer can advance the floor, so another routine can overdraft for
+    /// the new floor's next height. Each open handoff adds one more `B`.
     pub fn reserved_bound(&self, handoffs: u64) -> u64 {
+        let overdraft = self.per_request.saturating_mul(ESTIMATE_CEILING);
         self.budget
-            .saturating_add(handoffs.saturating_add(2).saturating_mul(ESTIMATE_CEILING))
+            .saturating_add(overdraft.saturating_mul(2))
+            .saturating_add(handoffs.saturating_mul(ESTIMATE_CEILING))
     }
 
     /// `L + 401·b + Q·b`, the most the sequencer may retain (properties.md,
@@ -144,25 +161,25 @@ impl BodyHolder {
 
 /// One input the owner model folds.
 ///
-/// Every input today comes from an effect the block-sync observer reports
-/// ([`OwnerInput::from_fact`]). Each routine's snapshot gives its
-/// outstanding requests, with each height's estimate and whether its body
-/// arrived. The stream-6 exchange model can feed [`OwnerInput::Requests`]
-/// from frame history instead, so a request counts once its `GET_BLOCKS`
-/// frame leaves and a height once its `BLOCK` frame arrives. The budget,
-/// handoff, holder and work-queue inputs are the node's own state, so they
-/// stay observer effects.
+/// Every input comes from an effect the block-sync observer reports
+/// ([`OwnerInput::from_fact`]). They are the node's own state, so no frame
+/// history can stand in for them.
+///
+/// The model doesn't fold the routines' outstanding requests. Their
+/// estimates don't reconcile with the budget at rest: in BS5's late-body
+/// case, the budget and the work queue count 2,000 bytes that no routine
+/// snapshot lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerInput {
     /// The routine for connection `connection`, generation `generation`,
-    /// has `requests` outstanding, and no others.
-    Requests {
+    /// reported a snapshot.
+    Routine {
         /// The routine's connection.
         connection: u64,
         /// The routine's generation.
         generation: u64,
-        /// Its outstanding requests.
-        requests: Vec<OpenRequest>,
+        /// True for its last snapshot, after it returned its work.
+        ended: bool,
     },
     /// The byte budget's counter went from `before` to `after`.
     BudgetChanged {
@@ -220,22 +237,12 @@ impl OwnerInput {
             BlockSyncFact::Routine {
                 connection,
                 generation,
-                requests,
+                ended,
                 ..
-            } => OwnerInput::Requests {
+            } => OwnerInput::Routine {
                 connection: *connection,
                 generation: *generation,
-                requests: requests
-                    .iter()
-                    .map(|request| OpenRequest {
-                        owner: request.owner.clone(),
-                        heights: request
-                            .heights
-                            .iter()
-                            .map(|height| (height.height, height.estimated_bytes, height.received))
-                            .collect(),
-                    })
-                    .collect(),
+                ended: *ended,
             },
             BlockSyncFact::Budget {
                 before,
@@ -297,16 +304,6 @@ impl OwnerInput {
     }
 }
 
-/// An outstanding request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenRequest {
-    /// The request.
-    pub owner: WorkOwner,
-    /// Each height with the estimate the request reserved for it, and
-    /// whether its body arrived.
-    pub heights: Vec<(u32, u64, bool)>,
-}
-
 /// A body a routine is handing to the sequencer while its request still
 /// charges the budget: one unit of D2's `h`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,8 +324,9 @@ pub struct OwnerModel {
     pub limits: Limits,
     /// The byte budget's counter.
     reserved: u64,
-    /// Each routine's outstanding requests, by connection and generation.
-    requests: BTreeMap<(u64, u64), Vec<OpenRequest>>,
+    /// The routines that reported a snapshot and haven't ended, by
+    /// connection and generation.
+    live: BTreeSet<(u64, u64)>,
     /// Each open handoff, oldest first.
     handoffs: Vec<OpenHandoff>,
     /// Each body holder, with its body's height and wire bytes.
@@ -337,6 +335,8 @@ pub struct OwnerModel {
     allocations: BTreeMap<u64, (u32, u64)>,
     /// The wire bytes of every retained allocation.
     retained: u64,
+    /// The wire bytes of the bodies in the sequencer's input queue.
+    queued: u64,
     /// The work queue's reserved tally, from its latest snapshot.
     queue_reserved: u64,
     /// The largest value of each quantity, for the run's report.
@@ -356,6 +356,9 @@ pub struct Peaks {
     pub handoffs: u64,
     /// The most retained wire bytes.
     pub retained: u64,
+    /// The most wire bytes in the sequencer's input queue, the `Q·b`
+    /// allowance's quantity.
+    pub queued: u64,
 }
 
 impl OwnerModel {
@@ -377,15 +380,15 @@ impl OwnerModel {
     /// Folds `input`.
     pub fn apply(&mut self, input: OwnerInput) {
         match input {
-            OwnerInput::Requests {
+            OwnerInput::Routine {
                 connection,
                 generation,
-                requests,
+                ended,
             } => {
-                if requests.is_empty() {
-                    self.requests.remove(&(connection, generation));
+                if ended {
+                    self.live.remove(&(connection, generation));
                 } else {
-                    self.requests.insert((connection, generation), requests);
+                    self.live.insert((connection, generation));
                 }
             }
             OwnerInput::BudgetChanged {
@@ -464,11 +467,18 @@ impl OwnerModel {
                     entry.0 += 1;
                     self.peaks.retained = self.peaks.retained.max(self.retained);
                 }
+                if let BodyHolder::Queued(_) = holder {
+                    self.queued = self.queued.saturating_add(bytes);
+                    self.peaks.queued = self.peaks.queued.max(self.queued);
+                }
             }
             OwnerInput::Released { holder } => {
-                if self.holders.remove(&holder).is_none() {
+                let Some((_, bytes)) = self.holders.remove(&holder) else {
                     self.note_holder_gap(format!("{holder:?} released a body it never took"));
                     return;
+                };
+                if let BodyHolder::Queued(_) = holder {
+                    self.queued = self.queued.saturating_sub(bytes);
                 }
                 if let Some(allocation) = holder.retained_allocation() {
                     if let Some(entry) = self.allocations.get_mut(&allocation) {
@@ -499,9 +509,27 @@ impl OwnerModel {
         self.reserved
     }
 
-    /// The open handoffs, D2's `h`.
+    /// The open handoffs.
     pub fn handoffs(&self) -> &[OpenHandoff] {
         &self.handoffs
+    }
+
+    /// The routines that reported a snapshot and haven't ended. A routine
+    /// reports one at the top of each loop, so one in a handoff has.
+    pub fn live_routines(&self) -> u64 {
+        u64::try_from(self.live.len()).unwrap_or(u64::MAX)
+    }
+
+    /// D2's `h` after a step that left the scheduler at `status`: the open
+    /// handoffs, at most one per live routine, since a routine hands one
+    /// body at a time; none at rest, since a handoff never parks.
+    pub fn counted_handoffs(&self, status: SchedulerStatus) -> u64 {
+        if at_rest(status) {
+            return 0;
+        }
+        u64::try_from(self.handoffs.len())
+            .unwrap_or(u64::MAX)
+            .min(self.live_routines())
     }
 
     /// The wire bytes the sequencer retains: each body held by its input
@@ -513,21 +541,6 @@ impl OwnerModel {
     /// The work queue's reserved tally, from its latest snapshot.
     pub fn queue_reserved(&self) -> u64 {
         self.queue_reserved
-    }
-
-    /// Each outstanding request, by its routine's latest snapshot.
-    pub fn requests(&self) -> impl Iterator<Item = &OpenRequest> {
-        self.requests.values().flatten()
-    }
-
-    /// The estimates outstanding requests reserved for heights whose bodies
-    /// haven't arrived.
-    pub fn outstanding_estimates(&self) -> u64 {
-        self.requests()
-            .flat_map(|request| &request.heights)
-            .filter(|(_, _, received)| !received)
-            .map(|(_, estimate, _)| estimate)
-            .sum()
     }
 
     /// The largest value each bound's quantity reached.
@@ -587,7 +600,8 @@ where
         },
         Property {
             id: PropertyId::new(BUDGET_LEDGERS_AGREE),
-            claim: "at quiescence, the byte budget equals the work queue's reserved tally",
+            claim: "at rest, no handoff is open, and the byte budget equals the work queue's \
+                    reserved tally",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View, Source::Schedule],
@@ -598,15 +612,28 @@ where
     ]
 }
 
+/// True if no task can run after a step that left the scheduler at
+/// `status`: every task finished or waits on time or an external source.
+/// A worker-starved run still has a ready task, so it isn't at rest.
+fn at_rest(status: SchedulerStatus) -> bool {
+    matches!(
+        status,
+        SchedulerStatus::Quiescent
+            | SchedulerStatus::WaitingOnTime
+            | SchedulerStatus::WaitingOnExternal
+    )
+}
+
 /// Checks [`RETAINED_BYTE_BOUND`] after a step.
 fn check_retained<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {
-    let (retained, bound, gap) = cx.view().read_owners(|owners| {
+    let (retained, bound, peaks, gap) = cx.view().read_owners(|owners| {
         (
             owners.retained(),
             owners.limits.retained_bound(),
+            owners.peaks(),
             owners.holder_gap().map(str::to_owned),
         )
     });
@@ -614,6 +641,8 @@ where
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
+    cx.peak("retained-wire-bytes", peaks.retained);
+    cx.peak("input-queue-wire-bytes", peaks.queued);
     if retained <= bound {
         return Verdict::Holds;
     }
@@ -623,50 +652,64 @@ where
     )
 }
 
-/// Checks [`RESERVED_BYTE_BOUND`] after a step, with `h` the charged
-/// handoffs open then.
+/// Checks [`RESERVED_BYTE_BOUND`] after a step, with `h` from
+/// [`OwnerModel::counted_handoffs`]. A handoff that never ends, such as a
+/// leaked charge, counts only while its routine could still be in it.
 fn check_reserved<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {
-    let (reserved, handoffs, limits, gap) = cx.view().read_owners(|owners| {
+    let status = cx.status;
+    let (reserved, handoffs, open, peaks, limits, gap) = cx.view().read_owners(|owners| {
         let gap = owners
             .budget_gap()
             .or_else(|| owners.holder_gap())
             .map(str::to_owned);
-        let handoffs = u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX);
-        (owners.reserved(), handoffs, owners.limits, gap)
+        (
+            owners.reserved(),
+            owners.counted_handoffs(status),
+            owners.handoffs().len(),
+            owners.peaks(),
+            owners.limits,
+            gap,
+        )
     });
     if let Some(gap) = gap {
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
+    cx.peak("reserved-estimate-bytes", peaks.reserved);
+    cx.peak(
+        "past-budget-estimate-bytes",
+        peaks.reserved.saturating_sub(limits.budget),
+    );
+    cx.peak("open-handoffs", peaks.handoffs);
     let bound = limits.reserved_bound(handoffs);
     if reserved <= bound {
         return Verdict::Holds;
     }
     cx.violated(
         format!(
-            "the byte budget counts at most M + 2·B + h·B = {bound} bytes, with M = {} and \
-             h = {handoffs}",
-            limits.budget
+            "the byte budget counts at most M + 2·k·B + h·B = {bound} bytes, with M = {}, \
+             k = {} and h = {handoffs}",
+            limits.budget, limits.per_request
         ),
-        format!("it counts {reserved}"),
+        format!("it counts {reserved}, with {open} handoffs open"),
     )
 }
 
-/// Checks [`BUDGET_LEDGERS_AGREE`] at a step after which no task can run.
+/// Checks [`BUDGET_LEDGERS_AGREE`] after a step that left the run at rest.
 ///
 /// Every path that releases a request's charge updates the work queue and
 /// the budget with no `await` between them. A routine hands a body to the
 /// sequencer through a send permit it reserved, so no routine parks
-/// between a handoff's start and its release either. At quiescence the
-/// budget therefore equals the work queue's tally, with no handoff open.
+/// between a handoff's start and its release either. At rest, no handoff
+/// is open and the budget equals the work queue's tally.
 fn check_ledgers<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
 {
-    if cx.status == SchedulerStatus::Running {
+    if !at_rest(cx.status) {
         return Verdict::NotApplicable;
     }
     let (reserved, queued, handoffs, gap) = cx.view().read_owners(|owners| {
@@ -685,12 +728,18 @@ where
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
+    if handoffs > 0 {
+        return cx.violated(
+            "no handoff is open at rest",
+            format!("{handoffs} handoffs are open, and the budget counts {reserved}"),
+        );
+    }
     if reserved == queued {
         return Verdict::Holds;
     }
     cx.violated(
         format!("the byte budget equals the work queue's tally, {queued}"),
-        format!("the budget counts {reserved}, with {handoffs} handoffs open"),
+        format!("the budget counts {reserved}"),
     )
 }
 
@@ -702,11 +751,12 @@ fn block_sync_facts(log: &ObservationLog) -> impl Iterator<Item = &BlockSyncFact
     })
 }
 
-/// [`RETAINED_BYTE_BOUND`]'s trigger history: the commit window filled. A
-/// sequencer snapshot held a body at every window height but the missing
-/// one above the verified tip, `COMMIT_WINDOW_BLOCKS - 1` bodies in its
-/// reorder buffer and `applying`, so every further body had to pass the
-/// look-ahead gate.
+/// [`RETAINED_BYTE_BOUND`]'s trigger history: the commit window could be
+/// full. A sequencer snapshot held at least `COMMIT_WINDOW_BLOCKS - 1`
+/// bodies in its reorder buffer and `applying`, as many as the window holds
+/// while the height above the verified tip is missing. The count includes
+/// bodies above the window, so it doesn't show that every window height
+/// holds a body.
 fn commit_window_filled(log: &ObservationLog) -> bool {
     block_sync_facts(log).any(|fact| match fact {
         BlockSyncFact::Sequencer {

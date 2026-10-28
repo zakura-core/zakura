@@ -550,9 +550,9 @@ impl PeerRoutine {
     }
 
     /// Reports the routine's owner state and the work queue's items, if an
-    /// observer is installed.
+    /// observer is installed. `ended` marks the routine's last snapshot.
     #[cfg(any(test, zakura_sim))]
-    fn observe_owners(&self) {
+    fn observe_owners(&self, ended: bool) {
         use super::block_sync_observe::{BlockEvent, RegistryClaim, RoutineSnapshot};
         observe!(
             self.observer,
@@ -572,6 +572,7 @@ impl PeerRoutine {
                     })
                     .collect(),
                 serving: self.serving.admitted_ranges(),
+                ended,
             })
         );
         self.work.observe_items();
@@ -632,7 +633,7 @@ impl PeerRoutine {
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             #[cfg(any(test, zakura_sim))]
-            self.observe_owners();
+            self.observe_owners(false);
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
@@ -1637,11 +1638,14 @@ impl PeerRoutine {
             // Only a request that starts at the download floor or the next
             // height gets here. The WorkQueue owns each height once, so at
             // most two such overdrafts are live, each past the max by at most
-            // `B` (`MAX_BLOCK_BYTES`). A routine handing a body to the
-            // sequencer still holds its charge, and the floor can advance
-            // meanwhile, so each open handoff adds at most one more `B`: the
-            // budget stays within `M + 2·B + h·B`. The normal reservation
-            // paths release the charge: receipt, timeout, watchdog, or reset.
+            // one request's estimate. A request asks for one body
+            // (`BS_BLOCKS_PER_RESPONSE`), so that is `B` (`MAX_BLOCK_BYTES`);
+            // more bodies per request would scale it. A routine handing a
+            // body to the sequencer still holds its charge, and the floor can
+            // advance meanwhile, so each open handoff adds at most one more
+            // `B`: the budget stays within `M + 2·B + h·B`. The normal
+            // reservation paths release the charge: receipt, timeout,
+            // watchdog, or reset.
             self.budget.charge(reserved_bytes);
             metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
             return true;
@@ -2841,7 +2845,7 @@ impl Drop for PeerRoutine {
         self.return_unreceived_requests("peer_routine_drop");
         // The routine's last snapshot, after it returned its work.
         #[cfg(any(test, zakura_sim))]
-        self.observe_owners();
+        self.observe_owners(true);
     }
 }
 

@@ -1,6 +1,10 @@
 //! The registry and its checker.
 
-use std::{collections::BTreeSet, fmt, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    rc::Rc,
+};
 
 use zakura_scheduler::{Op, SimInstant};
 
@@ -292,6 +296,8 @@ struct PropertyState {
     ever_held: bool,
     /// The first reason the run can't finish the check.
     inconclusive: Option<Inconclusive>,
+    /// Each quantity's largest value, as the check measured it.
+    peaks: BTreeMap<String, u64>,
 }
 
 /// An open obligation.
@@ -442,6 +448,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 outcome: outcome(property, state),
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
+                peaks: state.peaks.clone(),
                 violations: state.violations.clone(),
             })
             .collect()
@@ -540,6 +547,10 @@ fn step_property<S: HasView>(
         Verdict::Violated(v) => violations.push(v),
     }
     violations.extend(parts.recorded);
+    for (quantity, value) in parts.peaks {
+        let peak = state.peaks.entry(quantity.to_owned()).or_default();
+        *peak = (*peak).max(value);
+    }
     events.extend(parts.labelled.into_iter().map(|frame| CheckEvent::Label {
         property: property.id.clone(),
         frame,

@@ -281,6 +281,9 @@ pub struct RoutineSnapshot {
     pub claims: Vec<RegistryClaim>,
     /// The ranges the routine's serving session records.
     pub serving: Vec<AdmittedRange>,
+    /// True for the routine's last snapshot, which its drop reports after it
+    /// returned its work.
+    pub ended: bool,
 }
 
 /// One unreceived height a routine published to the peer registry.

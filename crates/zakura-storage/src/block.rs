@@ -83,6 +83,10 @@
 //!   its loop or in its select, never while it awaits a query or record
 //!   ([`Stage::needs_free_driver`]). A verdict commits and replies at
 //!   once, so this leaves out a commit that lands while the driver awaits.
+//!   The driver also admits in its `SubmitBlock` arm, right after it
+//!   queues the body. The run admits lazily instead: a queued submission
+//!   waits until the run picks `admit`, which only delays admissions the
+//!   driver makes at once.
 //! * The driver admits queued submissions in arrival order, skipping one
 //!   whose class is at its limit ([`Gate::AdmitNext`]). The limits are
 //!   [`ApplyLimits`].

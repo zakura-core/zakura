@@ -575,6 +575,35 @@ fn a_repeated_body_admits_its_work_once() {
     }
 }
 
+/// A well-formed body while the node has no range open is unsolicited: the
+/// relay labels it `Unsolicited`, the node's stream reader refuses its
+/// header and closes the probe's connection, and the close discharges
+/// `block/unsolicited-closes`.
+#[test]
+fn a_well_formed_unsolicited_body_reaches_unsolicited_closes() {
+    for report in runs(&probe(vec![ProbeFrame::Block { height: 1 }]), 4) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            held(&report, &id("block/unsolicited-closes")),
+            "{:?}",
+            report.properties
+        );
+        let labels: Vec<Label> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::PeerFrame { row, label, .. } if row.as_deref() == Some("block") => {
+                    Some(*label)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, [Label::Unsolicited]);
+        assert_eq!(causes(&report), ["ordered_read_rejected"]);
+    }
+}
+
 /// A verifier verdict against a mirror's body makes the node report the
 /// mirror, which no relay label justifies. The adapter writes no
 /// punishment for that mirror, so the run holds every ID.

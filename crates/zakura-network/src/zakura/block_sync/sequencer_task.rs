@@ -1206,7 +1206,7 @@ impl SequencerTask {
                 self.submission_retry_attempt = 0;
             }
             self.sequencer
-                .record_submitted_apply(item.height, item.hash);
+                .record_submitted_apply(item.height, item.hash, item.decoded_bytes);
             self.trace_body_submitted(item.height, item.token);
         }
     }

@@ -5503,12 +5503,41 @@ impl CappedSequencerTask {
         }
     }
 
-    /// Queue `block` at `height` for `owner`, charged `wire_bytes`.
+    /// Queue `block` at `height` for `owner`, decoded and charged `wire_bytes`.
     async fn send_body(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: u32,
         block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        self.send_buffered_body(owner, height, block, body, wire_bytes)
+            .await;
+    }
+
+    /// Queue `block` at `height` for `owner` as raw bytes, charged `wire_bytes`.
+    async fn send_raw_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        let body = BufferedBlockBody::RawFramePayload(raw_block_payload(block));
+        self.send_buffered_body(owner, height, block, body, wire_bytes)
+            .await;
+    }
+
+    /// Queue `body`, which holds `block`, at `height` for `owner`, charged
+    /// `wire_bytes`.
+    async fn send_buffered_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        body: BufferedBlockBody,
         wire_bytes: u64,
     ) {
         self.body_tx
@@ -5518,10 +5547,7 @@ impl CappedSequencerTask {
                 block::Height(height),
                 block.hash(),
                 block.header.previous_block_hash,
-                BufferedBlockBody::from_decoded_block(
-                    block.clone(),
-                    Some(raw_block_payload(block)),
-                ),
+                body,
                 wire_bytes,
                 None,
                 peer(1),
@@ -5709,6 +5735,57 @@ async fn decoded_cap_resubmits_failed_parent_beside_its_detached_successor() {
         u64::from(block_size(&blocks[0])),
     )
     .await;
+    task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_charges_a_retried_raw_parent_its_measured_size() {
+    let blocks = fake_sequential_blocks(2);
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let wire_2 = u64::from(block_size(&blocks[1]));
+    assert!(
+        blocks[1].attributed_memory_size_bytes() <= wire_2 * DESERIALIZED_MEM_FACTOR,
+        "height 2's estimate covers its decoded size"
+    );
+    // Height 2 arrives first and stays raw, so height 1 releases both. The cap
+    // fits height 1 decoded plus height 2's estimate.
+    let max_decoded_bytes = decoded_1 + wire_2 * DESERIALIZED_MEM_FACTOR;
+    let mut task = CappedSequencerTask::spawn(max_decoded_bytes);
+    for height in [2, 1] {
+        let block = &blocks[height as usize - 1];
+        task.send_body(
+            test_work_owner(),
+            height,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+
+    // Height 1 times out. Height 2 is detached and keeps its charge, as a
+    // successor waiting in state for its parent would, and never completes.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::TimedOut,
+        Some(test_work_owner()),
+    );
+    // The retried parent arrives raw, and its raw estimate exceeds the room
+    // its detached successor leaves. Its first attempt measured its decoded
+    // size, which fits into the charge that attempt returned.
+    let retried_wire_bytes = 1_000_000;
+    assert!(
+        retried_wire_bytes * DESERIALIZED_MEM_FACTOR
+            > max_decoded_bytes - blocks[1].attributed_memory_size_bytes(),
+        "the raw estimate exceeds the room beside height 2"
+    );
+    task.send_raw_body(test_work_owner(), 1, &blocks[0], retried_wire_bytes)
+        .await;
     task.expect_submission(1).await;
     task.task.abort();
 }
@@ -6040,7 +6117,7 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert!(seq.submittable_heights().is_empty());
 
@@ -6071,7 +6148,7 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
     seq.remove_applying(item.height);
@@ -6102,7 +6179,7 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash);
+    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
     assert!(seq.submitted_contains(block::Height(1)));
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6241,7 +6318,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         .into_iter()
         .map(|height| {
             let item = seq.prepare_submit(height).expect("height is applying");
-            seq.record_submitted_apply(item.height, item.hash);
+            seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
             item
         })
         .collect();

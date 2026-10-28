@@ -70,6 +70,22 @@ pub(super) struct SubmitItem {
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
     pub(super) block: Arc<block::Block>,
+    /// The decoded block's attributed size, measured at submission.
+    pub(super) decoded_bytes: u64,
+}
+
+/// One body hash submitted at a height.
+#[derive(Copy, Clone, Debug)]
+struct SubmittedApply {
+    hash: block::Hash,
+    /// Submissions of this hash still in flight. Only these suppress a
+    /// duplicate. Finishing a submission, or a failure that makes the height
+    /// re-requestable, lowers it, and the entry stays for `decoded_bytes`.
+    in_flight: usize,
+    /// The decoded size its last submission measured. A raw copy of the same
+    /// body is charged this instead of its raw estimate, so a retried parent
+    /// fits into the charge its failed attempt returned.
+    decoded_bytes: u64,
 }
 
 /// Accounting identity for a decoded body handed to the driver.
@@ -139,7 +155,7 @@ pub(super) struct AdvanceOutcome {
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
     applying: BTreeMap<block::Height, ApplyingBlock>,
-    submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
+    submitted_applies: BTreeMap<block::Height, Vec<SubmittedApply>>,
     in_flight_submissions: BTreeMap<BlockApplyToken, InFlightSubmission>,
     next_apply_token: Option<BlockApplyToken>,
 
@@ -249,7 +265,9 @@ impl Sequencer {
 
     #[cfg(test)]
     pub(super) fn submitted_contains(&self, height: block::Height) -> bool {
-        self.submitted_applies.contains_key(&height)
+        self.submitted_applies
+            .get(&height)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.in_flight > 0))
     }
 
     pub(super) fn reorder_len(&self) -> usize {
@@ -403,9 +421,21 @@ impl Sequencer {
     }
 
     pub(super) fn has_submitted_apply(&self, height: block::Height, hash: block::Hash) -> bool {
+        self.submitted_applies.get(&height).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.hash == hash && entry.in_flight > 0)
+        })
+    }
+
+    /// The decoded size measured at the last submission of `hash` at
+    /// `height`, if the sequencer still keeps it.
+    fn measured_decoded_bytes(&self, height: block::Height, hash: block::Hash) -> Option<u64> {
         self.submitted_applies
-            .get(&height)
-            .is_some_and(|entries| entries.iter().any(|(entry_hash, _)| *entry_hash == hash))
+            .get(&height)?
+            .iter()
+            .find(|entry| entry.hash == hash)
+            .map(|entry| entry.decoded_bytes)
     }
 
     /// Whether any reorder/applying/submitted body sits at or above `height`,
@@ -414,7 +444,10 @@ impl Sequencer {
     pub(super) fn has_buffered_at_or_above(&self, height: block::Height) -> bool {
         self.reorder.contains_at_or_above(height)
             || self.applying.range(height..).next().is_some()
-            || self.submitted_applies.range(height..).next().is_some()
+            || self
+                .submitted_applies
+                .range(height..)
+                .any(|(_, entries)| entries.iter().any(|entry| entry.in_flight > 0))
     }
 
     /// `previous_block_hash` of a held `applying` body, for deciding whether a
@@ -443,9 +476,13 @@ impl Sequencer {
         height: block::Height,
         hash: block::Hash,
     ) -> bool {
-        self.submitted_applies
-            .get(&height)
-            .is_some_and(|entries| entries.iter().all(|(entry_hash, _)| *entry_hash != hash))
+        self.submitted_applies.get(&height).is_some_and(|entries| {
+            let mut in_flight = entries
+                .iter()
+                .filter(|entry| entry.in_flight > 0)
+                .peekable();
+            in_flight.peek().is_some() && in_flight.all(|entry| entry.hash != hash)
+        })
     }
 
     // ---- body acceptance ----
@@ -629,8 +666,8 @@ impl Sequencer {
             ) {
                 break;
             }
-            resident_decoded_bytes =
-                resident_decoded_bytes.saturating_add(Self::submission_decode_charge(applying));
+            resident_decoded_bytes = resident_decoded_bytes
+                .saturating_add(self.submission_decode_charge(*height, applying));
             in_flight_submissions = in_flight_submissions.saturating_add(1);
             heights.push(*height);
         }
@@ -677,17 +714,19 @@ impl Sequencer {
             || self.decoded_window_admits(
                 height,
                 resident_decoded_bytes,
-                Self::submission_decode_charge(applying),
+                self.submission_decode_charge(height, applying),
             )
     }
 
-    /// Decoded bytes that submitting `applying` adds: none when it is already
-    /// decoded, otherwise the raw-body estimate.
-    fn submission_decode_charge(applying: &ApplyingBlock) -> u64 {
+    /// Decoded bytes that submitting `applying` at `height` adds: none when it
+    /// is already decoded, otherwise the size an earlier submission of the same
+    /// body measured, or else the raw-body estimate.
+    fn submission_decode_charge(&self, height: block::Height, applying: &ApplyingBlock) -> u64 {
         if applying.body.is_decoded() {
             0
         } else {
-            applying.bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
+            self.measured_decoded_bytes(height, applying.hash)
+                .unwrap_or_else(|| applying.bytes.saturating_mul(DESERIALIZED_MEM_FACTOR))
         }
     }
 
@@ -758,6 +797,7 @@ impl Sequencer {
             hash,
             token,
             block,
+            decoded_bytes: decoded_attributed_memory_size_bytes,
         })
     }
 
@@ -802,34 +842,34 @@ impl Sequencer {
         Some(token)
     }
 
-    pub(super) fn record_submitted_apply(&mut self, height: block::Height, hash: block::Hash) {
+    /// Record a dispatched submission of `hash` at `height`, which measured
+    /// `decoded_bytes`.
+    pub(super) fn record_submitted_apply(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        decoded_bytes: u64,
+    ) {
         let entries = self.submitted_applies.entry(height).or_default();
-        if let Some((_, count)) = entries
-            .iter_mut()
-            .find(|(entry_hash, _)| *entry_hash == hash)
-        {
-            *count = count.saturating_add(1);
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.hash == hash) {
+            entry.in_flight = entry.in_flight.saturating_add(1);
+            entry.decoded_bytes = decoded_bytes;
         } else {
-            entries.push((hash, 1));
+            entries.push(SubmittedApply {
+                hash,
+                in_flight: 1,
+                decoded_bytes,
+            });
         }
     }
 
     fn decrement_submitted_apply(&mut self, height: block::Height, hash: block::Hash) {
-        let Some(entries) = self.submitted_applies.get_mut(&height) else {
-            return;
-        };
-        if let Some(index) = entries
-            .iter()
-            .position(|(entry_hash, _)| *entry_hash == hash)
+        if let Some(entry) = self
+            .submitted_applies
+            .get_mut(&height)
+            .and_then(|entries| entries.iter_mut().find(|entry| entry.hash == hash))
         {
-            let (_, count) = &mut entries[index];
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                entries.remove(index);
-            }
-        }
-        if entries.is_empty() {
-            self.submitted_applies.remove(&height);
+            entry.in_flight = entry.in_flight.saturating_sub(1);
         }
     }
 
@@ -953,14 +993,15 @@ impl Sequencer {
         }
     }
 
+    /// Stop suppressing duplicates at or above `from`, so those heights are
+    /// re-requestable. Each entry keeps its measured decoded size.
     fn clear_submitted_applies_from(&mut self, from: block::Height) {
-        let heights: Vec<_> = self
+        for entry in self
             .submitted_applies
-            .range(from..)
-            .map(|(height, _)| *height)
-            .collect();
-        for height in heights {
-            self.submitted_applies.remove(&height);
+            .range_mut(from..)
+            .flat_map(|(_, entries)| entries.iter_mut())
+        {
+            entry.in_flight = 0;
         }
     }
 

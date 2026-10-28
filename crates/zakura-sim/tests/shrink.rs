@@ -7,7 +7,10 @@ use std::{
     cell::Cell,
     path::Path,
     process::Command,
-    sync::{atomic::AtomicBool, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -215,12 +218,12 @@ impl ActionSource for Owners {
 }
 
 /// True if this step's observations hold the owner event `event`.
-fn observed(cx: &CheckCtx<'_, StaleOwner>, event: &str) -> bool {
+fn observed<S: Subsystem>(cx: &CheckCtx<'_, S>, event: &str) -> bool {
     cx.observations().any(|obs| obs == &owner_event(event))
 }
 
 /// [`STALE_INERT`]'s check: violated when a late completion is applied.
-fn stale_inert(cx: &mut CheckCtx<'_, StaleOwner>) -> Verdict {
+fn stale_inert<S: Subsystem>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     if observed(cx, LATE) {
         cx.violated("a stale owner's completion is inert", LATE)
     } else {
@@ -229,7 +232,7 @@ fn stale_inert(cx: &mut CheckCtx<'_, StaleOwner>) -> Verdict {
 }
 
 /// [`NO_ORPHAN`]'s check: violated by a completion during a reset.
-fn no_orphan(cx: &mut CheckCtx<'_, StaleOwner>) -> Verdict {
+fn no_orphan<S: Subsystem>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     if observed(cx, ORPHAN) {
         cx.violated("no completion lands during a reset", ORPHAN)
     } else {
@@ -264,11 +267,33 @@ const STALE: HarnessEntry = entry::<StaleOwner>();
 
 no_view!(StaleOwner);
 
-thread_local! {
-    /// Builds left before [`StaleOwner`] sets [`INTERRUPT`], if armed.
-    static BUILDS_BEFORE_INTERRUPT: Cell<Option<u32>> = const { Cell::new(None) };
-    /// The interrupt flag `interrupt_keeps_best` hands the shrinker.
-    static INTERRUPT: AtomicBool = const { AtomicBool::new(false) };
+/// The bug's property and the orphan property, for either stale-owner
+/// harness.
+fn stale_properties<S: Subsystem>() -> Vec<Property<S>> {
+    let property = |id, claim, check: fn(&mut CheckCtx<'_, S>) -> Verdict, witness| Property {
+        id,
+        claim,
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[],
+        status: Status::Active,
+        check,
+        witness: Some(witness),
+    };
+    vec![
+        property(
+            STALE_INERT,
+            "a stale owner's completion is inert",
+            stale_inert,
+            reset_replace_late,
+        ),
+        property(
+            NO_ORPHAN,
+            "no completion lands during a reset",
+            no_orphan,
+            any_run,
+        ),
+    ]
 }
 
 impl Subsystem for StaleOwner {
@@ -286,47 +311,71 @@ impl Subsystem for StaleOwner {
     /// Nothing to set up.
     fn prepare(_: &Fixed) {}
 
-    /// Adds the actions, and sets [`INTERRUPT`] once the armed count of
-    /// builds runs out.
+    /// Adds the actions.
     fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
-        BUILDS_BEFORE_INTERRUPT.with(|left| match left.get() {
-            Some(0) => {
-                INTERRUPT.with(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed))
-            }
-            Some(n) => left.set(Some(n - 1)),
-            None => {}
-        });
         sim.add_source(Box::new(Owners::default()));
         StaleOwner
     }
 
     /// The bug's property and the orphan property.
     fn properties() -> Vec<Property<Self>> {
-        let property =
-            |id, claim, check: fn(&mut CheckCtx<'_, Self>) -> Verdict, witness| Property {
-                id,
-                claim,
-                kind: Kind::Safety,
-                assumes: &[],
-                needs: &[],
-                status: Status::Active,
-                check,
-                witness: Some(witness),
-            };
-        vec![
-            property(
-                STALE_INERT,
-                "a stale owner's completion is inert",
-                stale_inert,
-                reset_replace_late,
-            ),
-            property(
-                NO_ORPHAN,
-                "no completion lands during a reset",
-                no_orphan,
-                any_run,
-            ),
-        ]
+        stale_properties()
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// [`StaleOwner`] that sets [`INTERRUPT`] once [`BUILDS_BEFORE_INTERRUPT`]
+/// runs out. The shrinker runs each candidate on a new thread, so the count
+/// is process-wide, and only `interrupt_keeps_best` builds this harness.
+struct InterruptingStaleOwner;
+
+/// [`InterruptingStaleOwner`]'s registry entry.
+const INTERRUPTING: HarnessEntry = entry::<InterruptingStaleOwner>();
+
+/// Builds of [`InterruptingStaleOwner`] left before it sets [`INTERRUPT`].
+static BUILDS_BEFORE_INTERRUPT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The interrupt flag `interrupt_keeps_best` hands the shrinker.
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+no_view!(InterruptingStaleOwner);
+
+impl Subsystem for InterruptingStaleOwner {
+    const NAME: &'static str = "test/interrupting-stale-owner";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// [`StaleOwner`]'s limits.
+    fn config(scenario: &Fixed) -> RunConfig {
+        StaleOwner::config(scenario)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Fixed) {}
+
+    /// Adds [`StaleOwner`]'s actions, and sets [`INTERRUPT`] once the
+    /// count of builds runs out.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        let counted =
+            BUILDS_BEFORE_INTERRUPT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        if counted.is_err() {
+            INTERRUPT.store(true, Ordering::SeqCst);
+        }
+        sim.add_source(Box::new(Owners::default()));
+        InterruptingStaleOwner
+    }
+
+    /// [`StaleOwner`]'s properties.
+    fn properties() -> Vec<Property<Self>> {
+        stale_properties()
     }
 
     /// The fixed scenario.
@@ -845,15 +894,15 @@ impl Subsystem for PlantedClock {
 
 #[test]
 fn refuses_nondeterministic() {
-    let clock = entry::<PlantedClock>();
+    const CLOCK: HarnessEntry = entry::<PlantedClock>();
     let dir = TempDir::new().unwrap();
-    harness::record(&clock, RecordInput::Input(&[]), dir.path()).unwrap();
+    harness::record(&CLOCK, RecordInput::Input(&[]), dir.path()).unwrap();
     let recorded = std::fs::read(dir.path().join(TRACE_FILE)).unwrap();
     std::thread::sleep(Duration::from_micros(10));
     let out = TempDir::new().unwrap();
     let result = shrink_with(
         &open(dir.path()),
-        &clock,
+        &CLOCK,
         ShrinkBudget::default(),
         out.path(),
         &AtomicBool::new(false),
@@ -874,23 +923,20 @@ fn refuses_nondeterministic() {
 
 #[test]
 fn interrupt_keeps_best() {
-    let dir = padded();
+    let dir = record_script(&INTERRUPTING, &padded_plan());
     let recorded = std::fs::read(dir.path().join(TRACE_FILE)).unwrap();
     // The confirm replay and the baseline build twice, then candidates
     // build once each: the flag is set while the fifth candidate builds.
-    BUILDS_BEFORE_INTERRUPT.set(Some(6));
+    BUILDS_BEFORE_INTERRUPT.store(6, Ordering::SeqCst);
     let out = TempDir::new().unwrap();
-    let report = INTERRUPT.with(|flag| {
-        shrink_with(
-            &open(dir.path()),
-            &STALE,
-            ShrinkBudget::default(),
-            out.path(),
-            flag,
-        )
-    });
-    BUILDS_BEFORE_INTERRUPT.set(None);
-    let report = report.unwrap();
+    let report = shrink_with(
+        &open(dir.path()),
+        &INTERRUPTING,
+        ShrinkBudget::default(),
+        out.path(),
+        &INTERRUPT,
+    )
+    .unwrap();
     assert_eq!(report.stopped, Some(Stop::Interrupted), "{report:?}");
     assert!(!report.fixed_point);
     assert_eq!(report.candidates, 5, "{report:?}");
@@ -994,4 +1040,104 @@ fn explain_marks_non_default_picks() {
         replay_explained_with(&open(selector.path()), &SELECTOR, ReplayOptions::default()).unwrap();
     assert!(text.contains("task sel.1 at "), "{text}");
     assert!(text.contains("draw sel.1:select#1 = "), "{text}");
+}
+
+thread_local! {
+    /// The borrow [`LeakingFailure`]'s spinner holds for good.
+    static BUSY: std::cell::RefCell<()> = const { std::cell::RefCell::new(()) };
+}
+
+/// A harness whose one task spins forever holding a borrow of [`BUSY`], so
+/// every run leaks it and violates [`LEAKED_BORROW`].
+struct LeakingFailure;
+
+no_view!(LeakingFailure);
+
+/// Violated while a task holds [`BUSY`].
+const LEAKED_BORROW: PropertyId = PropertyId::new("test/leaked-borrow");
+
+impl Subsystem for LeakingFailure {
+    const NAME: &'static str = "test/leaking-failure";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = Fixed;
+    type Prepared = ();
+
+    /// Room for the spinner to be polled and abandoned.
+    fn config(_: &Fixed) -> RunConfig {
+        limits(50, 10)
+    }
+
+    /// Borrows [`BUSY`] on the run's thread, which panics if a leaked
+    /// spinner from an earlier run on this thread still holds it.
+    fn prepare(_: &Fixed) {
+        BUSY.with(|busy| drop(busy.borrow_mut()));
+    }
+
+    /// Spawns the spinner.
+    fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
+        sim.scheduler().spawn_root("spinner", async {
+            BUSY.with(|busy| {
+                let _held = busy.borrow_mut();
+                let flag = zakura_rt::sync::atomic::AtomicU64::new(0);
+                while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+            });
+        });
+        LeakingFailure
+    }
+
+    /// The leaked borrow's property.
+    fn properties() -> Vec<Property<Self>> {
+        vec![Property {
+            id: LEAKED_BORROW,
+            claim: "no task holds the thread-local borrow",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[],
+            status: Status::Active,
+            check: |cx: &mut CheckCtx<'_, Self>| {
+                if BUSY.with(|busy| busy.try_borrow_mut().is_err()) {
+                    cx.violated("no task holds the borrow", "the spinner holds it")
+                } else {
+                    Verdict::Holds
+                }
+            },
+            witness: Some(any_run),
+        }]
+    }
+
+    /// The fixed scenario.
+    fn draw(_: &[u8]) -> Fixed {
+        Fixed {}
+    }
+}
+
+/// Each shrink run builds its `Sim` on a new thread, so a run that leaks
+/// the spinner never breaks the next one with the borrow it holds.
+#[test]
+fn shrink_survives_runs_that_leak_tasks() {
+    const LEAKING: HarnessEntry = entry::<LeakingFailure>();
+    let dir = TempDir::new().unwrap();
+    let (done, recorded) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ =
+            done.send(harness::record(&LEAKING, RecordInput::Input(&[]), dir.path()).map(|_| dir));
+        // The leaked spinner still holds this thread's state, so the thread
+        // parks for good (#1694).
+        loop {
+            std::thread::park();
+        }
+    });
+    let dir = recorded.recv().unwrap().unwrap();
+    let out = TempDir::new().unwrap();
+    let report = shrink_with(
+        &open(dir.path()),
+        &LEAKING,
+        ShrinkBudget::default(),
+        out.path(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(report.property, LEAKED_BORROW.as_str());
+    assert!(report.reduced.is_some(), "{report:?}");
 }

@@ -13,6 +13,7 @@
 pub mod action;
 pub mod check;
 pub mod domain;
+mod downstream;
 mod draws;
 pub mod end;
 mod evidence;
@@ -24,10 +25,12 @@ pub mod observe;
 pub mod plan;
 pub mod property;
 pub mod record;
+mod sender;
 pub mod sim;
 pub mod storage;
 pub mod table;
 pub mod trace;
+pub mod witness;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
 pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};

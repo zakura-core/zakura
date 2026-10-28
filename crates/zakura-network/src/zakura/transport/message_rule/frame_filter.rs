@@ -7,12 +7,15 @@ use crate::zakura::{regulation::ResponsePrecheck, FRAME_HEADER_BYTES};
 
 /// Why a reader rejected a frame from its header.
 ///
-/// Every rejection is a framing violation that disconnects the peer. A payload
+/// Except for local capacity exhaustion, rejections are framing violations. A payload
 /// above its row's maximum is reported as an oversize frame instead, so the
 /// existing oversize diagnostics keep one path.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Error)]
 #[non_exhaustive]
 pub enum FrameRejection {
+    /// The local retained-memory envelope is full, without proving peer misconduct.
+    #[error("local receive capacity exhausted")]
+    LocalCapacity,
     /// No row on this reader declares the frame's message type.
     #[error("no row on this reader declares the message type")]
     UnknownMessageType,
@@ -48,6 +51,7 @@ impl FrameRejection {
     /// Stable metric and trace label.
     pub fn label(self) -> &'static str {
         match self {
+            Self::LocalCapacity => "local_capacity",
             Self::UnknownMessageType => "unknown_message_type",
             Self::ReservedFlags => "reserved_flags",
             Self::PayloadTooShort { .. } => "payload_too_short",
@@ -89,6 +93,7 @@ impl InboundReader {
 pub(crate) struct FrameFilter<'a> {
     rules: Option<&'static [MessageRule]>,
     reader: InboundReader,
+    legacy_stream: Option<u16>,
     precheck: Option<&'a dyn ResponsePrecheck>,
 }
 
@@ -97,8 +102,18 @@ impl<'a> FrameFilter<'a> {
         Self {
             rules,
             reader,
+            legacy_stream: None,
             precheck: None,
         }
+    }
+
+    /// Apply the legacy codec's bounds without changing its existing cadence policy.
+    pub(crate) fn with_legacy_stream(mut self, kind: u16) -> Self {
+        use crate::zakura::legacy_gossip::{ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_LEGACY_REQUESTS};
+        if matches!(kind, ZAKURA_STREAM_GOSSIP | ZAKURA_STREAM_LEGACY_REQUESTS) {
+            self.legacy_stream = Some(kind);
+        }
+        self
     }
 
     /// Also check each response header against `precheck`, which bounds it by
@@ -110,6 +125,7 @@ impl<'a> FrameFilter<'a> {
         FrameFilter {
             rules: self.rules,
             reader: self.reader,
+            legacy_stream: self.legacy_stream,
             precheck,
         }
     }
@@ -129,6 +145,28 @@ impl<'a> FrameFilter<'a> {
         payload_len: usize,
         frame_cap: usize,
     ) -> Result<usize, FrameRejection> {
+        let frame_cap = if let Some(kind) = self.legacy_stream {
+            let payload = crate::zakura::legacy_gossip::frame_payload_bounds(
+                kind,
+                message_type,
+                matches!(self.reader, InboundReader::Requester),
+            )
+            .ok_or(FrameRejection::UnknownMessageType)?;
+            if flags != 0 {
+                return Err(FrameRejection::ReservedFlags);
+            }
+            if payload_len < payload.min() {
+                return Err(FrameRejection::PayloadTooShort { min: payload.min() });
+            }
+            let cap = frame_cap.min(payload.max().saturating_add(FRAME_HEADER_BYTES));
+            // Let the reader report oversize before local capacity can mask bad framing.
+            if payload_len.saturating_add(FRAME_HEADER_BYTES) > cap {
+                return Ok(cap);
+            }
+            cap
+        } else {
+            frame_cap
+        };
         let Some(rules) = self.rules else {
             if let Some(precheck) = self.precheck {
                 precheck.check(message_type, payload_len)?;

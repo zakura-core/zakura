@@ -261,6 +261,7 @@ async fn run_request(case: RequestCase) -> Result<Outcome, BoxError> {
             prelude,
             context,
             Arc::new(ServiceRegistry::new(vec![])?),
+            Arc::new(LegacyReceiveCapacity::new()),
         ),
     )
     .await?;

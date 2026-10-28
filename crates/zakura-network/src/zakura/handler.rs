@@ -224,8 +224,8 @@ const LEGACY_RESPONSE_REQUEST_ID_BYTES: usize = 8;
 const LEGACY_RESPONSE_CHUNK_HEADER_BYTES: usize = LEGACY_RESPONSE_REQUEST_ID_BYTES + 1;
 const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
-const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
-const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
+// A witnessed transaction inventory entry has a four-byte type and two hashes.
+const LEGACY_INVENTORY_HASH_BYTES: usize = 68;
 /// Maximum cumulative response payload bytes the requester will retain in the
 /// accepted-frame `Vec` before `decode_response` consumes it.
 ///
@@ -240,6 +240,11 @@ const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 /// operational aggregate is the symmetric requester-side mirror.
 const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize =
     8 * zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
+/// Local retained raw-response envelope, independently of the wire payload allowance.
+/// Four node slots and one slot per peer reserve this before any response is read.
+const LEGACY_RESPONSE_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+/// Conservative charge for both vector spare capacity and each payload allocation header.
+const LEGACY_RESPONSE_FRAME_MEMORY: usize = 4 * std::mem::size_of::<Frame>() + 32;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -1264,6 +1269,46 @@ impl ZakuraSupervisorState {
     fn debug_assert_accounting(&self) {}
 }
 
+/// Shared ownership of the capacity reserved before a legacy request is read.
+/// Queueing or spawning service work must retain a clone until that work finishes.
+#[derive(Clone, Debug, Default)]
+pub struct ReceiveLease {
+    _permits: Option<Arc<(super::regulation::SlotPermit, super::regulation::SlotPermit)>>,
+}
+
+/// Raw response frames retaining their node receive allowance until decoding finishes.
+#[derive(Debug)]
+pub struct ReceivedFrames {
+    frames: Vec<Frame>,
+    _permit: ReceiveLease,
+}
+
+impl ReceivedFrames {
+    /// Borrow the raw frames while their receive allowance remains reserved.
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
+    /// Consume the frames while retaining capacity throughout synchronous decoding.
+    pub(crate) fn decode<T>(self, decode: impl FnOnce(Vec<Frame>) -> T) -> T {
+        let Self { frames, _permit } = self;
+        let decoded = decode(frames);
+        drop(_permit);
+        decoded
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<Frame>> for ReceivedFrames {
+    /// Wrap synthetic test responses that do not allocate through the transport reader.
+    fn from(frames: Vec<Frame>) -> Self {
+        Self {
+            frames,
+            _permit: ReceiveLease::default(),
+        }
+    }
+}
+
 /// Queue-backed outbound send handle for one authenticated Zakura peer.
 #[derive(Clone, Debug)]
 pub struct ZakuraPeerHandle {
@@ -1300,7 +1345,7 @@ impl ZakuraPeerHandle {
         flags: u16,
         payload: Vec<u8>,
         started: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<Vec<Frame>, BoxError> {
+    ) -> Result<ReceivedFrames, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
             stream_kind,
@@ -1343,7 +1388,7 @@ pub enum ZakuraOutboundFrame {
         /// is tokio's sender in both builds.
         started: Option<tokio::sync::oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
-        completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
+        completion: oneshot::Sender<Result<ReceivedFrames, BoxError>>,
     },
 }
 
@@ -2305,6 +2350,104 @@ pub(crate) fn service_registry(
     ))
 }
 
+/// Admission for legacy request payloads, before the first payload allocation.
+/// Each slot reserves the stream's entire 1 MiB frame cap: 64 MiB per node and
+/// 8 MiB per peer. Native control and matched responses use separate capacity.
+#[derive(Debug)]
+struct LegacyReceiveCapacity {
+    per_peer: usize,
+    node: super::regulation::SlotBudget,
+    peers: StdMutex<HashMap<ZakuraPeerId, super::regulation::WeakSlotBudget>>,
+}
+
+impl LegacyReceiveCapacity {
+    /// Construct the shared node limit, independently of connections and stream churn.
+    fn new() -> Self {
+        Self::with_limits(64, 8)
+    }
+
+    /// Construct disjoint request or response allowances shared across connections.
+    fn with_limits(node: usize, per_peer: usize) -> Self {
+        Self {
+            per_peer,
+            node: super::regulation::SlotBudget::new(node)
+                .expect("receive slots fit the semaphore"),
+            peers: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Find the peer's pool while retained permits and admission waiters keep it alive.
+    fn peer_budget(&self, peer: &ZakuraPeerId) -> super::regulation::SlotBudget {
+        let mut peers = self
+            .peers
+            .lock()
+            .expect("receive capacity mutex is never poisoned");
+        peers.retain(|_, budget| budget.upgrade().is_some());
+        if let Some(budget) = peers
+            .get(peer)
+            .and_then(super::regulation::WeakSlotBudget::upgrade)
+        {
+            return budget;
+        }
+        let budget = super::regulation::SlotBudget::new(self.per_peer)
+            .expect("peer receive slots fit the semaphore");
+        peers.insert(peer.clone(), budget.downgrade());
+        budget
+    }
+
+    /// Reserve both limits without adding an inbound waiting queue.
+    fn reserve(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<(super::regulation::SlotPermit, super::regulation::SlotPermit)> {
+        let peer = self.peer_budget(peer).try_reserve()?;
+        let node = self.node.try_reserve()?;
+        Some((peer, node))
+    }
+
+    /// Admit one already queued outbound request, with at most one waiter per connection.
+    async fn reserve_outbound(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> (super::regulation::SlotPermit, super::regulation::SlotPermit) {
+        let peer = self.peer_budget(peer).reserve().await;
+        let node = self.node.reserve().await;
+        (peer, node)
+    }
+}
+
+/// Charge request memory only after its complete header, immediately before allocation.
+#[derive(Debug)]
+struct LegacyRequestAdmission<'a> {
+    capacity: &'a LegacyReceiveCapacity,
+    peer: &'a ZakuraPeerId,
+    lease: StdMutex<Option<ReceiveLease>>,
+}
+
+impl super::regulation::ResponsePrecheck for LegacyRequestAdmission<'_> {
+    /// Reserve the request's payload allowance once for this one-shot stream.
+    #[allow(clippy::unwrap_in_result)] // Poisoning is a local invariant failure, not peer overload.
+    fn check(&self, _message_type: u16, _payload_len: usize) -> Result<(), FrameRejection> {
+        let mut lease = self
+            .lease
+            .lock()
+            .expect("request admission mutex is never poisoned");
+        if lease.is_none() {
+            let permits = self
+                .capacity
+                .reserve(self.peer)
+                .ok_or(FrameRejection::LocalCapacity)?;
+            *lease = Some(ReceiveLease {
+                _permits: Some(Arc::new(permits)),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One absolute deadline covers the header and payload, regardless of peer idle limits.
+const LEGACY_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// zakura-quic acceptor for the Zakura `p2p-v2/3` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
@@ -2317,6 +2460,8 @@ pub struct ZakuraProtocolHandler {
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
+    legacy_receive: Arc<LegacyReceiveCapacity>,
+    legacy_responses: Arc<LegacyReceiveCapacity>,
     shutdown: CancellationToken,
     // Bound endpoint identity, used for connection collision handling.
     local_node_id: Option<NodeId>,
@@ -2412,6 +2557,8 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            legacy_receive: Arc::new(LegacyReceiveCapacity::new()),
+            legacy_responses: Arc::new(LegacyReceiveCapacity::with_limits(4, 1)),
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2667,7 +2814,7 @@ impl ZakuraProtocolHandler {
         connection: Connection,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
-        mut outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
+        outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
         context: RegisteredConnectionServeContext,
         mut cleanup_guard: RegisteredPeerCleanupGuard,
     ) -> Result<(), ZakuraHandlerError> {
@@ -2880,6 +3027,38 @@ impl ZakuraProtocolHandler {
                     .schedule_demand(&mut session_waits, demand);
             }
         }
+
+        // Unfold retains the dequeued request and its admission future across select
+        // turns. Waiting for receive capacity must not stop inbound/control work.
+        let response_capacity = self.legacy_responses.clone();
+        let response_peer = peer_id.clone();
+        let mut admitted_outbound = Box::pin(futures::stream::unfold(
+            outbound_rx,
+            move |mut receiver| {
+                let capacity = response_capacity.clone();
+                let peer = response_peer.clone();
+                async move {
+                    loop {
+                        let mut frame = receiver.recv().await?;
+                        let lease = match &mut frame {
+                            ZakuraOutboundFrame::Request {
+                                stream_kind,
+                                completion,
+                                ..
+                            } if *stream_kind == LEGACY_REQUEST_STREAM_KIND => {
+                                zakura_rt::select! {
+                                    biased;
+                                    _ = completion.closed() => continue,
+                                    permit = capacity.reserve_outbound(&peer) => ReceiveLease { _permits: Some(Arc::new(permit)) },
+                                }
+                            }
+                            _ => ReceiveLease::default(),
+                        };
+                        return Some(((frame, lease), receiver));
+                    }
+                }
+            },
+        ));
 
         loop {
             let session_deadline = pending_sessions.deadline();
@@ -3194,8 +3373,8 @@ impl ZakuraProtocolHandler {
                         }
                     }
                 }
-                outbound = outbound_rx.recv() => {
-                    let Some(outbound) = outbound else {
+                outbound = admitted_outbound.next() => {
+                    let Some((outbound, response_lease)) = outbound else {
                         close_cause.record("outbound_closed");
                         break;
                     };
@@ -3238,7 +3417,7 @@ impl ZakuraProtocolHandler {
                             };
                             match result {
                                 Ok(frames) => {
-                                    let _ = completion.send(Ok(frames));
+                                    let _ = completion.send(Ok(ReceivedFrames { frames, _permit: response_lease }));
                                 }
                                 Err(OutboundRequestError::Local(error)) => {
                                     let _ = completion.send(Err(error));
@@ -3619,7 +3798,14 @@ impl ZakuraProtocolHandler {
         }
         admission.workers.spawn_named(
             "request_stream_worker",
-            request_stream_worker(send, recv, prelude, context, self.registry.clone()),
+            request_stream_worker(
+                send,
+                recv,
+                prelude,
+                context,
+                self.registry.clone(),
+                self.legacy_receive.clone(),
+            ),
         );
         None
     }
@@ -4762,6 +4948,7 @@ async fn persistent_stream_worker_with_policy(
                     &mut recv,
                     reader_context.inbound_frame_cap,
                     FrameFilter::new(reader_context.messages, InboundReader::Persistent)
+                        .with_legacy_stream(stream_kind)
                         .with_precheck(reader_context.precheck.get()),
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
@@ -5024,7 +5211,14 @@ async fn request_stream_worker(
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     registry: Arc<ServiceRegistry>,
+    receive: Arc<LegacyReceiveCapacity>,
 ) {
+    let legacy = prelude.stream_kind == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS;
+    let admission = LegacyRequestAdmission {
+        capacity: &receive,
+        peer: &context.peer_id,
+        lease: StdMutex::new(None),
+    };
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
         context.close_cause.record("request_without_id");
@@ -5032,23 +5226,45 @@ async fn request_stream_worker(
         return;
     };
 
+    let read = read_frame(
+        &mut recv,
+        context.inbound_frame_cap,
+        FrameFilter::new(context.messages, InboundReader::Responder)
+            .with_legacy_stream(prelude.stream_kind)
+            .with_precheck(
+                legacy.then_some(&admission as &dyn super::regulation::ResponsePrecheck),
+            ),
+        context.limits.idle_timeout,
+        Some(context.limits.idle_timeout),
+    );
+    let read = async {
+        if legacy {
+            timeout(
+                LEGACY_REQUEST_READ_TIMEOUT.min(context.limits.idle_timeout),
+                read,
+            )
+            .await
+            .unwrap_or(Err(ZakuraHandlerError::Timeout("legacy request frame")))
+        } else {
+            read.await
+        }
+    };
     let frame = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        frame = read_frame(
-            &mut recv,
-            context.inbound_frame_cap,
-            FrameFilter::new(context.messages, InboundReader::Responder),
-            context.limits.idle_timeout,
-            // A request stream carries its request frame immediately after the
-            // prelude, so a peer that opens one and then goes silent is treated
-            // as a stalled one-shot stream and bounded by the idle timeout.
-            Some(context.limits.idle_timeout),
-        ) => frame,
+        frame = read => frame,
     };
 
     let frame = match frame {
         Ok(frame) => frame,
+        Err(ZakuraHandlerError::RejectedFrame {
+            rejection: FrameRejection::LocalCapacity,
+            ..
+        }) => {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            return;
+        }
         Err(error) => {
             debug!(
                 ?error,
@@ -5080,15 +5296,21 @@ async fn request_stream_worker(
         }
     }
 
+    let receive_capacity = admission
+        .lease
+        .into_inner()
+        .expect("request admission mutex is never poisoned")
+        .unwrap_or_default();
     let response_frame_cap = context.outbound_frame_cap;
     let response_frames = match registry
-        .request(
+        .request_with_lease(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
+            receive_capacity,
         )
         .await
     {
@@ -5484,6 +5706,7 @@ async fn write_outbound_request_frame_inner(
             &mut recv,
             inbound_frame_cap,
             FrameFilter::new(stream.messages, InboundReader::Requester)
+                .with_legacy_stream(stream.kind)
                 .with_precheck(Some(&legacy_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
@@ -5505,6 +5728,14 @@ async fn write_outbound_request_frame_inner(
                 return Err(OutboundRequestError::Local(Box::new(
                     ZakuraHandlerError::Timeout("outbound response"),
                 )));
+            }
+            Err(
+                error @ ZakuraHandlerError::RejectedFrame {
+                    rejection: FrameRejection::LocalCapacity,
+                    ..
+                },
+            ) => {
+                return Err(OutboundRequestError::Local(Box::new(error)));
             }
             Err(error @ ZakuraHandlerError::OversizeFrame { .. })
             | Err(error @ ZakuraHandlerError::Oversize) => {
@@ -5568,9 +5799,7 @@ impl LegacyResponseBudget {
         let (max_items, max_frames, max_bytes) = match kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
                 let item_count = legacy_inventory_count(payload, kind)?;
-                let max_frames = item_count
-                    .saturating_mul(LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM)
-                    .saturating_add(1);
+                let max_frames = super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES;
                 let item_bytes = match kind {
                     LegacyResponseKind::Blocks => LEGACY_BLOCK_HASH_BYTES,
                     LegacyResponseKind::Transactions => LEGACY_INVENTORY_HASH_BYTES,
@@ -5579,8 +5808,12 @@ impl LegacyResponseBudget {
                 let missing_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
                     .saturating_add(item_count.saturating_mul(item_bytes));
+                // Chunks retain their own headers in addition to each assembled item.
+                // Allow any chunking within the local frame ceiling, not just full frames.
+                let chunk_headers = max_frames.saturating_mul(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 let max_bytes = item_count
                     .saturating_mul(max_message_bytes)
+                    .saturating_add(chunk_headers)
                     .saturating_add(missing_bytes)
                     .max(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 (item_count, max_frames, max_bytes)
@@ -5646,7 +5879,27 @@ struct LegacyResponseReadState {
 impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
     fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         if self.frames >= self.budget.max_frames {
-            return Err(FrameRejection::Unsolicited);
+            return Err(match self.budget.kind {
+                LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                    FrameRejection::LocalCapacity
+                }
+                _ => FrameRejection::Unsolicited,
+            });
+        }
+        // Keep protocol bytes separate: a maximum legal response still fits.
+        // Vec growth can retain almost twice the logical item size, both during
+        // validation and during the caller's subsequent response decoding.
+        let retained = self
+            .bytes
+            .saturating_add(payload_len)
+            .saturating_add(
+                self.frames
+                    .saturating_add(4)
+                    .saturating_mul(LEGACY_RESPONSE_FRAME_MEMORY),
+            )
+            .saturating_add(self.budget.max_message_bytes.saturating_mul(2));
+        if retained > LEGACY_RESPONSE_MEMORY_BYTES {
+            return Err(FrameRejection::LocalCapacity);
         }
         let remaining = self.budget.max_bytes.saturating_sub(self.bytes);
         if payload_len > remaining {
@@ -5677,6 +5930,19 @@ impl LegacyResponseReadState {
         request_id: u64,
         frame: &Frame,
     ) -> Result<(), OutboundRequestError> {
+        <Self as super::regulation::ResponsePrecheck>::check(
+            self,
+            frame.message_type,
+            frame.payload.len(),
+        )
+        .map_err(|error| match error {
+            FrameRejection::LocalCapacity => {
+                OutboundRequestError::Local("legacy response receive capacity exhausted".into())
+            }
+            _ => OutboundRequestError::Fatal(
+                format!("legacy response receive budget: {error:?}").into(),
+            ),
+        })?;
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
@@ -9605,7 +9871,7 @@ mod tests {
         let frame = Frame {
             message_type: 1,
             flags: 0,
-            payload: Vec::new(),
+            payload: vec![0; 32],
         }
         .encode(LOCAL_MAX_CONTROL_FRAME_BYTES)?;
 
@@ -12392,6 +12658,198 @@ mod tests {
         .await?;
 
         server_ep.shutdown().await;
+        Ok(())
+    }
+    /// Retained metadata and reassembly bytes exhaust memory independently of wire bytes.
+    #[test]
+    fn tiny_legacy_chunks_charge_retained_memory() {
+        use crate::zakura::regulation::ResponsePrecheck;
+        let mut state = LegacyResponseReadState::new(LegacyResponseBudget {
+            kind: LegacyResponseKind::Transactions,
+            max_items: 25_000,
+            max_frames: 200_001,
+            max_bytes: LEGACY_RESPONSE_MAX_AGGREGATE_BYTES,
+            max_message_bytes: 4 * 1024 * 1024,
+        });
+        let mut payload = 1_u64.to_le_bytes().to_vec();
+        payload.push(0);
+        let frame = Frame {
+            message_type: LEGACY_RESPONSE_TRANSACTION,
+            flags: 0,
+            payload,
+        };
+        let mut retained = Vec::new();
+        while state.check(frame.message_type, frame.payload.len()).is_ok() {
+            state.validate_frame(1, &frame).unwrap();
+            retained.push(frame.clone());
+        }
+        assert_eq!(
+            state.check(frame.message_type, frame.payload.len()),
+            Err(FrameRejection::LocalCapacity)
+        );
+        assert!(state.frames < state.budget.max_frames);
+        assert!(state.bytes < state.budget.max_bytes);
+        assert!(matches!(
+            state.validate_frame(1, &frame),
+            Err(OutboundRequestError::Local(_))
+        ));
+    }
+
+    /// Queue ownership and decoding retain the shared permits after the reader has exited.
+    #[test]
+    fn receive_capacity_follows_retained_work() {
+        let capacity = LegacyReceiveCapacity::with_limits(4, 1);
+        let lease = ReceiveLease {
+            _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+        };
+        let queued = lease.clone();
+        drop(lease);
+        assert_eq!(capacity.node.available(), 3);
+        assert!(capacity.reserve(&test_peer(1)).is_none());
+        let response = ReceivedFrames {
+            frames: Vec::new(),
+            _permit: queued,
+        };
+        response.decode(|_| assert_eq!(capacity.node.available(), 3));
+        assert_eq!(capacity.node.available(), 4);
+        let discarded = ReceivedFrames {
+            frames: Vec::new(),
+            _permit: ReceiveLease {
+                _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+            },
+        };
+        drop(discarded);
+        assert_eq!(capacity.node.available(), 4);
+    }
+
+    /// Legacy request and response declarations are checked before payload allocation.
+    #[test]
+    fn legacy_header_bounds_reject_impossible_declarations() {
+        let request = FrameFilter::new(None, InboundReader::Responder)
+            .with_legacy_stream(LEGACY_REQUEST_STREAM_KIND);
+        assert_eq!(
+            request.check_header(LEGACY_REQUEST_PING, 0, 0, 1024 * 1024),
+            Ok(8)
+        );
+        assert_eq!(
+            request.check_header(65535, 0, 0, 1024),
+            Err(FrameRejection::UnknownMessageType)
+        );
+        assert_eq!(
+            request.check_header(LEGACY_REQUEST_PING, 1, 0, 1024),
+            Err(FrameRejection::ReservedFlags)
+        );
+        assert!(matches!(
+            request.check_header(LEGACY_REQUEST_FIND_BLOCKS, 0, 32, 1024),
+            Err(FrameRejection::PayloadTooShort { min: 33 })
+        ));
+        let response = FrameFilter::new(None, InboundReader::Requester)
+            .with_legacy_stream(LEGACY_REQUEST_STREAM_KIND);
+        assert_eq!(
+            response.check_header(LEGACY_RESPONSE_PONG, 0, 1024, 1024),
+            Ok(16)
+        );
+        assert_eq!(
+            response.check_header(LEGACY_REQUEST_PING, 0, 0, 1024),
+            Err(FrameRejection::UnknownMessageType)
+        );
+    }
+    /// Real service work retains receive admission through queueing, cancellation, and timeout.
+    #[tokio::test(start_paused = true)]
+    async fn receive_lease_survives_service_queue_and_timeout() {
+        use crate::zakura::{
+            legacy_gossip::{LegacyGossipSink, LegacyRequestFrame},
+            transport::RequestResponseService,
+        };
+        for phase in 0..3 {
+            let capacity = LegacyReceiveCapacity::with_limits(1, 1);
+            let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let sink = LegacyGossipSink::spawn(
+                tower::service_fn(move |_: crate::Request| {
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<crate::Response, BoxError>>()
+                }),
+                ZakuraSupervisorHandle::new(1),
+            );
+            let lease = ReceiveLease {
+                _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+            };
+            let mut response = sink.request_frame_with_lease(
+                test_peer(1),
+                LEGACY_REQUEST_STREAM_KIND,
+                1,
+                1024 * 1024,
+                2 * 1024 * 1024,
+                LegacyRequestFrame::MempoolTransactionIds
+                    .encode_frame()
+                    .unwrap(),
+                lease,
+            );
+            assert!(futures::poll!(response.as_mut()).is_pending());
+            assert_eq!(capacity.node.available(), 0);
+            if phase != 0 {
+                entered.recv().await.unwrap();
+                assert_eq!(capacity.node.available(), 0);
+            }
+            if phase == 2 {
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert!(response.await.is_err());
+            } else {
+                drop(response);
+                assert_eq!(
+                    capacity.node.available(),
+                    0,
+                    "queued/backend work still owns the lease until cancellation is observed"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while capacity.node.available() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(capacity.reserve(&test_peer(1)).is_some());
+        }
+    }
+    /// A peer with a small negotiated frame cap can return a full-size block.
+    #[test]
+    fn small_frame_caps_accept_full_block_responses() -> Result<(), BoxError> {
+        use zakura_chain::serialization::ZcashSerialize;
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        let block = Arc::new(block);
+        let request = LegacyRequestFrame::BlocksByHash(vec![block.hash()]).encode_frame()?;
+        let mut limits = test_connection_limits();
+        limits.max_frame_bytes = 64 * 1024;
+        limits.max_message_bytes = u32::try_from(block.zcash_serialize_to_vec()?.len())?;
+        assert_eq!(limits.max_message_bytes, 2_000_000);
+        let budget =
+            LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                .map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        let frames = LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        assert!(frames.len() > 9);
+        for frame in frames {
+            state
+                .validate_frame(1, &frame)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        state.finish().map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        state.frames = state.budget.max_frames;
+        assert_eq!(
+            super::super::regulation::ResponsePrecheck::check(&state, LEGACY_RESPONSE_BLOCK, 10),
+            Err(FrameRejection::LocalCapacity),
+        );
         Ok(())
     }
 }

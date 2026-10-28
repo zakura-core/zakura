@@ -538,8 +538,9 @@ jobs:
 
   # Some witness tests need a run of most of a million simulated steps, which
   # a debug build takes over twenty minutes for. They're ignored in
-  # `sim-build`, and this job runs them in a release build beside it, with its
-  # own target directory and cache key.
+  # `sim-build`, and this job runs them beside it in an optimized `ci-tests`
+  # build with debug assertions and overflow checks on, with its own target
+  # directory and cache key.
   sim-slow-witnesses:
     name: zakura_sim slow witnesses
     needs: changes
@@ -549,7 +550,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      CARGO_TARGET_DIR: target/sim-release
+      CARGO_TARGET_DIR: target/sim-ci-tests
+      CARGO_PROFILE_CI_TESTS_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_CI_TESTS_OVERFLOW_CHECKS: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -557,14 +560,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
-          cache-shared-key: zakura-sim-release
+          cache-shared-key: zakura-sim-ci-tests
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       # #1523: the frontier-first input violates capacity-release-wakes, and
       # the reply-first input holds it.
       - name: Run the slow witness tests
         run: |
-          cargo test --locked --release -p zakura-sim --test block_semantic_properties -- --ignored \
+          cargo test --locked --profile ci-tests -p zakura-sim --test block_semantic_properties -- --ignored \
             the_frontier_first_input_violates_capacity_release_wakes \
             the_reply_first_input_holds_capacity_release_wakes
         env:

@@ -2,12 +2,13 @@ diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/z
 index 222e40c12..8d1d066a1 100644
 --- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
-@@ -1116,15 +1116,10 @@ impl Sequencer {
+@@ -1116,15 +1116,11 @@ impl Sequencer {
  
      fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
          let released = self.applying.values().map(|applying| applying.bytes).sum();
 +        // Forget each submitted body instead of detaching it: storage still
-+        // holds it, but the submission limit no longer counts it.
++        // holds it, but no holder charges it. The submission count and bytes
++        // keep its slot, which no verdict frees once the entry is gone.
          for applying in self.applying.values().filter(|applying| applying.submitted) {
 -            if let Some(submission) = self.in_flight_submissions.get_mut(&applying.token) {
 -                if !submission.detached {

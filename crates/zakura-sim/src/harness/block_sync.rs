@@ -280,6 +280,7 @@ impl Subsystem for Storage {
         if let Some(limit) = scenario.serving_limit {
             config.max_inflight_requests = limit;
         }
+        view.borrow().semantic.borrow_mut().set_limit(&config);
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());

@@ -9,8 +9,10 @@
 //! for all of them. A check never reads the node's own state, so a node
 //! that keys its work wrongly can't make its own check agree with it.
 //!
-//! The model knows the node's submission limit, `submitted_apply_limit()`
-//! of the default config, which every block-sync scenario runs.
+//! The harness hands the model the node's submission limit,
+//! `submitted_apply_limit()` of the config it spawns the node with. A
+//! trigger history rebuilds the model from the log alone, so it assumes
+//! the default config's limit, which every block-sync scenario runs.
 
 use std::{
     cell::RefCell,
@@ -108,7 +110,7 @@ where
                 issue: CAPACITY_RELEASE_WAKES_ISSUE,
             },
             check: check_capacity_release_wakes::<S>,
-            witness: Some(room_freed_beside_a_waiting_body),
+            witness: Some(room_freed_past_the_frontier),
         },
         Property {
             id: PropertyId::new(DETACHED_SUBMISSION_BOUNDED),
@@ -157,6 +159,10 @@ pub struct RoomFreed {
     pub at: usize,
     /// The waiting body's height.
     pub height: u32,
+    /// Whether the released submission's height had no `applying` entry
+    /// when the sequencer released it: the frontier passed that height
+    /// before its reply arrived, #1523's order.
+    pub past_frontier: bool,
 }
 
 /// A request the node published.
@@ -192,6 +198,8 @@ pub struct SemanticModel {
     step: Option<u64>,
     /// What the step being folded changed.
     pending: StepChanges,
+    /// The node's submission limit, if the harness set it.
+    limit: Option<u64>,
 
     /// Each session's connection.
     sessions: BTreeMap<u64, u64>,
@@ -259,11 +267,20 @@ pub struct SemanticModel {
 
     /// Whether storage took a submission.
     pub saw_submission: bool,
+    /// Submissions [`SUBMIT_ONLY_REQUESTED`] judged, by their owner's body
+    /// work epoch.
+    pub submission_epochs: BTreeMap<Option<u64>, u64>,
+    /// Submissions that first-completion-wins credited: their body crossed
+    /// in another request's exchange.
+    pub credited_elsewhere: u64,
     /// Whether a stale completion reached block sync while a current
     /// submission was attached.
     pub saw_stale_beside_current: bool,
     /// Whether a completion freed room beside an eligible waiting body.
     pub saw_room_freed: bool,
+    /// Whether such a completion released a submission whose height the
+    /// frontier had already passed.
+    pub saw_room_freed_past_frontier: bool,
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
@@ -279,8 +296,9 @@ struct StepChanges {
     submitted: Vec<(u64, WorkOwner, Option<u32>, String)>,
     /// Tokens whose verdict reached block sync.
     delivered: Vec<u64>,
-    /// Submission holders released, with the position of the release.
-    released: Vec<(BlockSyncHolder, usize)>,
+    /// Submission holders released, with the position of the release and
+    /// whether no `applying` entry held the submission's height then.
+    released: Vec<(BlockSyncHolder, usize, bool)>,
     /// Tokens the sequencer detached.
     detached: BTreeSet<u64>,
     /// Whether storage's held tokens or the sequencer's submission holders
@@ -321,10 +339,18 @@ impl SemanticModel {
         model
     }
 
-    /// The node's submission limit.
-    fn limit() -> u64 {
-        static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *LIMIT.get_or_init(|| {
+    /// Sets the node's submission limit to `config`'s.
+    pub fn set_limit(&mut self, config: &ZakuraBlockSyncConfig) {
+        self.limit = Some(
+            u64::try_from(config.submitted_apply_limit())
+                .expect("the submission limit fits in 64 bits"),
+        );
+    }
+
+    /// The node's submission limit: the harness's, else the default
+    /// config's.
+    fn limit(&self) -> u64 {
+        self.limit.unwrap_or_else(|| {
             u64::try_from(ZakuraBlockSyncConfig::default().submitted_apply_limit())
                 .expect("the submission limit fits in 64 bits")
         })
@@ -550,7 +576,12 @@ impl SemanticModel {
                         } else if *count > 0 {
                             *count -= 1;
                             *total -= 1;
-                            self.pending.released.push((holder.clone(), at));
+                            let past_frontier = !self.applying.values().any(|(height, _)| {
+                                Some(height) == self.submission_heights.get(token)
+                            });
+                            self.pending
+                                .released
+                                .push((holder.clone(), at, past_frontier));
                         }
                         if *counts == (0, 0) {
                             self.submissions.remove(token);
@@ -570,6 +601,10 @@ impl SemanticModel {
         let changes = std::mem::take(&mut self.pending);
         for (op, owner, height, hash) in &changes.submitted {
             self.submit_judged += 1;
+            *self
+                .submission_epochs
+                .entry(owner.body_work_epoch)
+                .or_default() += 1;
             if let Some(finding) = self.judge_submission(step, *op, owner, *height, hash) {
                 self.submit_findings.push(finding);
             }
@@ -584,7 +619,7 @@ impl SemanticModel {
 
     /// [`SUBMIT_ONLY_REQUESTED`] on submission `op`.
     fn judge_submission(
-        &self,
+        &mut self,
         step: u64,
         op: u64,
         owner: &WorkOwner,
@@ -631,7 +666,11 @@ impl SemanticModel {
             && owner
                 .body_work_epoch
                 .is_some_and(|epoch| self.authorized.contains(&(epoch, height, hash.to_owned())));
-        if own || elsewhere {
+        if own {
+            return None;
+        }
+        if elsewhere {
+            self.credited_elsewhere += 1;
             return None;
         }
         Some(finding(if crossed.iter().any(|body| body.hash == hash) {
@@ -676,7 +715,7 @@ impl SemanticModel {
         if self.closed {
             return;
         }
-        for (holder, _) in &changes.released {
+        for (holder, _, _) in &changes.released {
             let token = match holder {
                 BlockSyncHolder::Submitted { token } | BlockSyncHolder::Detached { token } => {
                     *token
@@ -711,10 +750,10 @@ impl SemanticModel {
     /// sequencer's decoded window always admits the next body, so only the
     /// count limit held it back.
     fn judge_room(&mut self, step: u64, changes: &StepChanges) {
-        let Some((_, at)) = changes.released.first() else {
+        let Some((_, at, past_frontier)) = changes.released.first() else {
             return;
         };
-        let limit = Self::limit();
+        let limit = self.limit();
         if self.closed
             || self.in_flight_at_last_step < limit
             || self.in_flight() >= limit
@@ -724,10 +763,12 @@ impl SemanticModel {
         }
         if let Some(height) = self.eligible() {
             self.saw_room_freed = true;
+            self.saw_room_freed_past_frontier |= *past_frontier;
             self.rooms.push(RoomFreed {
                 step,
                 at: *at,
                 height,
+                past_frontier: *past_frontier,
             });
         }
     }
@@ -754,7 +795,7 @@ impl SemanticModel {
     /// [`DETACHED_SUBMISSION_BOUNDED`]'s observable halves after `step`.
     fn judge_detached(&mut self, step: u64) {
         let in_flight = self.in_flight();
-        let limit = Self::limit();
+        let limit = self.limit();
         if in_flight > limit {
             self.detached_findings.push(Finding {
                 step,
@@ -957,10 +998,13 @@ fn stale_completion_beside_a_current_submission(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_stale_beside_current
 }
 
-/// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a completion freed room
-/// under the limit beside an eligible waiting body.
-fn room_freed_beside_a_waiting_body(log: &ObservationLog) -> bool {
-    SemanticModel::of(log).saw_room_freed
+/// [`CAPACITY_RELEASE_WAKES`]'s trigger history, #1523's order: a
+/// completion freed room under the limit beside an eligible waiting body,
+/// and released a submission whose height the frontier had already passed.
+/// A reply that arrives while its height is still `applying` frees room
+/// too, but wakes the waiting body on main.
+fn room_freed_past_the_frontier(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).saw_room_freed_past_frontier
 }
 
 /// [`DETACHED_SUBMISSION_BOUNDED`]'s trigger history: the run reached a

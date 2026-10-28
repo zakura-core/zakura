@@ -61,8 +61,9 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
 }
 
 /// Checks `witness` as a witness test of `property` that expects `expect`,
-/// and checks that the run paired every block storage operation.
-fn witnessed(witness: WitnessScenario<Storage>, property: &str, expect: Expect) {
+/// and checks that the run paired every block storage operation. Returns
+/// the run's ports.
+fn witnessed(witness: WitnessScenario<Storage>, property: &str, expect: Expect) -> Ports {
     let ports = Storage::prepare(&witness.scenario);
     if let Err(error) = witness_prepared::<Storage>(
         &witness.scenario,
@@ -74,8 +75,12 @@ fn witnessed(witness: WitnessScenario<Storage>, property: &str, expect: Expect) 
     ) {
         panic!("{property}: {error}");
     }
-    let view = ports.view.borrow();
-    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+    assert!(
+        ports.view.borrow().pairing.is_empty(),
+        "{:?}",
+        ports.view.borrow().pairing
+    );
+    ports
 }
 
 /// Runs `scenario` under `input`, and returns the report with the ports,
@@ -131,12 +136,26 @@ fn each_committed_input_draws_its_scenario() {
 /// through first-completion-wins, and each names the request that fetched
 /// it. With `height-only.patch`, the sequencer adopts an old-epoch body
 /// into the new epoch's work, and the same input violates the property.
+/// The test counts each kind of submission, so a change that drops one
+/// fails here instead of weakening the planted case.
 #[test]
 fn the_reset_mid_flight_input_holds_submit_only_requested() {
-    witnessed(
+    let ports = witnessed(
         committed(RESET_MID_FLIGHT_INPUT),
         SUBMIT_ONLY_REQUESTED,
         Expect::Holds,
+    );
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    // Each key counts at least one submission.
+    let epochs = &model.submission_epochs;
+    assert!(
+        epochs.len() >= 2 && !epochs.contains_key(&None),
+        "submissions by epoch, which needs an old and a new one: {epochs:?}"
+    );
+    assert!(
+        model.credited_elsewhere > 0,
+        "no first-completion-wins credit"
     );
 }
 
@@ -185,9 +204,10 @@ fn the_stalled_reset_input_leaves_input_decoded_bound_not_applicable() {
 /// The capacity-release input whose plan handles the detached commit's tip
 /// first: the frontier releases height 1, the stale reply frees room, and
 /// the waiting fork body stays unsubmitted until the node waits on time
-/// (#1523). The run takes 837,000 steps, about four minutes in release.
+/// (#1523). The witness requires that order: the released submission's
+/// height has no `applying` entry. The run takes 837,000 steps.
 #[test]
-#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it in release"]
+#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it with debug assertions and optimization"]
 fn the_frontier_first_input_violates_capacity_release_wakes() {
     witnessed(
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
@@ -198,16 +218,40 @@ fn the_frontier_first_input_violates_capacity_release_wakes() {
 
 /// The capacity-release input whose plan handles the detached commit's
 /// reply first, before the frontier releases height 1, so the freed room
-/// wakes the waiting fork body. The run takes 837,000 steps, about four
-/// minutes in release.
+/// wakes the waiting fork body. Room frees beside the waiting body, but not
+/// in #1523's order, so this run isn't the property's witness: the test
+/// checks the run directly. The run takes 837,000 steps.
 #[test]
-#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it in release"]
+#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it with debug assertions and optimization"]
 fn the_reply_first_input_holds_capacity_release_wakes() {
-    witnessed(
-        committed(CAPACITY_REPLY_FIRST_INPUT),
-        CAPACITY_RELEASE_WAKES,
-        Expect::Holds,
+    let witness = committed(CAPACITY_REPLY_FIRST_INPUT);
+    let (report, ports) = run(&witness.scenario, witness.input);
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    assert!(
+        report
+            .properties
+            .iter()
+            .all(|p| !matches!(p.outcome, PropertyOutcome::Violated { .. })),
+        "{:?}",
+        report.properties
     );
+    assert!(
+        matches!(
+            outcome(&report, CAPACITY_RELEASE_WAKES),
+            PropertyOutcome::Held { .. }
+        ),
+        "{:?}",
+        outcome(&report, CAPACITY_RELEASE_WAKES)
+    );
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    assert!(
+        model.saw_room_freed && !model.saw_room_freed_past_frontier,
+        "room freed: {}, past the frontier: {}",
+        model.saw_room_freed,
+        model.saw_room_freed_past_frontier
+    );
+    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
 }
 
 /// Bypass: an alternate callback hands the node's block service a body

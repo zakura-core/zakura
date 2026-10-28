@@ -943,3 +943,76 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
         );
     }
 }
+
+/// Honest runs replay: one plan run twice in one process gives the same
+/// picks and the same log, so nothing process-wide leaks into the honest
+/// script, its models or its records. The scenario has both directions of
+/// subscription, a held grant, a reopen and a refresh: `peer-0` dials and
+/// subscribes with a held grant, and the node dials `peer-1`, which serves
+/// and subscribes, then finishes its header stream. The test first checks
+/// that the history happened, so two equally short runs can't pass.
+#[test]
+fn an_honest_wire_run_replays_identically() {
+    let credit = CreditSpec {
+        objects: 1,
+        bytes: 526,
+    };
+    let mut held = honest(
+        PeerSpec::dialing(),
+        PRELOAD,
+        Some(SubscribeSpec {
+            start: PRELOAD,
+            open: credit,
+            grants: GrantPolicy::Held {
+                grant: credit,
+                quiet_ms: 5_000,
+            },
+        }),
+    );
+    held.script = vec![PeerAction::Grant];
+    let mut serving = honest(
+        PeerSpec::listening(),
+        120,
+        Some(SubscribeSpec {
+            start: 0,
+            open: CreditSpec {
+                objects: 250,
+                bytes: 65_750,
+            },
+            grants: GrantPolicy::Immediate,
+        }),
+    );
+    serving.script = vec![PeerAction::FinishHeader];
+    let scenario = scenario(vec![held, serving], Policy::converging());
+    for plan in plans() {
+        let runs: Vec<_> = (0..2).map(|_| run(&scenario, plan.clone()).0).collect();
+        for action in ["peer:peer-0:grant", "peer:peer-1:finish-header"] {
+            assert!(
+                runs[0].picks.iter().any(|pick| pick.identity == action),
+                "{action}"
+            );
+        }
+        let rows: std::collections::BTreeSet<_> = runs[0]
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::PeerFrame { row: Some(row), .. } => Some(row.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows.into_iter().collect::<Vec<_>>(),
+            ["headers", "headers-outcome", "status", "subscribe-headers"]
+        );
+        let sessions = runs[0]
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.obs, Observation::Session { .. }))
+            .count();
+        assert_eq!(sessions, 3, "two connections and one reopen");
+        assert_eq!(runs[0].picks, runs[1].picks);
+        assert_eq!(runs[0].log.entries(), runs[1].log.entries());
+    }
+}

@@ -5,11 +5,18 @@
 
 mod support;
 
-use std::{cell::Cell, path::Path, sync::OnceLock, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    path::Path,
+    sync::{mpsc, OnceLock},
+    thread,
+    time::Instant,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
@@ -313,12 +320,14 @@ impl Subsystem for Ticks {
     }
 }
 
+/// The [`Ticks`] harness.
+static TICKS: HarnessEntry = entry::<Ticks>();
+
 /// The fast run of a [`Ticks`] scenario.
-fn ticks_run(scenario: &TickScenario) -> (HarnessEntry, Value, RunReport) {
-    let ticks = entry::<Ticks>();
+fn ticks_run(scenario: &TickScenario) -> (&'static HarnessEntry, Value, RunReport) {
     let scenario = serde_json::to_value(scenario).unwrap();
-    let report = (ticks.run)(&scenario, Plan::from_fuzz(&[]), &mut NullSink).unwrap();
-    (ticks, scenario, report)
+    let report = (TICKS.run)(&scenario, Plan::from_fuzz(&[]), &mut NullSink).unwrap();
+    (&TICKS, scenario, report)
 }
 
 #[test]
@@ -333,7 +342,7 @@ fn record_failure_catches_a_planted_nondeterminism() {
     // The first rerun violates the property at the same step, so only the
     // replay can catch the stamped observation.
     match record_failure(
-        &ticks,
+        ticks,
         &scenario,
         &[],
         &PropertyId::new(ACTIVE),
@@ -366,7 +375,7 @@ fn record_failure_records_a_known_violation() {
     assert_eq!(first_violation(&first, KNOWN), 2);
     let root = TempDir::new().unwrap();
     let trace = record_failure(
-        &ticks,
+        ticks,
         &scenario,
         &[],
         &PropertyId::new(KNOWN),
@@ -384,5 +393,122 @@ fn record_failure_records_a_known_violation() {
     assert_eq!(
         trace.dir,
         property_dir(root.path(), KNOWN).join(&trace.id[..12])
+    );
+}
+
+thread_local! {
+    /// What a [`Leaky`] run's spinner borrows and never gives back.
+    static BORROWED: RefCell<()> = const { RefCell::new(()) };
+}
+
+/// The [`Leaky`] property.
+const LEAKY: &str = "test/leaky/no-borrow-left";
+
+/// A harness whose task spins forever holding a thread-local borrow, so
+/// shutdown leaks it, and the borrow stays on the run's thread.
+struct Leaky;
+
+impl HasView for Leaky {
+    type View = ();
+
+    /// Nothing: the check reads the thread-local.
+    fn view(&self) {}
+}
+
+impl Subsystem for Leaky {
+    const NAME: &'static str = "test/leaky";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = ();
+    type Prepared = ();
+
+    /// One worker, and a short run.
+    fn config((): &()) -> RunConfig {
+        RunConfig {
+            scheduler: SchedulerConfig {
+                workers: 1,
+                stack_size: 64 * 1024,
+                ..SchedulerConfig::default()
+            },
+            budget: 50,
+            drain_bound: 10,
+            ..RunConfig::default()
+        }
+    }
+
+    /// Takes the borrow and gives it back, which panics if a leaked task
+    /// from an earlier run on this thread still holds it.
+    fn prepare((): &()) {
+        BORROWED.with(|borrowed| drop(borrowed.borrow_mut()));
+    }
+
+    /// Spawns the spinner.
+    fn build(sim: &mut Sim, (): &(), (): ()) -> Self {
+        sim.scheduler().spawn_root("spinner", async {
+            BORROWED.with(|borrowed| {
+                let _held = borrowed.borrow_mut();
+                // Each load is a preemption point, so the run goes on.
+                let never = AtomicU64::new(0);
+                while never.load(Ordering::SeqCst) == 0 {}
+            });
+        });
+        Leaky
+    }
+
+    /// Violated once the spinner holds the borrow.
+    fn properties() -> Vec<Property<Self>> {
+        vec![Property {
+            id: PropertyId::new(LEAKY),
+            claim: "no task keeps the borrow",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Schedule],
+            status: Status::Active,
+            check: |cx: &mut CheckCtx<'_, Leaky>| {
+                if BORROWED.with(|borrowed| borrowed.try_borrow_mut().is_err()) {
+                    cx.violated("no borrow left", "the spinner holds the borrow")
+                } else {
+                    Verdict::Holds
+                }
+            },
+            witness: None,
+        }]
+    }
+
+    /// The only scenario.
+    fn draw(_: &[u8]) {}
+}
+
+/// The [`Leaky`] harness.
+static LEAKY_HARNESS: HarnessEntry = entry::<Leaky>();
+
+#[test]
+fn record_failure_survives_a_run_that_leaks_tasks() {
+    // The fast run leaks the spinner, so its thread parks for good.
+    let (done, first) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = done.send(fast_run(&LEAKY_HARNESS, &[]));
+        loop {
+            thread::park();
+        }
+    });
+    let (scenario, first) = first.recv().unwrap();
+    assert!(first.cleanup.leaked > 0, "the spinner leaks");
+    let step = first_violation(&first, LEAKY);
+    // The recording rerun leaks the spinner too. The replay must not reuse
+    // its thread, whose borrow is still held.
+    let root = TempDir::new().unwrap();
+    let trace = record_failure(
+        &LEAKY_HARNESS,
+        &scenario,
+        &[],
+        &PropertyId::new(LEAKY),
+        &first,
+        root.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        trace.end.as_ref().unwrap().violation.as_ref().unwrap().step,
+        step
     );
 }

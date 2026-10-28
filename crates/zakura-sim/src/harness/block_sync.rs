@@ -30,7 +30,7 @@ use zakura_storage::{
 use super::{
     block_node::{
         control::{Control, ControlAction, ControlStep},
-        default_limits, preload,
+        default_limits, policy, preload,
         probe::ProbeLog,
         tap::BlockTap,
         view::BlockSyncView,
@@ -181,7 +181,9 @@ impl Subsystem for Storage {
     ///
     /// # Panics
     ///
-    /// If the node holds more bodies than the scenario has blocks.
+    /// If the node holds more bodies than the scenario has blocks, or a
+    /// hold or control step waits for a trigger the node never records
+    /// ([`policy::undriven`]).
     fn prepare(scenario: &BlockScenario) -> Ports {
         assert!(
             scenario.node_bodies <= scenario.blocks,
@@ -189,6 +191,15 @@ impl Subsystem for Storage {
             scenario.blocks,
             scenario.node_bodies
         );
+        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
+            scenario
+                .control
+                .iter()
+                .filter_map(|step| step.when.as_ref()),
+        );
+        if let Some(why) = triggers.filter_map(policy::undriven).next() {
+            panic!("{why}");
+        }
         let fixture = BlockFixture::regtest();
         let chain = fixture.uniform(
             fixture.anchor(),

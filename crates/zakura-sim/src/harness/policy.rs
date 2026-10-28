@@ -16,7 +16,13 @@
 //! A trigger counts effects, never picks: a `Control` pick only queues its
 //! action, so [`Trigger::Closed`] counts connections that actually closed.
 //! Only [`Trigger::Handled`] shows that the reactor has handled a reply, as
-//! its tap witnesses. [`Trigger::ReplyTaken`] shows only that it took it.
+//! its tap witnesses. [`Trigger::ReplyTaken`] shows only that it took it,
+//! and [`Trigger::ReplyQueued`] only that the reply reached its queue.
+//!
+//! A node records only the events it can witness, so each node kind rejects
+//! a scenario that waits for an event it never records, rather than leave
+//! that hold shut: `header_node::policy::undriven` and
+//! `block_node::policy::undriven` say which.
 
 use std::{collections::BTreeMap, fmt::Debug, time::Duration};
 
@@ -110,6 +116,10 @@ pub enum Trigger<K> {
     CallerDropped(Select<K>),
     /// A selected operation completed. Its reply is only queued then.
     Completed(Select<K>),
+    /// A selected operation's reply reached its caller's queue: block
+    /// sync's handle, for a block operation. A completion queues no reply
+    /// when that queue is closed. Nothing has taken the reply yet.
+    ReplyQueued(Select<K>),
     /// A selected operation's caller consumed its reply. That doesn't mean
     /// the caller has acted on it: a caller can reach a scheduling point
     /// between taking a reply and handling it, as the header reactor does
@@ -150,6 +160,22 @@ pub enum Trigger<K> {
     All(Vec<Trigger<K>>),
 }
 
+impl<K> Trigger<K> {
+    /// The first trigger within this one, itself included, for which
+    /// `matches` holds, looking inside [`Trigger::Count`] and
+    /// [`Trigger::All`].
+    pub fn find(&self, matches: &impl Fn(&Trigger<K>) -> bool) -> Option<&Trigger<K>> {
+        if matches(self) {
+            return Some(self);
+        }
+        match self {
+            Trigger::Count(_, inner) => inner.find(matches),
+            Trigger::All(all) => all.iter().find_map(|inner| inner.find(matches)),
+            _ => None,
+        }
+    }
+}
+
 /// Offers nothing for the operations `select` picks until `until` holds,
 /// then only `then`. Held operations ignore the base bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +204,7 @@ pub(crate) enum Event {
     Submitted,
     CallerDropped,
     Completed,
+    ReplyQueued,
     ReplyTaken,
 }
 
@@ -401,6 +428,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Submitted(select) => events(Event::Submitted, select),
             Trigger::CallerDropped(select) => events(Event::CallerDropped, select),
             Trigger::Completed(select) => events(Event::Completed, select),
+            Trigger::ReplyQueued(select) => events(Event::ReplyQueued, select),
             Trigger::ReplyTaken(select) => events(Event::ReplyTaken, select),
             Trigger::Handled(select) => self
                 .handled

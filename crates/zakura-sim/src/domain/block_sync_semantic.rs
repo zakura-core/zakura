@@ -96,8 +96,9 @@ where
         },
         Property {
             id: PropertyId::new(CAPACITY_RELEASE_WAKES),
-            claim: "after a completion frees room under submitted_apply_limit, the sequencer \
-                    submits the eligible waiting body before quiescence",
+            claim: "after a completion frees room under submitted_apply_limit beside an \
+                    eligible waiting body, the sequencer submits a body into that room before \
+                    quiescence",
             kind: Kind::Liveness {
                 bound: LivenessBound::BeforeQuiescence,
             },
@@ -250,8 +251,6 @@ pub struct SemanticModel {
     closed: bool,
     /// Stale completions block sync received whose holders it still holds.
     stale: BTreeSet<u64>,
-    /// Submissions the sequencer held after the last step judged.
-    in_flight_at_last_step: u64,
 
     /// Submissions judged and not yet reported, for
     /// [`SUBMIT_ONLY_REQUESTED`].
@@ -302,6 +301,10 @@ struct StepChanges {
     released: Vec<(BlockSyncHolder, usize, bool)>,
     /// Tokens the sequencer detached.
     detached: BTreeSet<u64>,
+    /// The step's first release that freed room beside an eligible body,
+    /// as [`SemanticModel::note_room`] judged it then: the release's
+    /// position, the body's height and [`RoomFreed::past_frontier`].
+    room: Option<(usize, u32, bool)>,
     /// Tokens whose last holder the step released. The model keeps their
     /// submissions and stale completions until [`STALE_COMPLETION_INERT`]
     /// judges the step's releases.
@@ -575,6 +578,7 @@ impl SemanticModel {
                     }
                     BlockSyncHolder::Submitted { token } | BlockSyncHolder::Detached { token } => {
                         let detached = matches!(holder, BlockSyncHolder::Detached { .. });
+                        let held_before = self.in_flight();
                         let counts = self.submissions.entry(*token).or_default();
                         let (count, total) = if detached {
                             (&mut counts.1, &mut self.detached_total)
@@ -607,6 +611,7 @@ impl SemanticModel {
                             if *counts == (0, 0) {
                                 self.pending.emptied.insert(*token);
                             }
+                            self.note_room(held_before, at, past_frontier);
                         } else if *counts == (0, 0) && !self.pending.emptied.contains(token) {
                             self.submissions.remove(token);
                         }
@@ -643,7 +648,6 @@ impl SemanticModel {
         if changes.storage_changed {
             self.judge_detached(step);
         }
-        self.in_flight_at_last_step = self.in_flight();
     }
 
     /// [`SUBMIT_ONLY_REQUESTED`] on submission `op`.
@@ -777,31 +781,39 @@ impl SemanticModel {
         }
     }
 
-    /// [`CAPACITY_RELEASE_WAKES`]'s trigger on `step`'s changes: the step
-    /// released a submission while the sequencer held the limit's worth,
-    /// and an eligible body waits. With no submission attached, the
-    /// sequencer's decoded window always admits the next body, so only the
-    /// count limit held it back.
-    fn judge_room(&mut self, step: u64, changes: &StepChanges) {
-        let Some((_, at, past_frontier)) = changes.released.first() else {
-            return;
-        };
+    /// [`CAPACITY_RELEASE_WAKES`]'s trigger, judged at the release at
+    /// position `at`: the sequencer held the limit's worth of submissions
+    /// (`held_before`), the release freed room, and an eligible body waits.
+    /// With no submission attached, the sequencer's decoded window always
+    /// admits the next body, so only the count limit held it back. The
+    /// release is judged before the rest of its step, since a sequencer
+    /// that wakes the body submits it in the same step.
+    fn note_room(&mut self, held_before: u64, at: usize, past_frontier: bool) {
         let limit = self.limit();
-        if self.closed
-            || self.in_flight_at_last_step < limit
+        if self.pending.room.is_some()
+            || self.closed
+            || held_before < limit
             || self.in_flight() >= limit
             || self.attached() > 0
         {
             return;
         }
         if let Some(height) = self.eligible() {
+            self.pending.room = Some((at, height, past_frontier));
+        }
+    }
+
+    /// Records `step`'s [`CAPACITY_RELEASE_WAKES`] trigger, if
+    /// [`SemanticModel::note_room`] found one.
+    fn judge_room(&mut self, step: u64, changes: &StepChanges) {
+        if let Some((at, height, past_frontier)) = changes.room {
             self.saw_room_freed = true;
-            self.saw_room_freed_past_frontier |= *past_frontier;
+            self.saw_room_freed_past_frontier |= past_frontier;
             self.rooms.push(RoomFreed {
                 step,
-                at: *at,
+                at,
                 height,
-                past_frontier: *past_frontier,
+                past_frontier,
             });
         }
     }
@@ -944,8 +956,11 @@ where
     Verdict::Holds
 }
 
-/// Whether `obs` discharges the obligation `key` waits on: the waiting body
-/// at its height was submitted, or left `applying`, or the sequencer closed.
+/// Whether `obs` discharges the obligation `key` waits on: a submission
+/// took the freed room, the waiting body at its height left `applying`, or
+/// the sequencer closed. The room may go to a body the model no longer
+/// counts as eligible, such as one at the verified tip that the sequencer
+/// hasn't released yet; the property asks only that freed room is used.
 fn waiting_body_moved(key: &ObligationKey, obs: &Observation) -> bool {
     let Subject::Owner(subject) = &key.subject else {
         return false;
@@ -969,14 +984,11 @@ fn waiting_body_moved(key: &ObligationKey, obs: &Observation) -> bool {
                 body,
                 holder,
                 change,
-            } => {
-                body.height == height
-                    && match holder {
-                        BlockSyncHolder::Submitted { .. } => change == "retained",
-                        BlockSyncHolder::Applying { .. } => change == "released",
-                        _ => false,
-                    }
-            }
+            } => match holder {
+                BlockSyncHolder::Submitted { .. } => change == "retained",
+                BlockSyncHolder::Applying { .. } => body.height == height && change == "released",
+                _ => false,
+            },
             BlockSyncFact::SequencerClosed => true,
             _ => false,
         },

@@ -1,0 +1,7 @@
+# The committed fuzz input `header-wire-extra-ending.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `extra-ending` scenario, and
+# `header-wire-extra-ending.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "f048fb75afd36fbfdb168c504ba7f292dc98f3020a3946e8fc3df90de6283867"

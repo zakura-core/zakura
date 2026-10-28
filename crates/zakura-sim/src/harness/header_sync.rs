@@ -28,6 +28,7 @@ use super::{
         HeaderNode, Policy, PolicySource, Topology,
     },
     wire_node::{TransportTap, WireNode},
+    wire_plans::SavedPlan,
     NetScenario, Subsystem,
 };
 use crate::{
@@ -445,8 +446,8 @@ impl HasView for HeaderWire {
 
 impl Subsystem for HeaderWire {
     const NAME: &'static str = "header-sync/wire";
-    const GENERATOR: u32 = 1;
-    const SCENARIO_BYTES: usize = 0;
+    const GENERATOR: u32 = 2;
+    const SCENARIO_BYTES: usize = 2;
     type Scenario = WireScenario;
     type Prepared = WirePorts;
 
@@ -534,6 +535,7 @@ impl Subsystem for HeaderWire {
             .map(|index| format!("peer-{index}"))
             .collect();
         let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
+        let dials = tap.dials();
         sim.add_source(Box::new(tap));
         let node = WireNode::spawn(
             sim,
@@ -542,6 +544,7 @@ impl Subsystem for HeaderWire {
             net.sim(),
             scenario.net.seed,
             observer,
+            dials,
         );
         let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone(), ports.records.clone());
@@ -612,9 +615,10 @@ impl Subsystem for HeaderWire {
         }])
     }
 
-    /// The default scenario.
-    fn draw(_: &[u8]) -> WireScenario {
-        WireScenario::default()
+    /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or
+    /// the default scenario.
+    fn draw(prefix: &[u8]) -> WireScenario {
+        SavedPlan::from_tag(prefix).map_or_else(WireScenario::default, SavedPlan::scenario)
     }
 }
 

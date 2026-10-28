@@ -204,6 +204,10 @@ pub enum PeerAction {
     FinishHeader,
     /// Closes the connection with application code 0, as `Conn::close`.
     Close,
+    /// Closes the connection as [`PeerAction::Close`] does, but while the
+    /// honest script still serves the node: offered once it has written a
+    /// page of a subscription the node hasn't closed (M5-F).
+    Disconnect,
     /// After a [`PeerAction::Close`], dials again from a fresh address, once
     /// the production handshake timeout has passed. Only a dialing peer can.
     Redial,
@@ -224,6 +228,7 @@ impl PeerAction {
             PeerAction::Open { .. } => "open",
             PeerAction::FinishHeader => "finish-header",
             PeerAction::Close => "close",
+            PeerAction::Disconnect => "disconnect",
             PeerAction::Redial => "redial",
             PeerAction::Grant => "grant",
             PeerAction::Act { act } => act.name(),
@@ -1329,7 +1334,7 @@ impl PeerTask {
                             // A responder waits for the node to reopen it.
                             settled = self.spec.dialer == Dialer::Peer;
                         }
-                        PeerAction::Close => {
+                        PeerAction::Close | PeerAction::Disconnect => {
                             conn.close(VarInt::from_u32(0), b"close");
                             conn.closed().await;
                             return Ended::Closed;

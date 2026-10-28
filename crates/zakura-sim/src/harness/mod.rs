@@ -21,6 +21,7 @@ pub mod header_sync;
 pub mod policy;
 mod record;
 pub mod wire_node;
+pub mod wire_plans;
 
 use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
 

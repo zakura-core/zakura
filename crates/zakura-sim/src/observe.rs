@@ -1719,6 +1719,13 @@ pub enum TransportFact {
         /// The handshake error, or the refusal's trace label.
         reason: String,
     },
+    /// The node's dial to the remote address failed, as the wire node's
+    /// call to `ZakuraEndpoint::dial` returned. No connection was
+    /// registered for it, so the address alone keys it.
+    DialFailed {
+        /// The returned error, as it displays.
+        error: String,
+    },
     /// The supervisor registered the connection as `connection`.
     Registered,
     /// A service session's stream started.

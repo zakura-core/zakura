@@ -216,6 +216,9 @@ pub(crate) struct Honest {
     refresh: Duration,
     /// When it last sent or read a frame.
     pub(super) active: Instant,
+    /// When it last wrote a page of a subscription the node opened, while
+    /// it still serves one.
+    paged: Option<Instant>,
     /// Whether it sends `Status`, so the node may subscribe. An adversary
     /// may stay silent.
     announce: bool,
@@ -247,6 +250,7 @@ impl Honest {
             status_due: Instant::now(),
             refresh: ZakuraHeaderSyncConfig::default().status_refresh_interval,
             active: Instant::now(),
+            paged: None,
             announce,
             serve,
             node_status: None,
@@ -260,6 +264,7 @@ impl Honest {
         let now = Instant::now();
         self.models = StreamModels::new(now, self.chain.clone());
         self.serving.clear();
+        self.paged = None;
         self.node_status = None;
         self.status_due = now + self.refresh;
         if !self.announce {
@@ -301,13 +306,17 @@ impl Honest {
     }
 
     /// When the peer may next become ready for `next`, its next scripted
-    /// action: for a `grant`, the end of a held grant's quiet time, and for
+    /// action: for a `grant`, the end of a held grant's quiet time, for a
+    /// `disconnect`, its last page while it still serves the node, and for
     /// any other, [`SETTLE`] after its last frame once every subscription in
     /// either direction has ended, its own included, after the node opened
     /// at least one. `None` while that can't happen yet.
     pub(crate) fn wake(&self, next: Option<PeerAction>) -> Option<Instant> {
         if next == Some(PeerAction::Grant) {
             return self.grant_opens();
+        }
+        if next == Some(PeerAction::Disconnect) {
+            return self.paged.filter(|_| !self.serving.is_empty());
         }
         let own_ended =
             self.spec.subscribe.is_none() || self.subscribed.as_ref().is_some_and(|sub| sub.ended);
@@ -572,6 +581,9 @@ impl Honest {
             return Vec::new();
         };
         self.served += 1;
+        if self.serving.is_empty() {
+            self.paged = None;
+        }
         vec![self.send(RegtestMessage::HeadersOutcome(HeadersOutcome {
             subscription_id: id,
             initial_target_tip_hash: serving.target,
@@ -591,6 +603,9 @@ impl Honest {
             while let Some(page) = self.next_page(id) {
                 out.push(self.send(page));
             }
+        }
+        if !out.is_empty() {
+            self.paged = Some(Instant::now());
         }
         out
     }

@@ -16,7 +16,9 @@
 //! event joins that address to the connection's ID, and every admitted
 //! session gets an [`Observation::Session`] row naming the peer that bound
 //! the address. That's also when the tap opens loss on the session's links,
-//! through [`Net::admitted`].
+//! through [`Net::admitted`]. A dial of the node's that fails before any
+//! connection registers is reported through the tap too, as `dial-failed`
+//! keyed by the dialed address (M5-F).
 
 use std::{
     collections::BTreeMap,
@@ -72,13 +74,16 @@ pub struct WireNode {
     seed: [u8; 32],
     /// Set once the node serves.
     endpoint: watch::Receiver<Bound>,
+    /// Where its failed dials go.
+    dials: DialReporter,
 }
 
 impl WireNode {
     /// Binds `header`'s node to [`NODE_ADDR`] on `net`, with the key and
     /// endpoint inputs `seed` gives index 0, behind a handler that registers
     /// header sync alone, at production limits on `network`, and reports to
-    /// `observer`. The handler is built in the node's own root task.
+    /// `observer`, with failed dials to `dials`. The handler is built in the
+    /// node's own root task.
     pub fn spawn(
         sim: &mut Sim,
         header: HeaderNode,
@@ -86,6 +91,7 @@ impl WireNode {
         net: SimNet,
         seed: [u8; 32],
         observer: Arc<dyn TransportObserver>,
+        dials: DialReporter,
     ) -> Self {
         let (bound, endpoint) = watch::channel(None);
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
@@ -120,18 +126,22 @@ impl WireNode {
             header,
             seed,
             endpoint,
+            dials,
         }
     }
 
     /// Spawns a task that dials peer `index` once the node serves and
     /// `listening` says the peer does too, and serves the connection until
-    /// it ends.
+    /// it ends. A dial that fails is reported as `dial-failed` on the
+    /// peer's address.
     pub fn dial(&self, sim: &mut Sim, index: usize, mut listening: watch::Receiver<bool>) {
         let mut endpoint = self.endpoint.clone();
+        let remote = peer_addr(index, 0);
         let target = NodeAddr::with_addrs(
             SeededInputs::node_key(self.seed, key_index(index)).public(),
-            [peer_addr(index, 0)],
+            [remote],
         );
+        let dials = self.dials.clone();
         sim.scheduler().spawn_root("dial", async move {
             if listening.wait_for(|up| *up).await.is_err() {
                 return;
@@ -141,9 +151,24 @@ impl WireNode {
                 Err(_) => return,
             };
             let (endpoint, limits) = bound.expect("the wait returns a bound node");
-            // Its result shows in the transport's events.
-            let _ = endpoint.dial(target, &limits).await;
+            // A connection's own events show how it went once it registers.
+            if let Err(error) = endpoint.dial(target, &limits).await {
+                dials.report(remote, error.to_string());
+            }
         });
+    }
+}
+
+/// Reports the node's failed dials into its [`TransportTap`], in order with
+/// the transport's own events.
+#[derive(Clone)]
+pub struct DialReporter(Arc<TapState>);
+
+impl DialReporter {
+    /// Buffers the failure of the dial to `remote` with `error`, or refuses
+    /// it outside the tap's run, as the observer does.
+    fn report(&self, remote: SocketAddr, error: String) {
+        self.0.push(Reported::DialFailed { remote, error });
     }
 }
 
@@ -183,7 +208,15 @@ struct Buffer {
     /// The last event number handed out.
     last: u64,
     /// Each event with its number, in order.
-    events: Vec<(u64, TransportEvent)>,
+    events: Vec<(u64, Reported)>,
+}
+
+/// One event in the tap's buffer: the transport's, or the wire node's own.
+enum Reported {
+    /// What the transport reported.
+    Event(TransportEvent),
+    /// A dial to `remote` failed with `error`.
+    DialFailed { remote: SocketAddr, error: String },
 }
 
 impl TapState {
@@ -191,6 +224,23 @@ impl TapState {
     /// elsewhere can't leave it half changed.
     fn buffer(&self) -> std::sync::MutexGuard<'_, Buffer> {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Numbers and buffers `event`, or refuses it outside the tap's run.
+    /// Neither step yields, and the buffer's std lock is never held across
+    /// another call.
+    fn push(&self, event: Reported) {
+        if zakura_rt::sim::run_id() != Some(self.run) {
+            self.refused.store(true, Ordering::Relaxed);
+            return;
+        }
+        let mut buffer = self.buffer();
+        buffer.last = buffer
+            .last
+            .checked_add(1)
+            .expect("a run reports fewer than 2^64 events");
+        let seq = buffer.last;
+        buffer.events.push((seq, event));
     }
 }
 
@@ -223,21 +273,9 @@ impl std::fmt::Debug for TapObserver {
 }
 
 impl TransportObserver for TapObserver {
-    /// Buffers `event`, or refuses it outside the tap's run. Neither step
-    /// yields, and the buffer's std lock is never held across another call.
+    /// Buffers `event`, as [`TapState::push`] does.
     fn observe(&self, event: TransportEvent) {
-        let state = &self.0;
-        if zakura_rt::sim::run_id() != Some(state.run) {
-            state.refused.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut buffer = state.buffer();
-        buffer.last = buffer
-            .last
-            .checked_add(1)
-            .expect("a run reports fewer than 2^64 events");
-        let seq = buffer.last;
-        buffer.events.push((seq, event));
+        self.0.push(Reported::Event(event));
     }
 }
 
@@ -291,6 +329,11 @@ impl TransportTap {
         (observer, tap)
     }
 
+    /// The reporter the wire node's dials fail into.
+    pub fn dials(&self) -> DialReporter {
+        DialReporter(self.state.clone())
+    }
+
     /// The remote address of registered connection `conn_id`.
     fn remote(&self, conn_id: u64) -> Result<SocketAddr, String> {
         self.remotes.get(&conn_id).copied().ok_or_else(|| {
@@ -310,8 +353,14 @@ impl TransportTap {
     /// `registered` event records its connection's address first.
     fn fact(
         &mut self,
-        event: TransportEvent,
+        event: Reported,
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
+        let event = match event {
+            Reported::Event(event) => event,
+            Reported::DialFailed { remote, error } => {
+                return Ok((None, remote, TransportFact::DialFailed { error }));
+            }
+        };
         Ok(match event {
             TransportEvent::Negotiated {
                 remote,

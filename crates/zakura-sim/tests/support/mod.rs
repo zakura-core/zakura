@@ -4,6 +4,7 @@
 
 pub mod feed;
 pub mod script;
+pub mod steer;
 
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};

@@ -219,14 +219,14 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
     ///
     /// Use it only when the send failed locally before the first byte.
     pub(crate) fn retract(&mut self, key: &K) -> bool {
-        let removed = self.live.remove(key).is_some();
-        #[cfg(any(test, zakura_sim))]
-        if removed {
+        // Reported before `is_some` drops the subscription, whose exchange's
+        // drop takes simulator locks.
+        crate::zakura::transport::sim_chain!(self.live.remove(key) => inspect(|_| {
             self.regulated(|tap| crate::zakura::Transition::OpenRetracted {
                 subscription: tap.id(key),
             });
-        }
-        removed
+        }))
+        .is_some()
     }
 
     /// Record `Grant` before writing it. It acknowledges the last page the

@@ -150,6 +150,11 @@ pub enum Trigger<K> {
     /// node under test counts once its engine switches its header tip to
     /// the fork, before its verified chain resets.
     Reset(String),
+    /// This actor prepared a `Control` chain change's headers, which it
+    /// applies in a later step. Only the block-sync node under test takes a
+    /// change in two steps, so only it counts, once per preparation, a
+    /// repeated one included.
+    Prepared(String),
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
     VirtualTime(u64),
@@ -209,7 +214,8 @@ pub(crate) enum Event {
 }
 
 /// A link effect a task made, as [`Trigger::Closed`], [`Trigger::Linked`],
-/// [`Trigger::Grown`] and [`Trigger::Reset`] count it.
+/// [`Trigger::Grown`], [`Trigger::Reset`] and [`Trigger::Prepared`] count
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -220,6 +226,8 @@ pub enum LinkEffect {
     Grown,
     /// An actor's chain switched to a fork and published its tip.
     Reset,
+    /// An actor prepared a chain change's headers, to apply them later.
+    Prepared,
 }
 
 /// What [`Predicates`] knows about one stage of an operation from that
@@ -439,6 +447,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Linked(peer) => links(LinkEffect::Linked, peer),
             Trigger::Grown(peer) => links(LinkEffect::Grown, peer),
             Trigger::Reset(peer) => links(LinkEffect::Reset, peer),
+            Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
             Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }

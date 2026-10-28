@@ -40,7 +40,8 @@ use zakura_sim::{
 
 /// Runs `scenario` under `input`, and returns the report with the ports,
 /// which outlive the run. The run must end with no violation and no
-/// harness failure.
+/// harness failure, with every sequencer snapshot matching the holder
+/// events.
 fn node_run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     let ports = Storage::prepare(scenario);
     let report = run_prepared::<Storage>(
@@ -53,7 +54,16 @@ fn node_run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert_snapshots_match(&ports);
     (report, ports)
+}
+
+/// Asserts that the view folded every event, and that each sequencer
+/// snapshot matched the holder events.
+fn assert_snapshots_match(ports: &Ports) {
+    let view = ports.view.borrow();
+    assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+    assert_eq!(view.owners.holder_gap(), None);
 }
 
 /// A checker that hands `sample` the node's view after every step.
@@ -94,6 +104,7 @@ fn sampled_run(
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert_snapshots_match(&ports);
     (report, ports)
 }
 
@@ -157,6 +168,7 @@ fn stale_query() -> BlockScenario {
                     len: 8,
                 },
                 node_first: false,
+                apply_when: None,
             },
             when: Some(Trigger::Submitted(Select::nth(BlockKind::Query, 1))),
         }],
@@ -197,6 +209,7 @@ fn delayed_apply() -> BlockScenario {
                         len: 8,
                     },
                     node_first: false,
+                    apply_when: None,
                 },
                 when: Some(Trigger::Submitted(Select::nth(BlockKind::Apply, 1))),
             },

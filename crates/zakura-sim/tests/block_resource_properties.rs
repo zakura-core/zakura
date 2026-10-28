@@ -365,7 +365,8 @@ fn lookahead_estimate_to_wire_growth() {
 }
 
 /// Runs `scenario` under `input`. The run must end with no violation and
-/// no harness failure, with every block storage operation paired.
+/// no harness failure, with every block storage operation paired, and with
+/// every sequencer snapshot matching the holder events.
 fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
     node_run_with_ports(scenario, input).0
 }
@@ -383,11 +384,12 @@ fn node_run_with_ports(scenario: &BlockScenario, input: PlanInput) -> (RunReport
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
-    assert!(
-        ports.view.borrow().pairing.is_empty(),
-        "{:?}",
-        ports.view.borrow().pairing
-    );
+    {
+        let view = ports.view.borrow();
+        assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+        assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+        assert_eq!(view.owners.holder_gap(), None);
+    }
     (report, ports)
 }
 
@@ -605,6 +607,51 @@ fn holder_inputs_the_model_cannot_apply_are_gaps() {
         assert!(owners.holder_gap().is_some(), "{input:?}");
         assert_eq!(owners.budget_gap(), None, "{input:?}");
     }
+}
+
+/// A sequencer snapshot must list every holder the model folded other than
+/// the input queue's. A snapshot that lists a body whose retain event was
+/// dropped, or omits one the events hold, leaves the holders unknown.
+#[test]
+fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
+    let model = || {
+        let mut owners = OwnerModel::new(small_limits(), 0);
+        owners.apply(OwnerInput::Request {
+            request: (1, 1),
+            heights: vec![5],
+            estimate: 3,
+        });
+        owners
+    };
+    let held = |holder| OwnerInput::Held {
+        holder,
+        request: (1, 1),
+        height: 5,
+        bytes: 3,
+    };
+    let snapshot = |holders: &[BodyHolder]| OwnerInput::Snapshot {
+        holders: holders.iter().map(|holder| (*holder, 5, 3)).collect(),
+    };
+    let mut owners = model();
+    owners.apply(held(BodyHolder::Queued(1)));
+    owners.apply(held(BodyHolder::Applying(2)));
+    owners.apply(held(BodyHolder::Submitted(9)));
+    owners.apply(snapshot(&[
+        BodyHolder::Submitted(9),
+        BodyHolder::Applying(2),
+    ]));
+    assert_eq!(owners.holder_gap(), None);
+
+    let mut dropped = model();
+    dropped.apply(snapshot(&[BodyHolder::Reorder(1)]));
+    assert_eq!(dropped.retained(), 0);
+    assert!(dropped.holder_gap().is_some());
+
+    let mut omitted = model();
+    omitted.apply(held(BodyHolder::Reorder(1)));
+    omitted.apply(snapshot(&[]));
+    assert!(omitted.holder_gap().is_some());
+    assert_eq!(omitted.budget_gap(), None);
 }
 
 /// The budget's changes chain from the empty budget, at the configured

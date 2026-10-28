@@ -325,6 +325,7 @@ impl BlockScenario {
                             len: 16,
                         },
                         node_first: false,
+                        apply_when: None,
                     },
                     when: Some(policy::Trigger::VirtualTime(12_000)),
                 },
@@ -523,12 +524,26 @@ impl Subsystem for Storage {
             scenario.blocks,
             scenario.node_bodies
         );
-        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
-            scenario
-                .control
-                .iter()
-                .filter_map(|step| step.when.as_ref()),
-        );
+        let applies = scenario
+            .control
+            .iter()
+            .filter_map(|step| match &step.action {
+                ControlAction::Grow { apply_when, .. }
+                | ControlAction::Reset { apply_when, .. } => apply_when.as_ref(),
+                _ => None,
+            });
+        let triggers = scenario
+            .policy
+            .holds
+            .iter()
+            .map(|hold| &hold.until)
+            .chain(
+                scenario
+                    .control
+                    .iter()
+                    .filter_map(|step| step.when.as_ref()),
+            )
+            .chain(applies);
         if let Some(why) = triggers.filter_map(policy::undriven).next() {
             panic!("{why}");
         }

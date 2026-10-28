@@ -6,15 +6,15 @@
 //! `observe`, the source records there what it delivered. The run then
 //! requires, at setup and after every step, that the checkpoint names that
 //! step and that the run's own log holds exactly what it records. Storage
-//! sources and reactor taps are checked the same way, each through its
-//! [`LiveEvidence`].
+//! sources, reactor taps and transport taps are checked the same way, each
+//! through its [`LiveEvidence`].
 
 use std::{cell::RefCell, rc::Rc, sync::Weak};
 
 use zakura_storage::header::controlled::ControlledPort;
 
 use crate::{
-    observe::{reactor_entries, storage_entries},
+    observe::{reactor_entries, storage_entries, transport_entries},
     Observation,
 };
 
@@ -78,6 +78,11 @@ pub(crate) enum EvidenceKind {
         /// The node's name.
         node: String,
     },
+    /// A transport tap on the node named `node`, a display label only.
+    Transport {
+        /// The node's name.
+        node: String,
+    },
 }
 
 impl EvidenceKind {
@@ -96,6 +101,7 @@ impl EvidenceKind {
         match self {
             EvidenceKind::Storage { service } => storage_entries(observations, service, instance),
             EvidenceKind::Reactor { .. } => reactor_entries(observations, instance),
+            EvidenceKind::Transport { .. } => transport_entries(observations, instance),
         }
     }
 
@@ -104,6 +110,7 @@ impl EvidenceKind {
         match self {
             EvidenceKind::Storage { service } => format!("storage:{service}#{instance}"),
             EvidenceKind::Reactor { node } => format!("reactor:{node}#{instance}"),
+            EvidenceKind::Transport { node } => format!("transport:{node}#{instance}"),
         }
     }
 
@@ -116,7 +123,7 @@ impl EvidenceKind {
                 entries: "facts",
                 refused: "the port refused use outside its run",
             },
-            EvidenceKind::Reactor { .. } => Words {
+            EvidenceKind::Reactor { .. } | EvidenceKind::Transport { .. } => Words {
                 source: "tap",
                 publisher: "tap",
                 entries: "events",

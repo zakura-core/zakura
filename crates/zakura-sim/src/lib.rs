@@ -23,6 +23,7 @@ pub mod identity;
 pub mod model;
 pub mod net;
 pub mod observe;
+pub mod peer;
 pub mod plan;
 pub mod property;
 pub mod record;

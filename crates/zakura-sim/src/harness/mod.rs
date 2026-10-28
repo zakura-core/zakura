@@ -16,6 +16,7 @@ pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
 mod record;
+pub mod wire_node;
 
 use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
 
@@ -401,6 +402,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
+    entry::<header_sync::HeaderWire>(),
 ];
 
 /// The harness named `name`.

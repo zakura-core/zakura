@@ -285,6 +285,44 @@ pub enum Observation {
         /// When it was sent, in nanoseconds since the run's start.
         sent_at: u64,
     },
+    /// One event a node's transport reported through its tap, in the order
+    /// the transport reported it.
+    Transport {
+        /// The tap's registration index among the run's transport taps, an
+        /// index space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// The connection's registration ID, or `None` for an event the
+        /// transport reports before registration assigns it.
+        connection: Option<u64>,
+        /// The remote address the connection was admitted from, which keys
+        /// it before registration.
+        remote: String,
+        /// What happened.
+        event: TransportFact,
+    },
+    /// The identity map placed a service session the node admitted: the
+    /// connection from its `registered` event, the peer that bound the
+    /// connection's remote address, and the stream from its `admitted`
+    /// event. Logged right after that event. It's read back from the
+    /// transport, never predicted from draw order.
+    Session {
+        /// The connection.
+        connection: u64,
+        /// The peer's name.
+        peer: String,
+        /// The session's QUIC stream ID, the same on both ends.
+        quic_stream: u64,
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The node's session ID for it.
+        session_id: u64,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -880,6 +918,23 @@ pub enum ReactorPurpose {
     },
 }
 
+/// The events that transport tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn transport_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::Transport { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
 /// The events that reactor tap `instance` logged in `observations`, in
 /// order.
 pub(crate) fn reactor_entries<'o>(
@@ -976,6 +1031,240 @@ pub enum DatagramOutcome {
     Lost,
     /// Nothing was bound at its destination when it arrived.
     Unbound,
+}
+
+/// A transport event in plain fields, in [`Observation::Transport`]. Each
+/// mirrors the transport observer's event of the same name. Frame sequence
+/// numbers count from 0 per QUIC stream: reads in the order their headers
+/// arrived, writes in the order they started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum TransportFact {
+    /// The control handshake succeeded.
+    Negotiated {
+        /// The capability mask the node sent: its hello's, or, as the
+        /// responder, the mask it intersected with the peer's hello.
+        local: u64,
+        /// The capability mask the peer sent: its hello's, or its ack's.
+        offered: u64,
+        /// The capability mask the connection uses.
+        negotiated: u64,
+    },
+    /// The connection was refused before registration.
+    HandshakeRefused {
+        /// The handshake error, or the refusal's trace label.
+        reason: String,
+    },
+    /// The supervisor registered the connection as `connection`.
+    Registered,
+    /// A service session's stream started.
+    Admitted {
+        /// The stream's QUIC stream ID.
+        quic_stream: u64,
+        /// The stream kind.
+        kind: u16,
+        /// The stream version.
+        version: u16,
+        /// The service session's ID.
+        session_id: u64,
+        /// The connection's limits after negotiation and clamping.
+        limits: TransportLimits,
+        /// Frames the reader may queue for the service.
+        inbound_depth: u64,
+        /// Frames the service may queue for the writer.
+        outbound_depth: u64,
+    },
+    /// The reader has a frame's 8 header bytes, before any check of them.
+    HeaderRead {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+        /// The header's message type.
+        message_type: u16,
+        /// The header's flags.
+        flags: u16,
+        /// The header's declared payload length.
+        payload_len: u32,
+    },
+    /// The reader has the frame's whole payload.
+    FrameRead {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's reads.
+        seq: u64,
+    },
+    /// A regulation table changed state, inside the lock that applied it.
+    Regulated {
+        /// The service session's QUIC stream.
+        quic_stream: u64,
+        /// What changed.
+        transition: TransitionFact,
+    },
+    /// An unknown, unnegotiated or unselected stream was reset without
+    /// closing the connection.
+    StreamRefused {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The prelude's stream kind.
+        kind: u16,
+        /// The prelude's stream version.
+        version: u16,
+        /// Why, as the stream trace names it.
+        reason: String,
+    },
+    /// The writer is about to hand a frame's first bytes to the stream.
+    FrameWriteStarted {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's writes.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+    },
+    /// The writer finished writing a frame.
+    FrameWritten {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The frame's position among this stream's writes.
+        seq: u64,
+        /// The frame's message type.
+        message_type: u16,
+    },
+    /// The node decided to close the connection: its first recorded close
+    /// cause, or `None` for a cancellation with no cause recorded first.
+    CloseDecided {
+        /// The first recorded cause, such as `unexpected_stream`.
+        cause: Option<String>,
+    },
+    /// The connection's workers drained and its peer was unregistered.
+    TornDown,
+}
+
+/// A connection's limits after negotiation, in [`TransportFact::Admitted`],
+/// with durations in milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TransportLimits {
+    /// Maximum encoded frame bytes.
+    pub max_frame_bytes: u32,
+    /// Maximum reassembled message bytes.
+    pub max_message_bytes: u32,
+    /// Maximum concurrent streams.
+    pub max_open_streams: u16,
+    /// Bounded inbound queue depth.
+    pub max_inbound_queue_depth: u16,
+    /// Application idle timeout.
+    pub idle_timeout_ms: u64,
+    /// Stream prelude read timeout.
+    pub prelude_timeout_ms: u64,
+    /// Control handshake timeout.
+    pub control_timeout_ms: u64,
+    /// Per-connection stream-open rate.
+    pub stream_open_rate_per_second: u32,
+    /// Per-stream-kind message rate.
+    pub message_rate_per_second: u32,
+}
+
+/// A regulation table's state change, in [`TransportFact::Regulated`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "transition", rename_all = "kebab-case")]
+pub enum TransitionFact {
+    /// The subscriber's precheck judged the response header `seq`.
+    HeaderChecked {
+        /// The frame's position among the stream's reads.
+        seq: u64,
+        /// The verdict.
+        outcome: HeaderCheckFact,
+    },
+    /// The service claimed a page the reader had reserved.
+    PageClaimed {
+        /// The page's position among the stream's reads, if it was tagged.
+        seq: Option<u64>,
+        /// Objects the page spent.
+        objects: u32,
+        /// Payload bytes the page spent.
+        bytes: u64,
+    },
+    /// A subscription the node opened ended with its terminal outcome.
+    EndClaimed {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// A subscription the peer opened on the node ended.
+    PublicationEnded {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The publisher applied the peer's `Open` and its initial credit.
+    OpenApplied {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the `Open` granted.
+        objects: u32,
+        /// Bytes the `Open` granted.
+        bytes: u32,
+        /// The `Open` frame's position among the stream's reads, if it was
+        /// tagged.
+        seq: Option<u64>,
+    },
+    /// The publisher applied the peer's `Close` to a live subscription.
+    CloseApplied {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The publisher applied the peer's `Grant` to a live subscription.
+    GrantApplied {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the grant added.
+        objects: u32,
+        /// Bytes the grant added.
+        bytes: u32,
+    },
+    /// The node recorded its own `Open` before writing it.
+    OpenIssued {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the `Open` grants.
+        objects: u32,
+        /// Bytes the `Open` grants.
+        bytes: u32,
+    },
+    /// The node removed its own `Open`, whose frame was dropped before its
+    /// first byte was written.
+    OpenRetracted {
+        /// The subscription.
+        subscription: u64,
+    },
+    /// The node recorded its own `Grant` before writing it.
+    GrantIssued {
+        /// The subscription.
+        subscription: u64,
+        /// Objects the grant adds.
+        objects: u32,
+        /// Bytes the grant adds.
+        bytes: u32,
+    },
+}
+
+/// The subscriber precheck's verdict, in [`TransitionFact::HeaderChecked`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum HeaderCheckFact {
+    /// A page, charged to the queue until the service claims it.
+    Reserved {
+        /// Objects charged.
+        objects: u64,
+        /// Payload bytes charged.
+        bytes: u64,
+    },
+    /// A terminal outcome for a live subscription, which takes no charge.
+    AdmittedTerminal,
+    /// Refused, closing the connection.
+    Refused {
+        /// The rejection's label, such as `unsolicited`.
+        reason: String,
+    },
 }
 
 /// How a task ended.

@@ -1,9 +1,10 @@
 //! Header-sync harnesses. `header-sync/smoke` runs the reactor on the step
 //! loop with inert storage and no peers. `header-sync/storage` runs a node
 //! on controlled storage with mirror peers (M4), with the node's reactor
-//! tapped.
+//! tapped. `header-sync/wire` runs the same node behind its real transport
+//! on simulated QUIC, with scripted peers (M5-C).
 
-use std::{any::Any, collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
@@ -23,10 +24,12 @@ use super::{
         preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects, HeaderNode,
         Policy, PolicySource, Topology,
     },
-    Subsystem,
+    wire_node::{TransportTap, WireNode},
+    NetScenario, Subsystem,
 };
 use crate::{
     observe::StorageFact,
+    peer::{Dialer as PeerDialer, PeerControl, PeerSpec, PeerTask, NODE_ADDR},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
     Observation, RunConfig, Sim,
 };
@@ -329,6 +332,191 @@ impl Subsystem for Storage {
     /// The default scenario.
     fn draw(_: &[u8]) -> StorageScenario {
         StorageScenario::default()
+    }
+}
+
+/// The `header-sync/wire` scenario.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireScenario {
+    /// The network: its seed, links and loss gate.
+    #[serde(default)]
+    pub net: NetScenario,
+    /// The chain the node holds when the run starts.
+    pub node: Chain,
+    /// The scripted peers, named `peer-<i>` by index.
+    pub peers: Vec<PeerSpec>,
+    /// How the run completes the node's storage operations.
+    pub policy: Policy,
+}
+
+impl Default for WireScenario {
+    /// The node at genesis, dialed by one peer that offers header sync
+    /// alone, under the converging policy.
+    fn default() -> Self {
+        WireScenario {
+            net: NetScenario::default(),
+            node: Chain::default(),
+            peers: vec![PeerSpec::dialing()],
+            policy: Policy::converging(),
+        }
+    }
+}
+
+/// The wire scenario's storage: the fixture and the node's controlled port
+/// with its chain committed. Cloning shares the port.
+#[derive(Clone)]
+pub struct WirePorts {
+    /// The fixture the node's chain comes from.
+    pub fixture: HeaderFixture,
+    /// The node's controlled port.
+    pub node: Arc<ControlledPort>,
+}
+
+/// The node under test, named `node`, on a controlled port behind its real
+/// transport on simulated QUIC, with scripted peers. It's checked by
+/// [`storage_properties`].
+pub struct HeaderWire {
+    port: Arc<ControlledPort>,
+    dispatch: DispatchFlag,
+    /// The node and the peers' state. They live until the run ends, so no
+    /// task sees its inputs close.
+    _keep: Box<dyn Any>,
+}
+
+impl HasView for HeaderWire {
+    type View = StorageView;
+
+    /// The node's port and the dispatch guard's flag.
+    fn view(&self) -> StorageView {
+        StorageView {
+            port: self.port.clone(),
+            direct_dispatch_broken: self.dispatch.get(),
+        }
+    }
+}
+
+impl Subsystem for HeaderWire {
+    const NAME: &'static str = "header-sync/wire";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = WireScenario;
+    type Prepared = WirePorts;
+
+    /// [`wire_config`].
+    fn config(_: &WireScenario) -> RunConfig {
+        wire_config()
+    }
+
+    /// Commits the node's chain to its port.
+    fn prepare(scenario: &WireScenario) -> WirePorts {
+        let fixture = HeaderFixture::regtest();
+        let node = Arc::new(ControlledPort::new(&fixture));
+        preload(node.engine(), &fixture, &scenario.node);
+        WirePorts { fixture, node }
+    }
+
+    /// Adds the network, then spawns the node as `header-sync/storage` does,
+    /// with its reactor tapped, behind its transport, which its own tap
+    /// reports. Then spawns each peer, and a dial for each peer the node
+    /// dials, and adds the peers' action source.
+    fn build(sim: &mut Sim, scenario: &WireScenario, ports: WirePorts) -> Self {
+        let net = scenario.net.net();
+        sim.add_source(Box::new(net.clone()));
+        let dispatch = DispatchFlag::default();
+        let storage = PolicySource::new(
+            sim,
+            ports.node.clone(),
+            scenario.policy.clone(),
+            Effects::default(),
+        );
+        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        sim.add_source(Box::new(storage.with_tap(tap)));
+        let header = HeaderNode::spawn(
+            sim,
+            "node",
+            1,
+            ports.node.clone(),
+            &ports.fixture,
+            scenario.node.tip(&ports.fixture),
+            dispatch.clone(),
+            Some(observer),
+        );
+        let names: Vec<String> = (0..scenario.peers.len())
+            .map(|index| format!("peer-{index}"))
+            .collect();
+        let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
+        sim.add_source(Box::new(tap));
+        let node = WireNode::spawn(
+            sim,
+            header,
+            ports.fixture.network(),
+            net.sim(),
+            scenario.net.seed,
+            observer,
+        );
+        let failure = Rc::new(RefCell::new(None));
+        let mut control = PeerControl::new(failure.clone());
+        for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
+            let (readiness, commands) = control.add(&name, spec.script.clone());
+            let (listening, listened) = zakura_rt::sync::watch::channel(false);
+            let task = PeerTask {
+                name,
+                index,
+                spec: spec.clone(),
+                seed: scenario.net.seed,
+                net: net.sim(),
+                node: zakura_quic::NodeAddr::with_addrs(
+                    zakura_quic::sim::SeededInputs::node_key(scenario.net.seed, 0).public(),
+                    [NODE_ADDR],
+                ),
+                commands,
+                readiness,
+                failure: failure.clone(),
+                listening,
+            };
+            sim.scheduler().spawn_root("peer", task.run());
+            if spec.dialer == PeerDialer::Node {
+                node.dial(sim, index, listened);
+            }
+        }
+        sim.add_source(Box::new(control));
+        HeaderWire {
+            port: ports.node,
+            dispatch,
+            _keep: Box::new(node),
+        }
+    }
+
+    /// [`storage_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        storage_properties()
+    }
+
+    /// [`storage_sources`], plus the network's datagrams.
+    fn sources() -> Sources {
+        Sources::observed(&[
+            Source::Schedule,
+            Source::Storage,
+            Source::View,
+            Source::Datagrams,
+        ])
+    }
+
+    /// The default scenario.
+    fn draw(_: &[u8]) -> WireScenario {
+        WireScenario::default()
+    }
+}
+
+/// The wire run's config: the default scheduler, and room for QUIC
+/// handshakes, stream setup and a few scripted actions.
+pub fn wire_config() -> RunConfig {
+    RunConfig {
+        scheduler: SchedulerConfig::default(),
+        budget: 30_000,
+        drain_bound: 2_000,
+        ..RunConfig::default()
     }
 }
 

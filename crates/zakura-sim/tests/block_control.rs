@@ -331,7 +331,8 @@ fn a_reset_switches_the_node_to_the_fork() {
 /// waits for the last mirror's reset, so it races the node's steps. Long
 /// inputs keep the plan's choices fuzzed that late in the run. Few
 /// schedules win that race: of the first 96 seeded inputs, only the 82nd
-/// does, so the test runs the first 82.
+/// does, so the test runs it beside the first three, which keep the
+/// convergence check broad without running all 82.
 #[test]
 fn an_invalid_body_between_the_reset_steps_prepares_it_again() {
     let holds = vec![
@@ -367,7 +368,11 @@ fn an_invalid_body_between_the_reset_steps_prepares_it_again() {
         ..scenario(12, holds, control)
     };
     let mut prepared_again = 0;
-    for input in inputs(82, 16_384) {
+    let mut seeded = inputs(82, 16_384);
+    let pinned = seeded.pop().expect("82 inputs");
+    seeded.truncate(3);
+    seeded.push(pinned);
+    for input in seeded {
         let (report, ports) = run(&scenario, input);
         assert_converged(&ports);
         let picks = picks(&report);

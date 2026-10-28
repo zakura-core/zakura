@@ -5,4 +5,4 @@
 # block sync while the fork's first submission waits in storage.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "7e4b9454fbe9854a1441ef03ace3bb06c62d74d022c23a2d21c53a8197831075"
+sha256 = "6b2dad67d4f0e5201585777119140090e4108ec1de00d8b5682964cf3eaa7785"

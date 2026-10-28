@@ -582,12 +582,12 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
-        joinsplit_data: Some(zakura_chain::transaction::JoinSplitData {
+        joinsplit_data: Some(Box::new(zakura_chain::transaction::JoinSplitData {
             first: joinsplit,
             rest: Vec::new(),
             pub_key: zakura_chain::primitives::ed25519::VerificationKeyBytes::from([0; 32]),
             sig: zakura_chain::primitives::ed25519::Signature::from([0; 64]),
-        }),
+        })),
         sapling_shielded_data: None,
     })
 }
@@ -628,7 +628,7 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
             outputs: Vec::new(),
             sapling_shielded_data: None,
             orchard_shielded_data: None,
-            ironwood_shielded_data: Some(ironwood_shielded_data),
+            ironwood_shielded_data: Some(Box::new(ironwood_shielded_data)),
         }),
         nullifier,
     )

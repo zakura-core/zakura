@@ -294,10 +294,10 @@ so only a reader that sees no request in transition can compare them.
 
 ## Known limitations and follow-ups
 
-- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is an average, not a bound: real
-  Mainnet blocks decode at up to about 3.45× their wire size, the worst consensus-valid
-  block at about 26×. Admission therefore charges the larger of the factor's estimate and
-  the measured decoded heap. The factor remains a floor so the gate never loosens on
+- **Decoded-memory factor.** Real Mainnet blocks decode at up to about 3.45× their wire
+  size, the worst consensus-valid block at about 3.6×. Junk bodies can decode larger before
+  the Merkle check rejects them. Admission therefore charges the larger of the factor's
+  estimate and the measured decoded heap. The factor remains a floor so the gate never loosens on
   typical blocks. `estimated_resident_pipeline_bytes` is the single calibration point.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its
   count is not); the channel is bounded by the submit window (401 by default), which is

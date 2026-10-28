@@ -58,7 +58,7 @@ fn ironwood_v6_tx(
         outputs: Vec::new(),
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood::ShieldedData {
+        ironwood_shielded_data: Some(Box::new(ironwood::ShieldedData {
             flags: orchard::Flags::ENABLE_SPENDS,
             value_balance: Amount::zero(),
             shared_anchor: tree::Root::default(),
@@ -68,7 +68,7 @@ fn ironwood_v6_tx(
                 spend_auth_sig: [0u8; 64].into(),
             }],
             binding_sig: [0u8; 64].into(),
-        }),
+        })),
     })
 }
 

@@ -265,8 +265,8 @@ mod tests {
             }],
             outputs: vec![],
             sapling_shielded_data: None,
-            orchard_shielded_data,
-            ironwood_shielded_data,
+            orchard_shielded_data: orchard_shielded_data.map(Box::new),
+            ironwood_shielded_data: ironwood_shielded_data.map(Box::new),
         }
     }
 

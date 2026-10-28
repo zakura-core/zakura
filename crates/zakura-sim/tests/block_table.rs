@@ -6,8 +6,9 @@
 //! on the real routine, serving session and sequencer. These tests show
 //! that the harness registers exactly the generated stream-6 IDs, that an
 //! honest run holds every one it reaches with each judged frame labelled
-//! once, that each probe fault reaches its exact ID, and that a scripted
-//! bypass violates each ID.
+//! once, that each probe fault reaches its exact ID, that each relay
+//! label and adapter effect a check reads is the one the node acted on, and
+//! that a scripted bypass violates each ID.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -16,7 +17,7 @@ use support::{
     inputs,
     script::{run_under, Node, OBSERVED},
 };
-use zakura_network::zakura::block_sync_streams;
+use zakura_network::zakura::{block_sync_streams, BlockSyncMessage};
 use zakura_sim::{
     harness::{
         block_node::{
@@ -25,13 +26,13 @@ use zakura_sim::{
             probe::ProbeFrame,
             Policy, PROBE,
         },
-        block_sync::{table_wiring_properties, BlockScenario, Storage, FAMILY},
+        block_sync::{table_wiring_properties, BlockScenario, Ports, Storage, FAMILY},
         run_prepared, Subsystem,
     },
     model::Label,
-    observe::{RowAt, StreamId},
+    observe::{RowAt, StorageFact, StorageRequest, StreamId},
     table::{GeneratedId, Template},
-    MemorySink, Observation, PropertyOutcome, RunReport,
+    MemorySink, Observation, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Stream 6 at the regulated version.
@@ -50,21 +51,62 @@ fn row(row: &str) -> RowAt {
     RowAt::new(STREAM, row)
 }
 
-/// Runs `scenario` under each of `count` plan inputs, and returns each
-/// report. No run may end at a harness failure: a judged frame without
-/// exactly one label is one.
+/// Runs `scenario` under `input`, and returns its report and ports. No run
+/// may end at a harness failure: a judged frame without exactly one label
+/// is one.
+fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
+    let ports = Storage::prepare(scenario);
+    let report = run_prepared::<Storage>(
+        scenario,
+        ports.clone(),
+        input,
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    (report, ports)
+}
+
+/// Runs `scenario` under each of `count` plan inputs, as [`run`] does, and
+/// returns each report.
 fn runs(scenario: &BlockScenario, count: usize) -> Vec<RunReport> {
     inputs(count, 256)
         .into_iter()
-        .map(|input| {
-            let ports = Storage::prepare(scenario);
-            let report =
-                run_prepared::<Storage>(scenario, ports, input, &mut MemorySink::default(), None)
-                    .unwrap_or_else(|error| panic!("{error}"));
-            assert_eq!(report.end.harness, None, "{:?}", report.end);
-            report
+        .map(|input| run(scenario, input).0)
+        .collect()
+}
+
+/// The close causes in `report`, in order.
+fn causes(report: &RunReport) -> Vec<&str> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::ConnectionClosed { cause, .. } => Some(cause.as_str()),
+            _ => None,
         })
         .collect()
+}
+
+/// A hold on the node's `nth` range read until the probe's connection
+/// closes.
+fn held_read(nth: u32) -> Hold {
+    Hold {
+        select: Select::nth(BlockKind::Read, nth),
+        until: Trigger::Closed(PROBE.to_owned()),
+        then: vec![BlockAllow::Serve, BlockAllow::Error],
+        deadline_ms: None,
+    }
+}
+
+/// A request for `count` bodies from `start_height`.
+fn get_blocks(start_height: u32, count: u32) -> ProbeFrame {
+    ProbeFrame::GetBlocks {
+        start_height,
+        count,
+    }
 }
 
 /// The outcome `report` gives `id`.
@@ -237,43 +279,12 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
-/// Five generated IDs no block-sync scenario reaches, which stay
-/// `NotApplicable`:
-/// - `get-blocks/over-margin-closes`: the node's default config advertises
-///   a request limit no probe script can exceed twice over, and the
-///   scenario can't lower it;
-/// - each ending's `over-owed-closes`: every exchange owes room for its
-///   ending, and conformant bodies leave it;
-/// - each ending's `receiver-work-authorized`: an ending carries no work.
-#[test]
-fn ids_no_scenario_reaches_stay_not_applicable() {
-    for scenario in [honest_sync(), honest_serving()] {
-        for report in runs(&scenario, 1) {
-            for suffix in [
-                "get-blocks/over-margin-closes",
-                "blocks-done/over-owed-closes",
-                "range-unavailable/over-owed-closes",
-                "blocks-done/receiver-work-authorized",
-                "range-unavailable/receiver-work-authorized",
-            ] {
-                assert_eq!(
-                    *outcome(&report, &id(suffix)),
-                    PropertyOutcome::NotApplicable,
-                    "{suffix}"
-                );
-            }
-        }
-    }
-}
-
-/// Each probe fault the node judges outside any exchange of its own reaches
-/// its exact `<label>-closes` ID, and the node's fault close discharges it:
-/// undeclared types, flags, short and long payloads on every row, bad
-/// content on the rows the codec checks, unsolicited responses, and an
-/// overlapping request while the first one's read is held. A burst of
-/// statuses empties the cadence bucket, and the node punishes nothing.
-#[test]
-fn each_probe_fault_reaches_its_exact_id() {
+/// Each probe fault the node judges outside any exchange of its own, by the
+/// ID it reaches: undeclared types, flags, short and long payloads on every
+/// row, bad content on the rows the codec checks, unsolicited responses,
+/// and an overlapping request while the first one's read is held. A burst
+/// of statuses empties the cadence bucket.
+fn probe_faults() -> Vec<(&'static str, BlockScenario)> {
     let mut cases = vec![
         ("undeclared-type-closes", probe(vec![raw(9, 0, 1)])),
         ("status/bad-content-closes", probe(vec![raw(1, 0, 53)])),
@@ -350,52 +361,32 @@ fn each_probe_fault_reaches_its_exact_id() {
     }
     // The node's read for the first request stays held until the probe's
     // connection closes, so the overlap is certain.
-    let mut overlap = probe(vec![
-        ProbeFrame::GetBlocks {
-            start_height: 1,
-            count: 1,
-        },
-        ProbeFrame::GetBlocks {
-            start_height: 1,
-            count: 1,
-        },
-    ]);
+    let mut overlap = probe(vec![get_blocks(1, 1), get_blocks(1, 1)]);
     overlap.policy = Policy {
-        holds: vec![Hold {
-            select: Select::nth(BlockKind::Read, 1),
-            until: Trigger::Closed(PROBE.to_owned()),
-            then: vec![BlockAllow::Serve, BlockAllow::Error],
-            deadline_ms: None,
-        }],
+        holds: vec![held_read(1)],
         ..Policy::converging()
     };
     cases.push(("get-blocks/bad-content-closes", overlap));
-    for (suffix, scenario) in cases {
-        for report in runs(&scenario, 2) {
-            assert_eq!(report.end.violation, None, "{suffix}: {:?}", report.end);
-            assert!(
-                held(&report, &id(suffix)),
-                "{suffix}: {:?}",
-                report.properties
-            );
-        }
-    }
+    cases
 }
 
-/// Found by the wiring: a fault in a response to the node's own open
-/// request closes the probe's connection, but the close records
-/// `unfinished_exchange`, the writer fence's no-fault cause, before the
-/// routine's `service_protocol_reject`. So an over-owed body, an
-/// undecodable body, and an ending that disagrees with the bodies before it
-/// each violate their exact ID, and the probe goes unpunished.
-#[test]
-fn faults_inside_the_nodes_exchange_close_without_a_fault_cause() {
-    let body = ProbeFrame::Block { height: 1 };
-    for (suffix, scenario) in [
-        ("block/over-owed-closes", requested(1_000, vec![body])),
+/// Each probe fault inside the node's own exchange, by the ID it reaches:
+/// a body over the bytes the node's request allows, an undecodable body, a
+/// body whose header doesn't commit to its transactions, and endings that
+/// disagree with the bodies before them.
+fn exchange_faults() -> Vec<(&'static str, BlockScenario)> {
+    vec![
+        (
+            "block/over-owed-closes",
+            requested(1_000, vec![ProbeFrame::Block { height: 1 }]),
+        ),
         (
             "block/bad-content-closes",
             requested(2_000_000, vec![raw(3, 0, 2)]),
+        ),
+        (
+            "block/bad-content-closes",
+            requested(2_000_000, vec![ProbeFrame::TamperedBlock { height: 1 }]),
         ),
         (
             "blocks-done/bad-content-closes",
@@ -412,7 +403,7 @@ fn faults_inside_the_nodes_exchange_close_without_a_fault_cause() {
             requested(
                 2_000_000,
                 vec![
-                    body,
+                    ProbeFrame::Block { height: 1 },
                     ProbeFrame::RangeUnavailable {
                         start_height: 1,
                         count: 1,
@@ -420,25 +411,235 @@ fn faults_inside_the_nodes_exchange_close_without_a_fault_cause() {
                 ],
             ),
         ),
-    ] {
-        for report in runs(&scenario, 2) {
-            let violation = report
-                .end
-                .violation
-                .as_ref()
-                .expect("the close has no fault cause");
-            assert_eq!(violation.property, id(suffix), "{:?}", report.end);
-            let causes: Vec<_> = report
-                .log
-                .entries()
-                .iter()
-                .filter_map(|entry| match &entry.obs {
-                    Observation::ConnectionClosed { cause, .. } => Some(cause.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(causes, ["unfinished_exchange"], "{suffix}");
+    ]
+}
+
+/// The node holds every fixture body and serves one request at a time.
+/// The probe sends three requests while the node's first two reads are
+/// held, which is past twice its limit.
+fn over_margin() -> BlockScenario {
+    BlockScenario {
+        serving_limit: Some(1),
+        policy: Policy {
+            holds: vec![held_read(1), held_read(2)],
+            ..Policy::converging()
+        },
+        ..probe(vec![get_blocks(1, 1), get_blocks(2, 1), get_blocks(3, 1)])
+    }
+}
+
+/// Four generated IDs no block-sync scenario reaches stay `NotApplicable`
+/// in every scenario these tests run:
+/// - each ending's `over-owed-closes`: every exchange owes room for its
+///   ending, and conformant bodies leave it;
+/// - each ending's `receiver-work-authorized`: an ending carries no body,
+///   so the node admits no work from it.
+#[test]
+fn ids_no_scenario_reaches_stay_not_applicable() {
+    let scenarios = [honest_sync(), honest_serving(), over_margin()]
+        .into_iter()
+        .chain(probe_faults().into_iter().map(|(_, scenario)| scenario))
+        .chain(exchange_faults().into_iter().map(|(_, scenario)| scenario));
+    for scenario in scenarios {
+        for report in runs(&scenario, 1) {
+            for suffix in [
+                "blocks-done/over-owed-closes",
+                "range-unavailable/over-owed-closes",
+                "blocks-done/receiver-work-authorized",
+                "range-unavailable/receiver-work-authorized",
+            ] {
+                assert_eq!(
+                    *outcome(&report, &id(suffix)),
+                    PropertyOutcome::NotApplicable,
+                    "{suffix}"
+                );
+            }
         }
+    }
+}
+
+/// Each probe fault the node judges outside any exchange of its own reaches
+/// its exact `<label>-closes` ID, and the node's fault close discharges it.
+/// The cadence burst reaches `cadence-never-closes`, and the node punishes
+/// nothing.
+#[test]
+fn each_probe_fault_reaches_its_exact_id() {
+    for (suffix, scenario) in probe_faults() {
+        for report in runs(&scenario, 2) {
+            assert_eq!(report.end.violation, None, "{suffix}: {:?}", report.end);
+            assert!(
+                held(&report, &id(suffix)),
+                "{suffix}: {:?}",
+                report.properties
+            );
+        }
+    }
+}
+
+/// Each probe fault inside the node's own exchange reaches its exact ID,
+/// and the node's fault close discharges it: the node's stream reader
+/// refuses an over-owed body's header, and the routine rejects the rest.
+/// The node also reports the tampered body's sender as misbehaving.
+#[test]
+fn faults_inside_the_nodes_exchange_reach_their_exact_ids() {
+    for (suffix, scenario) in exchange_faults() {
+        let tampered = matches!(
+            scenario.control[1].action,
+            ControlAction::ProbeSend { ref frames } if matches!(frames[..], [ProbeFrame::TamperedBlock { .. }])
+        );
+        for report in runs(&scenario, 2) {
+            assert_eq!(report.end.violation, None, "{suffix}: {:?}", report.end);
+            assert!(
+                held(&report, &id(suffix)),
+                "{suffix}: {:?}",
+                report.properties
+            );
+            let causes = causes(&report);
+            assert!(
+                matches!(causes[..], [cause] if cause != "unfinished_exchange"),
+                "{suffix}: {causes:?}"
+            );
+            if tampered {
+                assert!(
+                    report
+                        .log
+                        .entries()
+                        .iter()
+                        .any(|entry| matches!(entry.obs, Observation::Misbehavior { .. })),
+                    "the node reports the tampered body's sender"
+                );
+            }
+        }
+    }
+}
+
+/// Requests past twice the node's serving limit, while none is served,
+/// reach `get-blocks/over-margin-closes`, and the node's close discharges
+/// it.
+#[test]
+fn requests_past_twice_the_serving_limit_reach_over_margin() {
+    for report in runs(&over_margin(), 4) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            held(&report, &id("get-blocks/over-margin-closes")),
+            "{:?}",
+            report.properties
+        );
+    }
+}
+
+/// The relay judges a request's overlap against the ranges the node still
+/// serves when it judges the request. A repeat of a request the node may
+/// already have answered holds every ID, whichever way the run orders the
+/// node's ending and its judgment. A request inside an earlier range's full
+/// count, while that range's read is held, reaches
+/// `get-blocks/bad-content-closes`.
+#[test]
+fn an_overlap_is_judged_against_the_nodes_live_ranges() {
+    for report in runs(&probe(vec![get_blocks(1, 1), get_blocks(1, 1)]), 8) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+    }
+    let mut inside = probe(vec![get_blocks(1, 4), get_blocks(2, 1)]);
+    inside.policy = Policy {
+        holds: vec![held_read(1)],
+        ..Policy::converging()
+    };
+    for report in runs(&inside, 2) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            held(&report, &id("get-blocks/bad-content-closes")),
+            "{:?}",
+            report.properties
+        );
+    }
+}
+
+/// A repeated body inside the node's open range is a local incompatibility,
+/// not a fault: the run holds every ID, and the node admits the body's work
+/// once, from the frame that delivered it first.
+#[test]
+fn a_repeated_body_admits_its_work_once() {
+    let body = ProbeFrame::Block { height: 1 };
+    for report in runs(&requested(2_000_000, vec![body, body]), 4) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            held(&report, &id("block/receiver-work-authorized")),
+            "{:?}",
+            report.properties
+        );
+    }
+}
+
+/// A verifier verdict against a mirror's body makes the node report the
+/// mirror, which no relay label justifies. The adapter writes no
+/// punishment for that mirror, so the run holds every ID.
+#[test]
+fn a_verifier_verdict_punishes_without_a_violation() {
+    let scenario = BlockScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(BlockKind::Apply, 1),
+                until: Trigger::VirtualTime(1),
+                then: vec![BlockAllow::ConsensusInvalid, BlockAllow::PayloadMismatch],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..honest_sync()
+    };
+    for report in runs(&scenario, 4) {
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(
+            report.log.entries().iter().any(|entry| matches!(
+                &entry.obs,
+                Observation::Storage {
+                    fact: StorageFact::BlockSubmitted {
+                        request: StorageRequest::Misbehavior { .. },
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "the node reports the mirror"
+        );
+    }
+}
+
+/// Each `NodeOutput` carries the payload length of the response frame the
+/// node sent, in the order the probe received them.
+#[test]
+fn node_outputs_carry_the_frames_the_node_sent() {
+    for input in inputs(4, 256) {
+        let (report, ports) = run(&honest_serving(), input);
+        let sent: Vec<u64> = ports
+            .probe
+            .received()
+            .into_iter()
+            .map(|message| message.expect("the node sends frames the codec reads"))
+            .filter(|message| {
+                matches!(
+                    message,
+                    BlockSyncMessage::Block(_)
+                        | BlockSyncMessage::BlocksDone { .. }
+                        | BlockSyncMessage::RangeUnavailable { .. }
+                )
+            })
+            .map(|message| {
+                let frame = message.encode_frame().expect("a read message encodes");
+                u64::try_from(frame.payload.len()).expect("a payload length fits in u64")
+            })
+            .collect();
+        let outputs: Vec<u64> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry.obs {
+                Observation::NodeOutput { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 5, "{sent:?}");
+        assert_eq!(outputs, sent);
     }
 }
 

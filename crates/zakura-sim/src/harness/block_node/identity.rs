@@ -8,13 +8,24 @@
 //! storage watermark; and, from the events themselves:
 //! - `SessionAdmitted` maps the session, and the peer's newest connection,
 //!   to the connection;
-//! - `FrameJudged` becomes [`Observation::FrameJudged`], numbered from 0 as
-//!   the relay numbers the peer's frames;
-//! - a body entering the sequencer's input queue after its handoff becomes
+//! - `FrameJudged`, and a relay's record of a header the node's reader
+//!   refused, become [`Observation::FrameJudged`], numbered from 0 as the
+//!   relay numbers the peer's frames, after the label of a request that
+//!   waited for it;
+//! - a body entering the sequencer's input queue becomes
 //!   [`Observation::WorkAdmitted`], from the frame that delivered it;
 //! - a serving lease's acquisition and release become
 //!   [`Observation::Serving`] and [`Observation::ServingEnded`];
-//! - a queued serving frame becomes [`Observation::NodeOutput`].
+//! - a serving admission settles the label of a request that waited for
+//!   the node's timing.
+//!
+//! A request that waits for the node's timing gets its label when the
+//! node's serving session judges it: the relay's [`Settle`] reads the
+//! ranges the session still served then. The adapter writes the label, then
+//! the exchange's [`Observation::ExchangeOwed`] if it settles `Conformant`,
+//! then the frame's [`Observation::FrameJudged`]. A request the session
+//! never judged keeps the relay's label, written when the node judges the
+//! frame some other way or its connection closes.
 //!
 //! A `Misbehavior` request becomes [`Observation::Misbehavior`] on the
 //! peer's newest connection, and a link's recorded close cause
@@ -35,12 +46,22 @@ use zakura_network::zakura::{
     ZakuraPeerId, MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
 };
 
-use super::relay::{row, row_name, stream, Wire};
+use super::relay::{row, row_name, stream, Record, Settle, Wire};
 use crate::{
+    model::Label,
     observe::{StorageFact, StorageRequest},
     storage::hex,
     Observation, ObservationLog,
 };
+
+/// A request that waits for the node to judge it.
+struct Held {
+    /// Its frame, with the relay's label.
+    frame: Observation,
+    settle: Settle,
+    /// Its exchange's record, once the relay opened it.
+    owed: Vec<Observation>,
+}
 
 /// Writes the generated observations of one node's block sync.
 pub(crate) struct Adapter {
@@ -49,12 +70,19 @@ pub(crate) struct Adapter {
     sessions: BTreeMap<u64, u64>,
     /// Each peer's newest connection, by its ID in hex.
     peers: BTreeMap<String, u64>,
-    /// Bodies handed off and not yet queued, by owner session and height.
-    handoffs: BTreeSet<(u64, u32)>,
     /// Each submitted body's supplier, by operation ID.
     suppliers: BTreeMap<u64, String>,
     /// Peers the verifier judged invalid.
     judged: BTreeSet<String>,
+    /// Requests waiting for the node to judge them, by connection and
+    /// frame number.
+    held: BTreeMap<(u64, u64), Held>,
+    /// The request the node judged and its serving session hasn't yet, by
+    /// connection, with its frame number.
+    admitting: BTreeMap<u64, (u64, Held)>,
+    /// Requests that waited, by connection and frame number, and whether
+    /// each settled `Conformant`.
+    settled: BTreeMap<(u64, u64), bool>,
 }
 
 impl Adapter {
@@ -64,9 +92,11 @@ impl Adapter {
             wire,
             sessions: BTreeMap::new(),
             peers: BTreeMap::new(),
-            handoffs: BTreeSet::new(),
             suppliers: BTreeMap::new(),
             judged: BTreeSet::new(),
+            held: BTreeMap::new(),
+            admitting: BTreeMap::new(),
+            settled: BTreeMap::new(),
         }
     }
 
@@ -82,21 +112,39 @@ impl Adapter {
         let mut records = self.wire.take().into_iter().peekable();
         let mut facts = facts.iter().peekable();
         for (seq, storage_seq, event) in events {
-            while let Some((_, obs)) = records.next_if(|(after, _)| after < seq) {
-                log.push(obs);
+            while let Some((_, record)) = records.next_if(|(after, _)| after < seq) {
+                self.record(record, log);
             }
             while let Some((_, fact)) = facts.next_if(|(at, _)| at <= storage_seq) {
                 self.fact(fact, log);
             }
-            self.event(event, log);
+            self.event(*seq, event, log);
         }
-        for (_, obs) in records {
-            log.push(obs);
+        for (_, record) in records {
+            self.record(record, log);
         }
         for (_, fact) in facts {
             self.fact(fact, log);
         }
         for (connection, cause) in self.wire.closes() {
+            let unjudged: Vec<_> = self
+                .held
+                .keys()
+                .filter(|(at, _)| *at == connection)
+                .copied()
+                .collect();
+            if let Some((seq, held)) = self.admitting.remove(&connection) {
+                self.unsettled(connection, seq, held, log);
+                log.push(Observation::FrameJudged {
+                    connection,
+                    stream: stream(),
+                    seq,
+                });
+            }
+            for key in unjudged {
+                let held = self.held.remove(&key).expect("listed above");
+                self.unsettled(key.0, key.1, held, log);
+            }
             if !self.judged_connection(connection) {
                 log.push(Observation::ConnectionClosed {
                     connection,
@@ -104,6 +152,96 @@ impl Adapter {
                 });
             }
         }
+    }
+
+    /// Writes `record`, or holds it until the node judges its request.
+    fn record(&mut self, record: Record, log: &mut ObservationLog) {
+        match record {
+            Record::Obs(obs) => log.push(obs),
+            Record::Pending {
+                connection,
+                seq,
+                frame,
+                settle,
+            } => {
+                self.held.insert(
+                    (connection, seq),
+                    Held {
+                        frame,
+                        settle,
+                        owed: Vec::new(),
+                    },
+                );
+            }
+            Record::Judged { connection, seq } => {
+                if let Some(held) = self.held.remove(&(connection, seq)) {
+                    self.unsettled(connection, seq, held, log);
+                }
+                log.push(Observation::FrameJudged {
+                    connection,
+                    stream: stream(),
+                    seq,
+                });
+            }
+            Record::Owed {
+                connection,
+                request,
+                obs,
+            } => {
+                if let Some(held) = self.held.get_mut(&(connection, request)) {
+                    held.owed.push(obs);
+                } else if self.settled.get(&(connection, request)) != Some(&false) {
+                    log.push(obs);
+                }
+            }
+        }
+    }
+
+    /// Writes held request `seq` on `connection`, which the node's serving
+    /// session judged against the `live` ranges, with the label they
+    /// settle, and its exchange's record if it's `Conformant`.
+    fn settle(
+        &mut self,
+        connection: u64,
+        seq: u64,
+        held: Held,
+        live: &[(u32, u32)],
+        log: &mut ObservationLog,
+    ) {
+        let label = held.settle.label(live);
+        let mut frame = held.frame;
+        if let Observation::PeerFrame { label: at, .. } = &mut frame {
+            *at = label;
+        }
+        log.push(frame);
+        let conformant = label == Label::Conformant;
+        if conformant {
+            for obs in held.owed {
+                log.push(obs);
+            }
+        }
+        self.settled.insert((connection, seq), conformant);
+    }
+
+    /// Writes held request `seq` on `connection`, which the node's serving
+    /// session never judged, with the relay's label and no exchange.
+    fn unsettled(&mut self, connection: u64, seq: u64, held: Held, log: &mut ObservationLog) {
+        log.push(held.frame);
+        self.settled.insert((connection, seq), false);
+    }
+
+    /// Writes that the node judged the peer's frame `seq` on `connection`,
+    /// or, for a held request, waits for its serving session to judge it.
+    fn judged(&mut self, connection: u64, seq: u64, log: &mut ObservationLog) {
+        if let Some(held) = self.held.remove(&(connection, seq)) {
+            self.admitting.insert(connection, (seq, held));
+            return;
+        }
+        log.push(Observation::FrameJudged {
+            connection,
+            stream: stream(),
+            seq,
+        });
     }
 
     /// True if the verifier judged the peer on `connection`.
@@ -152,8 +290,9 @@ impl Adapter {
         self.peers.get(&hex(peer.as_bytes())).copied()
     }
 
-    /// Writes what `event` means for the generated checks.
-    fn event(&mut self, event: &BlockEvent, log: &mut ObservationLog) {
+    /// Writes what `event`, the tap's event `seq`, means for the generated
+    /// checks.
+    fn event(&mut self, seq: u64, event: &BlockEvent, log: &mut ObservationLog) {
         let get_blocks = || row(row_name(u16::from(MSG_BS_GET_BLOCKS)));
         match event {
             BlockEvent::SessionAdmitted {
@@ -169,34 +308,27 @@ impl Adapter {
                 self.peers.insert(hex(peer.as_bytes()), *conn_id);
                 self.peers.insert(hex(&peer.digest()), *conn_id);
             }
-            BlockEvent::FrameJudged { conn_id, seq, .. } => {
-                log.push(Observation::FrameJudged {
-                    connection: *conn_id,
-                    stream: stream(),
-                    // The routine counts from 1, and the relay from 0.
-                    seq: seq - 1,
-                });
+            BlockEvent::FrameJudged {
+                conn_id,
+                seq: judged,
+                ..
+            } => {
+                // The routine counts from 1, and the relay from 0.
+                self.judged(*conn_id, judged - 1, log);
             }
-            BlockEvent::HandoffStarted { owner, height, .. } => {
-                self.handoffs.insert((owner.session_id, height.0));
-            }
+            // Every body the routine sends the sequencer, with or without a
+            // budget charge.
             BlockEvent::Holder {
                 body,
                 holder: Holder::Queued { .. },
                 change: HolderChange::Retained,
             } => {
-                if !self
-                    .handoffs
-                    .remove(&(body.owner.session_id, body.height.0))
-                {
-                    return;
-                }
                 let Some(connection) = self.sessions.get(&body.owner.session_id).copied() else {
                     return;
                 };
                 // Work from a body no frame delivered names no frame the
                 // check can find.
-                let delivered = self.wire.body(connection, body.height.0);
+                let delivered = self.wire.body(connection, body.height.0, seq);
                 log.push(Observation::WorkAdmitted {
                     connection,
                     frame: row(row_name(u16::from(MSG_BS_BLOCK))),
@@ -230,25 +362,19 @@ impl Adapter {
                     },
                 });
             }
-            BlockEvent::ServingFrame {
-                peer,
-                start,
-                message_type,
-                body_bytes,
-            } => {
+            BlockEvent::ServingAdmission { peer, live, .. } => {
                 let Some(connection) = self.connection(peer) else {
                     return;
                 };
-                let is_body = *message_type == MSG_BS_BLOCK;
-                log.push(Observation::NodeOutput {
+                let Some((judged, held)) = self.admitting.remove(&connection) else {
+                    return;
+                };
+                let live: Vec<_> = live.iter().map(|(first, last)| (first.0, last.0)).collect();
+                self.settle(connection, judged, held, &live, log);
+                log.push(Observation::FrameJudged {
                     connection,
-                    frame: row(row_name(u16::from(*message_type))),
-                    request: get_blocks(),
-                    exchange: u64::from(start.0),
-                    // A body's payload is its tag and its bytes, and an
-                    // ending's is its tag, start and count.
-                    payload: if is_body { body_bytes + 1 } else { 9 },
-                    ends: !is_body,
+                    stream: stream(),
+                    seq: judged,
                 });
             }
             _ => {}

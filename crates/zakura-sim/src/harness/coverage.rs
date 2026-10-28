@@ -10,10 +10,34 @@
 pub struct Coverage {
     /// The property's ID.
     pub property: &'static str,
-    /// A test where the property applies and holds.
-    pub passing: Witness,
+    /// Where the property applies and holds.
+    pub passing: Passing,
     /// Where a planted bug violates the property.
     pub bypass: Bypass,
+}
+
+/// Where a property applies and holds.
+#[derive(Clone, Copy, Debug)]
+pub enum Passing {
+    /// A test where the property applies and holds.
+    Test(Witness),
+    /// No scenario reaches the property, for `reason`. The witness test
+    /// shows that it stays `NotApplicable`.
+    Unreachable {
+        /// Why no scenario reaches it.
+        reason: &'static str,
+        /// The test where it stays `NotApplicable`.
+        witness: Witness,
+    },
+}
+
+impl Passing {
+    /// The test this names.
+    pub fn witness(self) -> Witness {
+        match self {
+            Passing::Test(witness) | Passing::Unreachable { witness, .. } => witness,
+        }
+    }
 }
 
 /// Where a planted bug violates a property.
@@ -51,12 +75,17 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
     }
 }
 
+/// A [`SIM_BUILD`] test where a property applies and holds.
+const fn passes(file: &'static str, test: &'static str) -> Passing {
+    Passing::Test(sim_test(file, test))
+}
+
 /// A race fixture's row: its witness test runs the fix to a pass and the
 /// planted race to its violation, both through the race's trigger history.
 const fn race(property: &'static str, test: &'static str) -> Coverage {
     Coverage {
         property,
-        passing: sim_test("tests/race_fixtures.rs", test),
+        passing: passes("tests/race_fixtures.rs", test),
         bypass: Bypass::Test(sim_test("tests/race_fixtures.rs", test)),
     }
 }
@@ -67,29 +96,47 @@ const fn race(property: &'static str, test: &'static str) -> Coverage {
 const fn table(property: &'static str, passing: &'static str) -> Coverage {
     Coverage {
         property,
-        passing: sim_test("tests/block_table.rs", passing),
-        bypass: Bypass::Test(sim_test(
-            "tests/block_table.rs",
-            "scripted_bypasses_violate_every_generated_id",
-        )),
+        passing: passes("tests/block_table.rs", passing),
+        bypass: TABLE_BYPASS,
     }
 }
+
+/// A stream-6 generated property no block-sync scenario reaches, for
+/// `reason`: [`UNREACHED`] shows it stays `NotApplicable`, and the scripted
+/// bypass still violates it.
+const fn unreachable(property: &'static str, reason: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test("tests/block_table.rs", UNREACHED),
+        },
+        bypass: TABLE_BYPASS,
+    }
+}
+
+/// The scripted bypass that violates every stream-6 generated ID.
+const TABLE_BYPASS: Bypass = Bypass::Test(sim_test(
+    "tests/block_table.rs",
+    "scripted_bypasses_violate_every_generated_id",
+));
 
 /// An honest sync or honest serving holds it.
 const HONEST: &str = "honest_runs_hold_every_generated_id_they_reach";
 /// A probe fault outside the node's own exchanges reaches it.
 const PROBE_FAULT: &str = "each_probe_fault_reaches_its_exact_id";
-/// A probe fault inside the node's own exchange reaches it, and violates
-/// it: the close records no fault cause.
-const EXCHANGE_FAULT: &str = "faults_inside_the_nodes_exchange_close_without_a_fault_cause";
-/// No scenario reaches it.
+/// A probe fault inside the node's own exchange reaches it.
+const EXCHANGE_FAULT: &str = "faults_inside_the_nodes_exchange_reach_their_exact_ids";
+/// Requests past twice the node's serving limit reach it.
+const OVER_MARGIN: &str = "requests_past_twice_the_serving_limit_reach_over_margin";
+/// The witness that no scenario reaches an [`unreachable`] row.
 const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
 
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: super::NO_TASK_PANIC,
-        passing: sim_test("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
+        passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         bypass: Bypass::Test(sim_test(
             "tests/harness.rs",
             "task_panic_violates_no_task_panic",
@@ -97,7 +144,7 @@ pub static COVERAGE: &[Coverage] = &[
     },
     Coverage {
         property: crate::sim::NO_LIVELOCK,
-        passing: sim_test("tests/harness.rs", "a_moving_clock_holds_no_livelock"),
+        passing: passes("tests/harness.rs", "a_moving_clock_holds_no_livelock"),
         bypass: Bypass::Test(sim_test("tests/harness.rs", "livelock_fires_before_budget")),
     },
     race("race/lost-update", "lost_update_witness"),
@@ -108,12 +155,12 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/abort-without-join", "abort_without_join_witness"),
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
-        passing: sim_test("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
+        passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
         bypass: Bypass::Planted("lost-wakeup"),
     },
     Coverage {
         property: super::header_sync::OPERATION_IDS,
-        passing: sim_test(
+        passing: passes(
             "tests/header_node.rs",
             "node_syncs_from_a_mirror_on_controlled_storage",
         ),
@@ -124,7 +171,7 @@ pub static COVERAGE: &[Coverage] = &[
     },
     Coverage {
         property: super::header_sync::DIRECT_DISPATCH,
-        passing: sim_test(
+        passing: passes(
             "tests/header_node.rs",
             "node_syncs_from_a_mirror_on_controlled_storage",
         ),
@@ -135,7 +182,7 @@ pub static COVERAGE: &[Coverage] = &[
     },
     Coverage {
         property: super::block_sync::OPERATION_IDS,
-        passing: sim_test("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
+        passing: passes("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
         bypass: Bypass::Test(sim_test(
             "tests/block_node.rs",
             "planted_block_operation_ids_violate_the_property",
@@ -229,18 +276,21 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/bad-content-closes",
         EXCHANGE_FAULT,
     ),
-    table("block-sync/s6v3/blocks-done/over-owed-closes", UNREACHED),
-    table(
-        "block-sync/s6v3/blocks-done/receiver-work-authorized",
-        UNREACHED,
+    table("block-sync/s6v3/get-blocks/over-margin-closes", OVER_MARGIN),
+    unreachable(
+        "block-sync/s6v3/blocks-done/over-owed-closes",
+        "every exchange owes room for its ending, and conformant bodies leave it",
     ),
-    table("block-sync/s6v3/get-blocks/over-margin-closes", UNREACHED),
-    table(
+    unreachable(
         "block-sync/s6v3/range-unavailable/over-owed-closes",
-        UNREACHED,
+        "every exchange owes room for its ending, and conformant bodies leave it",
     ),
-    table(
+    unreachable(
+        "block-sync/s6v3/blocks-done/receiver-work-authorized",
+        "an ending carries no body, so the node admits no work from it",
+    ),
+    unreachable(
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
-        UNREACHED,
+        "an ending carries no body, so the node admits no work from it",
     ),
 ];

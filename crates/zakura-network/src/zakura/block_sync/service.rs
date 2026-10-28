@@ -58,6 +58,14 @@ pub fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
 }
 
+/// The request limit a node running `config` enforces and advertises on
+/// each block-sync connection from the connection's start, for the
+/// simulator's role models.
+#[cfg(any(test, zakura_sim))]
+pub fn block_sync_serving_limit(config: &ZakuraBlockSyncConfig) -> u32 {
+    super::regulated::session::serving_max_inflight_requests(config)
+}
+
 /// Cloneable typed stream-6 sender.
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {

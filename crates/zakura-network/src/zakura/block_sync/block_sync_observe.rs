@@ -151,6 +151,18 @@ pub enum BlockEvent {
         /// Whether the lease was acquired or released.
         step: LeaseStep,
     },
+    /// Serving judged a peer's request against the ranges it still serves:
+    /// those whose endings it hadn't published by then.
+    ServingAdmission {
+        /// The requesting peer.
+        peer: ZakuraPeerId,
+        /// The request's first height.
+        start: block::Height,
+        /// The request's count.
+        count: u32,
+        /// The first and last heights of each range it still serves.
+        live: Vec<(block::Height, block::Height)>,
+    },
     /// Serving queued one response frame for a peer.
     ServingFrame {
         /// The requesting peer.
@@ -328,7 +340,9 @@ impl SequencerOwnership {
     }
 }
 
-/// Reports one serving session's lease and frame events for its peer. Serve's
+/// Reports one serving session's admission, lease and frame events for its
+/// peer. The session reports each request's live ranges once it drops the
+/// ranges whose endings were published, before it checks the request. Serve's
 /// dispatch reports each response's lease once it takes the execution slots,
 /// before it spawns the response's task. The slots report the release once
 /// they return, after the last lease clone drops. Serve's task reports each
@@ -356,6 +370,25 @@ impl ServingReporter {
                 start,
                 count,
                 step,
+            }
+        );
+    }
+
+    /// Reports that serving judged a request for `count` heights from
+    /// `start` against the `live` ranges.
+    pub(crate) fn admission(
+        &self,
+        start: block::Height,
+        count: u32,
+        live: Vec<(block::Height, block::Height)>,
+    ) {
+        observe!(
+            self.observer,
+            BlockEvent::ServingAdmission {
+                peer: self.peer.clone(),
+                start,
+                count,
+                live,
             }
         );
     }

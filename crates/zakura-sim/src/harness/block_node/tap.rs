@@ -394,6 +394,17 @@ impl BlockTap {
                 }
                 .to_owned(),
             },
+            BlockEvent::ServingAdmission {
+                peer: requesting,
+                start,
+                count,
+                live,
+            } => BlockSyncFact::ServingAdmission {
+                peer: peer(requesting),
+                start: start.0,
+                count: *count,
+                live: live.iter().map(|(first, last)| (first.0, last.0)).collect(),
+            },
             BlockEvent::ServingFrame {
                 peer: requesting,
                 start,

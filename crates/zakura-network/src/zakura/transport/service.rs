@@ -477,6 +477,13 @@ impl Peer {
         self.close_cause.clone()
     }
 
+    /// Makes `reader` the reader of this peer's stream: a frame it refuses
+    /// records its close cause on this connection and closes it.
+    #[cfg(any(test, zakura_sim))]
+    pub fn read_through(&self, reader: &super::StreamReader) {
+        reader.bind(self.close_cause.clone(), self.cancel_token.clone());
+    }
+
     /// Return a reader for the cause of this peer's connection close.
     ///
     /// A service takes the peer by value, so the simulator keeps this reader

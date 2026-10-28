@@ -54,8 +54,8 @@ use zakura_network::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
         BlockRangeRead, BlockRangeReadResult, BlockRangeSource, BlockSyncAction,
         BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, CloseCauseReader,
-        FramedSend, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig, ZakuraPeerId,
-        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        FramedSend, Peer, Service, ServicePeerDirection, StreamReader, ZakuraBlockSyncConfig,
+        ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
         ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
@@ -972,16 +972,21 @@ impl Topology {
     }
 
     /// A channel for frames from `sender` to `receiver` on connection `id`,
-    /// through a relay if the topology labels its links: the sender's end
-    /// and the receiver's.
+    /// through a relay if the topology labels its links: the sender's end,
+    /// the receiver's, and the reader of a relay into the node.
     fn pipe(
         &self,
         id: u64,
         sender: usize,
         receiver: usize,
-    ) -> (FramedSend, zakura_network::zakura::FramedRecv) {
+    ) -> (
+        FramedSend,
+        zakura_network::zakura::FramedRecv,
+        Option<StreamReader>,
+    ) {
         let Some(wire) = &self.wire else {
-            return framed_channel(LINK_DEPTH);
+            let (send, recv) = framed_channel(LINK_DEPTH);
+            return (send, recv, None);
         };
         let way = if receiver == 0 {
             relay::Way::ToNode
@@ -1000,7 +1005,9 @@ impl Topology {
     }
 
     /// Admits `local`'s side of connection `id` to its service, from
-    /// `remote`, with `streams`, and returns why it closes.
+    /// `remote`, with `streams`, whose receiving end `reader` reads if it
+    /// has one, and returns why it closes.
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
         local: usize,
@@ -1008,6 +1015,7 @@ impl Topology {
         direction: ServicePeerDirection,
         id: u64,
         streams: (zakura_network::zakura::FramedRecv, FramedSend),
+        reader: Option<StreamReader>,
         token: &CancellationToken,
     ) -> CloseCauseReader {
         let peer = Peer::new_versioned(
@@ -1022,6 +1030,9 @@ impl Topology {
             token.clone(),
         );
         let cause = peer.close_cause_reader();
+        if let Some(reader) = &reader {
+            peer.read_through(reader);
+        }
         self.nodes[local]
             .live
             .borrow()
@@ -1037,8 +1048,8 @@ impl Topology {
     /// in-memory channels. One side must be the node under test.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
         let id = self.next_id();
-        let (to_listener, from_dialer) = self.pipe(id, dialer, listener);
-        let (to_dialer, from_listener) = self.pipe(id, listener, dialer);
+        let (to_listener, from_dialer, listener_reader) = self.pipe(id, dialer, listener);
+        let (to_dialer, from_listener, dialer_reader) = self.pipe(id, listener, dialer);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
         let dialed = self.admit(
             dialer,
@@ -1046,6 +1057,7 @@ impl Topology {
             ServicePeerDirection::Outbound,
             id,
             (from_listener, to_listener),
+            dialer_reader,
             &tokens[0],
         );
         let listened = self.admit(
@@ -1054,6 +1066,7 @@ impl Topology {
             ServicePeerDirection::Inbound,
             id,
             (from_dialer, to_dialer),
+            listener_reader,
             &tokens[1],
         );
         let (peer, cause) = if dialer == 0 {
@@ -1081,8 +1094,8 @@ impl Topology {
     pub fn link_probe(&self, sim: &mut Sim, log: ProbeLog) -> Link {
         let id = self.next_id();
         // The probe is never node 0, so `usize::MAX` stands for it.
-        let (to_node, from_probe) = self.pipe(id, usize::MAX, 0);
-        let (to_probe, from_node) = self.pipe(id, 0, usize::MAX);
+        let (to_node, from_probe, reader) = self.pipe(id, usize::MAX, 0);
+        let (to_probe, from_node, _) = self.pipe(id, 0, usize::MAX);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
         let cause = self.admit(
             0,
@@ -1090,6 +1103,7 @@ impl Topology {
             ServicePeerDirection::Inbound,
             id,
             (from_probe, to_probe),
+            reader,
             &tokens[1],
         );
         if let Some(wire) = &self.wire {

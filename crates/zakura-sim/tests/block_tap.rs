@@ -491,6 +491,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 BlockSyncFact::HandoffEnded { .. } => "handoff-ended",
                 BlockSyncFact::Holder { .. } => "holder",
                 BlockSyncFact::ServingLease { .. } => "serving-lease",
+                BlockSyncFact::ServingAdmission { .. } => "serving-admission",
                 BlockSyncFact::ServingFrame { .. } => "serving-frame",
                 BlockSyncFact::Routine { .. } => "routine",
                 BlockSyncFact::WorkQueue { .. } => "work-queue",
@@ -594,6 +595,7 @@ fn an_honest_serve_pairs_every_read() {
         assert_numbered(&report);
         let kinds = event_kinds(&report);
         assert!(kinds.contains("serving-lease"), "{kinds:?}");
+        assert!(kinds.contains("serving-admission"), "{kinds:?}");
         assert!(kinds.contains("serving-frame"), "{kinds:?}");
         let (submits, reads) = operations(&report);
         assert!(submits.is_empty());

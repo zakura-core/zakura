@@ -39,6 +39,12 @@ pub enum ProbeFrame {
         /// The body's height.
         height: u32,
     },
+    /// The chain's body at `height` with its coinbase repeated, so its
+    /// header no longer commits to its transactions.
+    TamperedBlock {
+        /// The body's height.
+        height: u32,
+    },
     /// An ending for a response.
     BlocksDone {
         /// The response's first height.
@@ -149,6 +155,11 @@ impl ProbeFrame {
                 count,
             },
             ProbeFrame::Block { height } => BlockSyncMessage::Block(at(height).block.clone()),
+            ProbeFrame::TamperedBlock { height } => {
+                let mut block = block::Block::clone(&at(height).block);
+                block.transactions.push(block.transactions[0].clone());
+                BlockSyncMessage::Block(block.into())
+            }
             ProbeFrame::BlocksDone {
                 start_height,
                 returned,

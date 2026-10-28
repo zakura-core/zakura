@@ -23,7 +23,7 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use zakura_network::zakura::{block_sync_streams, ZakuraBlockSyncConfig};
+use zakura_network::zakura::{block_sync_serving_limit, block_sync_streams, ZakuraBlockSyncConfig};
 use zakura_scheduler::SchedulerConfig;
 use zakura_storage::{
     block::{
@@ -264,8 +264,12 @@ impl Subsystem for Storage {
             ports.effects.clone(),
         );
         let view = ports.view.clone();
+        let mut config = ZakuraBlockSyncConfig::default();
+        if let Some(limit) = scenario.serving_limit {
+            config.max_inflight_requests = limit;
+        }
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
-        let wire = Wire::default();
+        let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());
         let teardown = tap.teardown();
         let storage = storage.with_tap(tap);
@@ -275,10 +279,6 @@ impl Subsystem for Storage {
             ports.reads.clone(),
             predicates.clone(),
         )));
-        let mut config = ZakuraBlockSyncConfig::default();
-        if let Some(limit) = scenario.serving_limit {
-            config.max_inflight_requests = limit;
-        }
         let mut nodes = vec![BlockNode::spawn(
             sim,
             "node",

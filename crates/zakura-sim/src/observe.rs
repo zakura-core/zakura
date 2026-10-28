@@ -1246,6 +1246,18 @@ pub enum BlockSyncFact {
         /// `acquired` or `released`.
         step: String,
     },
+    /// Serving judged a request against the ranges it still served: those
+    /// whose endings it hadn't published by then.
+    ServingAdmission {
+        /// The requesting peer.
+        peer: String,
+        /// The request's first height.
+        start: u32,
+        /// The request's count.
+        count: u32,
+        /// The first and last heights of each range it still served.
+        live: Vec<(u32, u32)>,
+    },
     /// Serving queued one response frame.
     ServingFrame {
         /// The requesting peer.

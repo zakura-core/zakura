@@ -147,6 +147,11 @@ impl Serving {
         #[cfg(any(test, zakura_sim))]
         let producer = producer.with_observer(self.observer.clone(), peer.clone());
         ServingSession {
+            #[cfg(any(test, zakura_sim))]
+            reporter: crate::zakura::block_sync::block_sync_observe::ServingReporter::new(
+                self.observer.clone(),
+                peer.clone(),
+            ),
             // The requester matches each block to the live range expecting its
             // hash and each ending by start height, so ranges need no order.
             serve: self.capacity.session_with_order(
@@ -184,6 +189,9 @@ pub(crate) struct ServingSession {
     serve: Serve<Server<dyn Source>>,
     ranges: BTreeMap<Height, (Height, CompletionId)>,
     completed: Completions,
+    /// Receives each admission's live ranges, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    reporter: crate::zakura::block_sync::block_sync_observe::ServingReporter,
 }
 
 impl ServingSession {
@@ -193,6 +201,15 @@ impl ServingSession {
     pub(crate) fn admit(&mut self, range: Range) -> Result<(), SinkReject> {
         let (start, last) = (range.start(), range.last());
         self.remove_completed();
+        #[cfg(any(test, zakura_sim))]
+        self.reporter.admission(
+            start,
+            range.count(),
+            self.ranges
+                .iter()
+                .map(|(first, (last, _))| (*first, *last))
+                .collect(),
+        );
         if self
             .ranges
             .range(..=last)

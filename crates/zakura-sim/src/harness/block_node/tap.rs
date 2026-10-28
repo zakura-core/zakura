@@ -599,8 +599,12 @@ impl Allocations {
     /// `holder` of `body` in plain fields.
     fn holder(&mut self, holder: Holder, held: &HeldBody) -> BlockSyncHolder {
         match holder {
-            Holder::Queued { allocation } => BlockSyncHolder::Queued {
+            Holder::Queued {
+                allocation,
+                decoded_attributed_memory_bytes,
+            } => BlockSyncHolder::Queued {
                 allocation: self.number(allocation, *held),
+                decoded_attributed_memory_bytes,
             },
             Holder::Reorder { allocation } => BlockSyncHolder::Reorder {
                 allocation: self.number(allocation, *held),

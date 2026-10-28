@@ -64,9 +64,9 @@ pub trait SemanticView {
 }
 
 /// The block-sync semantic properties, for a harness whose view carries the
-/// model: [`SUBMIT_ONLY_REQUESTED`] and [`STALE_COMPLETION_INERT`], active;
-/// [`CAPACITY_RELEASE_WAKES`], known for #1523; and
-/// [`DETACHED_SUBMISSION_BOUNDED`] and [`INPUT_DECODED_BOUND`], drafts.
+/// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`] and
+/// [`INPUT_DECODED_BOUND`], active; [`CAPACITY_RELEASE_WAKES`], known for
+/// #1523; and [`DETACHED_SUBMISSION_BOUNDED`], a draft.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -131,9 +131,9 @@ where
             },
             assumes: &[],
             needs: NEEDS,
-            status: Status::Draft,
+            status: Status::Active,
             check: check_input_decoded_bound::<S>,
-            witness: Some(queued_at_idle),
+            witness: Some(any_queued),
         },
     ]
 }
@@ -267,6 +267,8 @@ pub struct SemanticModel {
     stale_findings: Vec<Finding>,
     /// Findings for [`DETACHED_SUBMISSION_BOUNDED`], not yet reported.
     detached_findings: Vec<Finding>,
+    /// Findings for [`INPUT_DECODED_BOUND`], not yet reported.
+    input_findings: Vec<Finding>,
     /// Triggers of [`CAPACITY_RELEASE_WAKES`], not yet obliged.
     rooms: Vec<RoomFreed>,
 
@@ -289,8 +291,14 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether a body entered the input queue.
+    pub saw_queued: bool,
     /// Whether virtual time advanced while the input queue held a body.
     pub saw_queued_at_idle: bool,
+    /// The most bodies the input queue held when virtual time advanced.
+    pub queued_at_idle_peak: usize,
+    /// The largest decoded block a queued body held, in attributed bytes.
+    pub queued_decoded_peak: u64,
 }
 
 /// What one step changed, judged once the step is folded.
@@ -419,6 +427,7 @@ impl SemanticModel {
             Observation::BlockSync { event, .. } => self.block_sync(event, at),
             Observation::TimeAdvanced { .. } if !self.queued.is_empty() => {
                 self.saw_queued_at_idle = true;
+                self.queued_at_idle_peak = self.queued_at_idle_peak.max(self.queued.len());
             }
             _ => {}
         }
@@ -563,9 +572,30 @@ impl SemanticModel {
             } => {
                 let retained = change == "retained";
                 match holder {
-                    BlockSyncHolder::Queued { allocation } => {
+                    BlockSyncHolder::Queued {
+                        allocation,
+                        decoded_attributed_memory_bytes,
+                    } => {
                         if retained {
                             self.queued.insert(*allocation);
+                            self.saw_queued = true;
+                            self.queued_decoded_peak = self
+                                .queued_decoded_peak
+                                .max(*decoded_attributed_memory_bytes);
+                            if *decoded_attributed_memory_bytes > 0 {
+                                self.input_findings.push(Finding {
+                                    step: self.step.unwrap_or_default(),
+                                    expected: "the input queue takes raw bytes, with no decoded \
+                                               block"
+                                        .to_owned(),
+                                    actual: format!(
+                                        "the height {} body entered the queue holding a decoded \
+                                         block of {decoded_attributed_memory_bytes} attributed \
+                                         bytes",
+                                        body.height
+                                    ),
+                                });
+                            }
                         } else {
                             self.queued.remove(allocation);
                         }
@@ -1013,15 +1043,31 @@ where
     })
 }
 
-/// [`INPUT_DECODED_BOUND`] is never applicable: no observation says
-/// whether a queued body is decoded, or how many bytes its graph holds.
+/// Checks [`INPUT_DECODED_BOUND`] on each body that enters the input
+/// queue. A peer routine reports the queue's retain before its send, so
+/// the report covers a body in a suspended send too. The retain carries
+/// the attributed size of the body's decoded block, measured from the
+/// block, not from the queue's gauge.
 fn check_input_decoded_bound<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: SemanticView,
 {
-    caught_up(cx);
-    Verdict::NotApplicable
+    let model = caught_up(cx);
+    let (findings, applicable, peak) = {
+        let mut model = model.borrow_mut();
+        (
+            std::mem::take(&mut model.input_findings),
+            model.saw_queued,
+            model.queued_decoded_peak,
+        )
+    };
+    cx.peak("queued-decoded-attributed-bytes", peak);
+    report(cx, findings).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
 }
 
 /// [`SUBMIT_ONLY_REQUESTED`]'s trigger history: storage took a submission.
@@ -1053,11 +1099,10 @@ fn reset_while_storage_held(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_reset_while_held
 }
 
-/// [`INPUT_DECODED_BOUND`]'s trigger history: virtual time advanced, which
-/// it does only once no task can run, while a body waited in the input
+/// [`INPUT_DECODED_BOUND`]'s trigger history: a body entered the input
 /// queue.
-fn queued_at_idle(log: &ObservationLog) -> bool {
-    SemanticModel::of(log).saw_queued_at_idle
+fn any_queued(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).saw_queued
 }
 
 #[cfg(test)]

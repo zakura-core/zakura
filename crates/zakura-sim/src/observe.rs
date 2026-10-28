@@ -1347,6 +1347,9 @@ pub enum BlockSyncHolder {
     Queued {
         /// The tap's number for the body's allocation.
         allocation: u64,
+        /// The attributed size of the decoded block the queued body holds,
+        /// measured from the block itself. 0 for raw bytes.
+        decoded_attributed_memory_bytes: u64,
     },
     /// The reorder buffer.
     Reorder {

@@ -414,7 +414,10 @@ mod tests {
     fn a_snapshot_must_match_the_holder_events() {
         let mut view = BlockSyncView::default();
         view.fold(&holder(
-            Holder::Queued { allocation: 1 },
+            Holder::Queued {
+                allocation: 1,
+                decoded_attributed_memory_bytes: 0,
+            },
             HolderChange::Retained,
         ));
         view.fold(&holder(

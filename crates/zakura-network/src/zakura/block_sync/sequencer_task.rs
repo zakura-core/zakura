@@ -38,6 +38,11 @@ const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
+///
+/// The body is always the raw frame payload. A queue of decoded bodies could
+/// hold `submitted_apply_limit` decoded block graphs while a slow verifier
+/// blocks the task (#1522). The sequencer decodes a body only when it submits
+/// it, inside the submission window.
 #[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -63,7 +68,7 @@ impl SequencedBody {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        body: BufferedBlockBody,
+        raw_frame_payload: Arc<[u8]>,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         peer: ZakuraPeerId,
@@ -71,6 +76,7 @@ impl SequencedBody {
         input_bytes: Arc<AtomicU64>,
         input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     ) -> Self {
+        let body = BufferedBlockBody::RawFramePayload(raw_frame_payload);
         let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
             owner,
@@ -437,6 +443,9 @@ impl SequencerTask {
                 },
                 holder: Holder::Queued {
                     allocation: body.body.allocation(),
+                    decoded_attributed_memory_bytes: body
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
                 },
                 change: HolderChange::Released,
             }
@@ -1525,13 +1534,17 @@ mod tests {
     ) -> SequencedBody {
         let block = test_block();
         let previous_block_hash = block.header.previous_block_hash;
+        let raw_frame_payload: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .expect("test block encodes")
+            .into();
         SequencedBody::new_queued(
             super::super::test_work_owner(),
             zakura_header_chain::SourceId::from_digest([1; 32]),
             block::Height(1),
             block.hash(),
             previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, None),
+            raw_frame_payload,
             123,
             None,
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
@@ -1551,9 +1564,12 @@ mod tests {
         );
 
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 123);
-        assert!(
-            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0
+        assert_eq!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the input queue holds raw bytes only"
         );
+        assert!(!body.body.is_decoded());
 
         body.leave_queue();
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -1655,13 +1671,15 @@ mod tests {
 
     // Use a real serialized block. Only the scheduling height is synthetic.
     fn received_test_body(task: &mut SequencerTask, height: u32, estimate: u64) -> SequencedBody {
-        use zakura_chain::serialization::ZcashSerialize;
         let block: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
                 .zcash_deserialize_into()
                 .unwrap(),
         );
-        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+        let raw: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .unwrap()
+            .into();
         let bytes = u64::try_from(raw.len()).unwrap();
         let height = block::Height(height);
         task.work.extend(
@@ -1697,7 +1715,7 @@ mod tests {
             height,
             block.hash(),
             block.header.previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, Some(raw)),
+            raw,
             bytes,
             None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),

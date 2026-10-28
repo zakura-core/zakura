@@ -185,20 +185,24 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
     );
 }
 
-/// No observation says whether a queued body is decoded, so the
-/// `input-decoded-bound` draft stays `NotApplicable`, even under stalled
-/// storage.
+/// Under stalled storage, the mirror's bodies keep entering the
+/// sequencer's input queue, and each one holds raw bytes only. Before the
+/// #1522 fix, the peer routine queued its decoded block beside the raw
+/// bytes, and the first body to enter the queue violated the property.
+/// With `decoded-enqueue.patch`, an alternate enqueue path keeps the
+/// decoded block but charges no decoded bytes to the queue's gauge, and the
+/// same input violates it.
 #[test]
-fn the_stalled_reset_input_leaves_input_decoded_bound_not_applicable() {
-    let witness = committed(STALLED_RESET_INPUT);
-    let (report, ports) = run(&witness.scenario, witness.input);
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert_eq!(
-        outcome(&report, INPUT_DECODED_BOUND),
-        &PropertyOutcome::NotApplicable
+fn the_stalled_reset_input_holds_input_decoded_bound() {
+    let ports = witnessed(
+        committed(STALLED_RESET_INPUT),
+        INPUT_DECODED_BOUND,
+        Expect::Holds,
     );
     let view = ports.view.borrow();
-    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+    let model = view.semantic.borrow();
+    assert!(model.saw_queued);
+    assert_eq!(model.queued_decoded_peak, 0);
 }
 
 /// The capacity-release input whose plan handles the detached commit's tip

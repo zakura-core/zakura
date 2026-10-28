@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 
 use crate::zakura::block_sync::reorder::RetainedBody;
 
-use zakura_chain::serialization::ZcashSerialize;
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_5_BYTES};
 
 /// The reorder, applying, and in-flight submission gauges, and the view
@@ -89,8 +88,11 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     for (index, (height, bytes)) in fixtures.into_iter().enumerate() {
         let height = block::Height(height);
         let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
-        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
-        let wire_bytes = raw.len() as u64;
+        let raw: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .unwrap()
+            .into();
+        let wire_bytes = bytes.len() as u64;
         allocations.insert(height, Arc::as_ptr(&raw).cast::<u8>().addr());
         bodies.push((height, Arc::downgrade(&block), Arc::downgrade(&raw)));
         let mut body = SequencedBody::new_queued(
@@ -99,7 +101,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
             height,
             block.hash(),
             block.header.previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, Some(raw)),
+            raw,
             wire_bytes,
             Some(estimate(height.0)),
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
@@ -258,9 +260,12 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
 
     let block: Arc<block::Block> =
         Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
-    let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+    let raw: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+        .encode()
+        .unwrap()
+        .into();
     let allocation = Arc::as_ptr(&raw).cast::<u8>().addr();
-    let bytes = raw.len() as u64;
+    let bytes = BLOCK_MAINNET_2_BYTES.len() as u64;
     body_tx
         .try_send(SequencedBody::new_queued(
             super::super::test_work_owner(),
@@ -268,7 +273,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
             block::Height(2),
             block.hash(),
             block.header.previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, Some(raw)),
+            raw,
             bytes,
             None,
             ZakuraPeerId::new(vec![1; 32]).unwrap(),
@@ -294,7 +299,10 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
                     owner: super::super::test_work_owner(),
                     bytes,
                 },
-                holder: Holder::Queued { allocation },
+                holder: Holder::Queued {
+                    allocation,
+                    decoded_attributed_memory_bytes: 0,
+                },
                 change: HolderChange::Released,
             },
         ]

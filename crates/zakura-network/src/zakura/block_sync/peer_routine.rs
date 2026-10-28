@@ -42,7 +42,6 @@ use super::{
     pipe::block_sync_guard,
     reactor::tolerated_bytes,
     regulated::{wire::Outcome, CompletedRange},
-    reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
     state::{
@@ -930,7 +929,7 @@ impl PeerRoutine {
             block,
             Some(body_wire_bytes),
             Some(body_permit),
-            Some(raw_block_payload),
+            raw_block_payload,
         )
         .await;
         Ok(())
@@ -1997,12 +1996,14 @@ impl PeerRoutine {
     // ===================== inbound matched body (ports `handle_block`) ======
 
     /// Handle a decoded body that a live reservation already authorized.
+    /// `raw_block_payload` is the frame payload `block` was decoded from, which
+    /// the routine forwards to the sequencer in place of `block`.
     async fn handle_body(
         &mut self,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
-        raw_block_payload: Option<Arc<[u8]>>,
+        raw_block_payload: Arc<[u8]>,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -2017,10 +2018,10 @@ impl PeerRoutine {
                 .accept_unmatched_queued_body(
                     height,
                     hash,
-                    block.clone(),
+                    block,
                     body_wire_bytes,
                     body_permit,
-                    raw_block_payload.clone(),
+                    raw_block_payload,
                 )
                 .await
             {
@@ -2187,12 +2188,10 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
+        // The routine drops its decoded copy first: the queue holds raw bytes
+        // only, and the sequencer decodes the body again when it submits it.
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_measured_decoded_block(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-        );
+        drop(block);
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(outstanding_owner, height, reserved_estimate);
         self.forward_body_to_sequencer(
@@ -2200,7 +2199,7 @@ impl PeerRoutine {
             height,
             hash,
             previous_block_hash,
-            body,
+            raw_block_payload,
             serialized_bytes,
             Some(estimated_bytes),
             body_permit,
@@ -2281,7 +2280,7 @@ impl PeerRoutine {
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
-        body: BufferedBlockBody,
+        raw_block_payload: Arc<[u8]>,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
@@ -2294,7 +2293,7 @@ impl PeerRoutine {
             height,
             hash,
             previous_block_hash,
-            body,
+            raw_block_payload,
             serialized_bytes,
             admitted_estimate_bytes,
             self.peer.clone(),
@@ -2317,6 +2316,9 @@ impl PeerRoutine {
                 },
                 Holder::Queued {
                     allocation: body.body.allocation(),
+                    decoded_attributed_memory_bytes: body
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
                 },
             );
             let (body, holder) = queued;
@@ -2371,7 +2373,7 @@ impl PeerRoutine {
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
-        raw_block_payload: Option<Arc<[u8]>>,
+        raw_block_payload: Arc<[u8]>,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -2477,12 +2479,9 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
+        // As on the matched path, only the raw bytes enter the queue.
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_measured_decoded_block(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-        );
+        drop(block);
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(owner, height, ended_reservation);
         self.forward_body_to_sequencer(
@@ -2490,7 +2489,7 @@ impl PeerRoutine {
             height,
             hash,
             previous_block_hash,
-            body,
+            raw_block_payload,
             serialized_bytes,
             admitted_estimate_bytes,
             body_permit,

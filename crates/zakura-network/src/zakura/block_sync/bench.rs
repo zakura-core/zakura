@@ -36,13 +36,13 @@ use crate::zakura::{
 
 use super::{
     events::{BlockApplyOutcome, BlockApplyToken, BlockSyncAction},
-    reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
         initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
     trace::{height as trace_height, BlockTraceEvent},
+    wire::BlockSyncMessage,
     work_queue::WorkQueue,
 };
 
@@ -252,14 +252,18 @@ impl BenchBodyFeeder {
         bytes: u64,
     ) -> bool {
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_decoded_block(block, None);
+        // The sequencer input takes raw frame payloads, as a peer routine
+        // forwards them.
+        let raw_frame_payload = BlockSyncMessage::Block(block)
+            .encode()
+            .expect("a chain block encodes within the block-sync message limits");
         let body = SequencedBody::new_queued(
             self.owner,
             self.source,
             height,
             hash,
             previous_block_hash,
-            body,
+            raw_frame_payload.into(),
             bytes,
             None,
             self.bench_peer.clone(),

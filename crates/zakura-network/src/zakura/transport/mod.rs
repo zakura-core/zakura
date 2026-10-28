@@ -37,7 +37,7 @@ pub use message_rule::{
     PayloadLen,
 };
 #[cfg(any(test, zakura_sim))]
-pub(crate) use observe::{CloseRegistry, ConnTap, RegulationTap, StreamTap};
+pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
 #[cfg(any(test, zakura_sim))]
 pub use observe::{HeaderCheck, Transition, TransportEvent, TransportObserver};
 #[cfg(feature = "internal-bench")]

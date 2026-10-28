@@ -19,6 +19,15 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const END_WAIT: Duration = Duration::from_secs(3);
 /// The connection ID the tests register.
 const CONN: ZakuraConnId = 7;
+/// The remote address of the tests' connection.
+const REMOTE: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9);
+
+/// A connection tap reporting to `observer`, registered as [`CONN`].
+fn registered_tap(observer: Arc<dyn TransportObserver>) -> Arc<ConnTap> {
+    let tap = Arc::new(ConnTap::new(observer, REMOTE));
+    tap.registered(CONN);
+    tap
+}
 
 /// Records every event in order.
 #[derive(Debug, Default)]
@@ -115,7 +124,7 @@ async fn run_worker(
     let mut context = tabled_context(Some(rows()), 128);
     context.inbound_frame_cap = RegtestMessage::LAYOUT[0].frame_cap;
     let recorder = Arc::new(Recorder::default());
-    let conn = Arc::new(ConnTap::new(recorder.clone(), CONN));
+    let conn = registered_tap(recorder.clone());
     context.close_cause.observe_with(conn.clone());
 
     let (peer_send, _peer_recv, send, recv) = link.open(bytes).await?;
@@ -220,7 +229,8 @@ async fn the_length_guard_alone_closes_an_oversize_page() -> Result<(), BoxError
                 },
             },
             TransportEvent::CloseDecided {
-                conn_id: CONN,
+                remote: REMOTE,
+                conn_id: Some(CONN),
                 cause: Some("ordered_read_rejected"),
             },
         ]
@@ -249,7 +259,8 @@ async fn oversize_header_is_read_then_closed() -> Result<(), BoxError> {
                 payload_len: u32::try_from(frame_cap)?,
             },
             TransportEvent::CloseDecided {
-                conn_id: CONN,
+                remote: REMOTE,
+                conn_id: Some(CONN),
                 cause: Some("ordered_read_rejected"),
             },
         ]
@@ -322,41 +333,28 @@ async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
 }
 
 /// Only the first recorded cause is reported, and a cancellation after it
-/// reports nothing more. A connection cancelled with no cause reports `None`
-/// once, and a cause recorded after that isn't reported.
+/// reports nothing more. The cause-free decisions need the simulator token's
+/// hook, so `tests/sim_header_sync.rs` covers them.
 #[test]
 fn close_is_decided_once() {
     let recorder = Arc::new(Recorder::default());
     let cause = CloseCause::new();
-    cause.observe_with(Arc::new(ConnTap::new(recorder.clone(), CONN)));
+    cause.observe_with(registered_tap(recorder.clone()));
     cause.record("first");
     cause.record("second");
     cause.cancelled_without_cause();
-    assert_eq!(
-        recorder.events(),
-        vec![TransportEvent::CloseDecided {
-            conn_id: CONN,
-            cause: Some("first"),
-        }]
-    );
-
-    let recorder = Arc::new(Recorder::default());
-    let cause = CloseCause::new();
-    cause.observe_with(Arc::new(ConnTap::new(recorder.clone(), CONN)));
-    cause.cancelled_without_cause();
-    cause.record("late");
     cause.torn_down();
     assert_eq!(
         recorder.events(),
         vec![
             TransportEvent::CloseDecided {
-                conn_id: CONN,
-                cause: None,
+                remote: REMOTE,
+                conn_id: Some(CONN),
+                cause: Some("first"),
             },
             TransportEvent::TornDown { conn_id: CONN },
         ]
     );
-    assert_eq!(cause.get_or("unset"), "late", "production still keeps it");
 }
 
 /// Without an observer, `transport_observe!` never evaluates its event.
@@ -399,7 +397,7 @@ impl TransportObserver for Panics {
 #[test]
 fn observer_panic_unwinds_with_its_own_payload() {
     let cause = CloseCause::new();
-    cause.observe_with(Arc::new(ConnTap::new(Arc::new(Panics), CONN)));
+    cause.observe_with(registered_tap(Arc::new(Panics)));
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         cause.record("fault");
     }))
@@ -424,10 +422,7 @@ fn regulation_tables_report_each_transition() {
     use v9::message_type::{HEADERS, HEADERS_OUTCOME, SUBSCRIBE_HEADERS};
 
     let recorder = Arc::new(Recorder::default());
-    let tap = Arc::new(StreamTap::new(
-        Arc::new(ConnTap::new(recorder.clone(), CONN)),
-        4,
-    ));
+    let tap = Arc::new(StreamTap::new(registered_tap(recorder.clone()), 4));
     tap.tag_frames();
     let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
         .expect("SUBSCRIBE_HEADERS is a subscription row");
@@ -578,10 +573,7 @@ impl TransportObserver for EndWatcher {
 #[test]
 fn end_claimed_precedes_the_exchange_end() {
     let watcher = Arc::new(EndWatcher::default());
-    let tap = Arc::new(StreamTap::new(
-        Arc::new(ConnTap::new(watcher.clone(), CONN)),
-        4,
-    ));
+    let tap = Arc::new(StreamTap::new(registered_tap(watcher.clone()), 4));
     let fence =
         crate::zakura::regulation::WriterFence::new(CancellationToken::new(), CloseCause::new());
     let exchange = fence.open().expect("a fresh fence opens");
@@ -628,7 +620,7 @@ impl TransportObserver for AlwaysPanics {
 #[tokio::test]
 async fn an_observer_panic_in_a_pipe_unwinds_once() {
     let cause = CloseCause::new();
-    let conn = Arc::new(ConnTap::new(Arc::new(AlwaysPanics), CONN));
+    let conn = registered_tap(Arc::new(AlwaysPanics));
     cause.observe_with(conn.clone());
     let hook_cause = cause.clone();
     let pipe = crate::zakura::spawn_supervised_pipe(

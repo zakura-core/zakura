@@ -15,16 +15,16 @@
 //! scheduling point to a simulated run.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     fmt,
     net::SocketAddr,
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
-use crate::zakura::{CloseCause, FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
+use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 
 /// Receives transport events as they happen.
 ///
@@ -166,10 +166,15 @@ pub enum TransportEvent {
         message_type: u16,
     },
     /// The node decided to close the connection: the first recorded close
-    /// cause, or `None` when its token was cancelled with no cause recorded.
+    /// cause, or `None` when its token was cancelled with no cause recorded
+    /// first. A cancellation before registration is keyed by `remote` alone.
+    /// The `None` decision comes from the simulator token's cancellation hook,
+    /// so a test build without `zakura_sim` reports only recorded causes.
     CloseDecided {
-        /// The connection.
-        conn_id: ZakuraConnId,
+        /// The remote address the connection was admitted from.
+        remote: SocketAddr,
+        /// The connection, once registered.
+        conn_id: Option<ZakuraConnId>,
         /// The first recorded cause.
         cause: Option<&'static str>,
     },
@@ -278,11 +283,13 @@ pub enum HeaderCheck {
     },
 }
 
-/// One connection's observer, once the supervisor registered it.
+/// One connection's observer, from just before registration.
 #[derive(Debug)]
 pub(crate) struct ConnTap {
     observer: Arc<dyn TransportObserver>,
-    conn_id: ZakuraConnId,
+    remote: SocketAddr,
+    /// Set when the supervisor registers the connection.
+    conn_id: OnceLock<ZakuraConnId>,
     /// 1 once `CloseDecided` was reported.
     decided: AtomicU64,
     /// 1 once the observer panicked. It gets no more of this connection's
@@ -292,19 +299,29 @@ pub(crate) struct ConnTap {
 }
 
 impl ConnTap {
-    /// A tap that reports `conn_id`'s events to `observer`.
-    pub(crate) fn new(observer: Arc<dyn TransportObserver>, conn_id: ZakuraConnId) -> Self {
+    /// A tap that reports the events of the connection from `remote` to
+    /// `observer`.
+    pub(crate) fn new(observer: Arc<dyn TransportObserver>, remote: SocketAddr) -> Self {
         Self {
             observer,
-            conn_id,
+            remote,
+            conn_id: OnceLock::new(),
             decided: AtomicU64::new(0),
             panicked: AtomicU64::new(0),
         }
     }
 
+    /// Record the connection's registration ID.
+    pub(crate) fn registered(&self, conn_id: ZakuraConnId) {
+        let _ = self.conn_id.set(conn_id);
+    }
+
     /// The connection's registration ID.
     pub(crate) fn conn_id(&self) -> ZakuraConnId {
-        self.conn_id
+        *self
+            .conn_id
+            .get()
+            .expect("stream and teardown events come after registration, which sets the ID")
     }
 
     /// Reports `event`, unless the observer already panicked on this
@@ -324,61 +341,21 @@ impl ConnTap {
         }
     }
 
+    /// Marks the close as decided without reporting it, for a connection the
+    /// supervisor refused, which reports `HandshakeRefused` instead.
+    pub(crate) fn refused(&self) {
+        self.decided.store(1, Ordering::Release);
+    }
+
     /// Reports `CloseDecided` with `cause`, unless a decision was already
     /// reported.
     pub(crate) fn decide(&self, cause: Option<&'static str>) {
         if self.decided.swap(1, Ordering::AcqRel) == 0 {
             self.emit(TransportEvent::CloseDecided {
-                conn_id: self.conn_id,
+                remote: self.remote,
+                conn_id: self.conn_id.get().copied(),
                 cause,
             });
-        }
-    }
-}
-
-/// The close causes of a supervisor's registered connections, so whatever
-/// cancels a connection's token without recording a cause reports the close
-/// decision right then.
-///
-/// Every connection-level close inside the handler and its services records
-/// a cause first. The cause-free ones are the supervisor's disconnects and
-/// evictions, endpoint shutdown, the cleanup guard (which also runs when the
-/// serving future is dropped), and the transport loop's own exit. Each calls
-/// [`CloseCause::cancelled_without_cause`], directly or through this
-/// registry.
-#[derive(Debug, Default)]
-pub(crate) struct CloseRegistry(Mutex<BTreeMap<ZakuraConnId, CloseCause>>);
-
-impl CloseRegistry {
-    /// Track `conn_id`'s `cause` until [`Self::forget`].
-    pub(crate) fn insert(&self, conn_id: ZakuraConnId, cause: CloseCause) {
-        lock(&self.0).insert(conn_id, cause);
-    }
-
-    /// [`Self::cancelled`] for `conn_id`, whose cleanup just cancelled its
-    /// token, and stop tracking it.
-    pub(crate) fn cancelled_and_forget(&self, conn_id: ZakuraConnId) {
-        let cause = lock(&self.0).remove(&conn_id);
-        if let Some(cause) = cause {
-            cause.cancelled_without_cause();
-        }
-    }
-
-    /// Report `CloseDecided` with no cause for `conn_id`, whose token was
-    /// just cancelled, unless it already recorded a cause.
-    pub(crate) fn cancelled(&self, conn_id: Option<ZakuraConnId>) {
-        let cause = conn_id.and_then(|conn_id| lock(&self.0).get(&conn_id).cloned());
-        if let Some(cause) = cause {
-            cause.cancelled_without_cause();
-        }
-    }
-
-    /// [`Self::cancelled`] for every tracked connection, whose tokens a
-    /// shutdown just cancelled.
-    pub(crate) fn cancelled_all(&self) {
-        let causes: Vec<CloseCause> = lock(&self.0).values().cloned().collect();
-        for cause in causes {
-            cause.cancelled_without_cause();
         }
     }
 }
@@ -425,7 +402,7 @@ impl StreamTap {
         let seq = self.next_read.fetch_add(1, Ordering::AcqRel);
         self.reading.store(seq, Ordering::Release);
         self.conn.emit(TransportEvent::HeaderRead {
-            conn_id: self.conn.conn_id,
+            conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq,
             message_type,
@@ -438,7 +415,7 @@ impl StreamTap {
     /// Reports `FrameRead` for the header the reader has now.
     pub(crate) fn frame_read(&self) {
         self.conn.emit(TransportEvent::FrameRead {
-            conn_id: self.conn.conn_id,
+            conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq: self.reading(),
         });
@@ -489,7 +466,7 @@ impl StreamTap {
     pub(crate) fn write_started(&self, message_type: u16) -> u64 {
         let seq = self.next_write.fetch_add(1, Ordering::AcqRel);
         self.conn.emit(TransportEvent::FrameWriteStarted {
-            conn_id: self.conn.conn_id,
+            conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq,
             message_type,
@@ -500,7 +477,7 @@ impl StreamTap {
     /// Reports `FrameWritten` for the write numbered `seq`.
     pub(crate) fn written(&self, seq: u64, message_type: u16) {
         self.conn.emit(TransportEvent::FrameWritten {
-            conn_id: self.conn.conn_id,
+            conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq,
             message_type,
@@ -510,7 +487,7 @@ impl StreamTap {
     /// Reports `transition` on this stream.
     pub(crate) fn regulated(&self, transition: Transition) {
         self.conn.emit(TransportEvent::Regulated {
-            conn_id: self.conn.conn_id,
+            conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             transition,
         });

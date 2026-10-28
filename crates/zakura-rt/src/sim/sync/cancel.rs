@@ -1,12 +1,16 @@
 //! tokio-util's `CancellationToken` with preemption points, simulator build.
 //!
 //! `cancel`, `is_cancelled`, and the first poll of `cancelled` are points.
+//! [`CancellationToken::on_cancel`] adds none: its hooks run synchronously
+//! inside the `cancel` that cancels the token, after that call's point.
 
 use std::{
     fmt,
     future::Future,
+    mem,
     panic::Location,
     pin::Pin,
+    sync::{Arc, Mutex, PoisonError, Weak},
     task::{Context, Poll},
 };
 
@@ -18,6 +22,44 @@ use crate::sim::{point, Op};
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     inner: tokio_sync::CancellationToken,
+    /// This token's hooks and its children's, shared by its clones.
+    hooks: Arc<Hooks>,
+}
+
+/// A token's cancellation hooks, and its children's, which its cancellation
+/// also runs.
+#[derive(Default)]
+struct Hooks {
+    /// Hooks that haven't run, in the order they were added.
+    pending: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    /// The children's hooks. A dropped child's entry is skipped and pruned.
+    children: Mutex<Vec<Weak<Hooks>>>,
+}
+
+impl Hooks {
+    /// Runs this token's pending hooks, then its children's, each once.
+    ///
+    /// Runs no hook while it holds a lock, so a hook may add hooks or cancel
+    /// tokens itself.
+    fn run(&self) {
+        let pending = mem::take(&mut *lock(&self.pending));
+        for hook in pending {
+            hook();
+        }
+        let children: Vec<Arc<Hooks>> = lock(&self.children)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for child in children {
+            child.run();
+        }
+    }
+}
+
+/// Locks `mutex`. A hook that panicked left only a drained list behind, so a
+/// poisoned lock still holds consistent state.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CancellationToken {
@@ -28,8 +70,33 @@ impl CancellationToken {
 
     /// A token that is cancelled with this one, but not the other way round.
     pub fn child_token(&self) -> Self {
+        let hooks = Arc::new(Hooks::default());
+        let mut children = lock(&self.hooks.children);
+        children.retain(|child| child.strong_count() > 0);
+        children.push(Arc::downgrade(&hooks));
         CancellationToken {
             inner: self.inner.child_token(),
+            hooks,
+        }
+    }
+
+    /// Runs `hook` once, when this token is cancelled, directly or through a
+    /// parent. It runs synchronously inside that `cancel` call, after the
+    /// call's preemption point, so it must not block or reach a point itself.
+    /// If the token is already cancelled, `hook` runs now.
+    ///
+    /// Adding a hook is not a point, and neither is running one. Only the
+    /// simulator build has this, for test observers.
+    pub fn on_cancel(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut pending = lock(&self.hooks.pending);
+        // tokio's token marks itself cancelled before this wrapper runs the
+        // hooks, so a token it reports cancelled already took or will never
+        // take its hooks.
+        if self.inner.is_cancelled() {
+            drop(pending);
+            hook();
+        } else {
+            pending.push(Box::new(hook));
         }
     }
 
@@ -43,6 +110,7 @@ impl CancellationToken {
     fn cancel_at(&self, site: &'static Location<'static>) {
         point(Op::Cancel, site);
         self.inner.cancel();
+        self.hooks.run();
     }
 
     /// True once cancelled.

@@ -43,7 +43,7 @@ use zakura_quic::{
     QuicConfig, QuicEndpoint,
 };
 use zakura_rt::sync::CancellationToken;
-use zakura_scheduler::{RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
+use zakura_scheduler::{Op, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status};
 
 /// A run that takes more steps than this is stuck.
 const MAX_STEPS: usize = 100_000;
@@ -484,6 +484,10 @@ struct Wire {
     /// Tasks whose own name, the last part of their path, starts with this
     /// aren't run.
     held: Option<&'static str>,
+    /// Whether to start holding the node's serving task once it's ready at a
+    /// `watch` point in the handler, which it first reaches inside
+    /// `register`, as the supervisor publishes its peer set.
+    hold_in_register: bool,
     steps: Vec<String>,
 }
 
@@ -535,6 +539,8 @@ struct Script {
     /// Whether the node's supervisor disconnects the peer once the test
     /// starts it.
     disconnect: bool,
+    /// Whether the node's endpoint shuts down once the test starts it.
+    shutdown: bool,
 }
 
 /// Dials the node from the peer, runs the control handshake with header
@@ -675,13 +681,18 @@ impl Wire {
                 let node = quic.local_id();
                 let endpoint = ZakuraEndpoint::new(quic, handler);
                 let supervisor = endpoint.supervisor();
-                let disconnect = script.disconnect;
+                let (disconnect, shutdown) = (script.disconnect, script.shutdown);
                 let disconnecting = {
-                    let go = go.clone();
+                    let (go, endpoint) = (go.clone(), endpoint.clone());
                     async move {
-                        if disconnect {
+                        if disconnect || shutdown {
                             go.cancelled().await;
+                        }
+                        if disconnect {
                             assert!(supervisor.disconnect_peer(&wire_peer()).await);
+                        }
+                        if shutdown {
+                            endpoint.shutdown().await;
                         }
                     }
                 };
@@ -702,6 +713,7 @@ impl Wire {
             go,
             shutdown,
             held: None,
+            hold_in_register: false,
             steps: Vec::new(),
         }
     }
@@ -714,6 +726,21 @@ impl Wire {
                 self.steps.len() < MAX_STEPS,
                 "the run took {MAX_STEPS} steps"
             );
+            if self.hold_in_register && self.held.is_none() {
+                let in_register = self.sched.ready().into_iter().any(|ready| {
+                    self.sched
+                        .task_name(ready.task)
+                        .ends_with("quic.inbound_handshake.1")
+                        && ready.at.op == Op::Watch
+                        && ready
+                            .at
+                            .site
+                            .is_some_and(|site| site.file().ends_with("zakura/handler.rs"))
+                });
+                if in_register {
+                    self.held = Some("quic.inbound_handshake");
+                }
+            }
             let ready: Vec<_> = self
                 .sched
                 .ready()
@@ -897,7 +924,8 @@ fn partial_frames_reach_only_their_stage() {
         assert_eq!(
             closes(&events),
             vec![TransportEvent::CloseDecided {
-                conn_id,
+                remote: peer_addr(),
+                conn_id: Some(conn_id),
                 cause: Some("ordered_read_timeout"),
             }],
             "{case}: the timeout is neutral"
@@ -942,7 +970,8 @@ fn close_is_observed_before_teardown() {
     assert_eq!(
         closes(&events),
         vec![TransportEvent::CloseDecided {
-            conn_id,
+            remote: peer_addr(),
+            conn_id: Some(conn_id),
             cause: Some("ordered_read_rejected"),
         }],
         "the close is decided while teardown is held"
@@ -1257,7 +1286,8 @@ fn a_cancellation_is_decided_when_it_happens() {
     assert_eq!(
         closes(&events),
         vec![TransportEvent::CloseDecided {
-            conn_id,
+            remote: peer_addr(),
+            conn_id: Some(conn_id),
             cause: None,
         }],
         "the cancellation is decided while the serving task is held"
@@ -1424,6 +1454,7 @@ fn a_dropped_dial_is_decided_at_once() {
         go,
         shutdown,
         held: None,
+        hold_in_register: false,
         steps: Vec::new(),
     };
     wire.run_until(Duration::from_secs(5));
@@ -1433,7 +1464,8 @@ fn a_dropped_dial_is_decided_at_once() {
     wire.go.cancel();
     wire.run_until(Duration::from_secs(6));
     let decided = vec![TransportEvent::CloseDecided {
-        conn_id,
+        remote: peer_addr(),
+        conn_id: Some(conn_id),
         cause: None,
     }];
     assert_eq!(
@@ -1445,5 +1477,57 @@ fn a_dropped_dial_is_decided_at_once() {
     wire.stop.cancel();
     wire.run_until(Duration::from_secs(20));
     assert_eq!(closes(&wire.events()), decided, "shutdown adds nothing");
+    wire.finish();
+}
+
+/// An endpoint shutdown while the serving task is paused inside `register`,
+/// after the supervisor published the connection and before `register`
+/// returned, decides the close at once, keyed by the remote address, since no
+/// `conn_id` has been reported yet. `Registered` follows once the task runs,
+/// and the decision isn't repeated.
+///
+/// This fails if the connection token's cancellation hook isn't attached
+/// before `register`.
+#[test]
+fn a_shutdown_during_registration_is_decided_at_once() {
+    let mut wire = Wire::start(
+        37,
+        Script {
+            shutdown: true,
+            ..Script::default()
+        },
+    );
+    wire.hold_in_register = true;
+    wire.run_until(Duration::from_secs(5));
+    assert!(wire.held.is_some(), "the serving task reached registration");
+    assert!(
+        !wire
+            .events()
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Registered { .. })),
+        "registration hasn't returned"
+    );
+
+    wire.go.cancel();
+    wire.run_until(Duration::from_secs(10));
+    let decided = vec![TransportEvent::CloseDecided {
+        remote: peer_addr(),
+        conn_id: None,
+        cause: None,
+    }];
+    assert_eq!(
+        closes(&wire.events()),
+        decided,
+        "the shutdown is decided while registration is held"
+    );
+
+    wire.held = None;
+    wire.hold_in_register = false;
+    wire.run_until(Duration::from_secs(20));
+    let events = wire.events();
+    assert!(events.iter().any(
+        |event| matches!(event, TransportEvent::Registered { remote, .. } if *remote == peer_addr())
+    ));
+    assert_eq!(closes(&events), decided, "the decision is reported once");
     wire.finish();
 }

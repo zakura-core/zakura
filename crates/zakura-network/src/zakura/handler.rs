@@ -982,8 +982,6 @@ impl ZakuraEndpoint {
         }
         self.supervisor.shutdown();
         self.handler.shutdown.cancel();
-        #[cfg(any(test, zakura_sim))]
-        self.supervisor.close_causes.cancelled_all();
         self.quic.shutdown().await;
     }
 
@@ -1090,9 +1088,6 @@ pub struct ZakuraSupervisorHandle {
     /// The same counts the supervisor state charges, read by the QUIC acceptor.
     ip_slots: IpSlots,
     max_connections_per_ip: usize,
-    /// Registered connections' close causes, for the transport observer.
-    #[cfg(any(test, zakura_sim))]
-    close_causes: Arc<super::CloseRegistry>,
 }
 
 /// Connections charged to each source IP: registered connections, and inbound
@@ -1423,8 +1418,6 @@ impl ZakuraSupervisorHandle {
             peer_registry,
             ip_slots,
             max_connections_per_ip,
-            #[cfg(any(test, zakura_sim))]
-            close_causes: Arc::default(),
         }
     }
 
@@ -1553,14 +1546,8 @@ impl ZakuraSupervisorHandle {
         if !reason.proves_tampered_body() {
             return false;
         }
-        #[cfg(any(test, zakura_sim))]
-        let cancelled;
         let token = {
             let state = self.inner.lock().await;
-            #[cfg(any(test, zakura_sim))]
-            {
-                cancelled = state.active_by_peer.get(peer_id).map(|entry| entry.conn_id);
-            }
             state
                 .active_by_peer
                 .get(peer_id)
@@ -1571,8 +1558,6 @@ impl ZakuraSupervisorHandle {
         let disconnected = token.is_some_and(|token| {
             let already_closing = token.is_cancelled();
             token.cancel();
-            #[cfg(any(test, zakura_sim))]
-            self.close_causes.cancelled(cancelled);
             !already_closing
         });
         if disconnected {
@@ -1589,14 +1574,8 @@ impl ZakuraSupervisorHandle {
 
     /// Disconnect one active Zakura peer.
     pub async fn disconnect_peer(&self, peer_id: &ZakuraPeerId) -> bool {
-        #[cfg(any(test, zakura_sim))]
-        let cancelled;
         let token = {
             let state = self.inner.lock().await;
-            #[cfg(any(test, zakura_sim))]
-            {
-                cancelled = state.active_by_peer.get(peer_id).map(|entry| entry.conn_id);
-            }
             state
                 .active_by_peer
                 .get(peer_id)
@@ -1605,8 +1584,6 @@ impl ZakuraSupervisorHandle {
 
         if let Some(token) = token {
             token.cancel();
-            #[cfg(any(test, zakura_sim))]
-            self.close_causes.cancelled(cancelled);
             true
         } else {
             false
@@ -1672,8 +1649,6 @@ impl ZakuraSupervisorHandle {
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
                     state.decrement_ip(old_entry.remote_ip);
                     old_entry.disconnect_token.cancel();
-                    #[cfg(any(test, zakura_sim))]
-                    self.close_causes.cancelled(Some(old_entry.conn_id));
                     metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
                 state.increment_ip(remote_ip);
@@ -1728,8 +1703,6 @@ impl ZakuraSupervisorHandle {
                         && !entry.disconnect_token.is_cancelled()
                     {
                         entry.disconnect_token.cancel();
-                        #[cfg(any(test, zakura_sim))]
-                        self.close_causes.cancelled(Some(entry.conn_id));
                         metrics::counter!("zakura.p2p.conn.duplicate.evicted_stale").increment(1);
                     }
                 }
@@ -1857,10 +1830,6 @@ impl RegisteredPeerCleanupGuard {
     async fn cleanup_registered_peer(mut self) {
         if self.armed {
             self.disconnect_token.cancel();
-            #[cfg(any(test, zakura_sim))]
-            self.supervisor
-                .close_causes
-                .cancelled_and_forget(self.conn_id);
             self.remove_admitted_services();
             self.supervisor
                 .deregister(&self.peer_id, self.conn_id)
@@ -1877,10 +1846,6 @@ impl Drop for RegisteredPeerCleanupGuard {
         }
 
         self.disconnect_token.cancel();
-        #[cfg(any(test, zakura_sim))]
-        self.supervisor
-            .close_causes
-            .cancelled_and_forget(self.conn_id);
         self.remove_admitted_services();
 
         let supervisor = self.supervisor.clone();
@@ -2511,8 +2476,20 @@ impl ZakuraProtocolHandler {
         self
     }
 
-    /// Report `connection`'s registration as `conn_id`, attach the observer
-    /// to its `close_cause`, and let the supervisor find that cause.
+    /// Attach the observer to `connection`'s `close_cause`, keyed by its
+    /// remote address until registration gives it a `conn_id`.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_close(&self, close_cause: &CloseCause, connection: &Connection) {
+        if let Some(observer) = &self.transport_observer {
+            close_cause.observe_with(Arc::new(super::ConnTap::new(
+                observer.clone(),
+                connection.admitted_addr(),
+            )));
+        }
+    }
+
+    /// Report `connection`'s registration as `conn_id`, which its later
+    /// events carry.
     #[cfg(any(test, zakura_sim))]
     fn observe_registered(
         &self,
@@ -2520,16 +2497,16 @@ impl ZakuraProtocolHandler {
         close_cause: &CloseCause,
         connection: &Connection,
     ) {
-        if let Some(observer) = &self.transport_observer {
-            close_cause.observe_with(Arc::new(super::ConnTap::new(observer.clone(), conn_id)));
-            self.supervisor
-                .close_causes
-                .insert(conn_id, close_cause.clone());
-            observer.observe(super::TransportEvent::Registered {
+        if let Some(tap) = close_cause.tap() {
+            tap.registered(conn_id);
+        }
+        transport_observe!(
+            self.transport_observer,
+            super::TransportEvent::Registered {
                 conn_id,
                 remote: connection.admitted_addr(),
-            });
-        }
+            }
+        );
     }
 
     /// Report that `connection` was refused before registration, for
@@ -2543,6 +2520,22 @@ impl ZakuraProtocolHandler {
                 reason: reason.to_string(),
             }
         );
+    }
+
+    /// [`Self::handshake_refused`] for a connection the supervisor refused to
+    /// register. The refusal is its close decision, so a later cancellation of
+    /// its token reports none.
+    #[cfg(any(test, zakura_sim))]
+    fn registration_refused(
+        &self,
+        close_cause: &CloseCause,
+        connection: &Connection,
+        reason: &'static str,
+    ) {
+        if let Some(tap) = close_cause.tap() {
+            tap.refused();
+        }
+        self.handshake_refused(connection, reason);
     }
 
     /// Restrict the locally advertised capability mask.
@@ -3411,8 +3404,6 @@ impl ZakuraProtocolHandler {
         }
 
         connection_token.cancel();
-        #[cfg(any(test, zakura_sim))]
-        close_cause.cancelled_without_cause();
         drop(incoming_setup);
         drop(pending_sessions);
         while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
@@ -3846,11 +3837,17 @@ impl ZakuraProtocolHandler {
         let (outbound_tx, outbound_rx) =
             mpsc::channel(usize::from(context.limits.max_inbound_queue_depth));
         let close_cause = CloseCause::new();
+        #[cfg(any(test, zakura_sim))]
+        self.observe_close(&close_cause, &connection);
         let outbound_handle = ZakuraPeerHandle {
             peer_id: peer_id.clone(),
             sender: outbound_tx,
         };
         let connection_token = self.shutdown.child_token();
+        // Every way the connection's token is cancelled reaches this hook, so
+        // it's the one place a close with no recorded cause is decided.
+        #[cfg(zakura_sim)]
+        close_cause.decide_when_cancelled(&connection_token);
         let registration = self
             .supervisor
             .register(
@@ -3863,8 +3860,8 @@ impl ZakuraProtocolHandler {
                 context.accepted_capabilities,
             )
             .await;
-        // Before the guard's drop below, which can be a scheduling point, so a
-        // supervisor that cancels the connection finds its close cause.
+        // Before the guard's drop below, which can be a scheduling point, so
+        // the connection's events carry its `conn_id` from registration on.
         #[cfg(any(test, zakura_sim))]
         if let ZakuraRegistration::Registered { conn_id, .. } = &registration {
             self.observe_registered(*conn_id, &close_cause, &connection);
@@ -3923,7 +3920,7 @@ impl ZakuraProtocolHandler {
                     None,
                 );
                 #[cfg(any(test, zakura_sim))]
-                self.handshake_refused(&connection, "duplicate");
+                self.registration_refused(&close_cause, &connection, "duplicate");
                 connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
                 Ok(())
             }
@@ -3939,7 +3936,7 @@ impl ZakuraProtocolHandler {
                     Some(reject_reason_label(reason)),
                 );
                 #[cfg(any(test, zakura_sim))]
-                self.handshake_refused(&connection, reject_reason_label(reason));
+                self.registration_refused(&close_cause, &connection, reject_reason_label(reason));
                 connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"registration");
                 Ok(())
             }

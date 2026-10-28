@@ -85,7 +85,8 @@ fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
 }
 
 /// Runs `scenario` under `input`. The run must end with no violation and
-/// no harness failure, with every block storage operation paired.
+/// no harness failure, with every block storage operation paired, and with
+/// every sequencer snapshot matching the holder events.
 fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
     let ports = Storage::prepare(scenario);
     let report = run_prepared::<Storage>(
@@ -100,6 +101,8 @@ fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     let view = ports.view.borrow();
     assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+    assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+    assert_eq!(view.owners.holder_gap(), None);
     report
 }
 

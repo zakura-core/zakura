@@ -17,7 +17,10 @@
 //! change again, as header sync would. No other actor changes the node's
 //! headers, so any other stale apply fails the run. The change reaches the
 //! mirrors before the node, or after it, as the action says. Chain changes
-//! run one stage at a time, in script order.
+//! run one stage at a time, in script order. An action can hold the node's
+//! apply step until a trigger holds, and a hold can wait for
+//! [`Trigger::Prepared`](crate::harness::policy::Trigger::Prepared), so a scenario
+//! can land an operation between the two steps on every schedule.
 //!
 //! A teardown runs on the link task, since it closes links. The two bypass
 //! witnesses run in the step loop, since they read the node's engine and
@@ -76,6 +79,10 @@ pub enum ControlAction {
         /// mirrors go first by default.
         #[serde(default)]
         node_first: bool,
+        /// If set, the node applies the prepared headers only once this
+        /// holds. Applied at once by default.
+        #[serde(default)]
+        apply_when: Option<Trigger>,
     },
     /// Switch every actor to `fork`: its headers on each engine, which
     /// reorganizes the node's selected chain through its real engine, and
@@ -88,6 +95,10 @@ pub enum ControlAction {
         /// change. The mirrors go first by default.
         #[serde(default)]
         node_first: bool,
+        /// If set, the node applies the prepared headers only once this
+        /// holds. Applied at once by default.
+        #[serde(default)]
+        apply_when: Option<Trigger>,
     },
     /// Send `frames` from the probe, in order. The scenario must link one.
     ProbeSend {
@@ -156,10 +167,15 @@ enum Stage {
     /// The mirrors make the change, on the chain task.
     Mirrors(ChainChange),
     /// The node prepares the change's headers, as a step of its own.
-    NodePrepare(ChainChange),
-    /// The node applies the prepared headers, as a step of its own.
-    NodeApply(ChainChange, NodeTarget),
+    NodePrepare(ChainChange, Gate),
+    /// The node applies the prepared headers, as a step of its own, once
+    /// its gate holds.
+    NodeApply(ChainChange, NodeTarget, Gate),
 }
+
+/// What a chain change's node apply step waits for, if anything: its
+/// action's `apply_when`.
+type Gate = Option<Trigger>;
 
 /// The chain changes' stages not yet done, in order, shared with the chain
 /// task.
@@ -279,14 +295,20 @@ impl ActionSource for Control {
             _ => "grow",
         };
         match self.stages.borrow().front() {
-            Some(Stage::NodePrepare(change)) => {
+            Some(Stage::NodePrepare(change, _)) => {
                 out.push((Identity::peer("node", action(change)), CHANGE_NODE));
             }
-            Some(Stage::NodeApply(change, _)) => out.push((
-                Identity::peer("node", &format!("{}-apply", action(change))),
-                CHANGE_NODE,
-            )),
-            Some(Stage::Mirrors(_)) | None => {}
+            Some(Stage::NodeApply(change, _, gate))
+                if gate
+                    .as_ref()
+                    .is_none_or(|when| self.predicates.borrow().control_holds(when, now)) =>
+            {
+                out.push((
+                    Identity::peer("node", &format!("{}-apply", action(change))),
+                    CHANGE_NODE,
+                ));
+            }
+            Some(Stage::NodeApply(..) | Stage::Mirrors(_)) | None => {}
         }
         let Some(step) = self.script.get(self.next) else {
             return;
@@ -305,6 +327,9 @@ impl ActionSource for Control {
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(Stage::NodeApply(_, _, Some(when))) = self.stages.borrow().front() {
+            self.predicates.borrow().control_boundaries(when, now, out);
+        }
         if let Some(when) = self
             .script
             .get(self.next)
@@ -318,13 +343,16 @@ impl ActionSource for Control {
         if token == CHANGE_NODE {
             let stage = self.stages.borrow_mut().pop_front();
             let next = match stage {
-                Some(Stage::NodePrepare(change)) => self
+                Some(Stage::NodePrepare(change, gate)) => self
                     .topology
                     .prepare_node(&change)
-                    .map(|target| Stage::NodeApply(change, target)),
-                Some(Stage::NodeApply(change, target)) => {
-                    (!self.topology.apply_node(&change, target))
-                        .then_some(Stage::NodePrepare(change))
+                    .map(|target| Stage::NodeApply(change, target, gate)),
+                Some(Stage::NodeApply(change, target, gate)) => {
+                    if self.topology.apply_node(&change, target) {
+                        None
+                    } else {
+                        Some(Stage::NodePrepare(change, gate))
+                    }
                 }
                 _ => unreachable!("`enabled` offers only a node stage that comes first"),
             };
@@ -338,11 +366,20 @@ impl ActionSource for Control {
         self.next += 1;
         let full = "each channel holds the whole script, and its task outlives the run";
         match action {
-            ControlAction::Grow { node_first, .. } | ControlAction::Reset { node_first, .. } => {
+            ControlAction::Grow {
+                node_first,
+                ref apply_when,
+                ..
+            }
+            | ControlAction::Reset {
+                node_first,
+                ref apply_when,
+                ..
+            } => {
                 let Some(change) = self.topology.plan_change(&action) else {
                     return;
                 };
-                let node = Stage::NodePrepare(change.clone());
+                let node = Stage::NodePrepare(change.clone(), apply_when.clone());
                 let mirrors = Stage::Mirrors(change);
                 let mut stages = self.stages.borrow_mut();
                 if node_first {

@@ -12,7 +12,7 @@
 //! set the act is for before sending it. A frame with a fault is labelled
 //! on a copy of the models, so it changes no model state.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
@@ -98,6 +98,12 @@ impl Row {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContentRule {
+    /// A `Status` whose work anchor is above its selected tip.
+    StatusAnchor,
+    /// A `Status` whose retention floor is above its selected tip.
+    StatusRetention,
+    /// A `Status` whose header cap is 0.
+    StatusHeaderCap,
     /// A `Status` whose `max_subscriptions` isn't 1.
     StatusSubscriptions,
     /// A `Status` with an unknown schema bit.
@@ -117,7 +123,10 @@ pub enum ContentRule {
 
 impl ContentRule {
     /// Every rule, by row.
-    pub const ALL: [ContentRule; 7] = [
+    pub const ALL: [ContentRule; 10] = [
+        ContentRule::StatusAnchor,
+        ContentRule::StatusRetention,
+        ContentRule::StatusHeaderCap,
         ContentRule::StatusSubscriptions,
         ContentRule::StatusSchema,
         ContentRule::StatusCap,
@@ -130,7 +139,10 @@ impl ContentRule {
     /// The row the rule's frame is on.
     pub fn row(self) -> Row {
         match self {
-            ContentRule::StatusSubscriptions
+            ContentRule::StatusAnchor
+            | ContentRule::StatusRetention
+            | ContentRule::StatusHeaderCap
+            | ContentRule::StatusSubscriptions
             | ContentRule::StatusSchema
             | ContentRule::StatusCap => Row::Status,
             ContentRule::OpenLocators | ContentRule::OpenCursor => Row::SubscribeHeaders,
@@ -201,8 +213,12 @@ pub enum Act {
     ExtraEndingAhead,
     /// A `Grant` after this peer's `Close`.
     AfterClose,
-    /// An `Open` the node ends at once, then a `Grant` sent once its
-    /// ending is in flight: conformant.
+    /// An `Open` toward a target no node retains, which the node ends at
+    /// once: conformant, the setup of [`Act::OutcomeCrossing`].
+    UnretainedOpen,
+    /// A `Grant` for the [`Act::UnretainedOpen`], sent [`CROSSING_DELAY`]
+    /// after it, once the node has ended the subscription and before the
+    /// ending arrives: conformant.
     OutcomeCrossing,
     /// A `Grant` acknowledging a cursor outside the subscription's history.
     BadCursor,
@@ -235,6 +251,7 @@ impl Act {
             Act::ExtraEnding => "extra-ending",
             Act::ExtraEndingAhead => "extra-ending-ahead",
             Act::AfterClose => "after-close",
+            Act::UnretainedOpen => "unretained-open",
             Act::OutcomeCrossing => "outcome-crossing",
             Act::BadCursor => "bad-cursor",
             Act::StatusBurst => "status-burst",
@@ -261,6 +278,7 @@ impl Act {
             Act::MinPayload { .. }
             | Act::MaxPayload { .. }
             | Act::SecondOpen
+            | Act::UnretainedOpen
             | Act::OutcomeCrossing
             | Act::StatusBurst => Labels::NONE,
             Act::Unsolicited { .. } | Act::ExtraEnding | Act::ExtraEndingAhead => {
@@ -288,6 +306,7 @@ impl Act {
             Act::SecondOpen
             | Act::OverLive
             | Act::AfterClose
+            | Act::UnretainedOpen
             | Act::OutcomeCrossing
             | Act::BadCursor => Row::SubscribeHeaders,
             Act::ExtraEnding | Act::ExtraEndingAhead => Row::HeadersOutcome,
@@ -329,8 +348,12 @@ const MAX_LOCATORS: u32 = 13;
 /// The target an `Open` names that no node retains.
 const UNRETAINED: block::Hash = block::Hash([0xa5; 32]);
 
-/// Byte offsets in a `Status` payload: `max_subscriptions`, the message
-/// cap and the schema mask.
+/// Byte offsets in a `Status` payload: the work anchor's height, the
+/// retention floor, the header cap, `max_subscriptions`, the message cap
+/// and the schema mask.
+const STATUS_ANCHOR: usize = 0;
+const STATUS_RETENTION: usize = 104;
+const STATUS_HEADER_CAP: usize = 108;
 const STATUS_SUBSCRIPTIONS: usize = 112;
 const STATUS_CAP: usize = 114;
 const STATUS_SCHEMA: usize = 118;
@@ -346,9 +369,35 @@ pub(crate) struct Adversary {
     spec: AdversarySpec,
     /// The next key for an `Open` beyond the honest script's.
     next_key: u64,
-    /// An `Open` whose ending its `Grant` waits to cross, with its start.
-    crossing: Option<(u64, Cursor)>,
+    /// Keys of the `Open`s it sent beyond the honest script's.
+    opened: Vec<u64>,
+    /// Those the node has sent a page for, so it applied them.
+    paged: BTreeSet<u64>,
+    /// The unretained `Open` whose ending a `Grant` will cross.
+    crossing: Option<Crossing>,
 }
+
+/// An [`Act::UnretainedOpen`] that an [`Act::OutcomeCrossing`] follows.
+#[derive(Clone, Copy, Debug)]
+struct Crossing {
+    key: u64,
+    /// Its start cursor, which the `Grant` acknowledges.
+    start: Cursor,
+    /// When it was sent.
+    sent: Instant,
+    /// Whether its ending has reached this peer, which is too late for a
+    /// crossing.
+    ended: bool,
+}
+
+/// How long after its unretained `Open` an adversary sends the crossing
+/// `Grant`: after the node ends the subscription, which it does on reading
+/// the `Open`, within a link's 100 ms, and before the ending can arrive on
+/// a link whose delays start at [`CROSSING_LINK_MS`].
+pub const CROSSING_DELAY: Duration = Duration::from_millis(200);
+
+/// The minimum delay from the node to an adversary that crosses an ending.
+pub const CROSSING_LINK_MS: u64 = 500;
 
 impl Adversary {
     /// An adversary as `spec` says.
@@ -356,6 +405,8 @@ impl Adversary {
         Adversary {
             spec,
             next_key: 2,
+            opened: Vec::new(),
+            paged: BTreeSet::new(),
             crossing: None,
         }
     }
@@ -385,8 +436,15 @@ impl Adversary {
                 .and_then(|id| models.unspent(SESSION, id))
                 .is_some_and(|unspent| unspent.objects >= 1),
             Act::Unsolicited { .. } => node_subscription.is_none() && honest.serving.is_empty(),
-            Act::SecondOpen => own.is_some() && models.held(SESSION) == 1,
-            Act::OverLive => own.is_some() && models.held(SESSION) == 2,
+            // Each `Open` waits until the node paged the ones before it, so
+            // the node applied them.
+            Act::SecondOpen => {
+                own.is_some_and(|sub| sub.paged_at.is_some()) && models.held(SESSION) == 1
+            }
+            Act::OverLive => {
+                let applied = self.opened.iter().all(|key| self.paged.contains(key));
+                own.is_some() && applied && models.held(SESSION) == 2
+            }
             Act::ExtraEnding => {
                 let ended = honest.last_ending.is_some()
                     && honest.serving.is_empty()
@@ -398,7 +456,13 @@ impl Adversary {
             | Act::MinPayload {
                 row: Row::SubscribeHeaders,
             } => own.is_some_and(|sub| sub.paged_at.is_some()),
-            Act::OutcomeCrossing
+            Act::OutcomeCrossing => {
+                return self
+                    .crossing
+                    .filter(|crossing| !crossing.ended)
+                    .map(|crossing| crossing.sent + CROSSING_DELAY);
+            }
+            Act::UnretainedOpen
             | Act::MaxPayload {
                 row: Row::SubscribeHeaders,
             } => honest.node_status.is_some() && honest.subscribed.is_none(),
@@ -465,6 +529,7 @@ impl Adversary {
                     .as_ref()
                     .map_or(0, |subscribe| subscribe.start);
                 let key = self.key();
+                self.opened.push(key);
                 Crafted::of(open(honest, key, &[start], ONE_PAGE)?)
             }
             Act::ExtraEnding => {
@@ -481,15 +546,33 @@ impl Adversary {
                 Crafted::of(ending)
             }
             Act::AfterClose => Crafted::of(honest.update(Some(ONE_PAGE))),
-            Act::OutcomeCrossing => {
+            Act::UnretainedOpen => {
                 let key = self.key();
                 let tip = honest.chain.status.selected_tip_height.0;
                 let mut message = open(honest, key, &[tip], ONE_PAGE)?;
                 if let Message::SubscribeHeaders(update) = &mut message {
                     update.initial_target_tip_hash = UNRETAINED;
-                    self.crossing = Some((key, update.acknowledged));
+                    self.crossing = Some(Crossing {
+                        key,
+                        start: update.acknowledged,
+                        sent: Instant::now(),
+                        ended: false,
+                    });
                 }
                 Crafted::of(message)
+            }
+            Act::OutcomeCrossing => {
+                let crossing = self.crossing.ok_or("no Open to cross")?;
+                Crafted::of(RegtestMessage::SubscribeHeaders(SubscribeHeaders {
+                    operation: Operation::Grant,
+                    subscription_id: crossing.key,
+                    update_sequence: 1,
+                    initial_target_tip_hash: UNRETAINED,
+                    acknowledged: crossing.start,
+                    locator_hashes: Vec::new(),
+                    added_credit: ONE_PAGE,
+                    tree_aux_schema: AuxSchema::None,
+                }))
             }
             Act::BadCursor => {
                 let mut message = honest.update(Some(ONE_PAGE));
@@ -533,41 +616,25 @@ impl Adversary {
         Ok(out)
     }
 
-    /// Frames a node frame triggers before the honest script follows it:
-    /// the `Grant` of an armed crossing, once its subscription's ending
-    /// arrives, labelled while the models still hold the subscription live.
-    pub(crate) fn before_receive(
-        &mut self,
-        message: &RegtestMessage,
-        honest: &mut Honest,
-    ) -> Result<Vec<Outgoing>, String> {
-        let Message::HeadersOutcome(outcome) = message else {
-            return Ok(Vec::new());
-        };
-        let Some((key, start)) = self
-            .crossing
-            .filter(|(key, _)| *key == outcome.subscription_id)
-        else {
-            return Ok(Vec::new());
-        };
-        self.crossing = None;
-        let grant = RegtestMessage::SubscribeHeaders(SubscribeHeaders {
-            operation: Operation::Grant,
-            subscription_id: key,
-            update_sequence: 1,
-            initial_target_tip_hash: UNRETAINED,
-            acknowledged: start,
-            locator_hashes: Vec::new(),
-            added_credit: ONE_PAGE,
-            tree_aux_schema: AuxSchema::None,
-        });
-        let frame = Crafted::of(grant);
-        check(
-            Act::OutcomeCrossing,
-            &honest.models.preview(&frame),
-            Labels::NONE,
-        )?;
-        Ok(vec![honest.send_crafted(frame)])
+    /// Follows a node frame before the honest script does: a page for one
+    /// of its extra `Open`s shows the node applied it, and an ending for
+    /// the crossing's `Open` shows the crossing came too late.
+    pub(crate) fn before_receive(&mut self, message: &RegtestMessage) {
+        match message {
+            Message::Headers(page) if self.opened.contains(&page.subscription_id) => {
+                self.paged.insert(page.subscription_id);
+            }
+            Message::HeadersOutcome(outcome) => {
+                if let Some(crossing) = self
+                    .crossing
+                    .as_mut()
+                    .filter(|crossing| crossing.key == outcome.subscription_id)
+                {
+                    crossing.ended = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A fresh key for an `Open`.
@@ -710,7 +777,35 @@ impl Adversary {
                 now,
             )
         };
+        let above = valid.selected_tip_height.0 + 1;
         match rule {
+            ContentRule::StatusAnchor => status(
+                Status {
+                    work_anchor_height: block::Height(above),
+                    ..valid.clone()
+                },
+                STATUS_ANCHOR,
+                &valid.work_anchor_height.0.to_le_bytes(),
+                &above.to_le_bytes(),
+            ),
+            ContentRule::StatusRetention => status(
+                Status {
+                    oldest_retained_height: block::Height(above),
+                    ..valid.clone()
+                },
+                STATUS_RETENTION,
+                &valid.oldest_retained_height.0.to_le_bytes(),
+                &above.to_le_bytes(),
+            ),
+            ContentRule::StatusHeaderCap => status(
+                Status {
+                    max_headers_per_response: 0,
+                    ..valid.clone()
+                },
+                STATUS_HEADER_CAP,
+                &valid.max_headers_per_response.to_le_bytes(),
+                &0u32.to_le_bytes(),
+            ),
             ContentRule::StatusSubscriptions => status(
                 Status {
                     max_subscriptions: 2,

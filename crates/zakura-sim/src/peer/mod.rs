@@ -72,7 +72,9 @@ use self::{
     limit::{RateLimit, ADVERSARY_RATE},
 };
 use crate::{
-    model::{CadenceModel, Charge, FrameHeader, FrameModel, Labels, ReaderEnd, SubscriptionModel},
+    model::{
+        CadenceModel, Charge, FrameHeader, FrameModel, Label, Labels, ReaderEnd, SubscriptionModel,
+    },
     observe::{PeerCredit, StreamId},
     table::rule_row,
     ActionSource, Boundary, Identity, ObservationLog,
@@ -460,6 +462,19 @@ impl Outgoing {
         self.bytes.truncate(8);
     }
 
+    /// Whether every frame here is labelled `Conformant`.
+    pub(crate) fn conformant(&self) -> bool {
+        self.records.iter().all(|record| {
+            matches!(
+                record,
+                RecordBody::Frame {
+                    label: Label::Conformant,
+                    ..
+                }
+            )
+        })
+    }
+
     /// `frames` in order, written with one call, so a burst's writes don't
     /// each take their own steps.
     pub(crate) fn burst(frames: Vec<Outgoing>) -> Outgoing {
@@ -565,19 +580,14 @@ impl StreamModels {
         }
     }
 
-    /// Labels `message` with the models and encodes it. A conformant frame
-    /// changes the models as its sending does.
-    pub(crate) fn send(&mut self, message: &RegtestMessage) -> Outgoing {
-        self.send_crafted(Crafted::of(message.clone()))
-    }
-
     /// Every label `frame` would get, without sending it.
     pub(crate) fn preview(&self, frame: &Crafted) -> Labels {
         self.clone().labels(frame)
     }
 
     /// Labels `frame` with the models, as [`Self::labels`] does, and
-    /// returns its bytes and record.
+    /// returns its bytes and record. A conformant frame changes the models
+    /// as its sending does.
     pub(crate) fn send_crafted(&mut self, frame: Crafted) -> Outgoing {
         let header = frame.header;
         let label = self.labels(&frame).first();
@@ -1145,16 +1155,11 @@ impl PeerTask {
                             payload: frame.payload.len() as u64,
                             credit: credit(&message),
                         });
-                        if let (Some(adversary), Some(honest)) =
-                            (scripts.adversary.as_mut(), scripts.honest.as_mut().filter(|_| current))
-                        {
-                            match adversary.before_receive(&message, honest) {
-                                Ok(crossing) => frames = crossing,
-                                Err(why) => return self.fail(why),
-                            }
+                        if let Some(adversary) = scripts.adversary.as_mut().filter(|_| current) {
+                            adversary.before_receive(&message);
                         }
                         if let Some(honest) = scripts.honest.as_mut().filter(|_| current) {
-                            frames.extend(honest.receive(&message, frame.payload.len()));
+                            frames = honest.receive(&message, frame.payload.len());
                         }
                     }
                 },

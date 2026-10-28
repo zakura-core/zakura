@@ -15,12 +15,14 @@
 //! own ancestors are followed, and on Windows a path can change between the
 //! check and the open.
 
+pub mod failure;
 pub mod meta;
 pub mod read;
 pub mod replay;
 mod verify;
 pub mod write;
 
+pub use failure::{artifacts_root, record_failure, ARTIFACTS_VAR, TRACES_DIR};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
 pub use replay::{

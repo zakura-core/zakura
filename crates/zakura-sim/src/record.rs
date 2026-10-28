@@ -260,6 +260,28 @@ impl From<Line> for Record {
 pub trait RecordSink {
     /// Takes the next record.
     fn record(&mut self, record: Record);
+
+    /// Whether the run emits step records to this sink. When it's false,
+    /// the run skips each step's record and its `obs` digest, and emits
+    /// only `init` and `end`. The run reads it once, before its first step.
+    fn wants_steps(&self) -> bool {
+        true
+    }
+}
+
+/// A sink that keeps nothing and wants no step records, for the fuzz loop,
+/// which records a trace only after a run fails (`trace::record_failure`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NullSink;
+
+impl RecordSink for NullSink {
+    /// Drops the record.
+    fn record(&mut self, _: Record) {}
+
+    /// False: the run skips step records and their digests.
+    fn wants_steps(&self) -> bool {
+        false
+    }
 }
 
 /// A sink that keeps every record in memory.

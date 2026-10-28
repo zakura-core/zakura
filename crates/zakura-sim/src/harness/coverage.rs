@@ -117,4 +117,28 @@ pub static COVERAGE: &[Coverage] = &[
             "planted_block_operation_ids_violate_the_property",
         )),
     },
+    Coverage {
+        property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
+        passing: sim_test(
+            "tests/block_resource_properties.rs",
+            "the_stuck_floor_fills_the_commit_window_within_retained_byte_bound",
+        ),
+        bypass: Bypass::Planted("wide-commit-window"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::RESERVED_BYTE_BOUND,
+        passing: sim_test(
+            "tests/block_resource_properties.rs",
+            "the_overdraft_input_holds_reserved_byte_bound",
+        ),
+        bypass: Bypass::Planted("above-floor-charge"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::BUDGET_LEDGERS_AGREE,
+        passing: sim_test(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_budget_ledgers_agree",
+        ),
+        bypass: Bypass::Planted("handoff-keeps-charge"),
+    },
 ];

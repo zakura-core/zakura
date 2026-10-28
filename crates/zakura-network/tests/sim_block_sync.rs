@@ -1116,6 +1116,7 @@ fn check_budget_chain(events: &[BlockEvent]) -> Result<(), String> {
             kind,
             before,
             after,
+            ..
         }) = event
         {
             if *before != reserved {
@@ -1213,6 +1214,7 @@ fn check_handoffs(events: &[BlockEvent]) -> Result<usize, String> {
                         kind: BudgetChangeKind::Released,
                         before,
                         after,
+                        ..
                     })) if before - after == *charge => ended += 1,
                     other => return Err(format!("{height:?} ended after {other:?}")),
                 }

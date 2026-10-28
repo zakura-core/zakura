@@ -24,6 +24,8 @@ use zakura_network::zakura::{
     ServicePeerDirection, ZakuraConnId, ZakuraPeerId,
 };
 
+use crate::domain::block_sync::OwnerModel;
+
 /// An admitted session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
@@ -98,6 +100,9 @@ pub struct BlockSyncView {
     pub reads: BTreeMap<u64, Height>,
     /// Events the fold couldn't apply, in order.
     pub anomalies: Vec<String>,
+    /// The resource properties' owner model, which folds the events as the
+    /// tap logs them.
+    pub owners: OwnerModel,
 }
 
 impl BlockSyncView {
@@ -348,12 +353,14 @@ mod tests {
             kind: BudgetChangeKind::Reserved,
             before: 0,
             after: 100,
+            limit: 1_000,
         }));
         assert!(view.anomalies.is_empty());
         view.fold(&BlockEvent::Budget(BudgetChange {
             kind: BudgetChangeKind::Released,
             before: 50,
             after: 0,
+            limit: 1_000,
         }));
         assert_eq!(view.anomalies.len(), 1, "{:?}", view.anomalies);
         assert_eq!(view.reserved, 0);

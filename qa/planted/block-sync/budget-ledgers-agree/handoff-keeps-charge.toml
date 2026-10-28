@@ -1,0 +1,9 @@
+# Drops the budget release after a routine hands a received body to the
+# sequencer. The work queue already released the body's reservation, so
+# at the next quiescence boundary the budget counts more than the work
+# queue's tally.
+input = "crates/zakura-sim/tests/fixtures/block-sync-handoff.bin"
+# Besides peer_routine.rs, which the patch changes, the harness drives the
+# rest of block sync and the Zakura transport under it. A change there can
+# move the input off the handoff.
+checks = ["crates/zakura-network/src/zakura"]

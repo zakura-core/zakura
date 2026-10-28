@@ -128,12 +128,7 @@ fn a_held_mirror_read_waits_for_its_trigger() {
     }];
     for input in inputs(8, 256) {
         let scenario = BlockScenario {
-            mirrors: vec![
-                MirrorSpec {
-                    dialer: Dialer::Mirror,
-                };
-                2
-            ],
+            mirrors: vec![MirrorSpec::new(Dialer::Mirror); 2],
             ..scenario(16, holds.clone(), Vec::new())
         };
         let (_, ports) = run(&scenario, input);
@@ -173,12 +168,8 @@ fn close_and_relink_change_only_the_named_link() {
     ];
     let scenario = BlockScenario {
         mirrors: vec![
-            MirrorSpec {
-                dialer: Dialer::Mirror,
-            },
-            MirrorSpec {
-                dialer: Dialer::Node,
-            },
+            MirrorSpec::new(Dialer::Mirror),
+            MirrorSpec::new(Dialer::Node),
         ],
         ..scenario(16, Vec::new(), control)
     };
@@ -416,9 +407,7 @@ fn the_probe_gets_the_range_it_asks_for() {
 fn an_unsolicited_probe_ending_closes_only_the_probe() {
     let scenario = BlockScenario {
         blocks: 8,
-        mirrors: vec![MirrorSpec {
-            dialer: Dialer::Mirror,
-        }],
+        mirrors: vec![MirrorSpec::new(Dialer::Mirror)],
         probe: true,
         control: vec![
             ControlStep {

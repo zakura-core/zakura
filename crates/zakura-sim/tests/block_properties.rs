@@ -100,12 +100,8 @@ fn sampled_run(
 /// One mirror that dials the node and one the node dials.
 fn two_mirrors() -> Vec<MirrorSpec> {
     vec![
-        MirrorSpec {
-            dialer: Dialer::Mirror,
-        },
-        MirrorSpec {
-            dialer: Dialer::Node,
-        },
+        MirrorSpec::new(Dialer::Mirror),
+        MirrorSpec::new(Dialer::Node),
     ]
 }
 

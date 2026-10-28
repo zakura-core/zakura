@@ -319,6 +319,7 @@ impl BlockTap {
                 .to_owned(),
                 before: change.before,
                 after: change.after,
+                limit: change.limit,
             },
             BlockEvent::HandoffStarted {
                 peer: delivering,
@@ -633,6 +634,11 @@ impl ActionSource for BlockTap {
         let mut view = self.view.borrow_mut();
         for (_, _, event) in &events {
             view.fold(event);
+        }
+        for obs in &sent {
+            if let Observation::BlockSync { event, .. } = obs {
+                view.owners.observe(event);
+            }
         }
         view.step = Some(log.step());
         match paired {

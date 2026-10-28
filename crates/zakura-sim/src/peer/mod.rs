@@ -46,7 +46,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
-    v9::{Message, Operation, RegtestMessage},
+    v9::{Cursor, Headers, Message, Operation, RegtestMessage},
     wire_codec::{decode_frame, encode_frame},
     Frame, P2P_V2_ALPN, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
     ZAKURA_STREAM_HEADER_SYNC,
@@ -545,8 +545,70 @@ pub(crate) struct StreamModels {
     pub(crate) subscriptions: SubscriptionModel,
     cadence: CadenceModel,
     content: ContentLabeller,
+    /// Wire cursors as the subscription model's keys.
+    cursors: Cursors,
     /// Frames labelled so far, the next one's `seq`.
     sent: u64,
+}
+
+/// Wire cursors as keys for the subscription model, which compares cursors
+/// by equality alone, as the publisher does: each distinct (height, hash,
+/// headers, bytes) gets its own key, so a cursor differing in any field is
+/// another cursor.
+#[derive(Clone, Debug, Default)]
+struct Cursors {
+    keys: BTreeMap<(u32, [u8; 32], u64, u64), u64>,
+    /// The headers and bytes the pages of each subscription consumed, by
+    /// who sent the pages and the subscription's ID.
+    consumed: BTreeMap<(Pages, u64), (u64, u64)>,
+}
+
+/// Whose pages a subscription carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Pages {
+    /// The peer's, on a subscription the node opened.
+    Peer,
+    /// The node's, on one the peer opened.
+    Node,
+}
+
+impl Cursors {
+    /// `cursor`'s key.
+    fn key(&mut self, cursor: &Cursor) -> u64 {
+        let next = u64::try_from(self.keys.len()).expect("a run sees fewer than 2^64 cursors");
+        *self
+            .keys
+            .entry((cursor.height.0, cursor.hash.0, cursor.headers, cursor.bytes))
+            .or_insert(next)
+    }
+
+    /// The key of `page`'s cursor, `payload_len` bytes long, from `pages`,
+    /// with the totals it consumes through it. Nothing is recorded.
+    fn page(&mut self, pages: Pages, page: &Headers, payload_len: usize) -> (u64, (u64, u64)) {
+        let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
+        let (headers, bytes) = self
+            .consumed
+            .get(&(pages, page.subscription_id))
+            .copied()
+            .unwrap_or_default();
+        let totals = (
+            headers.saturating_add(u64::from(count)),
+            bytes.saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX)),
+        );
+        let last = page
+            .entries
+            .last()
+            .map_or(page.common_ancestor_hash, |entry| entry.header.hash());
+        let key = self.key(&Cursor {
+            height: zakura_chain::block::Height(
+                page.common_ancestor_height.0.saturating_add(count),
+            ),
+            hash: last,
+            headers: totals.0,
+            bytes: totals.1,
+        });
+        (key, totals)
+    }
 }
 
 /// The model session of a header stream: each stream has models of its own.
@@ -577,6 +639,7 @@ impl StreamModels {
                 .expect("the row is a subscription"),
             cadence: CadenceModel::new(),
             content: ContentLabeller::new(chain),
+            cursors: Cursors::default(),
             sent: 0,
         }
     }
@@ -652,14 +715,24 @@ impl StreamModels {
         };
         let own_row = self.frames.row(header.message_type).is_some()
             && message_type(message) == header.message_type;
-        let role = if own_row {
-            role_labels(subscriptions, message, header.payload_len)
+        let (role, page) = if own_row {
+            role_labels(
+                subscriptions,
+                &mut self.cursors,
+                message,
+                header.payload_len,
+            )
         } else {
-            Labels::NONE
+            (Labels::NONE, None)
         };
         let labels = header_labels.union(role).union(content);
         if labels.is_conformant() {
             self.content.sent(message);
+            if let (Message::Headers(sent), Some(totals)) = (message, page) {
+                self.cursors
+                    .consumed
+                    .insert((Pages::Peer, sent.subscription_id), totals);
+            }
         }
         labels
     }
@@ -674,7 +747,7 @@ impl StreamModels {
             Message::Status(_) => {}
             Message::SubscribeHeaders(update) => {
                 let id = update.subscription_id;
-                let acknowledged = u64::from(update.acknowledged.height.0);
+                let acknowledged = self.cursors.key(&update.acknowledged);
                 match update.operation {
                     Operation::Open => {
                         models.subscribe(SESSION, id, update.added_credit, acknowledged);
@@ -693,8 +766,12 @@ impl StreamModels {
             }
             Message::Headers(page) => {
                 let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
-                let last = u64::from(page.common_ancestor_height.0) + u64::from(count);
-                models.send_page(SESSION, page.subscription_id, count, payload_len, last);
+                let (last, totals) = self.cursors.page(Pages::Node, page, payload_len);
+                if models.send_page(SESSION, page.subscription_id, count, payload_len, last) {
+                    self.cursors
+                        .consumed
+                        .insert((Pages::Node, page.subscription_id), totals);
+                }
             }
             Message::HeadersOutcome(outcome) => {
                 models.end(SESSION, outcome.subscription_id);
@@ -721,17 +798,20 @@ fn exchange(message: &RegtestMessage) -> Option<u64> {
 }
 
 /// The subscription model's labels for the peer sending `message`, a page
-/// read as `payload_len` bytes. It applies a conformant one.
+/// read as `payload_len` bytes, with cursors keyed by `cursors`. It applies
+/// a conformant one. For a page, also the totals it consumes, which the
+/// caller records once the whole frame is conformant.
 fn role_labels(
     subscriptions: &mut SubscriptionModel,
+    cursors: &mut Cursors,
     message: &RegtestMessage,
     payload_len: usize,
-) -> Labels {
-    match message {
+) -> (Labels, Option<(u64, u64)>) {
+    let labels = match message {
         Message::Status(_) => Labels::NONE,
         Message::SubscribeHeaders(update) => {
             let (id, sequence) = (update.subscription_id, update.update_sequence);
-            let acknowledged = u64::from(update.acknowledged.height.0);
+            let acknowledged = cursors.key(&update.acknowledged);
             match update.operation {
                 Operation::Open => subscriptions.open_frame(
                     SESSION,
@@ -752,13 +832,16 @@ fn role_labels(
         }
         Message::Headers(page) => {
             let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
-            let last = u64::from(page.common_ancestor_height.0) + u64::from(count);
-            subscriptions.page_frame(SESSION, page.subscription_id, count, payload_len, last)
+            let (last, totals) = cursors.page(Pages::Peer, page, payload_len);
+            let labels =
+                subscriptions.page_frame(SESSION, page.subscription_id, count, payload_len, last);
+            return (labels, Some(totals));
         }
         Message::HeadersOutcome(outcome) => {
             subscriptions.ending_frame(SESSION, outcome.subscription_id)
         }
-    }
+    };
+    (labels, None)
 }
 
 /// The credit `message` adds, if it's an `Open` or a `Grant`.

@@ -94,6 +94,30 @@ impl Row {
     }
 }
 
+/// A field of a subscription cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CursorField {
+    /// The last header's height.
+    Height,
+    /// The last header's hash.
+    Hash,
+    /// The headers consumed.
+    Headers,
+    /// The bytes consumed.
+    Bytes,
+}
+
+impl CursorField {
+    /// Every field.
+    pub const ALL: [CursorField; 4] = [
+        CursorField::Height,
+        CursorField::Hash,
+        CursorField::Headers,
+        CursorField::Bytes,
+    ];
+}
+
 /// A content rule the content labeller checks ([`super::content`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -220,8 +244,12 @@ pub enum Act {
     /// after it, once the node has ended the subscription and before the
     /// ending arrives: conformant.
     OutcomeCrossing,
-    /// A `Grant` acknowledging a cursor outside the subscription's history.
-    BadCursor,
+    /// A `Grant` acknowledging the last page's cursor with one `field`
+    /// changed, so it names no cursor of the subscription's history.
+    BadCursor {
+        /// The field changed.
+        field: CursorField,
+    },
     /// Up to [`BURST`] `Status` frames, written at once, stopping after the
     /// first that finds the cadence bucket empty: conformant, that one
     /// `exhausted`. A script of enough of them empties the bucket.
@@ -253,7 +281,7 @@ impl Act {
             Act::AfterClose => "after-close",
             Act::UnretainedOpen => "unretained-open",
             Act::OutcomeCrossing => "outcome-crossing",
-            Act::BadCursor => "bad-cursor",
+            Act::BadCursor { .. } => "bad-cursor",
             Act::StatusBurst => "status-burst",
             Act::BadContent { .. } => "bad-content",
         }
@@ -287,7 +315,7 @@ impl Act {
             Act::OverCreditHeader | Act::OverCreditObjects => of(Label::OverCredit),
             Act::OverLive => of(Label::OverLive),
             Act::AfterClose => of(Label::AfterClose),
-            Act::BadCursor => of(Label::BadCursor),
+            Act::BadCursor { .. } => of(Label::BadCursor),
             Act::BadContent { .. } => of(Label::BadContent),
         }
     }
@@ -308,7 +336,7 @@ impl Act {
             | Act::AfterClose
             | Act::UnretainedOpen
             | Act::OutcomeCrossing
-            | Act::BadCursor => Row::SubscribeHeaders,
+            | Act::BadCursor { .. } => Row::SubscribeHeaders,
             Act::ExtraEnding | Act::ExtraEndingAhead => Row::HeadersOutcome,
             Act::BadContent { rule } => rule.row(),
         }
@@ -452,7 +480,7 @@ impl Adversary {
                 return ended.then_some(past + SETTLE);
             }
             Act::AfterClose => honest.subscribed.as_ref().is_some_and(|sub| sub.close_sent),
-            Act::BadCursor
+            Act::BadCursor { .. }
             | Act::MinPayload {
                 row: Row::SubscribeHeaders,
             } => own.is_some_and(|sub| sub.paged_at.is_some()),
@@ -574,16 +602,16 @@ impl Adversary {
                     tree_aux_schema: AuxSchema::None,
                 }))
             }
-            Act::BadCursor => {
+            Act::BadCursor { field } => {
                 let mut message = honest.update(Some(ONE_PAGE));
                 if let Message::SubscribeHeaders(update) = &mut message {
-                    let height = update.acknowledged.height.0 + 1_000;
-                    update.acknowledged = Cursor {
-                        height: block::Height(height),
-                        hash: block::Hash([0x5a; 32]),
-                        headers: 0,
-                        bytes: 0,
-                    };
+                    let cursor = &mut update.acknowledged;
+                    match field {
+                        CursorField::Height => cursor.height.0 += 1,
+                        CursorField::Hash => cursor.hash.0[0] ^= 1,
+                        CursorField::Headers => cursor.headers += 1,
+                        CursorField::Bytes => cursor.bytes += 1,
+                    }
                 }
                 Crafted::of(message)
             }

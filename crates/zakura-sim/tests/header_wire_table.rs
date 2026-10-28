@@ -22,7 +22,7 @@ use zakura_sim::{
     model::{is_fault_cause, FrameModel, Label, ReaderEnd},
     observe::{TransitionFact, TransportFact},
     peer::{
-        adversary::{Act, AdversarySpec, ContentRule, Row, CROSSING_LINK_MS},
+        adversary::{Act, AdversarySpec, ContentRule, CursorField, Row, CROSSING_LINK_MS},
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         limit::ADVERSARY_RATE,
         peer_addr, PeerAction, PeerSpec, NODE_ADDR,
@@ -161,9 +161,9 @@ fn cases() -> Vec<Act> {
         Act::AfterClose,
         Act::UnretainedOpen,
         Act::OutcomeCrossing,
-        Act::BadCursor,
         Act::StatusBurst,
     ]);
+    acts.extend(CursorField::ALL.map(|field| Act::BadCursor { field }));
     acts.extend(ContentRule::ALL.map(|rule| Act::BadContent { rule }));
     acts.dedup();
     acts
@@ -248,7 +248,7 @@ fn scenario(act: Act, script: Vec<Act>, withhold: bool) -> WireScenario {
         ),
         Act::SecondOpen
         | Act::OverLive
-        | Act::BadCursor
+        | Act::BadCursor { .. }
         | Act::MinPayload {
             row: Row::SubscribeHeaders,
         } => (
@@ -597,7 +597,9 @@ fn the_intended_guard_decides() {
         Act::OverLive,
         Act::OverCreditObjects,
         Act::ExtraEndingAhead,
-        Act::BadCursor,
+        Act::BadCursor {
+            field: CursorField::Hash,
+        },
         Act::BadContent {
             rule: ContentRule::Linkage,
         },

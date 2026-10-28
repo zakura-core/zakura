@@ -10,7 +10,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
-use zakura_network::zakura::{BlockSyncMessage, BlockSyncStatus, FramedRecv};
+use zakura_network::zakura::{BlockSyncMessage, BlockSyncStatus, Frame, FramedRecv};
 use zakura_storage::block::fixture::FixtureBlock;
 
 use crate::Sim;
@@ -39,6 +39,12 @@ pub enum ProbeFrame {
         /// The body's height.
         height: u32,
     },
+    /// The chain's body at `height` with its coinbase repeated, so its
+    /// header no longer commits to its transactions.
+    TamperedBlock {
+        /// The body's height.
+        height: u32,
+    },
     /// An ending for a response.
     BlocksDone {
         /// The response's first height.
@@ -53,16 +59,70 @@ pub enum ProbeFrame {
         /// The number of heights.
         count: u32,
     },
+    /// A status like [`ProbeFrame::Status`], with these serving limits.
+    LimitedStatus {
+        /// The lowest servable height.
+        servable_low: u32,
+        /// The highest servable height, whose hash the status carries.
+        servable_high: u32,
+        /// The most requests the probe serves at once.
+        max_inflight_requests: u32,
+        /// The most body bytes the probe sends per range.
+        max_response_bytes: u32,
+    },
+    /// A frame the codec never writes: `message_type` and `flags` in its
+    /// header, and a payload of `len` bytes, the first of them the type's
+    /// low byte and the rest zero.
+    Raw {
+        /// The header's message type.
+        message_type: u16,
+        /// The header's flags.
+        flags: u16,
+        /// The payload's length.
+        len: u32,
+    },
 }
 
 impl ProbeFrame {
+    /// The frame, with hashes and bodies from `chain`, the blocks above
+    /// genesis whose hash is `genesis`.
+    ///
+    /// # Panics
+    ///
+    /// As [`ProbeFrame::message`].
+    pub fn frame(self, genesis: block::Hash, chain: &[FixtureBlock]) -> Frame {
+        match self {
+            ProbeFrame::Raw {
+                message_type,
+                flags,
+                len,
+            } => {
+                let len = usize::try_from(len).expect("a probe frame fits in memory");
+                let mut payload = vec![0; len];
+                if let Some(tag) = payload.first_mut() {
+                    // The low byte is the tag a stream-6 payload starts with.
+                    *tag = message_type.to_le_bytes()[0];
+                }
+                Frame {
+                    message_type,
+                    flags,
+                    payload,
+                }
+            }
+            frame => frame
+                .message(genesis, chain)
+                .encode_frame()
+                .expect("a probe frame encodes"),
+        }
+    }
+
     /// The message, with hashes and bodies from `chain`, the blocks above
     /// genesis whose hash is `genesis`.
     ///
     /// # Panics
     ///
     /// If a height the frame names is above the chain, which is a scenario
-    /// bug.
+    /// bug, or for a [`ProbeFrame::Raw`] frame, which no message encodes.
     pub fn message(self, genesis: block::Hash, chain: &[FixtureBlock]) -> BlockSyncMessage {
         let at = |height: u32| -> &FixtureBlock {
             let index = usize::try_from(height)
@@ -95,6 +155,11 @@ impl ProbeFrame {
                 count,
             },
             ProbeFrame::Block { height } => BlockSyncMessage::Block(at(height).block.clone()),
+            ProbeFrame::TamperedBlock { height } => {
+                let mut block = block::Block::clone(&at(height).block);
+                block.transactions.push(block.transactions[0].clone());
+                BlockSyncMessage::Block(block.into())
+            }
             ProbeFrame::BlocksDone {
                 start_height,
                 returned,
@@ -109,6 +174,26 @@ impl ProbeFrame {
                 start_height: block::Height(start_height),
                 count,
             },
+            ProbeFrame::LimitedStatus {
+                servable_low,
+                servable_high,
+                max_inflight_requests,
+                max_response_bytes,
+            } => {
+                let BlockSyncMessage::Status(status) = (ProbeFrame::Status {
+                    servable_low,
+                    servable_high,
+                })
+                .message(genesis, chain) else {
+                    unreachable!("a status frame is a status")
+                };
+                BlockSyncMessage::Status(BlockSyncStatus {
+                    max_inflight_requests,
+                    max_response_bytes,
+                    ..status
+                })
+            }
+            ProbeFrame::Raw { .. } => panic!("a raw probe frame has no message"),
         }
     }
 }

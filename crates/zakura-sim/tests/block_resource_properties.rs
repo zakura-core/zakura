@@ -57,11 +57,7 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
 /// past `M` too, and the same input violates it.
 #[test]
 fn the_overdraft_input_holds_reserved_byte_bound() {
-    check_witness(
-        committed(OVERDRAFT_INPUT),
-        RESERVED_BYTE_BOUND,
-        Expect::Holds,
-    );
+    holds(committed(OVERDRAFT_INPUT), RESERVED_BYTE_BOUND);
 }
 
 /// The handoff input holds the ledgers at every quiescence boundary after
@@ -69,11 +65,7 @@ fn the_overdraft_input_holds_reserved_byte_bound() {
 /// its charge after the handoff, and the same input violates them.
 #[test]
 fn the_handoff_input_holds_budget_ledgers_agree() {
-    check_witness(
-        committed(HANDOFF_INPUT),
-        BUDGET_LEDGERS_AGREE,
-        Expect::Holds,
-    );
+    holds(committed(HANDOFF_INPUT), BUDGET_LEDGERS_AGREE);
 }
 
 /// The stuck-floor scenario fills the commit window and holds the retained
@@ -85,18 +77,34 @@ fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
     let mut witness = committed(STUCK_FLOOR_INPUT);
     assert_eq!(witness.scenario, BlockScenario::stuck_floor());
     witness.scenario.steps = Some(400_000);
-    check_witness(witness, RETAINED_BYTE_BOUND, Expect::Holds);
+    holds(witness, RETAINED_BYTE_BOUND);
 }
 
 /// Runs `scenario` under `input`. The run must end with no violation and
-/// no harness failure.
+/// no harness failure, with every block storage operation paired.
 fn node_run(scenario: &BlockScenario, input: PlanInput) -> RunReport {
     let ports = Storage::prepare(scenario);
-    let report = run_prepared::<Storage>(scenario, ports, input, &mut MemorySink::default(), None)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let report = run_prepared::<Storage>(
+        scenario,
+        ports.clone(),
+        input,
+        &mut MemorySink::default(),
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let view = ports.view.borrow();
+    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
     report
+}
+
+/// Checks `witness` as a witness test of `property` that expects it to
+/// hold, after a run of the same scenario and Plan pairs every block
+/// storage operation.
+fn holds(witness: WitnessScenario<Storage>, property: &str) {
+    node_run(&witness.scenario, witness.input.clone());
+    check_witness(witness, property, Expect::Holds);
 }
 
 /// `id`'s outcome in `report`.

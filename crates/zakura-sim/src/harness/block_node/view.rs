@@ -7,7 +7,9 @@
 //! can't apply, such as a release of something never retained, is kept in
 //! [`BlockSyncView::anomalies`] for a check to judge, since it describes
 //! the node, not the harness. Each sequencer snapshot is compared with the
-//! folded holders it should match, and a mismatch is an anomaly too.
+//! folded holders it should match, and a mismatch is an anomaly too. A block
+//! storage operation that doesn't pair with the owner that should have sent
+//! it is kept in [`BlockSyncView::pairing`], for the same reason.
 //!
 //! Sessions are never pruned: block sync reports no session close yet, so a
 //! closed session's entry stays.
@@ -64,6 +66,30 @@ pub struct Lease {
     pub count: u32,
 }
 
+/// How a block storage operation failed to pair with the owner that should
+/// have sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingKind {
+    /// No retained submission, or no held serving lease, came before it.
+    Unpaired,
+    /// It took a submission that an earlier operation already took.
+    PairedTwice,
+    /// Its submission holds another owner or height, or the sequencer
+    /// released that submission while it was still open.
+    Mispaired,
+}
+
+/// A block storage operation, or a deferral, that didn't pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingAnomaly {
+    /// How it failed to pair.
+    pub kind: PairingKind,
+    /// The storage fact's sequence number.
+    pub fact: u64,
+    /// The operation and what it lacked.
+    pub detail: String,
+}
+
 /// A tapped node's block-sync owner state after a step. See the module doc.
 #[derive(Clone, Debug, Default)]
 pub struct BlockSyncView {
@@ -100,6 +126,8 @@ pub struct BlockSyncView {
     pub reads: BTreeMap<u64, Height>,
     /// Events the fold couldn't apply, in order.
     pub anomalies: Vec<String>,
+    /// Block storage operations that didn't pair, in order.
+    pub pairing: Vec<PairingAnomaly>,
     /// The resource properties' owner model, which folds the events as the
     /// tap logs them.
     pub owners: OwnerModel,

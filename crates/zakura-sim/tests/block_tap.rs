@@ -3,12 +3,13 @@
 //! once and in order, and a dropped, extra, changed or reordered event fails
 //! the run. On an honest node, every block storage submission and read
 //! pairs with the event that owns it, and the view folds the owners back to
-//! empty.
+//! empty. An operation that doesn't pair is an anomaly in the view, and the
+//! run goes on; a lost storage fact fails the run.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use support::{config, inputs, run};
 use zakura_chain::block::Height;
@@ -25,12 +26,12 @@ use zakura_sim::{
             policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
             probe::ProbeFrame,
             tap::BlockTap,
-            view::BlockSyncView,
+            view::{BlockSyncView, PairingKind},
         },
         block_sync::{BlockScenario, Ports, Storage},
         run_prepared, Subsystem,
     },
-    observe::{BlockSyncFact, StorageFact, StorageRequest},
+    observe::{BlockSyncFact, StorageBranch, StorageFact, StorageRequest, WorkOwner, WorkScope},
     ActionSource, Boundary, HarnessFailure, Identity, IdleStatus, MemorySink, Observation,
     ObservationLog, Outcome, PlanInput, RunConfig, RunReport, Sim,
 };
@@ -73,6 +74,15 @@ struct Twist {
 /// is added as `wrap` makes it, and the observer lives until the run ends
 /// unless `twist` drops it.
 fn tap_run(twist: Twist, wrap: impl FnOnce(BlockTap) -> Box<dyn ActionSource>) -> RunReport {
+    tap_run_into(twist, Rc::default(), wrap)
+}
+
+/// [`tap_run`] with the tap folding into `view`.
+fn tap_run_into(
+    twist: Twist,
+    view: Rc<RefCell<BlockSyncView>>,
+    wrap: impl FnOnce(BlockTap) -> Box<dyn ActionSource>,
+) -> RunReport {
     let mut kept = None;
     let mut service = Some(service());
     let report = run(
@@ -80,7 +90,7 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(BlockTap) -> Box<dyn ActionSource>) -
         PlanInput::Bytes(Vec::new()),
         |sim| {
             let held = service.as_ref().expect("the service is made before setup");
-            let (observer, tap) = BlockTap::new(sim, held, "node", Rc::default());
+            let (observer, tap) = BlockTap::new(sim, held, "node", view);
             if twist.drop_service {
                 service = None;
             }
@@ -235,6 +245,109 @@ impl<S: ActionSource> ActionSource for DropAfter<S> {
         }
         Ok(())
     }
+}
+
+/// A reader that, at step `at`, hands its tap `fact` as the block storage
+/// fact numbered `seq`, as if the node's storage had logged it.
+struct Plant {
+    inner: BlockTap,
+    at: u64,
+    seq: u64,
+    fact: StorageFact,
+}
+
+impl ActionSource for Plant {
+    forward!();
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        if log.step() == self.at {
+            self.inner.storage_facts([(self.seq, &self.fact)]);
+        }
+        self.inner.observe(log)
+    }
+}
+
+/// A body submission under token `token`, as block storage logs it.
+fn submission(token: u64) -> StorageFact {
+    StorageFact::BlockSubmitted {
+        id: 1,
+        request: StorageRequest::SubmitBlock {
+            owner: WorkOwner {
+                kind: "body".to_owned(),
+                scope: WorkScope {
+                    header_generation: 1,
+                    branch: StorageBranch {
+                        anchor: "00".to_owned(),
+                        target: "11".to_owned(),
+                    },
+                },
+                verified_generation: Some(1),
+                body_work_epoch: Some(1),
+                session_id: 1,
+                request_id: 1,
+            },
+            source: "01".to_owned(),
+            token,
+            height: Some(3),
+            hash: "aa".to_owned(),
+            parent: "bb".to_owned(),
+            class: "full".to_owned(),
+        },
+        stage: Some("queued".to_owned()),
+    }
+}
+
+/// A body submission that no sequencer holder retained is the node's
+/// anomaly, not the harness's: the view keeps it for a property to judge,
+/// and the run goes on to end as a plain run does.
+#[test]
+fn an_unpaired_submission_is_an_anomaly_and_the_run_goes_on() {
+    let plain = plain_run();
+    let view = Rc::default();
+    let report = tap_run_into(Twist::default(), Rc::clone(&view), |inner| {
+        Box::new(Plant {
+            inner,
+            at: 1,
+            seq: 1,
+            fact: submission(9),
+        })
+    });
+    assert_eq!(report.end, plain.end);
+    let view = view.borrow();
+    let kinds: Vec<_> = view
+        .pairing
+        .iter()
+        .map(|anomaly| (anomaly.kind, anomaly.fact))
+        .collect();
+    assert_eq!(kinds, [(PairingKind::Unpaired, 1)]);
+    assert!(
+        view.pairing[0].detail.contains("token 9"),
+        "{:?}",
+        view.pairing
+    );
+    assert!(view.submissions.is_empty());
+    assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+}
+
+/// A storage fact that skips a sequence number means the harness lost one,
+/// so it fails the run at that step with `LostFact`.
+#[test]
+fn a_lost_storage_fact_ends_the_run_there() {
+    let report = tap_run(Twist::default(), |inner| {
+        Box::new(Plant {
+            inner,
+            at: 1,
+            seq: 2,
+            fact: submission(9),
+        })
+    });
+    let (source, detail) = evidence_failure(&report);
+    assert_eq!(
+        source, "source 0",
+        "the run names a failing source by its index"
+    );
+    assert_eq!(report.end.steps, 1);
+    assert!(detail.starts_with("LostFact"), "{detail}");
 }
 
 /// A plain run logs every event once, numbered from 1 in the order the
@@ -491,6 +604,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 BlockSyncFact::HandoffEnded { .. } => "handoff-ended",
                 BlockSyncFact::Holder { .. } => "holder",
                 BlockSyncFact::ServingLease { .. } => "serving-lease",
+                BlockSyncFact::ServingAdmission { .. } => "serving-admission",
                 BlockSyncFact::ServingFrame { .. } => "serving-frame",
                 BlockSyncFact::Routine { .. } => "routine",
                 BlockSyncFact::WorkQueue { .. } => "work-queue",
@@ -518,9 +632,11 @@ fn assert_numbered(report: &RunReport) {
 }
 
 /// What an honest node's owners hold once it has converged: nothing in
-/// flight, and no event the fold couldn't apply.
+/// flight, no event the fold couldn't apply, and no operation that didn't
+/// pair.
 fn assert_settled(view: &BlockSyncView) {
     assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
     assert_eq!(view.reserved, 0, "the byte budget drains");
     assert!(view.handoffs.is_empty(), "{:?}", view.handoffs);
     assert!(view.holders.is_empty(), "{:?}", view.holders);
@@ -594,6 +710,7 @@ fn an_honest_serve_pairs_every_read() {
         assert_numbered(&report);
         let kinds = event_kinds(&report);
         assert!(kinds.contains("serving-lease"), "{kinds:?}");
+        assert!(kinds.contains("serving-admission"), "{kinds:?}");
         assert!(kinds.contains("serving-frame"), "{kinds:?}");
         let (submits, reads) = operations(&report);
         assert!(submits.is_empty());

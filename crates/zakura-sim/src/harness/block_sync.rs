@@ -14,11 +14,16 @@
 //! traces, the fail-closed shutdown when an invalid-body record isn't
 //! durable, the 30 s timeouts on state calls, and the tampered-body
 //! disconnect. No block property covers them.
+//!
+//! Every link carries a [`Wire`] relay that labels each frame with the
+//! stream-6 role models, and the node's tap writes its identities and
+//! effects beside the labels, so the harness checks stream 6's generated
+//! receiver, downstream and sender properties.
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use zakura_network::zakura::ZakuraBlockSyncConfig;
+use zakura_network::zakura::{block_sync_serving_limit, block_sync_streams, ZakuraBlockSyncConfig};
 use zakura_scheduler::SchedulerConfig;
 use zakura_storage::{
     block::{
@@ -31,8 +36,9 @@ use zakura_storage::{
 use super::{
     block_node::{
         control::{Control, ControlAction, ControlStep},
-        default_limits, preload,
+        default_limits, policy, preload,
         probe::ProbeLog,
+        relay::Wire,
         tap::BlockTap,
         view::BlockSyncView,
         BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
@@ -47,12 +53,16 @@ use crate::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::BLOCK_SERVICE,
+    table::{downstream_properties, sender_properties, table_properties, Effect},
     RunConfig, Sim,
 };
 
 /// The node's block operations get rising IDs, each completes at most once,
 /// and only after its submission.
 pub const OPERATION_IDS: &str = "block-sync/storage-operation-ids";
+
+/// The family the stream-6 generated property IDs name.
+pub const FAMILY: &str = "block-sync";
 
 /// A mirror peer: real block-sync code on full state that holds the whole
 /// fixture chain. It's named `mirror-<i>` by its index in
@@ -313,7 +323,9 @@ impl Subsystem for Storage {
     ///
     /// # Panics
     ///
-    /// If the node holds more bodies than the scenario has blocks.
+    /// If the node holds more bodies than the scenario has blocks, or a
+    /// hold or control step waits for a trigger the node never records
+    /// ([`policy::undriven`]).
     fn prepare(scenario: &BlockScenario) -> Ports {
         assert!(
             scenario.node_bodies <= scenario.blocks,
@@ -321,6 +333,15 @@ impl Subsystem for Storage {
             scenario.blocks,
             scenario.node_bodies
         );
+        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
+            scenario
+                .control
+                .iter()
+                .filter_map(|step| step.when.as_ref()),
+        );
+        if let Some(why) = triggers.filter_map(policy::undriven).next() {
+            panic!("{why}");
+        }
         let fixture = BlockFixture::regtest();
         let chain = fixture.uniform(fixture.anchor(), scenario.blocks, scenario.body_spec(), 0);
         let held = |bodies: u32| usize::try_from(bodies).expect("fixture chains are short");
@@ -380,7 +401,9 @@ impl Subsystem for Storage {
             .map_or(0, u64::from);
         ports.view.borrow_mut().owners = OwnerModel::new(Limits::of(&config, largest_body));
         let view = ports.view.clone();
-        let (observer, tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
+        let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
+        let wire = Wire::new(block_sync_serving_limit(&config));
+        tap.label_with(wire.clone());
         let teardown = tap.teardown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
@@ -416,7 +439,11 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, ports.effects, ports.live).with_tap(teardown));
+        let topology = Rc::new(
+            Topology::new(nodes, ports.effects, ports.live)
+                .with_wire(wire)
+                .with_tap(teardown),
+        );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
@@ -434,9 +461,11 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`storage_properties`], then the resource properties.
+    /// [`storage_properties`], [`table_wiring_properties`], then the
+    /// resource properties.
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
+        properties.extend(table_wiring_properties());
         properties.extend(resource_properties());
         properties
     }
@@ -514,11 +543,33 @@ pub fn storage_properties<S: HasView>() -> Vec<Property<S>> {
     }]
 }
 
-/// What [`storage_properties`] and the resource properties read: the
-/// node's storage facts and its view, plus the step loop's task
-/// observations.
+/// Stream 6's generated properties: every receiver property, the
+/// downstream properties of the node's work, serving and output, and every
+/// sender property. A test harness that wraps [`Storage`] registers them
+/// too.
+pub fn table_wiring_properties<S: HasView>() -> Vec<Property<S>> {
+    let streams = block_sync_streams();
+    let mut properties = table_properties(FAMILY, streams);
+    properties.extend(downstream_properties(
+        FAMILY,
+        streams,
+        &[Effect::Work, Effect::Serving, Effect::Output],
+    ));
+    properties.extend(sender_properties(FAMILY, streams));
+    properties
+}
+
+/// What the harness's properties read: the node's storage facts, the
+/// relays' frames, the node's closes and its view, plus the step loop's
+/// task observations.
 pub fn storage_sources() -> Sources {
-    Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+    Sources::observed(&[
+        Source::Schedule,
+        Source::Storage,
+        Source::Frames,
+        Source::Closes,
+        Source::View,
+    ])
 }
 
 /// Checks [`OPERATION_IDS`] on the node's block storage.

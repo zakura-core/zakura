@@ -12,6 +12,8 @@ mod pipe;
 mod registry;
 mod service;
 mod session;
+#[cfg(any(test, zakura_sim))]
+mod sim_reader;
 
 pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
@@ -54,3 +56,5 @@ pub use service::{
     StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};
+#[cfg(any(test, zakura_sim))]
+pub use sim_reader::{read_framed_channel, StreamReader};

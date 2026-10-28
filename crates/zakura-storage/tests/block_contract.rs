@@ -227,7 +227,7 @@ fn the_contract_pins_its_production_rows() {
             .map(|outcome| (outcome, Gate::NotCommitted)),
     );
     full.extend([
-        (verdict(Verdict::ConsensusInvalid), Gate::Always),
+        (verdict(Verdict::ConsensusInvalid), Gate::NewAtAdmission),
         (retry(RetryKind::MissingContext), Gate::Always),
         (retry(RetryKind::Canceled), Gate::Always),
         (retry(RetryKind::Storage), Gate::NotCommitted),
@@ -306,6 +306,16 @@ fn each_gate_opens_under_its_conditions() {
         (Gate::KnownToState, parent, false),
         (Gate::NotCommitted, parent, true),
         (Gate::NotCommitted, committed, false),
+        // A commit after admission leaves the verifier past its check.
+        (Gate::NewAtAdmission, committed, true),
+        (
+            Gate::NewAtAdmission,
+            Conditions {
+                committed_at_admission: true,
+                ..committed
+            },
+            false,
+        ),
     ];
     for (gate, conditions, open) in cases {
         assert_eq!(
@@ -343,8 +353,8 @@ fn a_submission_has_the_outcomes_its_situation_allows() {
     // Without its parent it can't commit.
     let orphan: Vec<_> = expected[1..expected.len() - 1].to_vec();
     assert_eq!(admitted(ApplyClass::Full, Conditions::default()), orphan);
-    // Once another submission commits it, only the duplicate and the
-    // verifier's early failures remain.
+    // Once another submission commits it after admission, only the
+    // duplicate and the verifier's failures remain.
     let committed = Conditions {
         committed: true,
         ..fresh
@@ -363,6 +373,24 @@ fn a_submission_has_the_outcomes_its_situation_allows() {
         admitted(ApplyClass::Checkpoint, committed),
         known_checkpoint
     );
+    // A hash committed when the verifier received it never reaches a
+    // consensus rule: both verifiers report the duplicate first.
+    let committed_at_admission = Conditions {
+        committed_at_admission: true,
+        ..committed
+    };
+    for (class, known) in [
+        (ApplyClass::Full, &known),
+        (ApplyClass::Checkpoint, &known_checkpoint),
+    ] {
+        let mut expected = known.clone();
+        expected.retain(|outcome| *outcome != verdict(Verdict::ConsensusInvalid));
+        assert_eq!(
+            admitted(class, committed_at_admission),
+            expected,
+            "{class:?}"
+        );
+    }
     // An older admission of the same hash makes a duplicate legal too.
     let mut both = expected.clone();
     both.insert(1, verdict(Verdict::Duplicate));

@@ -10,8 +10,9 @@
 //!
 //! Before it logs a drain, the reader pairs the node's storage operations
 //! with its events, as [`super::pair`] describes, from the facts
-//! [`PolicySource`](super::PolicySource) hands it, and folds the events into
-//! the [`BlockSyncView`] the harness's checks read.
+//! [`PolicySource`](super::PolicySource) hands it, and folds the events and
+//! the operations that didn't pair into the [`BlockSyncView`] the harness's
+//! checks read.
 //!
 //! A node's teardown ends its block sync on purpose. Once told of it through
 //! a [`TapTeardown`], the tap reports its observer's drop as unhealthy only
@@ -46,7 +47,9 @@ use zakura_scheduler::SimInstant;
 use zakura_storage::block::controlled::ControlledBlockService;
 
 use super::{
+    identity::Adapter,
     pair::{Paired, Pairer},
+    relay::Wire,
     view::BlockSyncView,
 };
 use crate::{
@@ -78,6 +81,9 @@ pub struct BlockTap {
     allocations: Allocations,
     /// The owner state the events fold into, shared with the harness.
     view: Rc<RefCell<BlockSyncView>>,
+    /// Writes the generated-property observations, if the run labels its
+    /// links.
+    adapter: Option<Adapter>,
 }
 
 /// What the observer and the reader share.
@@ -157,6 +163,17 @@ impl LiveEvidence for TapState {
         } else {
             None
         }
+    }
+}
+
+/// How many events a tap has recorded, read by the relays that label the
+/// node's links, so each label takes its place among the events.
+pub(crate) struct TapClock(Arc<TapState>);
+
+impl TapClock {
+    /// The events recorded so far. Takes only the buffer's std lock.
+    pub(crate) fn events(&self) -> u64 {
+        self.0.buffer().last
     }
 }
 
@@ -244,8 +261,16 @@ impl BlockTap {
             facts: Vec::new(),
             allocations: Allocations::default(),
             view,
+            adapter: None,
         };
         (observer, tap)
+    }
+
+    /// Writes `wire`'s labels, and the node's identities and effects, as the
+    /// observations the stream-6 generated checks read, at each drain.
+    pub(crate) fn label_with(&mut self, wire: Wire) {
+        wire.set_clock(TapClock(self.state.clone()));
+        self.adapter = Some(Adapter::new(wire));
     }
 
     /// The notice the harness gives this tap when it tears the node down.
@@ -256,10 +281,9 @@ impl BlockTap {
     /// Hands over the node's block storage facts that this step's drain
     /// logged, as `(seq, fact)` in order, so the next
     /// [`observe`](ActionSource::observe) can pair operations with events.
-    pub(crate) fn storage_facts<'f>(
-        &mut self,
-        facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
-    ) {
+    /// [`PolicySource`](super::PolicySource) hands over every fact its
+    /// block service logs.
+    pub fn storage_facts<'f>(&mut self, facts: impl IntoIterator<Item = (u64, &'f StorageFact)>) {
         self.facts
             .extend(facts.into_iter().map(|(seq, fact)| (seq, fact.clone())));
     }
@@ -370,6 +394,17 @@ impl BlockTap {
                     LeaseStep::Released => "released",
                 }
                 .to_owned(),
+            },
+            BlockEvent::ServingAdmission {
+                peer: requesting,
+                start,
+                count,
+                live,
+            } => BlockSyncFact::ServingAdmission {
+                peer: peer(requesting),
+                start: start.0,
+                count: *count,
+                live: live.iter().map(|(first, last)| (first.0, last.0)).collect(),
             },
             BlockEvent::ServingFrame {
                 peer: requesting,
@@ -586,9 +621,10 @@ impl ActionSource for BlockTap {
 
     /// Logs every event recorded since the last observation, in order,
     /// records what it delivered in the checkpoint, pairs the drain with
-    /// the handed-over storage facts, and folds it into the view. A drain
-    /// that doesn't pair is still logged, then fails, unless the tap is
-    /// unhealthy, which the run reports instead.
+    /// the handed-over storage facts, and folds it into the view, with every
+    /// operation that didn't pair. A drain whose sequence numbers skip or go
+    /// back is still logged, then fails, unless the tap is unhealthy, which
+    /// the run reports instead.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -622,6 +658,9 @@ impl ActionSource for BlockTap {
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
         let facts = mem::take(&mut self.facts);
+        if let Some(adapter) = &mut self.adapter {
+            adapter.write(&events, &facts, log);
+        }
         let paired = self.pairer.pair(
             facts.iter().map(|(seq, fact)| (*seq, fact)),
             sent.iter().filter_map(|obs| match obs {
@@ -642,8 +681,9 @@ impl ActionSource for BlockTap {
         }
         view.step = Some(log.step());
         match paired {
-            Ok(pairings) => {
-                for pairing in pairings {
+            Ok(drain) => {
+                view.pairing.extend(drain.anomalies);
+                for pairing in drain.paired {
                     match pairing {
                         Paired::Submission { token, op } => {
                             view.submissions.insert(token, op);
@@ -655,8 +695,9 @@ impl ActionSource for BlockTap {
                 }
                 Ok(())
             }
-            // A block sync that unwound leaves its last events unpaired. The
-            // run's evidence check then reports the tap's own health.
+            // An unhealthy tap's events may carry no watermark, such as
+            // those recorded after the block service was dropped. The run's
+            // evidence check then reports the tap's own health.
             Err(_) if self.state.health().is_some() => Ok(()),
             Err(detail) => Err(detail),
         }

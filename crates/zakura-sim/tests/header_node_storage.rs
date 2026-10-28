@@ -17,7 +17,10 @@ use support::inputs;
 use zakura_sim::{
     check::after_step,
     harness::{
-        header_node::{Base, Chain, Fork, Policy},
+        header_node::{
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            Base, Chain, Fork, Policy,
+        },
         header_sync::{
             storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
             StorageScenario, OPERATION_IDS,
@@ -107,6 +110,22 @@ fn any() -> Policy {
         bound_ms: None,
         holds: Vec::new(),
     }
+}
+
+/// A header scenario can't wait for a queued reply, which only the block
+/// node records: a header completion stores its reply.
+#[test]
+#[should_panic(expected = "a header scenario can't wait for ReplyQueued")]
+fn a_header_hold_cant_wait_for_a_queued_reply() {
+    Storage::prepare(&worked_example(Policy {
+        holds: vec![Hold {
+            select: Select::nth(OpKind::Prepare, 1),
+            until: Trigger::ReplyQueued(Select::nth(OpKind::Locator, 1)),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        }],
+        ..any()
+    }));
 }
 
 /// The node's storage facts, in log order, with their steps.

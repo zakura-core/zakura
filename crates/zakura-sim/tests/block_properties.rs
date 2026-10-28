@@ -462,9 +462,11 @@ fn assert_converged(ports: &Ports) {
     );
 }
 
-/// The view's owners hold nothing, and the fold applied every event.
+/// The view's owners hold nothing, the fold applied every event, and every
+/// storage operation paired.
 fn assert_settled(view: &BlockSyncView) {
     assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+    assert!(view.pairing.is_empty(), "{:?}", view.pairing);
     assert_eq!(view.reserved, 0, "the byte budget drains");
     assert!(view.handoffs.is_empty(), "{:?}", view.handoffs);
     assert!(view.holders.is_empty(), "{:?}", view.holders);

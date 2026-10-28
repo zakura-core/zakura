@@ -9,8 +9,12 @@
 //! runs it on `drive_block_sync_actions` and checks that both runs see the
 //! same events. A case with no verdict runs there over a real ephemeral
 //! zakura-state holding the case's headers. A case with verdicts commits
-//! fixture bodies, which zakura-state's contextual checks reject, so it runs
-//! over state fakes on the case's engine.
+//! fixture bodies, whose v1 coinbase and missing chain history commitment
+//! zakura-state refuses, so it runs over state fakes on the case's engine. zakurad's
+//! `block_sync_driver/committed_state.rs` covers what those fakes share with
+//! the service: it commits [`BlockFixture::committable`] blocks to real
+//! zakura-state and to the service, and compares fork selection, queries,
+//! range reads and views.
 //!
 //! The controlled run takes the driver's choices. It sends each step's
 //! actions to the driver's channel, a queue here, and runs the driver's
@@ -41,8 +45,7 @@
 //! | A misbehavior report waits for the supervisor | The simulator doesn't run the supervisor |
 //! | A checkpoint verifier error | The verifier fake answers as the full verifier does, so checkpoint-class bodies get only full-verifier verdicts |
 //! | The verifier returning another block's hash | The fake returns the submitted hash. The driver reports another hash as a `VerifierUnavailable` retry, the same event as [`Verdict::Retryable`] with that kind |
-//! | `record_body_unavailable`, `restart_body_availability` and `retry_body_availability` | Their fakes would need retry-episode summaries the fixture engine accepts. The service builds their engine requests with [`record_request`](super::controlled::record_request), from the driver's arms |
-//! | zakura-state's own `MissingBlockBodyMetadata` read and `RecordHeaderChainBodyInvalid` write, in a case with verdicts | The verdict-free cases run both on a real zakura-state. A case with verdicts would need the fixture bodies committed there, and fixture bodies never pass zakura-state's contextual checks, so the fakes answer from the engine port's ports of them |
+//! | zakura-state's own `MissingBlockBodyMetadata` read and record writes, in a case with verdicts | The verdict-free cases run both on a real zakura-state. A case with verdicts would need the fixture bodies committed there, and zakura-state refuses their v1 coinbase and missing chain history commitment, so the fakes answer from the engine port's ports of them. `committed_state.rs` compares the reads after real commits |
 //!
 //! A moved anchor fails a query in the driver when its chunks read
 //! different states. The controlled service reads every chunk from one
@@ -57,8 +60,9 @@ use std::{
 use futures::FutureExt;
 use zakura_chain::block;
 use zakura_header_chain::{
-    BodyRuleId, BodyWorkAuthority, CommittedHeaderChainView, ConsensusBodyInvalid, EvidenceId,
-    SourceId, StateVersion,
+    BodyRuleId, BodySupplierDiscovered, BodyUnavailableSummary, BodyWorkAuthority,
+    CommittedHeaderChainView, ConsensusBodyInvalid, EvidenceId, OperatorBodyRetry, SourceId,
+    StateVersion, TransientBodyFailure, TransientBodyFailureKind,
 };
 use zakura_network::zakura::{BlockApplyResult, BlockApplyToken, BlockSyncAction};
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
@@ -105,11 +109,69 @@ pub enum Step {
         /// The version block sync last saw.
         version: u64,
     },
+    /// Block sync records an availability episode of the block at this
+    /// index.
+    Availability {
+        /// Which record.
+        record: AvailabilityRecord,
+        /// The block's index.
+        block: usize,
+        /// The episode the record carries.
+        episode: Episode,
+        /// The version block sync last saw, or `None` for the latest view's.
+        version: Option<u64>,
+    },
     /// Every action in these steps arrives before the driver takes any.
     Burst(Vec<Step>),
     /// The verifier finishes the oldest admitted submission of the block
     /// at this index.
     Verdict(usize, Verdict),
+}
+
+/// The availability records block sync sends.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AvailabilityRecord {
+    /// `record_body_unavailable`, after failed deliveries.
+    Unavailable,
+    /// `restart_body_availability`, when an alarmed episode gains a
+    /// supplier.
+    Restart,
+    /// `retry_body_availability`, an operator's fresh episode.
+    Retry,
+}
+
+/// A retry episode's summary. Every episode starts at the genesis time and
+/// is due for its next probe then, so a probe is never early.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Episode {
+    /// The failed attempts.
+    pub attempts: u32,
+    /// The eligible suppliers, the first `suppliers` of a fixed sequence.
+    pub suppliers: u32,
+    /// Whether the alarm fired.
+    pub alarmed: bool,
+}
+
+impl Episode {
+    /// The summary a record carries.
+    pub fn summary(self) -> BodyUnavailableSummary {
+        let start = BlockFixture::regtest().headers().genesis_header().time;
+        let suppliers: BTreeSet<SourceId> = (1..=self.suppliers)
+            .map(|n| {
+                let mut digest = [0; 32];
+                digest[..4].copy_from_slice(&n.to_le_bytes());
+                SourceId::from_digest(digest)
+            })
+            .collect();
+        BodyUnavailableSummary {
+            started_at: start,
+            attempts: self.attempts,
+            suppliers: self.suppliers,
+            supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(&suppliers),
+            alarmed: self.alarmed,
+            next_probe_at: start,
+        }
+    }
 }
 
 /// An event at the handle, by its query or token.
@@ -354,6 +416,56 @@ impl Script {
                     source: SOURCE,
                 },
             }],
+            Step::Availability {
+                record,
+                block,
+                episode,
+                version,
+            } => {
+                let expected_version =
+                    version.map_or(view.snapshot.state_version, StateVersion::new);
+                let hash = self.blocks[*block].hash();
+                // A record's evidence is its block, kind and episode, so only
+                // a repeat of the same record shares it.
+                let mut digest = hash.0;
+                digest[0] ^= match record {
+                    AvailabilityRecord::Unavailable => 1,
+                    AvailabilityRecord::Restart => 2,
+                    AvailabilityRecord::Retry => 3,
+                };
+                digest[1..5].copy_from_slice(&episode.attempts.to_le_bytes());
+                digest[5..9].copy_from_slice(&episode.suppliers.to_le_bytes());
+                digest[9] = u8::from(episode.alarmed);
+                let evidence = EvidenceId::from_digest(digest);
+                let availability = episode.summary();
+                vec![match record {
+                    AvailabilityRecord::Unavailable => BlockSyncAction::RecordBodyUnavailable {
+                        expected_version,
+                        failure: TransientBodyFailure {
+                            hash,
+                            evidence,
+                            kind: TransientBodyFailureKind::Timeout,
+                            availability,
+                        },
+                    },
+                    AvailabilityRecord::Restart => BlockSyncAction::RestartBodyAvailability {
+                        expected_version,
+                        discovery: BodySupplierDiscovered {
+                            hash,
+                            evidence,
+                            availability,
+                        },
+                    },
+                    AvailabilityRecord::Retry => BlockSyncAction::RetryBodyAvailability {
+                        expected_version,
+                        retry: OperatorBodyRetry {
+                            hash,
+                            evidence,
+                            availability,
+                        },
+                    },
+                }]
+            }
             Step::Burst(steps) => steps
                 .iter()
                 .flat_map(|step| self.actions_in(step, view))
@@ -553,6 +665,38 @@ fn needed(query: u64, anchor: u32, heights: &[u32]) -> Expect {
         query,
         anchor,
         heights: heights.to_vec(),
+    }
+}
+
+/// A record of `episode` for the block at `block`.
+fn availability(
+    record: AvailabilityRecord,
+    block: usize,
+    episode: Episode,
+    version: Option<u64>,
+) -> Step {
+    Step::Availability {
+        record,
+        block,
+        episode,
+        version,
+    }
+}
+
+/// An episode of `attempts` failures among `suppliers`.
+fn episode(attempts: u32, suppliers: u32, alarmed: bool) -> Episode {
+    Episode {
+        attempts,
+        suppliers,
+        alarmed,
+    }
+}
+
+/// One record attempt with `result`, and nothing else.
+fn recorded(result: RecordResult) -> Seen {
+    Seen {
+        records: vec![result],
+        ..Seen::default()
     }
 }
 
@@ -811,6 +955,36 @@ pub fn cases() -> Vec<Case> {
             },
         },
         Case {
+            name: "a copy admitted before another commits can fail consensus",
+            bodies: vec![BODY],
+            limits: Configured {
+                full: 2,
+                ..ONE_FULL
+            },
+            steps: vec![
+                (
+                    Step::Burst(vec![Step::Submit(0), Step::Submit(0)]),
+                    Seen::admitted([1, 2]),
+                ),
+                (
+                    Step::Verdict(0, Verdict::Committed),
+                    Seen::events([finished(1, Committed)]),
+                ),
+                // The second copy passed the verifier's duplicate check before
+                // the first committed.
+                (
+                    Step::Verdict(0, Verdict::ConsensusInvalid),
+                    Seen::events([finished(2, Rejected)]),
+                ),
+                // A copy admitted after the commit is a duplicate.
+                (Step::Submit(0), Seen::admitted([3])),
+                (
+                    Step::Verdict(0, Verdict::Duplicate),
+                    Seen::events([finished(3, Duplicate)]),
+                ),
+            ],
+        },
+        Case {
             name: "a driver blocked in a record takes the next record before the coalesced query",
             bodies: vec![BODY; 3],
             limits: ONE_FULL,
@@ -893,6 +1067,62 @@ pub fn cases() -> Vec<Case> {
                     },
                 ),
             ],
+        },
+        Case {
+            name: "an alarmed episode restarts with a new supplier, and an operator retries it",
+            bodies: vec![BODY; 3],
+            limits: ONE_FULL,
+            steps: {
+                use AvailabilityRecord::{Restart, Retry, Unavailable};
+                let tip = 2;
+                vec![
+                    (
+                        availability(Unavailable, tip, episode(3, 1, true), None),
+                        recorded(RecordResult::Committed),
+                    ),
+                    // Only the header-best tip's alarm restarts.
+                    (
+                        availability(Restart, 1, episode(3, 2, true), None),
+                        recorded(RecordResult::Refused),
+                    ),
+                    (
+                        availability(Restart, tip, episode(3, 2, true), None),
+                        recorded(RecordResult::Committed),
+                    ),
+                    // The same record again changes nothing.
+                    (
+                        availability(Restart, tip, episode(3, 2, true), None),
+                        recorded(RecordResult::NoChange),
+                    ),
+                    // Fewer suppliers bring none new.
+                    (
+                        availability(Restart, tip, episode(3, 1, true), None),
+                        recorded(RecordResult::Refused),
+                    ),
+                    // Only an invalid-body record refreshes a stale version.
+                    (
+                        availability(Unavailable, tip, episode(4, 2, true), Some(1)),
+                        recorded(RecordResult::Stale),
+                    ),
+                    (
+                        availability(Retry, tip, episode(0, 2, false), None),
+                        recorded(RecordResult::Committed),
+                    ),
+                    // The fresh episode has no alarm to retry or restart.
+                    (
+                        availability(Retry, tip, episode(0, 3, false), None),
+                        recorded(RecordResult::Refused),
+                    ),
+                    (
+                        availability(Restart, tip, episode(0, 3, true), None),
+                        recorded(RecordResult::Refused),
+                    ),
+                    (
+                        Step::Query { from: 1, limit: 16 },
+                        Seen::events([needed(1, 0, &[1, 2, 3])]),
+                    ),
+                ]
+            },
         },
     ]
 }

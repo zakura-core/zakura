@@ -1,0 +1,25 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+index 1a6181da7..733e09ef5 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+@@ -613,7 +613,10 @@ impl Sequencer {
+             return Vec::new();
+         }
+         let mut resident_decoded_bytes = self.applying_decoded_attributed_memory_bytes();
+-        let mut in_flight_submissions = self.in_flight_submission_count();
++        // Count only attached submissions, so a window that detached all of
++        // them admits the next body past the cap however many decoded bytes
++        // the detached ones still hold.
++        let mut in_flight_submissions = self.attached_submission_count;
+         let mut heights = Vec::new();
+         for (height, applying) in self
+             .applying
+@@ -646,7 +649,7 @@ impl Sequencer {
+                 height,
+                 applying,
+                 self.applying_decoded_attributed_memory_bytes(),
+-                self.in_flight_submission_count(),
++                self.attached_submission_count,
+             )
+         })
+     }

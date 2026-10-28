@@ -573,15 +573,16 @@ fn subscription_row() -> u16 {
 }
 
 impl StreamModels {
-    /// Fresh models for a stream that starts at `start`.
-    pub(crate) fn new(start: Instant) -> Self {
+    /// Fresh models for a stream that starts at `start`, for a peer
+    /// holding `chain`.
+    pub(crate) fn new(start: Instant, chain: Arc<HonestChain>) -> Self {
         StreamModels {
             start,
             frames: FrameModel::new(&RegtestMessage::ROWS, ReaderEnd::Persistent),
             subscriptions: SubscriptionModel::new(&RegtestMessage::ROWS, subscription_row())
                 .expect("the row is a subscription"),
             cadence: CadenceModel::new(),
-            content: ContentLabeller::default(),
+            content: ContentLabeller::new(chain),
             sent: 0,
         }
     }
@@ -647,7 +648,7 @@ impl StreamModels {
         let header = frame.header;
         let message = &frame.message;
         let header_labels = self.frames.labels(&header);
-        let content = self.content.label(message);
+        let content = self.content.label(message, header.payload_len);
         let mut copy;
         let subscriptions = if header_labels.is_conformant() && content.is_conformant() {
             &mut self.subscriptions

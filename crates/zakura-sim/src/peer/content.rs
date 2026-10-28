@@ -2,8 +2,9 @@
 //! well-formed frame whose fields break a header-sync rule.
 //!
 //! It follows the header sync specification, never the production
-//! validator. It reads the frame, the table's own rows, and its own history
-//! of the stream's subscriptions, and labels each rule below:
+//! validator. It reads the frame, the table's own rows, the peer's fixture
+//! chain for the heights of its headers, and its own history of the
+//! stream's subscriptions, and labels each rule below:
 //!
 //! - `Status`: a work anchor or retention floor above the selected tip, a
 //!   header cap outside 1 to 4,000, a `max_subscriptions` other than the
@@ -11,22 +12,30 @@
 //!   outside one smallest page under the advertised schemas to 2 MiB.
 //! - `SubscribeHeaders`: an `Open` with no locator or a repeated one, or
 //!   whose start cursor isn't its first locator with nothing consumed.
-//! - `Headers`: a page whose headers don't link from its parent, or whose
-//!   parent isn't a locator of the `Open` (the first page, which extends
-//!   the target if a locator is it) or the last header sent (each later
-//!   one).
-//! - `HeadersOutcome`: an outcome its subscription's history doesn't
-//!   allow, such as `SubscriptionClosed` before the node's `Close`. A
-//!   subscription whose locators hold its target reached it at `Open`.
+//! - `Headers`, for a subscription the node opened: a page naming another
+//!   target or schema, or above the caps of the last `Status` the peer
+//!   sent. Its parent, by height and hash, must be the last header sent,
+//!   or for the first page a locator of the `Open`, the target if a
+//!   locator is it. Its headers must link from the parent. Before the
+//!   target is reached, no header may extend the target or a sent locator,
+//!   a page that doesn't end at the target must end below its height, and
+//!   one that does must end at that height. The marker is set on exactly
+//!   the page that reaches the target. Any page must link from its parent.
+//! - `HeadersOutcome`: an outcome naming another target, or one its
+//!   subscription's history doesn't allow, such as `SubscriptionClosed`
+//!   before the node's `Close`. A subscription whose locators hold its
+//!   target reached it at `Open`.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use zakura_chain::block;
+use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
     v9::{Headers, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status},
-    MessageRole, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
+    AuxSchema, MessageRole, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
+use super::honest::HonestChain;
 use crate::model::{Label, Labels};
 
 /// The schema bits the specification defines: bit 0, schema 1.
@@ -35,14 +44,18 @@ const KNOWN_SCHEMAS: u32 = 1;
 /// A subscription the node opened on this peer, as its frames show it.
 #[derive(Clone, Debug)]
 struct Served {
+    /// The `Open`'s target.
+    target: block::Hash,
+    /// The `Open`'s schema.
+    schema: AuxSchema,
     /// The `Open`'s locators, highest first.
     locators: Vec<block::Hash>,
-    /// The `Open`'s target, if one of the locators is it.
-    target_locator: Option<block::Hash>,
+    /// Whether one of the locators is the target.
+    target_locator: bool,
     /// Pages sent.
     pages: u64,
     /// The last header sent, if a page was.
-    last: Option<block::Hash>,
+    last: Option<Frontier>,
     /// Whether it reached its target: at `Open`, if a locator is the
     /// target, or with a page that carried the target marker.
     reached: bool,
@@ -53,6 +66,12 @@ struct Served {
 /// One header stream's content history, from both directions.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ContentLabeller {
+    /// The peer's chain, for its headers' heights. Without one, heights
+    /// aren't checked.
+    chain: Option<Arc<HonestChain>>,
+    /// The page caps of the last `Status` the peer sent: headers and
+    /// payload bytes.
+    caps: Option<(u32, u32)>,
     /// The subscriptions the node opened that haven't ended, by ID.
     served: BTreeMap<u64, Served>,
 }
@@ -118,8 +137,30 @@ fn allowed(outcome: HeadersOutcomeCode, served: &Served) -> bool {
 }
 
 impl ContentLabeller {
-    /// `BadContent` if the peer's `message` breaks a content rule.
-    pub(crate) fn label(&self, message: &RegtestMessage) -> Labels {
+    /// A labeller for a peer holding `chain`.
+    pub(crate) fn new(chain: Arc<HonestChain>) -> Self {
+        ContentLabeller {
+            chain: Some(chain),
+            ..ContentLabeller::default()
+        }
+    }
+
+    /// Whether `hash` sits at `height` on the peer's chain. True without a
+    /// chain, which checks hashes alone.
+    fn at(&self, hash: block::Hash, height: u32) -> bool {
+        self.chain
+            .as_ref()
+            .is_none_or(|chain| chain.height(hash) == Some(height))
+    }
+
+    /// `hash`'s height on the peer's chain, if it has a chain and the hash.
+    fn height(&self, hash: block::Hash) -> Option<u32> {
+        self.chain.as_ref()?.height(hash)
+    }
+
+    /// `BadContent` if the peer's `message`, `payload_len` bytes long,
+    /// breaks a content rule.
+    pub(crate) fn label(&self, message: &RegtestMessage, payload_len: usize) -> Labels {
         let bad = match message {
             Message::Status(status) => bad_status(status),
             Message::SubscribeHeaders(update) => {
@@ -137,41 +178,94 @@ impl ContentLabeller {
                 }
             }
             Message::Headers(page) => {
+                let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
+                let over_caps = self.caps.is_some_and(|(headers, bytes)| {
+                    count > headers || payload_len > usize::try_from(bytes).unwrap_or(usize::MAX)
+                });
                 unlinked(page)
+                    || over_caps
                     || self
                         .served
                         .get(&page.subscription_id)
-                        .is_some_and(|served| {
-                            let parent = page.common_ancestor_hash;
-                            match (served.last, served.target_locator) {
-                                (Some(last), _) => parent != last,
-                                (None, Some(target)) => parent != target,
-                                (None, None) => !served.locators.contains(&parent),
-                            }
-                        })
+                        .is_some_and(|served| self.bad_page(page, served))
             }
             Message::HeadersOutcome(outcome) => self
                 .served
                 .get(&outcome.subscription_id)
-                .is_some_and(|served| !allowed(outcome.outcome, served)),
+                .is_some_and(|served| {
+                    outcome.initial_target_tip_hash != served.target
+                        || !allowed(outcome.outcome, served)
+                }),
         };
         Labels::NONE.with_if(bad, Label::BadContent)
+    }
+
+    /// True if `page` breaks a rule of its subscription `served`'s history,
+    /// from its parent to its marker.
+    fn bad_page(&self, page: &Headers, served: &Served) -> bool {
+        let parent = Frontier::new(page.common_ancestor_height, page.common_ancestor_hash);
+        let parent_ok = match served.last {
+            Some(last) => parent == last,
+            None if served.target_locator => {
+                parent.hash == served.target && self.at(parent.hash, parent.height.0)
+            }
+            None => served.locators.contains(&parent.hash) && self.at(parent.hash, parent.height.0),
+        };
+        if page.initial_target_tip_hash != served.target
+            || page.tree_aux_schema != served.schema
+            || !parent_ok
+        {
+            return true;
+        }
+        let Some(last) = page.entries.last().map(|entry| entry.header.hash()) else {
+            return true;
+        };
+        if served.reached {
+            return page.reaches_initial_target;
+        }
+        // Each header's parent, after the first's, before the last's hash.
+        let passes = page.entries.iter().skip(1).any(|entry| {
+            let previous = entry.header.previous_block_hash;
+            previous == served.target || served.locators.contains(&previous)
+        });
+        let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
+        let height = parent.height.0.saturating_add(count);
+        let reaches = last == served.target;
+        let target_height = self.height(served.target);
+        let wrong_height = match (reaches, target_height) {
+            (true, Some(target)) => height != target,
+            (false, Some(target)) => height >= target,
+            (_, None) => false,
+        };
+        passes
+            || (!reaches && served.locators.contains(&last))
+            || wrong_height
+            || page.reaches_initial_target != reaches
     }
 
     /// The peer sent `message`, which the node takes as conformant.
     pub(crate) fn sent(&mut self, message: &RegtestMessage) {
         match message {
+            Message::Status(status) => {
+                self.caps = Some((status.max_headers_per_response, status.max_message_bytes));
+            }
             Message::Headers(page) => {
                 if let Some(served) = self.served.get_mut(&page.subscription_id) {
+                    let count = u32::try_from(page.entries.len()).unwrap_or(u32::MAX);
                     served.pages += 1;
-                    served.last = page.entries.last().map(|entry| entry.header.hash());
+                    served.last = page.entries.last().map(|entry| {
+                        Frontier::new(
+                            block::Height(page.common_ancestor_height.0.saturating_add(count)),
+                            entry.header.hash(),
+                        )
+                    });
                     served.reached |= page.reaches_initial_target;
                 }
             }
             Message::HeadersOutcome(outcome) => {
                 self.served.remove(&outcome.subscription_id);
             }
-            Message::Status(_) | Message::SubscribeHeaders(_) => {}
+            Message::SubscribeHeaders(_) => {}
         }
     }
 
@@ -183,19 +277,19 @@ impl ContentLabeller {
         };
         match update.operation {
             Operation::Open => {
+                let target_locator = update
+                    .locator_hashes
+                    .contains(&update.initial_target_tip_hash);
                 self.served.insert(
                     update.subscription_id,
                     Served {
+                        target: update.initial_target_tip_hash,
+                        schema: update.tree_aux_schema,
                         locators: update.locator_hashes.clone(),
+                        target_locator,
                         pages: 0,
                         last: None,
-                        target_locator: update
-                            .locator_hashes
-                            .contains(&update.initial_target_tip_hash)
-                            .then_some(update.initial_target_tip_hash),
-                        reached: update
-                            .locator_hashes
-                            .contains(&update.initial_target_tip_hash),
+                        reached: target_locator,
                         close_received: false,
                     },
                 );
@@ -236,7 +330,7 @@ mod tests {
     #[test]
     fn status_rules() {
         let labeller = ContentLabeller::default();
-        let label = |status: Status| labeller.label(&Message::Status(status)).first();
+        let label = |status: Status| labeller.label(&Message::Status(status), 122).first();
         assert_eq!(label(status()), Label::Conformant);
         for bad in [
             Status {
@@ -315,7 +409,7 @@ mod tests {
         for (locator, expected) in [(target, Label::BadContent), (other, Label::Conformant)] {
             let mut labeller = ContentLabeller::default();
             labeller.received(&open(vec![locator]));
-            assert_eq!(labeller.label(&pruned).first(), expected, "{locator:?}");
+            assert_eq!(labeller.label(&pruned, 41).first(), expected, "{locator:?}");
         }
         // With the target among the locators, the first page extends it,
         // not an older locator.
@@ -345,7 +439,87 @@ mod tests {
                 }],
             })
         };
-        assert_eq!(labeller.label(&page(target)).first(), Label::Conformant);
-        assert_eq!(labeller.label(&page(other)).first(), Label::BadContent);
+        assert_eq!(
+            labeller.label(&page(target), 263).first(),
+            Label::Conformant
+        );
+        assert_eq!(labeller.label(&page(other), 263).first(), Label::BadContent);
+    }
+
+    /// A later page's parent is the last header sent by height and hash,
+    /// and a page carries the target marker exactly when it ends at the
+    /// target. The node opens from the fixture's anchor toward its second
+    /// header, so the first page of one header has no marker and the
+    /// second ends at the target with it.
+    #[test]
+    fn pages_follow_their_history_by_height_and_hash() {
+        use zakura_network::zakura::{
+            v9::{Cursor, SubscribeHeaders},
+            Credit, HeaderEntry,
+        };
+        use zakura_storage::header::fixture::HeaderFixture;
+
+        let fixture = HeaderFixture::regtest();
+        let anchor = fixture.anchor();
+        let headers = fixture.extend(anchor, 2, 0);
+        let target = headers[1].hash();
+        let mut labeller = ContentLabeller::default();
+        labeller.received(&Message::SubscribeHeaders(SubscribeHeaders {
+            operation: Operation::Open,
+            subscription_id: 1,
+            update_sequence: 0,
+            initial_target_tip_hash: target,
+            acknowledged: Cursor {
+                height: anchor.height,
+                hash: anchor.hash,
+                headers: 0,
+                bytes: 0,
+            },
+            locator_hashes: vec![anchor.hash],
+            added_credit: Credit {
+                objects: 2,
+                bytes: 526,
+            },
+            tree_aux_schema: AuxSchema::None,
+        }));
+        let page = |height: u32, parent: block::Hash, index: usize, marker: bool| {
+            Message::Headers(Headers {
+                subscription_id: 1,
+                initial_target_tip_hash: target,
+                common_ancestor_height: Height(height),
+                common_ancestor_hash: parent,
+                reaches_initial_target: marker,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: headers[index].clone(),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            })
+        };
+        let label = |labeller: &ContentLabeller, message| labeller.label(&message, 263).first();
+        let first = page(0, anchor.hash, 0, false);
+        assert_eq!(label(&labeller, first.clone()), Label::Conformant);
+        assert_eq!(
+            label(&labeller, page(0, anchor.hash, 0, true)),
+            Label::BadContent,
+            "a marker before the target"
+        );
+        labeller.sent(&first);
+        let parent = headers[0].hash();
+        assert_eq!(
+            label(&labeller, page(1, parent, 1, true)),
+            Label::Conformant
+        );
+        assert_eq!(
+            label(&labeller, page(5, parent, 1, true)),
+            Label::BadContent,
+            "the last header's hash at another height"
+        );
+        assert_eq!(
+            label(&labeller, page(1, parent, 1, false)),
+            Label::BadContent,
+            "the target without its marker"
+        );
     }
 }

@@ -20,8 +20,8 @@ use zakura_network::zakura::{
         Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage,
         Status, SubscribeHeaders,
     },
-    AuxSchema, Credit, HeaderEntry, ZakuraHeaderSyncConfig, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
-    MAX_HS_RANGE,
+    AuxSchema, Credit, HeaderEntry, MessageRole, ZakuraHeaderSyncConfig, DEFAULT_HS_RANGE,
+    MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE,
 };
 use zakura_rt::time::Instant;
 use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
@@ -186,6 +186,11 @@ struct Subscribed {
     last: Cursor,
     /// When the last page arrived, if one has.
     paged_at: Option<Instant>,
+    /// Whether a held grant waits for release: set by each page, cleared by
+    /// its release, so one page readies one grant.
+    held: bool,
+    /// Credit granted so far, the `Open`'s included, as (objects, bytes).
+    granted: (u64, u64),
     close_sent: bool,
     ended: bool,
 }
@@ -258,7 +263,7 @@ impl Honest {
         let subscribed = self
             .subscribed
             .as_ref()
-            .filter(|sub| !sub.ended && !sub.close_sent)?;
+            .filter(|sub| sub.held && !sub.ended && !sub.close_sent)?;
         Some(subscribed.paged_at? + Duration::from_millis(quiet_ms))
     }
 
@@ -340,6 +345,8 @@ impl Honest {
             sequence: 0,
             last: cursor,
             paged_at: None,
+            held: false,
+            granted: (spec.open.objects.into(), spec.open.bytes.into()),
             close_sent: false,
             ended: false,
         });
@@ -380,6 +387,7 @@ impl Honest {
         if sub.close_sent {
             return Vec::new();
         }
+        sub.held = true;
         let added = if page.reaches_initial_target {
             sub.close_sent = true;
             None
@@ -396,26 +404,50 @@ impl Honest {
         vec![self.send(update)]
     }
 
-    /// Releases one held grant. Once this peer has sent its `Close` or its
-    /// subscription has ended, nothing is held, so the release sends
-    /// nothing. That's the rule, not [`Honest::grant_opens`]'s readiness: a
-    /// grant the `Plan` queued while the subscription was live can still be
-    /// taken after a page that reaches the target made the peer close.
-    /// Only a peer with no held grant policy can't release.
+    /// Releases the grant its last page held, at most what keeps the
+    /// subscription's window, granted less acknowledged, within the row's
+    /// credit in each unit. When nothing is held, the release sends
+    /// nothing: after a release with no page since, or once this peer has
+    /// sent its `Close` or its subscription has ended. That's the rule, not
+    /// [`Honest::grant_opens`]'s readiness, so a grant the `Plan` queued
+    /// while one was held can't over-grant or fail the run when it's taken
+    /// later. Only a peer with no held grant policy can't release.
     pub(crate) fn release_grant(&mut self) -> Result<Vec<Outgoing>, String> {
         let Some(GrantPolicy::Held { grant, .. }) =
             self.spec.subscribe.as_ref().map(|spec| spec.grants)
         else {
             return Err("can't grant without a held grant policy".to_owned());
         };
-        if self
+        let Some(sub) = self
             .subscribed
-            .as_ref()
-            .is_none_or(|sub| sub.ended || sub.close_sent)
-        {
+            .as_mut()
+            .filter(|sub| sub.held && !sub.ended && !sub.close_sent)
+        else {
+            return Ok(Vec::new());
+        };
+        sub.held = false;
+        let window = self.models.subscriptions.row();
+        let MessageRole::Subscription { credit: row, .. } = window.role else {
+            unreachable!("the models follow the subscription row");
+        };
+        let room = |limit: u32, granted: u64, acknowledged: u64| {
+            u64::from(limit).saturating_sub(granted.saturating_sub(acknowledged))
+        };
+        let fit = |want: u32, room: u64| u32::try_from(u64::from(want).min(room)).unwrap_or(want);
+        let added = Credit {
+            objects: fit(
+                grant.objects,
+                room(row.objects, sub.granted.0, sub.last.headers),
+            ),
+            bytes: fit(grant.bytes, room(row.bytes, sub.granted.1, sub.last.bytes)),
+        };
+        // A grant adds a header, or at least a smallest page of bytes, 263,
+        // which fits u32.
+        let smallest = (super::PAGE_FIXED_BYTES + super::ENTRY_BYTES) as u32;
+        if added.objects == 0 && added.bytes < smallest {
             return Ok(Vec::new());
         }
-        let update = self.update(Some(grant.into()));
+        let update = self.update(Some(added));
         Ok(vec![self.send(update)])
     }
 
@@ -427,6 +459,10 @@ impl Honest {
             .as_mut()
             .expect("an update follows the Open");
         sub.sequence += 1;
+        if let Some(added) = added {
+            sub.granted.0 += u64::from(added.objects);
+            sub.granted.1 += u64::from(added.bytes);
+        }
         RegtestMessage::SubscribeHeaders(SubscribeHeaders {
             operation: if added.is_some() {
                 Operation::Grant
@@ -557,63 +593,114 @@ impl Honest {
 
 #[cfg(test)]
 mod tests {
-    use zakura_network::zakura::v9::RegtestMessage;
+    use zakura_network::zakura::{
+        v9::{Headers, Message, Operation, RegtestMessage},
+        wire_codec::decode_frame,
+        AuxSchema, Frame, HeaderEntry,
+    };
+    use zakura_storage::header::fixture::HeaderFixture;
 
-    use super::super::{ENTRY_BYTES, PAGE_FIXED_BYTES};
+    use super::{
+        super::{ENTRY_BYTES, PAGE_FIXED_BYTES},
+        *,
+    };
 
-    /// A grant released after the page that reaches the target, as a grant
-    /// the `Plan` queued before that page arrived would be, sends nothing:
-    /// the peer has sent its `Close`, so nothing is held.
-    #[test]
-    fn a_grant_released_after_close_sends_nothing() {
-        use zakura_network::zakura::{
-            v9::{Headers, Message},
-            AuxSchema, HeaderEntry,
-        };
-        use zakura_storage::header::fixture::HeaderFixture;
-
-        use super::*;
-
+    /// An honest peer on 50 headers, subscribed with `open` and holding
+    /// `grant`, to a node on `node` headers, and the node's chain.
+    fn subscribed(node: u32, open: CreditSpec, grant: CreditSpec) -> (Honest, HonestChain) {
         let fixture = HeaderFixture::regtest();
-        let node = HonestChain::new(&fixture, 51);
-        let credit = CreditSpec {
-            objects: 1,
-            bytes: 263,
-        };
+        let node = HonestChain::new(&fixture, node);
         let spec = HonestSpec {
             chain: 50,
             subscribe: Some(SubscribeSpec {
                 start: 50,
-                open: credit,
-                grants: GrantPolicy::Held {
-                    grant: credit,
-                    quiet_ms: 0,
-                },
+                open,
+                grants: GrantPolicy::Held { grant, quiet_ms: 0 },
             }),
         };
         let mut honest = Honest::new(spec, Arc::new(HonestChain::new(&fixture, 50)));
         honest.start_stream();
-        let open = honest.receive(&Message::Status(node.status.clone()), 122);
-        assert_eq!(open.len(), 1, "the peer subscribes");
+        let sent = honest.receive(&Message::Status(node.status.clone()), 122);
+        assert_eq!(sent.len(), 1, "the peer subscribes");
+        (honest, node)
+    }
+
+    /// The node's page of header 51, which reaches its target if the node
+    /// holds 51.
+    fn page_51(node: &HonestChain) -> RegtestMessage {
         let parent = node.at(50);
-        let page = Message::Headers(Headers {
+        Message::Headers(Headers {
             subscription_id: 1,
             initial_target_tip_hash: node.status.selected_tip_hash,
             common_ancestor_height: parent.height,
             common_ancestor_hash: parent.hash,
-            reaches_initial_target: true,
+            reaches_initial_target: node.status.selected_tip_height.0 == 51,
             tree_aux_schema: AuxSchema::None,
             entries: vec![HeaderEntry {
                 header: node.headers[50].clone(),
                 body_size: 0,
                 tree_aux: None,
             }],
-        });
-        let close = honest.receive(&page, 263);
+        })
+    }
+
+    /// The credit of the one update in `sent`.
+    fn granted(sent: &[Outgoing]) -> (u32, u32) {
+        assert_eq!(sent.len(), 1);
+        let frame = Frame {
+            message_type: u16::from_le_bytes([sent[0].bytes[0], sent[0].bytes[1]]),
+            flags: 0,
+            payload: sent[0].bytes[8..].to_vec(),
+        };
+        let Message::SubscribeHeaders(update) =
+            decode_frame::<RegtestMessage>(&frame).expect("the update decodes")
+        else {
+            panic!("an update");
+        };
+        assert_eq!(update.operation, Operation::Grant);
+        (update.added_credit.objects, update.added_credit.bytes)
+    }
+
+    /// A grant released after the page that reaches the target, as a grant
+    /// the `Plan` queued before that page arrived would be, sends nothing:
+    /// the peer has sent its `Close`, so nothing is held.
+    #[test]
+    fn a_grant_released_after_close_sends_nothing() {
+        let credit = CreditSpec {
+            objects: 1,
+            bytes: 263,
+        };
+        let (mut honest, node) = subscribed(51, credit, credit);
+        let close = honest.receive(&page_51(&node), 263);
         assert_eq!(close.len(), 1, "the target page makes the peer close");
         assert_eq!(honest.grant_opens(), None, "no grant is offered");
         let released = honest.release_grant().expect("a held policy releases");
         assert!(released.is_empty(), "nothing is held after Close");
+    }
+
+    /// One page holds one grant, and its release keeps the window within
+    /// the row's credit: with the full 4,000-header window open and one
+    /// header spent, a two-header grant adds one. A second release before
+    /// another page sends nothing, so it can't push the window past the
+    /// row's 4,000.
+    #[test]
+    fn one_page_holds_one_grant_within_the_window() {
+        let open = CreditSpec {
+            objects: 4_000,
+            bytes: 4_000 * 263,
+        };
+        let grant = CreditSpec {
+            objects: 2,
+            bytes: 526,
+        };
+        let (mut honest, node) = subscribed(60, open, grant);
+        assert!(honest.receive(&page_51(&node), 263).is_empty());
+        assert!(honest.grant_opens().is_some(), "the page holds a grant");
+        let sent = honest.release_grant().expect("a held policy releases");
+        assert_eq!(granted(&sent), (1, 526));
+        assert_eq!(honest.grant_opens(), None, "the grant was taken");
+        let again = honest.release_grant().expect("a held policy releases");
+        assert!(again.is_empty(), "nothing is held until the next page");
     }
 
     /// The page sizes the honest publisher uses are the table's: its

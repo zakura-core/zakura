@@ -10,6 +10,13 @@
 //! header's merkle root. A body never passes consensus. The block service
 //! models the verifier, so nothing checks it.
 //!
+//! [`BlockFixture::committable`] builds blocks that real zakura-state also
+//! commits through its semantic path, for tests that compare the block
+//! service with it. Their coinbase is a v4 transaction, since zakura-state's
+//! non-finalized chain takes no older version, and each header commits to
+//! the chain history root of its ancestors, as ZIP 221 requires from
+//! Heartwood. They still fail the verifier's consensus checks.
+//!
 //! Each block also carries a size hint, separate from its real size. Header
 //! insertion advertises it as the header's `TargetEntry::body_size`, the
 //! engine keeps it as that header's auxiliary delivery, and the
@@ -22,6 +29,8 @@ use std::sync::Arc;
 use zakura_chain::{
     amount::Amount,
     block::{self, merkle},
+    history_tree::HistoryTree,
+    ironwood, orchard, sapling,
     serialization::ZcashSerialize,
     transaction::{LockTime, Transaction},
     transparent,
@@ -120,7 +129,13 @@ impl BlockFixture {
     /// The smallest body the fixture builds at `height`: a coinbase with an
     /// empty padding script.
     pub fn min_body_size(height: block::Height) -> u32 {
-        let coinbase = coinbase(height, 0, 0);
+        let coinbase = coinbase(Version::V1, height, 0, 0);
+        block_size(&coinbase)
+    }
+
+    /// The smallest body [`Self::committable`] builds at `height`.
+    pub fn min_committable_body_size(height: block::Height) -> u32 {
+        let coinbase = coinbase(Version::V4, height, 0, 0);
         block_size(&coinbase)
     }
 
@@ -131,14 +146,31 @@ impl BlockFixture {
     /// If `spec.size` is below [`Self::min_body_size`] or above
     /// `MAX_BLOCK_BYTES`, or the height overflows.
     pub fn block(&self, parent: Frontier, branch: u8, spec: BodySpec) -> FixtureBlock {
+        self.block_with(Version::V1, parent, branch, spec, None)
+    }
+
+    /// The body at height `parent + 1` on `branch`, with a `version`
+    /// coinbase. Its header commits to `commitment` if given, and otherwise
+    /// keeps the header fixture's.
+    fn block_with(
+        &self,
+        version: Version,
+        parent: Frontier,
+        branch: u8,
+        spec: BodySpec,
+        commitment: Option<[u8; 32]>,
+    ) -> FixtureBlock {
         let height = parent.height.next().expect("fixture heights stay small");
         assert!(
             u64::from(spec.size) <= block::MAX_BLOCK_BYTES,
             "a fixture body fits a block"
         );
-        let coinbase = padded_coinbase(height, spec.size);
+        let coinbase = padded_coinbase(version, height, spec.size);
         let root: merkle::Root = std::iter::once(coinbase.hash()).collect();
-        let header = self.headers.header_at(parent.hash, height.0, branch, root);
+        let mut header = self.headers.header_at(parent.hash, height.0, branch, root);
+        if let Some(commitment) = commitment {
+            header.commitment_bytes = commitment.into();
+        }
         let block = Arc::new(block::Block {
             header: Arc::new(header),
             transactions: vec![Arc::new(coinbase)],
@@ -150,6 +182,58 @@ impl BlockFixture {
         };
         assert_eq!(fixture.size(), spec.size, "padding reaches the exact size");
         fixture
+    }
+
+    /// One block per spec on `branch`, extending the last block of `prefix`,
+    /// or genesis if `prefix` is empty, that real zakura-state commits.
+    /// `prefix` is that block's chain from height 1, whose history each
+    /// header commits to.
+    ///
+    /// # Panics
+    ///
+    /// If `prefix` isn't a chain from height 1, a spec is below
+    /// [`Self::min_committable_body_size`], or as [`Self::block`] does.
+    pub fn committable(
+        &self,
+        prefix: &[FixtureBlock],
+        specs: &[BodySpec],
+        branch: u8,
+    ) -> Vec<FixtureBlock> {
+        let network = self.headers.network();
+        let push = |history: &mut HistoryTree, block: &FixtureBlock| {
+            // Fixture bodies have no shielded data, so every note commitment
+            // tree stays empty.
+            history
+                .push(
+                    network,
+                    block.block.clone(),
+                    &sapling::tree::NoteCommitmentTree::default().root(),
+                    &orchard::tree::NoteCommitmentTree::default().root(),
+                    &ironwood::tree::NoteCommitmentTree::default().root(),
+                )
+                .expect("a fixture block extends its history");
+        };
+        let mut history = HistoryTree::default();
+        let mut parent = self.anchor();
+        for block in prefix {
+            assert_eq!(
+                block.block.header.previous_block_hash, parent.hash,
+                "a prefix is a chain from height 1"
+            );
+            push(&mut history, block);
+            parent = block.frontier();
+        }
+        specs
+            .iter()
+            .map(|spec| {
+                // The Heartwood activation block commits to zeros.
+                let commitment = history.hash().map_or([0; 32], <[u8; 32]>::from);
+                let block = self.block_with(Version::V4, parent, branch, *spec, Some(commitment));
+                push(&mut history, &block);
+                parent = block.frontier();
+                block
+            })
+            .collect()
     }
 
     /// One block per spec extending `parent`, parent first, on `branch`.
@@ -218,8 +302,8 @@ impl BlockFixture {
 /// # Panics
 ///
 /// If `size` is below the minimum.
-fn padded_coinbase(height: block::Height, size: u32) -> Transaction {
-    let base = block_size(&coinbase(height, 0, 0));
+fn padded_coinbase(version: Version, height: block::Height, size: u32) -> Transaction {
+    let base = block_size(&coinbase(version, height, 0, 0));
     assert!(
         size >= base,
         "a fixture body at {height:?} is at least {base} bytes"
@@ -229,7 +313,7 @@ fn padded_coinbase(height: block::Height, size: u32) -> Transaction {
         // The prefix adds at most 4 bytes over the raw padding length.
         let most = gap.saturating_sub(extra);
         for padding in (most.saturating_sub(4)..=most).rev() {
-            let candidate = coinbase(height, extra, padding);
+            let candidate = coinbase(version, height, extra, padding);
             if block_size(&candidate) == size {
                 return candidate;
             }
@@ -238,24 +322,46 @@ fn padded_coinbase(height: block::Height, size: u32) -> Transaction {
     unreachable!("2 extra data bytes cover every length-prefix step")
 }
 
-/// The coinbase for `height` with `extra` more data bytes and a
+/// A fixture coinbase's transaction version.
+#[derive(Copy, Clone, Debug)]
+enum Version {
+    /// The smallest, for blocks only the block service commits.
+    V1,
+    /// The oldest that zakura-state's non-finalized chain takes.
+    V4,
+}
+
+/// The `version` coinbase for `height` with `extra` more data bytes and a
 /// `padding`-byte output script.
-fn coinbase(height: block::Height, extra: u32, padding: u32) -> Transaction {
+fn coinbase(version: Version, height: block::Height, extra: u32, padding: u32) -> Transaction {
     let mut data = COINBASE_DATA.to_vec();
     // Widening u32 to usize is lossless on supported targets.
     data.resize(data.len() + extra as usize, 0);
-    Transaction::V1 {
-        inputs: vec![transparent::Input::Coinbase {
-            height,
-            data,
-            sequence: u32::MAX,
-        }],
-        outputs: vec![transparent::Output::new(
-            Amount::zero(),
-            // Widening u32 to usize is lossless on supported targets.
-            transparent::Script::new(&vec![0; padding as usize]),
-        )],
-        lock_time: LockTime::unlocked(),
+    let inputs = vec![transparent::Input::Coinbase {
+        height,
+        data,
+        sequence: u32::MAX,
+    }];
+    let outputs = vec![transparent::Output::new(
+        Amount::zero(),
+        // Widening u32 to usize is lossless on supported targets.
+        transparent::Script::new(&vec![0; padding as usize]),
+    )];
+    let lock_time = LockTime::unlocked();
+    match version {
+        Version::V1 => Transaction::V1 {
+            inputs,
+            outputs,
+            lock_time,
+        },
+        Version::V4 => Transaction::V4 {
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height: height,
+            joinsplit_data: None,
+            sapling_shielded_data: None,
+        },
     }
 }
 

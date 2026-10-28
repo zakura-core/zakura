@@ -411,7 +411,9 @@ impl Labeller {
         };
         let bytes = u64::try_from(header.payload_len).unwrap_or(u64::MAX);
         let mut open = self.open(asked).peekable();
-        let first = open.peek().map(|(_, range)| range.start)?;
+        let Some(first) = open.peek().map(|(_, range)| range.start) else {
+            return Some(Label::Unsolicited);
+        };
         let fits = open.any(|(_, range)| {
             model
                 .owed(self.connection, u64::from(range.start))

@@ -12,7 +12,10 @@
 //! before the response's task reads storage, and the release once the slots
 //! return, after the task ends. So each `read_range` operation falls inside
 //! a held lease on its first height, for at most the lease's count, since
-//! serving truncates the range it reads.
+//! serving truncates the range it reads. A lease's release names its
+//! serving session, the peer's connection and routine generation, so it
+//! ends that session's lease even when another session holds a lease on
+//! the same range.
 //!
 //! [`Pairer`] merges one drain's facts and events in the order they
 //! happened: an event with storage watermark `w` came after fact `w` and
@@ -44,6 +47,8 @@ struct Submission {
 #[derive(Clone, Debug)]
 struct Lease {
     peer: String,
+    connection: u64,
+    generation: u64,
     start: u32,
     count: u32,
     /// The storage read paired with it.
@@ -289,23 +294,36 @@ impl Pairer {
             BlockSyncFact::SequencerClosed => self.closed = true,
             BlockSyncFact::ServingLease {
                 peer,
+                connection,
+                generation,
                 start,
                 count,
                 step,
             } if step == "acquired" => {
                 self.leases.push(Lease {
                     peer: peer.clone(),
+                    connection: *connection,
+                    generation: *generation,
                     start: *start,
                     count: *count,
                     read: None,
                 });
             }
             BlockSyncFact::ServingLease {
-                peer, start, count, ..
+                peer,
+                connection,
+                generation,
+                start,
+                count,
+                ..
             } => {
                 // A lease never acquired, which the view's fold reports.
                 if let Some(at) = self.leases.iter().position(|lease| {
-                    &lease.peer == peer && lease.start == *start && lease.count == *count
+                    &lease.peer == peer
+                        && lease.connection == *connection
+                        && lease.generation == *generation
+                        && lease.start == *start
+                        && lease.count == *count
                 }) {
                     self.leases.remove(at);
                 }
@@ -399,10 +417,24 @@ mod tests {
         }
     }
 
-    /// A lease on `count` heights from `start`, acquired or released.
+    /// A lease on `count` heights from `start`, acquired or released, by
+    /// the serving session on connection 1 at generation 1.
     fn lease(start: u32, count: u32, step: &str) -> BlockSyncFact {
+        session_lease((1, 1), start, count, step)
+    }
+
+    /// A lease on `count` heights from `start`, acquired or released, by
+    /// the serving session on `(connection, generation)`.
+    fn session_lease(
+        (connection, generation): (u64, u64),
+        start: u32,
+        count: u32,
+        step: &str,
+    ) -> BlockSyncFact {
         BlockSyncFact::ServingLease {
             peer: "02".to_owned(),
+            connection,
+            generation,
             start,
             count,
             step: step.to_owned(),
@@ -635,6 +667,35 @@ mod tests {
             &[(0, lease(5, 2, "acquired")), (0, lease(5, 2, "released"))],
         );
         assert_eq!(result, clean(vec![]));
+    }
+
+    /// Two serving sessions of one peer hold leases on the same range. The
+    /// first lease takes the first read, and the second session's release
+    /// ends the second lease, not the first. So a second read finds no
+    /// unread lease. Matching a release on the peer alone would end the
+    /// first, read lease and leave the released one to take the second
+    /// read.
+    #[test]
+    fn a_release_ends_its_own_sessions_lease() {
+        // A second connection, then a later generation on the same one.
+        for other in [(2, 1), (1, 2)] {
+            let mut pairer = Pairer::default();
+            let result = drain(
+                &mut pairer,
+                &[(1, read(1, 5, 2)), (2, read(2, 5, 2))],
+                &[
+                    (0, session_lease((1, 1), 5, 2, "acquired")),
+                    (0, session_lease(other, 5, 2, "acquired")),
+                    (1, session_lease(other, 5, 2, "released")),
+                ],
+            );
+            assert_eq!(
+                result.paired,
+                [Paired::Read { start: 5, op: 1 }],
+                "{other:?}"
+            );
+            assert_eq!(kinds(&result), [(PairingKind::Unpaired, 2)], "{other:?}");
+        }
     }
 
     /// A fact that skips or repeats a sequence number, or an event whose

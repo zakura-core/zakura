@@ -490,10 +490,12 @@ struct Slot {
     identity: RequestIdentity,
     /// The submitted body's class, `Full` for every other operation.
     class: ApplyClass,
-    /// Whether a later admission of the same hash replaced this one. Full
+    /// The later admissions of the same hash that replaced this one. Full
     /// state's queue replaced it, so this is history no container holds:
-    /// the flag stays set after the later admission finishes.
-    replaced: bool,
+    /// an admission stays here after it finishes. Full state either
+    /// replaces the older copy or refuses the newer one, so an admission
+    /// that reports a duplicate leaves the set.
+    replaced_by: BTreeSet<OpId>,
     /// Whether full state held the body's hash when the run admitted it.
     /// The verifier checks for a duplicate first, so this, not whether the
     /// hash is committed now, decides whether a consensus rule can fail.
@@ -695,7 +697,7 @@ impl Ops {
             parent_committed,
             committed: committed_now,
             committed_at_admission: slot.committed_at_admission,
-            replaced: slot.replaced,
+            replaced: !slot.replaced_by.is_empty(),
             older_in_flight,
         }
     }
@@ -977,7 +979,7 @@ impl ControlledBlockService {
                     stage: SlotStage::Waiting { stage, request },
                     identity: identity.clone(),
                     class,
-                    replaced: false,
+                    replaced_by: BTreeSet::new(),
                     committed_at_admission: false,
                     receipt: None,
                     caller,
@@ -1134,6 +1136,13 @@ impl ControlledBlockService {
                 }
             }
         };
+        // A copy that reports a duplicate was refused, so it replaced
+        // nothing.
+        if outcome == BlockOutcome::Verdict(Verdict::Duplicate) {
+            for slot in ops.slots.values_mut() {
+                slot.replaced_by.remove(&id);
+            }
+        }
         let mut completion = Completion {
             txn: 0,
             id,
@@ -1182,7 +1191,7 @@ impl ControlledBlockService {
         let mut shared = None;
         for (_, other) in ops.slots.range_mut(..id) {
             if other.admitted() && other.identity.submitted_hash() == hash {
-                other.replaced = true;
+                other.replaced_by.insert(id);
                 if shared.is_none() && other.submitted_block() == block.as_ref() {
                     shared = other.receipt;
                 }
@@ -1498,7 +1507,7 @@ impl ControlledBlockService {
                             ..
                         }
                         | SlotStage::Running(Stage::Admitted) => OperationStage::Admitted {
-                            replaced: slot.replaced,
+                            replaced: !slot.replaced_by.is_empty(),
                         },
                         SlotStage::Replied(_) => OperationStage::Replied,
                     },

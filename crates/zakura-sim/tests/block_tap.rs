@@ -49,6 +49,8 @@ fn tap_config() -> RunConfig {
 fn frame(start: u32) -> BlockEvent {
     BlockEvent::ServingFrame {
         peer: ZakuraPeerId::new(vec![1; 32]).expect("32 bytes is a valid peer id"),
+        conn_id: 1,
+        generation: 1,
         start: Height(start),
         message_type: 4,
         body_bytes: 0,

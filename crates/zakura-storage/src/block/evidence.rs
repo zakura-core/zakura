@@ -7,7 +7,10 @@
 //! [`OwnerState`]. [`ViewModel`] checks the committed views block sync
 //! receives against full state.
 
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+};
 
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -324,7 +327,9 @@ pub enum OperationStage {
     /// A submission at the verifier. `replaced` is whether a later
     /// admission of the same hash replaced it. Full state's queue replaced
     /// it, so the flag is history that no container holds, and stays set
-    /// after the later admission finishes.
+    /// after the later admission finishes, unless that admission reports a
+    /// duplicate: full state either replaces the older copy or refuses the
+    /// newer one.
     Admitted {
         /// Whether a later admission replaced it.
         replaced: bool,
@@ -444,6 +449,8 @@ pub struct OwnerModel {
     /// The last operation ID handed out, held or not.
     last_id: u64,
     ops: BTreeMap<OpId, OperationState>,
+    /// The later admissions that replaced each held submission.
+    replaced_by: BTreeMap<OpId, BTreeSet<OpId>>,
     /// The driver's deferred actions.
     deferred: Vec<RequestIdentity>,
     /// A query's reply found the handle closed, so the driver's exit comes
@@ -532,6 +539,7 @@ impl OwnerModel {
                     if other.id < *id && other.request.submitted_hash() == hash {
                         if let OperationStage::Admitted { replaced } = &mut other.stage {
                             *replaced = true;
+                            self.replaced_by.entry(other.id).or_default().insert(*id);
                         }
                     }
                 }
@@ -586,6 +594,7 @@ impl OwnerModel {
                 }
                 for id in actions {
                     self.ops.remove(&id);
+                    self.replaced_by.remove(&id);
                 }
                 self.exiting = false;
                 self.exited = true;
@@ -600,6 +609,7 @@ impl OwnerModel {
                     return Err(unexpected());
                 }
                 self.ops.clear();
+                self.replaced_by.clear();
                 self.deferred.clear();
                 self.shut_down = true;
             }
@@ -766,6 +776,20 @@ impl OwnerModel {
                 .stage = OperationStage::Replied;
         } else {
             self.ops.remove(&completion.id);
+            self.replaced_by.remove(&completion.id);
+        }
+        // A copy that reports a duplicate was refused, so it replaced
+        // nothing.
+        if completion.outcome == BlockOutcome::Verdict(Verdict::Duplicate) {
+            for (older, replacers) in &mut self.replaced_by {
+                if replacers.remove(&completion.id) && replacers.is_empty() {
+                    if let Some(OperationStage::Admitted { replaced }) =
+                        self.ops.get_mut(older).map(|op| &mut op.stage)
+                    {
+                        *replaced = false;
+                    }
+                }
+            }
         }
         // The driver returns when a query's reply finds the handle closed.
         self.exiting = completion.op == BlockOp::QueryNeededBlocks && !completion.delivered;

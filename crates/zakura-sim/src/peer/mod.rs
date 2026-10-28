@@ -384,16 +384,18 @@ impl ActionSource for PeerControl {
         slot.next += 1;
     }
 
-    /// Fails the run once a peer couldn't carry out an action. Otherwise
-    /// logs the peers' records the identity map can place, and what the
-    /// node's evidence means for P3b's checks ([`WireEvidence`]). This
+    /// Logs the peers' records the identity map can place, and what the
+    /// node's evidence means for P3b's checks ([`WireEvidence`]), then
+    /// fails the run if a peer couldn't carry out an action. So a node frame
+    /// that stopped its peer is logged with its `NodeFrame` first. This
     /// source is added after the transport tap, so the identity rows it
     /// reads are logged first.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let observed = self.evidence.observe(&self.records, log);
         if let Some(failure) = self.failure.borrow().as_ref() {
             return Err(format!("PeerActionFailed: {failure}"));
         }
-        self.evidence.observe(&self.records, log)
+        observed
     }
 }
 
@@ -1152,20 +1154,23 @@ impl PeerTask {
                         *read += 1;
                         let current = header.as_ref().is_some_and(|stream| stream.id == id);
                         settled |= current;
-                        let Ok(message) = decode_frame::<RegtestMessage>(&frame) else {
-                            return self.fail(format!(
-                                "the node's frame {seq} on stream {id} doesn't decode"
-                            ));
-                        };
+                        let decoded = decode_frame::<RegtestMessage>(&frame);
+                        // Recorded before a decode failure ends the run, so
+                        // the frame still gets its `NodeFrame`.
                         self.record(remote, id, RecordBody::Received {
                             seq,
                             message_type: frame.message_type,
                             // A frame's payload is under its 2 MiB cap.
                             payload: frame.payload.len() as u64,
-                            credit: credit(&message),
+                            credit: decoded.as_ref().ok().and_then(credit),
                             frame: frame.clone(),
                             at,
                         });
+                        let Ok(message) = decoded else {
+                            return self.fail(format!(
+                                "the node's frame {seq} on stream {id} doesn't decode"
+                            ));
+                        };
                         if let Some(adversary) = scripts.adversary.as_mut().filter(|_| current) {
                             adversary.before_receive(&message);
                         }

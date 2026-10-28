@@ -544,6 +544,66 @@ mod tests {
         }])))
     }
 
+    /// A node frame the peer couldn't decode, here one with a reserved flag
+    /// bit, still gets its `NodeFrame` after its `PeerReceived`, labelled
+    /// from its header.
+    #[test]
+    fn an_undecodable_node_frame_is_labelled() {
+        let frame = Frame {
+            message_type: RegtestMessage::ROWS[0].message_type,
+            flags: 1,
+            payload: Vec::new(),
+        };
+        let records = Rc::new(RefCell::new(VecDeque::from([PeerRecord {
+            remote: peer_addr(0, 0),
+            quic_stream: 4,
+            body: RecordBody::Received {
+                seq: 0,
+                message_type: frame.message_type,
+                payload: 0,
+                credit: None,
+                frame: frame.clone(),
+                at: Duration::ZERO,
+            },
+        }])));
+        let mut log = ObservationLog::default();
+        log.push(transport(1, Some(1), TransportFact::Registered));
+        log.push(Observation::Session {
+            connection: 1,
+            peer: "peer-0".to_owned(),
+            quic_stream: 4,
+            kind: RegtestMessage::LAYOUT[0].kind,
+            version: RegtestMessage::LAYOUT[0].version,
+            session_id: 7,
+        });
+        log.push(transport(
+            2,
+            Some(1),
+            TransportFact::FrameWriteStarted {
+                quic_stream: 4,
+                seq: 0,
+                message_type: frame.message_type,
+            },
+        ));
+        WireEvidence::default()
+            .observe(&records, &mut log)
+            .expect("the record is placed");
+        let logged: Vec<_> = log.entries()[3..].iter().map(|entry| &entry.obs).collect();
+        assert!(
+            matches!(
+                logged[..],
+                [
+                    Observation::PeerReceived { .. },
+                    Observation::NodeFrame {
+                        label: Label::ReservedFlags,
+                        ..
+                    }
+                ]
+            ),
+            "{logged:?}"
+        );
+    }
+
     /// A record waits while its stream may still be admitted, and fails the
     /// run once the node refuses the stream or the handshake, or tears the
     /// connection down first, so it can't drop out of the log unseen.

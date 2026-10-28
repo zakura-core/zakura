@@ -913,6 +913,31 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
             })
             .expect("the node wrote on the reopened stream");
         assert_eq!(seq, 0, "the reopened stream's frames count from 0");
+        // Every frame the node wrote on the retired stream, in the whole
+        // run, was read and logged, any after the finish included.
+        for stream in [first] {
+            let written: Vec<u64> = facts(&entries, connection)
+                .filter_map(|(_, fact)| match fact {
+                    TransportFact::FrameWritten {
+                        quic_stream, seq, ..
+                    } if *quic_stream == stream => Some(*seq),
+                    _ => None,
+                })
+                .collect();
+            let read: Vec<u64> = entries
+                .iter()
+                .filter_map(|at| match at.obs {
+                    Observation::PeerReceived {
+                        connection: c,
+                        quic_stream,
+                        seq,
+                        ..
+                    } if (c, quic_stream) == (connection, stream) => Some(seq),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(written, read, "stream {stream}'s writes were all read");
+        }
         assert!(
             !facts(&entries, connection)
                 .any(|(_, fact)| matches!(fact, TransportFact::CloseDecided { .. })),

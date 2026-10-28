@@ -26,6 +26,7 @@ pub mod honest;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     future::Future,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
@@ -592,8 +593,6 @@ fn credit(message: &RegtestMessage) -> Option<PeerCredit> {
 struct HeaderStream {
     id: u64,
     send: SendStream,
-    /// Frames read from the node so far, the next one's `seq`.
-    read: u64,
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
@@ -859,6 +858,8 @@ impl PeerTask {
         zakura_rt::task::spawn_named("peer_accept", accept_streams(conn.clone(), events.clone()));
         // The header stream the peer writes on, and whether it's settled.
         let mut header: Option<HeaderStream> = None;
+        // Frames read so far on each header stream, the next one's `seq`.
+        let mut reads = BTreeMap::new();
         let mut settled = !header_sync;
         if header_sync && self.spec.dialer == Dialer::Peer {
             let Ok((mut send, recv)) = conn.open_bi().await else {
@@ -875,7 +876,8 @@ impl PeerTask {
             }
             let id = send.id();
             zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, events.clone()));
-            let mut stream = HeaderStream { id, send, read: 0 };
+            reads.insert(id, 0);
+            let mut stream = HeaderStream { id, send };
             if let Some(honest) = honest.as_mut() {
                 let frames = honest.start_stream();
                 if !self.write(remote, &mut stream, frames).await {
@@ -901,18 +903,21 @@ impl PeerTask {
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
                     StreamEvent::Header { id, send } => {
-                        header = Some(HeaderStream { id, send, read: 0 });
+                        reads.insert(id, 0);
+                        header = Some(HeaderStream { id, send });
                         if let Some(honest) = honest.as_mut() {
                             frames = honest.start_stream();
                         }
                     }
                     StreamEvent::Frame { id, frame } => {
-                        let Some(stream) = header.as_mut().filter(|stream| stream.id == id) else {
-                            continue;
-                        };
-                        settled = true;
-                        let seq = stream.read;
-                        stream.read += 1;
+                        // Every header stream's reads are recorded, a
+                        // finished or replaced one's included, since the
+                        // node can still write on it.
+                        let read = reads.get_mut(&id).expect("a header stream's reader is known");
+                        let seq = *read;
+                        *read += 1;
+                        let current = header.as_ref().is_some_and(|stream| stream.id == id);
+                        settled |= current;
                         let Ok(message) = decode_frame::<RegtestMessage>(&frame) else {
                             return self.fail(format!(
                                 "the node's frame {seq} on stream {id} doesn't decode"
@@ -925,7 +930,7 @@ impl PeerTask {
                             payload: frame.payload.len() as u64,
                             credit: credit(&message),
                         });
-                        if let Some(honest) = honest.as_mut() {
+                        if let Some(honest) = honest.as_mut().filter(|_| current) {
                             frames = honest.receive(&message, frame.payload.len());
                         }
                     }

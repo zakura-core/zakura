@@ -12,7 +12,7 @@ use super::{
     header_sync::WireScenario,
 };
 use crate::peer::{
-    adversary::{Act, AdversarySpec, ContentRule, Row},
+    adversary::{Act, AdversarySpec, ContentRule, CursorField, Row},
     honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
     PeerAction, PeerSpec,
 };
@@ -42,8 +42,9 @@ pub enum SavedPlan {
 
 impl SavedPlan {
     /// Every saved Plan: the honest sync, then one act per violation
-    /// category of the action table, each on the row its case list reaches
-    /// first. M5-E1 marks no category unreachable.
+    /// category of the action table: a stateless fault on `status`, and
+    /// for `bad-cursor` and `bad-content` the case M5-E1's guard test
+    /// takes. M5-E1 marks no category unreachable.
     pub const ALL: [SavedPlan; 14] = [
         SavedPlan::HonestSync,
         SavedPlan::Act(Act::ShortPayload { row: Row::Status }),
@@ -60,7 +61,9 @@ impl SavedPlan {
         SavedPlan::Act(Act::ExtraEnding),
         SavedPlan::Act(Act::ExtraEndingAhead),
         SavedPlan::Act(Act::AfterClose),
-        SavedPlan::Act(Act::BadCursor),
+        SavedPlan::Act(Act::BadCursor {
+            field: CursorField::Hash,
+        }),
         SavedPlan::Act(Act::BadContent {
             rule: ContentRule::Linkage,
         }),
@@ -189,7 +192,7 @@ fn acting(act: Act) -> WireScenario {
                 script,
             ),
         ),
-        Act::SecondOpen | Act::OverLive | Act::BadCursor => {
+        Act::SecondOpen | Act::OverLive | Act::BadCursor { .. } => {
             (120, adversary(PRELOAD, Some(held), quiet, script))
         }
         Act::AfterClose => (PRELOAD + 1, adversary(PRELOAD, Some(held), quiet, script)),

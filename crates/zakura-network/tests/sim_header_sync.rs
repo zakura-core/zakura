@@ -11,6 +11,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use zakura_chain::parameters::Network;
@@ -503,6 +504,49 @@ fn endpoint_new_builds_without_the_testkit() {
     // The transport's handshake timeout comes back as it is, not wrapped as
     // the dial's own deadline.
     assert_eq!(dialed, "Err(QuicConnect(HandshakeTimeout))");
+}
+
+/// `ZakuraEndpoint::shutdown` stops a maintained dial started on an endpoint
+/// from `ZakuraEndpoint::new`, even while it is still retrying.
+#[test]
+fn shutdown_stops_a_maintained_dial() {
+    let plan = Rc::new(RefCell::new(Plan(17)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+    let net = SimNet::new(LinkModel::default());
+    let shutdown = CancellationToken::new();
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+    sched.spawn_root("reactor", async move {
+        reactor.await.expect("the reactor ends on shutdown");
+    });
+    let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(handle));
+    let stopped = Rc::new(RefCell::new(false));
+    {
+        let (net, stopped) = (net.clone(), Rc::clone(&stopped));
+        sched.spawn_root("node", async move {
+            let _actions = actions;
+            let (quic, handler, _limits) = bind_node(&net, service);
+            let endpoint = ZakuraEndpoint::new(quic, handler);
+            let unreachable =
+                NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
+            let dial = endpoint.spawn_native_dial(unreachable);
+            // Long enough for at least one failed attempt and a backoff.
+            zakura_rt::time::sleep(Duration::from_secs(60)).await;
+            endpoint.shutdown().await;
+            let _ = dial.await;
+            *stopped.borrow_mut() = true;
+        });
+    }
+    let mut steps = Vec::new();
+    run_to_end(&mut sched, &plan, &mut steps);
+    shutdown.cancel();
+    run_to_end(&mut sched, &plan, &mut steps);
+    let _ = sched.shutdown();
+    assert!(*stopped.borrow(), "the maintained dial ended at shutdown");
 }
 
 /// Every version 9 message builds from public fields, encodes, decodes to

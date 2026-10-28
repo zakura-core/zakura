@@ -76,10 +76,7 @@ fn run(
 
 /// [`fuzz_one`]'s action on one classified run.
 fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified: &Classified) {
-    if let Some(want) = expected() {
-        if matches!(&classified.outcome, ExploreOutcome::Fail { property } if property == want) {
-            panic!("{want}");
-        }
+    if met_expectation(classified) {
         return;
     }
     for (property, bucket) in &classified.notes {
@@ -101,7 +98,7 @@ fn abandoned(leaked: usize) {
 
 /// Records the failing run, then panics with the property and the trace's
 /// directory.
-fn fail(entry: &HarnessEntry, input: &[u8], run: &ExploreRun, property: &str) -> ! {
+fn fail(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, property: &str) -> ! {
     match record(entry, input, run, property, &artifacts_root()) {
         Ok(dir) => panic!("{property}: trace at {}", dir.display()),
         Err(error) => record_failed(property, error),
@@ -123,7 +120,7 @@ fn record_failed(property: &str, error: RecordError) -> ! {
 /// Records `property`'s violation in `run` under `root`, and returns the
 /// trace's directory.
 fn record(
-    entry: &HarnessEntry,
+    entry: &'static HarnessEntry,
     input: &[u8],
     run: &ExploreRun,
     property: &str,
@@ -146,7 +143,8 @@ fn record(
 /// already saved one. A property's ID is its signature, so one trace per
 /// property is enough. A rerun that disagrees panics with
 /// `nondeterministic:`.
-fn save_once(entry: &HarnessEntry, input: &[u8], run: &ExploreRun, property: &str, bucket: Bucket) {
+fn save_once(
+    entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, property: &str, bucket: Bucket) {
     static SAVED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
     let name = match bucket {
         Bucket::Known => "known",
@@ -174,6 +172,19 @@ fn save_once(entry: &HarnessEntry, input: &[u8], run: &ExploreRun, property: &st
     }
 }
 
+/// With `ZAKURA_SIM_EXPECT` set, panics on an `Active` violation of that
+/// property and returns `true` for any other run, so the caller does
+/// nothing else with it. Returns `false` when the variable is unset.
+fn met_expectation(classified: &Classified) -> bool {
+    let Some(want) = expected() else {
+        return false;
+    };
+    if matches!(&classified.outcome, ExploreOutcome::Fail { property } if property == want) {
+        panic!("{want}");
+    }
+    true
+}
+
 /// `ZAKURA_SIM_EXPECT`, read once per process. Empty counts as unset.
 fn expected() -> Option<&'static str> {
     static EXPECT: OnceLock<Option<String>> = OnceLock::new();
@@ -192,6 +203,8 @@ fn expected() -> Option<&'static str> {
 /// - a failure of any other property panics;
 /// - once a fixture's discovery limit has passed with no `Base` find, the
 ///   next input panics with `missed:`.
+///
+/// `ZAKURA_SIM_EXPECT` works as in [`fuzz_one`], and replaces the policy.
 pub fn fuzz_fixtures(input: &[u8]) {
     static ENTRY: HarnessEntry = zakura_sim::harness::entry::<fixtures::All>();
     run(&ENTRY, input, act_fixtures);
@@ -211,6 +224,9 @@ fn act_fixtures(
     run: &ExploreRun,
     classified: &Classified,
 ) {
+    if met_expectation(classified) {
+        return;
+    }
     static FINDS: OnceLock<Mutex<Finds>> = OnceLock::new();
     let finds = FINDS.get_or_init(|| {
         Mutex::new(Finds {

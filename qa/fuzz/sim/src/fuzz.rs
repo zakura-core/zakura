@@ -46,7 +46,8 @@ thread_local! {
 /// - a harness failure panics with `harness:` and the reason;
 /// - each `Known` and `Draft` violation saves a trace once per property
 ///   under its bucket, and the target returns;
-/// - an abandoned run returns, and the worker retires its thread (#1694);
+/// - an abandoned run is logged and returns, and the worker retires its
+///   thread (#1694);
 /// - a clean run returns.
 ///
 /// With `ZAKURA_SIM_EXPECT=<property-id>` set, only an `Active` violation
@@ -87,8 +88,15 @@ fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified:
     match &classified.outcome {
         ExploreOutcome::Fail { property } => fail(entry, input, run, property),
         ExploreOutcome::HarnessFailure { reason } => panic!("harness: {reason}"),
-        ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => {}
+        ExploreOutcome::Abandoned { leaked } => abandoned(*leaked),
+        ExploreOutcome::Clean => {}
     }
+}
+
+/// Logs an abandoned run. The worker parks the run's thread for good, so a
+/// campaign that keeps abandoning runs keeps growing; the log shows why.
+fn abandoned(leaked: usize) {
+    eprintln!("abandoned: shutdown leaked {leaked} tasks; the worker retired its thread");
 }
 
 /// Records the failing run, then panics with the property and the trace's
@@ -231,7 +239,8 @@ fn act_fixtures(
                 );
             }
         }
-        ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => {}
+        ExploreOutcome::Abandoned { leaked } => abandoned(*leaked),
+        ExploreOutcome::Clean => {}
     }
     let elapsed = finds.start.elapsed();
     if let Some((property, limit)) = fixtures::EXPECTED

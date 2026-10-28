@@ -738,13 +738,27 @@ pub(crate) struct Delivered {
     pub(crate) exchange: Option<u64>,
 }
 
-/// One delivery of a body, with the tap's event count when it crossed and
-/// whether work already named it.
-#[derive(Clone, Copy, Debug)]
+/// One delivery of a body, with the tap's event count when it crossed, the
+/// hash its body carries, and whether work already named it.
+#[derive(Clone, Debug)]
 struct Delivery {
     after: u64,
     delivered: Delivered,
+    /// `None` for a frame that doesn't decode.
+    hash: Option<String>,
     taken: bool,
+}
+
+/// A body frame that crossed to the node, as [`Wire::body_frames`] lists it.
+#[derive(Clone, Debug)]
+pub(crate) struct BodyFrame {
+    /// The connection it crossed on.
+    pub(crate) connection: u64,
+    pub(crate) delivered: Delivered,
+    /// The hash its body carries, `None` for a frame that doesn't decode.
+    pub(crate) hash: Option<String>,
+    /// Whether work already named it.
+    pub(crate) taken: bool,
 }
 
 /// What the relays share with the node's tap.
@@ -925,6 +939,10 @@ impl Wire {
                         seq,
                         exchange: extra.exchange.filter(|_| extra.body.is_some()),
                     },
+                    hash: match &decoded {
+                        Some(BlockSyncMessage::Block(body)) => Some(hex(&body.hash().0)),
+                        _ => None,
+                    },
                     taken: false,
                 });
         }
@@ -951,67 +969,92 @@ impl Wire {
     /// `before`: the oldest one a range took that no work named yet, else
     /// the newest.
     pub(crate) fn body(&self, connection: u64, height: u32, before: u64) -> Option<Delivered> {
-        self.untaken_body(connection, height, before, &|_, _| true)
-            .or_else(|| {
-                self.0
-                    .borrow()
-                    .bodies
-                    .get(&(connection, height))?
-                    .iter()
-                    .rev()
-                    .find(|delivery| delivery.after < before)
-                    .map(|delivery| delivery.delivered)
-            })
+        self.untaken_body(connection, height, before).or_else(|| {
+            self.0
+                .borrow()
+                .bodies
+                .get(&(connection, height))?
+                .iter()
+                .rev()
+                .find(|delivery| delivery.after < before)
+                .map(|delivery| delivery.delivered)
+        })
     }
 
     /// The oldest body frame at `height` on `connection` that a range took
     /// and no work named yet, of those that crossed before the tap's event
-    /// `before` and pass `judged`, which it marks named.
-    pub(crate) fn untaken_body(
-        &self,
-        connection: u64,
-        height: u32,
-        before: u64,
-        judged: &dyn Fn(u64, u64) -> bool,
-    ) -> Option<Delivered> {
+    /// `before`, which it marks named.
+    fn untaken_body(&self, connection: u64, height: u32, before: u64) -> Option<Delivered> {
         let mut state = self.0.borrow_mut();
         let delivery = state
             .bodies
             .get_mut(&(connection, height))?
             .iter_mut()
-            .find(|delivery| {
-                untaken(delivery, before) && judged(connection, delivery.delivered.seq)
-            })?;
+            .find(|delivery| untaken(delivery, before))?;
         delivery.taken = true;
         Some(delivery.delivered)
     }
 
-    /// [`Wire::untaken_body`] on any connection but `owner`: the oldest such
-    /// frame, with its connection. Block sync's first-completion-wins
-    /// credits such a body to a request on `owner`'s session.
-    pub(crate) fn body_elsewhere(
-        &self,
-        owner: u64,
-        height: u32,
-        before: u64,
-        judged: &dyn Fn(u64, u64) -> bool,
-    ) -> Option<(u64, Delivered)> {
-        let mut state = self.0.borrow_mut();
-        let (connection, delivery) = state
+    /// Every body frame at `height`, on any connection, of those that
+    /// crossed before the tap's event `before`.
+    pub(crate) fn body_frames(&self, height: u32, before: u64) -> Vec<BodyFrame> {
+        self.0
+            .borrow()
             .bodies
-            .iter_mut()
-            .filter(|((connection, at), _)| *connection != owner && *at == height)
+            .iter()
+            .filter(|((_, at), _)| *at == height)
             .flat_map(|((connection, _), deliveries)| {
                 deliveries
+                    .iter()
+                    .filter(|delivery| delivery.after < before)
+                    .map(|delivery| BodyFrame {
+                        connection: *connection,
+                        delivered: delivery.delivered,
+                        hash: delivery.hash.clone(),
+                        taken: delivery.taken,
+                    })
+            })
+            .collect()
+    }
+
+    /// Records that a body frame carrying `hash` crossed `connection` at
+    /// `height` after the tap's event `after`, as a relay would.
+    #[cfg(test)]
+    pub(crate) fn push_body(
+        &self,
+        connection: u64,
+        height: u32,
+        after: u64,
+        delivered: Delivered,
+        hash: &str,
+    ) {
+        self.0
+            .borrow_mut()
+            .bodies
+            .entry((connection, height))
+            .or_default()
+            .push(Delivery {
+                after,
+                delivered,
+                hash: Some(hash.to_owned()),
+                taken: false,
+            });
+    }
+
+    /// Marks the body frame `seq` at `height` on `connection` named by work.
+    pub(crate) fn name(&self, connection: u64, height: u32, seq: u64) {
+        let mut state = self.0.borrow_mut();
+        if let Some(delivery) = state
+            .bodies
+            .get_mut(&(connection, height))
+            .and_then(|deliveries| {
+                deliveries
                     .iter_mut()
-                    .map(move |delivery| (*connection, delivery))
+                    .find(|delivery| delivery.delivered.seq == seq)
             })
-            .filter(|(connection, delivery)| {
-                untaken(delivery, before) && judged(*connection, delivery.delivered.seq)
-            })
-            .min_by_key(|(_, delivery)| delivery.after)?;
-        delivery.taken = true;
-        Some((connection, delivery.delivered))
+        {
+            delivery.taken = true;
+        }
     }
 
     /// Each connection that closed since the last call, with its cause.

@@ -12,8 +12,9 @@
 //! - `SubscribeHeaders`: an `Open` with no locator or a repeated one, or
 //!   whose start cursor isn't its first locator with nothing consumed.
 //! - `Headers`: a page whose headers don't link from its parent, or whose
-//!   parent isn't a locator of the `Open` (the first page) or the last
-//!   header sent (each later one).
+//!   parent isn't a locator of the `Open` (the first page, which extends
+//!   the target if a locator is it) or the last header sent (each later
+//!   one).
 //! - `HeadersOutcome`: an outcome its subscription's history doesn't
 //!   allow, such as `SubscriptionClosed` before the node's `Close`. A
 //!   subscription whose locators hold its target reached it at `Open`.
@@ -36,6 +37,8 @@ const KNOWN_SCHEMAS: u32 = 1;
 struct Served {
     /// The `Open`'s locators, highest first.
     locators: Vec<block::Hash>,
+    /// The `Open`'s target, if one of the locators is it.
+    target_locator: Option<block::Hash>,
     /// Pages sent.
     pages: u64,
     /// The last header sent, if a page was.
@@ -140,9 +143,10 @@ impl ContentLabeller {
                         .get(&page.subscription_id)
                         .is_some_and(|served| {
                             let parent = page.common_ancestor_hash;
-                            match served.last {
-                                Some(last) => parent != last,
-                                None => !served.locators.contains(&parent),
+                            match (served.last, served.target_locator) {
+                                (Some(last), _) => parent != last,
+                                (None, Some(target)) => parent != target,
+                                (None, None) => !served.locators.contains(&parent),
                             }
                         })
             }
@@ -185,6 +189,10 @@ impl ContentLabeller {
                         locators: update.locator_hashes.clone(),
                         pages: 0,
                         last: None,
+                        target_locator: update
+                            .locator_hashes
+                            .contains(&update.initial_target_tip_hash)
+                            .then_some(update.initial_target_tip_hash),
                         reached: update
                             .locator_hashes
                             .contains(&update.initial_target_tip_hash),
@@ -275,11 +283,11 @@ mod tests {
     fn a_target_locator_reaches_the_target_at_open() {
         use zakura_network::zakura::{
             v9::{Cursor, HeadersOutcome, SubscribeHeaders},
-            AuxSchema, Credit,
+            AuxSchema, Credit, HeaderEntry,
         };
 
         let (target, other) = (block::Hash([1; 32]), block::Hash([2; 32]));
-        let open = |locator| {
+        let open = |locators: Vec<block::Hash>| {
             Message::SubscribeHeaders(SubscribeHeaders {
                 operation: Operation::Open,
                 subscription_id: 1,
@@ -287,11 +295,11 @@ mod tests {
                 initial_target_tip_hash: target,
                 acknowledged: Cursor {
                     height: Height(1),
-                    hash: locator,
+                    hash: locators[0],
                     headers: 0,
                     bytes: 0,
                 },
-                locator_hashes: vec![locator],
+                locator_hashes: locators,
                 added_credit: Credit {
                     objects: 1,
                     bytes: 263,
@@ -306,8 +314,38 @@ mod tests {
         });
         for (locator, expected) in [(target, Label::BadContent), (other, Label::Conformant)] {
             let mut labeller = ContentLabeller::default();
-            labeller.received(&open(locator));
+            labeller.received(&open(vec![locator]));
             assert_eq!(labeller.label(&pruned).first(), expected, "{locator:?}");
         }
+        // With the target among the locators, the first page extends it,
+        // not an older locator.
+        let mut labeller = ContentLabeller::default();
+        labeller.received(&open(vec![target, other]));
+        let header = |parent| {
+            let mut header = *zakura_storage::header::fixture::HeaderFixture::regtest().extend(
+                zakura_storage::header::fixture::HeaderFixture::regtest().anchor(),
+                1,
+                0,
+            )[0];
+            header.previous_block_hash = parent;
+            header
+        };
+        let page = |parent| {
+            Message::Headers(Headers {
+                subscription_id: 1,
+                initial_target_tip_hash: target,
+                common_ancestor_height: Height(1),
+                common_ancestor_hash: parent,
+                reaches_initial_target: false,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: header(parent).into(),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            })
+        };
+        assert_eq!(labeller.label(&page(target)).first(), Label::Conformant);
+        assert_eq!(labeller.label(&page(other)).first(), Label::BadContent);
     }
 }

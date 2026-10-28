@@ -362,12 +362,12 @@ impl Subsystem for InterruptingStaleOwner {
     /// Adds [`StaleOwner`]'s actions, and sets [`INTERRUPT`] once the
     /// count of builds runs out.
     fn build(sim: &mut Sim, _: &Fixed, (): ()) -> Self {
-        let counted =
-            BUILDS_BEFORE_INTERRUPT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            });
-        if counted.is_err() {
+        // Only `interrupt_keeps_best` builds this harness, one run at a
+        // time, so the load and the subtraction can't race.
+        if BUILDS_BEFORE_INTERRUPT.load(Ordering::SeqCst) == 0 {
             INTERRUPT.store(true, Ordering::SeqCst);
+        } else {
+            BUILDS_BEFORE_INTERRUPT.fetch_sub(1, Ordering::SeqCst);
         }
         sim.add_source(Box::new(Owners::default()));
         InterruptingStaleOwner

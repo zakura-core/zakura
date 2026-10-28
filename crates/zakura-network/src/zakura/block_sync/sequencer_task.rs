@@ -2834,8 +2834,10 @@ mod tests {
         task.abort();
     }
 
+    /// The input queue hands `applying` raw bytes, so no stage holds a
+    /// decoded block before the sequencer submits the body.
     #[test]
-    fn handoff_publishes_applying_decoded_bytes_before_submission() {
+    fn handoff_keeps_the_body_raw_until_submission() {
         let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
@@ -2872,14 +2874,12 @@ mod tests {
         task.handle_accept_body(body);
         task.publish_decoded_ownership_view();
 
+        assert_eq!(task.sequencer.applying_len(), 1);
         let handoff = *view_rx.borrow();
         assert_eq!(handoff.sequencer_input_decoded_attributed_memory_bytes, 0);
-        assert!(handoff.applying_decoded_attributed_memory_bytes > 0);
+        assert_eq!(handoff.applying_decoded_attributed_memory_bytes, 0);
         assert_eq!(handoff.reorder_decoded_attributed_memory_bytes, 0);
-        assert_eq!(
-            handoff.active_pipeline_decoded_attributed_memory_bytes,
-            handoff.applying_decoded_attributed_memory_bytes
-        );
+        assert_eq!(handoff.active_pipeline_decoded_attributed_memory_bytes, 0);
     }
 
     #[test]

@@ -299,7 +299,9 @@ fn call_of(entries: &[Entry], op: u64) -> Option<(u64, u64, usize, Option<usize>
 ///    between its `CallEnded` and `Handled` does either, the call's owner is
 ///    session 1's, and the header generation is the same at both. No apply
 ///    ever carries session 1.
-/// 7. Session 2's holds release, its apply commits, and the node reaches
+/// 7. Session 2's holds release, its apply commits, the reactor handles
+///    that apply, and session 2's request ends after the commit, admitted
+///    inside the apply's bracket or made obsolete by it. The node reaches
 ///    the tip.
 ///
 /// Every hold releases before the reactor's 30 s request deadline. A step
@@ -460,6 +462,39 @@ fn replacement_while_storage_is_pending() {
             generation_before(entries, a_done).map(|before| before + 1),
             "session 2's apply committed"
         );
+        let (_, owner, apply_ended, apply_handled) =
+            call_of(entries, applies[0].id).expect("session 2's apply call is paired");
+        assert_eq!(owner, new);
+        let apply_handled = apply_handled.expect("the reactor handled session 2's apply");
+        // Session 2's request ended after its commit: admitted inside its
+        // apply's bracket, or made obsolete by a commit past its owner's
+        // generation.
+        let retired: Vec<(usize, &str)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(at, entry)| match &entry.obs {
+                Observation::Reactor {
+                    event:
+                        ReactorFact::Retired {
+                            request, reason, ..
+                        },
+                    ..
+                } if request.session_id == new => Some((at, reason.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(!retired.is_empty(), "session 2's request ended");
+        for (at, reason) in &retired {
+            assert!(
+                *at > a_done,
+                "session 2 was retired before its commit: {reason}"
+            );
+            let admitted = *reason == "target_admitted" && apply_ended < *at && *at < apply_handled;
+            assert!(
+                admitted || *reason == "snapshot_obsolete",
+                "session 2 was retired as {reason}"
+            );
+        }
         assert_eq!(ports.selected_tip(), Chain::main(120).tip(&ports.fixture));
 
         // Every hold released before the request deadline.

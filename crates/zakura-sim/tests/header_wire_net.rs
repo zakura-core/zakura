@@ -383,7 +383,6 @@ fn a_lost_initial_is_retransmitted() {
         })
     };
     let (report, ports) = steered(&scenario, Plan::from_fuzz(&[]), &rule);
-    assert_conformant(&report, &ports, 120);
     let datagrams = datagrams(&report);
     let from_node = link(NODE_ADDR, peer);
     let node_first_sent = datagrams
@@ -434,6 +433,7 @@ fn a_lost_initial_is_retransmitted() {
             .is_some_and(|frame| frame > admitted),
         "the peer's frames came after admission"
     );
+    assert_conformant(&report, &ports, 120);
 }
 
 /// The node dials `peer-1`, and a focused Plan drops every datagram on that

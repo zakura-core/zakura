@@ -33,6 +33,9 @@ use crate::zakura::ZakuraPeerId;
 #[derive(Clone, Debug)]
 pub(crate) struct CloseCause {
     reason: Arc<OnceLock<&'static str>>,
+    /// The connection's transport observer, once it is registered.
+    #[cfg(any(test, zakura_sim))]
+    tap: Arc<OnceLock<Arc<super::ConnTap>>>,
 }
 
 impl CloseCause {
@@ -40,12 +43,58 @@ impl CloseCause {
     pub(crate) fn new() -> Self {
         Self {
             reason: Arc::new(OnceLock::new()),
+            #[cfg(any(test, zakura_sim))]
+            tap: Arc::new(OnceLock::new()),
         }
     }
 
     /// Record `reason` if no earlier close cause was recorded.
+    ///
+    /// In test and simulator builds, the call that records the first cause
+    /// reports it as `CloseDecided`.
     pub(crate) fn record(&self, reason: &'static str) {
+        #[cfg(not(any(test, zakura_sim)))]
         let _ = self.reason.set(reason);
+        #[cfg(any(test, zakura_sim))]
+        if self.reason.set(reason).is_ok() {
+            if let Some(tap) = self.tap.get() {
+                tap.decide(Some(reason));
+            }
+        }
+    }
+
+    /// Report this connection's close decision and teardown through `tap`.
+    /// Only the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<super::ConnTap>) {
+        let _ = self.tap.set(tap);
+    }
+
+    /// The connection's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<super::ConnTap>> {
+        self.tap.get()
+    }
+
+    /// Report `CloseDecided` with no cause, right after the connection's token
+    /// was cancelled, if no cause was recorded before. A cause recorded after
+    /// this isn't reported.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn cancelled_without_cause(&self) {
+        if let (None, Some(tap)) = (self.reason.get(), self.tap.get()) {
+            tap.decide(None);
+        }
+    }
+
+    /// Report `TornDown`, once the connection's workers drained and its peer
+    /// was unregistered.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn torn_down(&self) {
+        if let Some(tap) = self.tap.get() {
+            tap.emit(super::TransportEvent::TornDown {
+                conn_id: tap.conn_id(),
+            });
+        }
     }
 
     /// Return the recorded reason, or `default` when no local path recorded one.

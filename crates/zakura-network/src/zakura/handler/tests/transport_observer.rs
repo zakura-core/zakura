@@ -357,6 +357,35 @@ fn close_is_decided_once() {
     );
 }
 
+/// A registration refusal and a cause-free cancellation make one decision
+/// between them, whichever comes first. A refusal after the cancellation
+/// isn't the decision, and a cancellation after the refusal reports nothing.
+#[test]
+fn a_refusal_and_a_cancellation_decide_once() {
+    let recorder = Arc::new(Recorder::default());
+    let cause = CloseCause::new();
+    cause.observe_with(Arc::new(ConnTap::new(recorder.clone(), REMOTE)));
+    cause.cancelled_without_cause();
+    let tap = cause.tap().expect("the tap is attached");
+    assert!(!tap.refused(), "the cancellation decided first");
+    assert_eq!(
+        recorder.events(),
+        vec![TransportEvent::CloseDecided {
+            remote: REMOTE,
+            conn_id: None,
+            cause: None,
+        }]
+    );
+
+    let recorder = Arc::new(Recorder::default());
+    let cause = CloseCause::new();
+    cause.observe_with(Arc::new(ConnTap::new(recorder.clone(), REMOTE)));
+    let tap = cause.tap().expect("the tap is attached");
+    assert!(tap.refused(), "the refusal is the decision");
+    cause.cancelled_without_cause();
+    assert_eq!(recorder.events(), vec![]);
+}
+
 /// Without an observer, `transport_observe!` never evaluates its event.
 #[test]
 fn no_observer_evaluates_nothing() {
@@ -589,7 +618,7 @@ fn a_retracted_open_is_reported() {
 }
 
 /// Records whether a fenced subscription's exchange was still open when its
-/// `EndClaimed` arrived.
+/// `EndClaimed` or `OpenRetracted` arrived.
 #[derive(Debug, Default)]
 struct EndWatcher {
     writer: Mutex<Option<crate::zakura::regulation::ExchangeWriter>>,
@@ -599,7 +628,7 @@ struct EndWatcher {
 impl TransportObserver for EndWatcher {
     fn observe(&self, event: TransportEvent) {
         if let TransportEvent::Regulated {
-            transition: Transition::EndClaimed { .. },
+            transition: Transition::EndClaimed { .. } | Transition::OpenRetracted { .. },
             ..
         } = event
         {
@@ -638,6 +667,42 @@ fn end_claimed_precedes_the_exchange_end() {
         )
         .expect("the open fits");
     subscriptions.claim_end(&1).expect("the subscription ends");
+    assert_eq!(
+        *watcher
+            .open_at_end
+            .lock()
+            .expect("no test panics holding it"),
+        Some(true)
+    );
+}
+
+/// `OpenRetracted` is reported before the retracted subscription's exchange
+/// is dropped, since that drop takes the fence's locks, which are scheduling
+/// points in a simulated run.
+#[test]
+fn open_retracted_precedes_the_exchange_drop() {
+    let watcher = Arc::new(EndWatcher::default());
+    let tap = Arc::new(StreamTap::new(registered_tap(watcher.clone()), 4));
+    let fence =
+        crate::zakura::regulation::WriterFence::new(CancellationToken::new(), CloseCause::new());
+    let exchange = fence.open().expect("a fresh fence opens");
+    *watcher.writer.lock().expect("no test panics holding it") = Some(exchange.writer());
+    let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
+        .expect("SUBSCRIBE_HEADERS is a subscription row");
+    let mut subscriptions =
+        Subscriptions::new(limits, rows()).observed_by(Some(RegulationTap::new(tap, |id| *id)));
+    subscriptions
+        .open_fenced(
+            1,
+            Credit {
+                objects: 1,
+                bytes: 1_000,
+            },
+            cursor(0),
+            exchange,
+        )
+        .expect("the open fits");
+    assert!(subscriptions.retract(&1));
     assert_eq!(
         *watcher
             .open_at_end

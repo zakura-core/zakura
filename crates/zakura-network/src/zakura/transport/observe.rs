@@ -348,9 +348,11 @@ impl ConnTap {
     }
 
     /// Marks the close as decided without reporting it, for a connection the
-    /// supervisor refused, which reports `HandshakeRefused` instead.
-    pub(crate) fn refused(&self) {
-        self.decided.store(1, Ordering::Release);
+    /// supervisor refused. Returns whether this was the decision, so the
+    /// caller reports `HandshakeRefused` only if no cancellation reported
+    /// `CloseDecided` first.
+    pub(crate) fn refused(&self) -> bool {
+        self.decided.swap(1, Ordering::AcqRel) == 0
     }
 
     /// Reports `CloseDecided` with `cause`, unless a decision was already

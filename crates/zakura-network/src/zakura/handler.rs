@@ -2524,7 +2524,9 @@ impl ZakuraProtocolHandler {
 
     /// [`Self::handshake_refused`] for a connection the supervisor refused to
     /// register. The refusal is its close decision, so a later cancellation of
-    /// its token reports none.
+    /// its token reports none. If a cancellation during `register` already
+    /// reported `CloseDecided`, that stays the only decision and this reports
+    /// nothing.
     #[cfg(any(test, zakura_sim))]
     fn registration_refused(
         &self,
@@ -2532,10 +2534,9 @@ impl ZakuraProtocolHandler {
         connection: &Connection,
         reason: &'static str,
     ) {
-        if let Some(tap) = close_cause.tap() {
-            tap.refused();
+        if close_cause.tap().is_none_or(|tap| tap.refused()) {
+            self.handshake_refused(connection, reason);
         }
-        self.handshake_refused(connection, reason);
     }
 
     /// Restrict the locally advertised capability mask.

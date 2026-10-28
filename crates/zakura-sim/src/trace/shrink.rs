@@ -58,6 +58,7 @@ use super::{
     read::refuse_symlinked_dir,
     replay_with, ReadError, ReplayError, ReplayOptions, Trace, BLOBS_DIR, INPUT_FILE, TRACE_FILE,
 };
+pub use crate::plan::Candidate;
 use crate::{
     harness::{self, HarnessEntry, RecordInput},
     plan::{By, SkipScript},
@@ -83,17 +84,6 @@ pub const REDUCTIONS_FILE: &str = "reductions.jsonl";
 
 /// The [`ShrinkReport`].
 pub const REPORT_FILE: &str = "report.json";
-
-/// One step of a shrink candidate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Candidate {
-    /// A recorded step. The run takes its pick if `by` is `bytes` and the
-    /// pick is enabled, and the round-robin pick otherwise. Its draws answer
-    /// the step's draws where they match ([`SkipScript`]).
-    Recorded(StepRecord),
-    /// The round-robin pick, with default draws.
-    Default,
-}
 
 /// When the shrinker stops reducing. explorer.md sets the defaults: 2,000
 /// candidates or 10 minutes per failure.

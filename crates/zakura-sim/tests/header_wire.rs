@@ -456,16 +456,19 @@ fn a_bad_nonce_echo_is_refused() {
 
 /// Retiring a header stream without closing the connection needs no
 /// exchange started without an ending and no following frame being written
-/// (`regulation/writer_fence.rs`), and only the dialer reopens. This checks
-/// whether that state is reachable for header sync on purpose: the node
-/// dials `peer-0`, neither side subscribes, and the peer has read the
-/// node's one frame, its `Status`, when it finishes its side of the header
-/// stream.
+/// (`regulation/writer_fence.rs`), and only the dialer reopens. The state is
+/// reachable for header sync, and this builds it on purpose: the node dials
+/// `peer-0`, neither side subscribes, and the peer has read the node's one
+/// frame, its `Status`, when it finishes its side of the header stream.
 ///
-/// Either the node reopens the stream on the live connection, with a second
-/// session, or it closes the connection. A missing observation, neither of
-/// those, is a harness failure, never evidence that the state is
-/// unreachable.
+/// The node then reopens on the live connection. The new stream is a new
+/// identity: a second `Session` row on the same connection, with a new QUIC
+/// stream ID and a new session ID, whose frames count from 0 again, and no
+/// close decided before the node's first frame on it. A missing observation
+/// is a harness failure, never evidence that the state is unreachable.
+///
+/// This fails if a retirement with nothing outstanding closes the
+/// connection, or the dialer stops reopening.
 #[test]
 fn a_reopened_header_stream_gets_a_new_identity() {
     let scenario = scenario(vec![peer(
@@ -473,7 +476,6 @@ fn a_reopened_header_stream_gets_a_new_identity() {
         ZAKURA_CAP_HEADER_SYNC,
         vec![PeerAction::FinishHeader],
     )]);
-    let mut branches = Vec::new();
     for plan in plans() {
         let report = run(&scenario, plan);
         let (events, sessions) = read(&report);
@@ -503,32 +505,39 @@ fn a_reopened_header_stream_gets_a_new_identity() {
             .collect();
         assert_eq!(written, [0]);
 
-        let reopened = sessions.iter().find(|session| session.step > finished);
-        let closed = closes(&events, connection)
-            .into_iter()
-            .find(|(close, _)| close.step > finished);
-        let branch = match (reopened, closed) {
-            (Some(reopened), closed)
-                if closed
-                    .as_ref()
-                    .is_none_or(|(close, _)| close.step > reopened.step) =>
-            {
-                "reopened".to_owned()
-            }
-            (_, Some((_, cause))) => format!("closed with {cause:?}"),
-            _ => panic!(
-                "harness failure: after the finish, neither a second session nor a close \
-                 decision was observed"
+        let reopened = sessions
+            .iter()
+            .find(|session| session.step > finished)
+            .expect("the node reopened the header stream");
+        assert_eq!(
+            (
+                reopened.connection,
+                &reopened.peer,
+                reopened.kind,
+                reopened.version
             ),
-        };
-        branches.push(branch);
+            (
+                connection,
+                &first.peer,
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION
+            ),
+            "on the same connection"
+        );
+        assert_ne!(reopened.quic_stream, first.quic_stream);
+        assert_ne!(reopened.session_id, first.session_id);
+        let (status, seq) = writes(&events, connection, reopened.quic_stream)
+            .into_iter()
+            .next()
+            .expect("the node wrote on the reopened stream");
+        assert_eq!(seq, 0, "the reopened stream's frames count from 0");
+        assert!(
+            closes(&events, connection)
+                .iter()
+                .all(|(close, _)| close.step > status.step),
+            "the connection stayed up through the reopen"
+        );
     }
-    // The state is the same by construction under every plan, so every plan
-    // lands on one branch.
-    assert!(
-        branches.windows(2).all(|pair| pair[0] == pair[1]),
-        "{branches:?}"
-    );
 }
 
 /// With `loss_after_admission`, no datagram is dropped until the identity

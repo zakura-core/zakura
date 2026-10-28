@@ -435,8 +435,9 @@ enum Ended {
 enum StreamEvent {
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
-    /// A whole frame from the node arrived on header stream `id`.
-    Frame { id: u64, frame: Frame },
+    /// A whole frame from the node arrived on header stream `id`, read at
+    /// `at` since the run's start.
+    Frame { id: u64, frame: Frame, at: Duration },
 }
 
 /// The bytes of a plain `Headers` page's fixed fields: the subscription ID,
@@ -845,7 +846,12 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
             flags: u16::from_le_bytes([header[2], header[3]]),
             payload,
         };
-        if events.send(StreamEvent::Frame { id, frame }).is_err() {
+        // Taken as the read completes, since the peer task may handle the
+        // frame later, and the sender's cadence charges it at its read.
+        let at = zakura_scheduler::hooks::now()
+            .expect("a peer reads inside a run")
+            .since_start();
+        if events.send(StreamEvent::Frame { id, frame, at }).is_err() {
             return;
         }
     }
@@ -1137,7 +1143,7 @@ impl PeerTask {
                             frames = honest.start_stream();
                         }
                     }
-                    StreamEvent::Frame { id, frame } => {
+                    StreamEvent::Frame { id, frame, at } => {
                         // Every header stream's reads are recorded, a
                         // finished or replaced one's included, since the
                         // node can still write on it.
@@ -1151,9 +1157,6 @@ impl PeerTask {
                                 "the node's frame {seq} on stream {id} doesn't decode"
                             ));
                         };
-                        let at = zakura_scheduler::hooks::now()
-                            .expect("a peer reads inside a run")
-                            .since_start();
                         self.record(remote, id, RecordBody::Received {
                             seq,
                             message_type: frame.message_type,

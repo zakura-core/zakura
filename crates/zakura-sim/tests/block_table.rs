@@ -702,6 +702,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         vec![vec![Observation::NodeFrame {
             connection: 1,
             stream: STREAM,
+            quic_stream: None,
             seq: 0,
             row: row_name.clone(),
             rule_stream: STREAM,

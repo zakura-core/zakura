@@ -10,9 +10,11 @@
 //! streams (M5-D). Every frame a peer sends there is labelled by its
 //! [`StreamModels`] before the write and logged as a `PeerFrame`, then as a
 //! `PeerWritten` once the write returns, and every frame it reads from the
-//! node is logged as a `PeerReceived`. Each record names its connection and
-//! QUIC stream from the identity map, never from draw order, so it waits in
-//! [`PeerControl`] until the node's transport has admitted its stream.
+//! node is logged as a `PeerReceived`, then as a `NodeFrame` labelled under
+//! the sender's rules by the [`adapter`] (M5-E2). Each record names its
+//! connection and QUIC stream from the identity map, never from draw order,
+//! so it waits in [`PeerControl`] until the node's transport has admitted
+//! its stream.
 //!
 //! A peer with an [`AdversarySpec`] also takes [`PeerAction::Act`]s, the
 //! receiver-direction boundaries of M5-E1 ([`adversary`]). Its frames are
@@ -25,6 +27,7 @@
 //! the peer's task carries it out. So at most one action is queued per
 //! peer, and an adversary's actions stay within the rate [`limit`] sets.
 
+pub mod adapter;
 pub mod adversary;
 mod content;
 mod evidence;
@@ -1138,12 +1141,17 @@ impl PeerTask {
                                 "the node's frame {seq} on stream {id} doesn't decode"
                             ));
                         };
+                        let at = zakura_scheduler::hooks::now()
+                            .expect("a peer reads inside a run")
+                            .since_start();
                         self.record(remote, id, RecordBody::Received {
                             seq,
                             message_type: frame.message_type,
                             // A frame's payload is under its 2 MiB cap.
                             payload: frame.payload.len() as u64,
                             credit: credit(&message),
+                            frame: frame.clone(),
+                            at,
                         });
                         if let (Some(adversary), Some(honest)) =
                             (scripts.adversary.as_mut(), scripts.honest.as_mut().filter(|_| current))

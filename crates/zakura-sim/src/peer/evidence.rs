@@ -11,6 +11,10 @@
 //! connection down, fails the run, so a peer's frames can't drop out of the
 //! log unseen.
 //!
+//! Each `PeerReceived` is followed by the frame's `NodeFrame`, which the
+//! [`SenderAdapter`] labels under the sender's rules against the peer
+//! updates the node had applied when it started writing the frame (M5-E2).
+//!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
 //! [`super::stage`]), `ConnectionClosed` for a close decided with a cause,
@@ -24,11 +28,15 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     rc::Rc,
+    time::Duration,
 };
 
-use zakura_network::zakura::{v9::RegtestMessage, MessageRole, MessageRule};
+use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule};
 
-use super::stage::{header_stage, NodeView, Stage};
+use super::{
+    adapter::SenderAdapter,
+    stage::{header_stage, NodeView, Stage},
+};
 use crate::{
     model::{FrameHeader, Label},
     observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
@@ -78,12 +86,15 @@ pub(crate) enum RecordBody {
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
-    /// [`Observation::PeerReceived`].
+    /// [`Observation::PeerReceived`], with the frame and when the peer
+    /// read it, since the run's start, for its `NodeFrame`.
     Received {
         seq: u64,
         message_type: u16,
         payload: u64,
         credit: Option<PeerCredit>,
+        frame: Frame,
+        at: Duration,
     },
 }
 
@@ -113,6 +124,8 @@ pub(crate) struct WireEvidence {
     views: BTreeMap<(u64, u64), NodeView>,
     /// Frames whose header the reader has, not judged yet.
     waiting: BTreeMap<FrameKey, Waiting>,
+    /// Labels the node's frames.
+    sender: SenderAdapter,
 }
 
 impl WireEvidence {
@@ -125,6 +138,14 @@ impl WireEvidence {
     ) -> Result<(), String> {
         let start = self.seen;
         for entry in &log.entries()[start..] {
+            if let Observation::Transport {
+                connection: Some(connection),
+                event,
+                ..
+            } = &entry.obs
+            {
+                self.sender.node(*connection, event);
+            }
             match &entry.obs {
                 Observation::Transport {
                     connection: Some(connection),
@@ -175,15 +196,23 @@ impl WireEvidence {
             }
         }
         let mut placed = Vec::new();
+        let mut failed = None;
         records
             .borrow_mut()
             .retain(|record| match self.place(record) {
-                Some(obs) => {
-                    placed.push(obs);
+                Some(Ok(obs)) => {
+                    placed.extend(obs);
+                    false
+                }
+                Some(Err(why)) => {
+                    failed.get_or_insert(why);
                     false
                 }
                 None => true,
             });
+        if let Some(why) = failed {
+            return Err(why);
+        }
         if let Some(lost) = records.borrow().iter().find_map(|record| self.lost(record)) {
             return Err(lost);
         }
@@ -200,12 +229,14 @@ impl WireEvidence {
         Ok(())
     }
 
-    /// `record` as its observation, once its stream is admitted.
-    fn place(&mut self, record: &PeerRecord) -> Option<Observation> {
+    /// `record` as its observations, once its stream is admitted: one, or
+    /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
+    /// can't label the node's frame.
+    fn place(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
         let connection = *self.connections.get(&record.remote.to_string())?;
         let stream = *self.streams.get(&(connection, record.quic_stream))?;
         let quic_stream = record.quic_stream;
-        Some(match record.body.clone() {
+        Some(Ok(vec![match record.body.clone() {
             RecordBody::Frame {
                 seq,
                 row,
@@ -239,15 +270,30 @@ impl WireEvidence {
                 message_type,
                 payload,
                 credit,
-            } => Observation::PeerReceived {
-                connection,
-                quic_stream,
-                seq,
-                message_type,
-                payload,
-                credit,
-            },
-        })
+                frame,
+                at,
+            } => {
+                let node_frame =
+                    match self
+                        .sender
+                        .received(connection, quic_stream, seq, &frame, at)
+                    {
+                        Ok(node_frame) => node_frame,
+                        Err(why) => return Some(Err(why)),
+                    };
+                return Some(Ok(vec![
+                    Observation::PeerReceived {
+                        connection,
+                        quic_stream,
+                        seq,
+                        message_type,
+                        payload,
+                        credit,
+                    },
+                    node_frame,
+                ]));
+            }
+        }]))
     }
 
     /// Why `record`, still unplaced, never will be, if the node refused its

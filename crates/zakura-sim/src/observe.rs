@@ -163,16 +163,23 @@ pub enum Observation {
         hash: String,
     },
     /// A frame the node sent on a tabled stream reached a peer, whose role
-    /// models labelled it on arrival under the sender's rules: `OverMargin`
-    /// once the node's open requests exceed the highest limit the peer
-    /// advertised, and `OverLive` once the node's live subscriptions exceed
-    /// `max_live`, without the receiver's margin of twice those. A model
-    /// input, like [`Observation::CreditGranted`].
+    /// models labelled it under the sender's rules: `OverMargin` once the
+    /// node's open requests exceed the highest limit the peer advertised,
+    /// and `OverLive` once the node's live subscriptions exceed `max_live`,
+    /// without the receiver's margin of twice those. An in-memory link's
+    /// relay labels it on arrival. A wire link labels it against the peer
+    /// updates the node had applied when it started writing the frame
+    /// ([`crate::peer::adapter`]). A model input, like
+    /// [`Observation::CreditGranted`].
     NodeFrame {
         /// The connection.
         connection: u64,
         /// The stream.
         stream: StreamId,
+        /// The frame's QUIC stream, as for [`Observation::PeerFrame`].
+        /// `None` on an in-memory link.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame's position among the node's frames on this stream,
         /// from 0.
         seq: u64,

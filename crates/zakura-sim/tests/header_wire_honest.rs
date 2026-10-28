@@ -432,7 +432,7 @@ fn held_storage_stops_the_credit_grants() {
     for plan in plans() {
         let (report, ports) = run(&scenario, plan);
         let entries = timed(&report);
-        let (submitted, id) = entries
+        let (submitted, id, prepared) = entries
             .iter()
             .enumerate()
             .find_map(|(index, at)| match &at.obs {
@@ -440,14 +440,18 @@ fn held_storage_stops_the_credit_grants() {
                     fact:
                         StorageFact::Submitted {
                             id,
-                            request: StorageRequest::PrepareHeaderTarget { .. },
+                            request: StorageRequest::PrepareHeaderTarget { headers, .. },
                             ..
                         },
                     ..
-                } => Some((index, *id)),
+                } => Some((index, *id, *headers)),
                 _ => None,
             })
             .expect("the node prepared");
+        assert!(
+            prepared >= 401,
+            "the first prepare holds {prepared} headers, at least 401"
+        );
         let completed = entries
             .iter()
             .find_map(|at| match &at.obs {
@@ -463,7 +467,7 @@ fn held_storage_stops_the_credit_grants() {
             20_000_000_000,
             "held for 20 s"
         );
-        // Every page sent while it was held, and the headers they staged.
+        // Every page sent before the hold opened.
         let pages: Vec<u64> = entries
             .iter()
             .filter_map(|at| match &at.obs {
@@ -475,18 +479,6 @@ fn held_storage_stops_the_credit_grants() {
                 _ => None,
             })
             .collect();
-        let staged: u64 = entries
-            .iter()
-            .filter_map(|at| match &at.obs {
-                Observation::PeerFrame {
-                    row: Some(row),
-                    payload,
-                    ..
-                } if row == "headers" && at.ns < completed => Some((payload - 82) / 181),
-                _ => None,
-            })
-            .sum();
-        assert!(staged >= 401, "{staged} headers staged before the prepare");
         // The window opens once the prepare is held and the node has judged
         // every page sent.
         let judged = |seq: u64| {
@@ -921,6 +913,29 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
             })
             .expect("the node wrote on the reopened stream");
         assert_eq!(seq, 0, "the reopened stream's frames count from 0");
+        // Every frame the node wrote on the retired stream, in the whole
+        // run, was read and logged, any after the finish included.
+        let written: Vec<u64> = facts(&entries, connection)
+            .filter_map(|(_, fact)| match fact {
+                TransportFact::FrameWritten {
+                    quic_stream, seq, ..
+                } if *quic_stream == first => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        let read: Vec<u64> = entries
+            .iter()
+            .filter_map(|at| match at.obs {
+                Observation::PeerReceived {
+                    connection: c,
+                    quic_stream,
+                    seq,
+                    ..
+                } if (c, quic_stream) == (connection, first) => Some(seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written, read, "the retired stream's writes were all read");
         assert!(
             !facts(&entries, connection)
                 .any(|(_, fact)| matches!(fact, TransportFact::CloseDecided { .. })),

@@ -10,6 +10,11 @@ use support::{config, inputs};
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{
+        block_node::{
+            control::{ControlAction, ControlStep},
+            policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
+            Policy,
+        },
         block_sync::{
             storage_properties, storage_sources, BlockScenario, MirrorSpec, Ports, Storage,
             OPERATION_IDS,
@@ -175,6 +180,42 @@ fn a_node_with_bodies_submits_only_the_rest() {
 fn a_node_holds_at_most_the_chain() {
     Storage::prepare(&BlockScenario {
         node_bodies: 9,
+        ..BlockScenario::default()
+    });
+}
+
+/// A hold can't wait for block sync to take a reply its handle only queues.
+#[test]
+#[should_panic(expected = "a block scenario can't wait for ReplyTaken")]
+fn a_hold_cant_wait_for_a_taken_handle_reply() {
+    Storage::prepare(&BlockScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(BlockKind::Admit, 2),
+                until: Trigger::ReplyTaken(Select::nth(BlockKind::Apply, 1)),
+                then: vec![BlockAllow::Admit],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..BlockScenario::default()
+    });
+}
+
+/// A control step can't wait for a handled call.
+#[test]
+#[should_panic(expected = "a block scenario can't wait for Handled")]
+fn a_control_step_cant_wait_for_a_handled_call() {
+    Storage::prepare(&BlockScenario {
+        control: vec![ControlStep {
+            action: ControlAction::Close {
+                peer: "mirror-0".to_owned(),
+            },
+            when: Some(Trigger::Count(
+                1,
+                Box::new(Trigger::Handled(Select::nth(BlockKind::Query, 1))),
+            )),
+        }],
         ..BlockScenario::default()
     });
 }

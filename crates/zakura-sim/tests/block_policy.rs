@@ -8,7 +8,7 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{
         block_node::policy::{
-            Block, BlockAllow, BlockKind, Hold, MirrorEvent, Predicates, Select, Trigger,
+            undriven, Block, BlockAllow, BlockKind, Hold, MirrorEvent, Predicates, Select, Trigger,
         },
         policy::{Family, LinkEffect},
     },
@@ -193,6 +193,61 @@ fn an_admission_starts_the_verdict_stage() {
         !holds(&predicates, &count(2, BlockKind::Apply)),
         "each stage counts once, under its own kind"
     );
+}
+
+/// A reply that reached block sync's handle counts as queued, not taken:
+/// only a range read's caller takes its reply.
+#[test]
+fn a_delivered_reply_is_queued_and_a_taken_read_is_taken() {
+    let mut predicates = Predicates::new(Vec::new());
+    predicates.record(&submitted(1, 7));
+    predicates.record(&StorageFact::Admitted { id: 1 });
+    predicates.record(&StorageFact::ReplyDelivered { id: 1 });
+    let apply = Select::nth(BlockKind::Apply, 1);
+    assert!(holds(&predicates, &Trigger::ReplyQueued(apply.clone())));
+    assert!(!holds(&predicates, &Trigger::ReplyTaken(apply)));
+
+    predicates.record(&StorageFact::BlockSubmitted {
+        id: 2,
+        request: StorageRequest::ReadRange {
+            start_height: 1,
+            count: 4,
+            max_body_bytes: 10_000,
+        },
+        stage: Some("pending".to_owned()),
+    });
+    predicates.record(&StorageFact::ReadTaken { id: 2 });
+    let read = Select::nth(BlockKind::Read, 1);
+    assert!(holds(&predicates, &Trigger::ReplyTaken(read.clone())));
+    assert!(!holds(&predicates, &Trigger::ReplyQueued(read)));
+}
+
+/// A block scenario can't wait for a handled call, or for a taken reply
+/// other than a range read's, anywhere in a trigger.
+#[test]
+fn undriven_triggers_are_the_ones_the_block_node_never_records() {
+    let taken = |kind| Trigger::ReplyTaken(Select::nth(kind, 1));
+    let handled = Trigger::Handled(Select::nth(BlockKind::Apply, 1));
+    for trigger in [
+        handled.clone(),
+        taken(BlockKind::Query),
+        taken(BlockKind::Apply),
+        taken(BlockKind::Record),
+        Trigger::ReplyTaken(Select::default()),
+        Trigger::Count(2, Box::new(taken(BlockKind::Admit))),
+        Trigger::All(vec![Trigger::VirtualTime(5), handled]),
+    ] {
+        assert!(undriven(&trigger).is_some(), "{trigger:?}");
+    }
+    for trigger in [
+        taken(BlockKind::Read),
+        taken(BlockKind::MirrorRead),
+        Trigger::ReplyQueued(Select::nth(BlockKind::Apply, 1)),
+        Trigger::Completed(Select::nth(BlockKind::Query, 1)),
+        Trigger::All(vec![Trigger::VirtualTime(5), taken(BlockKind::Read)]),
+    ] {
+        assert_eq!(undriven(&trigger), None, "{trigger:?}");
+    }
 }
 
 /// A reset trigger counts only resets, of the actor it names.

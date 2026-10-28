@@ -167,9 +167,11 @@ impl BlockScenario {
     /// reply that follows frees room without waking the waiting body
     /// (#1523).
     ///
-    /// The teardown ends by step 465,000 on both committed inputs, after
+    /// The teardown ends by step 478,000 on both committed inputs, after
     /// which only the mirror's metrics timer runs, so the run stops at
-    /// 470,000 steps instead of the default budget's 837,000.
+    /// 520,000 steps instead of the default budget's 837,000. #1522's
+    /// decoded-budget reads and view publishes add preemption points, which
+    /// moved the mirror's second close past the earlier 470,000-step budget.
     pub fn capacity_release() -> Self {
         let mirror = "mirror-0";
         let reads = |count: u32| {
@@ -239,7 +241,7 @@ impl BlockScenario {
                     when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 21))),
                 },
             ],
-            steps: Some(470_000),
+            steps: Some(520_000),
             ..BlockScenario::default()
         }
     }

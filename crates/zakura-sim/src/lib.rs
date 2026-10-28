@@ -17,6 +17,7 @@ mod downstream;
 mod draws;
 pub mod end;
 mod evidence;
+pub mod explore;
 pub mod fake;
 pub mod harness;
 pub mod identity;

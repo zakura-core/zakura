@@ -1,0 +1,28 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/reorder.rs b/crates/zakura-network/src/zakura/block_sync/reorder.rs
+index 413059f8b..a84f4c206 100644
+--- a/crates/zakura-network/src/zakura/block_sync/reorder.rs
++++ b/crates/zakura-network/src/zakura/block_sync/reorder.rs
+@@ -334,16 +334,13 @@ impl BufferedBlockBody {
+         decoded_attributed_memory_size_bytes: u64,
+         resident_decoded_bytes: u64,
+     ) -> Self {
+-        if resident_decoded_bytes.saturating_add(decoded_attributed_memory_size_bytes)
+-            <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+-        {
+-            BufferedBlockBody::DecodedWithRawFramePayload {
+-                block,
+-                raw_frame_payload,
+-                decoded_attributed_memory_size_bytes,
+-            }
+-        } else {
+-            BufferedBlockBody::RawFramePayload(raw_frame_payload)
++        // Keep every decoded block, whatever the budget holds, as the routine
++        // did before #1522's fix.
++        let _ = resident_decoded_bytes;
++        BufferedBlockBody::DecodedWithRawFramePayload {
++            block,
++            raw_frame_payload,
++            decoded_attributed_memory_size_bytes,
+         }
+     }
+ 

@@ -1,0 +1,9 @@
+# The committed fuzz input `block-sync-decoded-input-stall.bin`: the harness
+# that runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes, `ff 10`, pick the decoded-input-stall scenario: the
+# sequencer stalls, and the mirror keeps delivering 2 MB bodies after the
+# input queue's decoded bytes fill the decoded-byte cap. Its plan is the
+# stalled-reset input's.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "601fc60f651d775ac102ae8c9a478978c08b042a5be541fa1b84ad0b7f61d174"

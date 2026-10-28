@@ -393,15 +393,15 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("forget-on-reset"),
     },
+    // The decoded-input-stall test is ignored, since its debug run takes
+    // minutes. The `zakura_sim slow witnesses` job runs it, and the planted
+    // case runs the same input.
     Coverage {
         property: crate::domain::block_sync_semantic::INPUT_DECODED_BOUND,
-        passing: passes(
+        passing: Passing::Test(slow_test(
             "tests/block_semantic_properties.rs",
-            "the_stalled_reset_input_holds_input_decoded_bound",
-        ),
-        bypass: Bypass::Test(sim_test(
-            "src/domain/block_sync_semantic.rs",
-            "a_decoded_handoff_past_the_cap_violates_input_decoded_bound",
+            "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),
+        bypass: Bypass::Planted("no-room-check"),
     },
 ];

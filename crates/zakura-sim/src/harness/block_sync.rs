@@ -161,6 +161,9 @@ pub struct BlockScenario {
     /// If set, the run pauses routines in their handoffs to the sequencer.
     #[serde(default)]
     pub handoff_pause: Option<HandoffPause>,
+    /// If set, the run pauses the node's sequencer task.
+    #[serde(default)]
+    pub sequencer_pause: Option<SequencerPause>,
 }
 
 /// Pauses each routine that hands a body to the sequencer, after the send
@@ -177,6 +180,20 @@ pub struct HandoffPause {
     /// The lowest height whose handoff pauses.
     pub from_height: u32,
     /// The most steps the pauses last after the first one began.
+    pub steps: u64,
+}
+
+/// Pauses the node's sequencer task once it records its first ownership
+/// snapshot, as a slow verifier would stall it, so routines' handoffs wait
+/// in its input queue.
+///
+/// The pause ends, for good, `steps` steps after it began. The sequencer
+/// also runs whenever nothing else can, since a [`TaskHold`] never ends a
+/// run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SequencerPause {
+    /// The most steps the pause lasts.
     pub steps: u64,
 }
 
@@ -201,6 +218,7 @@ impl Default for BlockScenario {
             policy: Policy::converging(),
             control: Vec::new(),
             handoff_pause: None,
+            sequencer_pause: None,
         }
     }
 }
@@ -649,6 +667,15 @@ impl Subsystem for Storage {
                 over: Cell::new(false),
             }));
         }
+        if let Some(pause) = scenario.sequencer_pause {
+            sim.hold_tasks(Box::new(PausedSequencer {
+                handoffs: tap.handoffs(),
+                view: view.clone(),
+                steps: pause.steps,
+                first: Cell::new(None),
+                over: Cell::new(false),
+            }));
+        }
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -801,6 +828,39 @@ impl TaskHold for PausedHandoffs {
         }
         if self.first.get().is_none() {
             self.first.set(Some(step));
+        }
+        true
+    }
+}
+
+/// [`SequencerPause`]'s hold: the task that recorded the sequencer's
+/// ownership snapshots.
+struct PausedSequencer {
+    handoffs: TapHandoffs,
+    view: Rc<RefCell<BlockSyncView>>,
+    steps: u64,
+    /// The step after which the pause began.
+    first: Cell<Option<u64>>,
+    /// Set once the pause ends.
+    over: Cell<bool>,
+}
+
+impl TaskHold for PausedSequencer {
+    fn holds(&self, task: TaskId, _at: &At) -> bool {
+        if self.over.get() || self.handoffs.sequencer() != Some(task) {
+            return false;
+        }
+        let step = self.view.borrow().step.unwrap_or(0);
+        let first = match self.first.get() {
+            Some(first) => first,
+            None => {
+                self.first.set(Some(step));
+                step
+            }
+        };
+        if step >= first.saturating_add(self.steps) {
+            self.over.set(true);
+            return false;
         }
         true
     }

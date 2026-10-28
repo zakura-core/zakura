@@ -41,6 +41,12 @@ const STALE_BESIDE_CURRENT_INPUT: &[u8] =
 /// answers, and a reset detaches the first submission.
 const STALLED_RESET_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stalled-reset.bin");
 
+/// The committed input that picks the decoded-input-stall scenario: the
+/// sequencer stalls, and the mirror keeps delivering 2 MB bodies after the
+/// input queue's decoded bytes fill the cap.
+const DECODED_INPUT_STALL_INPUT: &[u8] =
+    include_bytes!("fixtures/block-sync-decoded-input-stall.bin");
+
 /// The committed input that picks the capacity-release scenario, under a
 /// plan where block sync handles the detached commit's tip before its reply.
 const CAPACITY_FRONTIER_FIRST_INPUT: &[u8] =
@@ -120,6 +126,10 @@ fn each_committed_input_draws_its_scenario() {
         ),
         (STALLED_RESET_INPUT, BlockScenario::stalled_reset()),
         (
+            DECODED_INPUT_STALL_INPUT,
+            BlockScenario::decoded_input_stall(),
+        ),
+        (
             CAPACITY_FRONTIER_FIRST_INPUT,
             BlockScenario::capacity_release(),
         ),
@@ -188,11 +198,8 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
 /// Under stalled storage, the mirror's bodies keep entering the
 /// sequencer's input queue. The decoded cap has room for these small
 /// bodies, so each one keeps its decoded block, and the check judges each
-/// handoff against the queue's and `applying`'s decoded bytes. A slow
-/// verifier fills the cap only with blocks far larger than any fixture
-/// chain's, so the routine's raw fallback is witnessed by
-/// `a_handoff_without_room_hands_over_raw_bytes` in zakura-network, and
-/// the check's catch by its scripted bypass.
+/// handoff against the queue's and `applying`'s decoded bytes. The
+/// decoded-input-stall input fills the cap.
 #[test]
 fn the_stalled_reset_input_holds_input_decoded_bound() {
     let ports = witnessed(
@@ -204,6 +211,30 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
     let model = view.semantic.borrow();
     assert!(model.saw_decoded_queued);
     assert!(model.queued_decoded_peak > 0);
+}
+
+/// With the sequencer paused, the input queue's decoded bodies fill the
+/// decoded-byte cap, and the mirror keeps delivering 2 MB bodies. Once the
+/// cap fills, the routine hands over raw bytes, so no decoded handoff takes
+/// the queue's and applying's decoded bytes past the cap by more than one
+/// body per routine. With `no-room-check.patch`, every handoff keeps its
+/// decoded block, as on main, and the same input violates the property at
+/// step 122,041.
+#[test]
+#[ignore = "a debug run takes minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+fn the_decoded_input_stall_input_holds_input_decoded_bound() {
+    let ports = witnessed(
+        committed(DECODED_INPUT_STALL_INPUT),
+        INPUT_DECODED_BOUND,
+        Expect::Holds,
+    );
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    assert!(model.saw_decoded_queued);
+    assert!(
+        model.raw_queued_at_cap > 0,
+        "no raw body entered a full queue"
+    );
 }
 
 /// The capacity-release input whose plan handles the detached commit's tip

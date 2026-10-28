@@ -308,6 +308,13 @@ pub struct SemanticModel {
     pub saw_queued_at_idle: bool,
     /// The most decoded attributed bytes the input queue held at once.
     pub queued_decoded_peak: u64,
+    /// The most a decoded handoff took the queue's and applying's decoded
+    /// bytes past the cap, in attributed bytes.
+    pub handoff_past_cap_peak: u64,
+    /// Bodies that entered the input queue holding raw bytes alone while
+    /// the queue's and applying's decoded bytes had no room for the largest
+    /// decoded body queued so far.
+    pub raw_queued_at_cap: u64,
 }
 
 /// What one step changed, judged once the step is folded.
@@ -590,6 +597,8 @@ impl SemanticModel {
                                     body.height,
                                     *decoded_attributed_memory_bytes,
                                 );
+                            } else if self.decoded_resident_without_room() {
+                                self.raw_queued_at_cap += 1;
                             }
                             self.queued
                                 .insert(*allocation, *decoded_attributed_memory_bytes);
@@ -676,6 +685,15 @@ impl SemanticModel {
             .fold(0, |sum, bytes| sum.saturating_add(*bytes))
     }
 
+    /// Whether the queue's and applying's decoded bytes have no room under
+    /// the cap for the largest decoded body queued so far.
+    fn decoded_resident_without_room(&self) -> bool {
+        self.queued_decoded()
+            .saturating_add(self.applying_decoded)
+            .saturating_add(self.largest_queued_decoded)
+            > BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+    }
+
     /// Judges a body at `height` that entered the input queue holding
     /// `decoded` attributed bytes of its decoded block, for
     /// [`INPUT_DECODED_BOUND`]. Every routine checking the same room at once
@@ -691,6 +709,9 @@ impl SemanticModel {
         let routines = u64::try_from(self.sessions.len()).unwrap_or(u64::MAX);
         let bound = BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
             .saturating_add(routines.saturating_mul(self.largest_queued_decoded));
+        self.handoff_past_cap_peak = self
+            .handoff_past_cap_peak
+            .max(resident.saturating_sub(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES));
         if resident > bound {
             self.input_findings.push(Finding {
                 step: self.step.unwrap_or_default(),
@@ -1106,15 +1127,17 @@ where
     S::View: SemanticView,
 {
     let model = caught_up(cx);
-    let (findings, applicable, peak) = {
+    let (findings, applicable, peak, past_cap) = {
         let mut model = model.borrow_mut();
         (
             std::mem::take(&mut model.input_findings),
             model.saw_decoded_queued,
             model.queued_decoded_peak,
+            model.handoff_past_cap_peak,
         )
     };
     cx.peak("queued-decoded-attributed-bytes", peak);
+    cx.peak("handoff-past-cap-attributed-bytes", past_cap);
     report(cx, findings).unwrap_or(if applicable {
         Verdict::Holds
     } else {

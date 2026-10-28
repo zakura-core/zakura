@@ -11,6 +11,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use zakura_chain::parameters::Network;
@@ -432,16 +433,11 @@ fn regtest_config() -> Config {
 
 /// Builds the node: a header-sync reactor on inert storage behind the real
 /// handler, which advertises header sync alone. Returns its QUIC endpoint,
-/// supervisor, handler and local limits.
+/// handler and local limits.
 fn bind_node(
     net: &SimNet,
     service: Arc<dyn Service>,
-) -> (
-    QuicEndpoint,
-    ZakuraSupervisorHandle,
-    ZakuraProtocolHandler,
-    ZakuraLocalLimits,
-) {
+) -> (QuicEndpoint, ZakuraProtocolHandler, ZakuraLocalLimits) {
     let config = regtest_config();
     let limits = ZakuraLocalLimits::from_config(&config);
     let quic = QuicEndpoint::bind_with(
@@ -455,7 +451,7 @@ fn bind_node(
     let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
     let registry = ServiceRegistry::new(vec![service]).expect("one service registers");
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
-        supervisor.clone(),
+        supervisor,
         config.network.clone(),
         ZakuraHandshakeConfig::for_network(&config.network),
         limits.clone(),
@@ -463,7 +459,7 @@ fn bind_node(
         ZakuraTrace::noop(),
     )
     .with_local_node_id(quic.local_id());
-    (quic, supervisor, handler, limits)
+    (quic, handler, limits)
 }
 
 /// `ZakuraEndpoint::new` and `ZakuraEndpoint::dial` build and run without
@@ -490,8 +486,8 @@ fn endpoint_new_builds_without_the_testkit() {
         let (net, dialed) = (net.clone(), Rc::clone(&dialed));
         sched.spawn_root("node", async move {
             let _actions = actions;
-            let (quic, supervisor, handler, limits) = bind_node(&net, service);
-            let endpoint = ZakuraEndpoint::new(quic, supervisor, handler);
+            let (quic, handler, limits) = bind_node(&net, service);
+            let endpoint = ZakuraEndpoint::new(quic, handler);
             let unreachable =
                 NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
             let result = endpoint.dial(unreachable, &limits).await;
@@ -508,6 +504,50 @@ fn endpoint_new_builds_without_the_testkit() {
     // The transport's handshake timeout comes back as it is, not wrapped as
     // the dial's own deadline.
     assert_eq!(dialed, "Err(QuicConnect(HandshakeTimeout))");
+}
+
+/// `ZakuraEndpoint::shutdown` stops a maintained dial started on an endpoint
+/// from `ZakuraEndpoint::new`, even while it is still retrying.
+#[test]
+fn shutdown_stops_a_maintained_dial() {
+    let plan = Rc::new(RefCell::new(Plan(17)));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    {
+        let plan = Rc::clone(&plan);
+        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+    }
+    let net = SimNet::new(LinkModel::default());
+    let shutdown = CancellationToken::new();
+    let (handle, actions, reactor) =
+        spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+    sched.spawn_root("reactor", async move {
+        reactor.await.expect("the reactor ends on shutdown");
+    });
+    let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(handle));
+    let stopped = Rc::new(RefCell::new(false));
+    {
+        let (net, stopped) = (net.clone(), Rc::clone(&stopped));
+        sched.spawn_root("node", async move {
+            let _actions = actions;
+            let (quic, handler, _limits) = bind_node(&net, service);
+            let endpoint = ZakuraEndpoint::new(quic, handler);
+            let unreachable =
+                NodeAddr::with_addrs(SeededInputs::node_key(SEED, 1).public(), [peer_addr()]);
+            let dial = endpoint.spawn_native_dial(unreachable);
+            // Long enough for at least one failed attempt and a backoff.
+            zakura_rt::time::sleep(Duration::from_secs(60)).await;
+            assert!(!dial.is_finished(), "the dial is still retrying");
+            endpoint.shutdown().await;
+            dial.await.expect("the dial task ends without panicking");
+            *stopped.borrow_mut() = true;
+        });
+    }
+    let mut steps = Vec::new();
+    run_to_end(&mut sched, &plan, &mut steps);
+    shutdown.cancel();
+    run_to_end(&mut sched, &plan, &mut steps);
+    let _ = sched.shutdown();
+    assert!(*stopped.borrow(), "the maintained dial ended at shutdown");
 }
 
 /// Every version 9 message builds from public fields, encodes, decodes to

@@ -985,24 +985,27 @@ impl ZakuraEndpoint {
         self.quic.shutdown().await;
     }
 
-    /// An endpoint over a bound `quic` endpoint, its `supervisor`, and the
-    /// `handler` that serves its connections, with no sync services or
-    /// background tasks attached.
+    /// An endpoint over a bound `quic` endpoint and the `handler` that serves
+    /// its connections, with no sync services attached.
+    ///
+    /// It uses the handler's supervisor, so registration and the endpoint's
+    /// peer view can't diverge. It owns a background shutdown token, so
+    /// [`Self::shutdown`] also stops dials started with
+    /// [`Self::spawn_native_dial`].
     ///
     /// It doesn't serve inbound connections itself. Pass `handler` to
     /// `quic.serve` for those, and dial with [`Self::dial`].
-    pub fn new(
-        quic: QuicEndpoint,
-        supervisor: ZakuraSupervisorHandle,
-        handler: ZakuraProtocolHandler,
-    ) -> Self {
+    pub fn new(quic: QuicEndpoint, handler: ZakuraProtocolHandler) -> Self {
         Self {
             quic,
-            supervisor,
+            supervisor: handler.supervisor.clone(),
             handler,
             header_sync: None,
             block_sync: None,
-            header_sync_tasks: None,
+            header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
+                shutdown: CancellationToken::new(),
+                tasks: AsyncMutex::new(Vec::new()),
+            })),
             header_sync_fatal_events: None,
             #[cfg(any(test, feature = "zakura-testkit"))]
             header_sync_actions: None,
@@ -1031,7 +1034,12 @@ impl ZakuraEndpoint {
         supervisor: ZakuraSupervisorHandle,
         handler: ZakuraProtocolHandler,
     ) -> Self {
-        Self::new(quic, supervisor, handler)
+        // Test nodes keep their own supervisor and no background-task owner.
+        Self {
+            supervisor,
+            header_sync_tasks: None,
+            ..Self::new(quic, handler)
+        }
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]

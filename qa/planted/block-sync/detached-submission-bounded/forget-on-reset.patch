@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
-index 222e40c12..8d1d066a1 100644
+index c71ad5743..40bf0ad3b 100644
 --- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
-@@ -1116,15 +1116,11 @@ impl Sequencer {
+@@ -1180,15 +1180,11 @@ impl Sequencer {
  
      fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
          let released = self.applying.values().map(|applying| applying.bytes).sum();
@@ -21,4 +21,4 @@ index 222e40c12..8d1d066a1 100644
 +            self.in_flight_submissions.remove(&applying.token);
          }
          if !keep_submitted_applies {
-             self.submitted_applies.clear();
+             self.clear_submitted_applies_from(block::Height::MIN);

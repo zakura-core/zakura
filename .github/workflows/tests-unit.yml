@@ -17,6 +17,8 @@ on:
       - "**/Cargo.lock"
       # Include non-Rust inputs compiled or exercised by workspace crates.
       - crates/**
+      # Planted bypass patches and their case files, which sim-build applies.
+      - qa/planted/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
@@ -187,11 +189,12 @@ jobs:
           done <<< "$changed"
 
           # Broad test-relevant filter (the paths that formerly gated the whole
-          # workflow on pull_request). Every config-relevant change also needs
-          # the build archive consumed by zakura-config, so `config` implies
-          # `rust` even for paths outside the old workflow-level filter.
+          # workflow on pull_request, plus qa/planted/, whose patches sim-build
+          # applies). Every config-relevant change also needs the build archive
+          # consumed by zakura-config, so `config` implies `rust` even for paths
+          # outside the old workflow-level filter.
           if [[ "$config" == "true" ]] || \
-             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+             grep -qE '(^crates/|^qa/planted/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
             rust=true
           else
             rust=false
@@ -494,6 +497,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
+          # A pull request's checkout is its merge commit. Its first parent,
+          # the base branch, tells the planted runner what the PR changed.
+          fetch-depth: 2
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
@@ -515,13 +521,18 @@ jobs:
           RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
         env:
           RUSTFLAGS: --cfg zakura_sim
-      # S4.7: the discovery regression must still find the bug it guards.
-      # The patch reverts the wait_complete fix in this disposable checkout,
-      # so this step runs last. A patch that no longer applies fails here.
-      - name: Check the discovery regression against the reverted fix
+      # Each retained bypass patch under qa/planted/ must still make its
+      # property fail. The runner applies each patch in its own scratch
+      # worktree under target/planted/, so the checkout stays clean. A pull
+      # request runs only the cases its changes affect; main and the merge
+      # queue run every case.
+      - name: Check the planted bypass patches
         run: |
-          git apply crates/zakura-sim/tests/fixtures/discovery-wait-complete-revert.patch
-          cargo test --locked -p zakura-sim --test discovery -- --ignored --exact reverted_fix_misses_the_wakeup
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            cargo xtask planted --changed-since HEAD^1
+          else
+            cargo xtask planted
+          fi
         env:
           RUSTFLAGS: --cfg zakura_sim
 

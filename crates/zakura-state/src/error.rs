@@ -64,6 +64,18 @@ pub enum AwaitBlockInfoError {
     },
 }
 
+/// The block that a block header read identifies is not in the best chain.
+///
+/// The read handler returns this error when the hash or the height does not identify a block in
+/// the best chain. RPC methods use this type to tell a missing block from a failure of the state
+/// service.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("block hash or height not found")]
+pub struct BlockHeaderNotFound {
+    /// The block that the request identifies.
+    pub hash_or_height: HashOrHeight,
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]

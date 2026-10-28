@@ -311,8 +311,9 @@ fn history(report: &RunReport) -> Vec<String> {
 
 /// Each cheap scenario's history depends only on its scenario and plan:
 /// plan A twice gives one history, and so does A, then B, then A. B's
-/// differs, so the comparison can fail. Every run pairs each operation and
-/// violates nothing.
+/// differs, so the comparison can fail. Every run pairs each operation,
+/// matches each sequencer snapshot with the holder events, and violates
+/// nothing.
 #[test]
 fn the_semantic_scenarios_repeat_a_a_and_a_b_a() {
     let plans = inputs(2, 256);
@@ -339,6 +340,8 @@ fn the_semantic_scenarios_repeat_a_a_and_a_b_a() {
                 );
                 let view = ports.view.borrow();
                 assert!(view.pairing.is_empty(), "{name}: {:?}", view.pairing);
+                assert!(view.anomalies.is_empty(), "{name}: {:?}", view.anomalies);
+                assert_eq!(view.owners.holder_gap(), None, "{name}");
                 history(&report)
             })
             .collect();

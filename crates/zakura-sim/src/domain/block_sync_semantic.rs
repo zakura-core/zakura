@@ -301,10 +301,11 @@ struct StepChanges {
     released: Vec<(BlockSyncHolder, usize, bool)>,
     /// Tokens the sequencer detached.
     detached: BTreeSet<u64>,
-    /// The step's first release that freed room beside an eligible body,
-    /// as [`SemanticModel::note_room`] judged it then: the release's
-    /// position, the body's height and [`RoomFreed::past_frontier`].
-    room: Option<(usize, u32, bool)>,
+    /// Releases that freed room beside an eligible body, as
+    /// [`SemanticModel::note_room`] judged each then: the released token,
+    /// the release's position, the body's height and
+    /// [`RoomFreed::past_frontier`].
+    rooms: Vec<(u64, usize, u32, bool)>,
     /// Tokens whose last holder the step released. The model keeps their
     /// submissions and stale completions until [`STALE_COMPLETION_INERT`]
     /// judges the step's releases.
@@ -611,7 +612,7 @@ impl SemanticModel {
                             if *counts == (0, 0) {
                                 self.pending.emptied.insert(*token);
                             }
-                            self.note_room(held_before, at, past_frontier);
+                            self.note_room(*token, held_before, at, past_frontier);
                         } else if *counts == (0, 0) && !self.pending.emptied.contains(token) {
                             self.submissions.remove(token);
                         }
@@ -788,25 +789,26 @@ impl SemanticModel {
     /// admits the next body, so only the count limit held it back. The
     /// release is judged before the rest of its step, since a sequencer
     /// that wakes the body submits it in the same step.
-    fn note_room(&mut self, held_before: u64, at: usize, past_frontier: bool) {
+    fn note_room(&mut self, token: u64, held_before: u64, at: usize, past_frontier: bool) {
         let limit = self.limit();
-        if self.pending.room.is_some()
-            || self.closed
-            || held_before < limit
-            || self.in_flight() >= limit
-            || self.attached() > 0
-        {
+        if self.closed || held_before < limit || self.in_flight() >= limit || self.attached() > 0 {
             return;
         }
         if let Some(height) = self.eligible() {
-            self.pending.room = Some((at, height, past_frontier));
+            self.pending.rooms.push((token, at, height, past_frontier));
         }
     }
 
-    /// Records `step`'s [`CAPACITY_RELEASE_WAKES`] trigger, if
-    /// [`SemanticModel::note_room`] found one.
+    /// Records `step`'s [`CAPACITY_RELEASE_WAKES`] trigger: the first room
+    /// [`SemanticModel::note_room`] found whose token the step didn't
+    /// detach. A submission the sequencer detaches in the same step moves
+    /// to another holder and frees no room.
     fn judge_room(&mut self, step: u64, changes: &StepChanges) {
-        if let Some((at, height, past_frontier)) = changes.room {
+        let room = changes
+            .rooms
+            .iter()
+            .find(|(token, ..)| !changes.detached.contains(token));
+        if let Some(&(_, at, height, past_frontier)) = room {
             self.saw_room_freed = true;
             self.saw_room_freed_past_frontier |= past_frontier;
             self.rooms.push(RoomFreed {

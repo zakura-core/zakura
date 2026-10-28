@@ -43,6 +43,9 @@ struct Steering<'r> {
     rule: &'r Rule<'r>,
     /// The first refused step and the rule's answer.
     refused: Option<(u64, Result<String, String>)>,
+    /// A step loop violation found at the refused step, which the run's
+    /// end then doesn't name.
+    also: Option<Violation>,
 }
 
 impl Checker for Steering<'_> {
@@ -80,6 +83,12 @@ impl Checker for Steering<'_> {
     /// Nothing.
     fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
         Vec::new()
+    }
+
+    /// Keeps the step loop's violation, so a real failure at the refused
+    /// step isn't steered away.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        self.also.get_or_insert_with(|| violation.clone());
     }
 }
 
@@ -124,7 +133,10 @@ const ROUNDS: usize = 256;
 /// # Panics
 ///
 /// If the rule can't be kept at some step, wants a pick that isn't
-/// enabled, or needs more than [`ROUNDS`] changes.
+/// enabled, or needs more than [`ROUNDS`] changes, or if a run failed at
+/// the step the rule refused: a harness failure, another checker's
+/// violation, or the step loop's. A changed pick could hide that
+/// failure, so it's never retried.
 pub fn steer(
     plan: PlanInput,
     rule: &Rule<'_>,
@@ -135,11 +147,24 @@ pub fn steer(
         let mut steering = Steering {
             rule,
             refused: None,
+            also: None,
         };
         let (report, lines) = run(plan.clone(), &mut steering);
         let Some((step, wanted)) = steering.refused else {
             return (report, plan, round);
         };
+        let other = report
+            .end
+            .violation
+            .as_ref()
+            .filter(|violation| violation.property != STEERED);
+        if report.end.harness.is_some() || other.is_some() || steering.also.is_some() {
+            panic!(
+                "the run failed at step {step}, where steering would change its pick: {:?}, \
+                 step loop {:?}",
+                report.end, steering.also
+            );
+        }
         let want = wanted.unwrap_or_else(|why| panic!("the rule can't be kept: {why}"));
         let mut choices = choices_before(&lines, step);
         choices.push(PlanChoice::Pick(want));

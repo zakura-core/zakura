@@ -9,8 +9,8 @@
 //! runs it on `drive_block_sync_actions` and checks that both runs see the
 //! same events. A case with no verdict runs there over a real ephemeral
 //! zakura-state holding the case's headers. A case with verdicts commits
-//! fixture bodies, which zakura-state's contextual checks reject, so it runs
-//! over state fakes on the case's engine. zakurad's
+//! fixture bodies, whose v1 coinbase and missing chain history commitment
+//! zakura-state refuses, so it runs over state fakes on the case's engine. zakurad's
 //! `block_sync_driver/committed_state.rs` covers what those fakes share with
 //! the service: it commits [`BlockFixture::committable`] blocks to real
 //! zakura-state and to the service, and compares fork selection, queries,
@@ -45,7 +45,7 @@
 //! | A misbehavior report waits for the supervisor | The simulator doesn't run the supervisor |
 //! | A checkpoint verifier error | The verifier fake answers as the full verifier does, so checkpoint-class bodies get only full-verifier verdicts |
 //! | The verifier returning another block's hash | The fake returns the submitted hash. The driver reports another hash as a `VerifierUnavailable` retry, the same event as [`Verdict::Retryable`] with that kind |
-//! | zakura-state's own `MissingBlockBodyMetadata` read and record writes, in a case with verdicts | The verdict-free cases run both on a real zakura-state. A case with verdicts would need the fixture bodies committed there, and fixture bodies never pass zakura-state's contextual checks, so the fakes answer from the engine port's ports of them. `committed_state.rs` compares the reads after real commits |
+//! | zakura-state's own `MissingBlockBodyMetadata` read and record writes, in a case with verdicts | The verdict-free cases run both on a real zakura-state. A case with verdicts would need the fixture bodies committed there, and zakura-state refuses their v1 coinbase and missing chain history commitment, so the fakes answer from the engine port's ports of them. `committed_state.rs` compares the reads after real commits |
 //!
 //! A moved anchor fails a query in the driver when its chunks read
 //! different states. The controlled service reads every chunk from one

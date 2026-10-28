@@ -14,8 +14,8 @@ use std::{collections::VecDeque, fmt};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    record::DrawRecord,
-    trace::{shrink::Candidate, Invalid, Trace},
+    record::{DrawRecord, StepRecord},
+    trace::{Invalid, Trace},
     Category, Identity,
 };
 
@@ -102,6 +102,17 @@ pub enum PlanInput {
     /// A shrink candidate's picks and draws, which the run follows where it
     /// can and skips where it can't (traces.md, Trace shrinking).
     Skip(SkipScript),
+}
+
+/// One step of a shrink candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Candidate {
+    /// A recorded step. The run takes its pick if `by` is `bytes` and the
+    /// pick is enabled, and the round-robin pick otherwise. Its draws answer
+    /// the step's draws where they match ([`SkipScript`]).
+    Recorded(StepRecord),
+    /// The round-robin pick, with default draws.
+    Default,
 }
 
 /// A shrink candidate as a run's input: the `init` draws, then one

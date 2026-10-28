@@ -390,13 +390,13 @@ mod cli {
             report.original, report.property, report.accepted, report.candidates
         );
         println!(
-            "before: {} non-default picks, {} events",
+            "before: {} non-default picks and draws, {} events",
             report.before.non_default, report.before.events
         );
         match (&report.reduced, report.after, &report.rerecord_failure) {
             (Some(reduced), Some(after), _) => {
                 println!(
-                    "after: {} non-default picks, {} events, in trace {reduced}",
+                    "after: {} non-default picks and draws, {} events, in trace {reduced}",
                     after.non_default, after.events
                 );
                 println!("report in {}", out.join(REPORT_FILE).display());

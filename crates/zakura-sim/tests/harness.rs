@@ -12,7 +12,7 @@ use zakura_sim::{
     check::{self, StepCtx, Violation},
     harness::{
         self,
-        coverage::{Witness, COVERAGE},
+        coverage::{Bypass, Witness, COVERAGE},
         run_harness, HarnessEntry, HarnessError, Subsystem, HARNESSES, NO_TASK_PANIC,
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Status},
@@ -466,7 +466,23 @@ fn every_coverage_witness_exists_and_ci_runs_it() {
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
     for row in COVERAGE {
-        for witness in [row.passing, row.bypass] {
+        let witnesses = match row.bypass {
+            Bypass::Test(bypass) => vec![row.passing, bypass],
+            Bypass::Planted(name) => {
+                let patch = crate_dir
+                    .join("../../qa/planted")
+                    .join(row.property)
+                    .join(format!("{name}.patch"));
+                assert!(patch.is_file(), "{}: no {}", row.property, patch.display());
+                assert!(
+                    workflow.contains("cargo xtask planted"),
+                    "{}: CI never runs `cargo xtask planted`",
+                    row.property
+                );
+                vec![row.passing]
+            }
+        };
+        for witness in witnesses {
             let source = std::fs::read_to_string(crate_dir.join(witness.file))
                 .unwrap_or_else(|error| panic!("{}: {}: {error}", row.property, witness.file));
             if let Err(error) = witness_runs(&source, &workflow, witness) {

@@ -224,7 +224,7 @@ fn the_contract_pins_its_production_rows() {
     full.extend(
         mismatches()
             .into_iter()
-            .map(|outcome| (outcome, Gate::NotCommitted)),
+            .map(|outcome| (outcome, Gate::ParentCommitted)),
     );
     full.extend([
         (verdict(Verdict::ConsensusInvalid), Gate::NewAtAdmission),
@@ -350,8 +350,15 @@ fn a_submission_has_the_outcomes_its_situation_allows() {
         verdict(Verdict::Ambiguous),
     ]);
     assert_eq!(admitted(ApplyClass::Full, fresh), expected);
-    // Without its parent it can't commit.
-    let orphan: Vec<_> = expected[1..expected.len() - 1].to_vec();
+    // Without its parent it can't commit, and state can't check its
+    // commitments. A failed ancestor can still fail it with `Storage`.
+    let orphan = vec![
+        verdict(Verdict::ConsensusInvalid),
+        retry(RetryKind::MissingContext),
+        retry(RetryKind::Canceled),
+        retry(RetryKind::Storage),
+        retry(RetryKind::VerifierUnavailable),
+    ];
     assert_eq!(admitted(ApplyClass::Full, Conditions::default()), orphan);
     // Once another submission commits it after admission, only the
     // duplicate and the verifier's failures remain.

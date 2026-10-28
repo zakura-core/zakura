@@ -101,10 +101,21 @@
 //!   duplicate (`KnownBlock` in zakura-consensus's block verifier), and
 //!   state refuses a hash it has already sent to the writer
 //!   (`non_finalized_block_write_sent_hashes`). The older submission's own
-//!   verdict may still fail.
-//! * State decides `payload_mismatch` and a `Storage` retry after it checks
-//!   for a duplicate, so they need the hash not to be committed
-//!   ([`Gate::NotCommitted`]).
+//!   verdict may still fail. The two are either/or: state replaces a
+//!   queued older copy or refuses the newer one
+//!   (`queue_and_commit_to_non_finalized_state`), so a newer copy that
+//!   reports a duplicate replaced nothing, and the older copy must reach a
+//!   verdict of its own.
+//! * State checks a body's header commitments against its parent's trees,
+//!   after it checks for a duplicate, so `payload_mismatch` waits for the
+//!   parent too ([`Gate::ParentCommitted`]). Full state checks them once
+//!   `QueuedBlocks` releases the body, and finalized state once the body's
+//!   parent is its tip.
+//! * State decides a `Storage` retry after it checks for a duplicate, so it
+//!   needs the hash not to be committed ([`Gate::NotCommitted`]). It doesn't
+//!   wait for the parent: when a body fails without proving itself invalid,
+//!   full state fails its queued and later descendants with a header-chain
+//!   error (`failed_ancestor_error` in zakura-state).
 //! * Both verifiers check for a committed hash before any consensus rule.
 //!   The full verifier asks state for the hash first and reports a
 //!   committed one as a duplicate (`KnownBlock` in zakura-consensus's block
@@ -539,7 +550,8 @@ pub struct Conditions {
     pub committed: bool,
     /// The body's hash was committed when the run admitted it.
     pub committed_at_admission: bool,
-    /// A later admission of the same hash replaced this one.
+    /// A later admission of the same hash replaced this one and didn't
+    /// report a duplicate itself.
     pub replaced: bool,
     /// An older admission of the same hash is in flight.
     pub older_in_flight: bool,
@@ -568,7 +580,7 @@ pub enum OutcomeFamily {
     /// One outcome.
     One(BlockOutcome, Gate),
     /// `Verdict(PayloadMismatch(commitment))` for each [`Commitment`], with
-    /// [`Gate::NotCommitted`].
+    /// [`Gate::ParentCommitted`].
     PayloadMismatch,
     /// `Verdict(Retryable(kind))` for each of the class's kinds, with
     /// [`RetryKind::gate`].
@@ -768,7 +780,7 @@ impl BlockOp {
                     .map(|commitment| {
                         (
                             BlockOutcome::Verdict(Verdict::PayloadMismatch(*commitment)),
-                            Gate::NotCommitted,
+                            Gate::ParentCommitted,
                         )
                     })
                     .collect(),

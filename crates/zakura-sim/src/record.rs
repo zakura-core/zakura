@@ -683,8 +683,8 @@ mod tests {
         );
     }
 
-    /// Pins the datagram observations, one of each outcome, from the format
-    /// version that added them on.
+    /// Pins the datagram observations, one of each outcome, and the format
+    /// version.
     #[test]
     fn datagram_observation_encoding_is_pinned() {
         use crate::observe::DatagramOutcome;
@@ -704,7 +704,7 @@ mod tests {
         ];
         let bump = "a datagram observation's encoding changed, which changes `obs` digests, \
              so bump FORMAT_VERSION and update this test";
-        assert!(FORMAT_VERSION >= 4, "{bump}");
+        assert_eq!(FORMAT_VERSION, 5, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
             r#"[{"obs":"datagram","id":0,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"sent","sent_at":5000000},{"obs":"datagram","id":0,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"delivered","sent_at":5000000},{"obs":"datagram","id":1,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"lost","sent_at":5000000},{"obs":"datagram","id":2,"link":"10.0.0.2:4000->10.0.0.1:4000","len":1200,"outcome":"unbound","sent_at":5000000}]"#,

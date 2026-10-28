@@ -4,7 +4,7 @@
 //!
 //! A case with no verdict runs the driver over a real ephemeral zakura-state
 //! holding the case's headers. Its state reads and records go to that
-//! state. A case with verdicts runs the driver over fakes that share one
+//! state, and an error from a record is its refusal. A case with verdicts runs the driver over fakes that share one
 //! zakura-storage engine. State reads answer from the engine's full state,
 //! and records go to the engine. In both, the verifier waits for each case's
 //! verdict, committing the body to the engine, in the order the verifier
@@ -12,7 +12,8 @@
 //! real verifier returns, wrapped by its router, so
 //! `block_verify_error_class` classifies it.
 //! `zakura_storage::block::cases` lists the driver behavior the cases leave
-//! out.
+//! out. The engine fakes share the service's commits, fork choice and
+//! queries, so `committed_state.rs` checks those against real zakura-state.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -332,7 +333,8 @@ fn state_reads(
     }))
 }
 
-/// State writes: invalid-body records, to zakura-state.
+/// State writes: block sync's records, to zakura-state. Each answer is a
+/// record attempt's result, and an error is a refusal.
 fn state_writes(
     state: &ProductionState,
     shared: Arc<Shared>,
@@ -342,12 +344,29 @@ fn state_writes(
         let writer = writer.clone();
         let shared = shared.clone();
         async move {
-            let zakura_state::Request::RecordHeaderChainBodyInvalid { .. } = request else {
-                panic!("unexpected write request: {request:?}");
+            assert!(
+                matches!(
+                    request,
+                    zakura_state::Request::RecordHeaderChainBodyInvalid { .. }
+                        | zakura_state::Request::RecordHeaderChainBodyUnavailable { .. }
+                        | zakura_state::Request::RestartHeaderChainBodyAvailability { .. }
+                        | zakura_state::Request::RetryHeaderChainBodyAvailability { .. }
+                ),
+                "unexpected write request: {request:?}"
+            );
+            let response = match counted(&shared, writer.oneshot(request)).await {
+                Ok(response) => response,
+                Err(error) => {
+                    lock(&shared.records).push(RecordResult::Refused);
+                    return Err(error);
+                }
             };
-            let response = counted(&shared, writer.oneshot(request)).await?;
-            let zakura_state::Response::HeaderChainBodyInvalidRecorded(result) = &response else {
-                panic!("unexpected write response: {response:?}");
+            let result = match &response {
+                zakura_state::Response::HeaderChainBodyInvalidRecorded(result)
+                | zakura_state::Response::HeaderChainBodyUnavailableRecorded(result)
+                | zakura_state::Response::HeaderChainBodyAvailabilityRestarted(result)
+                | zakura_state::Response::HeaderChainBodyAvailabilityRetried(result) => result,
+                response => panic!("unexpected write response: {response:?}"),
             };
             lock(&shared.records).push(RecordResult::of(result));
             Ok(response)
@@ -367,7 +386,7 @@ fn writer(
         let authority = authority.clone();
         async move {
             let zakura_state::Request::RecordHeaderChainBodyInvalid { prepared } = request else {
-                panic!("unexpected write request: {request:?}");
+                panic!("a case with verdicts records only invalid bodies: {request:?}");
             };
             // The sealed request hides its fields, so find the record and
             // version that seal to it.

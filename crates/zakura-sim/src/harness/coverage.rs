@@ -308,7 +308,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::RESERVED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "the_short_budget_input_holds_reserved_byte_bound",
+            "the_paused_handoffs_input_holds_reserved_byte_bound",
         ),
         bypass: Bypass::Planted("above-floor-charge"),
     },
@@ -319,5 +319,24 @@ pub static COVERAGE: &[Coverage] = &[
             "the_handoff_input_holds_budget_ledgers_agree",
         ),
         bypass: Bypass::Planted("handoff-keeps-charge"),
+    },
+    // The above-window witness test is ignored, since one debug run takes
+    // about 100 s. `cargo xtask planted` runs its committed input unpatched
+    // as a witness test that expects a hold, before it runs the patch.
+    Coverage {
+        property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
+        ),
+        bypass: Bypass::Planted("omit-outstanding-estimates"),
+    },
+    Coverage {
+        property: crate::domain::block_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "block_sync_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("skip-return-on-drop"),
     },
 ];

@@ -20,11 +20,15 @@
 //! effects beside the labels, so the harness checks stream 6's generated
 //! receiver, downstream and sender properties.
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{block_sync_serving_limit, block_sync_streams, ZakuraBlockSyncConfig};
-use zakura_scheduler::SchedulerConfig;
+use zakura_scheduler::{At, SchedulerConfig, TaskId};
 use zakura_storage::{
     block::{
         controlled::ControlledBlockService,
@@ -35,11 +39,11 @@ use zakura_storage::{
 
 use super::{
     block_node::{
-        control::{Control, ControlAction, ControlStep},
+        control::{Control, ControlAction, ControlStep, Fork},
         default_limits, policy, preload,
         probe::ProbeLog,
         relay::Wire,
-        tap::BlockTap,
+        tap::{BlockTap, TapHandoffs},
         view::BlockSyncView,
         BlockNode, Effects, LateHandle, LiveChain, MirrorReadSource, MirrorReads, MirrorStorage,
         NodeStorage, Policy, PolicySource, Topology,
@@ -54,7 +58,7 @@ use crate::{
     },
     storage::BLOCK_SERVICE,
     table::{downstream_properties, sender_properties, table_properties, Effect},
-    RunConfig, Sim,
+    RunConfig, Sim, TaskHold,
 };
 
 /// The node's block operations get rising IDs, each completes at most once,
@@ -128,6 +132,11 @@ pub struct BlockScenario {
     /// maximum-size bodies.
     #[serde(default)]
     pub max_reorder_lookahead_bytes: Option<u64>,
+    /// The most block applies the node keeps submitted, which sets the
+    /// sequencer's input queue depth `Q`
+    /// (`max_submitted_block_applies`). `None` keeps production's.
+    #[serde(default)]
+    pub max_submitted_block_applies: Option<usize>,
     /// The response byte target the node advertises
     /// (`max_response_bytes`), which sets the smallest budget its config
     /// may have. `None` keeps production's.
@@ -137,12 +146,35 @@ pub struct BlockScenario {
     /// idle on timers.
     #[serde(default)]
     pub steps: Option<u64>,
+    /// The runtime's workers, `W`. `None` runs 2.
+    #[serde(default)]
+    pub workers: Option<u16>,
     /// How the run completes the node's block operations and the mirrors'
     /// range reads.
     pub policy: Policy,
     /// Scripted harness actions, offered in order.
     #[serde(default)]
     pub control: Vec<ControlStep>,
+    /// If set, the run pauses routines in their handoffs to the sequencer.
+    #[serde(default)]
+    pub handoff_pause: Option<HandoffPause>,
+}
+
+/// Pauses each routine that hands a body to the sequencer, after the send
+/// and before its budget release, so the sequencer can drain the body and
+/// move the download floor while the budget still counts it (D2's `h`).
+///
+/// The pauses end, for good, once the byte budget counts more than
+/// `M + 2·k·B`, or `steps` steps after the first one began. A paused
+/// routine also runs whenever nothing else can, since a [`TaskHold`] never
+/// ends a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffPause {
+    /// The lowest height whose handoff pauses.
+    pub from_height: u32,
+    /// The most steps the pauses last after the first one began.
+    pub steps: u64,
 }
 
 impl Default for BlockScenario {
@@ -159,10 +191,13 @@ impl Default for BlockScenario {
             serving_limit: None,
             max_inflight_block_bytes: None,
             max_reorder_lookahead_bytes: None,
+            max_submitted_block_applies: None,
             max_response_bytes: None,
             steps: None,
+            workers: None,
             policy: Policy::converging(),
             control: Vec::new(),
+            handoff_pause: None,
         }
     }
 }
@@ -213,6 +248,154 @@ impl BlockScenario {
         }
     }
 
+    /// The short budget on 4 workers, with each routine paused in its
+    /// handoff from height 5, by which point each mirror has delivered a
+    /// body. A paused routine's body moves the download floor while the
+    /// budget still counts it, so the next routine's floor request charges
+    /// past `M`. Every estimate is `B` and `M = 1.5·B`, so the budget passes
+    /// `M + 2·B` once three routines are paused and the fourth charges. Each
+    /// paused routine keeps its worker, so the run needs more than 2.
+    pub fn paused_handoffs() -> Self {
+        BlockScenario {
+            workers: Some(4),
+            handoff_pause: Some(HandoffPause {
+                from_height: 5,
+                steps: 20_000,
+            }),
+            ..BlockScenario::short_budget()
+        }
+    }
+
+    /// 420 bodies of unknown size from four mirrors that each withhold
+    /// height 3 and every height above 403, so nothing commits past height
+    /// 2 and every above-window request stays outstanding. The byte budget
+    /// `M` is `10·B` and the look-ahead limit `L` is `2.5·B`, more than the
+    /// 400 bodies the commit window retains. Once the window's heights
+    /// arrive, the node requests heights above it until its estimates spend
+    /// `L`.
+    pub fn above_window() -> Self {
+        BlockScenario {
+            blocks: 420,
+            size_hint: Some(0),
+            mirrors: [Dialer::Mirror, Dialer::Node, Dialer::Mirror, Dialer::Node]
+                .into_iter()
+                .map(|dialer| MirrorSpec {
+                    dialer,
+                    withheld: [3].into_iter().chain(404..=420).collect(),
+                })
+                .collect(),
+            max_inflight_block_bytes: Some(20_000_000),
+            max_reorder_lookahead_bytes: Some(5_000_000),
+            max_response_bytes: Some(2_000_000),
+            steps: Some(300_000),
+            ..BlockScenario::default()
+        }
+    }
+
+    /// The paused handoffs on 24 bodies, with the floor's other churn
+    /// (properties.md, P5.3): `mirror-0` never serves a read from height 7,
+    /// so a request for it times out; `mirror-3`'s link closes once the node
+    /// has asked storage to admit ten bodies, which retires its routine; and
+    /// the chain resets to a fork from height 12 once it has asked for
+    /// fourteen.
+    pub fn floor_churn() -> Self {
+        let after = |submissions| {
+            Some(policy::Trigger::Count(
+                submissions,
+                Box::new(policy::Trigger::Submitted(policy::Select {
+                    kind: Some(policy::BlockKind::Admit),
+                    ..policy::Select::default()
+                })),
+            ))
+        };
+        let mut scenario = BlockScenario {
+            blocks: 24,
+            control: vec![
+                ControlStep {
+                    action: ControlAction::Close {
+                        peer: "mirror-3".to_owned(),
+                    },
+                    when: after(10),
+                },
+                ControlStep {
+                    action: ControlAction::Reset {
+                        fork: Fork {
+                            branch: 1,
+                            at: 12,
+                            len: 16,
+                        },
+                        node_first: false,
+                    },
+                    when: after(14),
+                },
+            ],
+            ..BlockScenario::paused_handoffs()
+        };
+        scenario.mirrors[0].withheld = vec![7];
+        scenario
+    }
+
+    /// Two mirrors serve sixteen bodies but withhold every height from 9, and
+    /// both links close once the node has asked storage to admit eight
+    /// bodies. Every routine ends owing requests it must return, and then
+    /// every peer has left.
+    pub fn peers_leave() -> Self {
+        let after_eight = Some(policy::Trigger::Count(
+            8,
+            Box::new(policy::Trigger::Submitted(policy::Select {
+                kind: Some(policy::BlockKind::Admit),
+                ..policy::Select::default()
+            })),
+        ));
+        BlockScenario {
+            blocks: 16,
+            mirrors: [Dialer::Mirror, Dialer::Node]
+                .into_iter()
+                .map(|dialer| MirrorSpec {
+                    dialer,
+                    withheld: (9..=16).collect(),
+                })
+                .collect(),
+            control: ["mirror-0", "mirror-1"]
+                .into_iter()
+                .map(|peer| ControlStep {
+                    action: ControlAction::Close {
+                        peer: peer.to_owned(),
+                    },
+                    when: after_eight.clone(),
+                })
+                .collect(),
+            ..BlockScenario::default()
+        }
+    }
+
+    /// [`above_window`](Self::above_window), but every header advertises
+    /// 1,024 bytes, the smallest estimate, for its 2,000-byte body, and the
+    /// mirrors withhold only height 3, so above-window bodies arrive larger
+    /// than their requests' estimates while the sequencer can't commit
+    /// (properties.md, P5.4). Admission counts every retained body against
+    /// the look-ahead limit `L`, the commit window's too, so with `L` at
+    /// 1,000,000 bytes the 400 window bodies leave room for about 100
+    /// above-window heights. Each peer serves at most `outstanding` requests
+    /// at once, and the input queue holds `queue` bodies, at least 401. With
+    /// one request at a time, the above-window bodies arrive within 600,000
+    /// steps.
+    pub fn understated_hints(outstanding: u32, queue: usize) -> Self {
+        let mut scenario = BlockScenario {
+            blocks: 520,
+            size_hint: Some(1_024),
+            serving_limit: Some(outstanding),
+            max_reorder_lookahead_bytes: Some(1_000_000),
+            max_submitted_block_applies: Some(queue),
+            steps: Some(600_000),
+            ..BlockScenario::above_window()
+        };
+        for mirror in &mut scenario.mirrors {
+            mirror.withheld = vec![3];
+        }
+        scenario
+    }
+
     /// The node's block-sync config: production's, with the scenario's
     /// limits.
     ///
@@ -232,6 +415,9 @@ impl BlockScenario {
         }
         if let Some(bytes) = self.max_response_bytes {
             config.max_response_bytes = bytes;
+        }
+        if let Some(applies) = self.max_submitted_block_applies {
+            config.max_submitted_block_applies = applies;
         }
         if let Err(error) = config.validate() {
             panic!("the scenario's node config is invalid: {error}");
@@ -401,12 +587,31 @@ impl Subsystem for Storage {
             .chain([scenario.body_bytes])
             .max()
             .map_or(0, u64::from);
-        ports.view.borrow_mut().owners = OwnerModel::new(Limits::of(&config, largest_body));
+        let workers = storage_config(scenario).scheduler.workers;
+        // The node holds its first `node_bodies` bodies committed, so its
+        // verified tip starts at the last of them.
+        let verified_tip = scenario
+            .node_bodies
+            .checked_sub(1)
+            .and_then(|last| ports.chain.get(usize::try_from(last).ok()?))
+            .map_or(0, |block| block.height.0);
+        ports.view.borrow_mut().owners =
+            OwnerModel::new(Limits::of(&config, workers, largest_body), verified_tip);
         let view = ports.view.clone();
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());
         let teardown = tap.teardown();
+        if let Some(pause) = scenario.handoff_pause {
+            sim.hold_tasks(Box::new(PausedHandoffs {
+                handoffs: tap.handoffs(),
+                view: view.clone(),
+                from_height: pause.from_height,
+                steps: pause.steps,
+                first: Cell::new(None),
+                over: Cell::new(false),
+            }));
+        }
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -477,14 +682,24 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`] picks
-    /// the stuck floor; otherwise an odd first byte picks the short budget,
-    /// and an even one the default. The stuck floor's run takes over a
-    /// million steps, so fuzzing draws it on one prefix in 65,536.
+    /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],
+    /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`] and [`PEERS_LEAVE_TAG`]
+    /// pick theirs; otherwise an odd first byte picks the short budget, and
+    /// an even one the default. Each tagged run is long or narrow, so
+    /// fuzzing draws each on one prefix in 65,536.
     fn draw(prefix: &[u8]) -> BlockScenario {
         match prefix {
             [first, second, ..] if [*first, *second] == STUCK_FLOOR_TAG => {
                 BlockScenario::stuck_floor()
+            }
+            [first, second, ..] if [*first, *second] == PAUSED_HANDOFFS_TAG => {
+                BlockScenario::paused_handoffs()
+            }
+            [first, second, ..] if [*first, *second] == ABOVE_WINDOW_TAG => {
+                BlockScenario::above_window()
+            }
+            [first, second, ..] if [*first, *second] == PEERS_LEAVE_TAG => {
+                BlockScenario::peers_leave()
             }
             [first, ..] if first % 2 == 1 => BlockScenario::short_budget(),
             _ => BlockScenario::default(),
@@ -494,6 +709,59 @@ impl Subsystem for Storage {
 
 /// The scenario prefix that picks [`BlockScenario::stuck_floor`].
 pub const STUCK_FLOOR_TAG: [u8; 2] = [0xFF, 0x02];
+
+/// The scenario prefix that picks [`BlockScenario::paused_handoffs`].
+pub const PAUSED_HANDOFFS_TAG: [u8; 2] = [0xFF, 0x03];
+
+/// The scenario prefix that picks [`BlockScenario::above_window`].
+pub const ABOVE_WINDOW_TAG: [u8; 2] = [0xFF, 0x04];
+
+/// The scenario prefix that picks [`BlockScenario::peers_leave`].
+pub const PEERS_LEAVE_TAG: [u8; 2] = [0xFF, 0x05];
+
+/// [`HandoffPause`]'s hold: a routine task that recorded a handoff's start
+/// and not its end, stopped in the budget's code, which only its release
+/// reaches before the handoff ends.
+struct PausedHandoffs {
+    handoffs: TapHandoffs,
+    view: Rc<RefCell<BlockSyncView>>,
+    from_height: u32,
+    steps: u64,
+    /// The step after which the first pause began.
+    first: Cell<Option<u64>>,
+    /// Set once the pauses end.
+    over: Cell<bool>,
+}
+
+impl TaskHold for PausedHandoffs {
+    fn holds(&self, task: TaskId, at: &At) -> bool {
+        if self.over.get() {
+            return false;
+        }
+        let view = self.view.borrow();
+        let step = view.step.unwrap_or(0);
+        let past = view.owners.reserved() > view.owners.limits.reserved_bound(0);
+        let expired = self
+            .first
+            .get()
+            .is_some_and(|first| step >= first.saturating_add(self.steps));
+        if past || expired {
+            self.over.set(true);
+            return false;
+        }
+        let releasing = at
+            .site
+            .is_some_and(|site| site.file().ends_with("transport/guard.rs"));
+        let from = self.from_height;
+        if !releasing || !self.handoffs.open(task).iter().any(|h| *h >= from) {
+            return false;
+        }
+        if self.first.get().is_none() {
+            self.first.set(Some(step));
+        }
+        true
+    }
+}
 
 /// The resource properties read the owner model in the node's view.
 impl OwnerView for Rc<RefCell<BlockSyncView>> {
@@ -507,7 +775,7 @@ impl OwnerView for Rc<RefCell<BlockSyncView>> {
 /// and twice that leaves room.
 const STEPS_PER_BLOCK: u64 = 1_000;
 
-/// The storage run's config for `scenario`: 2 workers, the default stack,
+/// The storage run's config for `scenario`: its workers, 2 by default, the default stack,
 /// which engine planning needs, and the scenario's step budget, or room to
 /// sync every block, including those its control steps grow or fork, and
 /// then idle on timers.
@@ -523,7 +791,7 @@ pub fn storage_config(scenario: &BlockScenario) -> RunConfig {
         .sum();
     RunConfig {
         scheduler: SchedulerConfig {
-            workers: 2,
+            workers: scenario.workers.unwrap_or(2),
             ..SchedulerConfig::default()
         },
         budget: scenario

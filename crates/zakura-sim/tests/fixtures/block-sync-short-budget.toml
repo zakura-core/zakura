@@ -1,7 +1,0 @@
-# The committed fuzz input `block-sync-short-budget.bin`: the harness that
-# runs it, the generator version it was built for, and its SHA-256. Its
-# first two bytes pick the short-budget scenario: four mirrors serve sixteen
-# bodies of unknown size against a byte budget of `1.5·B`.
-harness = "block-sync/storage"
-generator = 2
-sha256 = "9d947d4fc6f710d75b2771170c1006b0c7af4ad683d13f34dcad2accd5940296"

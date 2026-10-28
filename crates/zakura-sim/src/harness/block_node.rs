@@ -376,6 +376,11 @@ impl ActionSource for PolicySource {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
             }
         }
+        if let Some(tap) = &self.tap {
+            let made = u64::try_from(links.len()).unwrap_or(u64::MAX);
+            let open = links.iter().filter(|link| !link.is_closed()).count();
+            tap.fold_links(made, u64::try_from(open).unwrap_or(u64::MAX));
+        }
         let chains = self.effects.chains.borrow();
         for (effect, actor) in &chains[self.changed..] {
             predicates.record_link(*effect, actor);

@@ -1,0 +1,9 @@
+# Skips returning a dropped routine's unreceived requests to the work
+# queue. The input's mirrors withhold every height from 9, then both
+# leave, so each routine ends owing requests, and their estimates stay in
+# the byte budget once teardown settles.
+input = "crates/zakura-sim/tests/fixtures/block-sync-peers-leave.bin"
+# Besides peer_routine.rs, which the patch changes, the harness drives the
+# rest of block sync and the Zakura transport under it. A change there can
+# move the input off its teardown.
+checks = ["crates/zakura-network/src/zakura"]

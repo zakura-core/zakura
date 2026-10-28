@@ -692,6 +692,12 @@ impl PeerRoutine {
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             zakura_rt::pin!(outbound_queue_poll);
 
+            // The fill above may have reserved or released request bytes, and
+            // the routine can park below for a whole timeout. A snapshot here
+            // lets an observer reconcile the budget with every routine's
+            // outstanding estimates while the run rests.
+            #[cfg(any(test, zakura_sim))]
+            self.observe_owners(false);
             zakura_rt::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),

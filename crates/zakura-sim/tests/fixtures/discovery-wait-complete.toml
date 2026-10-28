@@ -1,0 +1,5 @@
+# The committed fuzz input `discovery-wait-complete.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256.
+harness = "discovery/wait-complete"
+generator = 1
+sha256 = "0de50dd7cd5955cb68246bd9a27056b91bba8dea6872f5bf65e254d1db890acf"

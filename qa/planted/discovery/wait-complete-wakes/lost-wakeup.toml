@@ -1,0 +1,8 @@
+# Puts back the `wait_complete` that checked for completion before creating
+# its `Notified`, so a final mark between the two is lost (S4.7). The input
+# holds the source at that point until the sink has run all three marks.
+input = "crates/zakura-sim/tests/fixtures/discovery-wait-complete.bin"
+# Besides service.rs, which the patch changes, the harness drives the rest
+# of discovery and the Zakura transport under it, such as framed_channel and
+# wire_codec. A change there can move the input off the race.
+checks = ["crates/zakura-network/src/zakura"]

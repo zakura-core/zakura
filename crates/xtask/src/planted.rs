@@ -8,8 +8,9 @@
 //! sidecar names its harness. For each case the runner:
 //!
 //! 1. checks out `HEAD` in a scratch worktree under `target/planted/`; every
-//!    case builds in `target/planted/target`, apart from the checkout's own
-//!    target directory;
+//!    case builds with the workspace's `planted` profile in
+//!    `target/planted/target`, apart from the checkout's own target
+//!    directory;
 //! 2. records the input unpatched, which must hold the property with no
 //!    violation of any property and pass its witness test expecting
 //!    `holds`;
@@ -76,6 +77,11 @@ const SHARED: &[&str] = &[
     "rust-toolchain.toml",
     ".cargo",
 ];
+
+/// The cargo profile every case builds with: optimized, with the dev
+/// profile's debug assertions and overflow checks (the workspace's
+/// `Cargo.toml`).
+const PROFILE: &str = "planted";
 
 /// Fuzz inputs the short campaign records after the committed input.
 const CAMPAIGN_INPUTS: usize = 32;
@@ -526,7 +532,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
         fs::remove_dir_all(dir)?;
     }
     fs::create_dir_all(dir)?;
-    let binary = target.join("debug").join("zakura-sim");
+    let binary = target.join(PROFILE).join("zakura-sim");
     let mut caught = 0;
     let mut missed = BTreeMap::new();
     for (index, bytes) in campaign_inputs(&case.property).into_iter().enumerate() {
@@ -624,8 +630,8 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// `zakura-sim`, built and run from `worktree`'s simulator build in
-/// `target`.
+/// `zakura-sim`, built with [`PROFILE`] and run from `worktree`'s simulator
+/// build in `target`.
 fn cargo_run(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
@@ -636,6 +642,8 @@ fn cargo_run(worktree: &Path, target: &Path) -> Command {
         .args([
             "run",
             "--locked",
+            "--profile",
+            PROFILE,
             "-p",
             "zakura-sim",
             "--bin",

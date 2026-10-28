@@ -53,7 +53,8 @@ fn row(row: &str) -> RowAt {
 
 /// Runs `scenario` under `input`, and returns its report and ports. No run
 /// may end at a harness failure: a judged frame without exactly one label
-/// is one.
+/// is one. Every block storage operation the node dispatches pairs with the
+/// owner that sent it.
 fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     let ports = Storage::prepare(scenario);
     let report = run_prepared::<Storage>(
@@ -65,6 +66,10 @@ fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.harness, None, "{:?}", report.end);
+    {
+        let view = ports.view.borrow();
+        assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+    }
     (report, ports)
 }
 

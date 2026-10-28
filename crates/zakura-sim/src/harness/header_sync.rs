@@ -20,8 +20,8 @@ use zakura_storage::header::{
 
 use super::{
     header_node::{
-        preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects, HeaderNode,
-        Policy, PolicySource, Topology,
+        policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
+        HeaderNode, Policy, PolicySource, Topology,
     },
     Subsystem,
 };
@@ -231,7 +231,21 @@ impl Subsystem for Storage {
     }
 
     /// Commits each actor's chain to its port.
+    ///
+    /// # Panics
+    ///
+    /// If a hold or control step waits for a trigger the node never records
+    /// ([`policy::undriven`]).
     fn prepare(scenario: &StorageScenario) -> Ports {
+        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
+            scenario
+                .controls
+                .iter()
+                .filter_map(|step| step.when.as_ref()),
+        );
+        if let Some(why) = triggers.filter_map(policy::undriven).next() {
+            panic!("{why}");
+        }
         let fixture = HeaderFixture::regtest();
         let node = Arc::new(ControlledPort::new(&fixture));
         preload(node.engine(), &fixture, &scenario.node);

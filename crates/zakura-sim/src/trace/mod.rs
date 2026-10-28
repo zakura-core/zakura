@@ -17,6 +17,7 @@
 //! check and the open.
 
 pub mod explain;
+pub mod failure;
 pub mod meta;
 pub mod read;
 pub mod replay;
@@ -24,6 +25,7 @@ pub mod shrink;
 mod verify;
 pub mod write;
 
+pub use failure::{artifacts_root, record_failure, ARTIFACTS_VAR, TRACES_DIR};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
 pub use replay::{

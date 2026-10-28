@@ -70,6 +70,18 @@ pub enum RecordError {
     /// The witness test couldn't run: the harness doesn't register the
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
+    /// The run [`crate::trace::record_failure`] was handed doesn't violate
+    /// the property it was asked to record.
+    NotViolated {
+        /// The property.
+        property: String,
+    },
+    /// A rerun of a failing run didn't do what that run did, so
+    /// [`crate::trace::record_failure`] kept no trace.
+    Nondeterministic {
+        /// What differed.
+        detail: String,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -85,6 +97,12 @@ impl fmt::Display for RecordError {
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
             RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
+            RecordError::NotViolated { property } => {
+                write!(f, "the run doesn't violate {property}")
+            }
+            RecordError::Nondeterministic { detail } => {
+                write!(f, "the rerun is nondeterministic: {detail}")
+            }
         }
     }
 }
@@ -172,7 +190,23 @@ fn record_with<T>(
             derived_from.cloned(),
         ),
     };
-    let mut meta = (harness.meta)(&scenario).map_err(RecordError::Harness)?;
+    write_trace(harness, &scenario, plan, input, derived_from, out, run)
+}
+
+/// Writes the trace of `run` on `scenario` and `plan` to `out`, as
+/// [`record`] describes, and returns it with `run`'s result. `input`, the
+/// full fuzz input, becomes `input.bin` when it's given, and
+/// `derived_from` becomes `meta.derived_from`.
+pub(crate) fn write_trace<T>(
+    harness: &HarnessEntry,
+    scenario: &Value,
+    plan: PlanInput,
+    input: Option<&[u8]>,
+    derived_from: Option<Derivation>,
+    out: &Path,
+    run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
+) -> Result<(Trace, T), RecordError> {
+    let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
     meta.derived_from = derived_from;
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
     if fs::symlink_metadata(out.join(TRACE_FILE)).is_ok() {

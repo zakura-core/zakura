@@ -544,6 +544,50 @@ fn regulation_tables_report_each_transition() {
     );
 }
 
+/// An `Open` retracted before its first byte is reported, so a replayed
+/// ledger drops the subscription too. Retracting an unknown key reports
+/// nothing.
+#[test]
+fn a_retracted_open_is_reported() {
+    let recorder = Arc::new(Recorder::default());
+    let tap = Arc::new(StreamTap::new(registered_tap(recorder.clone()), 4));
+    let limits = SubscriptionLimits::from_rule(&v9::SUBSCRIBE_HEADERS)
+        .expect("SUBSCRIBE_HEADERS is a subscription row");
+    let mut subscriptions = Subscriptions::new(limits, rows())
+        .observed_by(Some(RegulationTap::new(tap.clone(), |id| *id)));
+    subscriptions
+        .open(
+            1,
+            Credit {
+                objects: 2,
+                bytes: 1_000,
+            },
+            cursor(0),
+        )
+        .expect("the open fits");
+    assert!(subscriptions.retract(&1));
+    assert!(!subscriptions.retract(&1));
+    let regulated: Vec<_> = recorder
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            TransportEvent::Regulated { transition, .. } => Some(transition),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        regulated,
+        vec![
+            Transition::OpenIssued {
+                subscription: 1,
+                objects: 2,
+                bytes: 1_000,
+            },
+            Transition::OpenRetracted { subscription: 1 },
+        ]
+    );
+}
+
 /// Records whether a fenced subscription's exchange was still open when its
 /// `EndClaimed` arrived.
 #[derive(Debug, Default)]

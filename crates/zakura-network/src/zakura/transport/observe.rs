@@ -253,6 +253,12 @@ pub enum Transition {
         /// Bytes the `Open` grants.
         bytes: u32,
     },
+    /// This node removed its own `Open` because the frame was dropped before
+    /// its first byte was written.
+    OpenRetracted {
+        /// The subscription.
+        subscription: u64,
+    },
     /// This node recorded its own `Grant` before writing it.
     GrantIssued {
         /// The subscription.

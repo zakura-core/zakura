@@ -5822,7 +5822,7 @@ async fn a_rejection_is_recorded_on_the_parent_it_validated() {
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _queue) = RpcImpl::new(
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(

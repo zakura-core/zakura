@@ -9,6 +9,7 @@ use std::{
 
 mod header_conformance;
 mod header_fuzz;
+mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
@@ -94,6 +95,30 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             rt_imports::check(&repo_root()?)
+        }
+        Some("planted") => {
+            let mut changed_since = None;
+            let mut property = None;
+            while let Some(arg) = args.next() {
+                if arg == "--changed-since" {
+                    if changed_since.is_some() {
+                        return Err(Box::new(UsageError(
+                            "expected at most one `--changed-since`",
+                        )));
+                    }
+                    changed_since = Some(
+                        args.next()
+                            .ok_or(UsageError("expected a revision after `--changed-since`"))?,
+                    );
+                } else if property.is_none() {
+                    property = Some(arg);
+                } else {
+                    return Err(Box::new(UsageError(
+                        "expected at most one property ID after `cargo xtask planted`",
+                    )));
+                }
+            }
+            planted::run(&repo_root()?, property.as_deref(), changed_since.as_deref())
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
@@ -303,6 +328,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask check-rt-imports")?;
     writeln!(
         output,
+        "  cargo xtask planted [--changed-since <rev>] [<property-id>]"
+    )?;
+    writeln!(
+        output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
     )?;
     writeln!(
@@ -343,6 +372,19 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Checks that the v2 P2P code in zakura-network takes runtime names from zakura-rt."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Applies each bypass patch under qa/planted/ in a scratch worktree, and checks that"
+    )?;
+    writeln!(
+        output,
+        "its committed input holds the property unpatched and violates exactly it patched."
+    )?;
+    writeln!(
+        output,
+        "With --changed-since, it runs only the cases the changes since that revision affect."
     )?;
     writeln!(output)?;
     writeln!(

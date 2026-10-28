@@ -5,6 +5,15 @@
 //! A submission has two stages, and a hold picks each one afresh: its
 //! admission as [`BlockKind::Admit`], then its verdict as
 //! [`BlockKind::Apply`]. Its session is its owner's.
+//!
+//! A query's, submission's or record's reply goes to block sync's handle,
+//! which queues it for the reactor. The block service sees it queued, which
+//! [`Trigger::ReplyQueued`](policy::Trigger::ReplyQueued) counts, and
+//! nothing the node records sees the reactor take or handle it. So a block
+//! scenario can't wait for [`Trigger::ReplyTaken`](policy::Trigger::ReplyTaken)
+//! on those replies, or for [`Trigger::Handled`](policy::Trigger::Handled)
+//! at all: [`undriven`] rejects both. A range read's caller takes its own
+//! reply, which `ReplyTaken` counts.
 
 use std::time::Duration;
 
@@ -163,6 +172,31 @@ pub type Hold = policy::Hold<BlockKind, BlockAllow>;
 /// The block node's holds and everything they count.
 pub type Predicates = policy::Predicates<Block>;
 
+/// Why a block scenario can't wait for `trigger`, if no event the node
+/// records drives it: [`Trigger::Handled`](policy::Trigger::Handled), or
+/// [`Trigger::ReplyTaken`](policy::Trigger::ReplyTaken) on anything but a
+/// range read. The module doc says why.
+pub fn undriven(trigger: &Trigger) -> Option<String> {
+    let found = trigger.find(&|trigger| match trigger {
+        policy::Trigger::Handled(_) => true,
+        policy::Trigger::ReplyTaken(select) => {
+            !matches!(select.kind, Some(BlockKind::Read | BlockKind::MirrorRead))
+        }
+        _ => false,
+    })?;
+    Some(match found {
+        policy::Trigger::Handled(_) => format!(
+            "a block scenario can't wait for {found:?}: nothing the block node records \
+             witnesses block sync handling a reply"
+        ),
+        _ => format!(
+            "a block scenario can't wait for {found:?}: only a range read's caller takes its \
+             own reply, so its select must name the `read` or `mirror-read` kind. Block sync's \
+             handle queues every other reply, which `reply-queued` counts"
+        ),
+    })
+}
+
 /// What happened to one mirror range read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MirrorEvent {
@@ -189,9 +223,8 @@ impl Predicates {
             }
             StorageFact::Admitted { id } => self.restage(key(id), BlockKind::Apply),
             StorageFact::BlockCompleted { id, .. } => self.event(Event::Completed, key(id)),
-            StorageFact::ReplyDelivered { id } | StorageFact::ReadTaken { id } => {
-                self.event(Event::ReplyTaken, key(id))
-            }
+            StorageFact::ReplyDelivered { id } => self.event(Event::ReplyQueued, key(id)),
+            StorageFact::ReadTaken { id } => self.event(Event::ReplyTaken, key(id)),
             StorageFact::CallerDropped { id } | StorageFact::ReadDropped { id } => {
                 self.event(Event::CallerDropped, key(id))
             }

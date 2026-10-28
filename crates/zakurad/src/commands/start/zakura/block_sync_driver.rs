@@ -1754,6 +1754,8 @@ pub(crate) fn block_sync_needed_blocks_from_state(
 }
 
 #[cfg(test)]
+mod committed_state;
+#[cfg(test)]
 mod fidelity;
 
 #[cfg(test)]

@@ -136,6 +136,18 @@ pub type Hold = policy::Hold<OpKind, Allow>;
 /// The header node's holds and everything they count.
 pub type Predicates = policy::Predicates<Header>;
 
+/// Why a header scenario can't wait for `trigger`, if no event the node
+/// records drives it: [`Trigger::ReplyQueued`](policy::Trigger::ReplyQueued).
+/// A completion stores the reply for its call's future, so `completed`
+/// counts that moment.
+pub fn undriven(trigger: &Trigger) -> Option<String> {
+    let found = trigger.find(&|trigger| matches!(trigger, policy::Trigger::ReplyQueued(_)))?;
+    Some(format!(
+        "a header scenario can't wait for {found:?}: a completion stores its reply, so \
+         `completed` counts that moment"
+    ))
+}
+
 impl Predicates {
     /// Counts one storage fact of the node's port.
     pub fn record(&mut self, fact: &StorageFact) {

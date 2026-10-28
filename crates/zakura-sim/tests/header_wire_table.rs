@@ -466,8 +466,10 @@ struct Checked {
 /// asserted precondition held (no harness failure), its frame got the
 /// act's label, and the node judged it at the act's stage, with a header
 /// stage fault never read whole. Then a fault's `<label>-closes` holds with
-/// an obligation it discharged, by a fault close, or for `BadContent` by a
-/// fault close or a `Misbehavior`. A conformant act's
+/// an obligation it discharged, and the node closed the connection with a
+/// fault cause: header sync's consequence for every fault, content
+/// included, though `bad-content-closes` would also take a `Misbehavior`.
+/// A conformant act's
 /// `conformant-never-closes` holds, applied, with no fault close. No
 /// property of the table is violated.
 fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
@@ -498,7 +500,8 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
             cause.as_deref().is_none_or(|cause| !is_fault_cause(cause)),
             "{act:?}: a conformant peer was closed with {cause:?}"
         );
-    } else if frame.label != Label::BadContent {
+    } else {
+        // Header sync's content consequence is a fault close too.
         let cause = cause.unwrap_or_else(|| panic!("{act:?}: no close"));
         assert!(is_fault_cause(&cause), "{act:?}: closed with {cause}");
     }

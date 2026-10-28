@@ -1012,6 +1012,15 @@ fn an_honest_wire_run_replays_identically() {
             .filter(|entry| matches!(entry.obs, Observation::Session { .. }))
             .count();
         assert_eq!(sessions, 3, "two connections and one reopen");
+        let statuses = runs[0]
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.obs, Observation::PeerFrame { row: Some(row), .. } if row == "status")
+            })
+            .count();
+        assert!(statuses > sessions, "a Status was refreshed: {statuses}");
         assert_eq!(runs[0].picks, runs[1].picks);
         assert_eq!(runs[0].log.entries(), runs[1].log.entries());
     }

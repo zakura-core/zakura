@@ -696,7 +696,8 @@ impl Sequencer {
     }
 
     /// Decoded-cap admission for one submission. A raw body's decoded size is
-    /// unknown until `prepare_submit` decodes it, so it is charged
+    /// unknown until `prepare_submit` decodes it, so it is charged the size an
+    /// earlier submission of the same body measured, or else
     /// `bytes × DESERIALIZED_MEM_FACTOR`.
     ///
     /// When no submission is in flight, attached or detached, the body is

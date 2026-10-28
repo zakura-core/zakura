@@ -17,7 +17,7 @@ on:
       - "**/Cargo.lock"
       # Include non-Rust inputs compiled or exercised by workspace crates.
       - crates/**
-      # Planted bypass patches and their case files, which sim-build applies.
+      # Planted bypass patches and their case files, which sim-planted applies.
       - qa/planted/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
@@ -189,7 +189,7 @@ jobs:
           done <<< "$changed"
 
           # Broad test-relevant filter (the paths that formerly gated the whole
-          # workflow on pull_request, plus qa/planted/, whose patches sim-build
+          # workflow on pull_request, plus qa/planted/, whose patches sim-planted
           # applies). Every config-relevant change also needs the build archive
           # consumed by zakura-config, so `config` implies `rust` even for paths
           # outside the old workflow-level filter.
@@ -521,11 +521,35 @@ jobs:
           RUSTDOCFLAGS="--cfg zakura_sim" cargo test --locked -p zakura-sim --doc
         env:
           RUSTFLAGS: --cfg zakura_sim
-      # Each retained bypass patch under qa/planted/ must still make its
-      # property fail. The runner applies each patch in its own scratch
-      # worktree under target/planted/, so the checkout stays clean. A pull
-      # request runs only the cases its changes affect; main and the merge
-      # queue run every case.
+
+  # Each retained bypass patch under qa/planted/ must still make its
+  # property fail. The runner checks out the commit once in a scratch
+  # worktree under target/planted/, so the checkout stays clean, builds the
+  # unpatched simulator once, and applies each patch there in turn. A pull
+  # request runs only the cases its changes affect; main and the merge
+  # queue run every case. It runs beside sim-build, whose tests would
+  # otherwise leave it too little of one job's time limit.
+  sim-planted:
+    name: zakura_sim planted
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          # A pull request's checkout is its merge commit. Its first parent,
+          # the base branch, tells the planted runner what the PR changed.
+          fetch-depth: 2
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+          cache-shared-key: zakura-sim-planted
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check the planted bypass patches
         run: |
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
@@ -675,6 +699,7 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
+      - sim-planted
       - sim-sanitizers
       - zakura-testkit
     timeout-minutes: 30
@@ -689,11 +714,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build skips with the same test-relevant filter as build-tests,
-          # and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
+          # sim-build and sim-planted skip with the same test-relevant filter
+          # as build-tests, and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
           # their build inputs change.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

@@ -231,10 +231,12 @@ fn remote(index: usize, dial: usize) -> String {
     peer_addr(index, dial).to_string()
 }
 
-/// Each scripted scenario, actions, refusals, the reopen and the redial
-/// included, replays the same picks and observations when one plan runs it
-/// twice in one process, so nothing process-wide, such as a QUIC
-/// connection's stable ID, leaks into the log.
+/// A scripted scenario with every peer action, a refused stream, a reopen,
+/// a redial and a refused handshake replays the same picks and observations
+/// when one plan runs it twice in one process, so nothing process-wide,
+/// such as a QUIC connection's stable ID, leaks into the log. The test first
+/// checks that the whole history happened, so two equally short runs can't
+/// pass.
 #[test]
 fn a_scripted_wire_run_replays_identically() {
     let open = |kind, version| PeerAction::Open { kind, version };
@@ -260,6 +262,43 @@ fn a_scripted_wire_run_replays_identically() {
     ]);
     for plan in plans() {
         let runs: Vec<_> = (0..2).map(|_| run(&scenario, plan.clone())).collect();
+        // The history happened: every action, and each one's outcome.
+        let picked: Vec<_> = runs[0]
+            .picks
+            .iter()
+            .map(|pick| pick.identity.as_str())
+            .filter(|identity| identity.starts_with("peer:"))
+            .collect();
+        for action in [
+            "peer:peer-0:open",
+            "peer:peer-0:close",
+            "peer:peer-0:redial",
+            "peer:peer-1:finish-header",
+        ] {
+            assert_eq!(
+                picked.iter().filter(|pick| **pick == action).count(),
+                1,
+                "{action}: {picked:?}"
+            );
+        }
+        let (events, sessions) = read(&runs[0]);
+        let connections = connections(&events);
+        assert_eq!(
+            refusals(&events, connections[&remote(0, 0)]),
+            [(
+                ZAKURA_STREAM_DISCOVERY,
+                ZAKURA_DISCOVERY_STREAM_VERSION,
+                "unknown_kind".to_owned()
+            )]
+        );
+        assert!(connections.contains_key(&remote(0, 1)), "the redial");
+        let reopened = sessions
+            .iter()
+            .filter(|session| session.connection == connections[&remote(1, 0)])
+            .count();
+        assert_eq!(reopened, 2, "the reopen");
+        assert!(events.iter().any(|event| event.remote == remote(2, 0)
+            && matches!(event.fact, TransportFact::HandshakeRefused { .. })));
         assert_eq!(runs[0].picks, runs[1].picks);
         assert_eq!(runs[0].log.entries(), runs[1].log.entries());
     }

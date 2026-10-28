@@ -28,6 +28,11 @@
 //!   as production's `Status` cadence does, so a reopened stream can't reset
 //!   it.
 //!
+//! A frame labelled with a fault changes no model state, as P3a's models
+//! do for the peers' own frames (P3a, Scope) and the block-sync relay does
+//! for the node's: an over-credit page spends nothing, so a later page is
+//! judged on the credit the conformant pages left.
+//!
 //! A `Close` the node applied doesn't stop its pages: a page committed to
 //! the stream before the `Close` arrived is still within credit, so the
 //! subscription stays live until the node's ending. The node's `Grant`s and

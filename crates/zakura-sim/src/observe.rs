@@ -113,8 +113,43 @@ pub enum Observation {
         rule_stream: StreamId,
         /// The frame's label.
         label: Label,
-        /// True if the frame emptied its row's cadence bucket. Such a frame
-        /// is still conformant.
+        /// True if charging the frame to its row's cadence bucket found it
+        /// empty: [`crate::model::CadenceModel`]'s charge returned
+        /// [`crate::model::Charge::Exhausted`]. Such a frame is still
+        /// conformant.
+        exhausted: bool,
+        /// The exchange or subscription the frame belongs to, as the peer's
+        /// role models key it: a request's own key, or the key a response,
+        /// page or update names. `None` for an announcement or a frame with
+        /// no key.
+        exchange: Option<u64>,
+        /// The payload's length in bytes, frame header excluded.
+        payload: u64,
+    },
+    /// A frame the node sent on a tabled stream reached a peer, whose role
+    /// models labelled it on arrival under the sender's rules: `OverMargin`
+    /// once the node's open requests exceed the highest limit the peer
+    /// advertised, and `OverLive` once the node's live subscriptions exceed
+    /// `max_live`, without the receiver's margin of twice those. A model
+    /// input, like [`Observation::CreditGranted`].
+    NodeFrame {
+        /// The connection.
+        connection: u64,
+        /// The stream.
+        stream: StreamId,
+        /// The frame's position among the node's frames on this stream,
+        /// from 0.
+        seq: u64,
+        /// The row whose rule `label` enforces, as for
+        /// [`Observation::PeerFrame`].
+        row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
+        /// The frame's label.
+        label: Label,
+        /// True if the peer's [`crate::model::CadenceModel`] charged the
+        /// frame to an empty bucket: its charge returned
+        /// [`crate::model::Charge::Exhausted`].
         exhausted: bool,
     },
     /// The node's reader reached the bytes it needs to judge the peer's
@@ -140,6 +175,101 @@ pub enum Observation {
         /// The connection.
         connection: u64,
     },
+    /// The node granted credit on a subscription it opened, as the peer's
+    /// subscription model applied the update. A model input: the peer's
+    /// harness emits it, never the node's.
+    CreditGranted {
+        /// The connection.
+        connection: u64,
+        /// The subscription row.
+        subscription: RowAt,
+        /// The subscription's key.
+        exchange: u64,
+        /// The objects the update added.
+        objects: u64,
+        /// The payload bytes the update added.
+        bytes: u64,
+        /// True if the update opened the subscription. A key the peer's
+        /// model has forgotten may open again, and its credit starts over.
+        opens: bool,
+    },
+    /// The peer opened an exchange with the node, owed this much, as the
+    /// peer's exchange model recorded it. A model input, like
+    /// [`Observation::CreditGranted`].
+    ExchangeOwed {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// Frames the node may send before the exchange's ending.
+        frames: u32,
+        /// Payload bytes the node may send, the ending's included.
+        bytes: u64,
+    },
+    /// The node retained, forwarded or handed storage work from one of the
+    /// peer's response or page frames: an actual effect, which the family's
+    /// adapter reads at the storage or forwarding boundary, whatever code
+    /// path produced it. Work counts once, at the first boundary it crosses:
+    /// an adapter that sees the same work retained and then forwarded
+    /// reports it once.
+    WorkAdmitted {
+        /// The connection.
+        connection: u64,
+        /// The row of the frame the work came from.
+        frame: RowAt,
+        /// That frame, as its [`Observation::PeerFrame`] numbers it on
+        /// `frame`'s stream: the frame whose body the work holds.
+        seq: u64,
+        /// The request or subscription row those frames answer.
+        request: RowAt,
+        /// The exchange or subscription key.
+        exchange: u64,
+        /// Objects, such as headers or blocks.
+        objects: u64,
+        /// Payload bytes.
+        bytes: u64,
+        /// True if `frame`'s row ends the exchange, as a subscription's
+        /// terminal outcome does.
+        ends: bool,
+    },
+    /// The node installed an owner for serving the peer's request: an actual
+    /// effect, read where the owner is created.
+    Serving {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// A serving owner from [`Observation::Serving`] retired: an actual
+    /// effect, read where the owner is dropped.
+    ServingEnded {
+        /// The connection.
+        connection: u64,
+        /// The request row.
+        request: RowAt,
+        /// The request's key.
+        exchange: u64,
+    },
+    /// The node wrote a response frame to the peer: an actual effect, read
+    /// at the writer.
+    NodeOutput {
+        /// The connection.
+        connection: u64,
+        /// The frame's row.
+        frame: RowAt,
+        /// The request row it answers.
+        request: RowAt,
+        /// The exchange's key.
+        exchange: u64,
+        /// The payload's length in bytes.
+        payload: u64,
+        /// True if the row ends the exchange.
+        ends: bool,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -147,6 +277,21 @@ pub enum Observation {
         /// What happened.
         event: String,
     },
+}
+
+impl Observation {
+    /// The task whose run appended this observation, if a step that runs a
+    /// task appends it: a stop at a point, a wait, a park or an exit. Each
+    /// such step appends exactly one.
+    pub fn ran_task(&self) -> Option<&str> {
+        match self {
+            Observation::TaskReached { task, .. }
+            | Observation::TaskWaiting { task }
+            | Observation::TaskParked { task }
+            | Observation::TaskExited { task, .. } => Some(task),
+            _ => None,
+        }
+    }
 }
 
 /// A storage fact in plain fields: hashes and peers in hex, counters as
@@ -1042,6 +1187,32 @@ impl std::fmt::Display for StreamId {
     /// Writes `s<kind>v<version>`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "s{}v{}", self.kind, self.version)
+    }
+}
+
+/// A row of a stream's message table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct RowAt {
+    /// The stream.
+    pub stream: StreamId,
+    /// The row's name.
+    pub row: String,
+}
+
+impl RowAt {
+    /// Row `row` of `stream`.
+    pub fn new(stream: StreamId, row: impl Into<String>) -> Self {
+        RowAt {
+            stream,
+            row: row.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RowAt {
+    /// Writes `s<kind>v<version>/<row>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.stream, self.row)
     }
 }
 

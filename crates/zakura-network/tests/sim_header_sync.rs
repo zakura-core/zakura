@@ -536,8 +536,9 @@ fn shutdown_stops_a_maintained_dial() {
             let dial = endpoint.spawn_native_dial(unreachable);
             // Long enough for at least one failed attempt and a backoff.
             zakura_rt::time::sleep(Duration::from_secs(60)).await;
+            assert!(!dial.is_finished(), "the dial is still retrying");
             endpoint.shutdown().await;
-            let _ = dial.await;
+            dial.await.expect("the dial task ends without panicking");
             *stopped.borrow_mut() = true;
         });
     }

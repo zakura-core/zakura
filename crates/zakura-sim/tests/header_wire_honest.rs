@@ -568,7 +568,7 @@ fn held_storage_stops_the_credit_grants() {
 /// unit makes the publisher send past it.
 #[test]
 fn a_slow_subscriber_stops_the_publisher() {
-    for (credit, left) in [
+    for (credit, left, regranted) in [
         (
             CreditSpec {
                 objects: 1,
@@ -578,6 +578,10 @@ fn a_slow_subscriber_stops_the_publisher() {
                 objects: 0,
                 bytes: 263,
             },
+            Balance {
+                objects: 0,
+                bytes: 526,
+            },
         ),
         (
             CreditSpec {
@@ -586,6 +590,10 @@ fn a_slow_subscriber_stops_the_publisher() {
             },
             Balance {
                 objects: 1,
+                bytes: 0,
+            },
+            Balance {
+                objects: 2,
                 bytes: 0,
             },
         ),
@@ -637,12 +645,15 @@ fn a_slow_subscriber_stops_the_publisher() {
                 objects: i64::from(credit.objects),
                 bytes: i64::from(credit.bytes),
             };
-            for at in &before {
+            let spend = |balance: &mut Balance, at: &At| {
                 let Observation::PeerReceived { payload, .. } = at.obs else {
                     unreachable!("pages are PeerReceived");
                 };
                 balance.objects -= i64::try_from((payload - 82) / 181).expect("a page is small");
                 balance.bytes -= i64::try_from(payload).expect("a page is small");
+            };
+            for at in &before {
+                spend(&mut balance, at);
             }
             assert_eq!(balance, left, "the publisher stayed within both balances");
             assert!(!balance.fits_a_page());
@@ -652,6 +663,19 @@ fn a_slow_subscriber_stops_the_publisher() {
                 pages.iter().any(|at| at.step > granted),
                 "a page came after the grant"
             );
+            // The pages after the grant stay within the regranted balance
+            // in both units, and stall the publisher again.
+            balance.objects += i64::from(credit.objects);
+            balance.bytes += i64::from(credit.bytes);
+            for at in pages.iter().filter(|at| at.step > granted) {
+                spend(&mut balance, at);
+                assert!(
+                    balance.objects >= 0 && balance.bytes >= 0,
+                    "a page after the grant overran it: {balance:?}"
+                );
+            }
+            assert_eq!(balance, regranted);
+            assert!(!balance.fits_a_page());
             // Checked last, so a publisher that overran fails above, before
             // the peer's next update, which its models then refuse.
             assert_eq!(report.end.harness, None);
@@ -699,6 +723,52 @@ fn a_held_grant_readies_only_the_grant() {
         entry.obs,
         Observation::PeerReceived { message_type, .. } if message_type == HEADERS
     )));
+}
+
+/// Once the page that reaches its target arrives, the peer sends `Close`,
+/// and its held grant is never offered again, though the terminal outcome
+/// is still on its way. The node holds 51 headers and the peer subscribes
+/// from 50 with one header of credit and no quiet time.
+///
+/// This fails if the grant stays offered after `Close`: picking it fails
+/// the run, since the subscription is closing.
+#[test]
+fn a_closed_subscription_offers_no_grant() {
+    let credit = CreditSpec {
+        objects: 1,
+        bytes: 263,
+    };
+    let subscribe = SubscribeSpec {
+        start: PRELOAD,
+        open: credit,
+        grants: GrantPolicy::Held {
+            grant: credit,
+            quiet_ms: 0,
+        },
+    };
+    let mut peer = honest(PeerSpec::dialing(), PRELOAD, Some(subscribe));
+    peer.script = vec![PeerAction::Grant];
+    let scenario = WireScenario {
+        node: Chain::main(PRELOAD + 1),
+        ..scenario(vec![peer], Policy::converging())
+    };
+    for plan in plans() {
+        let (report, _) = run(&scenario, plan);
+        assert!(
+            !report
+                .picks
+                .iter()
+                .any(|pick| pick.identity == "peer:peer-0:grant"),
+            "no grant after Close"
+        );
+        let outcome = report.log.entries().iter().any(|entry| {
+            matches!(
+                entry.obs,
+                Observation::PeerReceived { message_type, .. } if message_type == HEADERS_OUTCOME
+            )
+        });
+        assert!(outcome, "the subscription ended");
+    }
 }
 
 /// M5-C's reopen, after real subscriptions. The node dials `peer-0`, each

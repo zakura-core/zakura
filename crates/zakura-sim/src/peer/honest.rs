@@ -248,12 +248,17 @@ impl Honest {
         vec![self.send(RegtestMessage::Status(self.chain.status.clone()))]
     }
 
-    /// When a held grant may next be offered, if one is waiting.
+    /// When a held grant may next be offered, if one is waiting: never once
+    /// the subscription ended or this peer sent its `Close`, which
+    /// [`Honest::release_grant`] refuses.
     pub(crate) fn grant_opens(&self) -> Option<Instant> {
         let GrantPolicy::Held { quiet_ms, .. } = self.spec.subscribe.as_ref()?.grants else {
             return None;
         };
-        let subscribed = self.subscribed.as_ref().filter(|sub| !sub.ended)?;
+        let subscribed = self
+            .subscribed
+            .as_ref()
+            .filter(|sub| !sub.ended && !sub.close_sent)?;
         Some(subscribed.paged_at? + Duration::from_millis(quiet_ms))
     }
 

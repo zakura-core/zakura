@@ -255,7 +255,8 @@ impl TransportTap {
     ///
     /// # Panics
     ///
-    /// Outside a run, which can't happen while `sim` exists.
+    /// Outside a run, which can't happen while `sim` exists, or if `sim`
+    /// already holds a transport tap.
     pub fn new(
         sim: &mut Sim,
         node: &str,
@@ -280,6 +281,9 @@ impl TransportTap {
             live,
         );
         let id = sim.register(checkpoint.clone());
+        // Session rows name no tap, so the checkpoint covers them only
+        // while the run holds one.
+        assert_eq!(id.index, 0, "a run taps one node's transport");
         let tap = TransportTap {
             state,
             checkpoint,
@@ -582,9 +586,9 @@ impl ActionSource for TransportTap {
     }
 
     /// Logs every event reported since the last observation, in order, each
-    /// admitted session followed by its `Session` row, and records what it
-    /// delivered in the checkpoint. An event it can't encode or place fails
-    /// the run.
+    /// admitted session followed by its `Session` row, and records both in
+    /// the checkpoint, so a row that goes missing or changes fails the run
+    /// like a lost event. An event it can't encode or place fails the run.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         if log.run() != self.id.run {
@@ -627,7 +631,8 @@ impl ActionSource for TransportTap {
             sent.push(obs);
             if let Some(session) = session {
                 self.net.admitted(NODE_ADDR, remote);
-                log.push(session);
+                log.push(session.clone());
+                sent.push(session);
             }
         }
         self.delivered = last;

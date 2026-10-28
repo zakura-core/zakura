@@ -918,19 +918,21 @@ pub enum ReactorPurpose {
     },
 }
 
-/// The events that transport tap `instance` logged in `observations`, in
-/// order.
+/// The events and session rows that transport tap `instance` logged in
+/// `observations`, in order. A run holds one transport tap, so every
+/// session row is its own.
 pub(crate) fn transport_entries<'o>(
     observations: impl IntoIterator<Item = &'o Observation>,
     instance: u64,
 ) -> Vec<&'o Observation> {
     observations
         .into_iter()
-        .filter(|obs| {
-            matches!(
-                obs,
-                Observation::Transport { instance: index, .. } if *index == instance
-            )
+        .filter(|obs| match obs {
+            Observation::Transport {
+                instance: index, ..
+            } => *index == instance,
+            Observation::Session { .. } => true,
+            _ => false,
         })
         .collect()
 }

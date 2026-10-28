@@ -5,22 +5,31 @@
 //! from its transport events and the identity map's `Session` rows.
 #![cfg(zakura_sim)]
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use zakura_network::zakura::{
-    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
-    ZAKURA_STREAM_HEADER_SYNC,
+use zakura_chain::parameters::Network;
+use zakura_network::{
+    zakura::{
+        TransportEvent, TransportObserver, ZakuraLocalLimits, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+    },
+    Config,
 };
+use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{
-        header_sync::{HeaderWire, WireScenario},
+        header_sync::{wire_config, HeaderWire, WireScenario},
         run_harness,
+        wire_node::TransportTap,
+        NetScenario,
     },
     observe::{DatagramOutcome, TransportFact},
     peer::{peer_addr, PeerAction, PeerSpec},
-    MemorySink, Observation, Plan, PlanInput, RunReport,
+    ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NoChecks, Observation,
+    ObservationLog, Outcome, Plan, PlanInput, RunReport, Sim,
 };
 
 /// Every capability bit the node's code defines.
@@ -579,4 +588,133 @@ fn loss_opens_once_a_session_is_admitted() {
         lost.iter().all(|step| *step > admitted),
         "every drop came after the session's row at step {admitted}: {lost:?}"
     );
+}
+
+/// A transport tap that forwards everything, but observes into a copy of
+/// the log and logs what it delivered there after `edit` changes it.
+struct Rewrite {
+    inner: TransportTap,
+    edit: fn(Vec<Observation>) -> Vec<Observation>,
+}
+
+impl ActionSource for Rewrite {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        self.inner.enabled(now, out);
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.inner.boundaries(now, out);
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.inner.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let mut copy = log.clone();
+        let cursor = copy.entries().len();
+        self.inner.observe(&mut copy)?;
+        let delivered = copy.entries()[cursor..]
+            .iter()
+            .map(|entry| entry.obs.clone())
+            .collect();
+        for obs in (self.edit)(delivered) {
+            log.push(obs);
+        }
+        Ok(())
+    }
+}
+
+/// Runs a transport tap, wrapped to apply `edit` to what it delivers, on
+/// one connection's registration and header-session admission, reported
+/// by a task. Returns the report.
+fn tap_run(edit: fn(Vec<Observation>) -> Vec<Observation>) -> RunReport {
+    let mut sim = Sim::new(wire_config(), Plan::from_fuzz(&[]));
+    let (observer, tap) = TransportTap::new(
+        &mut sim,
+        "node",
+        NetScenario::default().net(),
+        vec!["peer-0".to_owned()],
+    );
+    sim.add_source(Box::new(Rewrite { inner: tap, edit }));
+    let reporter: Arc<dyn TransportObserver> = observer.clone();
+    sim.scheduler().spawn_root("node", async move {
+        let config = Config {
+            network: Network::new_regtest(Default::default()),
+            ..Config::default()
+        };
+        let limits = ZakuraLocalLimits::from_config(&config);
+        reporter.observe(TransportEvent::Registered {
+            conn_id: 1,
+            remote: peer_addr(0, 0),
+        });
+        reporter.observe(TransportEvent::Admitted {
+            conn_id: 1,
+            quic_stream: 4,
+            kind: ZAKURA_STREAM_HEADER_SYNC,
+            version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            session_id: 7,
+            negotiated_limits: limits.clamp(&limits.initial_limits()),
+            inbound_depth: 4,
+            outbound_depth: 4_096,
+        });
+    });
+    let report = sim.run(&mut NoChecks, &mut MemorySink::default());
+    // The observer outlives the run, as the node's handler does.
+    drop(observer);
+    report
+}
+
+/// The tap's checkpoint covers the `Session` rows it derives, not just the
+/// transport's own events: a wrapper that drops a row, or changes one,
+/// fails the run as lost evidence, and one that relogs everything
+/// unchanged passes.
+///
+/// This fails if the checkpoint records only the transport's events.
+#[test]
+fn a_lost_or_altered_session_row_fails_the_run() {
+    let faithful = tap_run(|delivered| delivered);
+    assert_ne!(faithful.end.outcome, Outcome::Harness, "{:?}", faithful.end);
+    assert!(faithful
+        .log
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry.obs, Observation::Session { .. })));
+    let dropped: fn(Vec<Observation>) -> Vec<Observation> = |delivered| {
+        delivered
+            .into_iter()
+            .filter(|obs| !matches!(obs, Observation::Session { .. }))
+            .collect()
+    };
+    let altered: fn(Vec<Observation>) -> Vec<Observation> = |delivered| {
+        delivered
+            .into_iter()
+            .map(|obs| match obs {
+                Observation::Session {
+                    connection,
+                    quic_stream,
+                    kind,
+                    version,
+                    session_id,
+                    ..
+                } => Observation::Session {
+                    connection,
+                    peer: "peer-1".to_owned(),
+                    quic_stream,
+                    kind,
+                    version,
+                    session_id,
+                },
+                obs => obs,
+            })
+            .collect()
+    };
+    for (case, edit) in [("dropped", dropped), ("altered", altered)] {
+        let report = tap_run(edit);
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("{case}: expected an evidence failure, got {:?}", report.end);
+        };
+        assert_eq!(source, "transport:node#0", "{case}");
+        assert!(detail.starts_with("Undelivered"), "{case}: {detail}");
+    }
 }

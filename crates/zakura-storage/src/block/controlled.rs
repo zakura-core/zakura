@@ -480,6 +480,10 @@ struct Slot {
     /// state's queue replaced it, so this is history no container holds:
     /// the flag stays set after the later admission finishes.
     replaced: bool,
+    /// Whether full state held the body's hash when the run admitted it.
+    /// The verifier checks for a duplicate first, so this, not whether the
+    /// hash is committed now, decides whether a consensus rule can fail.
+    committed_at_admission: bool,
     /// The verifier's receipt order, once admitted.
     receipt: Option<u64>,
     /// A read's caller: its waker, or `None` once it dropped its call. An
@@ -664,6 +668,7 @@ impl Ops {
             oldest_with_room,
             parent_committed,
             committed: committed_now,
+            committed_at_admission: slot.committed_at_admission,
             replaced: slot.replaced,
             older_in_flight,
         }
@@ -923,6 +928,7 @@ impl ControlledBlockService {
                     identity: identity.clone(),
                     class,
                     replaced: false,
+                    committed_at_admission: false,
                     receipt: None,
                     caller,
                 },
@@ -1019,7 +1025,7 @@ impl ControlledBlockService {
             op.check(stage, class, &conditions, outcome)
                 .map_err(CompleteError::Illegal)?;
             if outcome == BlockOutcome::Admit {
-                let (txn, request) = self.admit(&mut ops, id, now);
+                let (txn, request) = self.admit(&mut ops, id, conditions.committed, now);
                 drop(ops);
                 return Ok(Completion {
                     txn,
@@ -1107,9 +1113,16 @@ impl ControlledBlockService {
     /// Admits queued submission `id`, which the verifier receives now, and
     /// publishes its transaction, marking each older admitted submission of
     /// the same hash replaced, as full state's queue replaces a queued block
-    /// with a newer copy. Returns the transaction and the submission's
+    /// with a newer copy. `committed` says whether full state holds the
+    /// body's hash now. Returns the transaction and the submission's
     /// identity.
-    fn admit(&self, ops: &mut Ops, id: OpId, now: Instant) -> (u64, RequestIdentity) {
+    fn admit(
+        &self,
+        ops: &mut Ops,
+        id: OpId,
+        committed: bool,
+        now: Instant,
+    ) -> (u64, RequestIdentity) {
         let hash = ops.slots[&id].identity.submitted_hash();
         let block = ops.slots[&id].submitted_block().cloned();
         // An admitted body still at the verifier lends its receipt to
@@ -1138,6 +1151,7 @@ impl ControlledBlockService {
             *stage = Stage::Admitted;
         }
         slot.receipt = Some(receipt);
+        slot.committed_at_admission = committed;
         let request = slot.identity.clone();
         let txn = ops.publish(now, Vec::new(), |_| FactKind::Admitted { id });
         (txn, request)

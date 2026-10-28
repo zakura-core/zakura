@@ -158,6 +158,10 @@ impl BlockScenario {
     /// handles the tip first, the frontier releases height 1, and the stale
     /// reply that follows frees room without waking the waiting body
     /// (#1523).
+    ///
+    /// The teardown ends by step 465,000 on both committed inputs, after
+    /// which only the mirror's metrics timer runs, so the run stops at
+    /// 470,000 steps instead of the default budget's 837,000.
     pub fn capacity_release() -> Self {
         let mirror = "mirror-0";
         let reads = |count: u32| {
@@ -226,6 +230,7 @@ impl BlockScenario {
                     when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 21))),
                 },
             ],
+            steps: Some(470_000),
             ..BlockScenario::default()
         }
     }

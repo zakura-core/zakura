@@ -204,10 +204,11 @@ fn the_stalled_reset_input_leaves_input_decoded_bound_not_applicable() {
 /// The capacity-release input whose plan handles the detached commit's tip
 /// first: the frontier releases height 1, the stale reply frees room, and
 /// the waiting fork body stays unsubmitted until the node waits on time
-/// (#1523). The witness requires that order: the released submission's
-/// height has no `applying` entry. The run takes 837,000 steps.
+/// (#1523). The witness requires that order: the verified tip reached the
+/// released submission's height, and no `applying` entry holds it. The
+/// run takes 470,000 steps.
 #[test]
-#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it with debug assertions and optimization"]
+#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
 fn the_frontier_first_input_violates_capacity_release_wakes() {
     witnessed(
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
@@ -220,9 +221,9 @@ fn the_frontier_first_input_violates_capacity_release_wakes() {
 /// reply first, before the frontier releases height 1, so the freed room
 /// wakes the waiting fork body. Room frees beside the waiting body, but not
 /// in #1523's order, so this run isn't the property's witness: the test
-/// checks the run directly. The run takes 837,000 steps.
+/// checks the run directly. The run takes 470,000 steps.
 #[test]
-#[ignore = "a debug run takes over twenty minutes; the `zakura_sim slow witnesses` job runs it with debug assertions and optimization"]
+#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
 fn the_reply_first_input_holds_capacity_release_wakes() {
     let witness = committed(CAPACITY_REPLY_FIRST_INPUT);
     let (report, ports) = run(&witness.scenario, witness.input);

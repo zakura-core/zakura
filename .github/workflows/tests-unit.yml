@@ -560,8 +560,8 @@ jobs:
         env:
           RUSTFLAGS: --cfg zakura_sim
 
-  # Some witness tests need a run of most of a million simulated steps, which
-  # a debug build takes over twenty minutes for. They're ignored in
+  # Some witness tests need a run of half a million simulated steps, which a
+  # debug build takes about eight minutes for. They're ignored in
   # `sim-build`, and this job runs them beside it with the `planted` profile,
   # which optimizes and keeps debug assertions and overflow checks on. It has
   # its own target directory and cache key. Folding it into `sim-planted`

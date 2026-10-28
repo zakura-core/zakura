@@ -5,4 +5,4 @@
 # so the freed room wakes the waiting body.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "a79bd402ff6d47e25d80f6685e301bfc78bdddcb99088429e93079e267fa02ec"
+sha256 = "0f641c426bf20127aea63f246571e196258bcae09b54a5d302acb0c2588f9ad0"

@@ -371,8 +371,8 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("release-by-height"),
     },
-    // Both capacity tests are ignored, since each optimized run takes
-    // minutes. The `zakura_sim slow witnesses` job runs them. Main's
+    // Both capacity tests are ignored, since each debug run takes about
+    // eight minutes. The `zakura_sim slow witnesses` job runs them. Main's
     // sequencer is the bypass: the frontier-first input violates it (#1523).
     Coverage {
         property: crate::domain::block_sync_semantic::CAPACITY_RELEASE_WAKES,

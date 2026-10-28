@@ -1437,7 +1437,8 @@ fn check_teardown(events: &[BlockEvent]) -> Result<(), String> {
 
 /// One serving response, as [`check_serving`] folds it.
 struct Response {
-    peer: ZakuraPeerId,
+    /// The serving session: its peer, connection and routine generation.
+    session: (ZakuraPeerId, u64, u64),
     start: block::Height,
     count: u32,
     released: bool,
@@ -1456,11 +1457,13 @@ fn check_serving(events: &[BlockEvent]) -> Result<(usize, usize), String> {
         match event {
             BlockEvent::ServingLease {
                 peer,
+                conn_id,
+                generation,
                 start,
                 count,
                 step: LeaseStep::Acquired,
             } => responses.push(Response {
-                peer: peer.clone(),
+                session: (peer.clone(), *conn_id, *generation),
                 start: *start,
                 count: *count,
                 released: false,
@@ -1469,12 +1472,15 @@ fn check_serving(events: &[BlockEvent]) -> Result<(usize, usize), String> {
             }),
             BlockEvent::ServingLease {
                 peer,
+                conn_id,
+                generation,
                 start,
                 count,
                 step: LeaseStep::Released,
             } => {
+                let session = (peer.clone(), *conn_id, *generation);
                 let Some(response) = responses.iter_mut().find(|response| {
-                    response.peer == *peer
+                    response.session == session
                         && response.start == *start
                         && response.count == *count
                         && !response.released
@@ -1485,12 +1491,15 @@ fn check_serving(events: &[BlockEvent]) -> Result<(usize, usize), String> {
             }
             BlockEvent::ServingFrame {
                 peer,
+                conn_id,
+                generation,
                 start,
                 body_bytes,
                 ..
             } => {
+                let session = (peer.clone(), *conn_id, *generation);
                 let Some(response) = responses.iter_mut().find(|response| {
-                    response.peer == *peer
+                    response.session == session
                         && response.start == *start
                         && response.ending_after_release.is_none()
                 }) else {

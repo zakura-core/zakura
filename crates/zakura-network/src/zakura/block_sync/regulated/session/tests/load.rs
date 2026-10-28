@@ -125,6 +125,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                         let (send, output) = framed_channel(8);
                         let session = serving.session(
                             &peer,
+                            SessionKey::default(),
                             send,
                             cancel.clone(),
                             CancellationToken::new(),
@@ -396,6 +397,7 @@ async fn maximum_sessions_continuous_serving_probe() {
             let (send, output) = framed_channel(64);
             let session = serving.session(
                 &ZakuraPeerId::new(identity).unwrap(),
+                SessionKey::default(),
                 send,
                 cancel.clone(),
                 CancellationToken::new(),

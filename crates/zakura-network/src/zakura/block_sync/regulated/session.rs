@@ -133,9 +133,15 @@ impl Serving {
         self.capacity.peer_held(peer)
     }
 
+    /// A serving session for `peer` that sends on `send`.
+    ///
+    /// In test and simulator builds, the session reports its leases and
+    /// frames as routine session `key`.
     pub(crate) fn session(
         &self,
         peer: &ZakuraPeerId,
+        #[cfg(any(test, zakura_sim))]
+        key: crate::zakura::block_sync::block_sync_observe::SessionKey,
         send: FramedSend,
         cancel: CancellationToken,
         connection: CancellationToken,
@@ -145,12 +151,18 @@ impl Serving {
             .expect("advertised serving limits are within the protocol bounds")
             .with_session(send.clone());
         #[cfg(any(test, zakura_sim))]
-        let producer = producer.with_observer(self.observer.clone(), peer.clone());
+        let identity = crate::zakura::block_sync::block_sync_observe::ServingIdentity {
+            peer: peer.clone(),
+            conn_id: key.conn_id,
+            generation: key.generation,
+        };
+        #[cfg(any(test, zakura_sim))]
+        let producer = producer.with_observer(self.observer.clone(), identity.clone());
         ServingSession {
             #[cfg(any(test, zakura_sim))]
             reporter: crate::zakura::block_sync::block_sync_observe::ServingReporter::new(
                 self.observer.clone(),
-                peer.clone(),
+                identity,
             ),
             // The requester matches each block to the live range expecting its
             // hash and each ending by start height, so ranges need no order.

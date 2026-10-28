@@ -2949,6 +2949,7 @@ mod tests {
         );
         let serving = Serving::new(Arc::new(EmptyBlockRangeSource), config).session(
             session.peer_id(),
+            super::super::block_sync_observe::SessionKey::default(),
             session.request_sender(),
             session.cancel_token(),
             connection.clone(),

@@ -14,7 +14,11 @@
 //! Sessions are never pruned: block sync reports no session close yet, so a
 //! closed session's entry stays.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 
 use zakura_chain::block::Height;
 use zakura_header_chain::BodyWorkOwner;
@@ -27,6 +31,7 @@ use zakura_network::zakura::{
 };
 
 use crate::domain::block_sync::OwnerModel;
+use crate::domain::block_sync_semantic::SemanticModel;
 
 /// An admitted session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +137,9 @@ pub struct BlockSyncView {
     pub anomalies: Vec<String>,
     /// Block storage operations that didn't pair, in order.
     pub pairing: Vec<PairingAnomaly>,
+    /// The semantic checks' model of the run's log, which every clone of
+    /// the view shares.
+    pub semantic: Rc<RefCell<SemanticModel>>,
     /// The resource properties' owner model, which folds the events as the
     /// tap logs them.
     pub owners: OwnerModel,

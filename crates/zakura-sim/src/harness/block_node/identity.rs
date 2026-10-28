@@ -13,12 +13,10 @@
 //!   relay numbers the peer's frames, after the label of a request that
 //!   waited for it;
 //! - a body entering the sequencer's input queue becomes
-//!   [`Observation::WorkAdmitted`], from the frame that delivered it. A
-//!   body can arrive on another connection than its owner's: the routine
-//!   that receives a body for a height re-issued elsewhere hands it off
-//!   under the new owner. The adapter reads the connection from that
-//!   routine's `HandoffStarted`, else tries the owner's connection, then
-//!   every other;
+//!   [`Observation::WorkAdmitted`], from the frame that delivered it: on
+//!   its owner's connection, or, when first-completion-wins credits it to
+//!   that owner, on the connection whose range delivered it (see
+//!   [`Adapter::delivery`]);
 //! - a serving lease's acquisition and release become
 //!   [`Observation::Serving`] and [`Observation::ServingEnded`];
 //! - a serving admission settles the label of a request that waited for
@@ -51,10 +49,10 @@ use zakura_network::zakura::{
     ZakuraPeerId, MSG_BS_BLOCK, MSG_BS_GET_BLOCKS,
 };
 
-use super::relay::{row, row_name, stream, Record, Settle, Wire};
+use super::relay::{row, row_name, stream, BodyFrame, Delivered, Record, Settle, Wire};
 use crate::{
     model::Label,
-    observe::{StorageFact, StorageRequest},
+    observe::{StorageFact, StorageRequest, StorageResult},
     storage::hex,
     Observation, ObservationLog,
 };
@@ -73,9 +71,6 @@ pub(crate) struct Adapter {
     wire: Wire,
     /// Each session's connection.
     sessions: BTreeMap<u64, u64>,
-    /// The connection of the routine that last started a handoff, by
-    /// height.
-    handoffs: BTreeMap<u32, u64>,
     /// Each peer's newest connection, by its ID in hex.
     peers: BTreeMap<String, u64>,
     /// Each submitted body's supplier, by operation ID.
@@ -91,6 +86,14 @@ pub(crate) struct Adapter {
     /// Requests that waited, by connection and frame number, and whether
     /// each settled `Conformant`.
     settled: BTreeMap<(u64, u64), bool>,
+    /// The order in which the node judged each frame, by connection and
+    /// frame number.
+    judged_frames: BTreeMap<(u64, u64), u64>,
+    /// Each needed-blocks query's body work epoch, by operation ID.
+    queries: BTreeMap<u64, u64>,
+    /// The hash each needed-blocks answer listed, by body work epoch and
+    /// height.
+    asked: BTreeMap<(u64, u32), String>,
 }
 
 impl Adapter {
@@ -99,13 +102,15 @@ impl Adapter {
         Adapter {
             wire,
             sessions: BTreeMap::new(),
-            handoffs: BTreeMap::new(),
             peers: BTreeMap::new(),
             suppliers: BTreeMap::new(),
             judged: BTreeSet::new(),
             held: BTreeMap::new(),
             admitting: BTreeMap::new(),
             settled: BTreeMap::new(),
+            judged_frames: BTreeMap::new(),
+            queries: BTreeMap::new(),
+            asked: BTreeMap::new(),
         }
     }
 
@@ -242,6 +247,8 @@ impl Adapter {
     /// Writes that the node judged the peer's frame `seq` on `connection`,
     /// or, for a held request, waits for its serving session to judge it.
     fn judged(&mut self, connection: u64, seq: u64, log: &mut ObservationLog) {
+        let order = self.judged_frames.len() as u64;
+        self.judged_frames.entry((connection, seq)).or_insert(order);
         if let Some(held) = self.held.remove(&(connection, seq)) {
             self.admitting.insert(connection, (seq, held));
             return;
@@ -283,6 +290,13 @@ impl Adapter {
                     });
                 }
             }
+            StorageFact::BlockSubmitted {
+                id,
+                request: StorageRequest::QueryNeededBlocks { scope, .. },
+                ..
+            } => {
+                self.queries.insert(*id, scope.body_work_epoch);
+            }
             StorageFact::BlockCompleted { id, outcome, .. }
                 if outcome.starts_with("payload-mismatch") || outcome == "consensus-invalid" =>
             {
@@ -290,7 +304,80 @@ impl Adapter {
                     self.judged.insert(supplier.clone());
                 }
             }
+            StorageFact::BlockCompleted {
+                id,
+                result: StorageResult::NeededBlocks { blocks, .. },
+                ..
+            } => {
+                if let Some(epoch) = self.queries.get(id).copied() {
+                    for block in blocks {
+                        self.asked.insert((epoch, block.height), block.hash.clone());
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// The connection and frame that delivered a body at `height` that
+    /// block sync queued for a request of body work epoch `epoch` on
+    /// connection `owner`, as of the tap's event `before`.
+    ///
+    /// A candidate is a frame a range took, the node judged, and no work
+    /// named yet, carrying the hash `epoch`'s needed-blocks answer listed
+    /// at `height`. The newest candidate on `owner` wins, unless one on
+    /// another connection is newer and the node judged no frame at
+    /// `height` on `owner` after it, ranged or not. Then block sync's
+    /// first-completion-wins credited that connection's body to `owner`'s
+    /// request. A candidate on another connection needs that hash known,
+    /// so a frame left from an older epoch, on a dead connection, never
+    /// stands in for the body. Without a candidate, it's [`Wire::body`] on
+    /// `owner`, so a body no range took shows on its owner's connection.
+    fn delivery(
+        &self,
+        owner: u64,
+        height: u32,
+        epoch: u64,
+        before: u64,
+    ) -> (u64, Option<Delivered>) {
+        let asked = self.asked.get(&(epoch, height));
+        let frames = self.wire.body_frames(height, before);
+        let judged_at = |frame: &BodyFrame| {
+            self.judged_frames
+                .get(&(frame.connection, frame.delivered.seq))
+        };
+        let newest = |on_owner: bool| {
+            frames
+                .iter()
+                .filter(|frame| {
+                    (frame.connection == owner) == on_owner
+                        && frame.delivered.exchange.is_some()
+                        && !frame.taken
+                        && match asked {
+                            Some(hash) => frame.hash.as_ref() == Some(hash),
+                            None => on_owner,
+                        }
+                })
+                .filter_map(|frame| Some((*judged_at(frame)?, frame)))
+                .max_by_key(|(order, _)| *order)
+        };
+        let owner_last = frames
+            .iter()
+            .filter(|frame| frame.connection == owner)
+            .filter_map(judged_at)
+            .max();
+        let chosen = match (newest(true), newest(false)) {
+            (_, Some((order, other))) if owner_last.is_none_or(|last| *last < order) => Some(other),
+            (Some((_, own)), _) => Some(own),
+            _ => None,
+        };
+        match chosen {
+            Some(frame) => {
+                self.wire
+                    .name(frame.connection, height, frame.delivered.seq);
+                (frame.connection, Some(frame.delivered))
+            }
+            None => (owner, self.wire.body(owner, height, before)),
         }
     }
 
@@ -325,11 +412,6 @@ impl Adapter {
                 // The routine counts from 1, and the relay from 0.
                 self.judged(*conn_id, judged - 1, log);
             }
-            BlockEvent::HandoffStarted { peer, height, .. } => {
-                if let Some(connection) = self.connection(peer) {
-                    self.handoffs.insert(height.0, connection);
-                }
-            }
             // Every body the routine sends the sequencer, with or without a
             // budget charge.
             BlockEvent::Holder {
@@ -337,28 +419,17 @@ impl Adapter {
                 holder: Holder::Queued { .. },
                 change: HolderChange::Retained,
             } => {
-                let height = body.height.0;
-                let handoff = self.handoffs.remove(&height);
-                let owner = self.sessions.get(&body.owner.session_id).copied();
-                let mut candidates: Vec<u64> = handoff.into_iter().chain(owner).collect();
-                for connection in self.sessions.values() {
-                    if !candidates.contains(connection) {
-                        candidates.push(*connection);
-                    }
-                }
-                let Some(&first) = candidates.first() else {
+                let Some(owner) = self.sessions.get(&body.owner.session_id).copied() else {
                     return;
                 };
                 // Work from a body no frame delivered names no frame the
                 // check can find.
-                let (connection, delivered) = candidates
-                    .iter()
-                    .find_map(|connection| {
-                        self.wire
-                            .body(*connection, height, seq)
-                            .map(|delivered| (*connection, Some(delivered)))
-                    })
-                    .unwrap_or((first, None));
+                let (connection, delivered) = self.delivery(
+                    owner,
+                    body.height.0,
+                    body.owner.authority.body_work_epoch.get(),
+                    seq,
+                );
                 log.push(Observation::WorkAdmitted {
                     connection,
                     frame: row(row_name(u16::from(MSG_BS_BLOCK))),
@@ -409,5 +480,58 @@ impl Adapter {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The height every case delivers, and the epoch of the owner's work.
+    const HEIGHT: u32 = 5;
+    const EPOCH: u64 = 2;
+
+    /// An adapter whose needed-blocks answer for `EPOCH` asked for `bb` at
+    /// `HEIGHT`, with each `(connection, seq, exchange, hash)` frame
+    /// crossed and judged in order.
+    fn adapter(frames: &[(u64, u64, Option<u64>, &str)]) -> Adapter {
+        let wire = Wire::new(1);
+        let mut adapter = Adapter::new(wire.clone());
+        adapter.asked.insert((EPOCH, HEIGHT), "bb".to_owned());
+        for (order, (connection, seq, exchange, hash)) in (0..).zip(frames) {
+            let delivered = Delivered {
+                seq: *seq,
+                exchange: *exchange,
+            };
+            wire.push_body(*connection, HEIGHT, order, delivered, hash);
+            adapter.judged_frames.insert((*connection, *seq), order);
+        }
+        adapter
+    }
+
+    /// After a reset, an old-fork frame stays untaken on a dead connection.
+    /// A new-fork body first-completion-wins credits to the owner's request
+    /// comes from the live connection that delivered that hash. With only
+    /// the leftover crossed, the body shows on its owner's connection.
+    #[test]
+    fn a_dead_connections_leftover_never_stands_in_for_a_credited_body() {
+        let credited = adapter(&[(1, 0, Some(5), "aa"), (3, 0, Some(5), "bb")]);
+        let (connection, delivered) = credited.delivery(2, HEIGHT, EPOCH, 100);
+        assert_eq!((connection, delivered.map(|d| d.seq)), (3, Some(0)));
+
+        let leftover = adapter(&[(1, 0, Some(5), "aa")]);
+        let (connection, delivered) = leftover.delivery(2, HEIGHT, EPOCH, 100);
+        assert_eq!((connection, delivered.map(|d| d.seq)), (2, None));
+    }
+
+    /// A body the owner's connection delivered outside any range, judged
+    /// after a matching frame elsewhere, shows on the owner's connection
+    /// with no exchange, so the work check sees it.
+    #[test]
+    fn an_owner_frame_judged_later_beats_a_matching_frame_elsewhere() {
+        let late = adapter(&[(3, 0, Some(5), "bb"), (2, 0, None, "bb")]);
+        let (connection, delivered) = late.delivery(2, HEIGHT, EPOCH, 100);
+        assert_eq!(connection, 2);
+        assert_eq!(delivered.and_then(|d| d.exchange), None);
     }
 }

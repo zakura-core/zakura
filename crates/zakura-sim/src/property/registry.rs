@@ -296,6 +296,8 @@ struct PropertyState {
     ever_held: bool,
     /// The first reason the run can't finish the check.
     inconclusive: Option<Inconclusive>,
+    /// Why the latest evaluation couldn't judge its fired trigger, if so.
+    unsettled: Option<Inconclusive>,
     /// Each quantity's largest value, as the check measured it.
     peaks: BTreeMap<String, u64>,
 }
@@ -547,6 +549,7 @@ fn step_property<S: HasView>(
         Verdict::Violated(v) => violations.push(v),
     }
     violations.extend(parts.recorded);
+    state.unsettled = parts.unsettled;
     for (quantity, value) in parts.peaks {
         let peak = state.peaks.entry(quantity.to_owned()).or_default();
         *peak = (*peak).max(value);
@@ -709,6 +712,7 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
         state
             .inconclusive
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
+            .or(state.unsettled)
     };
     match reason {
         Some(reason) => PropertyOutcome::Inconclusive {

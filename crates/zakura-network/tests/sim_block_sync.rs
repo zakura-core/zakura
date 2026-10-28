@@ -1849,30 +1849,26 @@ fn a_request_that_times_out_unwritten_reports_its_expiry() {
     assert_eq!(net.finish(), ["completed", "completed"]);
     drop((kept_recv, kept_send));
 
-    // `a` still had requests out when the run shut down. Its routine's
-    // drop snapshot shows them returned.
+    // `a` still had requests out when the run shut down. Its routine
+    // returned them, as their timeouts expired or as it dropped, and its
+    // later snapshots show them returned. Without those snapshots, the
+    // teardown check finds the requests still out.
     let a = recorder.events();
     check_request_snapshots(&a).unwrap();
     check_teardown(&a).unwrap();
-    let index = a
+    let held = a
         .iter()
-        .rposition(|event| matches!(event, BlockEvent::Routine(_)))
-        .expect("the routine reports its snapshots");
-    let BlockEvent::Routine(before_drop) = &a[..index]
+        .rposition(
+            |event| matches!(event, BlockEvent::Routine(snapshot) if !snapshot.requests.is_empty()),
+        )
+        .expect("the routine held requests before the shutdown");
+    let without_returns: Vec<_> = a
         .iter()
-        .rev()
-        .find(|event| matches!(event, BlockEvent::Routine(_)))
-        .expect("the routine reported before its drop")
-    else {
-        unreachable!("found above")
-    };
-    assert!(
-        !before_drop.requests.is_empty(),
-        "the routine held requests until its drop"
-    );
-    let mut without_drop = a.clone();
-    without_drop.remove(index);
-    assert!(check_teardown(&without_drop).is_err());
+        .enumerate()
+        .filter(|(at, event)| *at <= held || !matches!(event, BlockEvent::Routine(_)))
+        .map(|(_, event)| event.clone())
+        .collect();
+    assert!(check_teardown(&without_returns).is_err());
 }
 
 /// `b` can't read the blocks it stores. Serve releases each response's

@@ -23,8 +23,9 @@ use zakura_sim::{
     observe::Exit,
     property::{
         Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent, HasView,
-        Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Registry,
-        RegistryChecker, RegistryError, Source, Sources, Status, Subject, Tee, Verdict,
+        Inconclusive, Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Property,
+        PropertyId, Registry, RegistryChecker, RegistryError, Source, Sources, Status, Subject,
+        Tee, Verdict,
     },
     ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, Observation,
     ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
@@ -672,6 +673,55 @@ fn known_violation_does_not_stop_the_run() {
         active.end.violation.map(|v| v.step),
         Some(exit_step(&active.log, "bump.1"))
     );
+}
+
+const SETTLED: PropertyId = PropertyId::new("test/settled-at-two");
+
+/// Holds once the counter reaches 2. At 1 its trigger has fired, but it
+/// can't judge yet, so it's unsettled.
+fn settled_at_two(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    match cx.view() {
+        0 => Verdict::NotApplicable,
+        1 => {
+            cx.unsettled(Inconclusive::TeardownOpen);
+            Verdict::NotApplicable
+        }
+        _ => Verdict::Holds,
+    }
+}
+
+/// A run whose latest evaluation was unsettled is `Inconclusive` with the
+/// check's reason. A later evaluation that judges the property clears it.
+#[test]
+fn an_unsettled_last_evaluation_is_inconclusive() {
+    let bumps = |count| {
+        let world = honest();
+        let task_world = world.clone();
+        let property = Property {
+            id: SETTLED,
+            claim: "the counter settles at 2",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status: Status::Active,
+            check: settled_at_two,
+            witness: None,
+        };
+        report(world, vec![property], Assumptions::none(), move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                for _ in 0..count {
+                    bump(&task_world);
+                    task::yield_now().await;
+                }
+            });
+        })
+    };
+    assert_eq!(outcome(&bumps(1), &SETTLED), inconclusive("teardown-open"));
+    assert!(
+        matches!(outcome(&bumps(2), &SETTLED), PropertyOutcome::Held { .. }),
+        "the second bump settles it"
+    );
+    assert_eq!(outcome(&bumps(0), &SETTLED), PropertyOutcome::NotApplicable);
 }
 
 /// An `Ops` bound counts the named task's points of one operation after

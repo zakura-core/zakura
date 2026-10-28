@@ -551,16 +551,42 @@ impl PeerRoutine {
 
     /// Reports the routine's owner state and the work queue's items, if an
     /// observer is installed. `ended` marks the routine's last snapshot.
+    ///
+    /// Each request lists its received heights and the unreceived heights
+    /// the work queue still assigns to it. Another actor's revocation
+    /// releases a height's charge at once, but the routine drops the height
+    /// only at its next fill (`gc_obsolete_outstanding`), which a full
+    /// outbound queue skips. The snapshot applies the same check now, so it
+    /// lists only heights the budget still counts.
     #[cfg(any(test, zakura_sim))]
     fn observe_owners(&self, ended: bool) {
         use super::block_sync_observe::{BlockEvent, RegistryClaim, RoutineSnapshot};
+        let mut requests = self.window.outstanding.ownership();
+        let unreceived: Vec<_> = requests
+            .iter()
+            .flat_map(|request| {
+                request
+                    .heights
+                    .iter()
+                    .filter(|height| !height.received)
+                    .map(|height| (height.height, request.owner))
+            })
+            .collect();
+        if !unreceived.is_empty() {
+            let disowned = self.work.disowned(&unreceived, |owner| *owner);
+            for request in &mut requests {
+                request
+                    .heights
+                    .retain(|height| !disowned.contains(&(height.height, request.owner)));
+            }
+        }
         observe!(
             self.observer,
             BlockEvent::Routine(RoutineSnapshot {
                 peer: self.peer.clone(),
                 conn_id: self.conn_id,
                 generation: self.generation,
-                requests: self.window.outstanding.ownership(),
+                requests,
                 claims: self
                     .registry
                     .outstanding_snapshot(&self.peer, self.generation)
@@ -690,8 +716,11 @@ impl PeerRoutine {
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             zakura_rt::pin!(outbound_queue_poll);
 
-            // After the fill, so the snapshot holds the requests and
-            // reservations it made while the routine parks.
+            // The routine's snapshot, once per iteration, after the deadlines
+            // and the fill above have reserved or released request bytes. The
+            // routine can park below for a whole timeout, so a snapshot here
+            // lets an observer reconcile the budget with every routine's
+            // outstanding estimates while the run rests.
             #[cfg(any(test, zakura_sim))]
             self.observe_owners(false);
             zakura_rt::select! {

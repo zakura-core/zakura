@@ -5,8 +5,9 @@
 //! link. It labels each frame as the peer at the link's far end would, with
 //! P3a's role models for stream 6, records the label, and forwards the
 //! frame unchanged. A peer's frame to the node becomes an
-//! [`Observation::PeerFrame`], and a request that opens an exchange with
-//! the node an [`Observation::ExchangeOwed`] too. The node's frame to the
+//! [`Observation::PeerFrame`], a request that opens an exchange with the
+//! node an [`Observation::ExchangeOwed`] too, and a body an
+//! [`Observation::PeerBody`] with its height and hash. The node's frame to the
 //! peer becomes an [`Observation::NodeFrame`], labelled under the sender's
 //! rules, and a response the node writes an [`Observation::NodeOutput`]
 //! with the frame's own payload length. The probe's link has relays too, so
@@ -68,6 +69,7 @@ use super::tap::TapClock;
 use crate::{
     model::{CadenceModel, Charge, ExchangeModel, FrameHeader, FrameModel, Label, Owed, ReaderEnd},
     observe::{RowAt, StreamId},
+    storage::hex,
     Observation,
 };
 
@@ -738,13 +740,27 @@ pub(crate) struct Delivered {
     pub(crate) exchange: Option<u64>,
 }
 
-/// One delivery of a body, with the tap's event count when it crossed and
-/// whether work already named it.
-#[derive(Clone, Copy, Debug)]
+/// One delivery of a body, with the tap's event count when it crossed, the
+/// hash its body carries, and whether work already named it.
+#[derive(Clone, Debug)]
 struct Delivery {
     after: u64,
     delivered: Delivered,
+    /// `None` for a frame that doesn't decode.
+    hash: Option<String>,
     taken: bool,
+}
+
+/// A body frame that crossed to the node, as [`Wire::body_frames`] lists it.
+#[derive(Clone, Debug)]
+pub(crate) struct BodyFrame {
+    /// The connection it crossed on.
+    pub(crate) connection: u64,
+    pub(crate) delivered: Delivered,
+    /// The hash its body carries, `None` for a frame that doesn't decode.
+    pub(crate) hash: Option<String>,
+    /// Whether work already named it.
+    pub(crate) taken: bool,
 }
 
 /// What the relays share with the node's tap.
@@ -853,7 +869,8 @@ impl Wire {
             panic!("a relay's connection has models, since its pipe made them");
         };
         let (obs, extra) = labeller.label(way, frame, now);
-        let height = frame_height(frame);
+        let decoded = BlockSyncMessage::decode_frame(frame.clone()).ok();
+        let height = decoded.as_ref().and_then(frame_height);
         let output = match way {
             Way::FromNode => node_output(connection, frame, height, &extra, labeller),
             Way::ToNode => None,
@@ -874,6 +891,19 @@ impl Wire {
                 None => Record::Obs(obs),
             },
         ));
+        if let (Way::ToNode, Some(BlockSyncMessage::Block(body))) = (way, &decoded) {
+            if let Some(height) = body.coinbase_height() {
+                state.records.push((
+                    after,
+                    Record::Obs(Observation::PeerBody {
+                        connection,
+                        seq,
+                        height: height.0,
+                        hash: hex(&body.hash().0),
+                    }),
+                ));
+            }
+        }
         // An ending's output closes its exchange before the exchanges
         // queued behind it open, which may share its key.
         if let Some(output) = output {
@@ -911,6 +941,10 @@ impl Wire {
                         seq,
                         exchange: extra.exchange.filter(|_| extra.body.is_some()),
                     },
+                    hash: match &decoded {
+                        Some(BlockSyncMessage::Block(body)) => Some(hex(&body.hash().0)),
+                        _ => None,
+                    },
                     taken: false,
                 });
         }
@@ -937,19 +971,92 @@ impl Wire {
     /// `before`: the oldest one a range took that no work named yet, else
     /// the newest.
     pub(crate) fn body(&self, connection: u64, height: u32, before: u64) -> Option<Delivered> {
+        self.untaken_body(connection, height, before).or_else(|| {
+            self.0
+                .borrow()
+                .bodies
+                .get(&(connection, height))?
+                .iter()
+                .rev()
+                .find(|delivery| delivery.after < before)
+                .map(|delivery| delivery.delivered)
+        })
+    }
+
+    /// The oldest body frame at `height` on `connection` that a range took
+    /// and no work named yet, of those that crossed before the tap's event
+    /// `before`, which it marks named.
+    fn untaken_body(&self, connection: u64, height: u32, before: u64) -> Option<Delivered> {
         let mut state = self.0.borrow_mut();
-        let deliveries = state.bodies.get_mut(&(connection, height))?;
-        if let Some(delivery) = deliveries.iter_mut().find(|delivery| {
-            delivery.after < before && !delivery.taken && delivery.delivered.exchange.is_some()
-        }) {
-            delivery.taken = true;
-            return Some(delivery.delivered);
-        }
-        deliveries
+        let delivery = state
+            .bodies
+            .get_mut(&(connection, height))?
+            .iter_mut()
+            .find(|delivery| untaken(delivery, before))?;
+        delivery.taken = true;
+        Some(delivery.delivered)
+    }
+
+    /// Every body frame at `height`, on any connection, of those that
+    /// crossed before the tap's event `before`.
+    pub(crate) fn body_frames(&self, height: u32, before: u64) -> Vec<BodyFrame> {
+        self.0
+            .borrow()
+            .bodies
             .iter()
-            .rev()
-            .find(|delivery| delivery.after < before)
-            .map(|delivery| delivery.delivered)
+            .filter(|((_, at), _)| *at == height)
+            .flat_map(|((connection, _), deliveries)| {
+                deliveries
+                    .iter()
+                    .filter(|delivery| delivery.after < before)
+                    .map(|delivery| BodyFrame {
+                        connection: *connection,
+                        delivered: delivery.delivered,
+                        hash: delivery.hash.clone(),
+                        taken: delivery.taken,
+                    })
+            })
+            .collect()
+    }
+
+    /// Records that a body frame carrying `hash` crossed `connection` at
+    /// `height` after the tap's event `after`, as a relay would.
+    #[cfg(test)]
+    pub(crate) fn push_body(
+        &self,
+        connection: u64,
+        height: u32,
+        after: u64,
+        delivered: Delivered,
+        hash: &str,
+    ) {
+        self.0
+            .borrow_mut()
+            .bodies
+            .entry((connection, height))
+            .or_default()
+            .push(Delivery {
+                after,
+                delivered,
+                hash: Some(hash.to_owned()),
+                taken: false,
+            });
+    }
+
+    /// Marks the body frame `seq` at `height` on `connection` named by work.
+    pub(crate) fn name(&self, connection: u64, height: u32, seq: u64) {
+        let mut state = self.0.borrow_mut();
+        if let Some(delivery) = state
+            .bodies
+            .get_mut(&(connection, height))
+            .and_then(|deliveries| {
+                deliveries
+                    .iter_mut()
+                    .find(|delivery| delivery.delivered.seq == seq)
+            })
+        {
+            delivery.taken = true;
+        }
     }
 
     /// Each connection that closed since the last call, with its cause.
@@ -971,10 +1078,15 @@ impl Wire {
     }
 }
 
-/// The height a body frame carries, or the start an ending names, if the
-/// frame decodes.
-fn frame_height(frame: &Frame) -> Option<u32> {
-    match BlockSyncMessage::decode_frame(frame.clone()).ok()? {
+/// Whether `delivery` crossed before the tap's event `before`, a range
+/// took it, and no work named it yet.
+fn untaken(delivery: &Delivery, before: u64) -> bool {
+    delivery.after < before && !delivery.taken && delivery.delivered.exchange.is_some()
+}
+
+/// The height a decoded body frame carries, or the start an ending names.
+fn frame_height(message: &BlockSyncMessage) -> Option<u32> {
+    match message {
         BlockSyncMessage::Block(body) => body.coinbase_height().map(|height| height.0),
         BlockSyncMessage::BlocksDone { start_height, .. }
         | BlockSyncMessage::RangeUnavailable { start_height, .. } => Some(start_height.0),

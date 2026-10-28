@@ -11,6 +11,7 @@
 //! scenario's [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
 pub mod block_node;
+pub mod block_semantic;
 pub mod block_sync;
 pub mod coverage;
 pub mod discovery;

@@ -5,25 +5,29 @@
 //! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
 //! change that bypasses the property's guard, with `<name>.toml` beside it
 //! naming the committed fuzz input that must find the bug. The input's own
-//! sidecar names its harness. For each case the runner:
+//! sidecar names its harness.
 //!
-//! 1. checks out `HEAD` in a scratch worktree under `target/planted/`; every
-//!    case builds with the workspace's `planted` profile in
-//!    `target/planted/target`, apart from the checkout's own target
-//!    directory;
-//! 2. records the input unpatched, which must hold the property with no
-//!    violation of any property and pass its witness test expecting
-//!    `holds`;
-//! 3. applies the patch and records the input again, which must violate
-//!    exactly the case's property and pass its witness test expecting
-//!    `violated`;
-//! 4. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
+//! The runner checks out `HEAD` once, in a scratch worktree under
+//! `target/planted/`, and builds the unpatched simulator there once. Every
+//! build uses the workspace's `planted` profile in `target/planted/target`,
+//! apart from the checkout's own target directory. Then for each case it:
+//!
+//! 1. records the input with the unpatched build, which must hold the
+//!    property with no violation of any property and pass its witness test
+//!    expecting `holds`;
+//! 2. applies the patch, rebuilds and records the input again, which must
+//!    violate exactly the case's property and pass its witness test
+//!    expecting `violated`;
+//! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
 //!    pass the witness test. A case file's `also_violates` names properties
 //!    the patch's bug breaks too, and a campaign run may violate one of
 //!    them instead;
-//! 5. removes the worktree, keeping every trace as evidence.
+//! 4. resets the worktree to `HEAD`, so the next patched build recompiles
+//!    only what the two patches touch.
+//!
+//! It then removes the worktree, keeping every trace as evidence.
 //!
 //! A witness test passes only if the run reached the property's trigger
 //! history. `zakura-sim record --witness` judges it with the rule the
@@ -290,15 +294,18 @@ pub(super) fn run(
         None => cases,
     };
     let work = repo_root.join("target").join("planted");
-    let mut failed = 0;
-    for (index, case) in cases.iter().enumerate() {
-        let scratch = work.join(format!("case-{index}"));
-        let verdict = run_case(repo_root, &scratch, &work.join("target"), case)?;
-        println!("{} {}: {verdict}", case.property, case.patch.display());
-        if !matches!(verdict, Verdict::Caught(_)) {
-            failed += 1;
-        }
-    }
+    let worktree = work.join("worktree");
+    remove_worktree(repo_root, &worktree)?;
+    fs::create_dir_all(&work)?;
+    run_command(
+        git(repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD"),
+    )?;
+    let failed = run_cases(&worktree, &work, &cases);
+    remove_worktree(repo_root, &worktree)?;
+    let failed = failed?;
     if failed > 0 {
         return Err(format!("{failed} of {} planted cases failed", cases.len()).into());
     }
@@ -471,50 +478,58 @@ fn find_patches(dir: &Path, patches: &mut Vec<PathBuf>) -> Result<(), BoxError> 
     Ok(())
 }
 
-/// Runs `case` in a scratch worktree under `scratch`, building in `target`,
-/// and removes the worktree after. The traces stay under `scratch`.
-fn run_case(
-    repo_root: &Path,
-    scratch: &Path,
-    target: &Path,
-    case: &Case,
-) -> Result<Verdict, BoxError> {
-    let worktree = scratch.join("worktree");
+/// Removes the scratch worktree at `worktree`, if there is one.
+fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
     if worktree.exists() {
         run_command(
             git(repo_root)
                 .args(["worktree", "remove", "--force"])
-                .arg(&worktree),
+                .arg(worktree),
         )?;
     }
-    fs::create_dir_all(scratch)?;
-    run_command(
-        git(repo_root)
-            .args(["worktree", "add", "--detach"])
-            .arg(&worktree)
-            .arg("HEAD"),
-    )?;
-    let verdict = check_case(&worktree, scratch, target, case);
-    run_command(
-        git(repo_root)
-            .args(["worktree", "remove", "--force"])
-            .arg(&worktree),
-    )?;
-    verdict
+    Ok(())
 }
 
-/// Runs the baseline and the patched input in `worktree`, building in
-/// `target` and writing their traces under `scratch`.
+/// Builds the unpatched simulator in `worktree` once, then runs each case
+/// there, writing its traces under `work`, and resets the worktree after
+/// each. Returns how many cases failed.
+fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxError> {
+    let target = work.join("target");
+    run_command(&mut cargo_sim(worktree, &target, "build"))?;
+    // The patched builds reuse the target directory, so the baseline keeps
+    // its own copy of the binary.
+    let baseline = work.join("baseline-zakura-sim");
+    fs::copy(target.join(PROFILE).join("zakura-sim"), &baseline)?;
+    let mut failed = 0;
+    for (index, case) in cases.iter().enumerate() {
+        let scratch = work.join(format!("case-{index}"));
+        fs::create_dir_all(&scratch)?;
+        let verdict = check_case(worktree, &scratch, &target, &baseline, case);
+        run_command(git(worktree).args(["reset", "--hard", "--quiet", "HEAD"]))?;
+        run_command(git(worktree).args(["clean", "-fdq"]))?;
+        let verdict = verdict?;
+        println!("{} {}: {verdict}", case.property, case.patch.display());
+        if !matches!(verdict, Verdict::Caught(_)) {
+            failed += 1;
+        }
+    }
+    Ok(failed)
+}
+
+/// Runs the input on the unpatched `baseline` binary, then patches
+/// `worktree` and runs it again, building in `target` and writing both
+/// traces under `scratch`.
 fn check_case(
     worktree: &Path,
     scratch: &Path,
     target: &Path,
+    baseline: &Path,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
     let harness = harness_of(worktree, &case.input)?;
     let input = worktree.join(&case.input);
     let baseline = record(
-        cargo_run(worktree, target),
+        Command::new(baseline),
         &harness,
         &input,
         &case.property,
@@ -527,8 +542,10 @@ fn check_case(
     if let Err(why) = apply(worktree, &case.patch) {
         return Ok(Verdict::PatchDoesntApply(why));
     }
+    let mut patched_sim = cargo_sim(worktree, target, "run");
+    patched_sim.arg("--");
     let patched = record(
-        cargo_run(worktree, target),
+        patched_sim,
         &harness,
         &input,
         &case.property,
@@ -650,17 +667,18 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// `zakura-sim`, built with [`PROFILE`] and run from `worktree`'s simulator
-/// build in `target`.
-fn cargo_run(worktree: &Path, target: &Path) -> Command {
+/// `cargo <verb>` for `worktree`'s `zakura-sim` binary, built with
+/// [`PROFILE`] and the simulator's flags in `target`. A `run` takes the
+/// binary's arguments after a `--`.
+fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", target)
         .current_dir(worktree)
+        .arg(verb)
         .args([
-            "run",
             "--locked",
             "--profile",
             PROFILE,
@@ -668,7 +686,6 @@ fn cargo_run(worktree: &Path, target: &Path) -> Command {
             "zakura-sim",
             "--bin",
             "zakura-sim",
-            "--",
         ]);
     command
 }

@@ -142,6 +142,20 @@ pub enum Observation {
         /// The payload's length in bytes, frame header excluded.
         payload: u64,
     },
+    /// The body a peer's block frame carried, which the relay reads off the
+    /// frame after its [`Observation::PeerFrame`]. A model input, like
+    /// [`Observation::ExchangeOwed`]. A frame whose body doesn't decode, or
+    /// has no coinbase height, has none.
+    PeerBody {
+        /// The connection.
+        connection: u64,
+        /// The frame, as its [`Observation::PeerFrame`] numbers it.
+        seq: u64,
+        /// The body's coinbase height.
+        height: u32,
+        /// The body's hash, in hex as storage writes it.
+        hash: String,
+    },
     /// A frame the node sent on a tabled stream reached a peer, whose role
     /// models labelled it on arrival under the sender's rules: `OverMargin`
     /// once the node's open requests exceed the highest limit the peer

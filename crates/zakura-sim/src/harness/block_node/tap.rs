@@ -26,7 +26,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     mem,
     rc::Rc,
     sync::{
@@ -43,7 +43,7 @@ use zakura_network::zakura::{
     ServicePeerDirection, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
-use zakura_scheduler::SimInstant;
+use zakura_scheduler::{hooks, SimInstant, TaskId};
 use zakura_storage::block::controlled::ControlledBlockService;
 
 use super::{
@@ -53,6 +53,7 @@ use super::{
     view::BlockSyncView,
 };
 use crate::{
+    domain::block_sync::OwnerInput,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
         BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
@@ -104,6 +105,9 @@ struct TapState {
     /// Set when the reader logged the sequencer's close.
     closed: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// The heights of each task's open handoffs, by the task that recorded
+    /// each start.
+    handoffs: Mutex<BTreeMap<TaskId, Vec<u32>>>,
 }
 
 /// Events recorded and not yet drained.
@@ -177,6 +181,25 @@ impl TapClock {
     }
 }
 
+/// Which tasks are handing a body to the sequencer, by the tasks that
+/// recorded each handoff's start and end.
+#[derive(Clone)]
+pub struct TapHandoffs(Arc<TapState>);
+
+impl TapHandoffs {
+    /// The heights of the handoffs `task` recorded the start of and not
+    /// yet the end.
+    pub fn open(&self, task: TaskId) -> Vec<u32> {
+        self.0
+            .handoffs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&task)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 /// The observer block sync holds.
 struct TapObserver(Arc<TapState>);
 
@@ -203,6 +226,28 @@ impl BlockSyncObserver for TapObserver {
                 0
             }
         };
+        if let Some(task) = hooks::current_task() {
+            let mut handoffs = state
+                .handoffs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match &event {
+                BlockEvent::HandoffStarted { height, .. } => {
+                    handoffs.entry(task).or_default().push(height.0);
+                }
+                BlockEvent::HandoffEnded { height, .. } => {
+                    if let Some(open) = handoffs.get_mut(&task) {
+                        if let Some(at) = open.iter().position(|open| *open == height.0) {
+                            open.remove(at);
+                        }
+                        if open.is_empty() {
+                            handoffs.remove(&task);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut buffer = state.buffer();
         buffer.last = buffer
             .last
@@ -240,6 +285,7 @@ impl BlockTap {
                 teardown: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                handoffs: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -271,6 +317,21 @@ impl BlockTap {
     pub(crate) fn label_with(&mut self, wire: Wire) {
         wire.set_clock(TapClock(self.state.clone()));
         self.adapter = Some(Adapter::new(wire));
+    }
+
+    /// Folds the harness's links to the node into the owner model: `made`
+    /// made so far, `open` of them still open.
+    pub(crate) fn fold_links(&self, made: u64, open: u64) {
+        self.view
+            .borrow_mut()
+            .owners
+            .apply(OwnerInput::Links { made, open });
+    }
+
+    /// The tasks handing a body to the sequencer, for a hold that pauses
+    /// them there.
+    pub fn handoffs(&self) -> TapHandoffs {
+        TapHandoffs(self.state.clone())
     }
 
     /// The notice the harness gives this tap when it tears the node down.
@@ -680,6 +741,9 @@ impl ActionSource for BlockTap {
             }),
         );
         let mut view = self.view.borrow_mut();
+        for (_, fact) in &facts {
+            view.owners.observe_storage(fact);
+        }
         for (_, _, event) in &events {
             view.fold(event);
         }

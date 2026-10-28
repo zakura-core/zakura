@@ -5912,6 +5912,156 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     task.abort();
 }
 
+/// #1523: an epoch change detaches a full submission window. The new epoch's
+/// bodies for heights 1 to 3 wait in `applying`. Detached completions for
+/// heights 399 to 401, which no `applying` entry holds, each free a slot with
+/// no semantic owner. Each must wake one waiting body.
+#[tokio::test]
+async fn stale_completions_without_applying_entries_wake_waiting_work() {
+    const WAITING: u32 = 3;
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+    let block_count = u32::try_from(submission_limit).expect("401 fits in u32");
+    let blocks = fake_sequential_blocks(block_count);
+    let frontiers = genesis_frontiers();
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(submission_limit);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(2 * submission_limit);
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), submission_limit),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+        body_rx,
+        control_rx,
+        body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
+        view_tx,
+        CHANNEL_TIMEOUT,
+        ZakuraTrace::noop(),
+    );
+    let task = tokio::spawn(task.run());
+    let queued = |owner, block: &Arc<block::Block>| {
+        SequencedBody::new_queued(
+            owner,
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            block.coinbase_height().expect("test block has height"),
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block))),
+            u64::from(block_size(block)),
+            None,
+            peer(1),
+            Instant::now(),
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+        )
+    };
+
+    for block in &blocks {
+        body_tx
+            .send(queued(test_work_owner(), block))
+            .await
+            .expect("old epoch bodies queue");
+    }
+    let mut detached = Vec::with_capacity(submission_limit);
+    while detached.len() < submission_limit {
+        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+            .await
+            .expect("old epoch submission arrives")
+            .expect("sequencer action channel remains live");
+        match action {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => detached.push((owner, source, token, block)),
+            action => panic!("unexpected old epoch action: {action:?}"),
+        }
+    }
+
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+    control_tx
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers,
+        })
+        .expect("scope transition queues");
+    let current_owner =
+        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
+    for block in blocks.iter().take(WAITING as usize) {
+        body_tx
+            .send(queued(current_owner, block))
+            .await
+            .expect("current epoch bodies queue");
+    }
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.unsubmitted_applying_count == u64::from(WAITING) {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("the current epoch's bodies wait behind the detached window");
+    assert!(
+        next_submission(&mut actions_rx, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "the detached submissions fill the count window",
+    );
+
+    for (owner, source, token, block) in detached.into_iter().rev().take(WAITING as usize) {
+        let height = block.coinbase_height().expect("test block has height");
+        assert!(
+            height.0 > WAITING,
+            "no applying entry holds height {height:?}"
+        );
+        control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source,
+                token,
+                height,
+                hash: block.hash(),
+                outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+                eligible_sources: BTreeSet::new(),
+                persisted_availability: None,
+                semantic_completion: None,
+            })
+            .expect("detached completion queues");
+    }
+
+    for expected_height in 1..=WAITING {
+        let (_, block) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
+            .await
+            .unwrap_or_else(|| panic!("freed room wakes height {expected_height}"));
+        assert_eq!(
+            block.coinbase_height(),
+            Some(block::Height(expected_height))
+        );
+    }
+
+    task.abort();
+}
+
 #[test]
 fn sequencer_accept_body_rejects_at_or_below_floor() {
     let mut seq = test_sequencer(5, 4);

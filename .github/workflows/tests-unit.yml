@@ -586,12 +586,11 @@ jobs:
           cache-shared-key: zakura-sim-slow
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      # #1523: the frontier-first input violates capacity-release-wakes, and
-      # the reply-first input holds it.
+      # Both capacity-release inputs hold capacity-release-wakes (#1523).
       - name: Run the slow witness tests
         run: |
           cargo test --locked --profile planted -p zakura-sim --test block_semantic_properties -- --ignored \
-            the_frontier_first_input_violates_capacity_release_wakes \
+            the_frontier_first_input_holds_capacity_release_wakes \
             the_reply_first_input_holds_capacity_release_wakes
         env:
           RUSTFLAGS: --cfg zakura_sim

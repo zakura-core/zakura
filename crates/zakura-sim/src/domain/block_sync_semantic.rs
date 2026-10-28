@@ -51,9 +51,6 @@ pub const DETACHED_SUBMISSION_BOUNDED: &str = "block-sync/detached-submission-bo
 /// The sequencer's input queue retains raw envelopes, not decoded bodies.
 pub const INPUT_DECODED_BOUND: &str = "block-sync/input-decoded-bound";
 
-/// The issue whose bug [`CAPACITY_RELEASE_WAKES`] witnesses.
-pub const CAPACITY_RELEASE_WAKES_ISSUE: u32 = 1523;
-
 /// What every property here reads.
 const NEEDS: &[Source] = &[Source::Storage, Source::Frames, Source::View];
 
@@ -64,9 +61,9 @@ pub trait SemanticView {
 }
 
 /// The block-sync semantic properties, for a harness whose view carries the
-/// model: [`SUBMIT_ONLY_REQUESTED`] and [`STALE_COMPLETION_INERT`], active;
-/// [`CAPACITY_RELEASE_WAKES`], known for #1523; and
-/// [`DETACHED_SUBMISSION_BOUNDED`] and [`INPUT_DECODED_BOUND`], drafts.
+/// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`] and
+/// [`CAPACITY_RELEASE_WAKES`], active; and [`DETACHED_SUBMISSION_BOUNDED`]
+/// and [`INPUT_DECODED_BOUND`], drafts.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -106,9 +103,7 @@ where
             },
             assumes: &[],
             needs: NEEDS,
-            status: Status::Known {
-                issue: CAPACITY_RELEASE_WAKES_ISSUE,
-            },
+            status: Status::Active,
             check: check_capacity_release_wakes::<S>,
             witness: Some(room_freed_past_the_frontier),
         },

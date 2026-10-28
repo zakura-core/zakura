@@ -912,7 +912,15 @@ impl SequencerTask {
                 outcome.verification(),
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
-            return (false, released && verified && semantic_completion.is_some());
+            // A detached submission from an older epoch completes with no
+            // semantic owner, but its slot still frees room for waiting
+            // `applying` work. Without this wake that work waits for an
+            // unrelated event (#1523).
+            let room_for_waiting_work = released && self.sequencer.unsubmitted_applying_count() > 0;
+            return (
+                false,
+                room_for_waiting_work || (released && verified && semantic_completion.is_some()),
+            );
         };
         if applying_owner != owner
             || applying_source != source

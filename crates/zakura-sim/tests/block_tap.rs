@@ -294,6 +294,7 @@ fn submission(token: u64) -> StorageFact {
             hash: "aa".to_owned(),
             parent: "bb".to_owned(),
             class: "full".to_owned(),
+            decoded_bytes: 2_000,
         },
         stage: Some("queued".to_owned()),
     }

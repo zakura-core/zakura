@@ -1,0 +1,10 @@
+# Admits the next body past the decoded-byte target whenever no `applying`
+# body is submitted, as #1521's main did: a reset that detaches every
+# submission frees the target's room though storage still holds the
+# detached bodies. The input's storage never answers a submission, the
+# node's submissions fill the target, and a reset then detaches them all.
+input = "crates/zakura-sim/tests/fixtures/block-sync-decoded-target-reset.bin"
+# Besides sequencer.rs, which the patch changes, the rest of block sync
+# decides when the reset reaches the sequencer and which bodies it holds
+# then. A change there can move the input off the full target.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

@@ -12,7 +12,9 @@
 //! The harness hands the model the node's submission limit,
 //! `submitted_apply_limit()` of the config it spawns the node with. A
 //! trigger history rebuilds the model from the log alone, so it assumes
-//! the default config's limit, which every block-sync scenario runs.
+//! the default config's limit, which every block-sync scenario runs. The
+//! decoded-byte target, [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], is a
+//! constant.
 
 use std::{
     cell::RefCell,
@@ -20,7 +22,7 @@ use std::{
     rc::Rc,
 };
 
-use zakura_network::zakura::ZakuraBlockSyncConfig;
+use zakura_network::zakura::{ZakuraBlockSyncConfig, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES};
 
 use crate::{
     model::Label,
@@ -64,9 +66,9 @@ pub trait SemanticView {
 }
 
 /// The block-sync semantic properties, for a harness whose view carries the
-/// model: [`SUBMIT_ONLY_REQUESTED`] and [`STALE_COMPLETION_INERT`], active;
-/// [`CAPACITY_RELEASE_WAKES`], known for #1523; and
-/// [`DETACHED_SUBMISSION_BOUNDED`] and [`INPUT_DECODED_BOUND`], drafts.
+/// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`] and
+/// [`DETACHED_SUBMISSION_BOUNDED`], active; [`CAPACITY_RELEASE_WAKES`],
+/// known for #1523; and [`INPUT_DECODED_BOUND`], a draft.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -114,12 +116,13 @@ where
         },
         Property {
             id: PropertyId::new(DETACHED_SUBMISSION_BOUNDED),
-            claim: "attached and detached submissions share the submission limit, and every \
-                    submission storage held across a reset keeps an attached or detached holder",
+            claim: "attached and detached submissions share the submission limit and the \
+                    decoded-byte target, which only a lone body may pass, and every submission \
+                    storage held across a reset keeps an attached or detached holder",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,
-            status: Status::Draft,
+            status: Status::Active,
             check: check_detached_submission_bounded::<S>,
             witness: Some(reset_while_storage_held),
         },
@@ -241,6 +244,9 @@ pub struct SemanticModel {
     detached_total: u64,
     /// Each taken token's owner epoch.
     token_epochs: BTreeMap<u64, Option<u64>>,
+    /// Each taken token's decoded bytes, for a body above the last
+    /// checkpoint, where the decoded-byte target applies.
+    decoded: BTreeMap<u64, u64>,
     /// Each submission holder's body height, by token.
     submission_heights: BTreeMap<u64, u32>,
     /// Each `applying` body's height and owner epoch, by allocation.
@@ -289,6 +295,9 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether it did so while the decoded bytes storage held left no room
+    /// under the decoded-byte target for another body of the same size.
+    pub saw_reset_at_byte_target: bool,
     /// Whether virtual time advanced while the input queue held a body.
     pub saw_queued_at_idle: bool,
 }
@@ -376,6 +385,21 @@ impl SemanticModel {
         self.attached_total
     }
 
+    /// The decoded bytes of the bodies storage holds above the last
+    /// checkpoint, how many bodies hold them, and the smallest one's bytes.
+    fn held_decoded(&self) -> (u64, usize, Option<u64>) {
+        self.storage_held
+            .iter()
+            .filter_map(|token| self.decoded.get(token))
+            .fold((0, 0, None), |(bytes, count, smallest), body| {
+                (
+                    bytes.saturating_add(*body),
+                    count + 1,
+                    Some(smallest.map_or(*body, |least: u64| least.min(*body))),
+                )
+            })
+    }
+
     /// Folds one observation into the model and the step's changes.
     fn fold(&mut self, obs: &Observation) {
         let at = self.pending.count;
@@ -440,7 +464,13 @@ impl SemanticModel {
                     .is_some_and(|owned| owned < epoch)
             })
             .collect();
-        self.saw_reset_while_held |= !older.is_empty();
+        if !older.is_empty() {
+            self.saw_reset_while_held = true;
+            let (bytes, _, smallest) = self.held_decoded();
+            self.saw_reset_at_byte_target |= smallest.is_some_and(|body| {
+                bytes.saturating_add(body) > BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+            });
+        }
         self.held_at_reset.extend(older);
     }
 
@@ -457,12 +487,17 @@ impl SemanticModel {
                     token,
                     height,
                     hash,
+                    class,
+                    decoded_bytes,
                     ..
                 } => {
                     self.saw_submission = true;
                     self.taken.insert(*id, Taken { token: *token });
                     self.taken_tokens.insert(*token);
                     self.token_epochs.insert(*token, owner.body_work_epoch);
+                    if class == "full" {
+                        self.decoded.insert(*token, *decoded_bytes);
+                    }
                     self.storage_held.insert(*token);
                     self.pending.storage_changed = true;
                     self.pending
@@ -830,7 +865,7 @@ impl SemanticModel {
         (contiguous && self.epoch.is_some() && *epoch == self.epoch).then_some(*height)
     }
 
-    /// [`DETACHED_SUBMISSION_BOUNDED`]'s observable halves after `step`.
+    /// [`DETACHED_SUBMISSION_BOUNDED`] after `step`.
     fn judge_detached(&mut self, step: u64) {
         let in_flight = self.in_flight();
         let limit = self.limit();
@@ -839,6 +874,18 @@ impl SemanticModel {
                 step,
                 expected: format!("at most {limit} attached and detached submissions"),
                 actual: format!("the sequencer holds {in_flight}"),
+            });
+        }
+        let (bytes, bodies, _) = self.held_decoded();
+        let target = BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+        if bodies > 1 && bytes > target {
+            self.detached_findings.push(Finding {
+                step,
+                expected: format!(
+                    "at most {target} decoded bytes in attached and detached submissions above \
+                     the last checkpoint, unless one body holds them alone"
+                ),
+                actual: format!("storage holds {bodies} such bodies of {bytes} decoded bytes"),
             });
         }
         if self.closed {
@@ -989,10 +1036,10 @@ fn waiting_body_moved(key: &ObligationKey, obs: &Observation) -> bool {
     }
 }
 
-/// Checks [`DETACHED_SUBMISSION_BOUNDED`]'s observable halves: the shared
-/// count limit, and a holder for every submission storage held across a
-/// reset. The byte half needs each submission's decoded bytes, which no
-/// observation carries.
+/// Checks [`DETACHED_SUBMISSION_BOUNDED`]: the shared count limit, the
+/// shared decoded-byte target over the bodies storage holds, which only a
+/// lone body may pass, and a holder for every submission storage held across
+/// a reset.
 fn check_detached_submission_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1134,6 +1181,7 @@ mod tests {
                     hash: hash.to_owned(),
                     parent: "parent".to_owned(),
                     class: "full".to_owned(),
+                    decoded_bytes: 2_000,
                 },
                 stage: Some("queued".to_owned()),
             })

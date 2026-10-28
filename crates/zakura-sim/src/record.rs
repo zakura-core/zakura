@@ -587,6 +587,7 @@ mod tests {
                 hash: "cc".into(),
                 parent: "aa".into(),
                 class: "full".into(),
+                decoded_bytes: 2_000,
             },
             StorageRequest::RecordBody {
                 record: "record_body_invalid".into(),

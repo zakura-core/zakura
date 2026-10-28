@@ -613,7 +613,7 @@ impl Sequencer {
             return Vec::new();
         }
         let mut resident_decoded_bytes = self.applying_decoded_attributed_memory_bytes();
-        let mut attached_submissions = self.attached_submission_count;
+        let mut in_flight_submissions = self.in_flight_submission_count();
         let mut heights = Vec::new();
         for (height, applying) in self
             .applying
@@ -625,13 +625,13 @@ impl Sequencer {
                 *height,
                 applying,
                 resident_decoded_bytes,
-                attached_submissions,
+                in_flight_submissions,
             ) {
                 break;
             }
             resident_decoded_bytes =
                 resident_decoded_bytes.saturating_add(Self::submission_decode_charge(applying));
-            attached_submissions = attached_submissions.saturating_add(1);
+            in_flight_submissions = in_flight_submissions.saturating_add(1);
             heights.push(*height);
         }
         heights
@@ -646,13 +646,14 @@ impl Sequencer {
                 height,
                 applying,
                 self.applying_decoded_attributed_memory_bytes(),
-                self.attached_submission_count,
+                self.in_flight_submission_count(),
             )
         })
     }
 
     /// Whether no `applying` body is submitted while unsubmitted work waits.
-    /// The next submission attempt then always admits one body.
+    /// No attached completion is left to wake that work, so the completion
+    /// that left the window in this state must wake it.
     pub(super) fn submission_window_idle_with_pending_work(&self) -> bool {
         self.attached_submission_count == 0 && self.unsubmitted_applying_count() > 0
     }
@@ -661,18 +662,18 @@ impl Sequencer {
     /// unknown until `prepare_submit` decodes it, so it is charged
     /// `bytes × DESERIALIZED_MEM_FACTOR`.
     ///
-    /// When no `applying` body is submitted, the body is always admitted, so one
-    /// oversized body still progresses. Detached submissions still count toward
-    /// the cap but never block this: they can be successors waiting in state
-    /// for the very parent this admits, and may never complete without it.
+    /// When no submission is in flight, attached or detached, the body is
+    /// always admitted, so one oversized body still progresses. A detached
+    /// submission keeps its decoded charge until its exact completion, so a
+    /// reset or failure that detaches it frees no room for another body.
     fn submission_admitted(
         &self,
         height: block::Height,
         applying: &ApplyingBlock,
         resident_decoded_bytes: u64,
-        attached_submissions: usize,
+        in_flight_submissions: usize,
     ) -> bool {
-        attached_submissions == 0
+        in_flight_submissions == 0
             || self.decoded_window_admits(
                 height,
                 resident_decoded_bytes,

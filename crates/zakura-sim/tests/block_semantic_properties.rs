@@ -41,6 +41,12 @@ const STALE_BESIDE_CURRENT_INPUT: &[u8] =
 /// answers, and a reset detaches the first submission.
 const STALLED_RESET_INPUT: &[u8] = include_bytes!("fixtures/block-sync-stalled-reset.bin");
 
+/// The committed input that picks the decoded-target-reset scenario: storage
+/// never answers, and a reset detaches a window that fills the decoded-byte
+/// target.
+const DECODED_TARGET_RESET_INPUT: &[u8] =
+    include_bytes!("fixtures/block-sync-decoded-target-reset.bin");
+
 /// The committed input that picks the capacity-release scenario, under a
 /// plan where block sync handles the detached commit's tip before its reply.
 const CAPACITY_FRONTIER_FIRST_INPUT: &[u8] =
@@ -120,6 +126,10 @@ fn each_committed_input_draws_its_scenario() {
         ),
         (STALLED_RESET_INPUT, BlockScenario::stalled_reset()),
         (
+            DECODED_TARGET_RESET_INPUT,
+            BlockScenario::decoded_target_reset(),
+        ),
+        (
             CAPACITY_FRONTIER_FIRST_INPUT,
             BlockScenario::capacity_release(),
         ),
@@ -174,7 +184,7 @@ fn the_stale_beside_current_input_holds_stale_completion_inert() {
 
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset
 /// detaches the held submission, which keeps its holder and its place
-/// under the limit. The draft holds. With `forget-on-reset.patch`, the
+/// under the limit. The property holds. With `forget-on-reset.patch`, the
 /// reset forgets the submission, and the same input violates it.
 #[test]
 fn the_stalled_reset_input_holds_detached_submission_bounded() {
@@ -182,6 +192,29 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
         committed(STALLED_RESET_INPUT),
         DETACHED_SUBMISSION_BOUNDED,
         Expect::Holds,
+    );
+}
+
+/// Under stalled storage, with no `BoundedStorage` assumption, the node's
+/// submissions fill the decoded-byte target, and a reset detaches them all.
+/// Detaching frees no room, so the fork's bodies wait, and the decoded bytes
+/// storage holds stay within the target (#1521). With
+/// `replenish-on-detach.patch`, the window with nothing attached admits the
+/// fork's first body past the target, and the same input violates the
+/// property. The node holds about 540 MB of bodies.
+#[test]
+#[ignore = "a debug run takes about five minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+fn the_decoded_target_reset_input_holds_detached_submission_bounded() {
+    let ports = witnessed(
+        committed(DECODED_TARGET_RESET_INPUT),
+        DETACHED_SUBMISSION_BOUNDED,
+        Expect::Holds,
+    );
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    assert!(
+        model.saw_reset_at_byte_target,
+        "the reset came before the decoded bytes storage held reached the target"
     );
 }
 

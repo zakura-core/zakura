@@ -251,6 +251,8 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
+    #[cfg(any(test, zakura_sim))]
+    let sequencer_task = sequencer_task.with_observer(startup.observer.clone());
     spawn_erased_named("block_sync_sequencer", sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
@@ -284,6 +286,16 @@ pub fn spawn_block_sync_reactor(
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
         trace: startup.trace.clone(),
+        #[cfg(any(test, zakura_sim))]
+        observer: startup.observer.clone(),
+    };
+    #[cfg(any(test, zakura_sim))]
+    let routine_wiring = {
+        let mut routine_wiring = routine_wiring;
+        Arc::get_mut(&mut routine_wiring.serving)
+            .expect("nothing shares serving before the handle exists")
+            .observer = startup.observer.clone();
+        routine_wiring
     };
 
     let handle = BlockSyncHandle {
@@ -462,6 +474,8 @@ impl BlockSyncReactor {
         self.refresh_throughput();
         self.trace_sync_state(true);
         loop {
+            #[cfg(any(test, zakura_sim))]
+            self.state.work_queue.observe_items();
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
             // arm): force-cancel an expired floor request exactly when it expires

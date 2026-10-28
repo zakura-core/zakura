@@ -106,6 +106,12 @@ impl CloseCause {
         }
     }
 
+    /// Return the recorded reason, or `None` when no local path recorded one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn get(&self) -> Option<&'static str> {
+        self.reason.get().copied()
+    }
+
     /// Return the recorded reason, or `default` when no local path recorded one.
     pub(crate) fn get_or(&self, default: &'static str) -> &'static str {
         self.reason.get().copied().unwrap_or(default)

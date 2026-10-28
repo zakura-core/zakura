@@ -52,8 +52,8 @@ use crate::{
         MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{
-        AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
-        PreciousError, ReconsiderError,
+        AwaitBlockInfoError, BlockHeaderNotFound, CommitBlockError, CommitCheckpointVerifiedError,
+        InvalidateError, PreciousError, ReconsiderError,
     },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
@@ -2988,20 +2988,20 @@ impl Service<ReadRequest> for ReadStateService {
                     .height_or_else(|hash| {
                         read::find::height_by_hash(best_chain.clone(), &state.db, hash)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let hash = hash_or_height
                     .hash_or_else(|height| {
                         read::find::hash_by_height(best_chain.clone(), &state.db, height)
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 let next_height = height.next()?;
                 let next_block_hash =
                     read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
 
                 let header = read::block_header(best_chain, &state.db, height.into())
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 Ok(ReadResponse::BlockHeader {
                     header,

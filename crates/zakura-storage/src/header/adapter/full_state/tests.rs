@@ -69,7 +69,6 @@ fn commits_grow_reset_and_publish_views() {
     let main = fixture.uniform(anchor, 2, BodySpec::exact(2_000), 0);
     let fork = fixture.uniform(anchor, 3, BodySpec::exact(2_000), 1);
     insert(&port, anchor, &main);
-    insert(&port, anchor, &fork);
     let epoch = port.view().body_work_epoch;
 
     let grown = commit(&port, &main[0], 1);
@@ -80,6 +79,10 @@ fn commits_grow_reset_and_publish_views() {
     assert_eq!(installed.view.snapshot, port.snapshot());
     assert_eq!(port.view().snapshot, port.snapshot());
     assert_eq!(verified_best(&port), main[0].frontier());
+
+    // The longer fork's headers move the selected chain, which starts an epoch.
+    insert(&port, anchor, &fork);
+    let epoch = port.view().body_work_epoch;
 
     // A one-block fork is a side path: the verified tip stays.
     let side = commit(&port, &fork[0], 2);
@@ -116,12 +119,15 @@ fn an_earlier_receipt_wins_an_equal_work_tie() {
     let b = fixture.block(anchor, 1, BodySpec::exact(2_000));
     insert(&port, anchor, std::slice::from_ref(&a));
     insert(&port, anchor, std::slice::from_ref(&b));
-    let epoch = port.view().body_work_epoch;
 
-    // A was received first, B committed first.
+    // A was received first, B committed first. The selected chain ends at A,
+    // so B's commit moves the verified tip off it and starts an epoch too.
     let first = commit(&port, &b, 2);
     assert_eq!(first.cause, Some(VerifiedChangeCause::Grow));
     assert_eq!(verified_best(&port), b.frontier());
+    let installed = first.installed.expect("a grow installs");
+    assert!(installed.effect.invalidates_body_work());
+    let epoch = installed.view.body_work_epoch;
     let second = commit(&port, &a, 1);
     assert_eq!(second.cause, Some(VerifiedChangeCause::Reset));
     assert_eq!(verified_best(&port), a.frontier());

@@ -588,7 +588,6 @@ fn views_follow_installed_transitions_and_a_reset_bumps_the_epoch() {
     let mut harness = Harness::new();
     let anchor = harness.fixture.anchor();
     let main = harness.chain(anchor, &[BodySpec::exact(900); 2], 0);
-    let fork = harness.chain(anchor, &[BodySpec::exact(800); 3], 1);
     let mut views = harness.engine.subscribe_views();
     let start_epoch = harness.engine.view().body_work_epoch;
 
@@ -617,7 +616,9 @@ fn views_follow_installed_transitions_and_a_reset_bumps_the_epoch() {
         main[1].frontier()
     );
 
+    // The fork's headers move the selected chain, which starts an epoch.
     // Equal or less work on the fork leaves the earlier tip verified.
+    let fork = harness.chain(anchor, &[BodySpec::exact(800); 3], 1);
     for block in &fork[..2] {
         let view = commit(&mut harness, block);
         assert_eq!(view.snapshot.frontiers.verified_best, main[1].frontier());
@@ -731,13 +732,15 @@ fn an_earlier_admission_wins_an_equal_work_tie() {
     let second = harness.submit(&b);
     harness.complete(first, BlockOutcome::Admit);
     harness.complete(second, BlockOutcome::Admit);
-    let epoch = harness.engine.view().body_work_epoch;
 
+    // The selected chain ends at A1, so B1's commit moves the verified tip
+    // off it and starts an epoch too.
     harness.complete(second, COMMITTED);
     assert_eq!(
         harness.engine.snapshot().frontiers.verified_best,
         b.frontier()
     );
+    let epoch = harness.engine.view().body_work_epoch;
     harness
         .service
         .complete(first, COMMITTED)

@@ -632,8 +632,6 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
-            #[cfg(any(test, zakura_sim))]
-            self.observe_owners(false);
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
@@ -692,6 +690,10 @@ impl PeerRoutine {
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             zakura_rt::pin!(outbound_queue_poll);
 
+            // After the fill, so the snapshot holds the requests and
+            // reservations it made while the routine parks.
+            #[cfg(any(test, zakura_sim))]
+            self.observe_owners(false);
             zakura_rt::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
@@ -2918,6 +2920,7 @@ mod tests {
         );
         let serving = Serving::new(Arc::new(EmptyBlockRangeSource), config).session(
             session.peer_id(),
+            super::super::block_sync_observe::SessionKey::default(),
             session.request_sender(),
             session.cancel_token(),
             connection.clone(),

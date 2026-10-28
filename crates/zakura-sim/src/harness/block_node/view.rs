@@ -60,6 +60,10 @@ pub struct Handoff {
 pub struct Lease {
     /// The requesting peer.
     pub peer: ZakuraPeerId,
+    /// The serving session's connection.
+    pub conn_id: ZakuraConnId,
+    /// The serving session's routine generation.
+    pub generation: u64,
     /// The range's first height.
     pub start: Height,
     /// The range's requested count.
@@ -221,12 +225,16 @@ impl BlockSyncView {
             },
             BlockEvent::ServingLease {
                 peer,
+                conn_id,
+                generation,
                 start,
                 count,
                 step,
             } => {
                 let lease = Lease {
                     peer: peer.clone(),
+                    conn_id: *conn_id,
+                    generation: *generation,
                     start: *start,
                     count: *count,
                 };

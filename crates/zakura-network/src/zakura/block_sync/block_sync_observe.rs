@@ -144,6 +144,10 @@ pub enum BlockEvent {
     ServingLease {
         /// The requesting peer.
         peer: ZakuraPeerId,
+        /// The serving session's connection.
+        conn_id: ZakuraConnId,
+        /// The serving session's routine generation.
+        generation: u64,
         /// The range's first height.
         start: block::Height,
         /// The range's requested count.
@@ -167,6 +171,10 @@ pub enum BlockEvent {
     ServingFrame {
         /// The requesting peer.
         peer: ZakuraPeerId,
+        /// The serving session's connection.
+        conn_id: ZakuraConnId,
+        /// The serving session's routine generation.
+        generation: u64,
         /// The range's first height.
         start: block::Height,
         /// The frame's message type.
@@ -354,13 +362,35 @@ impl SequencerOwnership {
 #[derive(Clone, Debug)]
 pub(crate) struct ServingReporter {
     observer: ObserverSlot,
-    peer: ZakuraPeerId,
+    session: ServingIdentity,
+}
+
+/// A routine session: its connection and generation.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionKey {
+    /// The session's connection.
+    pub(crate) conn_id: ZakuraConnId,
+    /// The session's routine generation.
+    pub(crate) generation: u64,
+}
+
+/// Which session a serving read belongs to. A cancelled session's read can
+/// still run when its replacement asks for the same range, and only the
+/// connection and generation tell the two apart.
+#[derive(Clone, Debug)]
+pub(crate) struct ServingIdentity {
+    /// The requesting peer.
+    pub(crate) peer: ZakuraPeerId,
+    /// The session's connection.
+    pub(crate) conn_id: ZakuraConnId,
+    /// The session's routine generation.
+    pub(crate) generation: u64,
 }
 
 impl ServingReporter {
-    /// A reporter for `peer`'s session.
-    pub(crate) fn new(observer: ObserverSlot, peer: ZakuraPeerId) -> Self {
-        Self { observer, peer }
+    /// A reporter for `session`.
+    pub(crate) fn new(observer: ObserverSlot, session: ServingIdentity) -> Self {
+        Self { observer, session }
     }
 
     /// Reports that the response for `count` heights from `start` took or
@@ -369,7 +399,9 @@ impl ServingReporter {
         observe!(
             self.observer,
             BlockEvent::ServingLease {
-                peer: self.peer.clone(),
+                peer: self.session.peer.clone(),
+                conn_id: self.session.conn_id,
+                generation: self.session.generation,
                 start,
                 count,
                 step,
@@ -388,7 +420,7 @@ impl ServingReporter {
         observe!(
             self.observer,
             BlockEvent::ServingAdmission {
-                peer: self.peer.clone(),
+                peer: self.session.peer.clone(),
                 start,
                 count,
                 live,
@@ -401,7 +433,9 @@ impl ServingReporter {
         observe!(
             self.observer,
             BlockEvent::ServingFrame {
-                peer: self.peer.clone(),
+                peer: self.session.peer.clone(),
+                conn_id: self.session.conn_id,
+                generation: self.session.generation,
                 start,
                 message_type,
                 body_bytes,

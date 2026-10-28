@@ -13,7 +13,12 @@
 //!   relay numbers the peer's frames, after the label of a request that
 //!   waited for it;
 //! - a body entering the sequencer's input queue becomes
-//!   [`Observation::WorkAdmitted`], from the frame that delivered it;
+//!   [`Observation::WorkAdmitted`], from the frame that delivered it. A
+//!   body can arrive on another connection than its owner's: the routine
+//!   that receives a body for a height re-issued elsewhere hands it off
+//!   under the new owner. The adapter reads the connection from that
+//!   routine's `HandoffStarted`, else tries the owner's connection, then
+//!   every other;
 //! - a serving lease's acquisition and release become
 //!   [`Observation::Serving`] and [`Observation::ServingEnded`];
 //! - a serving admission settles the label of a request that waited for
@@ -68,6 +73,9 @@ pub(crate) struct Adapter {
     wire: Wire,
     /// Each session's connection.
     sessions: BTreeMap<u64, u64>,
+    /// The connection of the routine that last started a handoff, by
+    /// height.
+    handoffs: BTreeMap<u32, u64>,
     /// Each peer's newest connection, by its ID in hex.
     peers: BTreeMap<String, u64>,
     /// Each submitted body's supplier, by operation ID.
@@ -91,6 +99,7 @@ impl Adapter {
         Adapter {
             wire,
             sessions: BTreeMap::new(),
+            handoffs: BTreeMap::new(),
             peers: BTreeMap::new(),
             suppliers: BTreeMap::new(),
             judged: BTreeSet::new(),
@@ -316,6 +325,11 @@ impl Adapter {
                 // The routine counts from 1, and the relay from 0.
                 self.judged(*conn_id, judged - 1, log);
             }
+            BlockEvent::HandoffStarted { peer, height, .. } => {
+                if let Some(connection) = self.connection(peer) {
+                    self.handoffs.insert(height.0, connection);
+                }
+            }
             // Every body the routine sends the sequencer, with or without a
             // budget charge.
             BlockEvent::Holder {
@@ -323,12 +337,28 @@ impl Adapter {
                 holder: Holder::Queued { .. },
                 change: HolderChange::Retained,
             } => {
-                let Some(connection) = self.sessions.get(&body.owner.session_id).copied() else {
+                let height = body.height.0;
+                let handoff = self.handoffs.remove(&height);
+                let owner = self.sessions.get(&body.owner.session_id).copied();
+                let mut candidates: Vec<u64> = handoff.into_iter().chain(owner).collect();
+                for connection in self.sessions.values() {
+                    if !candidates.contains(connection) {
+                        candidates.push(*connection);
+                    }
+                }
+                let Some(&first) = candidates.first() else {
                     return;
                 };
                 // Work from a body no frame delivered names no frame the
                 // check can find.
-                let delivered = self.wire.body(connection, body.height.0, seq);
+                let (connection, delivered) = candidates
+                    .iter()
+                    .find_map(|connection| {
+                        self.wire
+                            .body(*connection, height, seq)
+                            .map(|delivered| (*connection, Some(delivered)))
+                    })
+                    .unwrap_or((first, None));
                 log.push(Observation::WorkAdmitted {
                     connection,
                     frame: row(row_name(u16::from(MSG_BS_BLOCK))),

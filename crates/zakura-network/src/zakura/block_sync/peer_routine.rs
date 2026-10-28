@@ -1634,9 +1634,14 @@ impl PeerRoutine {
             return true;
         }
         if priority == RequestPriority::Floor {
-            // The WorkQueue owns each height once, so there can only be one
-            // floor-priority overdraft globally. Its charge is released by the
-            // normal reservation paths: receipt, timeout, watchdog, or reset.
+            // Only a request that starts at the download floor or the next
+            // height gets here. The WorkQueue owns each height once, so at
+            // most two such overdrafts are live, each past the max by at most
+            // `B` (`MAX_BLOCK_BYTES`). A routine handing a body to the
+            // sequencer still holds its charge, and the floor can advance
+            // meanwhile, so each open handoff adds at most one more `B`: the
+            // budget stays within `M + 2·B + h·B`. The normal reservation
+            // paths release the charge: receipt, timeout, watchdog, or reset.
             self.budget.charge(reserved_bytes);
             metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
             return true;

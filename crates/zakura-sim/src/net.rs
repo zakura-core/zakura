@@ -91,19 +91,35 @@ impl Net {
 
 impl State {
     /// `instant`, from the driver's clock, on the run's clock: the origin
-    /// plus the time since it, saturating at the origin and at the largest
-    /// instant. M3's `sim_of` rule, with the origin fixed when the source
-    /// was made.
+    /// moved by the time between them, either way, saturating at the run's
+    /// start and at the largest instant. M3's `sim_of` rule, with the origin
+    /// fixed when the source was made.
     fn sim_of(&self, instant: std::time::Instant) -> SimInstant {
-        self.sim_origin
-            .checked_add(instant.saturating_duration_since(self.std_origin))
-            .unwrap_or(SimInstant::from_start(Duration::MAX))
+        match instant.checked_duration_since(self.std_origin) {
+            Some(after) => self
+                .sim_origin
+                .checked_add(after)
+                .unwrap_or(SimInstant::from_start(Duration::MAX)),
+            None => SimInstant::from_start(
+                self.sim_origin
+                    .since_start()
+                    .saturating_sub(self.std_origin.duration_since(instant)),
+            ),
+        }
     }
 
     /// `at`, from the run's clock, on the driver's clock: the inverse of
-    /// [`State::sim_of`], saturating at the origin.
+    /// [`State::sim_of`]. An instant before the driver's clock can hold
+    /// saturates at the origin, which only a query before the run's start
+    /// on a clock that began after it could reach.
     fn std_of(&self, at: SimInstant) -> std::time::Instant {
-        self.std_origin + at.saturating_duration_since(self.sim_origin)
+        if at >= self.sim_origin {
+            self.std_origin + at.saturating_duration_since(self.sim_origin)
+        } else {
+            self.std_origin
+                .checked_sub(self.sim_origin.saturating_duration_since(at))
+                .unwrap_or(self.std_origin)
+        }
     }
 
     /// The datagrams the plan may drop now: those its network allows,

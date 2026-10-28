@@ -526,6 +526,40 @@ fn queries_answer_for_the_supplied_instant() {
     );
 }
 
+/// A `Net` made 3 s into a run answers for instants before its origin too:
+/// a datagram sent at 3 s isn't offered at 2 s, and its window still opens
+/// at 3 s.
+#[test]
+fn queries_before_the_origin_answer_for_that_instant() {
+    let mut sim = Sim::new(run_config(), Plan::from_fuzz(&[]));
+    sim.scheduler().advance_to(at(Duration::from_secs(3)));
+    let net = scenario(link(100, true)).net();
+    let sim_net = net.sim();
+    let (a, _b) = (
+        sim_net.bind(addr(1)).unwrap(),
+        sim_net.bind(addr(2)).unwrap(),
+    );
+    send(&a, addr(2), 10);
+    let ms = |n| at(Duration::from_millis(n));
+    let offered = |now| {
+        let mut out = Vec::new();
+        net.enabled(now, &mut out);
+        out.len()
+    };
+    let mut bounds = Vec::new();
+    net.boundaries(ms(2_000), &mut bounds);
+    assert_eq!(
+        offered(ms(2_000)),
+        0,
+        "nothing is deliverable before the send"
+    );
+    assert_eq!(
+        bounds,
+        [Boundary::Opens(ms(3_000)), Boundary::Deadline(ms(3_100))]
+    );
+    assert_eq!(offered(ms(3_000)), 1, "deliverable once sent");
+}
+
 /// With `loss_after_admission`, a link offers no drop until the harness
 /// says a session was admitted on it, and then both of its directions do.
 #[test]

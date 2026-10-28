@@ -159,9 +159,10 @@ pub struct RoomFreed {
     pub at: usize,
     /// The waiting body's height.
     pub height: u32,
-    /// Whether the released submission's height had no `applying` entry
-    /// when the sequencer released it: the frontier passed that height
-    /// before its reply arrived, #1523's order.
+    /// Whether the verified tip had reached the released submission's
+    /// height, and no `applying` entry held that height, when the sequencer
+    /// released it: the frontier passed that height before its reply
+    /// arrived, #1523's order.
     pub past_frontier: bool,
 }
 
@@ -297,7 +298,8 @@ struct StepChanges {
     /// Tokens whose verdict reached block sync.
     delivered: Vec<u64>,
     /// Submission holders released, with the position of the release and
-    /// whether no `applying` entry held the submission's height then.
+    /// whether the frontier had passed the submission's height then (see
+    /// [`RoomFreed::past_frontier`]).
     released: Vec<(BlockSyncHolder, usize, bool)>,
     /// Tokens the sequencer detached.
     detached: BTreeSet<u64>,
@@ -576,9 +578,14 @@ impl SemanticModel {
                         } else if *count > 0 {
                             *count -= 1;
                             *total -= 1;
-                            let past_frontier = !self.applying.values().any(|(height, _)| {
-                                Some(height) == self.submission_heights.get(token)
-                            });
+                            let past_frontier =
+                                self.submission_heights.get(token).is_some_and(|released| {
+                                    *released <= self.verified_tip
+                                        && !self
+                                            .applying
+                                            .values()
+                                            .any(|(height, _)| height == released)
+                                });
                             self.pending
                                 .released
                                 .push((holder.clone(), at, past_frontier));
@@ -1000,9 +1007,10 @@ fn stale_completion_beside_a_current_submission(log: &ObservationLog) -> bool {
 
 /// [`CAPACITY_RELEASE_WAKES`]'s trigger history, #1523's order: a
 /// completion freed room under the limit beside an eligible waiting body,
-/// and released a submission whose height the frontier had already passed.
-/// A reply that arrives while its height is still `applying` frees room
-/// too, but wakes the waiting body on main.
+/// and released a submission whose height the frontier had already passed:
+/// the verified tip reached it, and no `applying` entry held it. A reply
+/// that arrives while its height is still `applying` frees room too, but
+/// wakes the waiting body on main.
 fn room_freed_past_the_frontier(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_room_freed_past_frontier
 }

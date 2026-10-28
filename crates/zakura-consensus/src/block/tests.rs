@@ -1575,7 +1575,7 @@ fn failing_librustzcash_v5_transaction(
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     }
 }
 

@@ -173,7 +173,7 @@ impl Transaction {
                             // The genesis block should not contain any shielded data.
                             None
                         } else {
-                            orchard_shielded_data
+                            orchard_shielded_data.map(Box::new)
                         },
                     }
                 },
@@ -1105,7 +1105,7 @@ pub fn insert_fake_orchard_shielded_data(
             orchard_shielded_data,
             ..
         } => {
-            *orchard_shielded_data = Some(dummy_shielded_data);
+            *orchard_shielded_data = Some(Box::new(dummy_shielded_data));
 
             orchard_shielded_data
                 .as_mut()
@@ -1200,7 +1200,7 @@ pub fn fake_v6_with_orchard_and_ironwood_actions(
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: fake_orchard_protocol_shielded_data(orchard_actions),
+        orchard_shielded_data: fake_orchard_protocol_shielded_data(orchard_actions).map(Box::new),
         ironwood_shielded_data: fake_orchard_protocol_shielded_data(ironwood_actions),
     })
 }

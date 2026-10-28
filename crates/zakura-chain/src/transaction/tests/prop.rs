@@ -111,7 +111,7 @@ fn v5_tx_strategy(
                 inputs,
                 outputs,
                 sapling_shielded_data: sapling_shielded_data.map(Box::new),
-                orchard_shielded_data,
+                orchard_shielded_data: orchard_shielded_data.map(Box::new),
             },
         )
         .boxed()
@@ -147,7 +147,7 @@ fn v6_tx_strategy(
                 inputs,
                 outputs,
                 sapling_shielded_data: sapling_shielded_data.map(Box::new),
-                orchard_shielded_data,
+                orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 ironwood_shielded_data,
             },
         )

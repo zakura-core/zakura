@@ -72,8 +72,9 @@ use crate::{
 /// internally by different enum variants. Because we checkpoint on Canopy
 /// activation, we do not validate any pre-Sapling transaction types.
 ///
-/// Sprout and Sapling bundles are boxed so their inline storage does not enlarge
-/// every transaction. Orchard and Ironwood bundles remain inline.
+/// Sprout, Sapling, and Orchard bundles are boxed so their inline storage does
+/// not enlarge every transaction. Ironwood bundles remain inline for the common
+/// shielded transaction path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub enum Transaction {
@@ -147,7 +148,7 @@ pub enum Transaction {
         /// The sapling shielded data for this transaction, if any.
         sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        orchard_shielded_data: Option<Box<orchard::ShieldedData>>,
     },
     /// A `version = 6` transaction, which supports Sapling, Orchard, transparent,
     /// and Ironwood.
@@ -168,7 +169,7 @@ pub enum Transaction {
         /// The sapling shielded data for this transaction, if any.
         sapling_shielded_data: Option<Box<sapling::ShieldedData<sapling::SharedAnchor>>>,
         /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        orchard_shielded_data: Option<Box<orchard::ShieldedData>>,
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
@@ -1283,11 +1284,11 @@ impl Transaction {
             Transaction::V5 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data.as_deref(),
             Transaction::V6 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data.as_deref(),
 
             // No Orchard shielded data
             Transaction::V1 { .. }

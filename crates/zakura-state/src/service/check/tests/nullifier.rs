@@ -1488,7 +1488,7 @@ fn transaction_v5_with_orchard_shielded_data(
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(Box::new),
     }
 }
 

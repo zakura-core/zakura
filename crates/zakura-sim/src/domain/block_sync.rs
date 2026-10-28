@@ -64,7 +64,7 @@ use zakura_network::zakura::ZakuraBlockSyncConfig;
 use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
-    observe::{BlockSyncFact, BlockSyncHolder, StorageFact, WorkOwner},
+    observe::{BlockSyncFact, BlockSyncHolder, BlockSyncRetained, StorageFact, WorkOwner},
     property::{
         CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Unit, Verdict,
     },
@@ -341,6 +341,12 @@ pub enum OwnerInput {
         /// The links not yet closed.
         open: u64,
     },
+    /// The sequencer's snapshot lists `holders`: each holder other than its
+    /// input queue, with its body's height and wire bytes.
+    Snapshot {
+        /// The listed holders, in the snapshot's order.
+        holders: Vec<(BodyHolder, u32, u64)>,
+    },
 }
 
 impl OwnerInput {
@@ -444,6 +450,32 @@ impl OwnerInput {
             BlockSyncFact::WorkQueue { items } => OwnerInput::WorkQueue {
                 reserved: items.iter().map(|item| item.reserved_bytes).sum(),
             },
+            BlockSyncFact::Sequencer {
+                reorder,
+                applying,
+                submissions,
+            } => {
+                let retained = |holder: fn(u64) -> BodyHolder, body: &BlockSyncRetained| {
+                    (holder(body.allocation), body.body.height, body.body.bytes)
+                };
+                let reorder = reorder
+                    .iter()
+                    .map(|body| retained(BodyHolder::Reorder, body));
+                let applying = applying
+                    .iter()
+                    .map(|body| retained(BodyHolder::Applying, body));
+                let submissions = submissions.iter().map(|submission| {
+                    let holder = if submission.detached {
+                        BodyHolder::Detached(submission.token)
+                    } else {
+                        BodyHolder::Submitted(submission.token)
+                    };
+                    (holder, submission.body.height, submission.body.bytes)
+                });
+                OwnerInput::Snapshot {
+                    holders: reorder.chain(applying).chain(submissions).collect(),
+                }
+            }
             _ => return None,
         })
     }
@@ -678,6 +710,7 @@ impl OwnerModel {
                 self.verified_tip = self.verified_tip.max(height);
             }
             OwnerInput::Links { made, open } => self.links = Some((made, open)),
+            OwnerInput::Snapshot { holders } => self.compare_snapshot(holders),
         }
     }
 
@@ -739,6 +772,35 @@ impl OwnerModel {
                 }
             }
         }
+    }
+
+    /// Records a holder gap unless the sequencer's snapshot lists exactly
+    /// the holders the model folded, other than the input queue's. A holder
+    /// event the observer dropped shows here: the model would otherwise
+    /// count too few retained bytes and still hold.
+    fn compare_snapshot(&mut self, mut listed: Vec<(BodyHolder, u32, u64)>) {
+        let folded: Vec<_> = self
+            .holders
+            .iter()
+            .filter(|(holder, _)| !matches!(holder, BodyHolder::Queued(_)))
+            .map(|(holder, (height, bytes))| (*holder, *height, *bytes))
+            .collect();
+        listed.sort_unstable();
+        if listed == folded {
+            return;
+        }
+        let unfolded: Vec<_> = listed
+            .iter()
+            .filter(|held| !folded.contains(held))
+            .collect();
+        let unlisted: Vec<_> = folded
+            .iter()
+            .filter(|held| !listed.contains(held))
+            .collect();
+        self.note_holder_gap(format!(
+            "the sequencer's snapshot lists {unfolded:?} that its holder events don't, and \
+             omits {unlisted:?} that they hold"
+        ));
     }
 
     /// Records the first budget input the model couldn't apply.
@@ -965,7 +1027,9 @@ fn at_rest(status: SchedulerStatus) -> bool {
     )
 }
 
-/// Checks [`RETAINED_BYTE_BOUND`] after a step.
+/// Checks [`RETAINED_BYTE_BOUND`] after a step. A holder gap, such as a
+/// sequencer snapshot that disagrees with the holder events, leaves the
+/// retained bytes unknown, so the check reports missing evidence.
 fn check_retained<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,

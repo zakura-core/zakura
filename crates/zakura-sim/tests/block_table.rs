@@ -54,7 +54,8 @@ fn row(row: &str) -> RowAt {
 /// Runs `scenario` under `input`, and returns its report and ports. No run
 /// may end at a harness failure: a judged frame without exactly one label
 /// is one. Every block storage operation the node dispatches pairs with the
-/// owner that sent it.
+/// owner that sent it, and every sequencer snapshot matches the holder
+/// events.
 fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     let ports = Storage::prepare(scenario);
     let report = run_prepared::<Storage>(
@@ -69,6 +70,8 @@ fn run(scenario: &BlockScenario, input: PlanInput) -> (RunReport, Ports) {
     {
         let view = ports.view.borrow();
         assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+        assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+        assert_eq!(view.owners.holder_gap(), None);
     }
     (report, ports)
 }

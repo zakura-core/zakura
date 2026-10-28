@@ -213,6 +213,9 @@ pub struct Effects {
     /// Each actor whose chain grew or switched to a fork, once per change,
     /// in order.
     pub chains: Rc<RefCell<Vec<(LinkEffect, String)>>>,
+    /// Each actor that prepared a chain change's headers, once per
+    /// preparation, in order.
+    pub prepared: Rc<RefCell<Vec<String>>>,
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
@@ -260,6 +263,8 @@ pub struct PolicySource {
     closed: BTreeSet<u64>,
     /// How many chain changes are recorded.
     changed: usize,
+    /// How many preparations are recorded.
+    prepared: usize,
     /// The node's `record_body_invalid` operations not yet completed.
     invalid_records: BTreeSet<u64>,
 }
@@ -285,6 +290,7 @@ impl PolicySource {
             linked: 0,
             closed: BTreeSet::new(),
             changed: 0,
+            prepared: 0,
             invalid_records: BTreeSet::new(),
         }
     }
@@ -414,6 +420,11 @@ impl ActionSource for PolicySource {
             predicates.record_link(*effect, actor);
         }
         self.changed = chains.len();
+        let prepared = self.effects.prepared.borrow();
+        for actor in &prepared[self.prepared..] {
+            predicates.record_link(LinkEffect::Prepared, actor);
+        }
+        self.prepared = prepared.len();
         match self.effects.failure.borrow().as_ref() {
             Some(failure) => Err(format!("ControlFailed: {failure}")),
             None => Ok(()),
@@ -1486,9 +1497,10 @@ impl Topology {
     }
 
     /// Prepares `change`'s headers on the node under test's engine, for
-    /// [`apply_node`](Self::apply_node). Records a failure, and returns
-    /// `None`, if they don't prepare. Only the step loop reads the node's
-    /// engine, so only it may call this.
+    /// [`apply_node`](Self::apply_node), and records the preparation for
+    /// [`Trigger::Prepared`](crate::harness::policy::Trigger::Prepared). Records a failure,
+    /// and returns `None`, if they don't prepare. Only the step loop reads
+    /// the node's engine, so only it may call this.
     pub(crate) fn prepare_node(&self, change: &ChainChange) -> Option<NodeTarget> {
         let node = &self.nodes[0];
         let request = self.chain.fixture.target_request(
@@ -1498,10 +1510,13 @@ impl Topology {
             1,
         );
         match ready(node.engine.prepare_header_target(request)) {
-            Ok(prepared) => Some(NodeTarget {
-                prepared,
-                invalidated: self.effects.invalidated.get(),
-            }),
+            Ok(prepared) => {
+                self.effects.prepared.borrow_mut().push(node.name.clone());
+                Some(NodeTarget {
+                    prepared,
+                    invalidated: self.effects.invalidated.get(),
+                })
+            }
             Err(error) => {
                 let tip = node.engine.view().frontiers.header_best;
                 self.settle(node, change, Err(error), Ok(()), tip);

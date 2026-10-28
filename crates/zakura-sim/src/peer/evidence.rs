@@ -641,4 +641,98 @@ mod tests {
             assert!(error.starts_with("UnplacedRecord"), "{ending:?}: {error}");
         }
     }
+
+    /// Fed one reader event at a time, the projection judges each frame at
+    /// its own stage: a request after its payload, a header fault at its
+    /// header, an unsolicited page at its checkpoint, and an ending for a
+    /// live subscription only after its payload, not at its checkpoint.
+    #[test]
+    fn each_frame_is_judged_at_its_stage() {
+        let stream = StreamId {
+            kind: 5,
+            version: 9,
+        };
+        let records = PeerRecords::default();
+        records.borrow_mut().extend((0..4).map(|seq| PeerRecord {
+            remote: peer_addr(0, 0),
+            quic_stream: 4,
+            body: RecordBody::Frame {
+                seq,
+                row: None,
+                rule_stream: stream,
+                label: Label::Conformant,
+                exhausted: false,
+                exchange: None,
+                payload: 0,
+            },
+        }));
+        let mut evidence = WireEvidence::default();
+        let mut log = ObservationLog::default();
+        log.push(transport(1, Some(1), TransportFact::Registered));
+        log.push(Observation::Session {
+            connection: 1,
+            peer: "peer-0".to_owned(),
+            quic_stream: 4,
+            kind: 5,
+            version: 9,
+            session_id: 7,
+        });
+        let mut event = 1;
+        let mut feed = |log: &mut ObservationLog, fact: TransportFact| {
+            event += 1;
+            log.push(transport(event, Some(1), fact));
+            evidence
+                .observe(&records, log)
+                .expect("the evidence is whole");
+            log.entries()
+                .iter()
+                .filter_map(|entry| match entry.obs {
+                    Observation::FrameJudged { seq, .. } => Some(seq),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let header = |seq, message_type, flags, payload_len| TransportFact::HeaderRead {
+            quic_stream: 4,
+            seq,
+            message_type,
+            flags,
+            payload_len,
+        };
+        let read = |seq| TransportFact::FrameRead {
+            quic_stream: 4,
+            seq,
+        };
+        let checked = |seq| TransportFact::Regulated {
+            quic_stream: 4,
+            transition: TransitionFact::HeaderChecked {
+                seq,
+                outcome: crate::observe::HeaderCheckFact::AdmittedTerminal,
+            },
+        };
+        assert!(
+            feed(&mut log, header(0, 2, 0, 107)).is_empty(),
+            "a Grant waits"
+        );
+        assert_eq!(feed(&mut log, read(0)), [0]);
+        assert_eq!(feed(&mut log, header(1, 1, 1, 122)), [0, 1], "a flag bit");
+        assert_eq!(feed(&mut log, header(2, 3, 0, 263)), [0, 1], "a page waits");
+        assert_eq!(feed(&mut log, checked(2)), [0, 1, 2], "with nothing live");
+        let opened = TransportFact::Regulated {
+            quic_stream: 4,
+            transition: TransitionFact::OpenIssued {
+                subscription: 1,
+                objects: 1,
+                bytes: 263,
+            },
+        };
+        feed(&mut log, opened);
+        feed(&mut log, header(3, 4, 0, 41));
+        assert_eq!(
+            feed(&mut log, checked(3)),
+            [0, 1, 2],
+            "an ending for a live one"
+        );
+        assert_eq!(feed(&mut log, read(3)), [0, 1, 2, 3]);
+    }
 }

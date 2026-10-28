@@ -3,8 +3,8 @@
 use std::ops::Deref;
 
 use super::{
-    Cardinality, Kind, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Subject,
-    Verdict,
+    Cardinality, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey, Property,
+    PropertyId, Subject, Verdict,
 };
 use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
 
@@ -70,6 +70,8 @@ pub struct CheckCtx<'a, S: HasView> {
     recorded: Vec<Violation>,
     missing: Option<String>,
     labelled: Vec<LabelledFrame>,
+    peaks: Vec<(&'static str, u64)>,
+    unsettled: Option<Inconclusive>,
 }
 
 /// What a check left behind besides its verdict.
@@ -82,6 +84,10 @@ pub(crate) struct CheckParts {
     pub(crate) missing: Option<String>,
     /// The frames it labelled, in order.
     pub(crate) labelled: Vec<LabelledFrame>,
+    /// The quantities it measured, by name.
+    pub(crate) peaks: Vec<(&'static str, u64)>,
+    /// Why its trigger fired but it couldn't judge yet, if so.
+    pub(crate) unsettled: Option<Inconclusive>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -102,6 +108,8 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             recorded: Vec::new(),
             missing: None,
             labelled: Vec::new(),
+            peaks: Vec::new(),
+            unsettled: None,
         }
     }
 
@@ -112,6 +120,8 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             recorded: self.recorded,
             missing: self.missing,
             labelled: self.labelled,
+            peaks: self.peaks,
+            unsettled: self.unsettled,
         }
     }
 
@@ -223,6 +233,22 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     pub fn record_violation(&mut self, expected: impl Into<String>, actual: impl Into<String>) {
         let violation = self.violation(expected.into(), actual.into());
         self.recorded.push(violation);
+    }
+
+    /// Records the value `quantity` reached by this step. The property's
+    /// report keeps each quantity's largest value over the run, such as the
+    /// most bytes an allowance held (properties.md, Retained bytes).
+    pub fn peak(&mut self, quantity: &'static str, value: u64) {
+        self.peaks.push((quantity, value));
+    }
+
+    /// Records that the property's trigger fired but the run hasn't yet
+    /// shown what the check needs to judge it, such as a teardown's
+    /// settlement. Only the latest evaluation counts: if the run ends after
+    /// one that recorded `reason`, the property is `Inconclusive` with it,
+    /// unless it was violated.
+    pub fn unsettled(&mut self, reason: Inconclusive) {
+        self.unsettled = Some(reason);
     }
 
     /// Records that a source the property needs lacks evidence the check

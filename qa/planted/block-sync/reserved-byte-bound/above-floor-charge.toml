@@ -1,0 +1,10 @@
+# Lets above-floor requests call `charge` (properties.md's negative
+# control): admission sizes every grant to at least one byte, and the
+# routine charges any refused reservation past `M`. The input's budget
+# covers one body of unknown size, and its routines pause in their
+# handoffs, so other mirrors' requests charge it past `M + 2·B + h·B`.
+input = "crates/zakura-sim/tests/fixtures/block-sync-paused-handoffs.bin"
+# Besides admission.rs and peer_routine.rs, which the patch changes, the
+# harness drives the rest of block sync and the Zakura transport under it.
+# A change there can move the input off its paused handoffs.
+checks = ["crates/zakura-network/src/zakura"]

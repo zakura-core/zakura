@@ -318,11 +318,33 @@ pub(super) struct SequencerTask {
     submission_retry_started_at: Option<time::Instant>,
     submission_retry_attempt: u64,
     trace: ZakuraTrace,
+    /// Receives holder changes and snapshots, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observer: super::block_sync_observe::ObserverSlot,
+    /// The holders last reported to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    observed_holders: Vec<(
+        super::block_sync_observe::Holder,
+        super::block_sync_observe::HeldBody,
+    )>,
 }
 
 impl Drop for SequencerTask {
     fn drop(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::SequencerClosed
+        );
         self.body_input_rx.close();
+        #[cfg(any(test, zakura_sim))]
+        {
+            // Each body left in the input drops here, with no next holder.
+            while let Ok(body) = self.body_input_rx.try_recv() {
+                self.observe_dequeued(&body);
+            }
+            self.observe_teardown();
+        }
         while self.body_input_rx.try_recv().is_ok() {}
 
         self.view_tx.send_modify(|view| {
@@ -384,7 +406,102 @@ impl SequencerTask {
             submission_retry_started_at: None,
             submission_retry_attempt: 0,
             trace,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
+            #[cfg(any(test, zakura_sim))]
+            observed_holders: Vec::new(),
         }
+    }
+
+    /// This task, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports that `body` left the input queue.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_dequeued(&self, body: &SequencedBody) {
+        use super::block_sync_observe::{BlockEvent, HeldBody, Holder, HolderChange};
+        observe!(
+            self.observer,
+            BlockEvent::Holder {
+                body: HeldBody {
+                    height: body.height,
+                    owner: body.owner,
+                    bytes: body.bytes,
+                },
+                holder: Holder::Queued {
+                    allocation: body.body.allocation(),
+                },
+                change: HolderChange::Released,
+            }
+        );
+    }
+
+    /// Reports every holder change since the last report, then the
+    /// sequencer's snapshot. Called before each point where another task can
+    /// see the sequencer's bodies: an action send, and the end of an input.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_holders(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        let ownership = self.sequencer.ownership_snapshot();
+        let current = ownership.holders();
+        let released = self
+            .observed_holders
+            .iter()
+            .filter(|held| !current.contains(held))
+            .map(|held| (*held, HolderChange::Released));
+        let retained = current
+            .iter()
+            .filter(|held| !self.observed_holders.contains(held))
+            .map(|held| (*held, HolderChange::Retained));
+        for ((holder, body), change) in released.chain(retained) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change,
+                }
+            );
+        }
+        self.observed_holders = current;
+        observe!(self.observer, BlockEvent::Sequencer(ownership));
+    }
+
+    /// Reports every holder's release and an empty snapshot, because the
+    /// sequencer's ledgers drop with the task. A driver that still runs a
+    /// submission keeps its own copy of the decoded block; the block service
+    /// reports that copy, not the sequencer.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_teardown(&mut self) {
+        use super::block_sync_observe::{BlockEvent, HolderChange};
+        if self.observer.0.is_none() {
+            return;
+        }
+        self.observe_holders();
+        for (holder, body) in std::mem::take(&mut self.observed_holders) {
+            observe!(
+                self.observer,
+                BlockEvent::Holder {
+                    body,
+                    holder,
+                    change: HolderChange::Released,
+                }
+            );
+        }
+        observe!(
+            self.observer,
+            BlockEvent::Sequencer(super::block_sync_observe::SequencerOwnership::default())
+        );
     }
 
     pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
@@ -440,7 +557,11 @@ impl SequencerTask {
                     match body {
                         Some(mut body) => {
                             body.leave_queue();
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_dequeued(&body);
                             self.handle_accept_body(body);
+                            #[cfg(any(test, zakura_sim))]
+                            self.observe_holders();
                             // Publish the synchronous queue → reorder/applying ownership
                             // transfer before an action-channel send can await or time out.
                             // This updates observability without waking scheduling watchers.
@@ -829,6 +950,8 @@ impl SequencerTask {
             if let zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) =
                 outcome.verification()
             {
+                #[cfg(any(test, zakura_sim))]
+                self.observe_holders();
                 self.send_required_action(BlockSyncAction::RecordBodyInvalid {
                     expected_version: semantic_state_version,
                     invalid: invalid.clone(),
@@ -847,6 +970,8 @@ impl SequencerTask {
         if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
             outcome.verification()
         {
+            #[cfg(any(test, zakura_sim))]
+            self.observe_holders();
             self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
                 expected_version: semantic_state_version,
                 failure: *failure,
@@ -912,6 +1037,8 @@ impl SequencerTask {
                     };
                     // The driver disconnects a proven tampering supplier, so that
                     // record must not be dropped when the action channel is busy.
+                    #[cfg(any(test, zakura_sim))]
+                    self.observe_holders();
                     if disconnects {
                         self.send_required_action(action).await;
                     } else {
@@ -1048,6 +1175,8 @@ impl SequencerTask {
             )
             .record(queue_depth as f64);
             let send_started = time::Instant::now();
+            #[cfg(any(test, zakura_sim))]
+            self.observe_holders();
             let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
                     owner: item.owner,
@@ -1192,6 +1321,11 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.observe_holders();
+            self.work.observe_items();
+        }
         #[cfg(feature = "sync-metrics")]
         self.committed_throughput
             .sample_at_interval(Instant::now(), Duration::from_secs(1));

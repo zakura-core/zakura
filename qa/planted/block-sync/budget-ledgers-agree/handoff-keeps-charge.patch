@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+index 4d654417a..3c438db50 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+@@ -2171,10 +2171,6 @@ impl PeerRoutine {
+             body_permit,
+         )
+         .await;
+-        #[cfg(not(any(test, zakura_sim)))]
+-        self.budget.release(reserved_estimate);
+-        #[cfg(any(test, zakura_sim))]
+-        self.release_handoff(outstanding_owner, height, reserved_estimate);
+         // This body opened only this peer's slots; the want-work loop runs at the
+         // top of the next iteration.
+     }

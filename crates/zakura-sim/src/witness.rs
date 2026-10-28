@@ -1,16 +1,16 @@
 //! Witness tests (traces.md, Witness tests).
 //!
-//! A witness test runs one scenario through [`run_harness`] and checks one
-//! property's report against what the test expects. It passes only on a
-//! complete run whose report fits, and whose trigger history, the
-//! property's [`Property::witness`], shows the run reached the steps the
-//! property's bug needs. A run that reaches the right verdict along a
+//! A witness test runs one scenario through [`harness::run_harness`] and
+//! checks one property's report against what the test expects. It passes
+//! only on a complete run whose report fits, and whose trigger history,
+//! the property's [`Property::witness`], shows the run reached the steps
+//! the property's bug needs. A run that reaches the right verdict along a
 //! harmless path proves nothing, so it fails.
 
 use std::{fmt, str::FromStr};
 
 use crate::{
-    harness::{self, run_harness, HarnessError, Subsystem},
+    harness::{self, run_prepared, HarnessError, Subsystem},
     property::Status,
     record::Record,
     MemorySink, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
@@ -162,6 +162,26 @@ pub fn witness_into<S: Subsystem>(
     expect: Expect,
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
+    witness_prepared::<S>(
+        scenario,
+        S::prepare(scenario),
+        input,
+        property,
+        expect,
+        sink,
+    )
+}
+
+/// [`witness_into`] with state `prepared` by the caller, who may keep a
+/// clone of it, such as a port handle, to inspect after the run.
+pub fn witness_prepared<S: Subsystem>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    property: &str,
+    expect: Expect,
+    sink: &mut dyn RecordSink,
+) -> Result<(), WitnessError> {
     let registered = harness::registry::<S>();
     let registered = registered
         .properties()
@@ -172,7 +192,7 @@ pub fn witness_into<S: Subsystem>(
     let status = registered.status;
 
     let mut sink = EndSeen { sink, ended: false };
-    let report = match run_harness::<S>(scenario, input, &mut sink, None) {
+    let report = match run_prepared::<S>(scenario, prepared, input, &mut sink, None) {
         Ok(report) => report,
         Err(HarnessError::Run { failure, .. }) => {
             return Err(WitnessError::HarnessEnd(failure.to_string()))

@@ -1,0 +1,7 @@
+# The committed fuzz input `block-sync-stuck-floor.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes, `ff 02`, pick the stuck-floor scenario: one mirror serves
+# 840 bodies but withholds height 3.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "4fa5ce72c2dcba356e9db4a472497944eb6720eac3db88e18f4b37cd57d8916d"

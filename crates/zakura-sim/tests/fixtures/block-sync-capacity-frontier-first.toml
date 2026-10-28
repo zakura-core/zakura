@@ -1,0 +1,8 @@
+# The committed fuzz input `block-sync-capacity-frontier-first.bin`: the
+# harness that runs it, the generator version it was built for, and its
+# SHA-256. Its first two bytes, `ff 08`, pick the capacity-release scenario.
+# Its plan has block sync handle the detached commit's tip before its reply,
+# so the freed room wakes nothing (#1523).
+harness = "block-sync/storage"
+generator = 2
+sha256 = "a79bd402ff6d47e25d80f6685e301bfc78bdddcb99088429e93079e267fa02ec"

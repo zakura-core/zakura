@@ -35,8 +35,8 @@ use zakura_rt::{
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 mod request_write;
-#[cfg(test)]
-pub(super) use request_write::RequestWritePhase;
+#[cfg(any(test, zakura_sim))]
+pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
 pub(super) use request_write::{RequestWrite, RequestWriteStatus};
 
@@ -70,26 +70,31 @@ pub(super) struct WorkItem {
 }
 
 /// Where a queued item sits in its download lifecycle.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum WorkItemPlace {
+pub enum WorkItemPlace {
+    /// Waiting for a request.
     Pending,
     /// Taken by a request that has not yet published its reservation here.
     Provisional,
+    /// Taken by a published request.
     InFlight,
 }
 
 /// One queued item's owner and byte quantities.
-#[cfg(test)]
+#[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct WorkItemOwnership {
-    pub(super) height: block::Height,
-    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
-    pub(super) place: WorkItemPlace,
+pub struct WorkItemOwnership {
+    /// The item's height.
+    pub height: block::Height,
+    /// The request that took the item, if one did.
+    pub owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Where the item sits.
+    pub place: WorkItemPlace,
     /// The size estimate a request for this item reserves.
-    pub(super) estimated_bytes: u64,
+    pub estimated_bytes: u64,
     /// The estimate bytes this item currently charges to the queue's tally.
-    pub(super) reserved_bytes: u64,
+    pub reserved_bytes: u64,
 }
 
 /// A request reservation that a received body ended.
@@ -233,6 +238,10 @@ pub(super) struct WorkQueue {
     /// owner's routine retiring the request. Routines rescan their requests for
     /// lost ownership only after this changes.
     revocations: AtomicU64,
+    /// Receives request write steps and queue snapshots, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl WorkQueue {
@@ -250,7 +259,34 @@ impl WorkQueue {
             }),
             available: Notify::new(),
             revocations: AtomicU64::new(0),
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
+    }
+
+    /// This queue, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports the queue's items to the observer, if one is installed. A task
+    /// that changes the queue calls this after it handled an input.
+    ///
+    /// It reports under the queue's lock. Releasing the lock is a preemption
+    /// point under the simulator, so a snapshot read before it could land
+    /// after a newer one.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn observe_items(&self) {
+        let inner = self.lock();
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::WorkQueue(Self::ownership(&inner))
+        );
     }
 
     /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
@@ -1212,7 +1248,12 @@ impl WorkQueue {
     /// queue maps rather than from the maintained tallies.
     #[cfg(test)]
     pub(super) fn ownership_snapshot(&self) -> Vec<WorkItemOwnership> {
-        let inner = self.lock();
+        Self::ownership(&self.lock())
+    }
+
+    /// The items of `inner`, as [`Self::ownership_snapshot`] reads them.
+    #[cfg(any(test, zakura_sim))]
+    fn ownership(inner: &WorkQueueInner) -> Vec<WorkItemOwnership> {
         let pending = inner
             .pending
             .iter()

@@ -121,6 +121,8 @@ pub enum Inconclusive {
     /// The run ended at a harness failure, so its evidence may be
     /// incomplete.
     HarnessFailed,
+    /// Every peer left, but the run ended before teardown settled.
+    TeardownOpen,
 }
 
 impl fmt::Display for Inconclusive {
@@ -131,6 +133,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::AssumptionLost => "assumption-lost",
             Inconclusive::ObligationOpen => "obligation-open",
             Inconclusive::HarnessFailed => "harness-failed",
+            Inconclusive::TeardownOpen => "teardown-open",
         })
     }
 }

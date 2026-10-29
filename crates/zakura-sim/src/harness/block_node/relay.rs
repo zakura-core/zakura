@@ -334,6 +334,7 @@ impl Labeller {
             Way::ToNode => Observation::PeerFrame {
                 connection: self.connection,
                 stream: stream(),
+                quic_stream: None,
                 seq,
                 row,
                 rule_stream: stream(),
@@ -345,6 +346,7 @@ impl Labeller {
             Way::FromNode => Observation::NodeFrame {
                 connection: self.connection,
                 stream: stream(),
+                quic_stream: None,
                 seq,
                 row,
                 rule_stream: stream(),

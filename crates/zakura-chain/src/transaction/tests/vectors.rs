@@ -76,6 +76,87 @@ fn attributed_memory_size_counts_orchard_proof_capacity() {
     );
 }
 
+#[test]
+fn transaction_inline_size_excludes_sprout_sapling_and_orchard_bundles() {
+    // Allow the inline Ironwood bundle, but keep the other pools from
+    // enlarging every transparent or Ironwood-only transaction.
+    assert!(
+        std::mem::size_of::<Transaction>() <= 256,
+        "size_of::<Transaction>() is {} bytes",
+        std::mem::size_of::<Transaction>()
+    );
+}
+
+#[test]
+fn attributed_memory_size_counts_boxed_sprout_sapling_and_orchard_bundles() {
+    fn bundle_bytes<T: AttributedMemorySize>(bundle: &T) -> u64 {
+        u64::try_from(std::mem::size_of::<T>()).unwrap() + bundle.attributed_memory_size_bytes()
+    }
+
+    let mut seen = [false; 5];
+    for (_, transaction) in
+        Network::iter().flat_map(|network| arbitrary::test_transactions(&network))
+    {
+        let mut without_bundles = transaction.as_ref().clone();
+        // Cloning can shrink vector capacities, so compare the same clone
+        // before and after removing its bundles.
+        let original_bytes = without_bundles.attributed_memory_size_bytes();
+        let removed_bytes = match &mut without_bundles {
+            Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
+                seen[0] |= joinsplit_data.is_some();
+                joinsplit_data.take().as_deref().map_or(0, bundle_bytes)
+            }
+            Transaction::V4 {
+                joinsplit_data,
+                sapling_shielded_data,
+                ..
+            } => {
+                seen[1] |= joinsplit_data.is_some();
+                seen[2] |= sapling_shielded_data.is_some();
+                joinsplit_data.take().as_deref().map_or(0, bundle_bytes)
+                    + sapling_shielded_data
+                        .take()
+                        .as_deref()
+                        .map_or(0, bundle_bytes)
+            }
+            Transaction::V5 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            }
+            | Transaction::V6 {
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => {
+                seen[3] |= sapling_shielded_data.is_some();
+                seen[4] |= orchard_shielded_data.is_some();
+                sapling_shielded_data
+                    .take()
+                    .as_deref()
+                    .map_or(0, bundle_bytes)
+                    + orchard_shielded_data
+                        .take()
+                        .as_deref()
+                        .map_or(0, bundle_bytes)
+            }
+            _ => continue,
+        };
+
+        assert_eq!(
+            original_bytes - without_bundles.attributed_memory_size_bytes(),
+            removed_bytes,
+        );
+        if seen.into_iter().all(|present| present) {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, [true; 5],
+        "vectors cover both Sprout proofs, both Sapling anchors, and Orchard"
+    );
+}
+
 /// Build a mock output list for pre-V5 transactions, with (index+1)
 /// copies of `output`, which is used to computed the sighash.
 ///
@@ -301,7 +382,7 @@ fn v6_orchard_cross_address_flag_fails_serialization_and_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
         ironwood_shielded_data: None,
     };
 
@@ -1929,7 +2010,7 @@ fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_data),
+        orchard_shielded_data: Some(Box::new(orchard_data)),
         ironwood_shielded_data: Some(ironwood_data),
     };
 
@@ -2150,7 +2231,7 @@ fn v5_orchard_proof_size_is_always_enforced_during_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
     };
 
     let network_upgrades = [
@@ -2214,7 +2295,7 @@ fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
         ironwood_shielded_data: None,
     };
 
@@ -2385,7 +2466,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     };
 
     let v5_tx_bytes = v5_tx
@@ -2521,7 +2602,7 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(shielded_data),
+            sapling_shielded_data: Some(Box::new(shielded_data)),
             orchard_shielded_data: None,
         };
 
@@ -2616,13 +2697,13 @@ fn sapling_lazy_cv_epk_edge_cases() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::SharedAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::JustOutputs {
                     outputs: at_least_one![output],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
             orchard_shielded_data: None,
         }
     };
@@ -2756,7 +2837,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
             },
             Transaction::V6 {
@@ -2765,7 +2846,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 expiry_height: Height(0),
                 inputs: vec![],
                 outputs: vec![],
-                sapling_shielded_data: Some(shielded_data(cv)),
+                sapling_shielded_data: Some(Box::new(shielded_data(cv))),
                 orchard_shielded_data: None,
                 ironwood_shielded_data: None,
             },
@@ -2956,7 +3037,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
         }
     };
@@ -3001,7 +3082,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            sapling_shielded_data: Some(Box::new(make_shielded_data(cv, epk))),
             orchard_shielded_data: None,
             ironwood_shielded_data: None,
         }
@@ -3058,7 +3139,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
             inputs: vec![],
             outputs: vec![],
             joinsplit_data: None,
-            sapling_shielded_data: Some(ShieldedData::<sapling::PerSpendAnchor> {
+            sapling_shielded_data: Some(Box::new(ShieldedData::<sapling::PerSpendAnchor> {
                 value_balance: Amount::try_from(0).expect("zero is a valid amount"),
                 transfers: TransferData::SpendsAndMaybeOutputs {
                     shared_anchor: sapling::FieldNotPresent,
@@ -3066,7 +3147,7 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
                     maybe_outputs: vec![],
                 },
                 binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            })),
         }
     };
 

@@ -373,6 +373,15 @@ impl SubscriptionModel {
         true
     }
 
+    /// Subscriptions the peer holds on the node on `session`: live or
+    /// closing ones, and ended ones whose terminal outcome the node is still
+    /// writing. `OverLive` starts at twice `max_live` of them.
+    pub fn held(&self, session: SessionId) -> usize {
+        self.publishers.get(&session).map_or(0, |publisher| {
+            publisher.live.len() + publisher.writing.len()
+        })
+    }
+
     /// Tombstones the node holds on `session`.
     pub fn tombstones(&self, session: SessionId) -> usize {
         self.publishers
@@ -524,6 +533,14 @@ impl SubscriptionModel {
         };
         live.unaccepted.push_back((cursor, live.consumed));
         Labels::NONE
+    }
+
+    /// The credit the node granted on its live subscription `key` and the
+    /// peer's conformant pages haven't spent, in each unit. `None` if `key`
+    /// isn't live.
+    pub fn unspent(&self, session: SessionId, key: ExchangeKey) -> Option<Totals> {
+        let live = self.subscribers.get(&session)?.live.get(&key)?;
+        Some(live.granted.minus(live.consumed).unwrap_or_default())
     }
 
     /// Labels the peer's terminal outcome for `key` on `session`, and ends

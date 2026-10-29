@@ -298,9 +298,9 @@ so only a reader that sees no request in transition can compare them.
 
 ## Known limitations and follow-ups
 
-- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is an average, not a bound: real
-  Mainnet blocks decode at up to about 3.45× their wire size, the worst consensus-valid
-  block at about 26×. Admission therefore charges the larger of the factor's estimate and
+- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is an average, not a bound:
+  even with Sprout, Sapling, and Orchard bundles boxed, a block of small transparent V5
+  transactions decodes at about 4.7× its wire size. Admission charges the larger of the factor's estimate and
   the measured decoded heap. The factor remains a floor so the gate never loosens on
   typical blocks. `estimated_resident_pipeline_bytes` is the single calibration point.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its

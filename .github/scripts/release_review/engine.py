@@ -145,7 +145,8 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
     """Checkpoint coverage and candidates after each unit, including incomplete runs."""
     spending = Spending(settings)
     report.update(status="incomplete", findings=[], candidates=[], errors=[], summaries=[],
-                  provider=settings.provider, model=settings.model, reasoning_effort=settings.reasoning_effort,
+                  provider=settings.provider, model=settings.model,
+                  reasoning_effort=settings.reasoning_effort if settings.provider == "openai" else "provider default",
                   prompt_digest=settings.prompt_digest,
                   usage=spending.report(), synthesis_complete=False)
     deadline = time.monotonic() + settings.max_seconds

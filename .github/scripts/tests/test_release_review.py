@@ -427,6 +427,12 @@ class EngineTests(GitFixture):
         self.assertEqual(report["status"], "complete")
         self.assertIn("validate(block)", provider.requests[1].messages[-1]["content"])
 
+    def test_compatible_provider_does_not_claim_an_openai_reasoning_setting(self):
+        provider = ScriptedProvider([completed(), completed()])
+        report = self.metadata()
+        review(self.repository, provider, settings(provider="abliterated"), report, lambda _: None)
+        self.assertEqual(report["reasoning_effort"], "provider default")
+
     def test_invalid_provider_output_preserves_incomplete_checkpoint(self):
         provider = ScriptedProvider([{"invalid": "schema"}])
         report = self.metadata()

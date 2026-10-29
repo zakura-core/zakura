@@ -541,12 +541,15 @@ def elf_image(data):
                     sym = b"section " + name(headers[shndx]).encode()
                 symbols.append((sym, info, other, shndx, value, size))
             image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
-    seen = collections.Counter()
+    # ELF allows several sections with one name, such as COMDAT groups'
+    # `.text`, so each is known by its name and occurrence.
+    seen, labels = collections.Counter(), []
     for header in headers:
-        sname, stype, flags, addr, start, length, link, info, align, _ = header
-        # ELF allows several sections with one name, such as COMDAT groups' `.text`.
         seen[name(header)] += 1
-        key = "section %s" % name(header) + ("" if seen[name(header)] == 1 else "#%d" % seen[name(header)])
+        labels.append(name(header) + ("" if seen[name(header)] == 1 else "#%d" % seen[name(header)]))
+    for header, label in zip(headers, labels):
+        sname, stype, flags, addr, start, length, link, info, align, _ = header
+        key = "section " + label
         keep = flags & SHF_ALLOC and sname and name(header) != ".note.gnu.build-id"
         relocates = stype in (SHT_RELA, SHT_REL) and 0 < info < count and headers[info][2] & SHF_ALLOC
         if relocates and obj:
@@ -558,11 +561,11 @@ def elf_image(data):
                 index = rinfo >> 32
                 target = symbols[index] if index < len(symbols) else index
                 entries.append(b"%d %d %r %d" % (offset, rinfo & 0xFFFFFFFF, target, addend))
-            image[key] = struct.pack("<IQ", stype, flags) + name(headers[info]).encode() + b"\n" + b"\n".join(entries)
+            image[key] = struct.pack("<IQ", stype, flags) + labels[info].encode() + b"\n" + b"\n".join(entries)
         elif keep or relocates:
             contents = b"" if stype == SHT_NOBITS else data[start:start + length]
             # A relocation section's `sh_info` names the section it relocates.
-            applies = name(headers[info]).encode() if relocates else b""
+            applies = labels[info].encode() if relocates else b""
             image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + applies + b"\n" + contents
     return image
 

@@ -266,6 +266,15 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("section .rela.text", out)
 
+        def twins(target):
+            """An ELF executable with two `.data` sections, whose `.rela.data` applies to one of them."""
+            return elf([(".data", 1, 3, b"one", 0, 0), (".data", 1, 3, b"two", 0, 0),
+                        (".rela.data", 4, 0x40, b"r1", target, 0)])
+
+        status, out = image_status(twins(1), twins(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.data", out)
+
     def test_elf_program_headers_count(self):
         """An executable stack, which only a program header records, fails."""
         stack = 0x6474E551

@@ -96,7 +96,7 @@ impl CloseCause {
     }
 
     /// Report `TornDown`, once the connection's workers drained and its peer
-    /// was unregistered.
+    /// was unregistered. A drain that timed out doesn't call it.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn torn_down(&self) {
         if let Some(tap) = self.tap.get() {

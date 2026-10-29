@@ -777,3 +777,199 @@ async fn an_inbound_connection_without_a_permit_is_refused() -> Result<(), BoxEr
     link.close().await;
     Ok(())
 }
+
+/// Over real QUIC, the peer's `Open` and its page each carry the read
+/// sequence number of their own frame through the reader and the
+/// header-sync session: `OpenApplied` and `PageClaimed` name the `HeaderRead`
+/// of the frame that caused them. A `Status` before each puts other frames
+/// between them, so a tag taken twice or not at all shows.
+///
+/// `tests/sim_header_sync.rs` can't host this: the node opens a subscription
+/// only after its locator query is answered, and that crate can't name the
+/// query without `zakura-testkit`.
+#[tokio::test]
+async fn regulation_events_name_the_frames_that_caused_them() -> Result<(), BoxError> {
+    use crate::zakura::{
+        header_sync::v9::{CommonMessage, Cursor as V9Cursor, Operation, SubscribeHeaders},
+        testkit::HostilePeer,
+        AuxSchema, HeaderEntry, HeaderSyncAction, Headers, Status, ZAKURA_STREAM_HEADER_SYNC,
+    };
+    use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_GENESIS_BYTES};
+
+    let _guard = zakura_test::init();
+    let block = |bytes: &[u8]| -> Arc<Block> {
+        Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    };
+    let genesis = block(&BLOCK_MAINNET_GENESIS_BYTES);
+    let block_one = block(&BLOCK_MAINNET_1_BYTES);
+    let anchor = (block::Height(0), genesis.hash());
+    let target = (block::Height(1), block_one.hash());
+    let recorder = Arc::new(Recorder::default());
+    let node = ZakuraTestNode::builder(80)
+        .header_sync_driver(
+            Network::Mainnet,
+            anchor,
+            crate::zakura::FullStateFrontiers {
+                finalized_height: anchor.0,
+                verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
+            },
+            Some(anchor),
+        )
+        .transport_observer(recorder.clone())
+        .spawn()
+        .await?;
+    let mut actions = node
+        .take_header_sync_actions()
+        .await
+        .expect("the external header driver is enabled");
+    let header_sync = node.header_sync().expect("the header service is enabled");
+    let peer =
+        HostilePeer::connect_native_with_capabilities(&node, 81, ZAKURA_CAP_HEADER_SYNC).await?;
+    let peer_id = peer.id()?;
+    let status = CommonMessage::Status(Status {
+        work_anchor_height: anchor.0,
+        work_anchor_hash: anchor.1,
+        selected_tip_height: target.0,
+        selected_tip_hash: target.1,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
+        oldest_retained_height: anchor.0,
+        max_headers_per_response: 16,
+        max_subscriptions: 1,
+        max_message_bytes: 1_000_000,
+        tree_aux_schema_mask: 0,
+    });
+    let at_anchor = V9Cursor {
+        height: anchor.0,
+        hash: anchor.1,
+        headers: 0,
+        bytes: 0,
+    };
+
+    peer.send_header_sync_message(&status).await?;
+    peer.send_header_sync_message(&CommonMessage::SubscribeHeaders(SubscribeHeaders {
+        operation: Operation::Open,
+        subscription_id: 5,
+        update_sequence: 0,
+        initial_target_tip_hash: anchor.1,
+        acknowledged: at_anchor,
+        locator_hashes: vec![anchor.1],
+        added_credit: Credit {
+            objects: 1,
+            bytes: 10_000,
+        },
+        tree_aux_schema: AuxSchema::None,
+    }))
+    .await?;
+    let (session_id, scope) = match timeout(TEST_TIMEOUT, actions.recv())
+        .await?
+        .ok_or("the action channel stays open")?
+    {
+        HeaderSyncAction::QueryHeaderLocator {
+            session_id, scope, ..
+        } => (session_id, scope),
+        action => return Err(format!("unexpected header action: {action:?}").into()),
+    };
+    header_sync
+        .send(crate::zakura::Event::HeaderLocatorReady {
+            peer: peer_id,
+            session_id,
+            target_tip_hash: target.1,
+            scope,
+            locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
+                zakura_header_chain::Frontier::new(anchor.0, anchor.1),
+            )),
+        })
+        .await?;
+    let open = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let CommonMessage::SubscribeHeaders(open) = peer.recv_header_sync_message().await? {
+                return Ok::<_, BoxError>(open);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(open.operation, Operation::Open);
+
+    peer.send_header_sync_message(&status).await?;
+    peer.send_header_sync_message(&CommonMessage::Headers(Headers {
+        subscription_id: open.subscription_id,
+        initial_target_tip_hash: target.1,
+        common_ancestor_height: anchor.0,
+        common_ancestor_hash: anchor.1,
+        reaches_initial_target: true,
+        tree_aux_schema: AuxSchema::None,
+        entries: vec![HeaderEntry {
+            header: block_one.header.clone(),
+            body_size: 1_000,
+            tree_aux: None,
+        }],
+    }))
+    .await?;
+    let claimed = |events: &[TransportEvent]| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                TransportEvent::Regulated {
+                    transition: Transition::PageClaimed { .. },
+                    ..
+                }
+            )
+        })
+    };
+    timeout(TEST_TIMEOUT, async {
+        while !claimed(&recorder.events()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+
+    let events = recorder.events();
+    let quic_stream = events
+        .iter()
+        .find_map(|event| match event {
+            TransportEvent::Admitted {
+                quic_stream,
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                ..
+            } => Some(*quic_stream),
+            _ => None,
+        })
+        .expect("the header stream was admitted");
+    let read_types: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::HeaderRead {
+                quic_stream: read,
+                seq,
+                message_type,
+                ..
+            } if *read == quic_stream => Some((*seq, *message_type)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        read_types,
+        [
+            (0, v9::message_type::STATUS),
+            (1, v9::message_type::SUBSCRIBE_HEADERS),
+            (2, v9::message_type::STATUS),
+            (3, v9::message_type::HEADERS),
+        ]
+    );
+    let tagged: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::Regulated {
+                quic_stream: regulated,
+                transition:
+                    Transition::OpenApplied { seq, .. } | Transition::PageClaimed { seq, .. },
+                ..
+            } if *regulated == quic_stream => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tagged, [Some(1), Some(3)]);
+    Ok(())
+}

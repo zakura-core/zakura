@@ -32,8 +32,8 @@ use super::{
 use crate::{
     observe::StorageFact,
     peer::{
-        honest::HonestChain, Dialer as PeerDialer, PeerControl, PeerRecords, PeerSpec, PeerTask,
-        NODE_ADDR,
+        honest::HonestChain, Dialer as PeerDialer, PeerControl, PeerFailure, PeerRecords, PeerSpec,
+        PeerTask, NODE_ADDR,
     },
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
     storage::HEADER_SERVICE,
@@ -520,7 +520,7 @@ impl Subsystem for HeaderWire {
             scenario.net.seed,
             observer,
         );
-        let failure = Rc::new(RefCell::new(None));
+        let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone(), ports.records.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) = control.add(&name, spec.script.clone());

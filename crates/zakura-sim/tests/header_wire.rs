@@ -111,10 +111,77 @@ struct Session {
     session_id: u64,
 }
 
+/// A session's identity as (connection, quic_stream, kind, version,
+/// session_id). The connection is optional so an admission that names none
+/// matches no row.
+type SessionKey = (Option<u64>, u64, u16, u16, u64);
+
+/// The identity `obs` admits, if it's a transport `Admitted` event.
+fn admitted_key(obs: &Observation) -> Option<SessionKey> {
+    match obs {
+        Observation::Transport {
+            connection,
+            event:
+                TransportFact::Admitted {
+                    quic_stream,
+                    kind,
+                    version,
+                    session_id,
+                    ..
+                },
+            ..
+        } => Some((*connection, *quic_stream, *kind, *version, *session_id)),
+        _ => None,
+    }
+}
+
+/// The identity `obs` names, if it's a `Session` row.
+fn row_key(obs: &Observation) -> Option<SessionKey> {
+    match obs {
+        Observation::Session {
+            connection,
+            quic_stream,
+            kind,
+            version,
+            session_id,
+            ..
+        } => Some((
+            Some(*connection),
+            *quic_stream,
+            *kind,
+            *version,
+            *session_id,
+        )),
+        _ => None,
+    }
+}
+
 /// The transport events and session rows in `report`'s log, in order.
+/// Every `Admitted` event must be followed directly by its `Session` row,
+/// equal on all five identity fields, and every row must follow one, since
+/// peer evidence maps sessions to connections through these rows.
 fn read(report: &RunReport) -> (Vec<Event>, Vec<Session>) {
     let (mut events, mut sessions) = (Vec::new(), Vec::new());
-    for entry in report.log.entries() {
+    let entries = report.log.entries();
+    for (index, entry) in entries.iter().enumerate() {
+        let before = index
+            .checked_sub(1)
+            .and_then(|before| admitted_key(&entries[before].obs));
+        if let Some(row) = row_key(&entry.obs) {
+            assert_eq!(
+                before,
+                Some(row),
+                "the session row at entry {index} matches the admission it follows"
+            );
+        }
+        if admitted_key(&entry.obs).is_some() {
+            assert!(
+                entries
+                    .get(index + 1)
+                    .is_some_and(|next| row_key(&next.obs).is_some()),
+                "the admission at entry {index} is followed by its session row"
+            );
+        }
         match &entry.obs {
             Observation::Transport {
                 connection,
@@ -661,6 +728,35 @@ fn loss_opens_once_a_session_is_admitted() {
         lost.iter().all(|step| *step > admitted),
         "every drop came after the session's row at step {admitted}: {lost:?}"
     );
+}
+
+/// The node's endpoint binds at its production capacities, so 17 peers that
+/// dial it at once each get a connection and a header session. A bind with
+/// room for 16 connections leaves one peer out.
+///
+/// This fails if the node binds at test capacities instead of
+/// `quic_bind_config`'s.
+#[test]
+fn seventeen_dialing_peers_are_all_admitted() {
+    let scenario = scenario(vec![PeerSpec::dialing(); 17]);
+    for plan in plans() {
+        let (events, sessions) = read(&run(&scenario, plan));
+        let connections = connections(&events);
+        for index in 0..17 {
+            let remote = remote(index, 0);
+            let connection = connections
+                .get(&remote)
+                .unwrap_or_else(|| panic!("{remote} registered: {connections:?}"));
+            assert_eq!(
+                sessions
+                    .iter()
+                    .filter(|session| session.connection == *connection)
+                    .count(),
+                1,
+                "{remote}"
+            );
+        }
+    }
 }
 
 /// A transport tap that forwards everything, but observes into a copy of

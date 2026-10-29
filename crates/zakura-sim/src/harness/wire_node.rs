@@ -39,7 +39,7 @@ use zakura_network::{
 };
 use zakura_quic::{
     sim::{SeededInputs, SimNet},
-    NodeAddr, QuicBindConfig, QuicEndpoint,
+    NodeAddr, QuicEndpoint,
 };
 use zakura_rt::{sim::RunId, sync::watch};
 use zakura_scheduler::SimInstant;
@@ -94,13 +94,7 @@ impl WireNode {
             let limits = ZakuraLocalLimits::from_config(&config);
             let quic = QuicEndpoint::bind_with(
                 SeededInputs::node_key(seed, 0),
-                &QuicBindConfig {
-                    addrs: vec![NODE_ADDR],
-                    max_bidi_streams: 16,
-                    max_connections: 16,
-                    dial_reserve: 0,
-                    max_closing_connections: 16,
-                },
+                &limits.quic_bind_config(vec![NODE_ADDR]),
                 &limits.quic,
                 net,
                 SeededInputs::new(seed, 0).endpoint_inputs(),

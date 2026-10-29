@@ -3641,6 +3641,27 @@ impl ZakuraProtocolHandler {
                 return None;
             }
 
+            // The prelude cap becomes our outbound frame cap for this stream,
+            // so it must fit a frame header and at least one payload byte.
+            let peer_frame_cap = usize::try_from(prelude.max_frame_bytes)
+                .expect("u32 frame cap fits usize on supported targets");
+            if peer_frame_cap <= FRAME_HEADER_BYTES {
+                debug!(
+                    max_frame_bytes = prelude.max_frame_bytes,
+                    "rejecting Zakura stream whose frame cap cannot carry a payload"
+                );
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                close_cause.record("undersized_frame_cap");
+                connection_token.cancel();
+                metrics::counter!("zakura.p2p.stream.rejected.undersized_frame_cap").increment(1);
+                conn.trace_stream(
+                    "rejected.undersized_frame_cap",
+                    stream_id,
+                    Some(stream_kind),
+                );
+                return None;
+            }
+
             if stream.mode == StreamMode::Persistent
                 && !may_open_ordered_stream(registry.session_policy(stream.kind), !is_initiator)
             {

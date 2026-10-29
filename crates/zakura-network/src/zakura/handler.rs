@@ -4930,6 +4930,21 @@ fn bounded_stream_queue_depths(
 #[error("Zakura outbound frame write timed out")]
 struct OrderedFrameWriteTimeout;
 
+/// A queued ordered-stream frame that the writer refused before writing it.
+#[derive(Debug, Error)]
+enum OrderedFrameEncodeError {
+    #[error(
+        "Zakura outbound ordered frame payload {payload_len} exceeds negotiated \
+         max_message_bytes {max_message_bytes}"
+    )]
+    OverMessageCap {
+        payload_len: usize,
+        max_message_bytes: u32,
+    },
+    #[error("Zakura outbound ordered frame does not fit the stream's frame cap: {0}")]
+    Encode(ZakuraProtocolError),
+}
+
 #[cfg(test)]
 async fn persistent_stream_worker(
     send: SendStream,
@@ -5160,6 +5175,20 @@ async fn persistent_stream_worker_with_policy(
                             }
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
+                                break;
+                            }
+                            // A local frame that does not fit the stream is not a
+                            // connection fault. Retire only this session, as the
+                            // request worker resets only its own stream.
+                            if error.is::<OrderedFrameEncodeError>() {
+                                debug!(stream_kind, stream_id = context.stream_id, ?error,
+                                    "retiring Zakura service session after a local frame encode error");
+                                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
+                                context.conn.trace_stream(
+                                    "reset.local_oversize",
+                                    context.stream_id,
+                                    Some(stream_kind_label(stream_kind)),
+                                );
                                 break;
                             }
                             debug!(stream_kind, stream_id = context.stream_id, ?error, "closing Zakura ordered stream writer");
@@ -5627,14 +5656,15 @@ async fn write_ordered_frame_with_policy(
     // handshake clamps `max_frame_bytes` and `max_message_bytes` independently,
     // so the frame cap alone does not bound this.
     if frame.payload.len() > limits.max_message_bytes as usize {
-        return Err(format!(
-            "Zakura outbound ordered frame payload {} exceeds negotiated max_message_bytes {}",
-            frame.payload.len(),
-            limits.max_message_bytes,
-        )
+        return Err(OrderedFrameEncodeError::OverMessageCap {
+            payload_len: frame.payload.len(),
+            max_message_bytes: limits.max_message_bytes,
+        }
         .into());
     }
-    let encoded = frame.encode(max_frame_bytes)?;
+    let encoded = frame
+        .encode(max_frame_bytes)
+        .map_err(OrderedFrameEncodeError::Encode)?;
     #[cfg(any(test, zakura_sim))]
     let message_type = frame.message_type;
     // Free the payload now: the write can wait on QUIC credit, and holding

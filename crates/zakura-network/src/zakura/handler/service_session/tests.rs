@@ -409,6 +409,46 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_local_frame_retires_only_its_session() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start().await?;
+    let (client, server) = fixture.sessions().await?;
+    let mut client_sibling = timeout(TEST_TIMEOUT, fixture.client_siblings.recv())
+        .await
+        .expect("the client admits the sibling service")
+        .ok_or("missing client sibling")?;
+    let mut server_sibling = timeout(TEST_TIMEOUT, fixture.server_siblings.recv())
+        .await
+        .expect("the server admits the sibling service")
+        .ok_or("missing server sibling")?;
+    let (mut sibling_recv, _send) = client_sibling.take_stream(SIBLING.kind).unwrap();
+    let (_recv, sibling_send) = server_sibling.take_stream(SIBLING.kind).unwrap();
+
+    // A payload as large as the whole frame cap leaves no room for the header.
+    let oversize = frame(2, 43, usize::try_from(DATA.frame_cap)?);
+    timeout(TEST_TIMEOUT, client.data_send.send(oversize)).await??;
+    timeout(TEST_TIMEOUT, client.cancel.cancelled()).await?;
+    timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
+    assert!(!client.connection_cancel.is_cancelled());
+    assert!(!server.connection_cancel.is_cancelled());
+    assert!(!client_sibling.service_cancel_token().is_cancelled());
+    assert!(!server_sibling.service_cancel_token().is_cancelled());
+    assert!(fixture.connection.close_reason().is_none());
+
+    let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
+    assert_eq!(replacement_client.conn_id, client.conn_id);
+    assert_ne!(replacement_client.id, client.id);
+    exchange(&mut replacement_client, &mut replacement_server).await?;
+    let ping = frame(1, 19, 64);
+    timeout(TEST_TIMEOUT, sibling_send.send(ping.clone())).await??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+        Some(ping)
+    );
+    fixture.close().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_sibling_does_not_prevent_full_capacity_pair() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     // The pair needs both slots; the third negotiated role has no local demand.

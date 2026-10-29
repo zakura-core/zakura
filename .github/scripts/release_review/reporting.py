@@ -40,6 +40,9 @@ def render(report: dict, *, comment: bool = False) -> str:
     usage = report.get("usage", {})
     lines.append(f"Estimated API cost, including uncertain requests: ${usage.get('estimated_usd_including_uncertain_calls', '0')} "
                  f"of ${usage.get('budget_usd', '25')}; {usage.get('calls', 0)} requests.")
+    if report.get("resume_history"):
+        lines.append(f"Continued from {len(report['resume_history'])} saved attempt(s); "
+                     "coverage and usage include those attempts under the same API ceiling.")
     if report.get("run_url"):
         lines.extend(["", f"[Workflow run and full report artifacts]({report['run_url']})"])
     if not complete:

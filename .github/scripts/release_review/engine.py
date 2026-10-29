@@ -6,6 +6,7 @@ import json
 import time
 from dataclasses import asdict
 
+from .checkpoints import contract_digest, restore
 from .config import Settings
 from .contracts import ModelProvider, ModelRequest, ReviewError, parse_turn
 from .models import Spending
@@ -142,7 +143,7 @@ def synthesize(repo: Repository, provider: ModelProvider, settings: Settings,
 
 
 def review(repo: Repository, provider: ModelProvider, settings: Settings,
-           report: dict, checkpoint) -> dict:
+           report: dict, checkpoint, *, prior_report: dict | None = None) -> dict:
     """Checkpoint coverage and candidates after each unit, including incomplete runs."""
     spending = Spending(settings)
     report.update(status="incomplete", findings=[], candidates=[], errors=[], summaries=[],
@@ -154,8 +155,11 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
     deadline = time.monotonic() + settings.max_seconds
     units, coverage = repo.units(settings.unit_bytes, settings.excluded_paths)
     report["coverage"] = coverage
+    report["resume_contract_digest"] = contract_digest(repo, settings, units, coverage)
     changed = {entry["path"] for entry in coverage if entry["status"] != "out_of_scope"}
     completed = set()
+    if prior_report is not None:
+        spending, completed = restore(prior_report, report, repo, settings, units, changed)
 
     def save():
         for entry in coverage:
@@ -169,7 +173,7 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
     try:
         if coverage and not changed:
             raise ReviewError("No changed files remain in the configured review scope")
-        for batch in batch_units(units, settings.unit_bytes):
+        for batch in batch_units([unit for unit in units if unit.id not in completed], settings.unit_bytes):
             turn = inspect_unit(repo, provider, settings, spending, {
                 "task": "Review every release-diff unit in this batch and their interactions; "
                         "use repository reads to check context before reporting a bug.",

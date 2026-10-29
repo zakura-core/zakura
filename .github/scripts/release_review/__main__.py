@@ -57,8 +57,9 @@ def run_review(args) -> int:
         provider_type = OpenAIProvider if settings.provider == "openai" else AbliteratedProvider
         report["pricing"] = {"input_usd_per_million": str(settings.input_price),
                              "output_usd_per_million": str(settings.output_price)}
+        prior = json.loads(args.resume_report.read_text()) if args.resume_report else None
         review(repository, provider_type(settings, key, JsonTransport()), settings, report,
-               lambda current: write_report(args.output, current))
+               lambda current: write_report(args.output, current), prior_report=prior)
     except (ReviewError, OSError, ValueError, KeyError, TypeError) as error:
         # Only our domain errors are safe to publish. Exceptions from I/O or malformed
         # external envelopes can contain credential-bearing URLs or provider payloads.
@@ -103,9 +104,13 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path, default=Path(".github/release-review"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--context", type=Path)
+    parser.add_argument("--resume-report", type=Path,
+                        help="trusted incomplete report to continue under its existing API budget")
     args = parser.parse_args(argv)
     if args.command != "prepare" and args.context is None:
         parser.error("--context is required for review and publish")
+    if args.resume_report is not None and args.command != "review":
+        parser.error("--resume-report is only valid for review")
     try:
         return {"prepare": prepare, "review": run_review, "publish": publish_report}[args.command](args)
     except ReviewError as error:

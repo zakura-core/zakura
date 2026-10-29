@@ -103,7 +103,7 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
     rounds = limits["max_rounds"]
     seconds = limits["max_seconds"]
     if (type(unit_bytes) is not int or not 1000 <= unit_bytes <= 48000
-            or type(rounds) is not int or not 1 <= rounds <= 8
+            or type(rounds) is not int or not 1 <= rounds <= 16
             or type(seconds) is not int or not 60 <= seconds <= 10800):
         raise ReviewError("invalid review work limits")
     return Settings(provider, name, endpoint, input_price, output_price, budget,

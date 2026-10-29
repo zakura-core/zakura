@@ -76,6 +76,17 @@ comment's run identity before writing. It reads the comment back to verify the
 bot author, content, and target PR, then saves its URL in the JSON report and
 workflow summary. Results for old heads remain artifacts.
 
+For a local continuation, the reviewer CLI accepts `--resume-report` pointing to
+a trusted incomplete JSON report from this implementation. Do not use reports
+supplied by a PR author. A digest binds saved coverage to the exact revisions,
+rendered diff units, scope, prompts, provider/model/effort, request limits, and
+pricing. A mismatch stops before any API call. Completed units are reused and
+all earlier token costs and uncertain-call reservations carry forward under the
+same $25 ceiling. Source-request turns may be increased (up to 16); each
+invocation has its own wall-time limit. Reports preserve the earlier reviewer
+revisions, errors, and usage in continuation history. Normal manual workflow
+reruns still start a fresh review.
+
 ## Exclude files
 
 Edit `[scope].exclude_paths` in `.github/release-review/config.toml`:

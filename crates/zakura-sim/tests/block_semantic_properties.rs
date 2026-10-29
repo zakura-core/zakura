@@ -1,6 +1,6 @@
 //! Block sync's semantic properties (P6b, gates P6.1 and P6.2): each
 //! committed input reaches its property's trigger history on the real node,
-//! and holds or, for #1523, violates. An alternate submission callback
+//! and holds. An alternate submission callback
 //! violates `submit-only-requested`, and the honest scenarios repeat across
 //! A/A and A/B/A. `cargo xtask planted` runs the same inputs with each
 //! property's bypass patch applied.
@@ -184,7 +184,7 @@ fn the_stale_beside_current_input_holds_stale_completion_inert() {
 
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset
 /// detaches the held submission, which keeps its holder and its place
-/// under the limit. The draft holds. With `forget-on-reset.patch`, the
+/// under the limit. The property holds. With `forget-on-reset.patch`, the
 /// reset forgets the submission, and the same input violates it.
 #[test]
 fn the_stalled_reset_input_holds_detached_submission_bounded() {
@@ -238,26 +238,26 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 }
 
 /// The capacity-release input whose plan handles the detached commit's tip
-/// first: the frontier releases height 1, the stale reply frees room, and
-/// the waiting fork body stays unsubmitted until the node waits on time
-/// (#1523). The witness requires that order: the verified tip reached the
-/// released submission's height, and no `applying` entry holds it. The
-/// run takes 520,000 steps.
+/// first: the frontier releases height 1, and the stale reply frees room
+/// that wakes the waiting fork body. Before #1523's fix, that body stayed
+/// unsubmitted until the node waited on time. The witness requires that
+/// order: the verified tip reached the released submission's height, and
+/// no `applying` entry holds it.
 #[test]
 #[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
-fn the_frontier_first_input_violates_capacity_release_wakes() {
+fn the_frontier_first_input_holds_capacity_release_wakes() {
     witnessed(
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
         CAPACITY_RELEASE_WAKES,
-        Expect::Violated,
+        Expect::Holds,
     );
 }
 
 /// The capacity-release input whose plan handles the detached commit's
 /// reply first, before the frontier releases height 1, so the freed room
 /// wakes the waiting fork body. Room frees beside the waiting body, but not
-/// in #1523's order, so this run isn't the property's witness: the test
-/// checks the run directly. The run takes 520,000 steps.
+/// in the frontier-first order, so this run isn't the property's witness: the test
+/// checks the run directly.
 #[test]
 #[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_reply_first_input_holds_capacity_release_wakes() {

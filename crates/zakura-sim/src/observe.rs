@@ -848,6 +848,9 @@ pub enum StorageRequest {
         parent: String,
         /// Its apply class, `checkpoint` or `full`.
         class: String,
+        /// The decoded size of the block storage took,
+        /// `Block::attributed_memory_size_bytes`.
+        decoded_bytes: u64,
     },
     /// One of the body evidence records.
     RecordBody {

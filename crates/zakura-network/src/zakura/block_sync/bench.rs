@@ -332,6 +332,7 @@ impl BenchCommitter {
             eligible_sources: std::collections::BTreeSet::new(),
             persisted_availability: None,
             semantic_completion: Some((self.owner, zakura_header_chain::StateVersion::default())),
+            committed_epoch: Some(self.owner.authority.body_work_epoch),
         });
         let _ = self.control.send(SequencerControlInput::FrontierAdvance {
             frontiers,

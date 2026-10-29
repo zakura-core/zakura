@@ -379,19 +379,15 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("release-by-height"),
     },
-    // Both capacity tests are ignored, since each debug run takes about
-    // eight minutes, and run only on demand. Main's sequencer is the bypass:
-    // the frontier-first input violates it (#1523).
+    // The capacity test is ignored, since a debug run takes about eight
+    // minutes, and runs only on demand.
     Coverage {
         property: crate::domain::block_sync_semantic::CAPACITY_RELEASE_WAKES,
         passing: Passing::Test(on_demand_test(
             "tests/block_semantic_properties.rs",
-            "the_reply_first_input_holds_capacity_release_wakes",
+            "the_frontier_first_input_holds_capacity_release_wakes",
         )),
-        bypass: Bypass::Test(on_demand_test(
-            "tests/block_semantic_properties.rs",
-            "the_frontier_first_input_violates_capacity_release_wakes",
-        )),
+        bypass: Bypass::Planted("stale-completion-no-wake"),
     },
     Coverage {
         property: crate::domain::block_sync_semantic::DETACHED_SUBMISSION_BOUNDED,

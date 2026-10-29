@@ -164,7 +164,7 @@ impl BlockScenario {
     ///
     /// The commit both advances the view's tip and replies. When block sync
     /// handles the tip first, the frontier releases height 1, and the stale
-    /// reply that follows frees room without waking the waiting body
+    /// reply that follows frees room that must wake the waiting body
     /// (#1523).
     ///
     /// The teardown ends by step 478,000 on both committed inputs, after

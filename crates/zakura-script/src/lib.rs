@@ -27,6 +27,20 @@ use zcash_script::{
     Opcode,
 };
 
+/// Whether trusted network and block context enables PQ P2SH execution for this transaction.
+/// Builds without PQ support always retain legacy validation.
+pub fn pq_p2sh_active(
+    transaction: &zakura_chain::transaction::Transaction,
+    network: &Network,
+    height: Height,
+) -> bool {
+    cfg!(feature = "pq")
+        && transaction.version() == 5
+        && network
+            .pq_p2sh_activation_height()
+            .is_some_and(|activation| height >= activation)
+}
+
 /// Errors from transaction preparation and script verification.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -157,10 +171,7 @@ impl CachedFfiTransaction {
         )?;
         #[cfg(feature = "pq")]
         let cached = Self {
-            pq_p2sh: cached.transaction.version() == 5
-                && network
-                    .pq_p2sh_activation_height()
-                    .is_some_and(|activation| height >= activation),
+            pq_p2sh: pq_p2sh_active(&cached.transaction, network, height),
             ..cached
         };
         Ok(cached)
@@ -304,7 +315,7 @@ impl CachedFfiTransaction {
 
 /// Counts committed redeem-script operations without interpreting large signature pushes.
 /// This is accounting, not authorization: the verifier still authenticates and executes the
-/// input independently. The per-input PQ verification-attempt limit remains in Common.
+/// input independently. The shared operation limit bounds multisig key matching.
 #[cfg(feature = "pq")]
 fn pq_p2sh_input_sigop_count(input: &transparent::Input, output: &transparent::Output) -> u32 {
     let legacy_count = p2sh_input_sigop_count(input, output);

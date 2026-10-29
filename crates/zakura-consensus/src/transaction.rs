@@ -618,7 +618,7 @@ where
                 // scriptSigs, and high-sigop P2SH redeem scripts) *before*
                 // doing expensive script verification, to avoid DoS attacks on
                 // the script interpreter.
-                check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
+                check::mempool_standard_input_scripts_for_network(tx.as_ref(), &spent_outputs, &network, req.height())?;
             }
 
             let mempool_transaction = req.mempool_transaction();

@@ -782,6 +782,14 @@ pub(super) fn count_script_push_ops(script_bytes: &[u8]) -> usize {
 /// Callers must ensure `spent_outputs.len()` matches the number of transparent inputs.
 /// If the lengths differ, `false` is returned.
 pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Output]) -> bool {
+    are_inputs_standard_with_pq(tx, spent_outputs, false)
+}
+
+fn are_inputs_standard_with_pq(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    pq_active: bool,
+) -> bool {
     if tx.inputs().len() != spent_outputs.len() {
         return false;
     }
@@ -790,6 +798,18 @@ pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Outpu
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        #[cfg(feature = "pq")]
+        if pq_active {
+            if let Some(body) = authenticated_pq_body(unlock_script, &spent_output.lock_script) {
+                if body.sig_op_count(true) > MAX_P2SH_SIGOPS {
+                    return false;
+                }
+                continue;
+            }
+        }
+        #[cfg(not(feature = "pq"))]
+        let _ = pq_active;
 
         // Step 1: Classify the spent output's scriptPubKey via the zcash_script solver.
         let script_kind = match standard_script_kind(&spent_output.lock_script) {
@@ -873,6 +893,53 @@ pub fn mempool_standard_input_scripts(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
 ) -> Result<(), TransactionError> {
+    mempool_standard_input_scripts_with_pq(tx, spent_outputs, false)
+}
+
+/// Checks relay input policy using the same trusted activation context as script validation.
+/// Larger argument transport is allowed only for a supported, authenticated PQ redeem script.
+/// This does not verify signatures; the transaction verifier still executes every input.
+pub fn mempool_standard_input_scripts_for_network(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    network: &Network,
+    height: Height,
+) -> Result<(), TransactionError> {
+    mempool_standard_input_scripts_with_pq(
+        tx,
+        spent_outputs,
+        zakura_script::pq_p2sh_active(tx, network, height),
+    )
+}
+
+/// Recognizes supported PQ transport without allocating its large signature arguments.
+/// Authenticate the exact redeem bytes before selecting larger limits. Derive the supported
+/// header from Common's encoder so wire identifiers have one authoritative representation.
+#[cfg(feature = "pq")]
+fn authenticated_pq_body(
+    unlock: &transparent::Script,
+    lock: &transparent::Script,
+) -> Option<script::Code> {
+    let lock = script::Code(lock.as_raw_bytes().to_vec());
+    if !lock.is_pay_to_script_hash() {
+        return None;
+    }
+    let input = zcash_script::pq::SpendingInput::scan(unlock.as_raw_bytes()).ok()?;
+    let redeem = input.redeem_script();
+    if zcash_transparent::util::hash160::hash(redeem) != lock.0[2..22] {
+        return None;
+    }
+    let header = zcash_transparent::pq::p2sh::redeem_script(&script::Code(Vec::new())).ok()?;
+    let body = redeem.strip_prefix(header.0.as_slice())?;
+    input.pq_arguments().ok()?;
+    Some(script::Code(body.to_vec()))
+}
+
+fn mempool_standard_input_scripts_with_pq(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    pq_active: bool,
+) -> Result<(), TransactionError> {
     if tx.inputs().len() != spent_outputs.len() {
         return Err(TransactionError::Other(format!(
             "spent_outputs must align with transaction inputs for non-coinbase txs: inputs={}, spent_outputs={}",
@@ -886,6 +953,16 @@ pub fn mempool_standard_input_scripts(
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        #[cfg(feature = "pq")]
+        if pq_active
+            && authenticated_pq_body(unlock_script, &spent_outputs[input_index].lock_script)
+                .is_some()
+        {
+            // The bounded scanner enforces push-only serialization and the PQ input limit.
+            // Per-argument and execution checks remain in the shared PQ evaluator.
+            continue;
+        }
 
         // Rule: the scriptSig must be within the standard size limit.
         let size = unlock_script.as_raw_bytes().len();
@@ -901,7 +978,7 @@ pub fn mempool_standard_input_scripts(
 
     // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
     // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-    if !are_inputs_standard(tx, spent_outputs) {
+    if !are_inputs_standard_with_pq(tx, spent_outputs, pq_active) {
         return Err(TransactionError::NonStandardInputs);
     }
 

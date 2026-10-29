@@ -4479,3 +4479,11 @@ async fn zcashd_compat_reorg_context_zakura_tip_behind_recovers() -> Result<()> 
 async fn zcashd_compat_reorg_churn() -> Result<()> {
     common::zcashd_compat::reorg::churn().await
 }
+
+/// Local PQ spends pass RPC admission and template selection alongside legacy ECDSA.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_mempool_and_template() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_mempool_test()).await??;
+    Ok(())
+}

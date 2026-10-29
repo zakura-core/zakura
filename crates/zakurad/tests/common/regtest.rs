@@ -636,3 +636,214 @@ impl MiningRpcMethods for RpcRequestClient {
         .map_err(|err| eyre!(err))
     }
 }
+
+/// Exercises actual RPC admission, template selection, and mining across local PQ activation.
+#[cfg(feature = "pq")]
+pub(crate) async fn pq_mempool_test() -> Result<()> {
+    use zakura_chain::{parameters::testnet::RegtestParameters, transaction::HashType};
+    use zcash_script::script::Code;
+    use zcash_transparent::{
+        pq::{self, p2sh, SigningKey},
+        util::hash160,
+    };
+
+    fn push(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = vec![0x4d];
+        encoded.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
+        encoded.extend(bytes);
+        encoded
+    }
+    fn transaction(outpoint: OutPoint, value: Amount<NonNegative>, output: Script) -> Transaction {
+        Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![Input::PrevOut {
+                outpoint,
+                unlock_script: Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![Output::new(value, output)],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        }
+    }
+    fn install(tx: &mut Transaction, arguments: &[Vec<u8>], redeem: &Code) {
+        let mut script = Vec::new();
+        for argument in arguments {
+            script.extend(push(argument));
+        }
+        script.extend(push(&redeem.0));
+        if let Transaction::V5 { inputs, .. } = tx {
+            if let Input::PrevOut { unlock_script, .. } = &mut inputs[0] {
+                *unlock_script = Script::new(&script);
+            }
+        }
+    }
+
+    let _guard = zakura_test::init();
+    let maturity = transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
+    let activation = Height(maturity + 3);
+    let net = Network::new_regtest(RegtestParameters {
+        pq_p2sh_activation_height: Some(activation),
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let miner = Address::from_script_hash(NetworkKind::Regtest, OP_TRUE_SCRIPT_HASH);
+    let keys: Vec<_> = (1..=3)
+        .map(|seed| SigningKey::from_seed(&[seed; pq::SEED_BYTES]))
+        .collect();
+    let mut single = push(&keys[0].public_key());
+    single.push(0xac);
+    let mut multi = vec![0x52];
+    for key in &keys {
+        multi.extend(push(&key.public_key()));
+    }
+    multi.extend([0x53, 0xae]);
+    let mut unknown = p2sh::redeem_script(&Code(single.clone()))?;
+    unknown.0[5] = 2;
+    let secret = secp256k1::SecretKey::from_secret_bytes([4; 32])?;
+    let public = secp256k1::PublicKey::from_secret_key(&secret).serialize();
+    let mut legacy = push(&public);
+    legacy.push(0xac);
+    let redeems = [
+        p2sh::redeem_script(&Code(single))?,
+        p2sh::redeem_script(&Code(multi))?,
+        unknown,
+        Code(legacy),
+    ];
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    config.mempool.debug_enable_at_height = Some(0);
+    config.mining.miner_address = Some(miner.to_string().parse()?);
+    config.consensus.checkpoint_sync = false;
+    // Writing and reading TOML is part of starting this real node.
+    let mut node = testdir()?
+        .with_config(&mut config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let rpc = read_listen_addr_from_logs(&mut node, OPENED_RPC_ENDPOINT_MSG)?;
+    node.expect_stdout_line_matches("activating mempool")?;
+    let client = RpcRequestClient::new(rpc);
+    let first = client.mine_proposed_block(&net).await?;
+    for _ in 1..maturity {
+        client.mine_proposed_block(&net).await?;
+    }
+    let (outpoint, value) = op_true_coinbase_output(&first, &miner)?;
+    let mut funding = spend_op_true_output(outpoint, value, &miner)?;
+    let funded_value: Amount<NonNegative> = 10_000_000u64.try_into()?;
+    if let Transaction::V5 { outputs, .. } = &mut funding {
+        let mut change = outputs[0].value();
+        outputs.clear();
+        for redeem in &redeems {
+            let address = Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&redeem.0));
+            outputs.push(Output::new(funded_value, address.script()));
+            change = (change - funded_value)?.constrain()?;
+        }
+        outputs.push(Output::new(change, miner.script()));
+    }
+    client.send_raw_transaction(&funding).await?;
+    let block = client.mine_proposed_block(&net).await?;
+    assert!(block
+        .transactions
+        .iter()
+        .any(|tx| tx.hash() == funding.hash()));
+    let mut spends = Vec::new();
+    for (index, redeem) in redeems.iter().enumerate() {
+        // Covers ZIP-317's larger-input fee; no fee policy is disabled or discounted.
+        let output_value =
+            (funded_value - Amount::<NonNegative>::try_from(2_000_000i64)?)?.constrain()?;
+        let prevout = Output::new(
+            funded_value,
+            Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&redeem.0)).script(),
+        );
+        let mut tx = transaction(
+            OutPoint {
+                hash: funding.hash(),
+                index: u32::try_from(index)?,
+            },
+            output_value,
+            miner.script(),
+        );
+        let digest = tx
+            .sighasher(NetworkUpgrade::Nu5, Arc::new(vec![prevout]))?
+            .sighash(HashType::ALL, Some((0, redeem.0.clone())));
+        let arguments = if index == 3 {
+            let mut signature = secret
+                .sign_ecdsa(secp256k1::Message::from_digest(digest.0))
+                .serialize_der()
+                .to_vec();
+            signature.push(1);
+            vec![signature]
+        } else {
+            let sign = |key: &SigningKey| {
+                let mut signature = key.sign(&digest.0, p2sh::SIGNING_CONTEXT).unwrap();
+                signature.push(1);
+                signature
+            };
+            if index == 1 {
+                vec![vec![], sign(&keys[0]), sign(&keys[2])]
+            } else {
+                vec![sign(&keys[0])]
+            }
+        };
+        install(&mut tx, &arguments, redeem);
+        spends.push(tx);
+    }
+    assert!(
+        client.send_raw_transaction(&spends[0]).await.is_err(),
+        "PQ input is rejected before activation"
+    );
+    client.mine_proposed_block(&net).await?;
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 1),
+        "admission checks the next block height"
+    );
+    let mut forged = spends[0].clone();
+    if let Transaction::V5 { inputs, .. } = &mut forged {
+        if let Input::PrevOut { unlock_script, .. } = &mut inputs[0] {
+            let mut bytes = unlock_script.as_raw_bytes().to_vec();
+            bytes[10] ^= 1;
+            *unlock_script = Script::new(&bytes);
+        }
+    }
+    assert!(
+        client.send_raw_transaction(&forged).await.is_err(),
+        "forged signature is rejected"
+    );
+    assert!(
+        client.send_raw_transaction(&spends[2]).await.is_err(),
+        "unsupported execution identifier is rejected"
+    );
+    for index in [0, 1, 3] {
+        client.send_raw_transaction(&spends[index]).await?;
+    }
+    let mempool: Vec<String> = client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    let (template, _) = client.block_from_template(&net).await?;
+    for index in [0, 1, 3] {
+        let tx = &spends[index];
+        assert!(mempool.contains(&tx.hash().to_string()));
+        assert!(template
+            .transactions
+            .iter()
+            .any(|candidate| candidate.hash() == tx.hash()));
+    }
+    let mined = client.mine_proposed_block(&net).await?;
+    for index in [0, 1, 3] {
+        assert!(mined
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == spends[index].hash()));
+    }
+    node.kill(false)?;
+    node.wait_with_output()?
+        .assert_failure()?
+        .assert_was_killed()?;
+    Ok(())
+}

@@ -681,3 +681,55 @@ fn relay_policy_still_rejects_pq_sized_inputs() {
         })
     ));
 }
+
+#[test]
+fn relay_policy_uses_authenticated_pq_and_trusted_activation() {
+    let active = network(Some(ACTIVATION));
+    let policy = |spend: &Spend, net: &Network, height| {
+        check::mempool_standard_input_scripts_for_network(
+            &spend.transaction,
+            &spend.previous_outputs,
+            net,
+            height,
+        )
+    };
+    assert_eq!(policy(&SPEND, &active, ACTIVATION), Ok(()));
+    for net in [
+        network(None),
+        Network::Mainnet,
+        Network::new_default_testnet(),
+    ] {
+        assert!(policy(&SPEND, &net, ACTIVATION).is_err());
+    }
+    assert!(policy(&SPEND, &active, Height(9)).is_err());
+    let mut changed = SPEND.clone();
+    changed.previous_outputs[PQ_INPUT] = p2sh_output(&Code(vec![0x51]));
+    assert!(policy(&changed, &active, ACTIVATION).is_err());
+
+    let mut changed = SPEND.clone();
+    changed.redeem.0[5] = 2;
+    changed.previous_outputs[PQ_INPUT] = p2sh_output(&changed.redeem);
+    changed.install_arguments(&[vec![0; pq::SIGNATURE_BYTES + 1]]);
+    assert!(policy(&changed, &active, ACTIVATION).is_err());
+
+    let mut multiple = Spend::unsigned(
+        multisig(2, &[KEY.public_key(); 3], false),
+        LockTime::unlocked(),
+    );
+    let signature = multiple.signature(&KEY, HashType::ALL, p2sh::SIGNING_CONTEXT);
+    multiple.install_arguments(&[vec![], signature.clone(), signature]);
+    assert_eq!(policy(&multiple, &active, ACTIVATION), Ok(()));
+    let mut too_many = Spend::unsigned(
+        multisig(16, &[KEY.public_key(); 16], false),
+        LockTime::unlocked(),
+    );
+    too_many.install_arguments(&[vec![], vec![0; pq::SIGNATURE_BYTES + 1]]);
+    assert_eq!(
+        policy(&too_many, &active, ACTIVATION),
+        Err(TransactionError::NonStandardInputs)
+    );
+
+    let mut oversized = SPEND.clone();
+    *oversized.input_mut() = Script::new(&vec![0; script_pq::MAX_INPUT_BYTES + 1]);
+    assert!(policy(&oversized, &active, ACTIVATION).is_err());
+}

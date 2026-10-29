@@ -2838,6 +2838,7 @@ dependencies = [
  "rayon",
  "regex",
  "rustls",
+ "secp256k1",
  "semver",
  "serde",
  "serde_json",
@@ -2865,6 +2866,7 @@ dependencies = [
  "zakura-state",
  "zakura-storage",
  "zakura-test",
+ "zakura-transparent",
  "zakura-utils",
  "zakura-zcash-script",
 ]

@@ -1382,8 +1382,8 @@ fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderE
 #[derive(Debug, Default, Clone)]
 pub struct RegtestParameters {
     /// Local activation of the bounded PQ P2SH rules. Disabled by default.
-    /// Requires the consuming validator's `pq` feature; this does not configure relay policy.
-    /// This is a programmatic setting, not exposed by the node's TOML configuration.
+    /// Requires the consuming node's `pq` feature. The node exposes this regtest-only
+    /// setting as `network.params.pq_p2sh_activation_height` in TOML.
     pub pq_p2sh_activation_height: Option<Height>,
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,

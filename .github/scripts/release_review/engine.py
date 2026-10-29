@@ -9,7 +9,34 @@ from dataclasses import asdict
 from .config import Settings
 from .contracts import ModelProvider, ModelRequest, ReviewError, parse_turn
 from .models import Spending
-from .repository import Repository
+from .repository import Repository, ReviewUnit
+
+
+def review_priority(unit: ReviewUnit) -> int:
+    """Spend limited review time on production validation and liveness paths first."""
+    if unit.path.startswith(("crates/zakura-consensus/", "crates/zakura-script/",
+                             "crates/zakura-chain/", "crates/zakura-state/")):
+        return 0
+    if unit.path in {"Cargo.toml", "Cargo.lock"} or unit.path.startswith((
+            "crates/zakura-network/", "crates/zakurad/", "crates/zakura-rpc/",
+            "crates/zakura-header-chain/", "crates/zakura-node-services/")):
+        return 1
+    return 2 if unit.path.startswith("crates/") else 3
+
+
+def batch_units(units: list[ReviewUnit], limit: int):
+    """Pack small patches without losing unit identities or crossing risk priorities."""
+    batch, size = [], 0
+    for unit in sorted(units, key=lambda item: (review_priority(item), item.path, item.part)):
+        patch_bytes = len(unit.patch.encode())
+        if batch and (size + patch_bytes > limit or len(batch) == 32
+                      or review_priority(batch[0]) != review_priority(unit)):
+            yield batch
+            batch, size = [], 0
+        batch.append(unit)
+        size += patch_bytes
+    if batch:
+        yield batch
 
 
 def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
@@ -129,17 +156,21 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
 
     save()
     try:
-        for unit in units:
+        for batch in batch_units(units, settings.unit_bytes):
             turn = inspect_unit(repo, provider, settings, spending, {
-                "task": "Review this release-diff unit; use repository reads to check context before reporting a bug.",
-                "revisions": repo.refs, "unit": asdict(unit),
-                "note": "This can be a continuation of a file diff. Line citations must be verified against source reads.",
+                "task": "Review every release-diff unit in this batch and their interactions; "
+                        "use repository reads to check context before reporting a bug.",
+                "revisions": repo.refs, "units": [asdict(unit) for unit in batch],
+                "note": "Each unit can continue a file diff. Complete means every supplied unit was inspected. "
+                        "Line citations must be verified against source reads.",
             }, deadline, save)
             for finding in turn["findings"]:
                 repo.validate_finding(finding, changed)
             report["candidates"].extend(turn["findings"])
-            report["summaries"].append({"unit": unit.id, "path": unit.path, "summary": turn["summary"]})
-            completed.add(unit.id)
+            report["summaries"].append({"units": [unit.id for unit in batch],
+                                        "paths": list(dict.fromkeys(unit.path for unit in batch)),
+                                        "summary": turn["summary"]})
+            completed.update(unit.id for unit in batch)
             save()
         if units:
             report["findings"] = synthesize(repo, provider, settings, spending, report, deadline, changed, save)

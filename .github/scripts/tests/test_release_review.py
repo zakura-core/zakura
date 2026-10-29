@@ -26,7 +26,7 @@ from release_review.contracts import (
     ReviewError,
     parse_turn,
 )
-from release_review.engine import review, synthesize
+from release_review.engine import batch_units, review, synthesize
 from release_review.github import (
     COMMENT_MARKER,
     REQUEST_WORKFLOW,
@@ -40,7 +40,7 @@ from release_review.models import (
     Spending,
 )
 from release_review.reporting import render, write_report
-from release_review.repository import Repository
+from release_review.repository import Repository, ReviewUnit
 
 ROOT = Path(__file__).resolve().parents[2]
 HEAD = "b" * 40
@@ -349,6 +349,26 @@ class ProviderTests(unittest.TestCase):
 
 
 class EngineTests(GitFixture):
+    def test_batching_prioritizes_core_paths_and_preserves_every_unit_once(self):
+        units = [ReviewUnit("doc", "docs/change.md", 1, "d" * 200),
+                 ReviewUnit("network", "crates/zakura-network/src/lib.rs", 1, "n" * 600),
+                 ReviewUnit("validation", "crates/zakura-consensus/src/lib.rs", 1, "c" * 600),
+                 ReviewUnit("chain", "crates/zakura-chain/src/lib.rs", 1, "c" * 300)]
+        batches = list(batch_units(units, 1000))
+        self.assertEqual({item.id for item in batches[0]}, {"chain", "validation"})
+        self.assertEqual([item.id for batch in batches for item in batch], ["chain", "validation", "network", "doc"])
+        self.assertTrue(all(sum(len(item.patch.encode()) for item in batch) <= 1000 for batch in batches))
+
+    def test_small_files_share_a_request_but_keep_individual_coverage(self):
+        provider = ScriptedProvider([completed(), completed()])
+        report = self.metadata()
+        review(self.repository, provider, settings(), report, lambda _: None)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(len(provider.requests), 2)
+        request_units = json.loads(provider.requests[0].messages[-1]["content"])["units"]
+        self.assertEqual({item["path"] for item in request_units}, {"release.txt", "validator.rs"})
+        self.assertTrue(all(item["status"] == "reviewed" for item in report["coverage"]))
+
     def test_large_synthesis_reduces_all_summaries_without_truncating_them(self):
         report = self.metadata()
         report.update(summaries=[{"unit": f"unit-{i}", "summary": "x" * 2000} for i in range(24)], candidates=[])
@@ -371,7 +391,7 @@ class EngineTests(GitFixture):
         self.assertIn("finding limit", report["errors"][0])
 
     def test_complete_review_keeps_verified_finding_and_covers_every_unit(self):
-        provider = ScriptedProvider([completed(), completed([candidate()]), completed([candidate()])])
+        provider = ScriptedProvider([completed([candidate()]), completed([candidate()])])
         report, checkpoints = self.metadata(), []
         review(self.repository, provider, settings(), report, lambda value: checkpoints.append(copy.deepcopy(value)))
         self.assertEqual(report["status"], "complete")
@@ -405,7 +425,7 @@ class EngineTests(GitFixture):
         self.assertIn("not a clean review", render(report))
 
     def test_refuted_candidate_is_not_a_final_finding(self):
-        provider = ScriptedProvider([completed(), completed([candidate()]), completed()])
+        provider = ScriptedProvider([completed([candidate()]), completed()])
         report = self.metadata()
         review(self.repository, provider, settings(), report, lambda _: None)
         self.assertEqual(report["findings"], [])

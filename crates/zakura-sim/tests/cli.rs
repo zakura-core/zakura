@@ -417,13 +417,9 @@ fn seeds_reject_and_quarantine() {
     };
     let output = run(args(&[]));
     assert!(output.status.success(), "{output:?}");
-    let digest: String = Sha256::digest(&input)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert_eq!(std::fs::read(quarantine.join(&digest)).unwrap(), input);
-    let reason = std::fs::read_to_string(quarantine.join(format!("{digest}.reason"))).unwrap();
-    assert!(reason.contains("built for generator 0"), "{reason}");
+    let [record] = <[_; 1]>::try_from(quarantined(&quarantine)).expect("one record");
+    assert_eq!(record.0, input);
+    assert!(record.2.contains("built for generator 0"), "{}", record.2);
     std::fs::write(
         seeds.join("old.toml"),
         sidecar.replacen("generator = 1", "generator = 0", 1),
@@ -436,5 +432,75 @@ fn seeds_reject_and_quarantine() {
     assert!(
         stdout.contains("0 admitted, 0 quarantined, 1 rejected"),
         "{stdout}"
+    );
+}
+
+/// Each `.bin` file in the quarantine directory `dir`, with its sidecar and
+/// its reason, sorted by sidecar.
+fn quarantined(dir: &Path) -> Vec<(Vec<u8>, String, String)> {
+    let mut records: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "bin"))
+        .map(|path| {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read_to_string(path.with_extension("toml")).unwrap(),
+                std::fs::read_to_string(path.with_extension("reason")).unwrap(),
+            )
+        })
+        .collect();
+    records.sort_by(|a, b| a.1.cmp(&b.1));
+    records
+}
+
+/// Two quarantined `plan` seeds with the same Plan bytes and different
+/// prefixes keep separate records, each with its own sidecar.
+#[test]
+fn quarantine_keeps_each_sidecar() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let input = std::fs::read(fixtures.join("block-sync-stale-beside-current.bin")).unwrap();
+    let plan = &input[2..];
+    let sidecar = std::fs::read_to_string(fixtures.join("block-sync-stale-beside-current.toml"))
+        .unwrap()
+        .replace(
+            &zakura_sim::seed::sha256(&input),
+            &zakura_sim::seed::sha256(plan),
+        );
+    let dir = TempDir::new().unwrap();
+    let seeds = dir.path().join("seeds");
+    std::fs::create_dir(&seeds).unwrap();
+    let sidecars: Vec<String> = ["ff06", "ff0c"]
+        .into_iter()
+        .map(|prefix| {
+            sidecar.replacen(
+                "generator = 2",
+                &format!("generator = 0\nrequired = false\nkind = \"plan\"\nprefix = \"{prefix}\""),
+                1,
+            )
+        })
+        .collect();
+    for (stem, sidecar) in ["a", "b"].into_iter().zip(&sidecars) {
+        std::fs::write(seeds.join(format!("{stem}.bin")), plan).unwrap();
+        std::fs::write(seeds.join(format!("{stem}.toml")), sidecar).unwrap();
+    }
+    let quarantine = dir.path().join("quarantine");
+    let output = zakura_sim(&[
+        "seeds",
+        "--sim",
+        "block-sync/storage",
+        "--fixtures",
+        seeds.to_str().unwrap(),
+        "--quarantine",
+        quarantine.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let records = quarantined(&quarantine);
+    assert_eq!(
+        records
+            .iter()
+            .map(|(bytes, sidecar, _)| (bytes.as_slice(), sidecar))
+            .collect::<Vec<_>>(),
+        vec![(plan, &sidecars[0]), (plan, &sidecars[1])]
     );
 }

@@ -545,17 +545,27 @@ mod cli {
     }
 
     /// Writes the quarantined seed's file, its sidecar and its reason into
-    /// `dir`, named by the file's SHA-256.
+    /// `dir` as `<name>.bin`, `<name>.toml` and `<name>.reason`. `<name>` is
+    /// the SHA-256 of the file's SHA-256 and the sidecar's, in hex, so two
+    /// seeds with the same bytes and different sidecars, such as two `plan`
+    /// seeds with different prefixes, keep separate records.
     fn quarantine_seed(dir: &Path, failed: &Failed) -> Result<(), Error> {
-        let bytes = std::fs::read(&failed.path).map_err(|error| {
-            Error::Failed(format!("reading {}: {error}", failed.path.display()))
-        })?;
-        let name = seed::sha256(&bytes);
-        write(&dir.join(&name), &bytes)?;
-        let sidecar = failed.path.with_extension(seed::SIDECAR_EXTENSION);
-        let sidecar = std::fs::read(&sidecar)
-            .map_err(|error| Error::Failed(format!("reading {}: {error}", sidecar.display())))?;
-        write(&dir.join(format!("{name}.toml")), &sidecar)?;
+        let read = |path: &Path| {
+            std::fs::read(path)
+                .map_err(|error| Error::Failed(format!("reading {}: {error}", path.display())))
+        };
+        let bytes = read(&failed.path)?;
+        let sidecar = read(&failed.path.with_extension(seed::SIDECAR_EXTENSION))?;
+        let name =
+            seed::sha256(format!("{}{}", seed::sha256(&bytes), seed::sha256(&sidecar)).as_bytes());
+        write(
+            &dir.join(format!("{name}.{}", seed::SEED_EXTENSION)),
+            &bytes,
+        )?;
+        write(
+            &dir.join(format!("{name}.{}", seed::SIDECAR_EXTENSION)),
+            &sidecar,
+        )?;
         write(
             &dir.join(format!("{name}.reason")),
             format!("{}: {}\n", failed.path.display(), failed.error).as_bytes(),

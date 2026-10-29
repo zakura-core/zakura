@@ -247,15 +247,23 @@ class ProviderTests(unittest.TestCase):
         return ModelRequest([{"role": "user", "content": "review fixture"}], 4096)
 
     def test_openai_responses_schema_storage_and_usage(self):
-        transport = Transport({"status": "completed", "output": [
+        transport = Transport({"status": "completed", "service_tier": "default", "output": [
             {"type": "reasoning"}, {"type": "message", "content": [{"type": "output_text", "text": json.dumps(completed())}]}],
             "usage": {"input_tokens": 20, "output_tokens": 30}})
         reply = OpenAIProvider(settings(), "fixture", transport).complete(self.request())
         body = transport.requests[0][1]
         self.assertFalse(body["store"])
+        self.assertEqual(body["service_tier"], "default")
         self.assertTrue(body["text"]["format"]["strict"])
         self.assertEqual(body["reasoning"]["effort"], "medium")
         self.assertEqual(reply.output_tokens, 30)
+
+    def test_openai_unconfirmed_service_pricing_is_not_accepted(self):
+        for tier in (None, "priority", "auto"):
+            transport = Transport({"status": "completed", "service_tier": tier, "output": [],
+                                   "usage": {"input_tokens": 20, "output_tokens": 30}})
+            with self.subTest(tier=tier), self.assertRaisesRegex(ProviderError, "standard service pricing"):
+                OpenAIProvider(settings(), "fixture", transport).complete(self.request())
 
     def test_openai_incomplete_and_refusal_are_not_clean(self):
         for envelope in (

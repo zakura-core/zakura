@@ -65,6 +65,7 @@ class OpenAIProvider:
     def complete(self, request: ModelRequest) -> ModelReply:
         body = {
             "model": self.settings.model, "input": request.messages, "store": False,
+            "service_tier": "default",
             "max_output_tokens": request.max_output_tokens,
             "text": {"format": {"type": "json_schema", "name": "release_review",
                                 "strict": True, "schema": TURN_SCHEMA}},
@@ -79,6 +80,8 @@ class OpenAIProvider:
                      for part in item.get("content", [])]
             if any(part.get("type") == "refusal" for part in parts):
                 raise ProviderError("OpenAI refused the review request")
+            if data.get("service_tier") != "default":
+                raise ProviderError("OpenAI did not confirm standard service pricing; further calls stopped")
             text = "".join(part["text"] for part in parts if part.get("type") == "output_text")
             return ModelReply(text, token_count(data["usage"], "input_tokens"),
                               token_count(data["usage"], "output_tokens"))

@@ -36,6 +36,8 @@ Configure only providers you actually use. Use the highest applicable input and
 output prices for the selected model and request size; do not assume prompt-cache
 discounts. Price changes require updating this variable. The $25 ceiling is an
 estimate based on these configured rates, not a provider billing guarantee.
+OpenAI requests explicitly use the standard service tier so project-level
+priority processing cannot silently change the pricing assumption.
 
 The runner reserves conservative input and maximum output cost before every
 request, including retries. It replaces a reservation with reported usage after

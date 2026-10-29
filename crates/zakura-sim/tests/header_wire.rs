@@ -112,8 +112,9 @@ struct Session {
 }
 
 /// A session's identity as (connection, quic_stream, kind, version,
-/// session_id).
-type SessionKey = (u64, u64, u16, u16, u64);
+/// session_id). The connection is optional so an admission that names none
+/// matches no row.
+type SessionKey = (Option<u64>, u64, u16, u16, u64);
 
 /// The identity `obs` admits, if it's a transport `Admitted` event.
 fn admitted_key(obs: &Observation) -> Option<SessionKey> {
@@ -129,13 +130,7 @@ fn admitted_key(obs: &Observation) -> Option<SessionKey> {
                     ..
                 },
             ..
-        } => Some((
-            connection.expect("an admission names its connection"),
-            *quic_stream,
-            *kind,
-            *version,
-            *session_id,
-        )),
+        } => Some((*connection, *quic_stream, *kind, *version, *session_id)),
         _ => None,
     }
 }
@@ -150,7 +145,13 @@ fn row_key(obs: &Observation) -> Option<SessionKey> {
             version,
             session_id,
             ..
-        } => Some((*connection, *quic_stream, *kind, *version, *session_id)),
+        } => Some((
+            Some(*connection),
+            *quic_stream,
+            *kind,
+            *version,
+            *session_id,
+        )),
         _ => None,
     }
 }

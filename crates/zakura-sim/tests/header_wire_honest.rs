@@ -11,7 +11,7 @@
 
 mod support;
 
-use std::{rc::Rc, time::Duration};
+use std::{collections::BTreeMap, rc::Rc, time::Duration};
 
 use support::inputs;
 use zakura_chain::parameters::Network;
@@ -68,8 +68,93 @@ fn plans() -> Vec<PlanInput> {
     plans
 }
 
+/// One peer stream's offers in log order: each `PeerFrame`'s `seq`, and
+/// whether its `PeerWritten` followed.
+type Offers = Vec<(u64, bool)>;
+
+/// Each peer stream's [`Offers`] in `report`, by connection and QUIC
+/// stream.
+///
+/// A `PeerFrame` names its stream's kind and version, not its QUIC stream,
+/// so it takes the QUIC stream of its connection's latest `Session` row of
+/// that kind and version. A peer writes on one header stream at a time, and
+/// the node reopens one only after the peer finished the last. A frame
+/// given the wrong stream leaves its `PeerWritten` with no offer to finish.
+///
+/// # Panics
+///
+/// If a stream's offers don't count from 0, or a `PeerWritten` doesn't
+/// finish its stream's latest offer, with the same `seq`, once. A write
+/// finishes before the peer offers its next frame.
+fn peer_offers(report: &RunReport) -> BTreeMap<(u64, u64), Offers> {
+    let mut sessions = BTreeMap::new();
+    let mut offers: BTreeMap<(u64, u64), Offers> = BTreeMap::new();
+    for entry in report.log.entries() {
+        match &entry.obs {
+            Observation::Session {
+                connection,
+                quic_stream,
+                kind,
+                version,
+                ..
+            } => {
+                sessions.insert((*connection, *kind, *version), *quic_stream);
+            }
+            Observation::PeerFrame {
+                connection,
+                stream,
+                seq,
+                ..
+            } => {
+                let quic_stream = *sessions
+                    .get(&(*connection, stream.kind, stream.version))
+                    .expect("the identity map logs a PeerFrame after its stream's Session row");
+                let offered = offers.entry((*connection, quic_stream)).or_default();
+                assert_eq!(
+                    usize::try_from(*seq).ok(),
+                    Some(offered.len()),
+                    "connection {connection}, stream {quic_stream}: offers count from 0"
+                );
+                offered.push((*seq, false));
+            }
+            Observation::PeerWritten {
+                connection,
+                quic_stream,
+                seq,
+            } => {
+                let latest = offers
+                    .get_mut(&(*connection, *quic_stream))
+                    .and_then(|offered| offered.last_mut());
+                match latest {
+                    Some((offered, written)) if offered == seq && !*written => *written = true,
+                    _ => panic!(
+                        "connection {connection}, stream {quic_stream}: PeerWritten {seq} doesn't \
+                         finish the stream's latest offer, {latest:?}"
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
+    offers
+}
+
+/// Every frame a peer offered in `report` was written: each `PeerFrame`
+/// pairs with one `PeerWritten` by connection, QUIC stream and `seq`, in
+/// order, and no `PeerWritten` is left over ([`peer_offers`]).
+fn assert_every_offer_written(report: &RunReport) {
+    for ((connection, quic_stream), offered) in peer_offers(report) {
+        assert!(
+            offered.iter().all(|(_, written)| *written),
+            "connection {connection}, stream {quic_stream}: an offered frame was never written, \
+             {offered:?}"
+        );
+    }
+}
+
 /// Runs `scenario` under `plan`, with `extra` checking beside the harness,
-/// and returns the report with the ports, which outlive the run.
+/// and returns the report with the ports, which outlive the run. Every
+/// frame a peer offered must have been written.
 fn run_with(
     scenario: &WireScenario,
     plan: PlanInput,
@@ -86,6 +171,7 @@ fn run_with(
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
     assert_eq!(ports.unplaced_records(), 0, "every peer record was logged");
+    assert_every_offer_written(&report);
     (report, ports)
 }
 
@@ -673,6 +759,7 @@ fn a_slow_subscriber_stops_the_publisher() {
             assert_eq!(report.end.harness, None);
             assert_eq!(report.end.violation, None);
             assert_eq!(ports.unplaced_records(), 0);
+            assert_every_offer_written(&report);
         }
     }
 }

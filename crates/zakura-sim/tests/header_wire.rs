@@ -663,6 +663,35 @@ fn loss_opens_once_a_session_is_admitted() {
     );
 }
 
+/// The node's endpoint binds at its production capacities, so 17 peers that
+/// dial it at once each get a connection and a header session. A bind with
+/// room for 16 connections leaves one peer out.
+///
+/// This fails if the node binds at test capacities instead of
+/// `quic_bind_config`'s.
+#[test]
+fn seventeen_dialing_peers_are_all_admitted() {
+    let scenario = scenario(vec![PeerSpec::dialing(); 17]);
+    for plan in plans() {
+        let (events, sessions) = read(&run(&scenario, plan));
+        let connections = connections(&events);
+        for index in 0..17 {
+            let remote = remote(index, 0);
+            let connection = connections
+                .get(&remote)
+                .unwrap_or_else(|| panic!("{remote} registered: {connections:?}"));
+            assert_eq!(
+                sessions
+                    .iter()
+                    .filter(|session| session.connection == *connection)
+                    .count(),
+                1,
+                "{remote}"
+            );
+        }
+    }
+}
+
 /// A transport tap that forwards everything, but observes into a copy of
 /// the log and logs what it delivered there after `edit` changes it.
 struct Rewrite {

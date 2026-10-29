@@ -75,7 +75,11 @@ pub fn run_bytes<S: Subsystem>(
     let scenario = S::draw(&prefix);
     let result = run_harness::<S>(&scenario, Plan::from_fuzz(&input[n..]), sink, extra);
     let unclean = match &result {
-        Ok(report) => report.cleanup.leaked > 0 || report.properties.iter().any(violated),
+        Ok(report) => {
+            report.cleanup.leaked > 0
+                || report.end.violation.is_some()
+                || report.properties.iter().any(violated)
+        }
         Err(_) => true,
     };
     ExploreRun {

@@ -585,6 +585,39 @@ fn committed_input_records_and_classifies() {
 }
 
 #[test]
+fn a_violation_only_an_extra_checker_reports_keeps_its_scenario() {
+    let mut extra = zakura_sim::check::after_step(|cx: &StepCtx<'_>| {
+        Some(Violation {
+            property: "test/extra".to_owned(),
+            step: cx.step,
+            witness: Vec::new(),
+            expected: "nothing".to_owned(),
+            actual: "a step".to_owned(),
+        })
+    });
+    let run = (PENDING.run_bytes)(&[], &mut NullSink, Some(&mut extra));
+    let report = run.report().expect("the harness ran the scenario");
+    assert_eq!(
+        report.end.violation.as_ref().map(|v| v.property.as_str()),
+        Some("test/extra")
+    );
+    assert!(
+        report.properties.iter().all(|p| p.property != "test/extra"),
+        "only end.violation names the extra checker's property"
+    );
+    assert_eq!(
+        classify(&PENDING, &run).outcome,
+        ExploreOutcome::Fail {
+            property: "test/extra".to_owned()
+        }
+    );
+    assert!(
+        run.scenario.is_some(),
+        "a run classify fails keeps its scenario for record_failure"
+    );
+}
+
+#[test]
 fn abandoned_run_retires_the_worker() {
     let mut worker = Worker::new();
     let on = |worker: &mut Worker, entry: &'static HarnessEntry| {

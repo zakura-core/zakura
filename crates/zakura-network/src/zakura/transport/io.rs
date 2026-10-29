@@ -426,9 +426,29 @@ impl QueuedFrame {
     }
 
     /// Run the transport write while retaining this frame's guard.
+    #[cfg(test)]
     pub(crate) async fn write_with<E, F, Fut>(self, write: F) -> Result<(), E>
     where
         F: FnOnce(Frame) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.encode_and_write_with(Ok, write).await
+    }
+
+    /// Encode the frame, then claim it and run the transport write while
+    /// retaining this frame's guard.
+    ///
+    /// `encode` runs before the claim, so a frame that fails to encode starts
+    /// nothing: its exchange stays unstarted, and retiring its session leaves
+    /// the connection up.
+    pub(crate) async fn encode_and_write_with<P, E, Enc, F, Fut>(
+        self,
+        encode: Enc,
+        write: F,
+    ) -> Result<(), E>
+    where
+        Enc: FnOnce(Frame) -> Result<P, E>,
+        F: FnOnce(P) -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
         let Self {
@@ -436,10 +456,11 @@ impl QueuedFrame {
             guard: _guard,
             claim,
         } = self;
+        let encoded = encode(frame)?;
         if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
             return Ok(());
         }
-        write(frame).await?;
+        write(encoded).await?;
         if let Some(claim) = &claim {
             claim.written();
         }

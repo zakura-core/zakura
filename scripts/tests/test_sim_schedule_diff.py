@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,7 +14,8 @@ sys.modules[SPEC.name] = schedule_diff
 SPEC.loader.exec_module(schedule_diff)
 
 
-def trace(pick="task:wire-node.1:poll#1", draw_value="0x6a0dd7ac648655ab", obs="9fceee4cc7a5d858", build="aaaa"):
+def trace(pick="task:wire-node.1:poll#1", draw_value="0x6a0dd7ac648655ab", obs="9fceee4cc7a5d858", build="aaaa",
+          outcome="budget"):
     """A crafted trace in `zakura-sim record`'s shape: meta, init, three steps and end."""
     records = [
         {"meta": {"format": 18, "build": {"git": build}}},
@@ -23,7 +25,7 @@ def trace(pick="task:wire-node.1:poll#1", draw_value="0x6a0dd7ac648655ab", obs="
         {"step": 3, "pick": "task:wire-node.1:rmw#1", "options": 2, "by": "bytes", "offset": 12,
          "draws": [{"draw": "wire-node.1:rng#1", "bound": "0x0", "value": draw_value, "by": "bytes"}],
          "obs": "c304ab2559d393a8"},
-        {"end": {"outcome": "budget", "steps": 3}},
+        {"end": {"outcome": outcome, "steps": 3}},
     ]
     return [json.dumps(record) for record in records]
 
@@ -50,6 +52,29 @@ class TraceComparisonTests(unittest.TestCase):
         longer = trace()
         longer.insert(-1, json.dumps({"step": 4, "pick": "task:x.1:poll#1", "options": 1, "by": "forced"}))
         self.assertIn("4 choice records, head 5", schedule_diff.compare_traces(trace(), longer))
+
+    def test_a_harness_failure_fails(self):
+        """A run that ends in a harness failure fails, even with the same choices."""
+        difference = schedule_diff.compare_traces(trace(), trace(outcome="harness"))
+        self.assertIsNotNone(difference)
+        self.assertIn("head run ended in a harness failure", difference)
+        difference = schedule_diff.compare_traces(trace()[:-1], trace())
+        self.assertIsNotNone(difference)
+        self.assertIn("base run has no end record", difference)
+
+
+class FixtureTests(unittest.TestCase):
+    def test_a_removed_fixture_is_reported(self):
+        """A fixture that base has and head doesn't is reported, and head's fixtures are the ones run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base, head = Path(tmp) / "base", Path(tmp) / "head"
+            for tree, names in ((base, ["a.bin", "b.bin"]), (head, ["a.bin", "c.bin"])):
+                (tree / "fixtures").mkdir(parents=True)
+                for name in names:
+                    (tree / "fixtures" / name).write_bytes(b"x")
+            fixtures, missing = schedule_diff.find_fixtures(base, head, "fixtures/*.bin")
+        self.assertEqual([path.name for path in fixtures], ["a.bin", "c.bin"])
+        self.assertEqual(missing, ["fixtures/b.bin"])
 
 
 if __name__ == "__main__":

@@ -5,4 +5,4 @@
 # node submits its third body.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "c8f669d2b556219af082cd37e8e813be8ed498642d62e3cb2e5963f96fd790e7"
+sha256 = "fc591c33d3cc19cf3b7773e48e4431229c8ea36911f432912f12966cb88cf427"

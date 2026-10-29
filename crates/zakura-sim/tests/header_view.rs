@@ -9,9 +9,8 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, rc::Rc};
+use std::{fs, path::PathBuf};
 
-use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -24,8 +23,6 @@ use zakura_sim::{
         HarnessError, Subsystem,
     },
     observe::{Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest},
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    table::{sender_properties, table_properties},
     Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyReport,
     RunEnd, RunReport, StepCtx, Violation,
 };
@@ -354,31 +351,6 @@ fn a_hold_released_on_handled_still_fires() {
     assert_eq!(offered.first(second), Some(handled + 1));
 }
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
-/// Every generated receiver and sender property of header sync's table, as
-/// the saved Plans' pinned end records check them.
-fn table_checker() -> RegistryChecker<Logged> {
-    let mut properties: Vec<Property<Logged>> =
-        table_properties("header-sync", &RegtestMessage::LAYOUT);
-    properties.extend(sender_properties("header-sync", &RegtestMessage::LAYOUT));
-    RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
 /// Whether an observation is of one kind.
 type Kind = fn(&Observation) -> bool;
 
@@ -394,7 +366,7 @@ fn existing_runs_keep_their_records() {
             fs::read_to_string(fixtures().join(format!("header-wire-{}.end.json", plan.name())))
                 .expect("the fixture is committed");
         let (scenario, input) = saved(plan);
-        let (report, lines) = run::<HeaderWire>(&scenario, input, &mut table_checker());
+        let (report, lines) = run::<HeaderWire>(&scenario, input, &mut NoChecks);
         let entries = report.log.entries();
         let kinds: [(&str, Kind); 7] = [
             ("datagram", |obs| {

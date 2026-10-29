@@ -33,7 +33,7 @@ pub struct Layout {
 /// Why a [`Layout`] doesn't decode a prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    /// The prefix isn't [`Layout::len`] bytes long.
+    /// The prefix isn't [`Layout::prefix_len`] bytes long.
     Length {
         /// Its length.
         found: usize,
@@ -75,7 +75,7 @@ impl std::error::Error for Unencodable {}
 
 impl Layout {
     /// The scenario prefix's length: the header, then every slot.
-    pub const fn len(&self) -> usize {
+    pub const fn prefix_len(&self) -> usize {
         self.header + self.slot * self.slots
     }
 
@@ -83,7 +83,7 @@ impl Layout {
     /// header byte 1 reduced modulo `slots + 1`. A layout has at most 255
     /// slots, so every count fits that byte.
     pub fn read<'a>(&self, prefix: &'a [u8]) -> Result<Read<'a>, Rejection> {
-        if prefix.len() != self.len() {
+        if prefix.len() != self.prefix_len() {
             return Err(Rejection::Length {
                 found: prefix.len(),
             });
@@ -103,7 +103,7 @@ impl Layout {
     pub fn writer(&self) -> Writer {
         Writer {
             layout: *self,
-            bytes: vec![0; self.len()],
+            bytes: vec![0; self.prefix_len()],
             count: 0,
         }
     }

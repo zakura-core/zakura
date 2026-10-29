@@ -135,8 +135,10 @@ fn the_layout_is_the_documented_one() {
     assert_eq!(GENERATOR, 2);
     let entry = harness::find(Storage::NAME).unwrap();
     assert_eq!((entry.generator, entry.scenario_bytes), (2, 344));
-    assert!(Storage::SCENARIO_BYTES < MAX_INPUT_BYTES);
 }
+
+// The prefix leaves room for Plan bytes under the input cap.
+const _: () = assert!(Storage::SCENARIO_BYTES < MAX_INPUT_BYTES);
 
 /// The default scenario's canonical prefix is the documented bytes, and
 /// decodes back to the default scenario.
@@ -657,7 +659,7 @@ fn empty_and_truncated_inputs_draw_defined_scenarios() {
 fn accepted(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.resize(Storage::SCENARIO_BYTES, 0);
     bytes[0] = 2;
-    for slot in bytes[HEADER..].chunks_exact_mut(SLOT) {
+    for slot in bytes[HEADER..].as_chunks_mut::<SLOT>().0 {
         slot[0] = [CLOSE, RELINK, GROW, HOLD, HOLD, 0xff][usize::from(slot[0]) % 6];
         slot[5] %= 11;
     }

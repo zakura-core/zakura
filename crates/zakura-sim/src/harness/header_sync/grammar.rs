@@ -1,5 +1,5 @@
-//! `header-sync/storage`'s scenario prefix (G1): a [`scenario::Layout`]
-//! of a 24-byte header and 32 ten-byte action slots, 344 bytes in all.
+//! `header-sync/storage`'s scenario prefix (G1): a [`Layout`] of a 24-byte
+//! header and 32 ten-byte action slots, 344 bytes in all.
 //!
 //! [`decode`] turns any prefix of that length into a [`StorageScenario`],
 //! except one whose version byte names another generator. Every value is
@@ -54,7 +54,9 @@
 //! opens at once, as `virtual-time(0)`.
 //!
 //! Every opcode and trigger kind not listed is inert: [`decode`] drops its
-//! slot, so the scenario never claims that action. The grammar has no
+//! slot, so the scenario never claims that action. Opcodes `0x04`–`0x0f`
+//! are reserved for more control steps, and `0x11`–`0x1f` for more storage
+//! actions. The grammar has no
 //! `reply-queued` or `prepared` trigger, since a header node never records
 //! them, and no hold deadline, since a deadline before the hold opens
 //! stops time with nothing to offer. Bytes no field reads are ignored, and
@@ -99,6 +101,14 @@ pub const MAX_NTH: u32 = 64;
 /// The largest session a selection names: one per mirror's setup link, and
 /// one per relink.
 pub const MAX_SESSION: u64 = (MAX_MIRRORS + MAX_ACTIONS) as u64;
+
+// Each encodes in one byte.
+const _: () = assert!(
+    MAX_HEADERS <= u8::MAX as u32
+        && MAX_GROWTH <= u8::MAX as u32
+        && MAX_NTH <= u8::MAX as u32
+        && MAX_SESSION <= u8::MAX as u64
+);
 
 /// The base bound's unit.
 pub const BOUND_UNIT_MS: u64 = 100;
@@ -178,7 +188,9 @@ pub fn decode(prefix: &[u8]) -> Result<StorageScenario, Rejection> {
     let mut scenario = StorageScenario {
         node: chain(&header[NODE..NODE + 3]),
         mirrors: header[MIRRORS..]
-            .chunks_exact(MIRROR)
+            .as_chunks::<MIRROR>()
+            .0
+            .iter()
             .take(mirrors)
             .map(|record| MirrorSpec {
                 chain: chain(&record[..3]),
@@ -265,9 +277,7 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
     };
     header[BOUND] = match scenario.policy.bound_ms {
         None => 0,
-        Some(ms) => units(ms, BOUND_UNIT_MS, 1, u8::MAX.into(), "the base bound")?
-            .try_into()
-            .expect("units checks the range"),
+        Some(ms) => units(ms, BOUND_UNIT_MS, 1, u8::MAX, "the base bound")?,
     };
     encode_chain(&scenario.node, &mut header[NODE..NODE + 3])?;
     // At most MAX_MIRRORS, checked above.
@@ -275,7 +285,7 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
     for (spec, record) in scenario
         .mirrors
         .iter()
-        .zip(header[MIRRORS..].chunks_exact_mut(MIRROR))
+        .zip(header[MIRRORS..].as_chunks_mut::<MIRROR>().0)
     {
         encode_chain(&spec.chain, &mut record[..3])?;
         record[3] = match spec.dialer {
@@ -315,9 +325,8 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
             ControlAction::Close => CLOSE,
             ControlAction::Relink => RELINK,
             ControlAction::Grow { len } => {
-                slot[2] = (units(len.into(), 1, 1, MAX_GROWTH.into(), "a growth")? - 1)
-                    .try_into()
-                    .expect("units checks the range");
+                // The limit fits a byte, as the assertion on it checks.
+                slot[2] = units::<u8>(len.into(), 1, 1, MAX_GROWTH as u8, "a growth")? - 1;
                 GROW
             }
         };
@@ -351,11 +360,8 @@ fn chain(bytes: &[u8]) -> Chain {
 
 /// Writes `chain` to `out`'s 3 bytes.
 fn encode_chain(chain: &Chain, out: &mut [u8]) -> Result<(), Unencodable> {
-    let headers = |len: u32| -> Result<u8, Unencodable> {
-        Ok(units(len.into(), 1, 0, MAX_HEADERS.into(), "a branch")?
-            .try_into()
-            .expect("units checks the range"))
-    };
+    // The limit fits a byte, as the assertion on it checks.
+    let headers = |len: u32| units(len.into(), 1, 0, MAX_HEADERS as u8, "a branch");
     out[0] = headers(chain.main)?;
     if let Some(fork) = chain.fork {
         if fork.len == 0 {
@@ -410,16 +416,12 @@ fn encode_select(select: &Select, out: &mut [u8]) -> Result<(), Unencodable> {
     });
     // At most 8, the number of kinds.
     out[0] = kind as u8 | if select.held { HELD } else { 0 };
-    let byte = |value: u64, max: u64, what: &str| -> Result<u8, Unencodable> {
-        Ok(units(value, 1, 1, max, what)?
-            .try_into()
-            .expect("units checks the range"))
-    };
+    // The limits fit a byte, as the assertion on them checks.
     if let Some(nth) = select.nth {
-        out[1] = byte(nth.into(), MAX_NTH.into(), "a selection's nth")?;
+        out[1] = units(nth.into(), 1, 1, MAX_NTH as u8, "a selection's nth")?;
     }
     if let Some(session) = select.session {
-        out[2] = byte(session, MAX_SESSION, "a selection's session")?;
+        out[2] = units(session, 1, 1, MAX_SESSION as u8, "a selection's session")?;
     }
     Ok(())
 }
@@ -452,19 +454,13 @@ fn decode_trigger(bytes: &[u8], mirrors: usize) -> Option<Trigger> {
 fn encode_trigger(trigger: &Trigger, mirrors: usize, out: &mut [u8]) -> Result<(), Unencodable> {
     let event = match trigger {
         Trigger::VirtualTime(ms) => {
-            let units = units(*ms, TIME_UNIT_MS, 0, u16::MAX.into(), "a virtual time")?;
+            let units = units(*ms, TIME_UNIT_MS, 0, u16::MAX, "a virtual time")?;
             out[0] = VIRTUAL_TIME;
-            out[2..4].copy_from_slice(
-                &u16::try_from(units)
-                    .expect("units checks the range")
-                    .to_le_bytes(),
-            );
+            out[2..4].copy_from_slice(&units.to_le_bytes());
             return Ok(());
         }
         Trigger::Count(count, inner) => {
-            out[1] = units((*count).into(), 1, 1, u8::MAX.into(), "a trigger's count")?
-                .try_into()
-                .expect("units checks the range");
+            out[1] = units((*count).into(), 1, 1, u8::MAX, "a trigger's count")?;
             inner.as_ref()
         }
         event => event,
@@ -495,12 +491,20 @@ fn encode_trigger(trigger: &Trigger, mirrors: usize, out: &mut [u8]) -> Result<(
 }
 
 /// `value` in `unit`s, checked to be a whole number from `min` to `max`.
-fn units(value: u64, unit: u64, min: u64, max: u64, what: &str) -> Result<u64, Unencodable> {
+fn units<T>(value: u64, unit: u64, min: T, max: T, what: &str) -> Result<T, Unencodable>
+where
+    T: Copy + Into<u64> + TryFrom<u64>,
+{
+    let (low, high) = (min.into(), max.into());
     let units = value / unit;
-    if value % unit != 0 || !(min..=max).contains(&units) {
-        return Err(Unencodable(format!(
-            "{what} is {value}, not {min} to {max} times {unit}"
-        )));
-    }
-    Ok(units)
+    value
+        .is_multiple_of(unit)
+        .then_some(units)
+        .filter(|units| (low..=high).contains(units))
+        .and_then(|units| T::try_from(units).ok())
+        .ok_or_else(|| {
+            Unencodable(format!(
+                "{what} is {value}, not {low} to {high} times {unit}"
+            ))
+        })
 }

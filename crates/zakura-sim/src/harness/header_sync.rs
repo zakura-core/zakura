@@ -237,7 +237,7 @@ impl HasView for Storage {
 impl Subsystem for Storage {
     const NAME: &'static str = "header-sync/storage";
     const GENERATOR: u32 = grammar::GENERATOR;
-    const SCENARIO_BYTES: usize = grammar::LAYOUT.len();
+    const SCENARIO_BYTES: usize = grammar::LAYOUT.prefix_len();
     type Scenario = StorageScenario;
     type Prepared = Ports;
 

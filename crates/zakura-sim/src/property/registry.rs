@@ -9,11 +9,11 @@ use std::{
 use zakura_scheduler::{Op, SimInstant};
 
 use super::{
-    Assume, Assumptions, Capture, Cardinality, CheckCtx, HasView, Inconclusive, Kind,
-    LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
+    Assume, Assumptions, Capture, Cardinality, CheckCtx, ComponentKind, HasView, Inconclusive,
+    Kind, LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
 };
 use crate::{
-    check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
+    check::{Checker, Gap, PropertyOutcome, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, RunEnd},
     model::LabelledFrame,
     Observation, ObservationLog,
@@ -306,6 +306,10 @@ struct PropertyState {
     unsettled: Option<Inconclusive>,
     /// Each quantity's largest value, as the check measured it.
     peaks: BTreeMap<String, u64>,
+    /// The runs of evaluations the check couldn't read a component at.
+    gaps: Vec<Gap>,
+    /// The components whose gap the latest evaluation extended.
+    gapped: Vec<ComponentKind>,
 }
 
 /// An open obligation.
@@ -457,6 +461,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
+                gaps: state.gaps.clone(),
                 violations: state.violations.clone(),
             })
             .collect()
@@ -556,6 +561,10 @@ fn step_property<S: HasView>(
     }
     violations.extend(parts.recorded);
     state.unsettled = parts.unsettled;
+    if let Some(sticky) = parts.sticky {
+        state.inconclusive.get_or_insert(sticky);
+    }
+    record_gaps(state, parts.gaps, cx.step);
     for (quantity, value) in parts.peaks {
         let peak = state.peaks.entry(quantity.to_owned()).or_default();
         *peak = (*peak).max(value);
@@ -633,6 +642,29 @@ fn step_property<S: HasView>(
         !gone
     });
     violations
+}
+
+/// Extends each of `gaps`' runs that the previous evaluation left open, and
+/// opens one at `step` for each other component.
+fn record_gaps(state: &mut PropertyState, gaps: Vec<ComponentKind>, step: u64) {
+    for component in &gaps {
+        let name = format!("{component:?}");
+        let open = state.gapped.contains(component);
+        match state
+            .gaps
+            .iter_mut()
+            .rev()
+            .find(|gap| gap.component == name)
+        {
+            Some(gap) if open => gap.through = step,
+            _ => state.gaps.push(Gap {
+                component: name,
+                from: step,
+                through: step,
+            }),
+        }
+    }
+    state.gapped = gaps;
 }
 
 /// True if `obs` is `task` reaching a point of the operation named `op`.

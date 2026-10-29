@@ -16,7 +16,10 @@ mod verdict;
 use serde::{Deserialize, Serialize};
 
 pub use assume::{Assume, AssumeRecord, Assumptions};
-pub use component::ComponentKind;
+pub use component::{
+    require, require_coherent, require_every, Available, Coherence, Component, ComponentKind,
+    Ended, Part, Read, State, TagPhase, Tagged,
+};
 pub use cx::{Capture, CheckCtx, HasView};
 pub use id::{BadId, PropertyId};
 pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};

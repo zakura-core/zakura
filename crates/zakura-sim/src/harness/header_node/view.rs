@@ -1,0 +1,505 @@
+//! The header harnesses' owner view (M6a-2): one [`Component`] per row of
+//! the tier's [`SourceManifest`], folded by the evidence hub at each step
+//! boundary.
+//!
+//! No component has a read yet. Each one that M6a-3 onward adds registers
+//! it, gives [`Reading`] its state, and wires its existence evidence. Until
+//! then every component stays `Initializing`, so a property that needs one
+//! ends `Inconclusive`, never `Held`.
+
+use std::collections::BTreeMap;
+
+use crate::{
+    harness::header_sync::SourceManifest,
+    property::{Capture, Component, ComponentKind, Read, TagPhase, Tagged},
+};
+
+/// A header component's read state. It has no variant yet: each read M6a-3
+/// onward adds gives it one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reading {}
+
+impl Tagged for Reading {
+    /// Never called, since no reading exists.
+    fn in_flux(&self) -> Option<TagPhase> {
+        match *self {}
+    }
+}
+
+/// What the evidence hub folds at each boundary.
+pub(crate) trait Owners {
+    /// Ends `step`'s boundary: fails if a fold this step failed, or a live
+    /// registered read didn't complete at it.
+    fn close(&mut self, step: u64) -> Result<(), String>;
+}
+
+/// The owners' state a header harness's checks read: each manifest row's
+/// component, as of the last boundary the hub closed.
+#[derive(Clone, Debug)]
+pub struct HeaderSyncView<R = Reading> {
+    manifest: SourceManifest,
+    components: BTreeMap<ComponentKind, Component<R>>,
+    closed: Option<u64>,
+    failure: Option<String>,
+}
+
+impl<R: Clone + PartialEq> HeaderSyncView<R> {
+    /// A view of `manifest`'s components, each `Initializing` with no read
+    /// registered.
+    pub fn new(manifest: SourceManifest) -> Self {
+        let components = manifest
+            .rows()
+            .iter()
+            .map(|row| (row.kind, Component::new(row.kind)))
+            .collect();
+        HeaderSyncView {
+            manifest,
+            components,
+            closed: None,
+            failure: None,
+        }
+    }
+
+    /// The tier's manifest.
+    pub fn manifest(&self) -> &SourceManifest {
+        &self.manifest
+    }
+
+    /// The `kind` component, if the tier has it.
+    pub fn component(&self, kind: ComponentKind) -> Option<&Component<R>> {
+        self.components.get(&kind)
+    }
+
+    /// The step whose boundary the hub last closed, as
+    /// [`HasView::captured`](crate::property::HasView::captured) reports it.
+    pub fn captured(&self) -> Capture {
+        self.closed.map_or(Capture::Missing, Capture::AfterStep)
+    }
+
+    /// Registers `kind`'s read. A failure ends the boundary as one.
+    pub fn register(&mut self, kind: ComponentKind) {
+        self.fold(kind, |component| component.register());
+    }
+
+    /// Records `kind`'s existence evidence at `step`.
+    pub fn exists(&mut self, kind: ComponentKind, step: u64) {
+        self.fold(kind, |component| component.exists(step));
+    }
+
+    /// Folds `kind`'s read at `step`'s boundary.
+    pub fn read(&mut self, kind: ComponentKind, step: u64, read: Read<R>) {
+        self.fold(kind, |component| component.read(step, read));
+    }
+
+    /// Runs `fold` on `kind`'s component, keeping the first failure. A
+    /// component the manifest lacks is a failure.
+    fn fold(
+        &mut self,
+        kind: ComponentKind,
+        fold: impl FnOnce(&mut Component<R>) -> Result<(), String>,
+    ) {
+        let folded = match self.components.get_mut(&kind) {
+            Some(component) => fold(component),
+            None => Err(format!("{kind:?} isn't in the tier's manifest")),
+        };
+        if let Err(why) = folded {
+            self.failure.get_or_insert(why);
+        }
+    }
+}
+
+impl<R: Clone + PartialEq> Owners for HeaderSyncView<R> {
+    /// Every live registered read must complete at every boundary (rule 7).
+    fn close(&mut self, step: u64) -> Result<(), String> {
+        self.closed = Some(step);
+        if let Some(why) = self.failure.take() {
+            return Err(why);
+        }
+        match self
+            .components
+            .values()
+            .find(|component| component.live() && component.fresh_through() != Some(step))
+        {
+            Some(component) => Err(format!(
+                "SkippedRead: {:?}'s registered read didn't complete at step {step}",
+                component.kind()
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::*;
+    use crate::{
+        check::{Gap, PropertyOutcome},
+        harness::{
+            evidence_hub::EvidenceHub,
+            header_sync::{SourceManifest, Storage, StorageScenario},
+            Subsystem,
+        },
+        property::{
+            require, require_every, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId,
+            Registry, RegistryChecker, Source, Sources, State, Status, Verdict,
+        },
+        ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NullSink, ObservationLog,
+        Plan, RunConfig, RunReport, Sim,
+    };
+
+    /// The component the scripted owner folds.
+    const BUDGET: ComponentKind = ComponentKind::Budget;
+
+    /// A view of the wire tier's components with `u64` states.
+    type Owned = Rc<RefCell<HeaderSyncView<u64>>>;
+
+    /// A harness whose view is the scripted owner's.
+    struct Owners(Owned);
+
+    impl HasView for Owners {
+        type View = Owned;
+
+        /// The shared view.
+        fn view(&self) -> Owned {
+            self.0.clone()
+        }
+
+        /// The boundary the hub last closed.
+        fn captured(&self) -> Capture {
+            self.0.borrow().captured()
+        }
+    }
+
+    /// One fold the scripted owner makes on [`BUDGET`].
+    #[derive(Clone)]
+    enum Op {
+        Register,
+        Exists,
+        Read(Read<u64>),
+    }
+
+    /// An owner that offers `steps` ticks and folds each op at its step's
+    /// boundary, before the hub closes it.
+    struct Script {
+        view: Owned,
+        steps: u64,
+        taken: u64,
+        ops: Vec<(u64, Op)>,
+    }
+
+    impl ActionSource for Script {
+        fn enabled(&self, _: zakura_scheduler::SimInstant, out: &mut Vec<(Identity, u64)>) {
+            if self.taken < self.steps {
+                out.push((Identity::peer("owner", "tick"), 0));
+            }
+        }
+
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            self.taken += 1;
+        }
+
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            let step = log.step();
+            let mut view = self.view.borrow_mut();
+            for (_, op) in self.ops.iter().filter(|(at, _)| *at == step) {
+                match op.clone() {
+                    Op::Register => view.register(BUDGET),
+                    Op::Exists => view.exists(BUDGET, step),
+                    Op::Read(read) => view.read(BUDGET, step, read),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Registered and shown to exist at setup, then read at each listed
+    /// step.
+    fn reads(reads: impl IntoIterator<Item = (u64, Read<u64>)>) -> Vec<(u64, Op)> {
+        [(0, Op::Register), (0, Op::Exists)]
+            .into_iter()
+            .chain(reads.into_iter().map(|(at, read)| (at, Op::Read(read))))
+            .collect()
+    }
+
+    /// Reads `value` at each of `steps`.
+    fn current(steps: impl IntoIterator<Item = u64>, value: u64) -> Vec<(u64, Read<u64>)> {
+        steps
+            .into_iter()
+            .map(|at| (at, Read::Current(value)))
+            .collect()
+    }
+
+    /// Held at each of `steps`.
+    fn held(steps: impl IntoIterator<Item = u64>) -> Vec<(u64, Read<u64>)> {
+        steps
+            .into_iter()
+            .map(|at| {
+                (
+                    at,
+                    Read::Held {
+                        holder: "reactor.1".to_owned(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// `ops` over `steps` ticks under `properties`, with the hub closing
+    /// each boundary. Returns the run and the view.
+    fn run(
+        ops: Vec<(u64, Op)>,
+        steps: u64,
+        properties: Vec<Property<Owners>>,
+        sources: &Sources,
+    ) -> (RunReport, Owned) {
+        let view: Owned = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
+        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        let mut hub = EvidenceHub::new();
+        hub.owners(view.clone());
+        sim.add_source(Box::new(Script {
+            view: view.clone(),
+            steps,
+            taken: 0,
+            ops,
+        }));
+        sim.add_source(Box::new(hub));
+        let mut checker = RegistryChecker::new(
+            Registry::new(properties).expect("the IDs are unique"),
+            Rc::new(Owners(view.clone())),
+            Assumptions::none(),
+            sources,
+        );
+        (sim.run(&mut checker, &mut MemorySink::default()), view)
+    }
+
+    /// The wire tier's sources, with nothing else observed.
+    fn wire() -> Sources {
+        SourceManifest::wire().sources(Sources::default())
+    }
+
+    /// Holds whenever `require` hands out [`BUDGET`]'s value.
+    fn check_require(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        let view = cx.view();
+        let view = view.borrow();
+        let budget = view
+            .component(BUDGET)
+            .expect("the wire tier has the budget");
+        match require(cx, budget) {
+            Some(_) => Verdict::Holds,
+            None => Verdict::NotApplicable,
+        }
+    }
+
+    /// Holds whenever `require_every` hands out [`BUDGET`]'s value.
+    fn check_every(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        let view = cx.view();
+        let view = view.borrow();
+        let budget = view
+            .component(BUDGET)
+            .expect("the wire tier has the budget");
+        match require_every(cx, budget) {
+            Some(_) => Verdict::Holds,
+            None => Verdict::NotApplicable,
+        }
+    }
+
+    /// A safety property `id` that needs only [`BUDGET`], checked by
+    /// `check`.
+    fn needing(
+        id: &'static str,
+        check: fn(&mut CheckCtx<'_, Owners>) -> Verdict,
+    ) -> Property<Owners> {
+        Property {
+            id: PropertyId::new(id),
+            claim: "a test claim on a component",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Component(BUDGET)],
+            status: Status::Active,
+            check,
+            witness: None,
+        }
+    }
+
+    /// The `require` property.
+    fn requiring() -> Property<Owners> {
+        needing("test/require", check_require)
+    }
+
+    /// The `require_every` property.
+    fn requiring_every() -> Property<Owners> {
+        needing("test/require-every", check_every)
+    }
+
+    /// Property `id`'s report.
+    fn report<'r>(report: &'r RunReport, id: &str) -> &'r crate::PropertyReport {
+        report
+            .properties
+            .iter()
+            .find(|report| report.property == id)
+            .expect("the property is reported")
+    }
+
+    /// An inconclusive outcome with `reason`.
+    fn inconclusive(reason: &str) -> PropertyOutcome {
+        PropertyOutcome::Inconclusive {
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// `Storage`'s view holds the storage tier's components, each
+    /// `Initializing` before any source observes, and the hub closes its
+    /// boundaries, so after a run the view shows the last step's.
+    #[test]
+    fn the_storage_tier_has_the_composite_view() {
+        let scenario = StorageScenario::default();
+        let mut sim = Sim::new(Storage::config(&scenario), Plan::from_fuzz(&[]));
+        let storage = Storage::build(&mut sim, &scenario, Storage::prepare(&scenario));
+        assert_eq!(storage.captured(), Capture::Missing, "no boundary yet");
+        let kinds = |view: &HeaderSyncView| {
+            view.manifest()
+                .rows()
+                .iter()
+                .map(|row| {
+                    let component = view.component(row.kind).expect("a row has a component");
+                    assert_eq!(component.state(), State::Initializing);
+                    row.kind
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = kinds(&storage.view().owners.borrow());
+        assert_eq!(
+            before,
+            [
+                ComponentKind::Reactor,
+                ComponentKind::Budget,
+                ComponentKind::CallHolders,
+                ComponentKind::Transfers,
+                ComponentKind::SelectedChain,
+            ]
+        );
+        let report = sim.run(&mut crate::NoChecks, &mut NullSink);
+        assert_eq!(report.end.harness, None);
+        assert!(report.end.steps > 0, "the run takes steps");
+        assert_eq!(storage.captured(), Capture::AfterStep(report.end.steps));
+        assert_eq!(kinds(&storage.view().owners.borrow()), before);
+    }
+
+    /// A property that holds at several boundaries, then needs a component
+    /// in transition at the run's last, ends `state-unsettled`, with the
+    /// last boundary as its gap.
+    #[test]
+    fn a_component_in_transition_at_the_end_blocks_held() {
+        let (cut, _) = run(reads(current(0..=3, 1)), 3, vec![requiring()], &wire());
+        assert_eq!(
+            report(&cut, "test/require").outcome,
+            PropertyOutcome::Held { applicable: 3 },
+            "it holds at the current boundaries"
+        );
+        let ops = reads(current(0..=3, 1).into_iter().chain(held([4])));
+        let (run, view) = run(ops, 4, vec![requiring()], &wire());
+        assert_eq!(run.end.harness, None);
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::InTransition {
+                since: 4,
+                last: Some(&1)
+            })
+        );
+        let report = report(&run, "test/require");
+        assert_eq!(report.outcome, inconclusive("state-unsettled"));
+        assert_eq!(
+            report.gaps,
+            [Gap {
+                component: "Budget".to_owned(),
+                from: 4,
+                through: 4
+            }]
+        );
+    }
+
+    /// With no existence evidence, a component stays `Initializing`
+    /// through the run's end, which leaves its property inconclusive, not
+    /// failed. Evidence with no registered read fails the run.
+    #[test]
+    fn evidence_before_registration_fails_and_none_is_pending() {
+        let (none, view) = run(Vec::new(), 3, vec![requiring()], &wire());
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::Initializing),
+            "no evidence arrives"
+        );
+        assert_eq!(none.end.harness, None);
+        assert_eq!(none.end.steps, 3);
+        assert_eq!(view.borrow().captured(), Capture::AfterStep(3));
+        assert_eq!(
+            report(&none, "test/require").outcome,
+            inconclusive("state-unsettled")
+        );
+        let (early, _) = run(vec![(2, Op::Exists)], 3, vec![requiring()], &wire());
+        assert!(
+            matches!(&early.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail.contains("with no read registered")),
+            "{:?}",
+            early.end
+        );
+    }
+
+    /// A registered read that doesn't complete at one boundary fails the
+    /// run there, for a property that declares only the component.
+    #[test]
+    fn a_skipped_read_fails_the_run() {
+        let ops = reads(current([0, 1, 2, 4, 5], 1));
+        let (run, view) = run(ops, 5, vec![requiring()], &wire());
+        assert_eq!(
+            view.borrow()
+                .component(BUDGET)
+                .and_then(Component::fresh_through),
+            Some(2),
+            "it was read through step 2"
+        );
+        assert_eq!(run.end.steps, 3);
+        assert!(
+            matches!(&run.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail == "SkippedRead: Budget's registered read didn't complete at step 3"),
+            "{:?}",
+            run.end
+        );
+    }
+
+    /// A component in transition for three boundaries comes back current
+    /// with its old value. A `require` property ends `Held`, with the gap
+    /// listed. A `require_every` property ends `state-unobserved`.
+    #[test]
+    fn a_restored_transition_leaves_an_every_boundary_claim_open() {
+        let ops = reads(
+            current(0..=2, 7)
+                .into_iter()
+                .chain(held(3..=5))
+                .chain(current(6..=7, 7)),
+        );
+        let (run, view) = run(ops, 7, vec![requiring(), requiring_every()], &wire());
+        let view = view.borrow();
+        let budget = view
+            .component(BUDGET)
+            .expect("the wire tier has the budget");
+        assert_eq!(budget.state(), State::Current { state: &7 });
+        assert_eq!(budget.seq(), 3, "current, in transition, current");
+        assert_eq!(run.end.harness, None);
+        let gap = [Gap {
+            component: "Budget".to_owned(),
+            from: 3,
+            through: 5,
+        }];
+        let current = report(&run, "test/require");
+        assert_eq!(current.outcome, PropertyOutcome::Held { applicable: 4 });
+        assert_eq!(current.gaps, gap);
+        let every = report(&run, "test/require-every");
+        assert_eq!(every.outcome, inconclusive("state-unobserved"));
+        assert_eq!(every.gaps, gap);
+    }
+}

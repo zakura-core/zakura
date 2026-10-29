@@ -22,7 +22,7 @@
 
 use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc};
 
-use super::header_node::PredicateFeed;
+use super::header_node::{view::Owners, PredicateFeed};
 use crate::{
     peer::{PeerRecord, PeerRecords, WireEvidence},
     ActionSource, Boundary, Identity, Observation, ObservationLog,
@@ -106,6 +106,8 @@ pub struct EvidenceHub {
     peers: Option<Peers>,
     /// The storage policy's predicates, fed each written step.
     predicates: Option<Rc<RefCell<PredicateFeed>>>,
+    /// The owner view the hub closes each boundary of.
+    owners: Option<Rc<RefCell<dyn Owners>>>,
     /// Built under [`without_capture`], so it writes nothing.
     #[cfg(test)]
     off: bool,
@@ -178,6 +180,18 @@ impl EvidenceHub {
     /// Feeds each written step to `predicates`.
     pub(crate) fn feed(&mut self, predicates: Rc<RefCell<PredicateFeed>>) {
         self.predicates = Some(predicates);
+    }
+
+    /// Closes each boundary of `owners` after writing its step.
+    pub(crate) fn owners(&mut self, owners: Rc<RefCell<dyn Owners>>) {
+        self.owners = Some(owners);
+    }
+
+    /// Closes the owners' boundary after `step`, if the hub has owners.
+    fn close_owners(&self, step: u64) -> Result<(), String> {
+        self.owners
+            .as_ref()
+            .map_or(Ok(()), |owners| owners.borrow_mut().close(step))
     }
 
     /// Orders this step's rows and the peers' new records by position, and
@@ -343,13 +357,13 @@ impl ActionSource for EvidenceHub {
         unreachable!("the evidence hub offers no actions");
     }
 
-    /// Writes this step's rows in key order, then feeds them to the
-    /// predicates. Every row is written even when one fails, so a failure
-    /// a source's record explains is logged with it.
+    /// Writes this step's rows in key order, feeds them to the predicates,
+    /// then closes the owners' boundary. Every row is written even when one
+    /// fails, so a failure a source's record explains is logged with it.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         #[cfg(test)]
         if self.off {
-            return Ok(());
+            return self.close_owners(log.step());
         }
         let (rows, ordered) = self.order(log);
         let start = log.entries().len();
@@ -365,7 +379,10 @@ impl ActionSource for EvidenceHub {
                 .feed(log.entries()[start..].iter().map(|entry| &entry.obs)),
             None => Ok(()),
         };
-        ordered.and(written).and(fed)
+        ordered
+            .and(written)
+            .and(fed)
+            .and(self.close_owners(log.step()))
     }
 }
 

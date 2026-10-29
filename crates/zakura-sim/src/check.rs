@@ -95,6 +95,11 @@ pub struct PropertyReport {
     /// held. Empty for a property that measures none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peaks: BTreeMap<String, u64>,
+    /// The boundaries a check couldn't read a component it needed, as runs
+    /// of consecutive evaluations, in the order they opened. A property can
+    /// end `Held` with gaps (M6a, rule 8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<Gap>,
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
@@ -117,9 +122,23 @@ impl PropertyReport {
             holds_since: None,
             excluded: None,
             peaks: BTreeMap::new(),
+            gaps: Vec::new(),
             violations: Vec::new(),
         }
     }
+}
+
+/// A run of evaluations at which a property's check couldn't read a
+/// component, because it was in transition or ended unsettled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gap {
+    /// The component, such as `Budget`.
+    pub component: String,
+    /// The first step of the run.
+    pub from: u64,
+    /// The last step of the run.
+    pub through: u64,
 }
 
 /// Which part of the run a step belongs to.

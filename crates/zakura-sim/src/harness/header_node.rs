@@ -13,6 +13,7 @@
 mod pair;
 pub mod policy;
 pub mod tap;
+pub mod view;
 
 use std::{
     cell::{Cell, RefCell},

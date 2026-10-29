@@ -5,7 +5,7 @@
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1).
 
-use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{any::Any, borrow::Borrow, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
@@ -23,6 +23,7 @@ use zakura_storage::header::{
 
 use super::{
     evidence_hub::EvidenceHub,
+    header_node::view::HeaderSyncView,
     header_node::StartupFacts,
     header_node::{
         policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
@@ -39,8 +40,8 @@ use crate::{
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, ComponentKind, HasView, Kind, Property,
-        PropertyId, Source, Sources, Status, Verdict,
+        Assume, AssumeRecord, Assumptions, Capture, CheckCtx, ComponentKind, HasView, Kind,
+        Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
@@ -207,12 +208,13 @@ pub struct Ports {
 pub struct Storage {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
+    owners: Rc<RefCell<HeaderSyncView>>,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     _topology: Rc<Topology>,
 }
 
-/// What [`Storage`]'s checks read between steps.
+/// What [`storage_properties`] read between steps.
 pub struct StorageView {
     /// The node's port, for its pending operations and its engine's state.
     pub port: Arc<ControlledPort>,
@@ -220,15 +222,49 @@ pub struct StorageView {
     pub direct_dispatch_broken: bool,
 }
 
-impl HasView for Storage {
-    type View = StorageView;
-
+/// What both header tiers' checks read between steps: the storage view,
+/// and the owners' components as the evidence hub folded them (M6a-2).
+pub struct HeaderWireView {
     /// The node's port and the dispatch guard's flag.
-    fn view(&self) -> StorageView {
-        StorageView {
-            port: self.port.clone(),
-            direct_dispatch_broken: self.dispatch.get(),
-        }
+    pub storage: StorageView,
+    /// The tier's components, as of the last boundary the hub closed.
+    pub owners: Rc<RefCell<HeaderSyncView>>,
+}
+
+impl Borrow<StorageView> for HeaderWireView {
+    /// The storage view.
+    fn borrow(&self) -> &StorageView {
+        &self.storage
+    }
+}
+
+/// The composite view of a header tier's `port`, `dispatch` flag and
+/// `owners`.
+fn header_view(
+    port: &Arc<ControlledPort>,
+    dispatch: &DispatchFlag,
+    owners: &Rc<RefCell<HeaderSyncView>>,
+) -> HeaderWireView {
+    HeaderWireView {
+        storage: StorageView {
+            port: port.clone(),
+            direct_dispatch_broken: dispatch.get(),
+        },
+        owners: owners.clone(),
+    }
+}
+
+impl HasView for Storage {
+    type View = HeaderWireView;
+
+    /// The node's port, the dispatch guard's flag and the owners.
+    fn view(&self) -> HeaderWireView {
+        header_view(&self.port, &self.dispatch, &self.owners)
+    }
+
+    /// The boundary the hub last closed.
+    fn captured(&self) -> Capture {
+        RefCell::borrow(&self.owners).captured()
     }
 }
 
@@ -286,6 +322,8 @@ impl Subsystem for Storage {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
         let mut hub = EvidenceHub::new();
+        let owners = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::storage())));
+        hub.owners(owners.clone());
         let storage = PolicySource::new(
             sim,
             ports.node.clone(),
@@ -344,6 +382,7 @@ impl Subsystem for Storage {
         Storage {
             port: ports.node,
             dispatch,
+            owners,
             _topology: topology,
         }
     }
@@ -431,20 +470,23 @@ impl WirePorts {
 pub struct HeaderWire {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
+    owners: Rc<RefCell<HeaderSyncView>>,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
 }
 
 impl HasView for HeaderWire {
-    type View = StorageView;
+    type View = HeaderWireView;
 
-    /// The node's port and the dispatch guard's flag.
-    fn view(&self) -> StorageView {
-        StorageView {
-            port: self.port.clone(),
-            direct_dispatch_broken: self.dispatch.get(),
-        }
+    /// The node's port, the dispatch guard's flag and the owners.
+    fn view(&self) -> HeaderWireView {
+        header_view(&self.port, &self.dispatch, &self.owners)
+    }
+
+    /// The boundary the hub last closed.
+    fn captured(&self) -> Capture {
+        RefCell::borrow(&self.owners).captured()
     }
 }
 
@@ -515,6 +557,8 @@ impl Subsystem for HeaderWire {
     /// last, writes what every source observed.
     fn build(sim: &mut Sim, scenario: &WireScenario, ports: WirePorts) -> Self {
         let mut hub = EvidenceHub::new();
+        let owners = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
+        hub.owners(owners.clone());
         let net = scenario.net.net();
         net.write_to(hub.out());
         sim.add_source(Box::new(net.clone()));
@@ -588,6 +632,7 @@ impl Subsystem for HeaderWire {
         HeaderWire {
             port: ports.node,
             dispatch,
+            owners,
             _keep: Box::new(node),
         }
     }
@@ -659,7 +704,10 @@ pub fn storage_config() -> RunConfig {
 /// The storage harness's properties, [`OPERATION_IDS`] then
 /// [`DIRECT_DISPATCH`], both active. A test harness that wraps
 /// [`Storage`] with its view registers them too.
-pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
+pub fn storage_properties<S: HasView>() -> Vec<Property<S>>
+where
+    S::View: Borrow<StorageView>,
+{
     vec![
         Property {
             id: PropertyId::new(OPERATION_IDS),
@@ -921,8 +969,11 @@ pub(crate) fn check_service_operation_ids<S: HasView>(
 
 /// Checks [`DIRECT_DISPATCH`]: violated once the dispatch guard's flag is
 /// set.
-fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
-    if cx.view().direct_dispatch_broken {
+fn check_direct_dispatch<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S::View: Borrow<StorageView>,
+{
+    if cx.view().borrow().direct_dispatch_broken {
         cx.violated(
             "every storage call goes to the node's port",
             "a reactor sent a call to its action channel",

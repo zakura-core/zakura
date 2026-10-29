@@ -123,6 +123,21 @@ pub enum Inconclusive {
     HarnessFailed,
     /// Every peer left, but the run ended before teardown settled.
     TeardownOpen,
+    /// The latest evaluation needed a component that was initializing or in
+    /// transition at its boundary ([`require`](super::require)).
+    Unsettled,
+    /// An every-boundary claim couldn't read a component at some boundary
+    /// ([`require_every`](super::require_every)). Sticky: a later current
+    /// boundary doesn't clear it.
+    Unobserved,
+}
+
+impl Inconclusive {
+    /// True for a reason that stays once recorded, whatever later
+    /// evaluations find.
+    pub(crate) fn is_sticky(self) -> bool {
+        self == Inconclusive::Unobserved
+    }
 }
 
 impl fmt::Display for Inconclusive {
@@ -134,6 +149,8 @@ impl fmt::Display for Inconclusive {
             Inconclusive::ObligationOpen => "obligation-open",
             Inconclusive::HarnessFailed => "harness-failed",
             Inconclusive::TeardownOpen => "teardown-open",
+            Inconclusive::Unsettled => "state-unsettled",
+            Inconclusive::Unobserved => "state-unobserved",
         })
     }
 }

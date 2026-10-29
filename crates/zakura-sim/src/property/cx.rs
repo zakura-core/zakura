@@ -3,8 +3,8 @@
 use std::ops::Deref;
 
 use super::{
-    Cardinality, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey, Property,
-    PropertyId, Subject, Verdict,
+    Cardinality, ComponentKind, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey,
+    Property, PropertyId, Subject, Verdict,
 };
 use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
 
@@ -72,6 +72,8 @@ pub struct CheckCtx<'a, S: HasView> {
     labelled: Vec<LabelledFrame>,
     peaks: Vec<(&'static str, u64)>,
     unsettled: Option<Inconclusive>,
+    sticky: Option<Inconclusive>,
+    gaps: Vec<ComponentKind>,
 }
 
 /// What a check left behind besides its verdict.
@@ -88,6 +90,10 @@ pub(crate) struct CheckParts {
     pub(crate) peaks: Vec<(&'static str, u64)>,
     /// Why its trigger fired but it couldn't judge yet, if so.
     pub(crate) unsettled: Option<Inconclusive>,
+    /// A reason that stays for the rest of the run, if it recorded one.
+    pub(crate) sticky: Option<Inconclusive>,
+    /// The components it couldn't read at this boundary.
+    pub(crate) gaps: Vec<ComponentKind>,
 }
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
@@ -110,6 +116,8 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             labelled: Vec::new(),
             peaks: Vec::new(),
             unsettled: None,
+            sticky: None,
+            gaps: Vec::new(),
         }
     }
 
@@ -122,6 +130,8 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             labelled: self.labelled,
             peaks: self.peaks,
             unsettled: self.unsettled,
+            sticky: self.sticky,
+            gaps: self.gaps,
         }
     }
 
@@ -246,9 +256,22 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// shown what the check needs to judge it, such as a teardown's
     /// settlement. Only the latest evaluation counts: if the run ends after
     /// one that recorded `reason`, the property is `Inconclusive` with it,
-    /// unless it was violated.
+    /// unless it was violated. A sticky reason, `Unobserved`, stays for the
+    /// rest of the run instead.
     pub fn unsettled(&mut self, reason: Inconclusive) {
-        self.unsettled = Some(reason);
+        if reason.is_sticky() {
+            self.sticky.get_or_insert(reason);
+        } else {
+            self.unsettled = Some(reason);
+        }
+    }
+
+    /// Records that the check couldn't read `component` at this boundary.
+    /// The property's report lists each run of such boundaries.
+    pub(crate) fn gap(&mut self, component: ComponentKind) {
+        if !self.gaps.contains(&component) {
+            self.gaps.push(component);
+        }
     }
 
     /// Records that a source the property needs lacks evidence the check

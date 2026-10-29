@@ -480,11 +480,16 @@ struct ProbeReady {
 struct Probing(std::rc::Rc<Storage>);
 
 impl zakura_sim::property::HasView for Probing {
-    type View = zakura_sim::harness::header_sync::StorageView;
+    type View = zakura_sim::harness::header_sync::HeaderWireView;
 
     /// The storage harness's view.
     fn view(&self) -> Self::View {
         self.0.view()
+    }
+
+    /// When the storage harness's view was captured.
+    fn captured(&self) -> zakura_sim::property::Capture {
+        self.0.captured()
     }
 }
 

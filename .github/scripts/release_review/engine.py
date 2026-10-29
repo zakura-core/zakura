@@ -46,11 +46,12 @@ def batch_units(units: list[ReviewUnit], limit: int):
 
 def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
                  spending: Spending, content: dict, deadline: float, checkpoint) -> dict:
+    """Request evidence until the model finishes, subject to shared run safeguards."""
     messages = [
         {"role": "system", "content": settings.instructions},
-        {"role": "user", "content": json.dumps({**content, "response_turn_limit": settings.max_rounds}, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(content, ensure_ascii=False)},
     ]
-    for turn_index in range(settings.max_rounds):
+    while True:
         if time.monotonic() >= deadline:
             raise ReviewError("review time budget exhausted")
         reply = spending.call(provider, ModelRequest(messages, settings.max_output_tokens),
@@ -71,11 +72,7 @@ def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
             except ReviewError as error:
                 result = {"error": str(error)}
             results.append({"request": action, "result": result})
-        messages.append({"role": "user", "content": json.dumps({
-            "repository_tool_results": results,
-            "remaining_response_turns": settings.max_rounds - turn_index - 1,
-        })})
-    raise ReviewError("model did not finish within the configured context-request rounds")
+        messages.append({"role": "user", "content": json.dumps({"repository_tool_results": results})})
 
 
 def deduplicate(findings: list[dict]) -> list[dict]:

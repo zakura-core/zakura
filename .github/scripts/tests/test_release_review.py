@@ -51,7 +51,7 @@ BASE = "a" * 40
 def settings(**changes):
     base = Settings("openai", "fixture-model", "https://api.openai.com/v1/responses",
                     Decimal(1), Decimal(2), Decimal(25), 120000, 4096,
-                    "medium", 24000, 4, 300, "Find concrete bugs only.", "digest")
+                    "medium", 24000, 300, "Find concrete bugs only.", "digest")
     return replace(base, **changes)
 
 
@@ -504,6 +504,33 @@ class EngineTests(GitFixture):
         review(self.repository, provider, settings(), report, lambda _: None)
         self.assertEqual(report["status"], "complete")
         self.assertIn("validate(block)", provider.requests[1].messages[-1]["content"])
+
+    def test_batch_and_synthesis_can_each_request_more_than_sixteen_context_turns(self):
+        action = {"kind": "read", "revision": "base", "path": "validator.rs", "start": 1, "end": 1, "query": ""}
+        context = {"complete": False, "summary": "Inspecting source evidence", "actions": [action], "findings": []}
+        provider = ScriptedProvider([context] * 20 + [completed()] + [context] * 20 + [completed()])
+        report = self.metadata()
+        review(self.repository, provider, settings(), report, lambda _: None)
+        self.assertEqual(len(provider.requests), 42)
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["synthesis_complete"])
+        self.assertTrue(all(entry["status"] == "reviewed" for entry in report["coverage"]))
+        self.assertNotIn("response_turn_limit", json.loads(provider.requests[0].messages[1]["content"]))
+        self.assertNotIn("remaining_response_turns", json.loads(provider.requests[1].messages[-1]["content"]))
+
+    def test_repeated_context_requests_stop_at_the_shared_cost_ceiling(self):
+        action = {"kind": "read", "revision": "base", "path": "validator.rs", "start": 1, "end": 1, "query": ""}
+        context = {"complete": False, "summary": "Inspecting source evidence", "actions": [action], "findings": []}
+        provider = ScriptedProvider([context] * 1000)
+        report = self.metadata()
+        config = settings(budget=Decimal("0.08"))
+        review(self.repository, provider, config, report, lambda _: None)
+        self.assertGreater(len(provider.requests), 16)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["errors"], ["API budget exhausted before the next request"])
+        self.assertLessEqual(Decimal(report["usage"]["estimated_usd_including_uncertain_calls"]), config.budget)
+        self.assertFalse(report["synthesis_complete"])
+        self.assertTrue(all(entry["status"] == "pending" for entry in report["coverage"]))
 
     def test_compatible_provider_does_not_claim_an_openai_reasoning_setting(self):
         provider = ScriptedProvider([completed(), completed()])

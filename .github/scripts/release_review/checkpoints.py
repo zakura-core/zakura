@@ -14,7 +14,7 @@ from .models import Spending
 def contract_digest(repo, settings, units, coverage) -> str:
     """Bind reusable results to revisions, rendered diffs, scope, prompts, and pricing.
 
-    Turn and wall-time limits may change for a continuation; evidence, provider,
+    Wall-time limits may change for a continuation; evidence, provider,
     effort, request limits, and the shared API ceiling must remain identical.
     """
     identity = {

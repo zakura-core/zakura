@@ -31,7 +31,7 @@ class CheckpointTests(GitFixture):
         original = copy.deepcopy(prior)
         provider = ScriptedProvider([completed(), completed()])
         report = self.metadata() | {"control_sha": "next-reviewer"}
-        review(self.repository, provider, settings(max_rounds=12), report, lambda _: None, prior_report=prior)
+        review(self.repository, provider, settings(max_seconds=600), report, lambda _: None, prior_report=prior)
         self.assertEqual(report["status"], "complete")
         self.assertNotIn("production.rs", provider.requests[0].messages[-1]["content"])
         self.assertEqual(report["usage"]["calls"], prior["usage"]["calls"] + 2)

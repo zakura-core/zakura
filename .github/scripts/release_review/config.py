@@ -37,7 +37,6 @@ class Settings:
     max_output_tokens: int
     reasoning_effort: str
     unit_bytes: int
-    max_rounds: int
     max_seconds: int
     instructions: str
     prompt_digest: str
@@ -106,12 +105,10 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
     if budget > 25:
         raise ReviewError("this workflow is authorized for at most $25 per run")
     unit_bytes = limits["unit_bytes"]
-    rounds = limits["max_rounds"]
     seconds = limits["max_seconds"]
     if (type(unit_bytes) is not int or not 1000 <= unit_bytes <= 48000
-            or type(rounds) is not int or not 1 <= rounds <= 16
             or type(seconds) is not int or not 60 <= seconds <= 10800):
         raise ReviewError("invalid review work limits")
     return Settings(provider, name, endpoint, input_price, output_price, budget,
-                    max_input, max_output, effort, unit_bytes, rounds, seconds,
+                    max_input, max_output, effort, unit_bytes, seconds,
                     prompt, hashlib.sha256(prompt.encode()).hexdigest(), exclusions, cached_price)

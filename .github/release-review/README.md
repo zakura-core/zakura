@@ -50,6 +50,10 @@ request, including retries. It replaces a reservation with reported usage after
 a successful response. A timeout or missing usage keeps the full reservation.
 Unknown usage, incompatible responses, missing prices, and exhausted budgets
 cannot produce a clean review. The code never switches providers on failure.
+There is no per-batch source-request turn limit: investigation and synthesis
+can request further evidence under the shared API ceiling. Request-size bounds
+and operational timeouts still apply; hitting a safeguard preserves an
+incomplete report.
 
 ## Prompts and manual runs
 
@@ -86,8 +90,8 @@ supplied by a PR author. A digest binds saved coverage to the exact revisions,
 rendered diff units, scope, prompts, provider/model/effort, request limits, and
 pricing. A mismatch stops before any API call. Completed units are reused and
 all earlier token costs and uncertain-call reservations carry forward under the
-same $25 ceiling. Source-request turns may be increased (up to 16); each
-invocation has its own wall-time limit. Reports preserve the earlier reviewer
+same $25 ceiling. Each invocation has its own wall-time limit. Reports preserve
+the earlier reviewer
 revisions, errors, and usage in continuation history. Normal manual workflow
 reruns still start a fresh review.
 

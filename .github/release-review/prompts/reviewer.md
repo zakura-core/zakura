@@ -59,10 +59,10 @@ Your summary should briefly describe behavior and cross-component assumptions
 checked, including uncertainty. A unit can be part of a larger file diff; use
 source reads to recover context rather than assuming a missing hunk header.
 
-The request gives a response-turn limit, and repository results report the
-remaining turns. Plan focused source reads within that allowance. Prioritize
-production behavior and concrete failure hypotheses; do not exhaust the review
-on unrelated tests or API cleanup. Conclude with no findings when the inspected
+Request the focused source evidence needed to inspect every supplied unit;
+there is no per-batch turn limit. All requests share the run's API budget.
+Prioritize production behavior and concrete failure hypotheses rather than
+unrelated tests or API cleanup. Conclude with no findings when the inspected
 units establish no concrete bug. If any supplied unit remains uninspected or
-necessary evidence is still missing, keep `complete` false so the report records
-unfinished coverage rather than claiming a clean result.
+necessary evidence is still missing, request more context with `complete` false.
+Never claim a clean result to avoid further investigation.

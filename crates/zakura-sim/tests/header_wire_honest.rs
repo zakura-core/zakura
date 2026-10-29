@@ -75,40 +75,23 @@ type Offers = Vec<(u64, bool)>;
 /// Each peer stream's [`Offers`] in `report`, by connection and QUIC
 /// stream.
 ///
-/// A `PeerFrame` names its stream's kind and version, not its QUIC stream,
-/// so it takes the QUIC stream of its connection's latest `Session` row of
-/// that kind and version. A peer writes on one header stream at a time, and
-/// the node reopens one only after the peer finished the last. A frame
-/// given the wrong stream leaves its `PeerWritten` with no offer to finish.
-///
 /// # Panics
 ///
 /// If a stream's offers don't count from 0, or a `PeerWritten` doesn't
 /// finish its stream's earliest unwritten offer, with the same `seq`. So
 /// writes finish in offer order, each once.
 fn peer_offers(report: &RunReport) -> BTreeMap<(u64, u64), Offers> {
-    let mut sessions = BTreeMap::new();
     let mut offers: BTreeMap<(u64, u64), Offers> = BTreeMap::new();
     for entry in report.log.entries() {
         match &entry.obs {
-            Observation::Session {
-                connection,
-                quic_stream,
-                kind,
-                version,
-                ..
-            } => {
-                sessions.insert((*connection, *kind, *version), *quic_stream);
-            }
             Observation::PeerFrame {
                 connection,
-                stream,
+                quic_stream,
                 seq,
                 ..
             } => {
-                let quic_stream = *sessions
-                    .get(&(*connection, stream.kind, stream.version))
-                    .expect("the identity map logs a PeerFrame after its stream's Session row");
+                let quic_stream =
+                    quic_stream.expect("a wire run's PeerFrame names its QUIC stream");
                 let offered = offers.entry((*connection, quic_stream)).or_default();
                 assert_eq!(
                     usize::try_from(*seq).ok(),

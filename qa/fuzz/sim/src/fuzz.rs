@@ -430,4 +430,16 @@ mod tests {
         assert_eq!(kept.admit(path(MAX_KEPT_INPUTS)), Keep::Full);
         assert_eq!(kept.admit(path(MAX_KEPT_INPUTS + 1)), Keep::Skip);
     }
+
+    /// One input repeated past the cap still leaves room for a second
+    /// distinct input (review of bc06ef3a2).
+    #[test]
+    fn a_repeated_input_leaves_room_for_another() {
+        let mut kept = Kept::default();
+        assert_eq!(kept.admit(PathBuf::from("known.bin")), Keep::First);
+        for _ in 1..=MAX_KEPT_INPUTS {
+            assert_eq!(kept.admit(PathBuf::from("known.bin")), Keep::Skip);
+        }
+        assert_eq!(kept.admit(PathBuf::from("known-1.bin")), Keep::Later);
+    }
 }

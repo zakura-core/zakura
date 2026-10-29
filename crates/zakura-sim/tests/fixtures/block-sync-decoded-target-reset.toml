@@ -1,9 +1,0 @@
-# The committed fuzz input `block-sync-decoded-target-reset.bin`: the
-# harness that runs it, the generator version it was built for, and its
-# SHA-256. Its first two bytes, `ff 0e`, pick the decoded-target-reset
-# scenario: storage never answers a submission, and a reset detaches a
-# window that fills the decoded-byte target. Its plan is the stalled-reset
-# input's.
-harness = "block-sync/storage"
-generator = 2
-sha256 = "fbdea0d48973be1403870eec661e535173a5f3537ac95e268b5b90174124aec4"

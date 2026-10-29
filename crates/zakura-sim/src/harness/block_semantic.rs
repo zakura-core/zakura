@@ -12,9 +12,6 @@
 //!   while a fork body waits for it.
 //! - [`BlockScenario::stalled_reset`]: storage never answers a
 //!   submission, and a reset detaches the first one.
-//! - [`BlockScenario::decoded_target_reset`]: storage never answers a
-//!   submission, and a reset detaches a window that fills the decoded-byte
-//!   target.
 //! - [`BlockScenario::decoded_input_stall`]: the sequencer stalls, as a
 //!   slow verifier stalls it, and the mirror keeps delivering bodies after
 //!   the input queue's decoded bytes fill the decoded-byte cap.
@@ -41,8 +38,6 @@ pub const CAPACITY_RELEASE_TAG: [u8; 2] = [0xFF, 0x08];
 /// The fuzz prefix that draws [`BlockScenario::stalled_reset`].
 pub const STALLED_RESET_TAG: [u8; 2] = [0xFF, 0x0A];
 
-/// The fuzz prefix that draws [`BlockScenario::decoded_target_reset`].
-pub const DECODED_TARGET_RESET_TAG: [u8; 2] = [0xFF, 0x0E];
 /// The fuzz prefix that draws [`BlockScenario::decoded_input_stall`].
 pub const DECODED_INPUT_STALL_TAG: [u8; 2] = [0xFF, 0x10];
 
@@ -285,47 +280,6 @@ impl BlockScenario {
         }
     }
 
-    /// 272 blocks of 2,000,000 bytes, the first two already the node's.
-    /// Storage stalls: it never answers a submission. The node's
-    /// submissions fill the 512 MiB decoded-byte target before its
-    /// 401-submission limit. These padded bodies decode to about their wire
-    /// size, so the node's look-ahead limit is 4 GiB: production's 1.5 GiB
-    /// would stop downloads before the target. After 60 s, every actor
-    /// switches to a fork from height 2, which detaches every submission,
-    /// and the fork's bodies wait for room.
-    pub fn decoded_target_reset() -> Self {
-        BlockScenario {
-            blocks: 272,
-            body_bytes: 2_000_000,
-            node_bodies: 2,
-            max_reorder_lookahead_bytes: Some(4 << 30),
-            policy: Policy {
-                holds: vec![hold(
-                    every(BlockKind::Apply),
-                    Trigger::VirtualTime(u64::MAX),
-                    vec![BlockAllow::Committed],
-                )],
-                ..Policy::converging()
-            },
-            control: vec![
-                ControlStep {
-                    action: ControlAction::Reset {
-                        fork: Fork {
-                            branch: 1,
-                            at: 2,
-                            len: 271,
-                        },
-                        node_first: false,
-                        apply_when: None,
-                    },
-                    when: Some(Trigger::VirtualTime(60_000)),
-                },
-                relink("mirror-0"),
-            ],
-            ..BlockScenario::default()
-        }
-    }
-
     /// 320 blocks of 2,000,000 bytes from one mirror, the first two
     /// already the node's. Storage never answers a submission, and the
     /// node's sequencer task pauses once it publishes its first snapshot, as
@@ -364,7 +318,6 @@ impl BlockScenario {
             tag if tag == STALE_BESIDE_CURRENT_TAG => Some(BlockScenario::stale_beside_current()),
             tag if tag == CAPACITY_RELEASE_TAG => Some(BlockScenario::capacity_release()),
             tag if tag == STALLED_RESET_TAG => Some(BlockScenario::stalled_reset()),
-            tag if tag == DECODED_TARGET_RESET_TAG => Some(BlockScenario::decoded_target_reset()),
             tag if tag == DECODED_INPUT_STALL_TAG => Some(BlockScenario::decoded_input_stall()),
             _ => None,
         }

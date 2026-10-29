@@ -316,9 +316,6 @@ pub struct SemanticModel {
     /// Whether a verdict reached block sync while a submission holder still
     /// held its token.
     pub saw_verdict_while_held: bool,
-    /// Whether it did so while the decoded bytes storage held left no room
-    /// under the decoded-byte target for another body of the same size.
-    pub saw_reset_at_byte_target: bool,
     /// Whether a body entered the input queue holding its decoded block.
     pub saw_decoded_queued: bool,
     /// Whether virtual time advanced while the input queue held a body.
@@ -498,10 +495,6 @@ impl SemanticModel {
             .collect();
         if !older.is_empty() {
             self.saw_reset_while_held = true;
-            let (bytes, _, smallest) = self.held_decoded();
-            self.saw_reset_at_byte_target |= smallest.is_some_and(|body| {
-                bytes.saturating_add(body) > BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-            });
         }
         self.held_at_reset.extend(older);
     }

@@ -78,6 +78,7 @@ use crate::zakura::{
         ExchangeWriter, SharedSubscriptions, SubscribeRefused, SubscriptionFault,
         SubscriptionLimits, Subscriptions, Update, WriterFence,
     },
+    transport::sim_chain,
     Credit, Frame, FramedRecv,
 };
 
@@ -286,6 +287,16 @@ pub(crate) struct Subscriber {
     header_bytes: usize,
 }
 
+/// The reader's tap for this session's subscription tables, if it has one.
+/// The reader waits for the precheck the caller attaches next, so tagging
+/// starts before it reads the first frame.
+#[cfg(any(test, zakura_sim))]
+pub(crate) fn observed_tools(recv: &FramedRecv) -> Option<crate::zakura::RegulationTap<u64>> {
+    let tap = recv.stream_tap()?;
+    tap.tag_frames();
+    Some(crate::zakura::RegulationTap::new(tap.clone(), |id| *id))
+}
+
 impl Subscriber {
     /// A subscriber with no subscription, on a network whose headers take
     /// `header_bytes`, for the session that `fence` guards and `recv` reads.
@@ -296,7 +307,10 @@ impl Subscriber {
     pub(crate) fn new(header_bytes: usize, fence: WriterFence, recv: &FramedRecv) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
-        let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes)));
+        let tools = SharedSubscriptions::new(sim_chain!(
+            Subscriptions::new(limits, rows(header_bytes))
+                => observed_by(observed_tools(recv))
+        ));
         let transport_admits = recv.attach_precheck(Arc::new(tools.admitting()));
         Self {
             tools,

@@ -4,6 +4,7 @@
 
 pub mod feed;
 pub mod script;
+pub mod steer;
 
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{Checker, MemorySink, Plan, PlanInput, RunConfig, RunReport, Sim};
@@ -51,6 +52,14 @@ pub fn recorded(
 
 /// `count` byte inputs of up to `max_len` bytes, the same on every call.
 pub fn inputs(count: usize, max_len: usize) -> Vec<PlanInput> {
+    byte_inputs(count, max_len)
+        .iter()
+        .map(|bytes| Plan::from_fuzz(bytes))
+        .collect()
+}
+
+/// The bytes of [`inputs`].
+pub fn byte_inputs(count: usize, max_len: usize) -> Vec<Vec<u8>> {
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = move || {
         // SplitMix64.
@@ -65,8 +74,7 @@ pub fn inputs(count: usize, max_len: usize) -> Vec<PlanInput> {
             // The remainder is at most max_len, which is a usize.
             let len = (next() % (max_len as u64 + 1)) as usize;
             // Keeping the low byte is the point.
-            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            Plan::from_fuzz(&bytes)
+            (0..len).map(|_| next() as u8).collect()
         })
         .collect()
 }

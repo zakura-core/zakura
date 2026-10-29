@@ -12,6 +12,9 @@
 //!   while a fork body waits for it.
 //! - [`BlockScenario::stalled_reset`]: storage never answers a
 //!   submission, and a reset detaches the first one.
+//! - [`BlockScenario::decoded_input_stall`]: the sequencer stalls, as a
+//!   slow verifier stalls it, and the mirror keeps delivering bodies after
+//!   the input queue's decoded bytes fill the decoded-byte cap.
 
 use super::{
     block_node::{
@@ -19,7 +22,7 @@ use super::{
         policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
         Policy,
     },
-    block_sync::{BlockScenario, MirrorSpec},
+    block_sync::{BlockScenario, MirrorSpec, SequencerPause},
     header_sync::Dialer,
 };
 
@@ -34,6 +37,9 @@ pub const CAPACITY_RELEASE_TAG: [u8; 2] = [0xFF, 0x08];
 
 /// The fuzz prefix that draws [`BlockScenario::stalled_reset`].
 pub const STALLED_RESET_TAG: [u8; 2] = [0xFF, 0x0A];
+
+/// The fuzz prefix that draws [`BlockScenario::decoded_input_stall`].
+pub const DECODED_INPUT_STALL_TAG: [u8; 2] = [0xFF, 0x10];
 
 /// Holds the operations `select` picks until `until`, then offers `then`.
 fn hold(select: Select, until: Trigger, then: Vec<BlockAllow>) -> Hold {
@@ -165,12 +171,14 @@ impl BlockScenario {
     ///
     /// The commit both advances the view's tip and replies. When block sync
     /// handles the tip first, the frontier releases height 1, and the stale
-    /// reply that follows frees room without waking the waiting body
+    /// reply that follows frees room that must wake the waiting body
     /// (#1523).
     ///
-    /// The teardown ends by step 465,000 on both committed inputs, after
+    /// The teardown ends by step 478,000 on both committed inputs, after
     /// which only the mirror's metrics timer runs, so the run stops at
-    /// 470,000 steps instead of the default budget's 837,000.
+    /// 520,000 steps instead of the default budget's 837,000. #1522's
+    /// decoded-budget reads and view publishes add preemption points, which
+    /// moved the mirror's second close past the earlier 470,000-step budget.
     pub fn capacity_release() -> Self {
         let mirror = "mirror-0";
         let reads = |count: u32| {
@@ -240,7 +248,7 @@ impl BlockScenario {
                     when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 21))),
                 },
             ],
-            steps: Some(470_000),
+            steps: Some(520_000),
             ..BlockScenario::default()
         }
     }
@@ -279,6 +287,36 @@ impl BlockScenario {
         }
     }
 
+    /// 320 blocks of 2,000,000 bytes from one mirror, the first two
+    /// already the node's. Storage never answers a submission, and the
+    /// node's sequencer task pauses once it publishes its first snapshot, as
+    /// a slow verifier would stall it. The routine keeps handing bodies to
+    /// the sequencer's input queue, which has room for every one. These
+    /// padded bodies decode to about their wire size, so the queue's
+    /// decoded bodies fill the 512 MiB decoded-byte cap after about 265
+    /// bodies, and the mirror keeps delivering the rest. The node's
+    /// look-ahead limit is 4 GiB: production's 1.5 GiB would stop downloads
+    /// before the cap. The pause lasts 150,000 steps, which outlasts the
+    /// downloads.
+    pub fn decoded_input_stall() -> Self {
+        BlockScenario {
+            blocks: 320,
+            body_bytes: 2_000_000,
+            node_bodies: 2,
+            max_reorder_lookahead_bytes: Some(4 << 30),
+            policy: Policy {
+                holds: vec![hold(
+                    every(BlockKind::Apply),
+                    Trigger::VirtualTime(u64::MAX),
+                    vec![BlockAllow::Committed],
+                )],
+                ..Policy::converging()
+            },
+            sequencer_pause: Some(SequencerPause { steps: 150_000 }),
+            ..BlockScenario::default()
+        }
+    }
+
     /// The semantic scenario a fuzz input's 2-byte prefix names, if it
     /// starts with one of the tags above.
     pub fn semantic_drawn(prefix: &[u8]) -> Option<Self> {
@@ -287,6 +325,7 @@ impl BlockScenario {
             tag if tag == STALE_BESIDE_CURRENT_TAG => Some(BlockScenario::stale_beside_current()),
             tag if tag == CAPACITY_RELEASE_TAG => Some(BlockScenario::capacity_release()),
             tag if tag == STALLED_RESET_TAG => Some(BlockScenario::stalled_reset()),
+            tag if tag == DECODED_INPUT_STALL_TAG => Some(BlockScenario::decoded_input_stall()),
             _ => None,
         }
     }

@@ -535,6 +535,38 @@ fn a_datagram_to_an_unbound_address_is_dropped_on_arrival() {
 }
 
 #[test]
+fn events_since_returns_the_tail_of_events() {
+    let net = SimNet::new(fifo(0, 10));
+    let a = net.bind(addr(1)).unwrap();
+    send(&a, addr(9), b"one");
+    let all = net.events();
+    assert_eq!(net.events_since(0), all);
+    assert_eq!(net.events_since(1), all[1..]);
+    assert_eq!(net.events_since(all.len()), []);
+    assert_eq!(net.events_since(all.len() + 5), []);
+}
+
+#[test]
+fn queries_at_an_instant_answer_for_that_instant() {
+    let net = SimNet::new(fifo(50, 100));
+    let a = net.bind(addr(1)).unwrap();
+    let sent = now();
+    send(&a, addr(2), b"later");
+    let [id] = net.in_flight()[..] else {
+        panic!("one datagram in flight")
+    };
+    // This test runs on the real clock, so the send's own reading is a
+    // little after `sent`.
+    let opens = net
+        .next_eligible_after(sent)
+        .expect("the window opens after the send");
+    assert!(opens >= sent + Duration::from_millis(50));
+    assert_eq!(net.deliverable_at(opens - Duration::from_nanos(1)), []);
+    assert_eq!(net.deliverable_at(opens), [id]);
+    assert_eq!(net.next_eligible_after(opens), None);
+}
+
+#[test]
 fn a_simulated_socket_binds_only_explicit_addresses() {
     let net = SimNet::new(fifo(0, 10));
     for bad in [

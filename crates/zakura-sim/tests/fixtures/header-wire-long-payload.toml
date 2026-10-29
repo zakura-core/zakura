@@ -1,0 +1,7 @@
+# The committed fuzz input `header-wire-long-payload.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `long-payload` scenario, and
+# `header-wire-long-payload.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "bddcf194282150062bf053a220a353eef271f01a36c978795cc9d48f914e56b4"

@@ -201,7 +201,9 @@ impl Sim {
 
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
-    /// each step, then `end`.
+    /// each step, then `end`. A sink that doesn't want steps
+    /// ([`RecordSink::wants_steps`]) gets only `init` and `end`, and the run
+    /// skips each step's `obs` digest.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
         state.log.set_run(self.run_id);
@@ -329,6 +331,8 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
+        // Read once, so a run never emits only some of its steps.
+        let record_steps = sink.wants_steps();
         if let Err(failure) = self.observe_sources(st) {
             return st.end_harness(failure);
         }
@@ -455,16 +459,18 @@ impl Sim {
             };
 
             let next = self.ready(st);
-            sink.record(Record::Step(StepRecord {
-                step: st.step,
-                pick: chosen.identity.to_string(),
-                key: None,
-                options: enabled.len(),
-                by: decision.by,
-                offset: decision.offset,
-                draws,
-                obs: Some(digest(st.log.of_step(st.step))),
-            }));
+            if record_steps {
+                sink.record(Record::Step(StepRecord {
+                    step: st.step,
+                    pick: chosen.identity.to_string(),
+                    key: None,
+                    options: enabled.len(),
+                    by: decision.by,
+                    offset: decision.offset,
+                    draws,
+                    obs: Some(digest(st.log.of_step(st.step))),
+                }));
+            }
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }

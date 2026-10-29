@@ -247,6 +247,7 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             hash: submitted,
             parent,
             class: applied,
+            decoded_bytes,
         } => StorageRequest::SubmitBlock {
             owner: block_owner(*owner),
             source: peer(*source),
@@ -255,6 +256,7 @@ fn request(request: &RequestIdentity) -> StorageRequest {
             hash: hash(*submitted),
             parent: hash(*parent),
             class: class(*applied),
+            decoded_bytes: *decoded_bytes,
         },
         RequestIdentity::Record {
             op,

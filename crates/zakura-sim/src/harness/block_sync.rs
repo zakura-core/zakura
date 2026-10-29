@@ -161,6 +161,9 @@ pub struct BlockScenario {
     /// If set, the run pauses routines in their handoffs to the sequencer.
     #[serde(default)]
     pub handoff_pause: Option<HandoffPause>,
+    /// If set, the run pauses the node's sequencer task.
+    #[serde(default)]
+    pub sequencer_pause: Option<SequencerPause>,
 }
 
 /// Pauses each routine that hands a body to the sequencer, after the send
@@ -177,6 +180,20 @@ pub struct HandoffPause {
     /// The lowest height whose handoff pauses.
     pub from_height: u32,
     /// The most steps the pauses last after the first one began.
+    pub steps: u64,
+}
+
+/// Pauses the node's sequencer task once it records its first ownership
+/// snapshot, as a slow verifier would stall it, so routines' handoffs wait
+/// in its input queue.
+///
+/// The pause ends, for good, `steps` steps after it began. The sequencer
+/// also runs whenever nothing else can, since a [`TaskHold`] never ends a
+/// run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SequencerPause {
+    /// The most steps the pause lasts.
     pub steps: u64,
 }
 
@@ -201,6 +218,7 @@ impl Default for BlockScenario {
             policy: Policy::converging(),
             control: Vec::new(),
             handoff_pause: None,
+            sequencer_pause: None,
         }
     }
 }
@@ -295,12 +313,21 @@ impl BlockScenario {
         }
     }
 
-    /// The paused handoffs on 24 bodies, with the floor's other churn
-    /// (properties.md, P5.3): every mirror withholds height 7, so each
-    /// request for it times out; `mirror-3`'s link closes once the node has
-    /// asked storage to admit four bodies, which retires its routine; and
-    /// the chain resets to a fork from height 12 at 12 s of virtual time,
-    /// after the 8 s request timeout.
+    /// The paused handoffs on 24 bodies, pausing from height 6, with the
+    /// floor's other churn (properties.md, P5.3): every mirror withholds
+    /// height 7, so each request for it times out; `mirror-3`'s link closes
+    /// once the node has asked storage to admit four bodies, which retires
+    /// its routine; and the chain resets to a fork from height 12 at 12 s of
+    /// virtual time, after the 8 s request timeout.
+    ///
+    /// The pause starts at height 6, not 5. From height 5, some plans leave
+    /// free only a routine that never completed a request. That routine has
+    /// no RTprop sample, so it defers the floor to the paused routines,
+    /// which still publish free slots and measured RTprops. No routine then
+    /// asks for height 7 before the reset. Main shows the same deferral on
+    /// 7 of 24 plans. From height 6, the routine that delivered height 5
+    /// stays free and measured, and all 24 plans ask for height 7 before
+    /// the timeout.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(
@@ -333,6 +360,10 @@ impl BlockScenario {
                     when: Some(policy::Trigger::VirtualTime(12_000)),
                 },
             ],
+            handoff_pause: Some(HandoffPause {
+                from_height: 6,
+                steps: 20_000,
+            }),
             ..BlockScenario::paused_handoffs()
         };
         for mirror in &mut scenario.mirrors {
@@ -643,6 +674,15 @@ impl Subsystem for Storage {
                 over: Cell::new(false),
             }));
         }
+        if let Some(pause) = scenario.sequencer_pause {
+            sim.hold_tasks(Box::new(PausedSequencer {
+                handoffs: tap.handoffs(),
+                view: view.clone(),
+                steps: pause.steps,
+                first: Cell::new(None),
+                over: Cell::new(false),
+            }));
+        }
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -795,6 +835,39 @@ impl TaskHold for PausedHandoffs {
         }
         if self.first.get().is_none() {
             self.first.set(Some(step));
+        }
+        true
+    }
+}
+
+/// [`SequencerPause`]'s hold: the task that recorded the sequencer's
+/// ownership snapshots.
+struct PausedSequencer {
+    handoffs: TapHandoffs,
+    view: Rc<RefCell<BlockSyncView>>,
+    steps: u64,
+    /// The step after which the pause began.
+    first: Cell<Option<u64>>,
+    /// Set once the pause ends.
+    over: Cell<bool>,
+}
+
+impl TaskHold for PausedSequencer {
+    fn holds(&self, task: TaskId, _at: &At) -> bool {
+        if self.over.get() || self.handoffs.sequencer() != Some(task) {
+            return false;
+        }
+        let step = self.view.borrow().step.unwrap_or(0);
+        let first = match self.first.get() {
+            Some(first) => first,
+            None => {
+                self.first.set(Some(step));
+                step
+            }
+        };
+        if step >= first.saturating_add(self.steps) {
+            self.over.set(true);
+            return false;
         }
         true
     }

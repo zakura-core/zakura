@@ -17,11 +17,14 @@ mod downstream;
 mod draws;
 pub mod end;
 mod evidence;
+pub mod explore;
 pub mod fake;
 pub mod harness;
 pub mod identity;
 pub mod model;
+pub mod net;
 pub mod observe;
+pub mod peer;
 pub mod plan;
 pub mod property;
 pub mod record;
@@ -37,6 +40,9 @@ pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Vio
 pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};
-pub use plan::{By, Divergence, HexU64, Plan, PlanChoice, PlanError, PlanInput, TraceScript};
-pub use record::{MemorySink, Record, RecordSink};
+pub use plan::{
+    By, Candidate, Divergence, HexU64, Plan, PlanChoice, PlanError, PlanInput, SkipScript,
+    TraceScript,
+};
+pub use record::{MemorySink, NullSink, Record, RecordSink};
 pub use sim::{RunConfig, RunReport, Sim, TaskHold};

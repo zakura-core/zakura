@@ -1,9 +1,8 @@
 //! Session-local completion records without a channel or future for each request.
 
-use std::{
-    num::NonZeroU64,
-    sync::{Arc, Mutex, PoisonError, Weak},
-};
+use std::{num::NonZeroU64, sync::Arc};
+
+use zakura_rt::sync::{downgrade, Mutex, PoisonError, Weak};
 
 /// A caller key and a unique admission on this completion queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,13 +49,21 @@ impl Completions {
         let pending = state.pending;
         state.completed.reserve(pending);
         Completion {
-            state: Arc::downgrade(&self.0),
+            state: downgrade(&self.0),
             id: Some(CompletionId {
                 key,
                 sequence: NonZeroU64::new(state.sequence)
                     .expect("admission sequences start at one"),
             }),
         }
+    }
+
+    /// The completion records not yet consumed, oldest first. Reads the
+    /// queue without draining it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn recorded(&self) -> Vec<CompletionId> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.completed.to_vec()
     }
 
     /// Consume completed admissions under the publication lock.

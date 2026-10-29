@@ -1,19 +1,19 @@
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc, Mutex,
-    },
-};
+use std::{cmp::Ordering, sync::Arc};
 
 use zakura_header_chain::{
     EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
     MAX_STAGED_TARGETS_V1,
 };
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        watch, Mutex, PoisonError,
+    },
+};
 
 use super::super::{
-    AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
+    v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
 };
 
 /// Exact aggregate header count owned across receiving, preparation, and application.
@@ -35,6 +35,7 @@ struct HeaderChunkUsage {
 struct HeaderChunkBudgetInner {
     capacity: usize,
     usage: Mutex<HeaderChunkUsage>,
+    released: watch::Sender<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,17 +46,14 @@ impl Default for HeaderChunkBudget {
         Self(Arc::new(HeaderChunkBudgetInner {
             capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
             usage: Mutex::new(HeaderChunkUsage::default()),
+            released: watch::channel(0).0,
         }))
     }
 }
 
 impl HeaderChunkBudget {
     fn usage(&self) -> HeaderChunkUsage {
-        *self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.0.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn remaining(&self) -> usize {
@@ -74,11 +72,7 @@ impl HeaderChunkBudget {
         if count == 0 {
             return None;
         }
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         if count
             > self
                 .0
@@ -102,11 +96,7 @@ impl HeaderChunkBudget {
         if owned > reserved {
             return Err(());
         }
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         if usage.reserved < reserved {
             return Err(());
         }
@@ -124,25 +114,27 @@ impl HeaderChunkBudget {
     }
 
     fn release_reserved(&self, count: usize) {
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert!(usage.reserved >= count);
         usage.reserved = usage.reserved.saturating_sub(count);
         self.publish(*usage);
+        if count != 0 {
+            self.0
+                .released
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     fn release_owned(&self, count: usize) {
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
         debug_assert!(usage.owned >= count);
         usage.owned = usage.owned.saturating_sub(count);
         self.publish(*usage);
+        if count != 0 {
+            self.0
+                .released
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     fn publish(&self, usage: HeaderChunkUsage) {
@@ -169,21 +161,17 @@ impl HeaderCountReservation {
         self.0.remaining.load(AtomicOrdering::SeqCst)
     }
 
+    /// Move `owned` headers of this reservation into owned capacity. The rest
+    /// stays reserved for the pages that its credit still authorizes.
     fn consume(&self, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
-        let reserved = self.0.remaining.swap(0, AtomicOrdering::SeqCst);
-        if reserved == 0 || owned > reserved {
-            if reserved != 0 {
-                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
-            }
-            return Err(());
-        }
-        match self.0.budget.consume(reserved, owned) {
-            Ok(lease) => Ok(lease),
-            Err(()) => {
-                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
-                Err(())
-            }
-        }
+        let reserved = self.remaining();
+        let rest = reserved
+            .checked_sub(owned)
+            .filter(|_| reserved != 0)
+            .ok_or(())?;
+        let lease = self.0.budget.consume(owned, owned)?;
+        self.0.remaining.store(rest, AtomicOrdering::SeqCst);
+        Ok(lease)
     }
 }
 
@@ -264,8 +252,10 @@ impl AdvertisedHeaderTarget {
     /// Whether this status names a different target that can actually serve a request.
     pub fn is_discovery_eligible(&self, local: &EngineSnapshot) -> bool {
         self.status.selected_tip_hash != local.frontiers.header_best.hash
+            // Normal discovery cannot replace the finalized prefix. Historical
+            // auxiliary repair uses its own explicitly selected target path.
+            && self.status.selected_tip_height > local.frontiers.finalized.height
             && self.status.max_headers_per_response != 0
-            && self.status.max_inflight_requests != 0
             && self.status.max_message_bytes != 0
     }
 }
@@ -293,6 +283,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
+    /// The subscription cursor of the last staged page.
+    pub cursor: Option<Cursor>,
     /// Negotiated page bound before temporary credit limits.
     /// Each request reserves its count against current shared headroom.
     pub max_header_count: u32,
@@ -312,25 +304,6 @@ pub enum HeaderTargetPurpose {
         /// Durable repair-signal generation that owns this attempt.
         repair_generation: u64,
     },
-}
-
-impl HeaderTargetPurpose {
-    /// Return the target purpose's exact response-count requirement, when fixed.
-    ///
-    /// Selected auxiliary repairs can cover a negotiated range, so they have no fixed count.
-    pub const fn exact_header_count(&self) -> Option<usize> {
-        None
-    }
-
-    /// Return the selected target fixed by an auxiliary repair.
-    pub fn selected_repair_target(&self) -> Option<Frontier> {
-        match self {
-            Self::Normal => None,
-            Self::SelectedAuxiliaryRepair {
-                selected_target, ..
-            } => Some(*selected_target),
-        }
-    }
 }
 
 /// Reactor-owned phase that permits each target preparation and state submission once.
@@ -440,6 +413,7 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
+    scheduling_revision: u64,
     repair_episodes: HashMap<HeaderSyncWorkOwner, zakura_header_chain::AuxiliaryRequirementEpisode>,
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
@@ -447,9 +421,61 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
-    #[cfg(any(test, feature = "header-fuzz"))]
+    /// Changes to target ownership or awaiting/active state invalidate cached offers.
+    /// The reactor separately tracks effective virtual claims using negotiated limits.
+    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
+        self.scheduling_revision
+    }
+
+    pub(in crate::zakura::header_sync) fn capacity_releases(&self) -> watch::Receiver<u64> {
+        self.budget.0.released.subscribe()
+    }
+
     pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
+    }
+
+    /// Whether `peer` holds unstarted or active work.
+    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
+        self.work_by_peer.contains_key(peer)
+    }
+
+    /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
+    pub(in crate::zakura::header_sync) fn is_target_assigned(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> bool {
+        self.target_owners(target_tip_hash).next().is_some()
+    }
+
+    fn target_owners(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> impl Iterator<Item = &ZakuraPeerId> {
+        self.work_by_peer
+            .iter()
+            .filter(move |(_, work)| {
+                let owned_target = match work {
+                    PeerWorkState::AwaitingLocator { target, .. } => {
+                        target.status.selected_tip_hash
+                    }
+                    PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
+                };
+                owned_target == target_tip_hash
+            })
+            .map(|(peer, _)| peer)
+    }
+
+    /// Return every peer's target that still waits for its locator.
+    pub(in crate::zakura::header_sync) fn awaiting_targets(
+        &self,
+    ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
+        self.work_by_peer
+            .iter()
+            .filter_map(|(peer, work)| match work {
+                PeerWorkState::AwaitingLocator { target, .. } => Some((peer, target.as_ref())),
+                PeerWorkState::Active(_) => None,
+            })
     }
 
     /// Retire locator work captured from an obsolete committed snapshot.
@@ -535,6 +561,11 @@ impl PeerWorkQueue {
                 } => {
                     self.request_reservations.remove(&peer);
                     self.staged_capacity.remove(&peer);
+                    // Replacing metadata or priority does not release a target.
+                    // The reactor tracks changes to the negotiated locator claim.
+                    if current.status.selected_tip_hash != target.status.selected_tip_hash {
+                        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+                    }
                     **current = target;
                     *current_priority = priority;
                     QueueWorkResult::NeedsLocator
@@ -563,6 +594,7 @@ impl PeerWorkQueue {
             };
             self.remove_all(&replace);
         }
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         self.work_by_peer.insert(
             peer,
             PeerWorkState::AwaitingLocator {
@@ -577,20 +609,17 @@ impl PeerWorkQueue {
     ///
     /// All peers derive locators from shared local state.
     /// Two peers pursuing one target would download and authenticate overlapping prefixes.
-    /// The reactor retains the alternate peer's status until the owner retires.
+    /// The reactor keeps the alternate peer's status unspent and stages it once the owner
+    /// retires.
     pub(in crate::zakura::header_sync) fn stage_distinct_target(
         &mut self,
         peer: ZakuraPeerId,
         target: AdvertisedHeaderTarget,
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
-        let owned_by_other_peer = self.work_by_peer.iter().any(|(owner, work)| {
-            let owned_target = match work {
-                PeerWorkState::AwaitingLocator { target, .. } => target.status.selected_tip_hash,
-                PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
-            };
-            owner != &peer && owned_target == target.status.selected_tip_hash
-        });
+        let owned_by_other_peer = self
+            .target_owners(target.status.selected_tip_hash)
+            .any(|owner| owner != &peer);
         if owned_by_other_peer {
             self.remove_unstarted(&peer);
             return QueueWorkResult::TargetAlreadyAssigned;
@@ -638,6 +667,7 @@ impl PeerWorkQueue {
             request.target.scope,
         ) == Some(&request.target);
         if matches && self.request_reservations.contains_key(&peer) {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
             self.work_by_peer
                 .insert(peer, PeerWorkState::Active(Box::new(request)));
             true
@@ -693,7 +723,11 @@ impl PeerWorkQueue {
     ) -> Option<ActiveHeaderRequest> {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        match self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+        }
+        match removed {
             Some(PeerWorkState::Active(request)) => {
                 self.repair_episodes.remove(&request.owner);
                 Some(*request)
@@ -759,7 +793,11 @@ impl PeerWorkQueue {
     fn remove_all(&mut self, peer: &ZakuraPeerId) {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        if let Some(PeerWorkState::Active(request)) = self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+        }
+        if let Some(PeerWorkState::Active(request)) = removed {
             self.repair_episodes.remove(&request.owner);
         }
     }
@@ -830,18 +868,22 @@ impl PeerWorkQueue {
         self.request_reservations.remove(peer);
     }
 
-    /// Transfer one response's consumed count into owned staged capacity.
+    /// Transfer one page's header count from its round's reservation into
+    /// owned staged capacity.
     pub(in crate::zakura::header_sync) fn consume_response_capacity(
         &mut self,
         peer: &ZakuraPeerId,
         returned: usize,
     ) -> bool {
-        let Some(reservation) = self.request_reservations.remove(peer) else {
+        let Some(reservation) = self.request_reservations.get(peer) else {
             return false;
         };
         let Ok(lease) = reservation.consume(returned) else {
             return false;
         };
+        if reservation.remaining() == 0 {
+            self.request_reservations.remove(peer);
+        }
         if let Some(lease) = lease {
             self.staged_capacity
                 .entry(peer.clone())
@@ -997,7 +1039,7 @@ mod tests {
                 suffix_cumulative_work: U256::from(u32::from(marker)),
                 oldest_retained_height: block::Height(10),
                 max_headers_per_response: 1_000,
-                max_inflight_requests: 1,
+                max_subscriptions: 1,
                 max_message_bytes: 2_000_000,
                 tree_aux_schema_mask: 1,
             },
@@ -1033,13 +1075,14 @@ mod tests {
             common_ancestor: Some(local.frontiers.finalized),
             entries,
             phase: HeaderTargetPhase::Receiving,
+            cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         }
     }
 
     #[test]
-    fn unknown_status_targets_remain_eligible_regardless_of_advisory_shape() {
+    fn unknown_targets_above_finality_remain_eligible_regardless_of_work_claims() {
         let local = snapshot();
 
         let mut same_height_fork = advertisement(1);
@@ -1061,18 +1104,35 @@ mod tests {
         );
 
         let mut incomparable = advertisement(3);
+        incomparable.status.selected_tip_height = block::Height(90);
         incomparable.status.work_anchor_hash = hash(11);
         incomparable.status.suffix_cumulative_work = U256::MAX;
         assert!(incomparable.is_discovery_eligible(&local));
         assert_eq!(incomparable.claimed_work_order(&local), None);
 
         let mut known = advertisement(4);
+        known.status.selected_tip_height = local.frontiers.header_best.height;
         known.status.selected_tip_hash = local.frontiers.header_best.hash;
         assert!(!known.is_discovery_eligible(&local));
 
         let mut pure_requester = advertisement(5);
+        pure_requester.status.selected_tip_height = local.frontiers.header_best.height;
         pure_requester.status.max_headers_per_response = 0;
         assert!(!pure_requester.is_discovery_eligible(&local));
+    }
+
+    #[test]
+    fn discovery_skips_targets_at_or_below_finality_but_keeps_shorter_forks() {
+        let local = snapshot();
+        let mut target = advertisement(3);
+        target.status.suffix_cumulative_work = U256::MAX;
+        target.status.work_anchor_hash = hash(11);
+        for height in [0, 9, 10] {
+            target.status.selected_tip_height = block::Height(height);
+            assert!(!target.is_discovery_eligible(&local));
+        }
+        target.status.selected_tip_height = block::Height(11);
+        assert!(target.is_discovery_eligible(&local));
     }
 
     #[test]
@@ -1147,6 +1207,7 @@ mod tests {
             common_ancestor: None,
             entries: Vec::new(),
             phase: HeaderTargetPhase::Receiving,
+            cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         };
@@ -1401,15 +1462,24 @@ mod tests {
         let returned = MAX_HEADER_CHUNK_RESERVATION_V1 / 2;
         let lease = reservation
             .consume(returned)
-            .expect("a partial response fits its reservation")
-            .expect("a nonempty response returns an owned lease");
+            .expect("a partial page fits its reservation")
+            .expect("a nonempty page returns an owned lease");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: MAX_HEADER_CHUNK_RESERVATION_V1 - returned,
+                owned: returned,
+            },
+            "the rest stays reserved for the credit still outstanding"
+        );
+        drop(reservation);
         assert_eq!(
             budget.usage(),
             HeaderChunkUsage {
                 reserved: 0,
                 owned: returned,
             },
-            "unused response capacity is returned immediately"
+            "ending the round returns its unused capacity"
         );
         drop(lease);
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
@@ -1419,8 +1489,9 @@ mod tests {
             .expect("released capacity can be reserved again");
         assert!(empty
             .consume(0)
-            .expect("an empty response consumes its reservation")
+            .expect("an empty page fits its reservation")
             .is_none());
+        drop(empty);
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
     }
 
@@ -1518,19 +1589,5 @@ mod tests {
 
         assert!(queue.remove(&peer(1)).is_some());
         assert_eq!(queue.repair_episode(owner), None);
-    }
-
-    #[test]
-    fn selected_auxiliary_repair_keeps_its_selected_target() {
-        let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
-        let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
-            selected_target,
-            repair_generation: 7,
-        };
-
-        assert_eq!(purpose.exact_header_count(), None);
-        assert_eq!(purpose.selected_repair_target(), Some(selected_target));
-        assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
-        assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

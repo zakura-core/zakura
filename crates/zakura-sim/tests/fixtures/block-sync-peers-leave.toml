@@ -1,0 +1,9 @@
+# The committed fuzz input `block-sync-peers-leave.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# two bytes, `ff 05`, pick the peers-leave scenario: two mirrors serve
+# sixteen bodies but withhold every height from 9, and both links close
+# once the node has asked storage to admit eight bodies. The plan is
+# empty, so every pick is round-robin.
+harness = "block-sync/storage"
+generator = 2
+sha256 = "b9fe6c9d03eb685a1a234b4782234e455cce35f78467858e21a59ca9ab6cc3c0"

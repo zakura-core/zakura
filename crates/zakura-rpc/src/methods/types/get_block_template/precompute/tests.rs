@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use zcash_keys::address::Address;
+use crate::methods::types::get_block_template::MinerAddress;
 
 use zakura_chain::{
     block,
@@ -26,7 +26,7 @@ fn template_with_max_time(net: &Network, max_time: DateTime32) -> BlockTemplateR
         .expect("Nu5 is active on the test network");
 
     let miner_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
@@ -204,7 +204,7 @@ async fn in_flight_coinbase_is_retained_across_height_changes() {
     let _init_guard = zakura_test::init();
     let net = Network::Mainnet;
     let miner_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
@@ -262,7 +262,7 @@ async fn completed_coinbase_is_replaced_without_caching_the_wrong_height() {
     let _init_guard = zakura_test::init();
     let net = Network::Mainnet;
     let miner_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
@@ -331,7 +331,7 @@ fn shielded_miner_addresses_wait_longer_for_a_template() {
 
     let miner_params = |addr_type| {
         MinerParams::from(
-            Address::decode(&net, default_miner_address(net.kind(), &addr_type))
+            MinerAddress::decode(&net, default_miner_address(net.kind(), &addr_type))
                 .expect("hard-coded miner address is valid"),
         )
     };
@@ -362,29 +362,34 @@ fn shielded_miner_addresses_wait_longer_for_a_template() {
 /// Orchard receiver. A unified address without a Sapling receiver has no proof to wait for then.
 #[test]
 fn orchard_receivers_are_only_shielded_from_nu5() {
-    use zcash_keys::address::UnifiedAddress;
-
     let _init_guard = zakura_test::init();
 
     let net = Network::Mainnet;
-    let Address::Unified(unified) = Address::decode(
+    let MinerAddress::Unified {
+        orchard,
+        transparent,
+        ..
+    } = MinerAddress::decode(
         &net,
         default_miner_address(net.kind(), &MinerAddressType::Unified),
     )
-    .expect("hard-coded miner address is valid") else {
+    .expect("hard-coded miner address is valid")
+    else {
         panic!("the default unified miner address is unified");
     };
-    let orchard_and_transparent = UnifiedAddress::from_receivers(
-        unified.orchard().copied(),
-        None,
-        Some(
-            *unified
-                .transparent()
-                .expect("the default unified miner address has a transparent receiver"),
-        ),
-    )
-    .expect("an Orchard receiver makes a valid unified address");
-    let miner_params = MinerParams::from(Address::Unified(orchard_and_transparent));
+    assert!(
+        orchard.is_some(),
+        "the default unified address has an Orchard receiver"
+    );
+    assert!(
+        transparent.is_some(),
+        "the default unified address has a transparent receiver"
+    );
+    let miner_params = MinerParams::from(MinerAddress::Unified {
+        orchard,
+        sapling: None,
+        transparent,
+    });
 
     let nu5 = NetworkUpgrade::Nu5
         .activation_height(&net)
@@ -488,7 +493,7 @@ fn cached_testnet_work_follows_the_minimum_difficulty_switchover() {
 async fn next_coinbase_respects_shared_proof_capacity() {
     let net = Network::Mainnet;
     let miner = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
@@ -520,7 +525,7 @@ async fn next_coinbase_skips_zip234() {
         ..Default::default()
     });
     let miner = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )

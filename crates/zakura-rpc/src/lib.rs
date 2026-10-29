@@ -9,17 +9,22 @@
 
 pub mod client;
 pub mod config;
+#[cfg(feature = "indexer-rpc")]
 pub mod indexer;
 pub mod methods;
+pub mod node;
 pub mod queue;
 pub mod server;
+#[cfg(feature = "indexer-rpc")]
 pub mod sync;
 
 #[cfg(test)]
 mod tests;
 
 pub use methods::types::{
-    get_block_template::{fetch_chain_info, proposal::proposal_block_from_template, MinerParams},
+    get_block_template::{
+        fetch_chain_info, proposal::proposal_block_from_template, MinerAddress, MinerParams,
+    },
     submit_block::{
         MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistration, PendingBlockRegistry,
         PendingBlockSignal, SubmitBlockChannel,

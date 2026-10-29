@@ -22,7 +22,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use rand::seq::SliceRandom;
+use rand_10::seq::SliceRandom;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
@@ -39,6 +39,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
 };
+use zakura_node_services::task::{erased, spawn_buffer};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -147,6 +148,7 @@ async fn batch_misbehavior_reports(
 /// (zakura-network expects to be able to connect to at least one peer.)
 ///
 /// [1]: zakura_chain::chain_tip::NoChainTip
+#[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init<S, C>(
     config: Config,
     inbound_service: S,
@@ -154,7 +156,7 @@ pub async fn init<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
 )
@@ -178,6 +180,7 @@ where
 }
 
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
+#[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_with_zakura_header_sync<S, C>(
     config: Config,
     inbound_service: S,
@@ -187,7 +190,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
     Option<ZakuraEndpoint>,
@@ -224,7 +227,7 @@ pub async fn init_with_zakura<S, C>(
     custom_services: Vec<CustomService>,
 ) -> Result<
     (
-        Buffer<BoxService<Request, Response, BoxError>, Request>,
+        Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
@@ -261,6 +264,7 @@ where
         custom_services,
         peer_registry.clone(),
     )
+    .boxed()
     .await?;
     let zakura_startup_shutdown = zakura_endpoint
         .as_ref()
@@ -282,9 +286,9 @@ where
             .max(MIN_CHANNEL_SIZE),
     );
 
-    tokio::spawn(
+    tokio::spawn(erased(
         batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
-    );
+    ));
 
     // Create a broadcast channel for peer inventory advertisements.
     // If it reaches capacity, this channel drops older inventory advertisements.
@@ -383,16 +387,16 @@ where
     // Using Buffer::pair returns the background service, letting us inject our cancellation
     let (peer_set, worker) =
         Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
-    tokio::spawn(async move {
+    tokio::spawn(erased(async move {
         tokio::select! {
             _ = shutdown.cancelled() => {}
             _ = worker => {}
         }
-    });
+    }));
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
-    let peer_cache_updater_guard = tokio::spawn(peer_cache_updater_fut.in_current_span());
+    let peer_cache_updater_guard = tokio::spawn(erased(peer_cache_updater_fut.in_current_span()));
 
     // Abort startup tasks if this initialization future is dropped before handoff.
     let mut task_handles = vec![
@@ -413,9 +417,9 @@ where
             bans,
             block_gossip_peer_ips,
         );
-        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             listen_fut.in_current_span(),
-        )));
+        ))));
 
         // 2. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
@@ -425,7 +429,7 @@ where
             address_book_updater.clone(),
         );
         let initial_peers_join =
-            AbortOnDropHandle::new(tokio::spawn(initial_peers_fut.in_current_span()));
+            AbortOnDropHandle::new(tokio::spawn(erased(initial_peers_fut.in_current_span())));
 
         // 3. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
@@ -449,7 +453,10 @@ where
             ?active_initial_peer_count,
             "sending initial request for peers"
         );
-        let _ = candidates.update_initial(active_initial_peer_count).await;
+        let _ = candidates
+            .update_initial(active_initial_peer_count)
+            .boxed()
+            .await;
 
         // Compute remaining connections to open.
         let demand_count = config
@@ -472,11 +479,11 @@ where
             address_book_updater,
             Arc::new(AtomicBool::new(false)),
         );
-        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             crawl_fut.in_current_span(),
-        )));
+        ))));
     } else {
-        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(
             async move {
                 let _peerset_tx = peerset_tx;
                 let mut demand_rx = demand_rx;
@@ -488,7 +495,7 @@ where
                 future::pending::<Result<(), BoxError>>().await
             }
             .in_current_span(),
-        )));
+        ))));
     }
 
     // Capture the supervisor before the endpoint is moved into the keep-alive
@@ -499,10 +506,10 @@ where
 
     let returned_zakura_endpoint = zakura_endpoint.clone();
     if let Some(zakura_endpoint) = zakura_endpoint {
-        task_handles.push(AbortOnDropHandle::new(tokio::spawn(async move {
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(erased(async move {
             let _zakura_endpoint = zakura_endpoint;
             future::pending::<Result<(), BoxError>>().await
-        })));
+        }))));
     }
 
     handle_tx
@@ -527,7 +534,7 @@ where
                 trace,
                 config.zakura.stream_open_rate_per_second,
             );
-            Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
+            spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
         }
         None => peer_set,
     };
@@ -607,7 +614,7 @@ where
             let outbound_connector = outbound_connector.clone();
 
             // Spawn a new task to make the outbound connection.
-            tokio::spawn(
+            tokio::spawn(erased(
                 async move {
                     // Only spawn one outbound connector per
                     // `MIN_OUTBOUND_PEER_CONNECTION_INTERVAL`,
@@ -625,7 +632,7 @@ where
                         .await
                 }
                 .in_current_span(),
-            )
+            ))
             .wait_for_panics()
         })
         .collect();
@@ -757,7 +764,7 @@ async fn limit_initial_peers(
     for better_peers in preferred_peers.values() {
         let mut better_peers = better_peers.clone();
         let (chosen_peers, _unused_peers) = better_peers.partial_shuffle(
-            &mut rand::thread_rng(),
+            &mut rand_10::rng(),
             config.peerset_initial_target_size - initial_peers.len(),
         );
 
@@ -1054,7 +1061,7 @@ where
     // ... instead, spawn a new task to handle this connection
     let mut peerset_tx = peerset_tx.clone();
 
-    let handshake_task = tokio::spawn(
+    let handshake_task = tokio::spawn(erased(
         async move {
             let handshake_result = handshake.await;
 
@@ -1066,7 +1073,7 @@ where
             }
         }
         .in_current_span(),
-    );
+    ));
 
     Ok(handshake_task)
 }
@@ -1334,7 +1341,7 @@ where
                 // The peer crawler must be able to make progress even if some handshakes are
                 // rate-limited. So the async mutex and next peer timeout are awaited inside the
                 // spawned task.
-                let handshake_or_crawl_handle = tokio::spawn(
+                let handshake_or_crawl_handle = tokio::spawn(erased(
                     async move {
                         // Try to get the next available peer for a handshake.
                         //
@@ -1375,7 +1382,7 @@ where
                         }
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(handshake_or_crawl_handle);
@@ -1384,7 +1391,7 @@ where
                 let candidates = candidates.clone();
                 let demand_tx = demand_tx.clone();
 
-                let crawl_handle = tokio::spawn(
+                let crawl_handle = tokio::spawn(erased(
                     async move {
                         debug!(
                             ?tick,
@@ -1396,7 +1403,7 @@ where
                         Ok(TimerCrawlFinished)
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(crawl_handle);

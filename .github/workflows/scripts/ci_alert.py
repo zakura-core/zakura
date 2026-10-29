@@ -3,7 +3,8 @@
 
 `ci-alerts.yml` runs this when an attempt of a watched workflow fails on `main`.
 Every failed attempt is posted, with its failed jobs and, for a push, its
-commit. Passing runs post nothing, so nothing depends on GitHub's run history.
+commit. Continuous-sync incidents already handled by the audit are suppressed.
+Passing runs post nothing, so nothing depends on GitHub's run history.
 """
 
 import argparse
@@ -16,6 +17,9 @@ import urllib.request
 FAILED = {"failure", "startup_failure", "timed_out"}
 MAX_LISTED_JOBS = 8
 MAX_TITLE_CHARS = 100
+CONTINUOUS_SYNC_PATH = ".github/workflows/zakura-continuous-sync.yml"
+AUDIT_STEP = "Audit controllers"
+AUDIT_HANDLED_STEP = "Audit notification handled"
 
 
 def gh_api(path):
@@ -66,13 +70,41 @@ def message(run, jobs):
     return "\n".join(lines)
 
 
+def audit_failure_handled(job):
+    """Suppresses only a normal audit failure with confirmed notification handling.
+
+    A missing receipt, timeout, or any other unsuccessful step needs a fallback
+    alert. The receipt covers both delivered alerts and intentional duplicates.
+    """
+    steps = job.get("steps", [])
+    return (
+        job["conclusion"] == "failure"
+        and any(
+            step["name"] == AUDIT_HANDLED_STEP and step["conclusion"] == "success"
+            for step in steps
+        )
+        and [
+            (step["name"], step["conclusion"])
+            for step in steps
+            if step["conclusion"] not in {"success", "skipped"}
+        ] == [(AUDIT_STEP, "failure")]
+    )
+
+
 def alert_text(repository, run_id, attempt, api=gh_api):
-    """Returns the Slack text for attempt `attempt` of run `run_id`, or `None` unless it failed."""
+    """Returns Slack text for an unhandled failure of this attempt, or `None`."""
     base = f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}"
     run = api(base)
     if not is_failure(run["conclusion"]):
         return None
-    return message(run, failed_jobs(api(f"{base}/jobs?per_page=100")["jobs"]))
+    jobs = api(f"{base}/jobs?per_page=100")["jobs"]
+    if run.get("path") == CONTINUOUS_SYNC_PATH and run["conclusion"] == "failure":
+        failed = [job for job in jobs if is_failure(job["conclusion"])]
+        unhandled = [job for job in failed if not audit_failure_handled(job)]
+        if failed and not unhandled:
+            return None
+        jobs = unhandled
+    return message(run, failed_jobs(jobs))
 
 
 def post(webhook, text):
@@ -87,7 +119,7 @@ def post(webhook, text):
             raise SystemExit("Slack did not acknowledge the CI alert")
 
 
-def main():
+def main(argv=None):
     """Posts the alert for one failed attempt, or a test message."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repository", required=True, help="owner/name of the repository")
@@ -96,7 +128,7 @@ def main():
     mode.add_argument("--test", metavar="RUN_URL", help="post a test message linking RUN_URL")
     parser.add_argument("--attempt", type=int, help="attempt of --run-id to report")
     parser.add_argument("--dry-run", action="store_true", help="print the alert instead of posting it")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.test:
         text = f":large_blue_circle: CI alerts test message from <{args.test}|this run>"
@@ -105,7 +137,7 @@ def main():
             parser.error("--run-id needs --attempt")
         text = alert_text(args.repository, args.run_id, args.attempt)
         if text is None:
-            print("No alert: the attempt did not fail.")
+            print("No alert: no unhandled failure.")
             return
     if args.dry_run:
         print(text)

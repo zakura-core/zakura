@@ -39,8 +39,9 @@ use crate::{
         finalized_state::{
             header_chain::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-                select_vct_auxiliary_delivery, HeaderChainReader, HeaderChainRuntime,
-                HeaderChainStore, HeaderChainStoreError, SelectedAuxiliaryWindow,
+                ranked_vct_auxiliary_deliveries, select_vct_auxiliary_delivery, HeaderChainReader,
+                HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
+                SelectedAuxiliaryWindow,
             },
             DiskWriteBatch, FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
@@ -63,10 +64,8 @@ use crate::service::{
 mod vct_authentication_sweep;
 mod vct_write_retry;
 
-use vct_authentication_sweep::VctAuthenticationSweeper;
-use vct_write_retry::{
-    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
-};
+use vct_authentication_sweep::{recover_commit_boundary, VctAuthenticationSweeper};
+use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 /// Classifies durable failure evidence as a new repair episode or an idempotent observation.
@@ -104,10 +103,9 @@ fn missing_vct_successor_retry(
     current_height: Height,
 ) -> (Height, VctWriteRetryCause) {
     if let Some(successor_height) = successor_height {
-        // The successor header exists but carries no auxiliary record. The committer disputed
-        // nothing, so this poll continues the open repair episode instead of starting a new one.
-        // A new episode would retire the header-sync repair task and discard its supplier
-        // backoff on every poll.
+        // The successor header exists but carries no auxiliary record. This observation
+        // continues the open repair episode. A new episode would retire the header-sync
+        // repair task and discard its supplier backoff.
         return (
             successor_height,
             VctWriteRetryCause::MissingRoot {
@@ -224,7 +222,6 @@ impl FullStateEvidenceAuthority for PreparedHeaderCompletionAuthority {
     }
 }
 
-#[allow(dead_code)] // Called when the dark header engine is attached to the writer task.
 impl PreparedFullStateTransition {
     /// Construct a staged mutation only when its duplicated identity and verified path agree.
     pub fn new(
@@ -337,7 +334,6 @@ impl PreparedFullStateTransition {
 }
 
 /// Incoherent duplicated facts at the staging boundary.
-#[allow(dead_code)] // Returned when the dark header engine stages writer mutations.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum PreparedFullStateTransitionError {
     /// The header request did not carry the exact state-writer transition identity.
@@ -502,6 +498,83 @@ impl HeaderChainWriter {
             .runtime
             .selected_auxiliary_window_at_projection_index(projection_index, expected_frontier)?;
         Self::prepare_vct_auxiliary_window(expected_frontier.height, selected_window)
+    }
+
+    /// Reads the untried delivery pairs at a selected VCT boundary, grouped by current delivery.
+    ///
+    /// Selection pairs the best row of each header. Once both headers hold disputed rows, that
+    /// pairing can hide the pair that verifies, so the writer tries these pairs before it waits for
+    /// repair. Rows that share an observation already failed together, so the read skips them.
+    pub(crate) fn vct_boundary_alternatives_at_projection_index(
+        &self,
+        projection_index: usize,
+        expected_frontier: Frontier,
+    ) -> Result<Vec<VctAuxiliaryWindow>, HeaderChainStoreError> {
+        Self::vct_boundary_alternatives(
+            self.runtime.selected_auxiliary_window_at_projection_index(
+                projection_index,
+                expected_frontier,
+            )?,
+        )
+    }
+
+    /// Builds untried pairs from one coherent selected boundary read.
+    fn vct_boundary_alternatives(
+        selected_window: Option<SelectedAuxiliaryWindow>,
+    ) -> Result<Vec<VctAuxiliaryWindow>, HeaderChainStoreError> {
+        let Some(SelectedAuxiliaryWindow {
+            engine_snapshot,
+            delivery_header,
+            successor_header: Some(successor_header),
+        }) = selected_window
+        else {
+            return Ok(Vec::new());
+        };
+        let current_node = delivery_header.header_node;
+        let successor_node = successor_header.header_node;
+        let successors = ranked_vct_auxiliary_deliveries(successor_header.auxiliary_deliveries);
+        let mut windows = Vec::new();
+        for delivery in ranked_vct_auxiliary_deliveries(delivery_header.auxiliary_deliveries) {
+            if delivery.header_hash != current_node.hash
+                || delivery.tree_aux.map(|aux| aux.height) != Some(current_node.height)
+            {
+                return Err(zakura_header_chain::StoreError::Incoherent(
+                    "selected VCT delivery disagrees with its retained header",
+                )
+                .into());
+            }
+            for successor_delivery in &successors {
+                let failed_together =
+                    delivery
+                        .observation_ids()
+                        .into_iter()
+                        .flatten()
+                        .any(|observation| {
+                            successor_delivery
+                                .observation_ids()
+                                .contains(&Some(observation))
+                        });
+                if failed_together {
+                    continue;
+                }
+                let successor = VctSuccessorWitness::from_delivery(
+                    successor_node.header.clone(),
+                    successor_node.height,
+                    *successor_delivery,
+                )
+                .ok_or(zakura_header_chain::StoreError::Incoherent(
+                    "selected VCT successor delivery disagrees with its retained header",
+                ))?;
+                windows.push(VctAuxiliaryWindow {
+                    engine_snapshot: engine_snapshot.clone(),
+                    delivery_header: current_node.header.clone(),
+                    delivery,
+                    successor_height: Some(successor_node.height),
+                    successor: Some(successor),
+                });
+            }
+        }
+        Ok(windows)
     }
 
     fn prepare_vct_auxiliary_window(
@@ -2208,6 +2281,7 @@ fn handle_header_chain_control_message(
 ///
 /// The diagnostic deadline remains active while no commit arrives.
 fn wait_for_vct_root_insert(
+    retry_cause: VctWriteRetryCause,
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     header_chain: Option<&HeaderChainWriter>,
     deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
@@ -2223,9 +2297,7 @@ fn wait_for_vct_root_insert(
             {
                 Ok(message) => message,
                 Err(_) => {
-                    retry_manager.report_stall_if_due(VctWriteRetryCause::MissingRoot {
-                        trigger: VctRepairTrigger::MissingRootObserved,
-                    });
+                    retry_manager.report_stall_if_due(retry_cause);
                     continue;
                 }
             }
@@ -2245,7 +2317,7 @@ fn wait_for_vct_root_insert(
 
 /// Wait until one retry condition can change, or return the writer exit caused by the wait.
 fn wait_for_vct_retry(
-    wait: VctWriteRetryWait,
+    retry_cause: VctWriteRetryCause,
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     header_chain: Option<&HeaderChainWriter>,
     deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
@@ -2253,20 +2325,15 @@ fn wait_for_vct_retry(
     retry_manager: &mut VctWriteRetryManager,
     last_resource_stall_recovery: &mut Option<StateVersion>,
 ) -> Option<BlockWriteTaskExit> {
-    let result = match wait {
-        VctWriteRetryWait::HeaderChainInsert => wait_for_vct_root_insert(
-            receiver,
-            header_chain,
-            deferred_messages,
-            deadline_runtime,
-            retry_manager,
-            last_resource_stall_recovery,
-        ),
-        VctWriteRetryWait::Delay(wait) => {
-            std::thread::park_timeout(wait);
-            Ok(true)
-        }
-    };
+    let result = wait_for_vct_root_insert(
+        retry_cause,
+        receiver,
+        header_chain,
+        deferred_messages,
+        deadline_runtime,
+        retry_manager,
+        last_resource_stall_recovery,
+    );
     match result {
         Ok(true) => None,
         Ok(false) => Some(BlockWriteTaskExit::Completed),
@@ -2490,15 +2557,16 @@ impl WriteBlockWorkerTask {
                         None
                     }
                     Ok(VctAuxiliaryWindowRead::Missing { height }) => {
-                        let wait = vct_write_retry_manager.on_retryable_error(
+                        let retry_cause = VctWriteRetryCause::MissingRoot {
+                            trigger: VctRepairTrigger::MissingRootObserved,
+                        };
+                        vct_write_retry_manager.on_retryable_error(
                             height,
-                            VctWriteRetryCause::MissingRoot {
-                                trigger: VctRepairTrigger::MissingRootObserved,
-                            },
+                            retry_cause,
                             ordered_block,
                         );
                         if let Some(exit) = wait_for_vct_retry(
-                            wait,
+                            retry_cause,
                             non_finalized_block_write_receiver,
                             header_chain.as_ref(),
                             &mut deferred_non_finalized_messages,
@@ -2574,13 +2642,9 @@ impl WriteBlockWorkerTask {
                         auxiliary_window.successor_height,
                         ordered_block.0.height,
                     );
-                    let wait = vct_write_retry_manager.on_retryable_error(
-                        height,
-                        retry_cause,
-                        ordered_block,
-                    );
+                    vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                     if let Some(exit) = wait_for_vct_retry(
-                        wait,
+                        retry_cause,
                         non_finalized_block_write_receiver,
                         header_chain.as_ref(),
                         &mut deferred_non_finalized_messages,
@@ -2668,6 +2732,7 @@ impl WriteBlockWorkerTask {
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
+                    let mut failure_evidence_committed = false;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),
                         error.vct_failure(),
@@ -2698,6 +2763,8 @@ impl WriteBlockWorkerTask {
                                     apply_result @ (ApplyResult::Committed
                                     | ApplyResult::NoChange(_)),
                                 )) => {
+                                    failure_evidence_committed =
+                                        matches!(apply_result, ApplyResult::Committed);
                                     let trigger = vct_failure_repair_trigger(&apply_result)
                                         .expect("committed or idempotent evidence has a trigger");
                                     attributed_failure_repair = failure_attribution
@@ -2742,7 +2809,6 @@ impl WriteBlockWorkerTask {
                     // Header sync repairs the missing selected range.
                     // A completed header insertion wakes an absent-root stall.
                     // An await-successor stall waits only for state to store the next header.
-                    // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
                         let (repair_height, repair_trigger) = attributed_failure_repair
@@ -2756,13 +2822,33 @@ impl WriteBlockWorkerTask {
                         } else {
                             VctWriteRetryCause::MissingSuccessor
                         };
-                        let wait = vct_write_retry_manager.on_retryable_error(
+                        let frontier = Frontier::new(ordered_block.0.height, ordered_block.0.hash);
+                        vct_write_retry_manager.on_retryable_error(
                             repair_height,
                             retry_cause,
                             ordered_block,
                         );
+                        // New evidence can expose another selected delivery. Exhaust those
+                        // retries before searching retained pairs or waiting for peer input.
+                        if failure_evidence_committed {
+                            continue;
+                        }
+                        if let Some(writer) = header_chain.as_ref() {
+                            match recover_commit_boundary(finalized_state, writer, frontier) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                                        BlockWriteTaskFailure::runtime(
+                                            "VCT boundary recovery stopped the finalized writer",
+                                            error,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         if let Some(exit) = wait_for_vct_retry(
-                            wait,
+                            retry_cause,
                             non_finalized_block_write_receiver,
                             header_chain.as_ref(),
                             &mut deferred_non_finalized_messages,

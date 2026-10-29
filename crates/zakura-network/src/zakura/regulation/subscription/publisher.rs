@@ -1,10 +1,8 @@
 //! The publisher's side: subscriptions a peer opened on this session.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    hash::Hash,
-    sync::Arc,
-};
+use std::{collections::VecDeque, hash::Hash, sync::Arc};
+
+use zakura_rt::collections::HashMap;
 
 use super::{
     credit::{ResponseCredit, Totals},
@@ -81,10 +79,16 @@ struct Published<C> {
     slot: SlotPermit,
 }
 
+/// An ended subscription; see the module docs for the rules it enforces.
 #[derive(Debug)]
 struct Tombstone<K> {
     key: K,
+    /// The last update sequence applied.
     sequence: u32,
+    /// The ended subscription's credit. Crossed grants add to it.
+    credit: ResponseCredit,
+    /// Whether the subscriber sent `Close` before the end.
+    close_received: bool,
 }
 
 /// The subscriptions a peer opened on one session, keyed by `K`, with
@@ -102,6 +106,9 @@ pub(crate) struct Publications<K, C> {
     slots: SlotBudget,
     slot_count: usize,
     over_limit: u64,
+    /// Reports this table's transitions, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<crate::zakura::RegulationTap<K>>,
 }
 
 impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
@@ -116,6 +123,29 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
                 .expect("the validator requires max_live >= 1, and twice it fits a semaphore"),
             slot_count: slots,
             over_limit: 0,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
+        }
+    }
+
+    /// This table, reporting its transitions through `tap` if there is one.
+    /// Attach it before sharing the table, since locking a shared table is a
+    /// scheduling point in a simulated run.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<crate::zakura::RegulationTap<K>>) -> Self {
+        self.tap = tap;
+        self
+    }
+
+    /// Report `transition` if a tap is attached. `transition` is built only
+    /// then.
+    #[cfg(any(test, zakura_sim))]
+    fn regulated(
+        &self,
+        transition: impl FnOnce(&crate::zakura::RegulationTap<K>) -> crate::zakura::Transition,
+    ) {
+        if let Some(tap) = &self.tap {
+            tap.stream().regulated(transition(tap));
         }
     }
 
@@ -168,6 +198,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         while self.tombstones.len() > keep {
             self.tombstones.pop_front();
         }
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::OpenApplied {
+            subscription: tap.id(&key),
+            objects: credit.objects,
+            bytes: credit.bytes,
+            seq: tap.stream().serving(),
+        });
         self.live.insert(
             key,
             Published {
@@ -195,7 +232,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         let limit = self.limits.credit;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
-            return self.crossed(key, sequence, false);
+            return self.crossed(key, sequence, Some(added));
         };
         if published.closing {
             return Err(fault(SubscriptionFault::AfterClose));
@@ -212,6 +249,15 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
             .map_err(|_| fault(SubscriptionFault::AboveWindow))?;
         published.sequence = sequence;
         acknowledge(published, through);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::GrantApplied {
+                    subscription: tap.id(key),
+                    objects: added.objects,
+                    bytes: added.bytes,
+                });
+        }
         Ok(Applied::Live)
     }
 
@@ -227,7 +273,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         let message_type = self.limits.message_type;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
-            return self.crossed(key, sequence, true);
+            return self.crossed(key, sequence, None);
         };
         if published.closing {
             return Err(fault(SubscriptionFault::AfterClose));
@@ -237,30 +283,51 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         published.sequence = sequence;
         published.closing = true;
         acknowledge(published, through);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.tap {
+            tap.stream()
+                .regulated(crate::zakura::Transition::CloseApplied {
+                    subscription: tap.id(key),
+                });
+        }
         Ok(Applied::Live)
     }
 
-    /// Match an update for no live subscription against the tombstones. A
-    /// `Close` consumes its tombstone; a `Grant` keeps it.
+    /// Match an update for no live subscription against the tombstones; see
+    /// the module docs. `added` is a `Grant`'s credit, or `None` for `Close`.
     fn crossed(
         &mut self,
         key: &K,
         sequence: u32,
-        close: bool,
+        added: Option<Credit>,
     ) -> Result<Applied, SubscriptionFault> {
         let message_type = self.limits.message_type;
+        let limit = self.limits.credit;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let index = self
             .tombstones
             .iter()
             .position(|dead| dead.key == *key)
             .ok_or_else(|| fault(SubscriptionFault::Unknown))?;
-        next_sequence(self.tombstones[index].sequence, sequence).map_err(fault)?;
-        if close {
-            self.tombstones.remove(index);
-        } else {
-            self.tombstones[index].sequence = sequence;
+        let dead = &mut self.tombstones[index];
+        if dead.close_received {
+            return Err(fault(SubscriptionFault::AfterClose));
         }
+        next_sequence(dead.sequence, sequence).map_err(fault)?;
+        let Some(added) = added else {
+            self.tombstones.remove(index);
+            return Ok(Applied::Crossed);
+        };
+        if is_empty(added) {
+            return Err(fault(SubscriptionFault::EmptyCredit));
+        }
+        // The subscriber acknowledged at most every page sent before the end,
+        // so its window starts at or before the consumed credit.
+        let consumed = dead.credit.consumed();
+        dead.credit
+            .grant(added, consumed, limit)
+            .map_err(|_| fault(SubscriptionFault::CrossedAboveWindow))?;
+        dead.sequence = sequence;
         Ok(Applied::Crossed)
     }
 
@@ -313,11 +380,17 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         self.tombstones.push_back(Tombstone {
             key: key.clone(),
             sequence: published.sequence,
+            credit: published.credit,
+            close_received: published.closing,
         });
         let bound = self.limits.max_live().saturating_mul(2);
         while self.tombstones.len() > bound {
             self.tombstones.pop_front();
         }
+        #[cfg(any(test, zakura_sim))]
+        self.regulated(|tap| crate::zakura::Transition::PublicationEnded {
+            subscription: tap.id(key),
+        });
         Some(TerminalPermit {
             _slot: published.slot,
         })

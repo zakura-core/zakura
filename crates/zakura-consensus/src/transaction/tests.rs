@@ -10,14 +10,14 @@ use std::{
     sync::Arc,
 };
 
+use crate::primitives::batch_control::{Batch, BatchControl};
+use crate::primitives::fallback::Fallback;
 use chrono::{DateTime, TimeZone, Utc};
-use color_eyre::eyre::Report;
+use eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
-use tower_batch_control::{Batch, BatchControl};
-use tower_fallback::Fallback;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -27,7 +27,7 @@ use zakura_chain::{
         testnet::{ConfiguredActivationHeights, Parameters},
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
-    primitives::{ed25519, x25519, Groth16Proof},
+    primitives::{ed25519, Groth16Proof},
     sapling,
     serialization::{
         AtLeastOne, DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
@@ -638,7 +638,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
     };
 
     assert_eq!(
-        check::shielded_proof_size_is_canonical(&make_v5(shielded_data.clone())),
+        check::shielded_proof_size_is_canonical(&make_v5(Box::new(shielded_data.clone()))),
         Ok(())
     );
     assert_eq!(
@@ -657,7 +657,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
 
     for noncanonical in [short, padded] {
         assert_eq!(
-            check::shielded_proof_size_is_canonical(&make_v5(noncanonical.clone())),
+            check::shielded_proof_size_is_canonical(&make_v5(Box::new(noncanonical.clone()))),
             Err(TransactionError::OrchardProofSize)
         );
         assert_eq!(
@@ -687,7 +687,7 @@ fn matching_orchard_and_ironwood_nullifiers_are_not_conflicts() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data.clone()),
+        orchard_shielded_data: Some(Box::new(shielded_data.clone())),
         ironwood_shielded_data: Some(shielded_data),
     };
 
@@ -796,7 +796,7 @@ fn v6_pool_flow_transaction(
         inputs: vec![],
         outputs: transparent_outputs,
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(Box::new),
         ironwood_shielded_data,
     }
 }
@@ -883,7 +883,7 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
         inputs: vec![coinbase_input()],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS))),
         ironwood_shielded_data: None,
     };
     assert!(coinbase_with_orchard.is_coinbase());
@@ -2697,7 +2697,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 
@@ -2772,7 +2772,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 
@@ -4485,10 +4485,11 @@ fn v4_deprecation_boundary() {
     for network in [
         configured_network_with_nu7(Some(Height(2_000_000))),
         Network::new_default_testnet(),
+        Network::Mainnet,
     ] {
         let nu7 = NetworkUpgrade::Nu7
             .activation_height(&network)
-            .expect("NU7 is scheduled on configured and default Testnet");
+            .expect("NU7 is scheduled on configured and default networks");
         assert!(
             verify_v4_at(
                 &network,
@@ -4519,14 +4520,13 @@ fn v4_deprecation_boundary() {
         );
     }
 
-    for network in [Network::Mainnet, configured_network_with_nu7(None)] {
-        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
-        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
-        assert!(
-            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
-            "a network without an exact NU7 activation must keep accepting V4",
-        );
-    }
+    let network = configured_network_with_nu7(None);
+    assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+    assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+    assert!(
+        verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+        "a network without an exact NU7 activation must keep accepting V4",
+    );
 }
 
 /// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`
@@ -5330,8 +5330,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     let first_nullifier = sprout::note::Nullifier([0u8; 32].into());
     let second_nullifier = sprout::note::Nullifier([1u8; 32].into());
     let commitment = sprout::commitment::NoteCommitment::from([0u8; 32]);
-    let ephemeral_key =
-        x25519::PublicKey::from(&x25519::EphemeralSecret::random_from_rng(rand::thread_rng()));
+    let ephemeral_key = sprout::keys::EphemeralPublicKey::from([0u8; 32]);
     let random_seed = sprout::RandomSeed::from([0u8; 32]);
     let mac = sprout::note::Mac::zcash_deserialize(&[0u8; 32][..])
         .expect("Failure to deserialize dummy MAC");
@@ -5353,7 +5352,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     };
 
     // Create a usable signing key
-    let signing_key = ed25519::SigningKey::new(rand::thread_rng());
+    let signing_key = ed25519::SigningKey::new(rand_core::OsRng);
     let verification_key = ed25519::VerificationKey::from(&signing_key);
 
     // Populate join split data with the dummy join split.
@@ -6720,11 +6719,11 @@ fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::Shi
 /// The Halo2 proof cache, exercised end to end through the transaction verifier.
 ///
 /// This is one test rather than three because all three claims need the same transaction and a
-/// cold cache for it. The Halo2 verifiers are process-wide `Lazy` statics, so only one test can
+/// cold cache for it. The Halo2 verifiers are process-wide `LazyLock` statics, so only one test can
 /// ever see that transaction's cache entry cold.
 ///
 /// It runs on [`zakura_test::MULTI_THREADED_RUNTIME`] because it reaches a global verifier.
-/// `tower-batch-control` spawns that verifier's batch worker on whichever runtime first touches
+/// The batch middleware spawns that verifier's batch worker on whichever runtime first touches
 /// it, so a per-test runtime would leave the worker cancelled for every test that ran afterwards.
 ///
 /// The three claims, in order:

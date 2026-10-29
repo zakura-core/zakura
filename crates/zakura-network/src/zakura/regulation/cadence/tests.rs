@@ -312,3 +312,68 @@ fn a_blocked_writer_holds_at_most_one_frame_per_row() {
     // Nobody read the output: one frame for each cadence row.
     assert_eq!(status_frames(&mut output), 2);
 }
+
+#[test]
+fn a_row_reports_why_it_did_not_send() {
+    let clock = TestClock::new();
+    let mut sender = CadenceSender::<Probe, _>::with_clock(clock.clone());
+    let (send, mut output) = framed_channel(1);
+    let status = STATUS.message_type;
+    assert_eq!(sender.send_row(status, &send), Ok(RowSend::Idle));
+    sender.update(Probe::Status(1)).unwrap();
+    assert_eq!(sender.send_row(status, &send), Ok(RowSend::Queued));
+    sender.update(Probe::Status(2)).unwrap();
+    let due = clock.now() + EVERY_30_SECONDS.send_interval;
+    assert_eq!(
+        sender.send_row(status, &send),
+        Ok(RowSend::DeferredUntil(due)),
+        "pacing is not queue pressure"
+    );
+    clock.advance(EVERY_30_SECONDS.send_interval);
+    assert_eq!(sender.send_row(status, &send), Ok(RowSend::Unwritten));
+    output.try_recv().unwrap();
+    // Another row's frame fills the one-slot queue.
+    sender.update(Probe::Ping(1)).unwrap();
+    assert_eq!(
+        sender.send_row(PING.message_type, &send),
+        Ok(RowSend::Queued)
+    );
+    assert_eq!(sender.send_row(status, &send), Ok(RowSend::QueueFull));
+    output.try_recv().unwrap();
+    assert_eq!(sender.send_row(status, &send), Ok(RowSend::Queued));
+    assert_eq!(
+        sender.send_row(GET.message_type, &send),
+        Err(CadenceSendError::NoCadence {
+            message_type: GET.message_type
+        })
+    );
+}
+
+#[test]
+fn a_minimum_interval_only_slows_a_row() {
+    let clock = TestClock::new();
+    let slower = EVERY_30_SECONDS.send_interval * 2;
+    let mut sender = CadenceSender::<Probe, _>::with_clock(clock.clone())
+        .with_min_interval(STATUS.message_type, Duration::from_secs(1))
+        .unwrap()
+        .with_min_interval(PING.message_type, slower)
+        .unwrap();
+    let (send, mut output) = framed_channel(8);
+    sender.update(Probe::Status(1)).unwrap();
+    sender.update(Probe::Ping(1)).unwrap();
+    assert_eq!(sender.send_due(&send), Ok(2));
+    status_frames(&mut output);
+    let start = clock.now();
+    sender.update(Probe::Status(2)).unwrap();
+    sender.update(Probe::Ping(2)).unwrap();
+    assert_eq!(
+        sender.send_row(STATUS.message_type, &send),
+        Ok(RowSend::DeferredUntil(
+            start + EVERY_30_SECONDS.send_interval
+        ))
+    );
+    assert_eq!(
+        sender.send_row(PING.message_type, &send),
+        Ok(RowSend::DeferredUntil(start + slower))
+    );
+}

@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use chrono::DateTime;
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{amount::NegativeAllowed, ironwood};
@@ -58,7 +58,11 @@ fn prepared_test_verifier(
     let transaction =
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
 
-    SemanticBlockVerifier::new(network, state, transaction)
+    SemanticBlockVerifier::new(
+        network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -142,10 +146,14 @@ async fn missing_input_requires_committed_parent_evidence() {
             );
             Err::<tx::Response, BoxError>(TransactionError::TransparentInputNotFound.into())
         });
-        let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
-            .oneshot(Request::Commit(block.clone()))
-            .await
-            .expect_err("the input cannot be resolved");
+        let error = SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(block.clone()))
+        .await
+        .expect_err("the input cannot be resolved");
         assert_eq!(read_count.load(Ordering::SeqCst), reads.len(), "{reads:?}");
         match expected {
             Expected::Missing => {
@@ -282,7 +290,11 @@ async fn mined_orphan_replays_skip_transaction_verification() {
     let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
         panic!("orphan replay must not reach transaction verification")
     });
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
     let result = verifier
         .ready()
         .await
@@ -467,7 +479,11 @@ async fn failed_preparation_does_not_populate_the_cache() {
             _ => panic!("failed-preparation test received an unexpected request: {request:?}"),
         }
     });
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
 
     let prepare_result = verifier
         .ready()
@@ -537,7 +553,11 @@ fn counting_prepared_test_verifier(
         }
     });
 
-    let verifier = SemanticBlockVerifier::new(network, state, transaction);
+    let verifier = SemanticBlockVerifier::new(
+        network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
     (verifier, transaction_calls, proposal_calls)
 }
 
@@ -665,7 +685,11 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
     });
     let transaction =
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
     prepare_for_test(&mut verifier, candidate.clone()).await;
 
     let resolved = candidate.clone();
@@ -742,7 +766,11 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         };
         Ok::<_, BoxError>(response)
     });
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
 
     prepare_for_test(&mut verifier, candidate).await;
     let proposal_result = verifier
@@ -822,8 +850,11 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) })
     };
 
-    let mut full_verifier =
-        SemanticBlockVerifier::new(&network, state_service(full_commit.clone()), transaction());
+    let mut full_verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state_service(full_commit.clone())),
+        crate::transaction::boxed_transaction_verifier(transaction()),
+    );
     let full_hash = full_verifier
         .ready()
         .await
@@ -834,8 +865,8 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
 
     let mut prepared_verifier = SemanticBlockVerifier::new(
         &network,
-        state_service(prepared_commit.clone()),
-        transaction(),
+        crate::transaction::boxed_state(state_service(prepared_commit.clone())),
+        crate::transaction::boxed_transaction_verifier(transaction()),
     );
     prepare_for_test(&mut prepared_verifier, block.clone()).await;
     let prepared_hash = prepared_verifier
@@ -851,16 +882,18 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .expect("prepared verification commits the block");
 
     assert_eq!(prepared_hash, full_hash);
-    assert_eq!(
-        prepared_commit
+
+    // Each submission takes a fresh process-wide receipt order, so compare the rest.
+    let take_commit = |commit: &Mutex<Option<zs::SemanticallyVerifiedBlock>>| {
+        let mut block = commit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-        full_commit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-    );
+            .take()
+            .expect("the verifier committed the block");
+        assert!(block.receipt_order.take().is_some());
+        block
+    };
+    assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
 }
 
 #[test]
@@ -1387,8 +1420,11 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
             .expect("genesis block should commit");
         let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
         let transaction = Buffer::new(BoxService::new(transaction), 1);
-        let block_verifier =
-            SemanticBlockVerifier::new(&network, state_service.clone(), transaction);
+        let block_verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state_service.clone()),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
 
         let result = block_verifier
             .oneshot(Request::CheckProposal(Arc::new(block)))
@@ -1539,7 +1575,7 @@ fn failing_librustzcash_v5_transaction(
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     }
 }
 
@@ -1779,7 +1815,7 @@ fn legacy_sigops_count_for_large_generated_blocks() {
     let block = large_single_transaction_block_many_inputs();
     let mut legacy_sigop_count = 0;
     for tx in block.transactions {
-        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        let tx_sigop_count = tx.sigops();
         assert_eq!(tx_sigop_count, 0);
         legacy_sigop_count += tx_sigop_count;
     }
@@ -1789,7 +1825,7 @@ fn legacy_sigops_count_for_large_generated_blocks() {
     let block = large_multi_transaction_block();
     let mut sigops = 0;
     for tx in block.transactions {
-        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        let tx_sigop_count = tx.sigops();
         assert_eq!(tx_sigop_count, 1);
         sigops += tx_sigop_count;
     }
@@ -1810,7 +1846,7 @@ fn legacy_sigops_count_for_historic_blocks() {
             .zcash_deserialize_into()
             .expect("block test vector is valid");
         for tx in block.transactions {
-            sigops += tx.sigops().expect("unexpected invalid sigop count");
+            sigops += tx.sigops();
         }
 
         // Test that historic blocks pass the sigops check.
@@ -2029,7 +2065,11 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
             let transaction = service_fn(|request| async move {
                 Ok::<_, BoxError>(accept_block_transaction(request))
             });
-            let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+            let verifier = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            );
 
             verifier.oneshot(Request::Commit(Arc::new(block)))
         };
@@ -2174,8 +2214,12 @@ async fn derived_nsm_crossing_gates_block_verification() {
             });
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                SemanticBlockVerifier::new(&network, state, transaction)
-                    .oneshot(Request::Commit(Arc::new(block))),
+                SemanticBlockVerifier::new(
+                    &network,
+                    crate::transaction::boxed_state(state),
+                    crate::transaction::boxed_transaction_verifier(transaction),
+                )
+                .oneshot(Request::Commit(Arc::new(block))),
             )
             .await
             .expect("semantic verification completes");
@@ -2232,7 +2276,11 @@ async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting(
             service_fn(
                 |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
             );
-        let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        let verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             verifier.oneshot(Request::CheckProposal(Arc::new(block))),
@@ -2283,7 +2331,11 @@ async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
     });
     let transaction =
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
-    let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -2413,7 +2465,11 @@ async fn a_server_template_error_waits_for_the_checks_it_dispatched() {
             }
         })
     };
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
 
     let preparation = tokio::spawn(verifier.ready().await.expect("the verifier is ready").call(
         Request::Prepare {
@@ -2476,7 +2532,11 @@ async fn pending_commit_retry_waits_for_state_outcome() {
         let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
             panic!("duplicate and missing-height blocks cannot reach transaction verification")
         });
-        let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+        let verifier = SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
         let start = tokio::time::Instant::now();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2514,8 +2574,12 @@ async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
     let start = tokio::time::Instant::now();
     let error = tokio::time::timeout(
         super::PENDING_COMMIT_WAIT_LIMIT * 2,
-        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
-            .oneshot(Request::Commit(Arc::new(block))),
+        SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(Arc::new(block))),
     )
     .await
     .expect("the pending commit wait has a limit")
@@ -2898,8 +2962,252 @@ mod zip218_shielded_action_limits {
             outputs: Vec::new(),
             lock_time: LockTime::unlocked(),
             expiry_height: Height(100),
-            joinsplit_data,
+            joinsplit_data: joinsplit_data.map(Box::new),
             sapling_shielded_data: None,
         })
     }
+}
+
+#[tokio::test]
+async fn malformed_headers_do_not_stop_buffered_verification() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| async move {
+        assert!(matches!(request, zs::Request::KnownBlock(requested) if requested == hash));
+        Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::Finalized)))
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("malformed headers and committed duplicates stop before transaction verification")
+    });
+    let verifier = Buffer::new(
+        SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        ),
+        1,
+    );
+
+    for (version, time) in [
+        (3, block.header.time),
+        (1 << 31, block.header.time),
+        (4, DateTime::from_timestamp(-1, 0).unwrap()),
+        (
+            4,
+            DateTime::from_timestamp(i64::from(u32::MAX) + 1, 0).unwrap(),
+        ),
+    ] {
+        let mut malformed = block.as_ref().clone();
+        let header = Arc::make_mut(&mut malformed.header);
+        header.version = version;
+        header.time = time;
+        let malformed = Arc::new(malformed);
+        for request in [
+            Request::Commit(malformed.clone()),
+            Request::CommitMined {
+                block: malformed,
+                admission: zs::BlockAdmission::pending(),
+            },
+        ] {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                verifier.clone().oneshot(request),
+            )
+            .await
+            .expect("malformed headers must return without waiting on state")
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<VerifyBlockError>(),
+                Some(VerifyBlockError::Block {
+                    source: BlockError::InvalidHeaderEncoding(_),
+                })
+            ));
+        }
+    }
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        verifier.oneshot(Request::Commit(block)),
+    )
+    .await
+    .expect("the verifier worker must still accept subsequent requests")
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<VerifyBlockError>(),
+        Some(VerifyBlockError::Block {
+            source: BlockError::AlreadyInChain(duplicate, zs::KnownBlock::Finalized),
+        }) if *duplicate == hash
+    ));
+}
+
+#[tokio::test]
+async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    let _init_guard = zakura_test::init();
+    for cache_hit in [false, true] {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let state = service_fn({
+            let received = received.clone();
+            move |request: zs::Request| {
+                let received = received.clone();
+                async move {
+                    let response = match request {
+                        zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                            (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                        ),
+                        zs::Request::CheckBlockProposalValidity(block) => {
+                            assert!(block.receipt_order.is_none());
+                            zs::Response::ValidBlockProposal
+                        }
+                        zs::Request::CheckParentInputs { .. } => {
+                            zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                        }
+                        zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
+                            block, ..
+                        } => {
+                            received.lock().unwrap().push(
+                                block
+                                    .receipt_order
+                                    .expect("solved submissions have receipt order"),
+                            );
+                            zs::Response::Committed(block.hash)
+                        }
+                        _ => panic!("unexpected receipt-order test request: {request:?}"),
+                    };
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let transaction_calls = Arc::new(AtomicUsize::new(0));
+        let transaction = service_fn({
+            let calls = transaction_calls.clone();
+            move |request| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+            }
+        });
+        let mut verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
+        if cache_hit {
+            verifier
+                .call(Request::Prepare {
+                    block: candidate.clone(),
+                    source: PreparedCandidateSource::ClientProposal,
+                })
+                .await
+                .unwrap();
+        }
+        let request = || Request::CommitMined {
+            block: candidate.clone(),
+            admission: zs::BlockAdmission::pending(),
+        };
+        let early = verifier.call(request());
+        let late = verifier.call(request());
+        late.await.unwrap();
+        early.await.unwrap();
+        let receipts = received.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts[1], receipts[0],
+            "overlapping copies share their first receipt"
+        );
+        assert_eq!(
+            transaction_calls.load(Ordering::Relaxed),
+            if cache_hit { 1 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for cache_hit in [false, true] {
+            let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            state
+                .clone()
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                    genesis.clone().into(),
+                ))
+                .await
+                .unwrap();
+            let mut a = nu5_prepared_test_block(&network, None);
+            let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                &a.auth_data_root(),
+            );
+            let header = Arc::make_mut(&mut a.header);
+            header.previous_block_hash = genesis.hash();
+            header.time = genesis.header.time + chrono::Duration::seconds(150);
+            header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+            let a = Arc::new(a);
+            let mut b = a.as_ref().clone();
+            Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+            let b = Arc::new(b);
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let mut verifier = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state.clone()),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            );
+            if cache_hit {
+                for block in [a.clone(), b.clone()] {
+                    verifier
+                        .call(Request::Prepare {
+                            block,
+                            source: PreparedCandidateSource::ClientProposal,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            // A arrives first but its first verification is held. B and the
+            // duplicate A finish before it, using the real state's deduplication.
+            let early_a = verifier.call(Request::Commit(a.clone()));
+            let later_b = verifier.call(Request::CommitMined {
+                block: b.clone(),
+                admission: zs::BlockAdmission::pending(),
+            });
+            let duplicate_a = verifier.call(Request::CommitMined {
+                block: Arc::new(a.as_ref().clone()),
+                admission: zs::BlockAdmission::pending(),
+            });
+            later_b.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(b.hash()));
+            duplicate_a.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+            assert!(early_a.await.unwrap_err().is_duplicate_request());
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+
+            // Cancellation releases an unpolled request's registration.
+            let mut c = a.as_ref().clone();
+            Arc::make_mut(&mut c.header).nonce.0[1] ^= 1;
+            let c = Arc::new(c);
+            let cancelled = verifier.call(Request::Commit(c.clone()));
+            drop(cancelled);
+            verifier.call(Request::Commit(c)).await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+        }
+    })
+    .await
+    .expect("duplicate receipt regression must finish");
 }

@@ -80,7 +80,7 @@ separate serving/read reservation contract.
 | Purpose | unblock the contiguous prefix so the committer keeps moving | fill the look-ahead buffer so the bursty committer never starves |
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
-| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one request when `try_reserve` fails — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
+| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one body when `try_reserve` fails — reachable even at zero in-flight budget; liveness rule 3 bounds the total | non-blocking `try_reserve`; refused if the in-flight budget is spent |
 | Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
@@ -139,8 +139,8 @@ sequencer channel and appears in the next resident snapshot.
 window top, so a single multi-block request can never carry both exempt in-window blocks
 and gated above-window blocks — every above-window height must pass the resident check
 in the gated arm. A contiguous run straddling the boundary becomes two requests (the
-above-window half is planned on the next fill iteration with headroom sizing). At the
-production default of one block per response this split never occurs.
+above-window half is planned on the next fill iteration with headroom sizing). Requests
+carry one block, so this split never occurs in practice.
 
 ## The memory budget
 
@@ -154,8 +154,9 @@ window. Accounting therefore follows each pool's actual representation:
 | --- | --- | --- |
 | `reorder_buffered_bytes` | serialized | wire bytes |
 | unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
-| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
-| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | `wire × DESERIALIZED_MEM_FACTOR`, plus the applying wire charge while attached |
+| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus the decoded charge below |
+| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | the decoded charge below, plus the applying wire charge while attached |
+| `decoded_resident_bytes` | measured heap of every decoded body in the input queue, reorder buffer and apply window | decoded charge = `max((input + submissions) × DESERIALIZED_MEM_FACTOR, decoded_resident_bytes)` |
 | `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
 
 Two gates, checked together in `lookahead_over_budget`:
@@ -200,9 +201,16 @@ not by budget size. Zero config values are rejected.
 ### The bound
 
 Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
-process overhead and bounded transients. At the default 401-block submission window,
-the worst-case decoded contribution is approximately
-401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB:
+process overhead and bounded transients. At the default 401-block submission window and
+a chain that decodes at about four times its wire size, the decoded contribution is
+approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. Above the
+last checkpoint the window is also capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`
+(512 MiB) of decoded blocks: past the cap, bodies stay raw until earlier submissions finish,
+and the next body is always allowed when none of the window's bodies is submitted. The peer
+routine rejects a body whose transactions do not match its header's Merkle root, so the
+decoded window holds the real chain's blocks; a chain that decodes larger is charged its
+measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)
+derives the whole-node bound. The plateau can still exceed the budget by:
 
 - the floor's first-item progress margin (≤ one block per request — see liveness below);
 - a single in-window response can exceed the byte gate by up to its decoded resident
@@ -219,11 +227,15 @@ the worst-case decoded contribution is approximately
    takes its first item regardless of the byte cap — so the floor block is taken even
    when the in-flight budget is exactly full, reaching the floor reservation path…
 3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
-   `reserve_request_budget`'s Floor path charges the reservation past the max — a
-   bounded overshoot of at most one request (the WorkQueue single-owner invariant
-   permits one floor reservation globally), repaid through the normal release
-   discipline. The floor is therefore never starved by speculative work, with no
-   cross-task funding round trip.
+   `reserve_request_budget`'s Floor path charges the reservation past the max `M`,
+   repaid through the normal release discipline. The overshoot is bounded: only a
+   request starting at the floor or the next height is floor-priority, and the
+   WorkQueue gives each height one owner, so at most two overdrafts are live, each
+   at most one body `B`. A routine that hands a body to the sequencer still holds
+   its charge while the floor can advance, so each such open handoff `h` adds at
+   most one more `B`: the budget stays within `M + 2·B + h·B`
+   (`block-sync/reserved-byte-bound`). The floor is therefore never starved by
+   speculative work, with no cross-task funding round trip.
 4. **In-window floor liveness never depends on budget size** — the clamps only stop
    sub-range configs from thrashing the speculative lane.
 
@@ -247,30 +259,50 @@ The `sync.block.backlog.at_cap` gauge is latched to 1 whenever a pass stops on
 above-floor grant. `sync.block.request.floor_bypass` counts floor requests that
 borrowed a bypass slot.
 
+### Byte gauges
+
+Resource-bound tests read these gauges, so their names are a test contract.
+Each resource gauge is written where its owner changes the value, including
+release and drop paths, so a reader between any two steps sees the current
+value:
+
+| Gauge | Measures | Written |
+| --- | --- | --- |
+| `sync.block.reorder.buffered_bytes` | Wire bytes of bodies in the reorder buffer | When the reorder buffer inserts or drops a body |
+| `sync.block.applying.buffered_bytes` | Wire bytes of bodies in `applying`; a detached submission no longer counts | When the sequencer adds or removes an `applying` body |
+| `sync.block.sequencer_input.queued_bytes` | Wire bytes of bodies in the sequencer input queue | When a body enters the queue, leaves it, or drops |
+| `sync.block.submission.in_flight_bytes` | Wire bytes of decoded submissions the driver can still retain, including detached ones | When the sequencer submits or settles a body |
+| `sync.block.work.reserved_bytes` | Request-estimate bytes that the work queue's ledger reserves | Under the work-queue lock, when the ledger changes |
+| `sync.block.budget.reserved_bytes` | Bytes charged to the shared in-flight request budget | When the budget charges or releases bytes |
+| `sync.block.work.reserved_above_floor_bytes` | Request-estimate bytes that in-flight work above the download floor reserves | At each admission snapshot |
+
+The above-floor gauge records an admission input, not a resource, so it keeps
+the value the latest admission read. It counts every reservation above the
+current download floor, including commit-window work, so it is a diagnostic.
+`lookahead-overshoot-bound` instead sums the estimates of outstanding
+above-window requests from the request records. The budget charges a request before the
+work queue does and releases it after, so the budget gauge can exceed the work
+gauge while a request is in transition. The two gauges are written separately,
+so only a reader that sees no request in transition can compare them.
+
 ## Key config knobs (defaults)
 
 | Knob | Default | Notes |
 | --- | --- | --- |
 | `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
 | `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
-| `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
+| `max_blocks_per_response` | 1 (fixed) | deprecated and ignored; requests always carry one block, and serving answers a larger request with a one-block prefix |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |
 | `max_submitted_block_applies` | 401 | sequencer submit window (floored at one checkpoint range; no ceiling — which is why the exemption span is a constant) |
 
 ## Known limitations and follow-ups
 
-- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
-  measured ~3.3–4× wire→decoded ratio, not a per-block heap measure. Replacing it with
-  a precise per-block resident estimate is tracked as
-  [ZCA-750](https://linear.app/zcale/issue/ZCA-750).
-- **Decoded accounting remains approximate.** Serialized pools are charged exactly
-  at wire size, but the bounded input and submission windows still use the calibrated
-  factor rather than a precise heap measurement.
-  `estimated_resident_pipeline_bytes` is the single calibration point.
-- **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
-  commit window costs one extra request per crossing (the price of the never-span
-  rule). Irrelevant at the default of 1.
+- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is an average, not a bound:
+  even with Sprout, Sapling, and Orchard bundles boxed, a block of small transparent V5
+  transactions decodes at about 4.7× its wire size. Admission charges the larger of the factor's estimate and
+  the measured decoded heap. The factor remains a floor so the gate never loosens on
+  typical blocks. `estimated_resident_pipeline_bytes` is the single calibration point.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its
   count is not); the channel is bounded by the submit window (401 by default), which is
   noise against the 262,144 default cap.

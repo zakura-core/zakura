@@ -9,11 +9,7 @@ const RPC_CRATE: &str = "crates/zakura-rpc";
 const METHODS_SOURCE: &str = "crates/zakura-rpc/src/methods.rs";
 const OPENRPC_ARTIFACT: &str = "crates/zakura-rpc/src/methods/rpc_openrpc.rs";
 
-const GENERATED_FILES: [(&str, &str); 3] = [
-    (
-        "indexer_descriptor.bin",
-        "crates/zakura-rpc/proto/__generated__/indexer_descriptor.bin",
-    ),
+const GENERATED_FILES: [(&str, &str); 2] = [
     (
         "zebra.indexer.rpc.rs",
         "crates/zakura-rpc/proto/__generated__/zebra.indexer.rpc.rs",
@@ -72,7 +68,6 @@ fn generate(repo_root: &Path, output_dir: &Path) -> Result<(), BoxError> {
         .emit_rerun_if_changed(false)
         .out_dir(output_dir)
         .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
-        .file_descriptor_set_path(output_dir.join("indexer_descriptor.bin"))
         .compile_protos(&[proto_file], &[rpc_crate])?;
 
     openrpc::generate(&repo_root.join(METHODS_SOURCE), output_dir)?;

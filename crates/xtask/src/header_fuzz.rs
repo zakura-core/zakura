@@ -17,7 +17,7 @@ use crate::{run_command, BoxError};
 const PINNED_NIGHTLY: &str = "nightly-2026-07-15";
 const TARGETS: [&str; 4] = [
     "fork_transitions",
-    "header_codec",
+    "header_codec_v9",
     "header_pursuit",
     "recovery_rows",
 ];
@@ -134,7 +134,7 @@ fn render_regression(target: &str, bytes: &[u8]) -> Result<String, BoxError> {
         "fork_transitions" => "zakura_header_chain::replay_fork_transition_bytes",
         "header_pursuit" => "zakura_network::zakura::replay_header_pursuit_bytes",
         "recovery_rows" => "zakura_state::replay_recovery_rows_bytes",
-        "header_codec" => return Ok(render_codec_regression(bytes)),
+        "header_codec_v9" => "zakura_network::zakura::replay_header_sync_v9_codec_bytes",
         _ => return Err(format!("unknown header fuzz target {target}").into()),
     };
     let operations = render_operations(target, bytes);
@@ -150,31 +150,6 @@ fn render_regression(target: &str, bytes: &[u8]) -> Result<String, BoxError> {
         sha256(bytes),
         render_bytes(bytes),
     ))
-}
-
-fn render_codec_regression(bytes: &[u8]) -> String {
-    format!(
-        "// Target: header_codec\n\
-         // SHA-256: {}\n\
-         const REGRESSION: &[u8] = &{};\n\
-         let codec = HeaderSyncCodec::new(\n\
-             Network::Mainnet,\n\
-             u32::try_from(MAX_HS_MESSAGE_BYTES).expect(\"protocol byte bound fits in u32\"),\n\
-             MAX_HS_RANGE,\n\
-             1,\n\
-         );\n\
-         let context = HeaderSyncDecodeContext {{\n\
-             max_header_count: MAX_HS_RANGE,\n\
-             requested_tree_aux_schema: AuxSchema::V1,\n\
-         }};\n\
-         if let Ok(message) = codec.decode(REGRESSION, Some(context)) {{\n\
-             let canonical = codec.encode(&message).expect(\"decoded messages encode\");\n\
-             let decoded = codec.decode(&canonical, Some(context)).expect(\"canonical messages decode\");\n\
-             assert_eq!(decoded, message);\n\
-         }}\n",
-        sha256(bytes),
-        render_bytes(bytes),
-    )
 }
 
 fn render_operations(target: &str, bytes: &[u8]) -> String {
@@ -226,8 +201,8 @@ mod tests {
         assert!(pursuit.contains("// 000: [0x00, 0x01, 0xfe, 0xff]"));
         assert!(pursuit.contains(&sha256(&bytes)));
 
-        let codec = render_regression("header_codec", &bytes).expect("the codec target renders");
-        assert!(codec.contains("HeaderSyncCodec::new"));
+        let codec = render_regression("header_codec_v9", &bytes).expect("the codec target renders");
+        assert!(codec.contains("replay_header_sync_v9_codec_bytes"));
         assert!(codec.contains("const REGRESSION: &[u8] = &[0x00, 0x01, 0xfe, 0xff];"));
     }
 }

@@ -14,6 +14,8 @@
 //! requests to Rust's system allocator and records them while [`measure`] runs.
 //! Only requests on the calling thread count. Other threads and the helper's
 //! own records are excluded. This does not measure the whole program's memory.
+//! For async lifecycles, use [`ProcessMeasurement`] inside [`in_isolated_process`]
+//! to follow allocations and frees across all worker threads.
 
 // Rust requires `unsafe` to implement its raw memory allocation interface.
 // This wrapper lets System allocate and free memory. It records addresses and
@@ -22,6 +24,10 @@
     unsafe_code,
     reason = "Rust's allocator interface requires unsafe raw memory operations"
 )]
+
+mod process;
+
+pub use process::{in_isolated_process, ProcessMeasurement};
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -54,7 +60,7 @@ thread_local! {
     static ACTIVE: RefCell<Option<Observation>> = const { RefCell::new(None) };
 }
 
-fn observe(operation: impl FnOnce(&mut Observation)) {
+fn observe(mut operation: impl FnMut(&mut Observation)) {
     let _ = ACTIVE.try_with(|active| {
         // Updating our records can itself allocate or free memory. Skip those
         // requests so the helper does not count its own memory use.
@@ -64,31 +70,39 @@ fn observe(operation: impl FnOnce(&mut Observation)) {
             }
         }
     });
+    process::observe(operation);
 }
 
 fn allocated(pointer: *mut u8, size: usize) {
     if pointer.is_null() {
         return;
     }
-    observe(|observation| {
-        // usize can represent this platform's pointer address. It is never dereferenced.
-        observation.allocations.insert(pointer as usize, size);
-        let stats = &mut observation.stats;
-        stats.requests += 1;
-        stats.requested_bytes += size;
-        stats.largest_request = stats.largest_request.max(size);
-        stats.retained_bytes += size;
-        stats.peak_live_bytes = stats.peak_live_bytes.max(stats.retained_bytes);
-    });
+    observe(|observation| observation.allocated(pointer, size));
 }
 
 fn freed(pointer: *mut u8) {
-    observe(|observation| {
-        // usize preserves the pointer address solely as an allocation identity.
-        if let Some(size) = observation.allocations.remove(&(pointer as usize)) {
-            observation.stats.retained_bytes -= size;
+    observe(|observation| observation.freed(pointer));
+}
+
+impl Observation {
+    /// Record only payload bytes, excluding the observer's own map storage.
+    fn allocated(&mut self, pointer: *mut u8, size: usize) {
+        // usize preserves the address solely as an allocation identity.
+        self.allocations.insert(pointer as usize, size);
+        self.stats.requests += 1;
+        self.stats.requested_bytes += size;
+        self.stats.largest_request = self.stats.largest_request.max(size);
+        self.stats.retained_bytes += size;
+        self.stats.peak_live_bytes = self.stats.peak_live_bytes.max(self.stats.retained_bytes);
+    }
+
+    /// Ignore storage allocated before this observation began.
+    fn freed(&mut self, pointer: *mut u8) {
+        // usize preserves the address solely as an allocation identity.
+        if let Some(size) = self.allocations.remove(&(pointer as usize)) {
+            self.stats.retained_bytes -= size;
         }
-    });
+    }
 }
 
 /// Handle the test program's memory requests and record them during [`measure`].
@@ -121,6 +135,10 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: The caller supplies the same realloc contract as System.
+        if let Some(replacement) = unsafe { process::reallocate(pointer, layout, size) } {
+            return replacement;
+        }
         // SAFETY: The pointer/layout and new size satisfy GlobalAlloc's contract.
         let replacement = unsafe { System.realloc(pointer, layout, size) };
         if !replacement.is_null() {
@@ -141,6 +159,10 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 /// [`TrackingAllocator`]. If the measured function panics, recording stops
 /// before it propagates.
 pub fn measure<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
+    assert!(
+        !process::is_active(),
+        "thread and process measurements cannot overlap"
+    );
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

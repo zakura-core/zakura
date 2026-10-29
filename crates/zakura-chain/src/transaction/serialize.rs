@@ -85,10 +85,10 @@ impl ZcashDeserialize for pallas::Base {
 }
 
 impl<P: ZkSnarkProof> ZcashSerialize for JoinSplitData<P> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // Denoted as `nJoinSplit` and `vJoinSplit` in the spec.
         let joinsplits: Vec<_> = self.joinsplits().cloned().collect();
-        joinsplits.zcash_serialize(&mut writer)?;
+        joinsplits.zcash_serialize(writer)?;
 
         // Denoted as `joinSplitPubKey` in the spec.
         writer.write_all(&<[u8; 32]>::from(self.pub_key)[..])?;
@@ -132,24 +132,31 @@ where
 // (Unlike V4, where it must be serialized as part of the transaction.)
 
 impl ZcashSerialize for Option<sapling::ShieldedData<sapling::SharedAnchor>> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        match self {
-            None => {
-                // Denoted as `nSpendsSapling` in the spec.
-                zcash_serialize_empty_list(&mut writer)?;
-                // Denoted as `nOutputsSapling` in the spec.
-                zcash_serialize_empty_list(&mut writer)?;
-            }
-            Some(sapling_shielded_data) => {
-                sapling_shielded_data.zcash_serialize(&mut writer)?;
-            }
-        }
-        Ok(())
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        serialize_optional_sapling_shielded_data(self.as_ref(), writer)
     }
 }
 
+fn serialize_optional_sapling_shielded_data<W: io::Write + ?Sized>(
+    sapling_shielded_data: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
+    writer: &mut W,
+) -> Result<(), io::Error> {
+    match sapling_shielded_data {
+        None => {
+            // Denoted as `nSpendsSapling` in the spec.
+            zcash_serialize_empty_list(writer)?;
+            // Denoted as `nOutputsSapling` in the spec.
+            zcash_serialize_empty_list(writer)?;
+        }
+        Some(sapling_shielded_data) => {
+            sapling_shielded_data.zcash_serialize(writer)?;
+        }
+    }
+    Ok(())
+}
+
 impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // Collect arrays for Spends
         // There's no unzip3, so we have to unzip twice.
         let (spend_prefixes, spend_proofs_sigs): (Vec<_>, Vec<_>) = self
@@ -168,12 +175,12 @@ impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
             .unzip();
 
         // Denoted as `nSpendsSapling` and `vSpendsSapling` in the spec.
-        spend_prefixes.zcash_serialize(&mut writer)?;
+        spend_prefixes.zcash_serialize(writer)?;
         // Denoted as `nOutputsSapling` and `vOutputsSapling` in the spec.
-        output_prefixes.zcash_serialize(&mut writer)?;
+        output_prefixes.zcash_serialize(writer)?;
 
         // Denoted as `valueBalanceSapling` in the spec.
-        self.value_balance.zcash_serialize(&mut writer)?;
+        self.value_balance.zcash_serialize(writer)?;
 
         // Denoted as `anchorSapling` in the spec.
         // `TransferData` ensures this field is only present when there is at
@@ -183,12 +190,12 @@ impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
         }
 
         // Denoted as `vSpendProofsSapling` in the spec.
-        zcash_serialize_external_count(&spend_proofs, &mut writer)?;
+        zcash_serialize_external_count(&spend_proofs, writer)?;
         // Denoted as `vSpendAuthSigsSapling` in the spec.
-        zcash_serialize_external_count(&spend_sigs, &mut writer)?;
+        zcash_serialize_external_count(&spend_sigs, writer)?;
 
         // Denoted as `vOutputProofsSapling` in the spec.
-        zcash_serialize_external_count(&output_proofs, &mut writer)?;
+        zcash_serialize_external_count(&output_proofs, writer)?;
 
         // Denoted as `bindingSigSapling` in the spec.
         writer.write_all(&<[u8; 64]>::from(self.binding_sig)[..])?;
@@ -382,18 +389,18 @@ fn deserialize_v5_sapling_shielded_data<R: io::Read>(
 impl ZcashSerialize for Option<orchard::ShieldedData> {
     /// Serializes Orchard shielded data using the pre-Ironwood Orchard flag
     /// rules, where the cross-address bit is reserved.
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         serialize_optional_orchard_shielded_data_with_flags(
-            self,
-            &mut writer,
+            self.as_ref(),
+            writer,
             !ALLOW_CROSS_ADDRESS_BIT,
         )
     }
 }
 
-fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
-    orchard_shielded_data: &Option<orchard::ShieldedData>,
-    mut writer: W,
+fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write + ?Sized>(
+    orchard_shielded_data: Option<&orchard::ShieldedData>,
+    writer: &mut W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     match orchard_shielded_data {
@@ -409,7 +416,7 @@ fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
         Some(orchard_shielded_data) => {
             serialize_orchard_shielded_data_with_flags(
                 orchard_shielded_data,
-                &mut writer,
+                writer,
                 allow_cross_address_bit,
             )?;
         }
@@ -417,9 +424,9 @@ fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
     Ok(())
 }
 
-fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
+fn serialize_orchard_shielded_data_with_flags<W: io::Write + ?Sized>(
     orchard_shielded_data: &orchard::ShieldedData,
-    mut writer: W,
+    writer: &mut W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     // Split the AuthorizedAction
@@ -431,35 +438,29 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
         .unzip();
 
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
-    actions.zcash_serialize(&mut writer)?;
+    actions.zcash_serialize(writer)?;
 
     // Denoted as `flagsOrchard` in the spec.
-    serialize_orchard_flags(
-        orchard_shielded_data.flags,
-        &mut writer,
-        allow_cross_address_bit,
-    )?;
+    serialize_orchard_flags(orchard_shielded_data.flags, writer, allow_cross_address_bit)?;
 
     // Denoted as `valueBalanceOrchard` in the spec.
     orchard_shielded_data
         .value_balance
-        .zcash_serialize(&mut writer)?;
+        .zcash_serialize(writer)?;
 
     // Denoted as `anchorOrchard` in the spec.
     orchard_shielded_data
         .shared_anchor
-        .zcash_serialize(&mut writer)?;
+        .zcash_serialize(writer)?;
 
     // Denoted as `sizeProofsOrchard` and `proofsOrchard` in the spec.
-    orchard_shielded_data.proof.zcash_serialize(&mut writer)?;
+    orchard_shielded_data.proof.zcash_serialize(writer)?;
 
     // Denoted as `vSpendAuthSigsOrchard` in the spec.
-    zcash_serialize_external_count(&sigs, &mut writer)?;
+    zcash_serialize_external_count(&sigs, writer)?;
 
     // Denoted as `bindingSigOrchard` in the spec.
-    orchard_shielded_data
-        .binding_sig
-        .zcash_serialize(&mut writer)?;
+    orchard_shielded_data.binding_sig.zcash_serialize(writer)?;
 
     Ok(())
 }
@@ -467,14 +468,14 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
 impl ZcashSerialize for orchard::ShieldedData {
     /// Serializes Orchard shielded data using the pre-Ironwood Orchard flag
     /// rules, where the cross-address bit is reserved.
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         serialize_orchard_shielded_data_with_flags(self, writer, !ALLOW_CROSS_ADDRESS_BIT)
     }
 }
 
-fn serialize_orchard_flags<W: io::Write>(
+fn serialize_orchard_flags<W: io::Write + ?Sized>(
     flags: orchard::Flags,
-    mut writer: W,
+    writer: &mut W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     let valid_bits = orchard_allowed_flag_bits(allow_cross_address_bit);
@@ -590,7 +591,7 @@ impl ZcashDeserialize for Option<orchard::ShieldedData> {
 }
 
 impl<T: reddsa::SigType> ZcashSerialize for reddsa::Signature<T> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&<[u8; 64]>::from(*self)[..])?;
         Ok(())
     }
@@ -605,8 +606,10 @@ impl<T: reddsa::SigType> ZcashDeserialize for reddsa::Signature<T> {
 }
 
 impl ZcashSerialize for Transaction {
+    crate::serialization::compile_serialize_entry_points_here!();
+
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // Post-Sapling, transaction size is limited to MAX_BLOCK_BYTES.
         // (Strictly, the maximum transaction size is about 1.5 kB less,
         // because blocks also include a block header.)
@@ -633,13 +636,13 @@ impl ZcashSerialize for Transaction {
                 lock_time,
             } => {
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
             }
             Transaction::V2 {
                 inputs,
@@ -648,20 +651,20 @@ impl ZcashSerialize for Transaction {
                 joinsplit_data,
             } => {
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
 
                 // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                 // `joinSplitPubKey` and `joinSplitSig`.
                 match joinsplit_data {
                     // Write 0 for nJoinSplits to signal no JoinSplitData.
                     None => zcash_serialize_empty_list(writer)?,
-                    Some(jsd) => jsd.zcash_serialize(&mut writer)?,
+                    Some(jsd) => jsd.zcash_serialize(writer)?,
                 }
             }
             Transaction::V3 {
@@ -675,13 +678,13 @@ impl ZcashSerialize for Transaction {
                 writer.write_u32::<LittleEndian>(OVERWINTER_VERSION_GROUP_ID)?;
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
 
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
 
@@ -690,7 +693,7 @@ impl ZcashSerialize for Transaction {
                 match joinsplit_data {
                     // Write 0 for nJoinSplits to signal no JoinSplitData.
                     None => zcash_serialize_empty_list(writer)?,
-                    Some(jsd) => jsd.zcash_serialize(&mut writer)?,
+                    Some(jsd) => jsd.zcash_serialize(writer)?,
                 }
             }
             Transaction::V4 {
@@ -708,13 +711,13 @@ impl ZcashSerialize for Transaction {
                 writer.write_u32::<LittleEndian>(SAPLING_VERSION_GROUP_ID)?;
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
 
                 // Denoted as `nExpiryHeight` in the spec.
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
@@ -732,18 +735,18 @@ impl ZcashSerialize for Transaction {
                         // Signal no value balance.
                         writer.write_i64::<LittleEndian>(0)?;
                         // Signal no shielded spends and no shielded outputs.
-                        zcash_serialize_empty_list(&mut writer)?;
-                        zcash_serialize_empty_list(&mut writer)?;
+                        zcash_serialize_empty_list(writer)?;
+                        zcash_serialize_empty_list(writer)?;
                     }
                     Some(sapling_shielded_data) => {
                         // Denoted as `valueBalanceSapling` in the spec.
                         sapling_shielded_data
                             .value_balance
-                            .zcash_serialize(&mut writer)?;
+                            .zcash_serialize(writer)?;
 
                         // Denoted as `nSpendsSapling` and `vSpendsSapling` in the spec.
                         let spends: Vec<_> = sapling_shielded_data.spends().cloned().collect();
-                        spends.zcash_serialize(&mut writer)?;
+                        spends.zcash_serialize(writer)?;
 
                         // Denoted as `nOutputsSapling` and `vOutputsSapling` in the spec.
                         let outputs: Vec<_> = sapling_shielded_data
@@ -751,15 +754,15 @@ impl ZcashSerialize for Transaction {
                             .cloned()
                             .map(sapling::OutputInTransactionV4)
                             .collect();
-                        outputs.zcash_serialize(&mut writer)?;
+                        outputs.zcash_serialize(writer)?;
                     }
                 }
 
                 // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                 // `joinSplitPubKey` and `joinSplitSig`.
                 match joinsplit_data {
-                    None => zcash_serialize_empty_list(&mut writer)?,
-                    Some(jsd) => jsd.zcash_serialize(&mut writer)?,
+                    None => zcash_serialize_empty_list(writer)?,
+                    Some(jsd) => jsd.zcash_serialize(writer)?,
                 }
 
                 // Denoted as `bindingSigSapling` in the spec.
@@ -791,29 +794,29 @@ impl ZcashSerialize for Transaction {
                 ))?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
 
                 // Denoted as `nExpiryHeight` in the spec.
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // A bundle of fields denoted in the spec as `nSpendsSapling`, `vSpendsSapling`,
                 // `nOutputsSapling`,`vOutputsSapling`, `valueBalanceSapling`, `anchorSapling`,
                 // `vSpendProofsSapling`, `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
-                sapling_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_sapling_shielded_data(sapling_shielded_data.as_deref(), writer)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
-                    &mut writer,
+                    orchard_shielded_data.as_deref(),
+                    writer,
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
@@ -849,31 +852,31 @@ impl ZcashSerialize for Transaction {
                 ))?;
 
                 // Denoted as `lock_time` in the spec.
-                lock_time.zcash_serialize(&mut writer)?;
+                lock_time.zcash_serialize(writer)?;
 
                 // Denoted as `nExpiryHeight` in the spec.
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
-                inputs.zcash_serialize(&mut writer)?;
+                inputs.zcash_serialize(writer)?;
 
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
-                outputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(writer)?;
 
                 // A bundle of fields denoted in the spec as `nSpendsSapling`,
                 // `vSpendsSapling`, `nOutputsSapling`, `vOutputsSapling`,
                 // `valueBalanceSapling`, `anchorSapling`, `vSpendProofsSapling`,
                 // `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
-                sapling_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_sapling_shielded_data(sapling_shielded_data.as_deref(), writer)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 // V6 Orchard still reserves bit 2; only the Ironwood slot below permits it.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
-                    &mut writer,
+                    orchard_shielded_data.as_deref(),
+                    writer,
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
@@ -882,8 +885,8 @@ impl ZcashSerialize for Transaction {
                 // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    ironwood_shielded_data,
-                    &mut writer,
+                    ironwood_shielded_data.as_ref(),
+                    writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
@@ -893,6 +896,8 @@ impl ZcashSerialize for Transaction {
 }
 
 impl ZcashDeserialize for Transaction {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     #[allow(clippy::unwrap_in_result)]
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
@@ -973,7 +978,7 @@ impl ZcashDeserialize for Transaction {
                     lock_time: limited_reader.read_value::<LockTime>()?,
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV2Jsd>()?,
+                    joinsplit_data: limited_reader.read_value::<OptV2Jsd>()?.map(Box::new),
                 })
             }
             (3, true) => {
@@ -997,7 +1002,7 @@ impl ZcashDeserialize for Transaction {
                     expiry_height: block::Height(limited_reader.read_u32::<LittleEndian>()?),
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV3Jsd>()?,
+                    joinsplit_data: limited_reader.read_value::<OptV3Jsd>()?.map(Box::new),
                 })
             }
             (4, true) => {
@@ -1108,8 +1113,8 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     lock_time,
                     expiry_height,
-                    sapling_shielded_data,
-                    joinsplit_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 })
             }
             (5, true) => {
@@ -1174,8 +1179,8 @@ impl ZcashDeserialize for Transaction {
                     expiry_height,
                     inputs,
                     outputs,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 })
             }
             (6, true) => {
@@ -1243,8 +1248,8 @@ impl ZcashDeserialize for Transaction {
                     expiry_height,
                     inputs,
                     outputs,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    orchard_shielded_data: orchard_shielded_data.map(Box::new),
                     ironwood_shielded_data,
                 })
             }
@@ -1262,14 +1267,26 @@ where
     ) -> Result<Self, SerializationError> {
         Ok(Arc::new(reader.read_value::<T>()?))
     }
+
+    fn zcash_deserialize_from_slice(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
+        T::zcash_deserialize_from_slice(bytes).map(Arc::new)
+    }
 }
 
 impl<T> ZcashSerialize for Arc<T>
 where
     T: ZcashSerialize,
 {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         T::zcash_serialize(self, writer)
+    }
+
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        T::zcash_serialize_into_vec(self, out)
+    }
+
+    fn zcash_serialized_size(&self) -> usize {
+        T::zcash_serialized_size(self)
     }
 }
 

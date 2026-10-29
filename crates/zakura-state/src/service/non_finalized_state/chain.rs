@@ -33,7 +33,6 @@ use zakura_chain::{
     value_balance::ValueBalance,
     work::difficulty::PartialCumulativeWork,
 };
-use zakura_header_chain::{ChainScore, SuffixWork};
 
 use crate::{
     request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
@@ -43,10 +42,15 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-use self::{counted_set::CountedSet, index::TransparentTransfers};
-use super::{AddressTransfers, CreatedUtxos};
+use self::{counted_set::CountedSet, height_map::HeightMap, index::TransparentTransfers};
+use super::{AddressTransfers, CreatedUtxos, SharedMap};
 
+#[cfg(test)]
+mod chunked_height_map_tests;
 mod counted_set;
+mod height_map;
+#[cfg(feature = "internal-bench")]
+pub use height_map::benchmark::{benchmark_height_map, HeightMapBenchmarkSample};
 pub mod index;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
@@ -89,10 +93,10 @@ pub struct ChainInner {
     pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
-    pub height_by_hash: HashMap<block::Hash, block::Height>,
+    pub(crate) height_by_hash: SharedMap<block::Hash, block::Height>,
 
     /// An index of [`TransactionLocation`]s for each transaction hash in `blocks`.
-    pub tx_loc_by_hash: HashMap<transaction::Hash, TransactionLocation>,
+    pub(crate) tx_loc_by_hash: SharedMap<transaction::Hash, TransactionLocation>,
 
     // Transparent outputs and spends
     //
@@ -110,7 +114,7 @@ pub struct ChainInner {
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///
     /// Note: Spending transaction ids are only tracked when the `indexer` feature is selected.
-    pub(crate) spent_utxos: HashMap<transparent::OutPoint, SpendingTransactionId>,
+    pub(crate) spent_utxos: SharedMap<transparent::OutPoint, SpendingTransactionId>,
 
     // Note commitment trees
     //
@@ -125,29 +129,25 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) sprout_trees_by_height:
-        BTreeMap<block::Height, Arc<sprout::tree::NoteCommitmentTree>>,
+    pub(crate) sprout_trees_by_height: HeightMap<Arc<sprout::tree::NoteCommitmentTree>>,
 
     /// The Sapling note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) sapling_trees_by_height:
-        BTreeMap<block::Height, Arc<sapling::tree::NoteCommitmentTree>>,
+    pub(crate) sapling_trees_by_height: HeightMap<Arc<sapling::tree::NoteCommitmentTree>>,
 
     /// The Orchard note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) orchard_trees_by_height:
-        BTreeMap<block::Height, Arc<orchard::tree::NoteCommitmentTree>>,
+    pub(crate) orchard_trees_by_height: HeightMap<Arc<orchard::tree::NoteCommitmentTree>>,
 
     /// The Ironwood note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_trees_by_height:
-        BTreeMap<block::Height, Arc<ironwood::tree::NoteCommitmentTree>>,
+    pub(crate) ironwood_trees_by_height: HeightMap<Arc<ironwood::tree::NoteCommitmentTree>>,
 
     // History trees
     //
@@ -156,7 +156,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) history_trees_by_height: BTreeMap<block::Height, Arc<HistoryTree>>,
+    pub(crate) history_trees_by_height: HeightMap<Arc<HistoryTree>>,
 
     // Anchors
     //
@@ -169,7 +169,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sprout_anchors_by_height: BTreeMap<block::Height, sprout::tree::Root>,
+    pub(crate) sprout_anchors_by_height: HeightMap<sprout::tree::Root>,
 
     /// The Sapling anchors created by `blocks`.
     ///
@@ -180,7 +180,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sapling_anchors_by_height: BTreeMap<block::Height, sapling::tree::Root>,
+    pub(crate) sapling_anchors_by_height: HeightMap<sapling::tree::Root>,
     /// A list of Sapling subtrees completed in the non-finalized state
     pub(crate) sapling_subtrees:
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
@@ -194,7 +194,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) orchard_anchors_by_height: BTreeMap<block::Height, orchard::tree::Root>,
+    pub(crate) orchard_anchors_by_height: HeightMap<orchard::tree::Root>,
     /// A list of Orchard subtrees completed in the non-finalized state
     pub(crate) orchard_subtrees:
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
@@ -213,22 +213,22 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_anchors_by_height: BTreeMap<block::Height, ironwood::tree::Root>,
+    pub(crate) ironwood_anchors_by_height: HeightMap<ironwood::tree::Root>,
 
     // Nullifiers
     //
     /// The Sprout nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) sprout_nullifiers: HashMap<sprout::Nullifier, SpendingTransactionId>,
+    pub(crate) sprout_nullifiers: SharedMap<sprout::Nullifier, SpendingTransactionId>,
     /// The Sapling nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) sapling_nullifiers: HashMap<sapling::Nullifier, SpendingTransactionId>,
+    pub(crate) sapling_nullifiers: SharedMap<sapling::Nullifier, SpendingTransactionId>,
     /// The Orchard nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) orchard_nullifiers: HashMap<orchard::Nullifier, SpendingTransactionId>,
+    pub(crate) orchard_nullifiers: SharedMap<orchard::Nullifier, SpendingTransactionId>,
     /// The Ironwood nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) ironwood_nullifiers: HashMap<ironwood::Nullifier, SpendingTransactionId>,
+    pub(crate) ironwood_nullifiers: SharedMap<ironwood::Nullifier, SpendingTransactionId>,
 
     // Transparent Transfers
     // TODO: move to the transparent section
@@ -257,7 +257,7 @@ pub struct ChainInner {
     /// chain value pool balances.
     pub(crate) chain_value_pools: ValueBalance<NonNegative>,
     /// The block info after the given block height.
-    pub(crate) block_info_by_height: BTreeMap<block::Height, BlockInfo>,
+    pub(crate) block_info_by_height: HeightMap<BlockInfo>,
 }
 
 impl Chain {
@@ -653,9 +653,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.sprout_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.sprout_tree(height.into()),
@@ -855,9 +854,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.sapling_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.sapling_tree(height.into()),
@@ -1166,9 +1164,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.orchard_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.orchard_tree(height.into()),
@@ -1225,9 +1222,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.ironwood_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.ironwood_tree(height.into()),
@@ -1333,8 +1329,7 @@ impl Chain {
         if position == RevertPosition::Root {
             // Remove all trees at or below the reverted root block.
             // This makes sure the temporary trees from finalized tip forks are removed.
-            self.history_trees_by_height
-                .retain(|index_height, _tree| *index_height > height);
+            self.history_trees_by_height.remove_through(height);
         } else {
             // Just remove the reverted tip tree.
             self.history_trees_by_height
@@ -1375,7 +1370,6 @@ impl Chain {
     }
 
     /// Returns the non-finalized root block hash and height.
-    #[allow(dead_code)]
     pub fn non_finalized_root(&self) -> (block::Hash, block::Height) {
         (
             self.non_finalized_root_hash(),
@@ -1390,14 +1384,6 @@ impl Chain {
             .next()
             .expect("only called while blocks is populated")
             .hash
-    }
-
-    /// Returns the block hash of the `n`th block from the non-finalized root.
-    ///
-    /// This is the block at `non_finalized_root_height() + n`.
-    #[allow(dead_code)]
-    pub fn non_finalized_nth_hash(&self, n: usize) -> Option<block::Hash> {
-        self.blocks.values().nth(n).map(|block| block.hash)
     }
 
     /// Remove the highest height block of the non-finalized portion of a chain.
@@ -1472,7 +1458,6 @@ impl Chain {
     }
 
     /// Returns the non-finalized length of this chain.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
@@ -2304,7 +2289,7 @@ impl
 
 impl
     UpdateWith<(
-        &Option<transaction::JoinSplitData<Groth16Proof>>,
+        &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
         &SpendingTransactionId,
     )> for Chain
 {
@@ -2312,7 +2297,7 @@ impl
     fn update_chain_tip_with(
         &mut self,
         &(joinsplit_data, revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2337,7 +2322,7 @@ impl
     fn revert_chain_with(
         &mut self,
         &(joinsplit_data, _revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2357,7 +2342,7 @@ impl
 
 impl<AnchorV>
     UpdateWith<(
-        &Option<sapling::ShieldedData<AnchorV>>,
+        &Option<Box<sapling::ShieldedData<AnchorV>>>,
         &SpendingTransactionId,
     )> for Chain
 where
@@ -2367,7 +2352,7 @@ where
     fn update_chain_tip_with(
         &mut self,
         &(sapling_shielded_data, revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2392,7 +2377,7 @@ where
     fn revert_chain_with(
         &mut self,
         &(sapling_shielded_data, _revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2410,12 +2395,12 @@ where
     }
 }
 
-impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Chain {
+impl UpdateWith<(&Option<Box<orchard::ShieldedData>>, &SpendingTransactionId)> for Chain {
     #[instrument(skip(self, orchard_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(orchard_shielded_data, revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2440,7 +2425,7 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
     fn revert_chain_with(
         &mut self,
         (orchard_shielded_data, _revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2582,73 +2567,36 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`].
-    /// Equal-work ties prefer the operator's latest `preciousblock` tip, then
-    /// break using the tip block hash.
+    /// Greater work wins, then the latest operator `preciousblock` preference,
+    /// then the earlier tip receipt, then the raw tip hash.
+    /// Missing receipt orders precede live receipts and tie by hash, so backup
+    /// replay order cannot decide the best chain after restart.
     ///
-    /// Despite the consensus rules, Zebra uses the tip block hash as a
-    /// tie-breaker. Zebra blocks are downloaded in parallel, so download
-    /// timestamps may not be unique. (And Zebra currently doesn't track
-    /// download times, because [`Block`](block::Block)s are immutable.)
-    ///
-    /// This departure from the consensus rules may delay network convergence,
-    /// for as long as the greater hash belongs to the later mined block.
-    /// But Zebra nodes should converge as soon as the tied work is broken.
-    ///
-    /// "At a given point in time, each full validator is aware of a set of candidate blocks.
-    /// These form a tree rooted at the genesis block, where each node in the tree
-    /// refers to its parent via the hashPrevBlock block header field.
-    ///
-    /// A path from the root toward the leaves of the tree consisting of a sequence
-    /// of one or more valid blocks consistent with consensus rules,
-    /// is called a valid block chain.
-    ///
-    /// In order to choose the best valid block chain in its view of the overall block tree,
-    /// a node sums the work ... of all blocks in each valid block chain,
-    /// and considers the valid block chain with greatest total work to be best.
-    ///
-    /// To break ties between leaf blocks, a node will prefer the block that it received first.
-    ///
-    /// The consensus protocol is designed to ensure that for any given block height,
-    /// the vast majority of nodes should eventually agree on their best valid block chain
-    /// up to that height."
-    ///
-    /// <https://zips.z.cash/protocol/protocol.pdf#blockchain>
+    /// See <https://zips.z.cash/protocol/protocol.pdf#blockchain>.
     ///
     /// # Correctness
     ///
-    /// `Chain::cmp` is used in a `BTreeSet`, so the fields accessed by `cmp` must not have
-    /// interior mutability.
-    ///
-    /// `cmp` returns [`Ordering::Equal`] only when both the cumulative work and
-    /// the tip hash match, because the non-finalized state derives the
-    /// `preciousblock` preference from the tip hash on every insert. The [`NonFinalizedState::chain_set`][2] is a
-    /// `BTreeSet<Arc<Chain>>`, so an attempt to insert a chain that compares
-    /// equal to an existing entry is a no-op rather than a process-fatal panic.
-    /// Callers that need to replace such a chain must remove the existing entry
-    /// first.
+    /// Ordering keys must not change while a chain is in the set. Forks and
+    /// reconsideration retain the original block's receipt order, and duplicate
+    /// deliveries must not replace the stored block with a new receipt.
     ///
     /// [1]: super::NonFinalizedState
-    /// [2]: super::NonFinalizedState::chain_set
     fn cmp(&self, other: &Self) -> Ordering {
-        let score = |chain: &Self| {
-            let tip = chain
-                .blocks
-                .values()
-                .last()
-                .expect("a non-finalized chain always contains a block")
-                .hash;
-            ChainScore::new(
-                SuffixWork::new(chain.partial_cumulative_work.as_u256()),
-                tip,
-            )
-        };
-        let (self_score, other_score) = (score(self), score(other));
-        self_score
-            .suffix_work
-            .cmp(&other_score.suffix_work)
+        self.partial_cumulative_work
+            .cmp(&other.partial_cumulative_work)
             .then_with(|| self.active_precedence().cmp(&other.active_precedence()))
-            .then_with(|| self_score.cmp(&other_score))
+            .then_with(|| {
+                let self_tip = self
+                    .tip_block()
+                    .expect("non-finalized chains contain a block");
+                let other_tip = other
+                    .tip_block()
+                    .expect("non-finalized chains contain a block");
+                other_tip
+                    .receipt_order
+                    .cmp(&self_tip.receipt_order)
+                    .then_with(|| self_tip.hash.0.cmp(&other_tip.hash.0))
+            })
     }
 }
 
@@ -2660,10 +2608,10 @@ impl PartialOrd for Chain {
 
 impl PartialEq for Chain {
     /// Chain equality for [`NonFinalizedState::chain_set`][1], using proof of
-    /// work, then the tip block hash as a tie-breaker.
+    /// work, operator preference, tip receipt order, then its hash.
     ///
-    /// Two chains with the same cumulative work and tip hash are equal; the
-    /// `chain_set` uses this to keep tip hashes unique.
+    /// Retained copies of a tip keep the same receipt order, so equal work and
+    /// tip hashes compare equal and the `chain_set` keeps tip hashes unique.
     ///
     /// [1]: super::NonFinalizedState::chain_set
     fn eq(&self, other: &Self) -> bool {

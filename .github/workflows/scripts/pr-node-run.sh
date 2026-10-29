@@ -19,7 +19,9 @@ set -euo pipefail
 
 OUT_DIR=/root/out
 NOTES="$OUT_DIR/notes.md"
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" /var/log/zakura
+# A new path excludes startup records inherited from the baked image.
+LOG_FILE=$(mktemp /var/log/zakura/zakura-canary.XXXXXX)
 
 note() {
   echo "$1"
@@ -130,6 +132,7 @@ vct_fast_sync = true
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
+log_file = "${LOG_FILE}"
 TOML
 
 export CARGO_TARGET_DIR=/root/cargo-target
@@ -137,8 +140,8 @@ BUILD_START=$(date +%s)
 python3 deploy/deployer/deploy.py build --config /root/fleet.toml
 note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache)."
 
-# Read the restored DB directly before networking starts. Snapshot names are a
-# picker optimization, not trusted proof of the handoff start height.
+# Normal startup upgrades the restored DB before recording its finalized height.
+# The monitor checks that recorded height even if RPC appears after the crossing.
 MONITOR_CROSSING_ARGS=()
 if [ "$MODE" = "pre-checkpoint" ] || [ "$MODE" = "vct-handoff" ]; then
   [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
@@ -150,42 +153,15 @@ if [ "$MODE" = "pre-checkpoint" ] || [ "$MODE" = "vct-handoff" ]; then
     --stop-after-height "$MAX_CKPT"
     --required-finalized-at-least "$MAX_CKPT"
     --require-vct-fast-blocks
+    --require-startup-height
   )
-  cat > /root/tip-height.toml <<TOML
-[state]
-storage_mode = "$STORAGE_MODE"
-TOML
-  TIP_OUTPUT=$(
-    /root/cargo-target/release/zakurad -c /root/tip-height.toml tip-height \
-      --cache-dir "$STATE_CACHE_DIR" \
-      --network "$NET_TOML" 2>&1
-  ) || {
-    note "**FAILED:** could not read the restored database tip before starting the node."
-    printf '%s\n' "$TIP_OUTPUT" >&2
-    exit 1
-  }
-  VERIFIED_START_HEIGHT=$(printf '%s\n' "$TIP_OUTPUT" | awk '/^[0-9]+$/ { height=$1 } END { print height }')
-  [[ "$VERIFIED_START_HEIGHT" =~ ^[0-9]+$ ]] || {
-    note "**FAILED:** restored database tip-height output was not numeric."
-    printf '%s\n' "$TIP_OUTPUT" >&2
-    exit 1
-  }
-  if [ "$VERIFIED_START_HEIGHT" -ge "$MAX_CKPT" ]; then
-    note "**FAILED: no handoff crossing** — restored database height ${VERIFIED_START_HEIGHT} is at or above max checkpoint ${MAX_CKPT}."
-    exit 1
-  fi
-  MONITOR_CROSSING_ARGS+=(--known-start-height "$VERIFIED_START_HEIGHT")
   if [ -n "$SNAPSHOT_HEIGHT" ]; then
     [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ ]] || {
       note "**FAILED:** selected snapshot has a non-numeric baked height."
       exit 1
     }
-    if [ "$SNAPSHOT_HEIGHT" -ne "$VERIFIED_START_HEIGHT" ]; then
-      note "**FAILED:** snapshot name height ${SNAPSHOT_HEIGHT} does not match restored database height ${VERIFIED_START_HEIGHT}."
-      exit 1
-    fi
+    MONITOR_CROSSING_ARGS+=(--expected-snapshot-height "$SNAPSHOT_HEIGHT")
   fi
-  note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
   # The trace option is supported by the same binary whose handoff is tested.
   # Keep traces on the disposable state volume, away from the warm build cache.
   cat >> /root/fleet.toml <<TOML
@@ -209,14 +185,14 @@ python3 /root/pr-node-monitor.py \
   --rpc-url http://127.0.0.1:8232 \
   --metrics-url http://127.0.0.1:9999/metrics \
   --service zakurad \
-  --log-file /var/log/zakura/zakura.log \
+  --log-file "$LOG_FILE" \
   --notes "$NOTES" \
   --meta "mode=${MODE},network=${NETWORK},sha=${SHA}" \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
 
-tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
-zstd -T0 -q -f /var/log/zakura/zakura.log -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true
+tail -n 2000 "$LOG_FILE" > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
+zstd -T0 -q -f "$LOG_FILE" -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true
 if [ -d /mnt/snapshots/handoff-traces ]; then
   tar -C /mnt/snapshots/handoff-traces -cf - . | zstd -T0 -q -f -o "$OUT_DIR/handoff-traces.tar.zst" || true
 fi

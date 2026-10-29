@@ -862,8 +862,10 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
     template.transactions = vec![Arc::new(transaction_v4_from_coinbase(
         &template.transactions[0],
     ))];
-    let siblings =
+    let mut siblings =
         Arc::new(template).make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
     let evicted = &siblings[siblings.len() - 2];
     // Record a temporary failure before this block succeeds on its next attempt.
     state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
@@ -873,7 +875,8 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         },
     ));
     for (order, block) in siblings.iter().enumerate() {
-        let prepared = block.clone().prepare();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
         tokio::time::timeout(
             Duration::from_secs(10),
             state.queue_and_commit_to_non_finalized_state(prepared, None),
@@ -995,7 +998,10 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     header.commitment_bytes =
         <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
 
-    let siblings = template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
     for (order, block) in siblings.iter().enumerate() {
         if order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
             timeout(limit, state.send_invalidate_block(siblings[0].hash()))
@@ -1004,7 +1010,8 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
                 .unwrap()
                 .unwrap();
         }
-        let prepared = block.clone().prepare();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
         timeout(
             limit,
             state.queue_and_commit_to_non_finalized_state(prepared, None),
@@ -1054,7 +1061,8 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
         .non_finalized_failed_ancestors
         .contains_key(&evicted.hash()));
 
-    let prepared = evicted.clone().prepare();
+    let mut prepared = evicted.clone().prepare();
+    prepared.receipt_order = Some(u64::try_from(siblings.len()).unwrap());
     timeout(
         limit,
         state.queue_and_commit_to_non_finalized_state(prepared, None),
@@ -1540,7 +1548,7 @@ fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
 }
 
 async fn test_populated_state_responds_correctly(
-    mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
+    mut state: Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
 ) -> Result<()> {
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
         .range(0..=LAST_BLOCK_HEIGHT)
@@ -1560,11 +1568,6 @@ async fn test_populated_state_responds_correctly(
         let height = block.coinbase_height().unwrap();
         let hash = block.hash();
 
-        transcript.push((
-            Request::Depth(block.hash()),
-            Ok(Response::Depth(Some(LAST_BLOCK_HEIGHT - height.0))),
-        ));
-
         // these requests don't have any arguments, so we just do them once
         if ind == LAST_BLOCK_HEIGHT as usize {
             transcript.push((Request::Tip, Ok(Response::Tip(Some((height, hash))))));
@@ -1582,18 +1585,6 @@ async fn test_populated_state_responds_correctly(
                 Request::BlockLocator,
                 Ok(Response::BlockLocator(locator_hashes)),
             ));
-        }
-
-        // Spec: transactions in the genesis block are ignored.
-        if height.0 != 0 {
-            for transaction in &block.transactions {
-                let transaction_hash = transaction.hash();
-
-                transcript.push((
-                    Request::Transaction(transaction_hash),
-                    Ok(Response::Transaction(Some(transaction.clone()))),
-                ));
-            }
         }
 
         transcript.push((
@@ -1729,13 +1720,8 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
     let iter = vec![
         // No checks for SemanticallyVerifiedBlock or CommitCheckpointVerifiedBlock because empty state
         // precondition doesn't matter to them
-        (Request::Depth(block.hash()), Ok(Response::Depth(None))),
         (Request::Tip, Ok(Response::Tip(None))),
         (Request::BlockLocator, Ok(Response::BlockLocator(vec![]))),
-        (
-            Request::Transaction(transaction::Hash([0; 32])),
-            Ok(Response::Transaction(None)),
-        ),
         (
             Request::Block(block.hash().into()),
             Ok(Response::Block(None)),
@@ -1849,7 +1835,15 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
                 state_service.block_write_sender.finalized.is_some(),
                 "the header runtime must become ready after genesis while checkpoint writes remain open",
             );
-            assert!(read.subscribe_header_runtime_status().borrow().is_ready());
+            // The writer publishes the attached runtime's snapshot before marking it ready.
+            let mut status = read.subscribe_header_runtime_status();
+            timeout(
+                Duration::from_secs(5),
+                status.wait_for(|status| status.is_ready()),
+            )
+            .await
+            .expect("the header runtime becomes ready after genesis")
+            .expect("the header runtime status sender stays open");
         }
     }
 
@@ -1912,7 +1906,7 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
 /// The handoff request must release children queued before the final checkpoint became durable.
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
-    use color_eyre::eyre::eyre;
+    use eyre::eyre;
     use tower::Service;
 
     let _init_guard = zakura_test::init();

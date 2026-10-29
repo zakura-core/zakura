@@ -259,15 +259,37 @@ impl ZakuraDb {
     /// [`block::Hash`] or [`Height`], if it exists in the finalized chain and
     /// its raw transaction data is available.
     ///
-    /// The block is assembled from the stored raw bytes — the header, the
-    /// CompactSize-encoded transaction count, and the raw transactions — so
-    /// the transactions are never deserialized.
-    ///
     /// Returns `None` if the block does not exist, or if its transaction bodies
     /// are missing because they have been pruned.
-    #[cfg(feature = "indexer")]
-    #[allow(clippy::unwrap_in_result)]
     pub fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
+        self.raw_block_bytes_within(hash_or_height, usize::MAX)
+    }
+
+    /// Returns the serialized finalized block like [`Self::raw_block_bytes`],
+    /// unless it is longer than `max_bytes`.
+    ///
+    /// The block is assembled from the stored raw bytes — the header, the
+    /// CompactSize-encoded transaction count, and the raw transactions — so
+    /// it is never deserialized. The recorded block size is checked before the
+    /// transactions are read, and the exact size before the parts are copied
+    /// into the returned buffer.
+    ///
+    /// Returns `None` if the block does not exist, if its transaction bodies
+    /// are missing because they have been pruned, or if it does not fit.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn raw_block_bytes_within(
+        &self,
+        hash_or_height: HashOrHeight,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        // The recorded size skips a block that cannot fit before its
+        // transactions are read.
+        if self
+            .block_info(hash_or_height)
+            .is_some_and(|info| usize::try_from(info.size()).is_ok_and(|size| size > max_bytes))
+        {
+            return None;
+        }
         let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
         let tx_count = CompactSizeMessage::try_from(raw_txs.len())
@@ -282,6 +304,9 @@ impl ZakuraDb {
                 .iter()
                 .map(|raw_tx| raw_tx.raw_bytes().len())
                 .sum::<usize>();
+        if size > max_bytes {
+            return None;
+        }
 
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(raw_header.raw_bytes());
@@ -561,17 +586,26 @@ impl ZakuraDb {
 
     /// Returns the [`transaction::Hash`] of the transaction that spent or revealed the given
     /// [`transparent::OutPoint`] or nullifier, if it is spent or revealed in the finalized state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) for a
+    /// [`Spend::OutPoint`] if this database skips transparent indexes, even if a stale spender
+    /// entry exists. Nullifier lookups are always answered.
     #[cfg(feature = "indexer")]
-    pub fn spending_transaction_hash(&self, spend: &Spend) -> Option<transaction::Hash> {
+    pub fn spending_transaction_hash(
+        &self,
+        spend: &Spend,
+    ) -> Result<Option<transaction::Hash>, crate::TransparentIndexesUnavailable> {
         let tx_loc = match spend {
             Spend::OutPoint(outpoint) => self.spending_tx_loc(outpoint)?,
-            Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier)?,
-            Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier)?,
-            Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier)?,
-            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier)?,
+            Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier),
+            Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier),
+            Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier),
+            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier),
         };
 
-        self.transaction_hash(tx_loc)
+        Ok(tx_loc.and_then(|tx_loc| self.transaction_hash(tx_loc)))
     }
 
     /// Returns the [`transaction::Hash`]es in the block with `hash_or_height`,
@@ -928,18 +962,9 @@ impl ZakuraDb {
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
 
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
+        // Pruned checkpoint sync stops optional index writes in place. A durable marker
+        // keeps them disabled after configuration changes or rollback.
+        let skip_transparent_indexes = self.skips_transparent_indexes();
 
         // Get the current address balances, before the transactions in this block
 
@@ -976,14 +1001,33 @@ impl ZakuraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+        //
+        // A database without transparent indexes reads and writes no address balances.
+        let address_balances: AddressBalanceLocationUpdates = if skip_transparent_indexes {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            // Get the transparent addresses with changed balances/UTXOs
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    self.address_balance_location(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(self.address_balance_location(addr)?.into_new_change())
+                }))
+            }
         };
 
         let mut batch = DiskWriteBatch::new();
@@ -999,12 +1043,20 @@ impl ZakuraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
+            skip_transparent_indexes,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
             vct_data,
         )?;
+
+        // The first block committed without transparent indexes durably marks the database, in
+        // the same atomic batch. This happens before any raw transaction pruning can start,
+        // because pruning only runs in later commits or later in this batch.
+        if skip_transparent_indexes && self.transparent_indexes_skipped_from().is_none() {
+            batch.prepare_transparent_indexes_skipped_marker_batch(self, finalized.height);
+        }
 
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
@@ -1306,6 +1358,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         address_balances: AddressBalanceLocationUpdates,
+        skip_transparent_indexes: bool,
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
@@ -1350,6 +1403,7 @@ impl DiskWriteBatch {
                 #[cfg(feature = "indexer")]
                 &out_loc_by_outpoint,
                 address_balances,
+                skip_transparent_indexes,
             );
         }
 

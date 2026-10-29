@@ -28,32 +28,14 @@ pub(crate) const RECEIPT_SESSION_HEADER: &str = "x-zakura-receipt-session";
 /// Receipt orders in this process share one session.
 pub(crate) fn receipt_session() -> &'static str {
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SESSION.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+    SESSION.get_or_init(|| format!("{:032x}", rand_10::random::<u128>()))
 }
-
-pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
-    tonic::include_file_descriptor_set!("indexer_descriptor");
 
 impl BlockHashAndHeight {
     /// Create a new [`BlockHashAndHeight`] from a [`block::Hash`] and [`block::Height`].
     pub fn new(hash: block::Hash, block::Height(height): block::Height) -> Self {
         let hash = hash.bytes_in_display_order().to_vec();
         BlockHashAndHeight { hash, height }
-    }
-
-    /// Try to convert a [`BlockHashAndHeight`] into a tuple of a block hash and height.
-    pub fn try_into_hash_and_height(self) -> Option<(block::Hash, block::Height)> {
-        self.hash
-            .try_into()
-            .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
-            .map_err(|bytes: Vec<_>| {
-                tracing::warn!(
-                    "failed to convert BlockHash to Hash, unexpected len: {}",
-                    bytes.len()
-                )
-            })
-            .ok()
-            .zip(self.height.try_into().ok())
     }
 }
 

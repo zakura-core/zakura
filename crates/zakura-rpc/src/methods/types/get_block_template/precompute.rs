@@ -13,7 +13,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use jsonrpsee::core::RpcResult;
+use crate::server::jsonrpc::RpcResult;
 use tokio::{
     sync::{watch, Semaphore},
     task::JoinHandle,

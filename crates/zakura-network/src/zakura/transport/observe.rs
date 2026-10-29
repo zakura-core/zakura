@@ -459,9 +459,13 @@ impl StreamTap {
     }
 
     /// Takes the oldest queued tag as the frame the service handles now.
+    /// `FramedRecv` calls it for each frame it hands the service. On a stream
+    /// nobody tags it does nothing.
     pub(crate) fn take_tag(&self) {
-        let seq = lock(&self.queued).pop_front();
-        *lock(&self.serving) = seq;
+        if self.tagged.load(Ordering::Acquire) == 1 {
+            let seq = lock(&self.queued).pop_front();
+            *lock(&self.serving) = seq;
+        }
     }
 
     /// The tag of the frame the service handles now.

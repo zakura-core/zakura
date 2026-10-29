@@ -122,6 +122,7 @@ pub(crate) async fn initiate(
         protocol,
         peer_nonce,
         ack.peer_nonce,
+        capabilities,
         &local.limits.initial_limits(),
         &local.config,
     )

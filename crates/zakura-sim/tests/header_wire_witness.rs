@@ -366,6 +366,7 @@ fn act_frame(report: &RunReport, act: Act) -> (u64, u64, u64, Label) {
         .find(|pick| pick.identity == identity)
         .unwrap_or_else(|| panic!("the plan never picked {identity}: {:?}", report.end))
         .step;
+    let peer0 = peer_connections(report, &BTreeSet::from([0]));
     report
         .log
         .entries()
@@ -379,7 +380,9 @@ fn act_frame(report: &RunReport, act: Act) -> (u64, u64, u64, Label) {
                 row: Some(row),
                 label,
                 ..
-            } if row == act.row().name() => Some((*connection, *quic_stream, *seq, *label)),
+            } if peer0.contains(connection) && row == act.row().name() => {
+                Some((*connection, *quic_stream, *seq, *label))
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("{act:?} sent no frame on its row"))
@@ -434,9 +437,14 @@ fn each_invalid_label_witness_has_a_conformant_control() {
 }
 
 /// The node's connections to peers the scenario marks `HonestPeer`, in
-/// `report`, from the remote addresses their `registered` rows name.
+/// `report`.
 fn honest_connections(report: &RunReport, scenario: &WireScenario) -> BTreeSet<u64> {
-    let honest = scenario.honest_peers();
+    peer_connections(report, &scenario.honest_peers())
+}
+
+/// The node's connections to the scenario peers `peers`, in `report`, from
+/// the remote addresses their `registered` rows name.
+fn peer_connections(report: &RunReport, peers: &BTreeSet<usize>) -> BTreeSet<u64> {
     report
         .log
         .entries()
@@ -449,7 +457,7 @@ fn honest_connections(report: &RunReport, scenario: &WireScenario) -> BTreeSet<u
                 ..
             } => {
                 let peer = peer_of(remote.parse().ok()?)?;
-                honest.contains(&peer).then_some(*connection)
+                peers.contains(&peer).then_some(*connection)
             }
             _ => None,
         })

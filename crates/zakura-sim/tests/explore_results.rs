@@ -438,7 +438,7 @@ fn a_run_without_end_is_incomplete() {
 fn process_failure_kinds() {
     let asan = b"==7==ERROR: AddressSanitizer: heap-use-after-free on address 0x1\n\
         SUMMARY: AddressSanitizer: heap-use-after-free\n";
-    let rows: [(ProcessExit, &[u8], Option<ProcessFailure>); 10] = [
+    let rows: [(ProcessExit, &[u8], Option<ProcessFailure>); 13] = [
         (ProcessExit::Code(0), b"", None),
         (ProcessExit::Code(0), b"warning: unrelated\n", None),
         (ProcessExit::TimedOut, b"", Some(ProcessFailure::Timeout)),
@@ -454,6 +454,25 @@ fn process_failure_kinds() {
                 report: "==7==ERROR: AddressSanitizer: heap-use-after-free on address 0x1"
                     .to_owned(),
             }),
+        ),
+        (
+            ProcessExit::Code(66),
+            b"WARNING: ThreadSanitizer: data race (pid=5)\n",
+            Some(ProcessFailure::Sanitizer {
+                report: "WARNING: ThreadSanitizer: data race (pid=5)".to_owned(),
+            }),
+        ),
+        (
+            ProcessExit::Code(77),
+            b"==4==WARNING: MemorySanitizer: use-of-uninitialized-value\n",
+            Some(ProcessFailure::Sanitizer {
+                report: "==4==WARNING: MemorySanitizer: use-of-uninitialized-value".to_owned(),
+            }),
+        ),
+        (
+            ProcessExit::Code(1),
+            b"==8==ERROR: AddressSanitizer: out of memory: allocator is trying to allocate 0x1 bytes\n",
+            Some(ProcessFailure::OutOfMemory),
         ),
         (
             ProcessExit::Signal(6),

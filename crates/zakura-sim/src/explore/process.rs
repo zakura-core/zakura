@@ -58,8 +58,9 @@ pub enum ProcessFailure {
         /// `==1==ERROR: AddressSanitizer: heap-use-after-free ...`.
         report: String,
     },
-    /// An allocation failed, or libFuzzer reported the process out of
-    /// memory. A kernel out-of-memory kill shows as `signal` 9.
+    /// An allocation failed, or libFuzzer or a sanitizer reported the
+    /// process out of memory. A kernel out-of-memory kill shows as `signal`
+    /// 9.
     OutOfMemory,
     /// It aborted, with no sanitizer report and no allocation failure.
     Abort,
@@ -84,27 +85,34 @@ impl ProcessFailure {
     /// for an exit with code 0 and no error report.
     ///
     /// A report in `stderr` ranks before the exit, since a sanitizer and an
-    /// allocation failure both abort or exit with a code of their own.
+    /// allocation failure both abort or exit with a code of their own. An
+    /// out-of-memory report ranks before a sanitizer's other reports, so a
+    /// sanitizer's out-of-memory report is `out-of-memory`.
     pub fn of(exit: ProcessExit, stderr: &[u8]) -> Option<ProcessFailure> {
         let stderr = String::from_utf8_lossy(stderr);
         let line = |marker: &str| stderr.lines().find(|line| line.contains(marker));
         if exit == ProcessExit::TimedOut || line("ERROR: libFuzzer: timeout").is_some() {
             return Some(ProcessFailure::Timeout);
         }
-        if let Some(report) = stderr
-            .lines()
-            .find(|line| line.contains("ERROR: ") && line.contains("Sanitizer"))
-        {
-            return Some(ProcessFailure::Sanitizer {
-                report: report.trim().to_owned(),
-            });
-        }
         if line("ERROR: libFuzzer: out-of-memory").is_some()
+            || line("Sanitizer: out of memory").is_some()
+            || line("Sanitizer: hard rss limit exhausted").is_some()
             || stderr
                 .lines()
                 .any(|line| line.contains("memory allocation of") && line.contains("failed"))
         {
             return Some(ProcessFailure::OutOfMemory);
+        }
+        // MemorySanitizer and ThreadSanitizer start their reports with
+        // `WARNING:`, and the others with `ERROR:`.
+        if let Some(report) = stderr.lines().find(|line| {
+            (line.contains("ERROR: ") && line.contains("Sanitizer"))
+                || line.contains("WARNING: MemorySanitizer: ")
+                || line.contains("WARNING: ThreadSanitizer: ")
+        }) {
+            return Some(ProcessFailure::Sanitizer {
+                report: report.trim().to_owned(),
+            });
         }
         match exit {
             ProcessExit::Code(0) => None,

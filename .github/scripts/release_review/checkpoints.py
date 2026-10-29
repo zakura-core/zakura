@@ -7,8 +7,9 @@ import hashlib
 import json
 from decimal import Decimal, InvalidOperation
 
-from .contracts import FINDING_SCHEMA, ReviewError, validate_schema
+from .contracts import FINDING_SCHEMA, Finding, ReviewError, validate_schema
 from .models import Spending
+from .state import ReviewState
 
 
 def contract_digest(repo, settings, units, coverage) -> str:
@@ -31,15 +32,18 @@ def contract_digest(repo, settings, units, coverage) -> str:
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def restore(prior: dict, report: dict, repo, settings, units, changed: set[str]) -> tuple[Spending, set[str]]:
-    """Accept only a matching trusted checkpoint and retain every prior cost."""
+def validate_checkpoint_target(prior: dict, report: dict) -> None:
+    """Reject evidence from another release target or a finished review."""
     if any(prior.get(key) != report.get(key) for key in ("repository", "pr_number", "head_sha", "base_sha")):
         raise ReviewError("checkpoint belongs to a different release target")
     if prior.get("resume_contract_digest") != report["resume_contract_digest"]:
         raise ReviewError("checkpoint revisions, scope, prompts, model, pricing, or diff units changed")
     if prior.get("status") != "incomplete":
         raise ReviewError("only an incomplete review needs continuation")
-    usage = prior.get("usage", {})
+
+
+def restore_spending(usage: dict, settings) -> Spending:
+    """Reconstruct the ledger without discarding known charges or uncertain calls."""
     try:
         charged = Decimal(usage["estimated_usd_including_uncertain_calls"])
         budget = Decimal(usage["budget_usd"])
@@ -47,16 +51,45 @@ def restore(prior: dict, report: dict, repo, settings, units, changed: set[str])
         raise ReviewError("checkpoint has invalid billing information") from None
     counts = {key: usage.get(key) for key in ("input_tokens", "output_tokens", "calls", "uncertain_calls")}
     counts["cached_input_tokens"] = usage.get("cached_input_tokens", 0)
-    if (not charged.is_finite() or not 0 <= charged <= settings.budget or budget != settings.budget
-            or any(type(value) is not int or value < 0 for value in counts.values())
-            or counts["uncertain_calls"] > counts["calls"]
-            or counts["cached_input_tokens"] > counts["input_tokens"]):
+    if not charged.is_finite() or not 0 <= charged <= settings.budget or budget != settings.budget:
+        raise ReviewError("checkpoint has invalid billing information")
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        raise ReviewError("checkpoint has invalid billing information")
+    if counts["uncertain_calls"] > counts["calls"] or counts["cached_input_tokens"] > counts["input_tokens"]:
         raise ReviewError("checkpoint has invalid billing information")
     spending = Spending(settings, charged=charged, **counts)
     if spending.price(counts["input_tokens"], counts["output_tokens"], counts["cached_input_tokens"]) > charged:
         raise ReviewError("checkpoint billing omits known token usage")
+    return spending
+
+
+def restore_completed_units(summaries: list[dict], units) -> set[str]:
+    """Validate each saved batch against the current unit IDs and paths."""
     known = {unit.id: unit.path for unit in units}
     completed = set()
+    for summary in summaries:
+        if not isinstance(summary, dict) or not isinstance(summary.get("summary"), str):
+            raise ReviewError("checkpoint contains invalid or duplicated completed units")
+        batch = summary.get("units")
+        if not isinstance(batch, list) or not batch:
+            raise ReviewError("checkpoint contains invalid or duplicated completed units")
+        if any(not isinstance(unit, str) or unit not in known or unit in completed for unit in batch):
+            raise ReviewError("checkpoint contains invalid or duplicated completed units")
+        if len(set(batch)) != len(batch):
+            raise ReviewError("checkpoint contains invalid or duplicated completed units")
+        expected_paths = list(dict.fromkeys(known[unit] for unit in batch))
+        if summary.get("paths") != expected_paths:
+            raise ReviewError("checkpoint contains invalid or duplicated completed units")
+        completed.update(batch)
+    return completed
+
+
+def restore(prior: dict, report: dict, state: ReviewState, repo, settings, units,
+            *, changed: set[str]) -> Spending:
+    """Restore validated progress and spending under the original review contract."""
+    validate_checkpoint_target(prior, report)
+    usage = prior.get("usage", {})
+    spending = restore_spending(usage, settings)
     summaries = prior.get("summaries", [])
     candidates = prior.get("candidates", [])
     history = prior.get("resume_history", [])
@@ -64,23 +97,21 @@ def restore(prior: dict, report: dict, repo, settings, units, changed: set[str])
         raise ReviewError("checkpoint evidence must contain summary and candidate lists")
     if not isinstance(history, list):
         raise ReviewError("checkpoint continuation history must be a list")
-    for summary in summaries:
-        if (not isinstance(summary, dict) or not isinstance(summary.get("summary"), str)
-                or not isinstance(summary.get("units"), list) or not summary["units"]
-                or any(not isinstance(unit, str) or unit not in known or unit in completed for unit in summary["units"])
-                or len(set(summary["units"])) != len(summary["units"])
-                or summary.get("paths") != list(dict.fromkeys(known[unit] for unit in summary["units"]))):
-            raise ReviewError("checkpoint contains invalid or duplicated completed units")
-        completed.update(summary["units"])
-    for finding in candidates:
-        validate_schema(finding, FINDING_SCHEMA)
+    completed = restore_completed_units(summaries, units)
+    findings = []
+    for value in candidates:
+        validate_schema(value, FINDING_SCHEMA)
+        finding = Finding.from_validated(value)
         repo.validate_finding(finding, changed)
-    report["summaries"] = copy.deepcopy(summaries)
-    report["candidates"] = copy.deepcopy(candidates)
-    report["resume_history"] = copy.deepcopy(history) + [{
+        findings.append(finding)
+    state.summaries = copy.deepcopy(summaries)
+    state.candidates = findings
+    state.completed = completed
+    state.update_coverage()
+    state.resume_history = copy.deepcopy(history) + [{
         "control_sha": prior.get("control_sha"), "errors": prior.get("errors", []),
         "duration_seconds": prior.get("duration_seconds"), "usage": usage,
         "completed_units": len(completed),
         "checkpoint_sha256": hashlib.sha256(json.dumps(prior, sort_keys=True).encode()).hexdigest(),
     }]
-    return spending, completed
+    return spending

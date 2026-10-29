@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .assets import ASSET_PATHS, asset_text
-from .contracts import ReviewError
+from .contracts import Finding, ReviewError
 from .scope import matching_exclusion, safe_path
 
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?")
@@ -243,15 +243,15 @@ class Repository:
                 entry.update(status="excluded", reason=str(error))
         return units, coverage
 
-    def validate_finding(self, finding: dict, changed_paths: set[str]) -> None:
-        if finding["change_path"] not in changed_paths:
+    def validate_finding(self, finding: Finding, changed_paths: set[str]) -> None:
+        if finding.change_path not in changed_paths:
             raise ReviewError("finding does not identify a changed release file")
-        ref = finding["reference"]
-        if ref["end"] < ref["start"] or ref["end"] - ref["start"] > 40:
+        ref = finding.reference
+        if ref.end < ref.start or ref.end - ref.start > 40:
             raise ReviewError("finding source range is invalid or too broad")
-        lines = self.source(ref["revision"], ref["path"]).splitlines()
-        if ref["end"] > len(lines):
+        lines = self.source(ref.revision, ref.path).splitlines()
+        if ref.end > len(lines):
             raise ReviewError("finding cites a nonexistent source line")
-        excerpt = "\n".join(lines[ref["start"] - 1:ref["end"]])
-        if ref["quote"].strip() not in excerpt:
+        excerpt = "\n".join(lines[ref.start - 1:ref.end])
+        if ref.quote.strip() not in excerpt:
             raise ReviewError("finding quotation does not match the pinned source")

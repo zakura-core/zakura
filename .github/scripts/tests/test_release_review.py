@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from release_review.__main__ import main
 from release_review.config import Settings, load_settings
 from release_review.contracts import (
+    Finding,
     ModelReply,
     ModelRequest,
     ProviderError,
@@ -42,6 +43,7 @@ from release_review.models import (
 from release_review.reporting import render, write_report
 from release_review.repository import Repository, ReviewUnit
 from release_review.scope import exclusion_paths, matching_exclusion
+from release_review.state import ReviewState
 
 ROOT = Path(__file__).resolve().parents[2]
 HEAD = "b" * 40
@@ -226,12 +228,12 @@ class RangeTests(GitFixture):
         self.assertEqual("".join(unit.patch for unit in parts), patch_text)
 
     def test_source_quote_and_changed_path_are_verified(self):
-        self.repository.validate_finding(candidate(), {"validator.rs"})
+        self.repository.validate_finding(Finding.from_validated(candidate()), {"validator.rs"})
         wrong = candidate(quote="invented source")
         with self.assertRaisesRegex(ReviewError, "quotation"):
-            self.repository.validate_finding(wrong, {"validator.rs"})
+            self.repository.validate_finding(Finding.from_validated(wrong), {"validator.rs"})
         with self.assertRaisesRegex(ReviewError, "changed release file"):
-            self.repository.validate_finding(candidate(), {"release.txt"})
+            self.repository.validate_finding(Finding.from_validated(candidate()), {"release.txt"})
 
     def test_rename_and_deletion_are_not_silently_lost(self):
         self.git("mv", "validator.rs", "renamed.rs")
@@ -249,7 +251,7 @@ class ContractTests(unittest.TestCase):
             for category in ("consensus", "cryptography", "mining", "propagation"):
                 finding = candidate()
                 finding.update(severity=severity, category=category)
-                self.assertEqual(parse_turn(json.dumps(completed([finding])))["findings"], [finding])
+                self.assertEqual([asdict(item) for item in parse_turn(json.dumps(completed([finding]))).findings], [finding])
 
     def test_nit_severity_and_missing_evidence_are_rejected(self):
         for key, value in (("severity", "Low"), ("category", "style"), ("trigger", ""), ("impact", "")):
@@ -358,7 +360,7 @@ class ProviderTests(unittest.TestCase):
         spending = Spending(settings())
         checkpoints = []
         provider = ScriptedProvider([completed()])
-        spending.call(provider, self.request(), checkpoint=lambda: checkpoints.append(spending.report()))
+        spending.call(provider, self.request(), persist_reservation=lambda: checkpoints.append(spending.report()))
         self.assertEqual(checkpoints[0]["uncertain_calls"], 1)
         self.assertGreater(Decimal(checkpoints[0]["estimated_usd_including_uncertain_calls"]), 0)
         self.assertEqual(spending.uncertain_calls, 0)
@@ -469,8 +471,9 @@ class EngineTests(GitFixture):
         report.update(summaries=[{"unit": f"unit-{i}", "summary": "x" * 2000} for i in range(24)], candidates=[])
         conf = settings(max_input_bytes=30000)
         provider = ScriptedProvider([completed()] * 30)
-        synthesize(self.repository, provider, conf, Spending(conf), report,
-                   time.monotonic() + 60, {"validator.rs"}, lambda: None)
+        state = ReviewState(summaries=report["summaries"])
+        synthesize(self.repository, provider, conf, Spending(conf), state,
+                   deadline=time.monotonic() + 60, changed={"validator.rs"}, persist_checkpoint=lambda: None)
         self.assertGreater(len(provider.requests), 1)
         self.assertTrue(all(Spending.input_bound(request) <= conf.max_input_bytes for request in provider.requests))
         first_pass = [json.loads(request.messages[-1]["content"])["review_results"]

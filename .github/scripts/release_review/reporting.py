@@ -99,11 +99,21 @@ def render(report: dict, *, comment: bool = False) -> str:
     return text
 
 
+def write_atomic(path: Path, content: str) -> None:
+    """Replace a report file only after its complete contents reach the temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content)
+    temporary.replace(path)
+
+
+def write_checkpoint(directory: Path, report: dict) -> None:
+    """Persist recovery state before requests and after completed review steps."""
+    write_atomic(directory / "report.json", json.dumps(report, indent=2))
+
+
 def write_report(directory: Path, report: dict) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    # Atomic checkpoints survive a cancelled model request or exhausted job budget.
-    for name, content in (("report.json", json.dumps(report, indent=2)),
-                          ("report.md", render(report)), ("comment.md", render(report, comment=True))):
-        temporary = directory / (name + ".tmp")
-        temporary.write_text(content)
-        temporary.replace(directory / name)
+    """Save recovery state and render documents at CLI and publication boundaries."""
+    write_checkpoint(directory, report)
+    write_atomic(directory / "report.md", render(report))
+    write_atomic(directory / "comment.md", render(report, comment=True))

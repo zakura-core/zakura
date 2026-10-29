@@ -13,7 +13,7 @@ from .contracts import ReviewError
 from .engine import review
 from .github import GitHub, fetch_head, publish, resolve_request
 from .models import AbliteratedProvider, JsonTransport, OpenAIProvider
-from .reporting import render, write_report
+from .reporting import render, write_checkpoint, write_report
 from .repository import Repository
 from .state import new_report
 
@@ -61,7 +61,7 @@ def run_review(args) -> int:
                                                               if settings.cached_input_price is not None else None)}
         prior = json.loads(args.resume_report.read_text()) if args.resume_report else None
         review(repository, provider_type(settings, key, JsonTransport()), settings, report,
-               lambda current: write_report(args.output, current), prior_report=prior)
+               lambda current: write_checkpoint(args.output, current), prior_report=prior)
     except (ReviewError, OSError, ValueError, KeyError, TypeError) as error:
         # Only our domain errors are safe to publish. Exceptions from I/O or malformed
         # external envelopes can contain credential-bearing URLs or provider payloads.

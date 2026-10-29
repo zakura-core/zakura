@@ -33,6 +33,52 @@ class ModelReply:
     cached_input_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class SourceReference:
+    revision: str
+    path: str
+    start: int
+    end: int
+    quote: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    severity: str
+    category: str
+    title: str
+    trigger: str
+    impact: str
+    explanation: str
+    change_path: str
+    release_connection: str
+    verification: str
+    reference: SourceReference
+
+    @classmethod
+    def from_validated(cls, value: dict) -> Finding:
+        """Convert a schema-validated finding without changing its wire fields."""
+        return cls(**(value | {"reference": SourceReference(**value["reference"])}))
+
+
+@dataclass(frozen=True)
+class RepositoryAction:
+    kind: str
+    revision: str
+    path: str
+    start: int
+    end: int
+    query: str
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    complete: bool
+    summary: str
+    actions: list[RepositoryAction]
+    findings: list[Finding]
+
+
 class ModelProvider(Protocol):
     def complete(self, request: ModelRequest) -> ModelReply:
         """Return a completed response with billable usage, or a sanitized error."""
@@ -117,7 +163,7 @@ def validate_schema(value, schema: dict) -> None:
         raise ReviewError("model output has an invalid line number")
 
 
-def parse_turn(text: str) -> dict:
+def parse_turn(text: str) -> ModelTurn:
     try:
         turn = json.loads(text)
     except (ValueError, TypeError) as error:
@@ -134,4 +180,9 @@ def parse_turn(text: str) -> dict:
                 raise ReviewError("a finding lacks required evidence")
         if not finding["reference"]["quote"].strip():
             raise ReviewError("a finding lacks a source quotation")
-    return turn
+    return ModelTurn(
+        complete=turn["complete"],
+        summary=turn["summary"],
+        actions=[RepositoryAction(**action) for action in turn["actions"]],
+        findings=[Finding.from_validated(finding) for finding in turn["findings"]],
+    )

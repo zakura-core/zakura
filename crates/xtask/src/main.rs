@@ -125,6 +125,7 @@ fn try_main() -> Result<(), BoxError> {
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
         Some("sim-versions") => sim::run(&repo_root()?, "versions", args),
         Some("sim-seeds") => sim::run(&repo_root()?, "seeds", args),
+        Some("sim-suite") => sim::run(&repo_root()?, "suite", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -350,6 +351,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask sim-seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>] [--quarantine <dir>] [--report <file>]"
     )?;
+    writeln!(output, "  cargo xtask sim-suite [--out <file>] [--frozen]")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -426,5 +428,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "with --out writes one harness's admitted seeds there as a fuzz corpus."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Builds the zakura-sim full-suite manifest from qa/suite.toml, and fails with every"
+    )?;
+    writeln!(
+        output,
+        "harness, property, target, ignored test or seed the manifest doesn't cover."
     )
 }

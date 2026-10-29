@@ -11,7 +11,10 @@ mod support;
 
 use std::{fs, path::PathBuf, rc::Rc};
 
-use zakura_network::zakura::v9::RegtestMessage;
+use zakura_network::zakura::{
+    v9::RegtestMessage, ZAKURA_CAP_DISCOVERY, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_HEADER_SYNC,
+};
 use zakura_sim::{
     harness::{
         header_node::{
@@ -723,5 +726,59 @@ fn a_received_frame_keeps_its_read_boundary() {
     assert!(
         digests.values().any(|seen| seen.len() > 1),
         "two frames of one type and length have different digests"
+    );
+}
+
+/// A peer that didn't negotiate header sync opens a header stream, and the
+/// node refuses it while the connection lives. The peer's scripted open
+/// records how the stream ended, on a stream the node never admits, so it
+/// keeps only its `peer-emitted` row.
+#[test]
+fn a_refused_open_keeps_its_end() {
+    let scenario = WireScenario {
+        peers: vec![PeerSpec {
+            capabilities: ZAKURA_CAP_DISCOVERY,
+            script: vec![PeerAction::Open {
+                kind: ZAKURA_STREAM_HEADER_SYNC,
+                version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            }],
+            ..PeerSpec::dialing()
+        }],
+        ..WireScenario::default()
+    };
+    let (report, _) = run::<HeaderWire>(&scenario, Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let refused = entries
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Transport {
+                event: TransportFact::StreamRefused { quic_stream, .. },
+                ..
+            } => Some(*quic_stream),
+            _ => None,
+        })
+        .expect("the node refuses the stream");
+    let ended = entries
+        .iter()
+        .position(|entry| {
+            matches!(&entry.obs, Observation::PeerEmitted {
+                quic_stream: Some(q),
+                body: EmittedBody::StreamEnded { direction: Direction::Receive, .. },
+                ..
+            } if *q == refused)
+        })
+        .expect("the peer records the refused stream's end");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.origin == Some(entries[ended].pos)),
+        "an unadmitted stream's end doesn't resolve"
+    );
+    assert!(
+        !entries[..ended]
+            .iter()
+            .any(|entry| matches!(entry.obs, Observation::PeerConnEnded { .. })),
+        "the connection lives"
     );
 }

@@ -1438,7 +1438,7 @@ impl PeerTask {
                     self.readiness.taken();
                     self.taken += 1;
                     match action {
-                        PeerAction::Open { kind, version } => open(conn, kind, version).await,
+                        PeerAction::Open { kind, version } => open(conn, kind, version, &recorder).await,
                         PeerAction::FinishHeader => {
                             let Some(mut stream) = header.take() else {
                                 return self.fail("can't finish-header without a header stream");
@@ -1502,19 +1502,32 @@ impl PeerTask {
 
 /// Opens a `kind` stream at `version` on `conn` and waits, for at most
 /// [`REFUSAL_WAIT`], for the node to reset it, finish it, or close the
-/// connection.
-async fn open(conn: &Conn, kind: u16, version: u16) {
-    let Ok((mut send, mut recv)) = conn.open_bi().await else {
-        return;
+/// connection, recording how the open, the prelude's write or the stream
+/// ended.
+async fn open(conn: &Conn, kind: u16, version: u16, recorder: &Recorder) {
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let reason = conn_end(&error);
+            return recorder.record(None, RecordBody::ConnEnded { reason });
+        }
     };
-    if handshake::write_prelude(&mut send, kind, version)
-        .await
-        .is_err()
-    {
-        return;
+    let id = send.id();
+    if let Err(error) = handshake::write_prelude(&mut send, kind, version).await {
+        return recorder.write_failed(Some(id), &error);
     }
-    let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
-    let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
+    let refused = async {
+        loop {
+            match recv.read_chunk(64 * 1024).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break ReadExactError::FinishedEarly(0),
+                Err(error) => break ReadExactError::ReadError(error),
+            }
+        }
+    };
+    if let Ok(ended) = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await {
+        recorder.read_failed(id, 0, &ended);
+    }
 }
 
 #[cfg(test)]

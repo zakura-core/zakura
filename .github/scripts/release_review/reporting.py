@@ -16,17 +16,24 @@ def plain(value: str) -> str:
 
 def render(report: dict, *, comment: bool = False) -> str:
     complete = report.get("status") == "complete"
-    lines = ["## Release AI review — " + ("complete" if complete else "INCOMPLETE"), "",
+    coverage = report.get("coverage", [])
+    excluded = [item for item in coverage if item["status"] == "out_of_scope"]
+    verdict = "complete within configured scope" if excluded else "complete"
+    lines = ["## Release AI review — " + (verdict if complete else "INCOMPLETE"), "",
              "Advisory, read-only review. No source code or tests were executed.", "",
              f"Range: `{report.get('base_tag', 'unresolved')}` (`{report.get('base_sha', 'unresolved')}`) → `{report['head_sha']}`.",
              (f"Reviewer revision: `{report.get('control_sha', 'unknown')}`. "
               f"Provider/model: {plain(report.get('provider', 'unconfigured'))} / {plain(report.get('model', 'unconfigured'))}. "
               f"Reasoning effort: {plain(report.get('reasoning_effort', 'unavailable'))}."),
              f"Prompt digest: `{report.get('prompt_digest', 'unavailable')}`.", ""]
-    coverage = report.get("coverage", [])
     reviewed = sum(item["status"] == "reviewed" for item in coverage)
-    lines.append(f"Coverage: {reviewed}/{len(coverage)} changed files reviewed; "
+    lines.append(f"Coverage: {reviewed}/{len(coverage) - len(excluded)} in-scope changed files reviewed "
+                 f"({len(coverage)} total changed files; {len(excluded)} excluded by configuration); "
                  f"cross-component synthesis {'completed' if report.get('synthesis_complete') else 'not completed'}.")
+    if report.get("excluded_paths"):
+        lines.append("Configured exclusions: " + ", ".join(plain(path) for path in report["excluded_paths"]) + ".")
+    if excluded:
+        lines.append("Excluded changes were not reviewed. Completion applies only to the configured scope.")
     usage = report.get("usage", {})
     lines.append(f"Estimated API cost, including uncertain requests: ${usage.get('estimated_usd_including_uncertain_calls', '0')} "
                  f"of ${usage.get('budget_usd', '25')}; {usage.get('calls', 0)} requests.")
@@ -51,7 +58,13 @@ def render(report: dict, *, comment: bool = False) -> str:
                            ("Connection to this release", "release_connection"), ("Suggested verification", "verification")):
             lines.append(f"**{label}:** {plain(finding[key])}")
         lines.append("")
-    missing = [entry for entry in coverage if entry["status"] != "reviewed"]
+    if excluded:
+        lines.extend(["", "### Configured exclusions", ""])
+        for entry in excluded[:20] if comment else excluded:
+            lines.append(f"- {plain(entry['path'])}: matched {plain(entry['exclusion_rule'])}")
+        if comment and len(excluded) > 20:
+            lines.append(f"- {len(excluded) - 20} additional excluded files are listed in the report artifact.")
+    missing = [entry for entry in coverage if entry["status"] not in {"reviewed", "out_of_scope"}]
     if missing:
         lines.extend(["", "### Coverage gaps", ""])
         for entry in missing[:20] if comment else missing:

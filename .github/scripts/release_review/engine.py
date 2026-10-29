@@ -102,6 +102,7 @@ def synthesize(repo: Repository, provider: ModelProvider, settings: Settings,
                     "Summarize the changed behavior and remaining interactions for the next synthesis pass. "
                     "Retain every substantiated bug; do not claim to have run tests.",
             "revisions": repo.refs, "review_results": group,
+            "excluded_paths": settings.excluded_paths,
         }
 
     def fits(group):
@@ -148,16 +149,17 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
                   provider=settings.provider, model=settings.model,
                   reasoning_effort=settings.reasoning_effort if settings.provider == "openai" else "provider default",
                   prompt_digest=settings.prompt_digest,
+                  excluded_paths=list(settings.excluded_paths),
                   usage=spending.report(), synthesis_complete=False)
     deadline = time.monotonic() + settings.max_seconds
-    units, coverage = repo.units(settings.unit_bytes)
+    units, coverage = repo.units(settings.unit_bytes, settings.excluded_paths)
     report["coverage"] = coverage
-    changed = {entry["path"] for entry in coverage}
+    changed = {entry["path"] for entry in coverage if entry["status"] != "out_of_scope"}
     completed = set()
 
     def save():
         for entry in coverage:
-            if entry["status"] != "excluded":
+            if entry["status"] not in {"excluded", "out_of_scope"}:
                 entry["status"] = "reviewed" if all(unit in completed for unit in entry["units"]) else "pending"
                 entry["reviewed_units"] = sum(unit in completed for unit in entry["units"])
         report["usage"] = spending.report()
@@ -165,11 +167,14 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
 
     save()
     try:
+        if coverage and not changed:
+            raise ReviewError("No changed files remain in the configured review scope")
         for batch in batch_units(units, settings.unit_bytes):
             turn = inspect_unit(repo, provider, settings, spending, {
                 "task": "Review every release-diff unit in this batch and their interactions; "
                         "use repository reads to check context before reporting a bug.",
                 "revisions": repo.refs, "units": [asdict(unit) for unit in batch],
+                "excluded_paths": settings.excluded_paths,
                 "note": "Each unit can continue a file diff. Complete means every supplied unit was inspected. "
                         "Line citations must be verified against source reads.",
             }, deadline, save)
@@ -184,7 +189,8 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
         if units:
             report["findings"] = synthesize(repo, provider, settings, spending, report, deadline, changed, save)
         report["synthesis_complete"] = True
-        report["status"] = "complete" if all(item["status"] == "reviewed" for item in coverage) else "incomplete"
+        report["status"] = "complete" if all(item["status"] in {"reviewed", "out_of_scope"}
+                                              for item in coverage) else "incomplete"
     except ReviewError as error:
         report["errors"].append(str(error))
     finally:

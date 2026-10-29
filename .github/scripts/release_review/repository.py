@@ -9,20 +9,15 @@ import selectors
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .contracts import ReviewError
+from .scope import matching_exclusion, safe_path
 
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?")
 SHA = re.compile(r"[0-9a-f]{40}")
 BASE_MARKER = re.compile(r"<!-- release-review-base: (.*?) -->")
 MAX_BLOB = 2_000_000
-
-
-def safe_path(path: str) -> bool:
-    return (bool(path) and not PurePosixPath(path).is_absolute()
-            and all(part not in {".", ".."} for part in path.split("/"))
-            and not any(ord(char) < 32 for char in path) and "\\" not in path)
 
 
 @dataclass(frozen=True)
@@ -172,7 +167,7 @@ class Repository:
         result = self.git(*args, allowed=(0, 1), max_bytes=80001, truncate=True).decode("utf-8", errors="replace")
         return {"revision": revision, "matches": result[:20000], "truncated": len(result) > 20000}
 
-    def units(self, limit: int) -> tuple[list[ReviewUnit], list[dict]]:
+    def units(self, limit: int, excluded_paths: tuple[str, ...] = ()) -> tuple[list[ReviewUnit], list[dict]]:
         paths = self.git("diff", "--name-only", "-z", "--no-renames", self.refs["base"], self.refs["head"])
         units, coverage = [], []
         for raw in paths.split(b"\0"):
@@ -184,6 +179,11 @@ class Repository:
             try:
                 if not safe_path(path):
                     raise ReviewError("path cannot be represented safely")
+                rule = matching_exclusion(path, excluded_paths)
+                if rule:
+                    entry.update(status="out_of_scope", reason="excluded by configuration",
+                                 exclusion_rule=rule)
+                    continue
                 for revision in ("base", "head"):
                     if path in self.trees[revision]:
                         self.source(revision, path)

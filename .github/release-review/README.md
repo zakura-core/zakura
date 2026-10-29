@@ -1,7 +1,8 @@
 # Release AI review
 
-This advisory workflow reviews the complete release diff from the preparation
-baseline to the release PR head, including changes already merged into `main`.
+This advisory workflow reviews the release diff from the preparation baseline
+to the release PR head, including changes already merged into `main`, subject
+to the explicit file exclusions below.
 It reports concrete consensus, cryptography, mining, and block propagation bugs
 as Critical, High, or Medium. It does not execute reviewed code, run tests, send
 Slack messages, change release gates, or approve a release.
@@ -74,6 +75,33 @@ for that PR. The publisher rechecks the current PR head and the existing
 comment's run identity before writing. It reads the comment back to verify the
 bot author, content, and target PR, then saves its URL in the JSON report and
 workflow summary. Results for old heads remain artifacts.
+
+## Exclude files
+
+Edit `[scope].exclude_paths` in `.github/release-review/config.toml`:
+
+```toml
+[scope]
+exclude_paths = [
+  ".github/workflows/", # Skip this directory and all descendants (enabled demo).
+  "docs/example.md",   # Skip exactly this file (optional example).
+]
+```
+
+Paths are literal, case-sensitive, and relative to the repository root.
+Use a trailing `/` for directories; wildcards, absolute paths, and `..` are
+rejected. Set `exclude_paths = []` to review every changed file. A rule applies
+to added, modified, and deleted paths; renames are evaluated as deletion and
+addition, so moving a file out of an excluded directory includes its new path.
+Changes take effect from the trusted reviewer revision on `main`.
+
+Matching diffs are omitted from model review requests. Related source remains
+available through read-only context tools, so this is a review-scope setting,
+not a confidentiality boundary. Findings must identify an included change.
+Every excluded file and its matching rule remain in the coverage manifest and
+are listed separately from unexpected coverage gaps. Reports record the rules
+and say when completion applies only to the configured scope. Excluding every
+changed file produces an incomplete report without making model calls.
 
 ## Interpret the result
 

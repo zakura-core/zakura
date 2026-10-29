@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .contracts import ReviewError
+from .scope import exclusion_paths
 
 
 def positive_decimal(value, name: str) -> Decimal:
@@ -40,6 +41,7 @@ class Settings:
     max_seconds: int
     instructions: str
     prompt_digest: str
+    excluded_paths: tuple[str, ...] = ()
 
 
 def load_settings(root: Path, provider: str, profile: str, models_json: str) -> Settings:
@@ -57,6 +59,7 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
         raise ReviewError("configure the prompt profile and RELEASE_REVIEW_MODELS first") from error
     if not isinstance(model, dict):
         raise ReviewError("provider configuration must be a JSON object")
+    exclusions = exclusion_paths(raw.get("scope", {}))
     name = model.get("model", "")
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,199}", name):
         raise ReviewError("an explicit model ID is required")
@@ -105,4 +108,4 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
         raise ReviewError("invalid review work limits")
     return Settings(provider, name, endpoint, input_price, output_price, budget,
                     max_input, max_output, effort, unit_bytes, rounds, seconds,
-                    prompt, hashlib.sha256(prompt.encode()).hexdigest())
+                    prompt, hashlib.sha256(prompt.encode()).hexdigest(), exclusions)

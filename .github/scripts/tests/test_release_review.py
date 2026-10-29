@@ -41,6 +41,7 @@ from release_review.models import (
 )
 from release_review.reporting import render, write_report
 from release_review.repository import Repository, ReviewUnit
+from release_review.scope import exclusion_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 HEAD = "b" * 40
@@ -127,6 +128,32 @@ class GitFixture(unittest.TestCase):
 
 
 class RangeTests(GitFixture):
+    def test_literal_exclusions_skip_diffs_but_keep_context_and_manifest(self):
+        for path in (".github/workflows/review.yml", ".github/workflows/nested/test.yml",
+                     ".github/workflows-old/review.yml", "release.txt.backup"):
+            file = self.root / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("related context\n")
+        self.commit("workflow examples")
+        self.repository.pin(self.git("rev-parse", "HEAD").strip(), "")
+        units, coverage = self.repository.units(24000, (".github/workflows/", "release.txt"))
+        skipped = {entry["path"]: entry for entry in coverage if entry["status"] == "out_of_scope"}
+        self.assertEqual(set(skipped), {".github/workflows/review.yml", ".github/workflows/nested/test.yml", "release.txt"})
+        self.assertTrue(all(not entry["units"] for entry in skipped.values()))
+        self.assertEqual(skipped[".github/workflows/review.yml"]["exclusion_rule"], ".github/workflows/")
+        self.assertEqual({unit.path for unit in units},
+                         {"validator.rs", ".github/workflows-old/review.yml", "release.txt.backup"})
+        self.assertIn("related context", self.repository.read("head", ".github/workflows/review.yml", 1, 1)["text"])
+
+    def test_renamed_file_leaving_excluded_path_is_reviewed_at_new_path(self):
+        self.git("mv", "validator.rs", "renamed.rs")
+        self.commit("move out of excluded path")
+        self.repository.pin(self.git("rev-parse", "HEAD").strip(), "")
+        units, coverage = self.repository.units(24000, ("validator.rs",))
+        self.assertEqual({unit.path for unit in units}, {"renamed.rs", "release.txt"})
+        deleted = next(entry for entry in coverage if entry["path"] == "validator.rs")
+        self.assertEqual(deleted["status"], "out_of_scope")
+
     def test_repository_output_limits_are_enforced_and_search_marks_truncation(self):
         with self.assertRaisesRegex(ReviewError, "bounded repository read"):
             self.repository.git("show", self.head + ":validator.rs", max_bytes=3)
@@ -358,6 +385,57 @@ class ProviderTests(unittest.TestCase):
 
 
 class EngineTests(GitFixture):
+    def test_scope_exclusions_are_reported_separately_from_reviewed_files(self):
+        provider = ScriptedProvider([completed([candidate()]), completed([candidate()])])
+        report = self.metadata()
+        review(self.repository, provider, settings(excluded_paths=("release.txt",)), report, lambda _: None)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["excluded_paths"], ["release.txt"])
+        self.assertEqual({entry["path"]: entry["status"] for entry in report["coverage"]},
+                         {"release.txt": "out_of_scope", "validator.rs": "reviewed"})
+        for request in provider.requests:
+            self.assertEqual(json.loads(request.messages[-1]["content"])["excluded_paths"], ["release.txt"])
+        markdown = render(report)
+        self.assertIn("complete within configured scope", markdown)
+        self.assertIn("1/1 in-scope changed files", markdown)
+        self.assertIn("2 total changed files; 1 excluded by configuration", markdown)
+        self.assertIn("### Configured exclusions", markdown)
+        self.assertNotIn("### Coverage gaps", markdown)
+
+    def test_excluding_every_change_is_incomplete_without_spending(self):
+        provider = ScriptedProvider([])
+        report = self.metadata()
+        review(self.repository, provider, settings(excluded_paths=("release.txt", "validator.rs")), report, lambda _: None)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertIn("No changed files remain", report["errors"][0])
+        self.assertFalse(report["synthesis_complete"])
+        self.assertEqual(provider.requests, [])
+        self.assertIn("not a clean review", render(report))
+
+    def test_excluded_change_cannot_anchor_a_finding(self):
+        provider = ScriptedProvider([completed([candidate()])])
+        report = self.metadata()
+        review(self.repository, provider, settings(excluded_paths=("validator.rs",)), report, lambda _: None)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertIn("changed release file", report["errors"][0])
+        self.assertEqual(report["findings"], [])
+
+    def test_unreadable_in_scope_files_remain_gaps_with_configured_exclusions(self):
+        (self.root / "binary").write_bytes(b"\0unreviewable")
+        self.commit("binary change")
+        self.repository.pin(self.git("rev-parse", "HEAD").strip(), "")
+        provider = ScriptedProvider([completed(), completed()])
+        report = self.metadata()
+        review(self.repository, provider, settings(excluded_paths=("release.txt",)), report, lambda _: None)
+        self.assertEqual(report["status"], "incomplete")
+        statuses = {entry["path"]: entry["status"] for entry in report["coverage"]}
+        self.assertEqual(statuses["binary"], "excluded")
+        self.assertEqual(statuses["release.txt"], "out_of_scope")
+        markdown = render(report)
+        self.assertIn("### Configured exclusions", markdown)
+        self.assertIn("### Coverage gaps", markdown)
+        self.assertIn("not a clean review", markdown)
+
     def test_batching_prioritizes_core_paths_and_preserves_every_unit_once(self):
         units = [ReviewUnit("doc", "docs/change.md", 1, "d" * 200),
                  ReviewUnit("network", "crates/zakura-network/src/lib.rs", 1, "n" * 600),
@@ -591,6 +669,25 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertEqual(len(conf.prompt_digest), 64)
         self.assertIn("Do not invent measurements", conf.instructions)
         self.assertEqual(conf.budget, Decimal(25))
+        self.assertEqual(conf.excluded_paths, (".github/workflows/",))
+
+    def test_exclusions_reject_ambiguous_or_unsafe_configuration(self):
+        for value in ("*.rs", [""], ["/"], ["/etc/passwd"], ["../file"], ["dir/../file"],
+                      ["dir//file"], ["./file"], ["dir\\file"], ["*.rs"], ["file?"],
+                      ["file[0]"], ["file\n"], [" file"], [True], ["x"] * 257):
+            with self.subTest(value=value), self.assertRaises(ReviewError):
+                exclusion_paths({"exclude_paths": value})
+        with self.assertRaises(ReviewError):
+            exclusion_paths({"exclude_path": ["file"]})
+        self.assertEqual(exclusion_paths({}), ())
+        self.assertEqual(exclusion_paths({"exclude_paths": ["file", "dir/", "file"]}), ("file", "dir/"))
+
+    def test_comment_bounds_exclusion_list_without_losing_full_artifact_coverage(self):
+        report = {"head_sha": HEAD, "status": "complete", "excluded_paths": ["docs/"],
+                  "coverage": [{"path": f"docs/file-{i}.md", "status": "out_of_scope",
+                                "exclusion_rule": "docs/"} for i in range(25)]}
+        self.assertIn("5 additional excluded files", render(report, comment=True))
+        self.assertIn("file\\-24", render(report))
 
     def test_model_prices_and_context_are_explicit(self):
         for changes in ({"model": ""}, {"input_usd_per_million": None}, {"output_usd_per_million": "NaN"},

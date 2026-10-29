@@ -4495,3 +4495,15 @@ async fn regtest_pq_p2p_relay_and_block_acceptance() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_p2p_test()).await??;
     Ok(())
 }
+
+/// Rollback below PQ activation removes eligibility; an alternate chain restores it.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_activation_crossing_reorg() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        common::regtest::pq_activation_reorg_test(),
+    )
+    .await??;
+    Ok(())
+}

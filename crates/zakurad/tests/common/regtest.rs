@@ -640,18 +640,31 @@ impl MiningRpcMethods for RpcRequestClient {
 /// Exercises actual RPC admission, template selection, and mining across local PQ activation.
 #[cfg(feature = "pq")]
 pub(crate) async fn pq_mempool_test() -> Result<()> {
-    pq_spend_test(false).await
+    pq_spend_test(PqSpendScenario::Mempool).await
 }
 
 /// Sends PQ authorizations over legacy P2P, then verifies the peer's mined block and RPC bytes.
 #[cfg(feature = "pq")]
 pub(crate) async fn pq_p2p_test() -> Result<()> {
-    pq_spend_test(true).await
+    pq_spend_test(PqSpendScenario::Peer).await
 }
 
-/// Shares real signed fixtures and RPC checks between local admission and peer propagation.
+/// Revalidates PQ spending after a rollback below activation and an alternate chain.
 #[cfg(feature = "pq")]
-async fn pq_spend_test(with_peer: bool) -> Result<()> {
+pub(crate) async fn pq_activation_reorg_test() -> Result<()> {
+    pq_spend_test(PqSpendScenario::Reorg).await
+}
+
+#[cfg(feature = "pq")]
+enum PqSpendScenario {
+    Mempool,
+    Peer,
+    Reorg,
+}
+
+/// Shares real signed fixtures across admission, propagation, and activation reorganization.
+#[cfg(feature = "pq")]
+async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
     use zakura_chain::{parameters::testnet::RegtestParameters, transaction::HashType};
     use zcash_script::script::Code;
     use zcash_transparent::{
@@ -835,7 +848,7 @@ async fn pq_spend_test(with_peer: bool) -> Result<()> {
     );
     // Node B starts with an empty database and learns the funding chain only from A.
     // No funding block or spending transaction is submitted to B through RPC.
-    let mut peer = if with_peer {
+    let mut peer = if matches!(scenario, PqSpendScenario::Peer) {
         let mut peer_config = config.clone();
         peer_config.network.initial_testnet_peers = [peer_address.to_string()].into();
         let mut peer_node = testdir()?
@@ -939,10 +952,17 @@ async fn pq_spend_test(with_peer: bool) -> Result<()> {
             .wrap_err("mined spends did not leave a node's mempool")??;
         }
         mined
+    } else if matches!(scenario, PqSpendScenario::Reorg) {
+        pq_reorg_spends(&client, &net, &spends, activation, block.hash()).await?
     } else {
         client.mine_proposed_block(&net).await?
     };
-    for index in [0, 1, 3] {
+    let expected_mined: &[usize] = if matches!(scenario, PqSpendScenario::Reorg) {
+        &[0, 1]
+    } else {
+        &[0, 1, 3]
+    };
+    for &index in expected_mined {
         assert!(mined
             .transactions
             .iter()
@@ -1000,4 +1020,158 @@ async fn assert_pq_rpc_bytes(client: &RpcRequestClient, transaction: &Transactio
     let decoded: Transaction = raw.0.as_slice().zcash_deserialize_into()?;
     assert_eq!(decoded, *transaction);
     Ok(())
+}
+
+/// Rolls back mined authorizations, rejects them below activation, then mines an alternate chain.
+#[cfg(feature = "pq")]
+async fn pq_reorg_spends(
+    client: &RpcRequestClient,
+    network: &Network,
+    spends: &[Transaction],
+    activation: Height,
+    funding_tip: block::Hash,
+) -> Result<Block> {
+    use zakura_chain::{
+        block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash},
+        serialization::BytesInDisplayOrder,
+    };
+
+    let old_block = client.mine_proposed_block(network).await?;
+    assert_eq!(old_block.coinbase_height(), Some(activation));
+    for index in [0, 1, 3] {
+        assert!(old_block
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == spends[index].hash()));
+    }
+    let fork_parent_height = i32::try_from(activation.0 - 1)?;
+    let old_parent = client
+        .get_block(fork_parent_height)
+        .await
+        .map_err(|e| eyre!(e))?
+        .expect("activation block has a parent");
+    let params = serde_json::to_string(&vec![old_parent.hash().to_string()])?;
+    let _: () = client
+        .json_result_from_call("invalidateblock", params)
+        .await
+        .map_err(|e| eyre!(e))?;
+    wait_for_pq_tip(client, funding_tip).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let pool: Vec<String> = client
+                .json_result_from_call("getrawmempool", "[]")
+                .await
+                .map_err(|e| eyre!(e))?;
+            if pool == vec![spends[3].hash().to_string()] {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .wrap_err("rollback did not remove PQ spends while preserving the legacy spend")??;
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 2)
+    );
+    for index in [0, 1] {
+        assert!(
+            client.send_raw_transaction(&spends[index]).await.is_err(),
+            "PQ spends are ineligible below activation after rollback"
+        );
+    }
+
+    let template: BlockTemplateResponse = client
+        .json_result_from_call("getblocktemplate", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert_eq!(template.height(), activation.0 - 1);
+    let mut candidate =
+        proposal_block_from_template(&template, BlockTemplateTimeSource::default(), network)?;
+    assert_eq!(
+        candidate.transactions.len(),
+        2,
+        "only the legacy spend remains eligible below activation"
+    );
+    assert_eq!(candidate.transactions[1].hash(), spends[3].hash());
+    // A different nonce avoids reusing the explicitly invalidated parent's hash.
+    Arc::make_mut(&mut candidate.header).nonce = [7; 32].into();
+    let proposal = |block: &Block| -> Result<String> {
+        Ok(serde_json::json!([{"mode": "proposal", "data": hex::encode(block.zcash_serialize_to_vec()?)}]).to_string())
+    };
+    let valid: BlockProposalResponse = client
+        .json_result_from_call("getblocktemplate", proposal(&candidate)?)
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert!(
+        valid.is_valid(),
+        "the pre-activation control block is valid: {valid:?}"
+    );
+    let mut forbidden = candidate.clone();
+    forbidden
+        .transactions
+        .extend([Arc::new(spends[0].clone()), Arc::new(spends[1].clone())]);
+    // The shared fixture pays two million zatoshis per spend. Preserve the exact reward
+    // and both commitments so rejection must reach transaction script validation.
+    if let Transaction::V5 { outputs, .. } = Arc::make_mut(&mut forbidden.transactions[0]) {
+        outputs[0] = Output::new(
+            (outputs[0].value() + Amount::<NonNegative>::try_from(4_000_000i64)?)?,
+            outputs[0].lock_script.clone(),
+        );
+    }
+    let auth_root: AuthDataRoot = forbidden.transactions.iter().collect();
+    let header = Arc::make_mut(&mut forbidden.header);
+    header.merkle_root = forbidden.transactions.iter().collect();
+    header.commitment_bytes = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &template.default_roots().chain_history_root(),
+        &auth_root,
+    )
+    .bytes_in_serialized_order()
+    .into();
+    let rejected: BlockProposalResponse = client
+        .json_result_from_call("getblocktemplate", proposal(&forbidden)?)
+        .await
+        .map_err(|e| eyre!(e))?;
+    match rejected {
+        BlockProposalResponse::Rejected(reason) => assert!(
+            reason.contains("script"),
+            "the otherwise valid block must fail script validation: {reason}"
+        ),
+        BlockProposalResponse::Valid => panic!("PQ spending block was accepted before activation"),
+    }
+    assert!(
+        client.submit_block(forbidden).await.is_err(),
+        "block submission also rejects pre-activation PQ authorizations"
+    );
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 2)
+    );
+    client.submit_block(candidate.clone()).await?;
+    wait_for_pq_tip(client, candidate.hash()).await?;
+    assert_ne!(
+        candidate.hash(),
+        old_parent.hash(),
+        "the node follows an alternate branch"
+    );
+    for index in [0, 1] {
+        client.send_raw_transaction(&spends[index]).await?;
+    }
+    let (restored, height) = client.block_from_template(network).await?;
+    assert_eq!(height, activation);
+    for index in [0, 1] {
+        assert!(
+            restored
+                .transactions
+                .iter()
+                .any(|tx| tx.hash() == spends[index].hash()),
+            "spends become eligible again on the alternate branch"
+        );
+    }
+    let mined = client.mine_proposed_block(network).await?;
+    assert_ne!(mined.hash(), old_block.hash());
+    for index in [0, 1, 3] {
+        assert_pq_rpc_bytes(client, &spends[index]).await?;
+    }
+    Ok(mined)
 }

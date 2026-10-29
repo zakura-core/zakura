@@ -29,6 +29,7 @@ use super::{
         policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
         HeaderNode, Policy, PolicySource, Topology,
     },
+    scenario::Rejection,
     wire_node::{TransportTap, WireNode},
     wire_plans::SavedPlan,
     NetScenario, Subsystem,
@@ -357,11 +358,21 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The scenario [`grammar::decode`] reads from `prefix`. A prefix the
-    /// grammar rejects, one written for another generator, draws the
-    /// default scenario.
+    /// The scenario [`grammar::decode`] reads from `prefix`. A prefix
+    /// written for another generator draws the default scenario.
+    ///
+    /// # Panics
+    ///
+    /// If `prefix` isn't [`Subsystem::SCENARIO_BYTES`] long, which breaks
+    /// `draw`'s contract.
     fn draw(prefix: &[u8]) -> StorageScenario {
-        grammar::decode(prefix).unwrap_or_default()
+        match grammar::decode(prefix) {
+            Ok(scenario) => scenario,
+            Err(Rejection::Version { .. }) => StorageScenario::default(),
+            Err(rejection @ Rejection::Length { .. }) => {
+                panic!("`draw` takes exactly SCENARIO_BYTES bytes, but {rejection}")
+            }
+        }
     }
 }
 

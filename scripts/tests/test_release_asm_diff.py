@@ -213,6 +213,46 @@ class ComparatorTests(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("masked location crates/x/src/lib.rs:10 -> 11", out)
 
+    def test_a_changed_string_naming_llvm_fails(self):
+        """A string that merely looks like a thin LTO suffix is still compared."""
+        status, out = compare([render(BASE, msg="a.llvm.111")], [render(BASE, msg="a.llvm.222")])
+        self.assertEqual(status, 1, out)
+
+    def test_a_changed_constructor_entry_fails(self):
+        """Unlabeled data, such as a constructor table's entry, is compared."""
+        table = "\t.section\t__DATA,__mod_init_func,mod_init_funcs\n\t.p2align\t3, 0x0\n\t.quad\t%s\n"
+        base = render(BASE, extra_function=SECOND_FUNCTION) + table % "__RNvCs1_5crate5check"
+        head = render(BASE, extra_function=SECOND_FUNCTION) + table % "__RNvCs1_5crate4zero"
+        status, out = compare([base], [head])
+        self.assertEqual(status, 1, out)
+        self.assertIn("unlabeled data in", out)
+
+    def test_a_changed_alignment_fails(self):
+        """A constant that keeps its contents but changes its alignment fails."""
+        head = render(BASE).replace("\t.p2align\t3, 0x0\nl_anon.aaaa.3:", "\t.p2align\t5, 0x0\nl_anon.aaaa.3:")
+        self.assertNotEqual(head, render(BASE))
+        status, out = compare([render(BASE)], [head])
+        self.assertEqual(status, 1, out)
+        self.assertIn("placement", out)
+
+    def test_a_location_column_must_fit_its_line(self):
+        """A moved location whose column isn't on its source line fails."""
+
+        class ShortLines:
+            """A line map for one inserted line, where every source line is 3 columns wide."""
+
+            def __call__(self, path, line):
+                """Maps through the insertion."""
+                return inserted_above(7)(path, line)
+
+            def fits(self, path, line, column):
+                """Only columns 1 to 4 fit."""
+                return 1 <= column <= 4
+
+        status, out = compare([render(BASE)], [render(BASE, line=11)], ShortLines())
+        self.assertEqual(status, 1, out)
+        self.assertIn("location crates/x/src/lib.rs:10:5 isn't a column of that line", out)
+
     def test_a_moved_promoted_location_passes(self):
         """A location and path string that thin LTO promoted to global symbols are still masked."""
 
@@ -317,27 +357,31 @@ class LineMapTests(unittest.TestCase):
         self.assertEqual(asm_diff.map_line(hunks, 22), 22)
 
 
-# A fake `cargo`: `metadata` prints an empty workspace, and any build
-# records whether Git can find the repository from a crate directory, the
-# way `zakurad`'s build script runs, then fails with status 7.
+# A fake `cargo`: `metadata` prints an empty workspace, and any build records
+# the build metadata that Git and `SOURCE_DATE_EPOCH` give a crate directory,
+# the way `zakurad`'s build script reads it. Then a base build succeeds when
+# `FAKE_CARGO_PASS_BASE` is set, and any other build fails with status 7.
 FAKE_CARGO = """#!/bin/sh
 if [ "$1" = metadata ]; then echo '{"packages": []}'; exit 0; fi
-(cd crates/x && git rev-parse HEAD) >> "$FAKE_CARGO_LOG" 2>&1
-echo "git status $?" >> "$FAKE_CARGO_LOG"
+side=$(basename "$PWD")
+cd crates/x
+echo "$side $(git rev-parse HEAD) $(git describe --always --tags --match 'v*.*.*') $SOURCE_DATE_EPOCH" >> "$FAKE_CARGO_LOG"
+[ "$side" = base ] && [ -n "$FAKE_CARGO_PASS_BASE" ] && exit 0
 exit 7
 """
 
 
 class CommandTests(unittest.TestCase):
-    def run_fake(self, tmp):
-        """Runs the tool on a one-commit repository with the fake cargo, returning status, output and log."""
+    def run_fake(self, tmp, base="HEAD", pass_base=False):
+        """Runs the tool on a two-commit repository with the fake cargo, returning status, output and log."""
         repo = Path(tmp) / "repo"
         (repo / "crates" / "x").mkdir(parents=True)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
-        (repo / "crates" / "x" / "README").write_text("x\n")
-        subprocess.run(git + ["add", "."], check=True)
-        subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+        for text in ("x\n", "y\n"):
+            (repo / "crates" / "x" / "README").write_text(text)
+            subprocess.run(git + ["add", "."], check=True)
+            subprocess.run(git + ["commit", "-q", "-m", text.strip()], check=True)
         cargo = Path(tmp) / "cargo"
         cargo.write_text(FAKE_CARGO)
         os.chmod(cargo, 0o755)
@@ -345,14 +389,17 @@ class CommandTests(unittest.TestCase):
         log.write_text("")
         out, err = io.StringIO(), io.StringIO()
         os.environ["FAKE_CARGO_LOG"] = str(log)
+        if pass_base:
+            os.environ["FAKE_CARGO_PASS_BASE"] = "1"
         try:
             with redirect_stdout(out), redirect_stderr(err):
                 status = asm_diff.main([
-                    "--repo", str(repo), "--base", "HEAD", "--head", "HEAD", "--cargo", str(cargo),
+                    "--repo", str(repo), "--base", base, "--head", "HEAD", "--cargo", str(cargo),
                     "--no-binary", "--work-dir", str(Path(tmp) / "work"),
                 ])
         finally:
             del os.environ["FAKE_CARGO_LOG"]
+            os.environ.pop("FAKE_CARGO_PASS_BASE", None)
         return status, out.getvalue() + err.getvalue(), log.read_text()
 
     def test_a_failed_command_exits_nonzero(self):
@@ -377,12 +424,13 @@ class CommandTests(unittest.TestCase):
     def test_build_overrides_are_dropped(self):
         """A caller's compiler flags and profile overrides don't reach the builds."""
         names = ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
-                 "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS", "CARGO_INCREMENTAL"]
+                 "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS", "CARGO_INCREMENTAL",
+                 "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]
         saved = {name: os.environ.get(name) for name in names}
         try:
             for name in names:
                 os.environ[name] = "--cfg zakura_sim"
-            env = asm_diff.build_env(Path("/tree"), Path("/target"), {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1"})
+            env = asm_diff.build_env(Path("/target"), {}, {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1"})
         finally:
             for name, value in saved.items():
                 if value is None:
@@ -393,13 +441,35 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"], "1")
         self.assertEqual(env["CARGO_TARGET_DIR"], "/target")
 
-    def test_builds_see_no_git_metadata(self):
-        """A build can't find the revision's Git repository, so `zakurad`'s build metadata is the same on both sides."""
+    def test_both_sides_see_the_base_metadata(self):
+        """Both sides' builds see the base revision's SHA, description and commit time."""
         with tempfile.TemporaryDirectory() as tmp:
-            _, output, log = self.run_fake(tmp)
-            self.assertIn("git status 128", log, output)
-            self.assertIn("not a git repository", log)
+            status, output, log = self.run_fake(tmp, base="HEAD~1", pass_base=True)
+            repo = Path(tmp) / "repo"
+            base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD~1"],
+                                  stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+        self.assertEqual(status, 3, output)
+        rows = [line.split() for line in log.splitlines()]
+        self.assertEqual(sorted({row[0] for row in rows}), ["base", "head"], log)
+        self.assertEqual({tuple(row[1:]) for row in rows}, {(base, base[:7], rows[0][3])}, log)
+        self.assertNotEqual(rows[0][3], "0", log)
 
+    def test_native_input_changes_are_reported(self):
+        """A change to C sources, build scripts or `Cargo.lock` is listed, and Rust sources aren't."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run(git + ["init", "-q"], check=True)
+            (repo / "README").write_text("x\n")
+            subprocess.run(git + ["add", "."], check=True)
+            subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+            for name in ("Cargo.lock", "crates/x/build.rs", "crates/x/src/lib.rs", "vendor/y/z.c"):
+                (repo / name).parent.mkdir(parents=True, exist_ok=True)
+                (repo / name).write_text("1\n")
+            subprocess.run(git + ["add", "."], check=True)
+            subprocess.run(git + ["commit", "-q", "-m", "y"], check=True)
+            changed = asm_diff.native_changes(repo, "HEAD~1", "HEAD")
+        self.assertEqual(sorted(changed), ["Cargo.lock", "crates/x/build.rs", "vendor/y/z.c"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -104,8 +104,9 @@ CALLSITE_META = re.compile(r"CALLSITE4META(?:17h[0-9a-f]{16}E)?$")
 
 # Directives that carry no code or data: debug lines, alignment, linkage and
 # object-file bookkeeping.
-DROPPED = (
-    ".loc", ".file", ".p2align", ".align", ".balign", ".globl", ".global",
+ALIGNMENT = (".p2align", ".align", ".balign")
+DROPPED = ALIGNMENT + (
+    ".loc", ".file", ".globl", ".global",
     ".private_extern", ".weak_definition", ".weak_def_can_be_hidden",
     ".weak_reference", ".alt_entry", ".build_version", ".macosx_version_min",
     ".subsections_via_symbols", ".type", ".size", ".local", ".hidden",
@@ -203,30 +204,40 @@ def split_file(text):
 
     Returns `(functions, blocks, set_names)`: functions as `(name, lines)`,
     with local code labels kept in the body as `label:` lines, data blocks
-    as `(label, section, lines)`, and the names that `.set` defines. Each
-    function body starts with its section directive, and each block keeps
-    its own, with the item's own name in it replaced by `SELF`, so moving
-    code or data to another section is a difference.
+    as `(label, section, align, lines)`, and the names that `.set` defines.
+    Each function body starts with its section directive, and each block
+    keeps its own and the alignment directives before it, with the item's
+    own name replaced by `SELF`, so moving code or data to another section
+    or alignment is a difference. Code or data that no label precedes, such
+    as a constructor table's entries, gets an empty label. Thin LTO's
+    `.llvm.<hash>` suffix is dropped from labels.
     """
     kind, section = "text", ".text"
     functions, blocks, set_names = [], [], set()
-    current = None
+    current, align = None, []
     for raw in text.splitlines():
         line = strip_comment(raw).strip()
         if not line:
             continue
         switched = section_kind(line)
         if switched:
-            kind, section, current = switched, line, None
+            kind, section, current, align = switched, line, None, []
             continue
-        if kind == "skip" or line.startswith(DROPPED):
+        if kind == "skip":
+            continue
+        if kind == "data" and line.startswith(ALIGNMENT):
+            # Alignment belongs to the block that follows it.
+            current = None
+            align.append(line)
+            continue
+        if line.startswith(DROPPED):
             continue
         if line.startswith(".set"):
             set_names.add(line.split(None, 1)[1].split(",")[0].strip())
         if line.startswith((".zerofill", ".tbss", ".comm", ".lcomm")):
             fields = [field.strip() for field in line.split(None, 1)[1].split(",")]
             name = fields[2] if line.startswith(".zerofill") else fields[0]
-            blocks.append((name, ".zerofill", [line.replace(name, "SELF")]))
+            blocks.append((LLVM_SUFFIX.sub("", name), ".zerofill", (), [line.replace(name, "SELF")]))
             current = None
             continue
         match = LABEL_LINE.match(line)
@@ -237,15 +248,23 @@ def split_file(text):
                     current.append(label + ":")
             elif kind == "text":
                 current = [section.replace(label, "SELF")]
-                functions.append((label, current))
+                functions.append((LLVM_SUFFIX.sub("", label), current))
             else:
                 current = []
-                blocks.append((label, section.replace(label, "SELF"), current))
+                blocks.append((LLVM_SUFFIX.sub("", label), section.replace(label, "SELF"),
+                               tuple(item.replace(label, "SELF") for item in align), current))
+                align = []
             if rest and current is not None:
                 current.append(rest)
             continue
-        if current is not None:
-            current.append(line)
+        if current is None:
+            current = [section] if kind == "text" else []
+            if kind == "text":
+                functions.append(("", current))
+            else:
+                blocks.append(("", section, tuple(align), current))
+                align = []
+        current.append(line)
     return functions, blocks, set_names
 
 
@@ -272,6 +291,7 @@ class Renamer:
         """The new name for one identifier, or the identifier itself when it isn't local."""
         token = match.group(1)
         if token not in self.local:
+            token = LLVM_SUFFIX.sub("", token)
             self.symbols.add(token)
             return token
         if token not in self.names:
@@ -294,7 +314,10 @@ class Block:
     __slots__ = ("key", "section", "items", "refs", "symbols")
 
     def __init__(self, key, section, items, refs, symbols=()):
-        """Stores the block's unit-wide key, section, items, `(token, qualified label)` refs and global symbols."""
+        """Stores the block's unit-wide key, placement, items, `(token, qualified label)` refs and global symbols.
+
+        `section` is the block's section directive and alignment directives.
+        """
         self.key, self.section, self.items, self.refs = key, section, items, refs
         self.symbols = frozenset(symbols)
 
@@ -414,8 +437,8 @@ class Unit:
 
     def add_file(self, index, text):
         """Parses one `.s` file's text into the unit."""
-        functions, blocks, set_names = split_file(LLVM_SUFFIX.sub("", text))
-        data = {label for label, _, _ in blocks if LOCAL.match(label)}
+        functions, blocks, set_names = split_file(text)
+        data = {label for label, _, _, _ in blocks if LOCAL.match(label)}
         local = set(data) | {n for n in set_names if LOCAL.match(n)}
         for _, lines in functions:
             for line in lines:
@@ -429,15 +452,16 @@ class Unit:
         for name, lines in functions:
             rename = Renamer(local, data, qualify)
             body = tuple(rename(line) for line in lines)
-            self.functions[name].append((body, rename.refs))
-        for label, section, lines in blocks:
+            self.functions[name or "unlabeled code in " + lines[0]].append((body, rename.refs))
+        for label, section, align, lines in blocks:
             rename = Renamer(local, data, qualify)
-            key = qualify(label) if label in data else label
-            block = Block(key, rename(section), data_items(lines, rename), rename.refs, rename.symbols)
+            placement = tuple(rename(line) for line in (section,) + align)
+            key = qualify(label) if label in data else label or "unlabeled data in " + section
+            block = Block(key, placement, data_items(lines, rename), rename.refs, rename.symbols)
             if label in data:
                 self.local[key] = block
             else:
-                self.named[label].append(block)
+                self.named[key].append(block)
 
     def finish(self):
         """Marks string lengths, then finds where `tracing` callsites keep their line.
@@ -572,7 +596,7 @@ class GitLineMap:
     def __init__(self, repo, base, head):
         """Takes the repository and the two commits."""
         self.repo, self.base, self.head = repo, base, head
-        self.hunks = {}
+        self.hunks, self.texts = {}, {}
 
     def __call__(self, path, line):
         """The head line for `path`'s base `line`, or None when it changed or the file isn't in both."""
@@ -580,6 +604,16 @@ class GitLineMap:
             self.hunks[path] = self._hunks(path)
         hunks = self.hunks[path]
         return None if hunks is None else map_line(hunks, line)
+
+    def fits(self, path, line, column):
+        """Whether `column` (1-based) is a column of base `line` of `path`, or just past its end."""
+        if path not in self.texts:
+            show = subprocess.run(["git", "-C", str(self.repo), "show", f"{self.base}:{path}"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            text = show.stdout.decode(errors="replace") if show.returncode == 0 else None
+            self.texts[path] = text.split("\n") if text is not None else None
+        lines = self.texts[path]
+        return lines is not None and 1 <= line <= len(lines) and 1 <= column <= len(lines[line - 1]) + 1
 
     def _hunks(self, path):
         """The diff hunks for a relative repository path in both commits, else None."""
@@ -672,7 +706,7 @@ def compare_blocks(bunit, base, hunit, head, line_map):
     `event <file>:<line>` name.
     """
     if base.section != head.section:
-        return "section %s -> %s" % (base.section, head.section), []
+        return "placement %s -> %s" % (" ".join(base.section), " ".join(head.section)), []
     if base.items == head.items:
         return None, []
     btext, htext = base.string(), head.string()
@@ -720,6 +754,10 @@ def compare_blocks(bunit, base, hunit, head, line_map):
         bline, hline = int.from_bytes(bytes(bword), "little"), int.from_bytes(bytes(hword), "little")
         if line_map(path, bline) != hline:
             return "line %d -> %d of %s isn't mapped by the diff" % (bline, hline, path), []
+        fits = getattr(line_map, "fits", None)
+        column = int.from_bytes(bytes(bflat[20:24]), "little") if location and None not in bflat[20:24] else None
+        if fits and column is not None and not fits(path, bline, column):
+            return "location %s:%d:%d isn't a column of that line" % (path, bline, column), []
         masked.append((path, bline, hline, "location" if location else "callsite"))
     return None, masked
 
@@ -848,19 +886,63 @@ def compare_text(base, head):
 # ---------------------------------------------------------------------------
 
 
-def build_env(tree, target, extra=None):
-    """The environment for a build of `tree`, with build metadata made the same on both sides.
+# A `git` that answers `zakurad`'s build-metadata queries
+# (`crates/zakurad/build/metadata.rs`) with fixed values and passes anything
+# else to the real `git`.
+FAKE_GIT = """#!/bin/sh
+case "$*" in
+  'rev-parse --is-inside-work-tree') echo true ;;
+  'rev-parse --git-dir') echo '{git_dir}' ;;
+  'symbolic-ref HEAD') exit 1 ;;
+  'rev-parse --abbrev-ref --symbolic-full-name HEAD') echo HEAD ;;
+  'rev-parse HEAD') echo '{sha}' ;;
+  'describe --always --tags --match v*.*.*') echo '{describe}' ;;
+  'status --porcelain --untracked-files=no') ;;
+  *) exec '{git}' "$@" ;;
+esac
+"""
+
+
+def metadata_env(work, repo, base):
+    """Build settings that give both sides the base revision's build metadata.
 
     `zakurad`'s build script embeds the revision's Git SHA, description and
-    commit time (`crates/zakurad/build/metadata.rs`), which would make any
-    two commits differ. Git can't find the repository from inside `tree`
-    when `tree` is a ceiling directory, so the script records no Git
-    metadata on either side, as for a source archive build. No data is
-    masked for it.
+    commit time, which would make any two commits differ. Both sides get the
+    base's values instead, from a `git` placed first on `PATH` and from
+    `SOURCE_DATE_EPOCH`, so the metadata is present and valid, as in a normal
+    build, and the code that reads it is still compiled. No data is masked
+    for it.
     """
-    env = {"GIT_CEILING_DIRECTORIES": str(tree), "SOURCE_DATE_EPOCH": "0"}
+    real = shutil.which("git")
+    if real is None:
+        raise rw.CommandFailed(["git"], "not on PATH")
+    describe = rw.run(["git", "-C", repo, "describe", "--always", "--tags", "--match", "v*.*.*", base],
+                      capture=True).strip()
+    epoch = rw.run(["git", "-C", repo, "log", "-1", "--format=%ct", base], capture=True).strip()
+    fake = work / "metadata-git" / "git"
+    fake.parent.mkdir(parents=True, exist_ok=True)
+    fake.write_text(FAKE_GIT.format(git_dir=fake.parent / "no-git-dir", sha=base, describe=describe, git=real))
+    fake.chmod(0o755)
+    return {"PATH": str(fake.parent) + os.pathsep + os.environ.get("PATH", ""), "SOURCE_DATE_EPOCH": epoch}
+
+
+def build_env(target, inputs, extra=None):
+    """The environment for a build into `target`, with `inputs` from `metadata_env` and then `extra`."""
+    env = dict(inputs)
     env.update(extra or {})
     return rw.cargo_env(target, env)
+
+
+# Inputs that build native code or drive builds, which the assembly doesn't
+# show. A change to one means the gate can't vouch for the binary.
+NATIVE_INPUTS = ["Cargo.lock", "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.S",
+                 ":(glob)**/build.rs", ":(glob)**/build/**"]
+
+
+def native_changes(repo, base, head):
+    """The files in `NATIVE_INPUTS` that differ between `base` and `head`."""
+    return rw.run(["git", "-C", repo, "diff", "--name-only", base, head, "--"] + NATIVE_INPUTS,
+                  capture=True).split()
 
 
 @contextlib.contextmanager
@@ -893,7 +975,7 @@ def collect_asm(deps, prefix, out_dir):
     return sorted(out_dir.glob("*.s"))
 
 
-def emit_asm(cargo, tree, target, package, crate, cgu, out_dir):
+def emit_asm(cargo, tree, target, inputs, package, crate, cgu, out_dir):
     """Emits `package`'s release library assembly, and moves its `.s` files to `out_dir`.
 
     `crate` is the library's crate name, and `cgu` the codegen-units setting
@@ -906,12 +988,12 @@ def emit_asm(cargo, tree, target, package, crate, cgu, out_dir):
     rw.run(
         [cargo, "rustc", "--release", "--locked", "-p", package, "--lib", "--",
          "--emit=asm,link", "-C", "codegen-units=%d" % cgu],
-        cwd=tree, env=build_env(tree, target),
+        cwd=tree, env=build_env(target, inputs),
     )
     return collect_asm(deps, crate + "-", out_dir)
 
 
-def emit_binary(cargo, tree, target, cgu, out_dir):
+def emit_binary(cargo, tree, target, inputs, cgu, out_dir):
     """Builds the release `zakurad` with every workspace crate at `cgu` codegen units.
 
     With the release profile's thin LTO, `--emit=asm` on the binary writes
@@ -926,7 +1008,7 @@ def emit_binary(cargo, tree, target, cgu, out_dir):
     rw.run(
         [cargo, "rustc", "--release", "--locked", "-p", BINARY_PACKAGE, "--bin", BINARY, "--",
          "--emit=asm,link"],
-        cwd=tree, env=build_env(tree, target, {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": str(cgu)}),
+        cwd=tree, env=build_env(target, inputs, {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": str(cgu)}),
     )
     text = text_section(target / "release" / BINARY)
     return collect_asm(deps, BINARY + "-", out_dir), text
@@ -1050,7 +1132,9 @@ def main(argv=None):
         base, head = rw.resolve(repo, args.base), rw.resolve(repo, args.head)
         print("base %s, head %s" % (base, head), flush=True)
         line_map = GitLineMap(repo, base, head)
+        native = native_changes(repo, base, head)
         with rw.Worktrees(repo, base, head, args.work_dir) as trees:
+            inputs = metadata_env(trees.work, repo, base)
             asm, texts = {}, {}
             for side in ("base", "head"):
                 tree = trees.tree(side)
@@ -1061,12 +1145,12 @@ def main(argv=None):
                         for cgu in cgus:
                             out = trees.work / "asm" / side / ("%s-cgu%d" % (package, cgu))
                             asm[side, package, cgu] = emit_asm(
-                                args.cargo, tree, target, package, crate, cgu, out)
+                                args.cargo, tree, target, inputs, package, crate, cgu, out)
                     if not args.no_binary:
                         for cgu in cgus:
                             out = trees.work / "asm" / side / ("%s-cgu%d" % (BINARY, cgu))
                             asm[side, BINARY, cgu], texts[side, cgu] = emit_binary(
-                                args.cargo, tree, target, cgu, out)
+                                args.cargo, tree, target, inputs, cgu, out)
             status = run_comparisons(comparisons(asm, packages, cgus, not args.no_binary), line_map, args.jobs)
             for cgu in cgus:
                 if args.no_binary:
@@ -1077,6 +1161,9 @@ def main(argv=None):
                     BINARY, cgu, difference or "identical (%d bytes)" % len(texts["base", cgu])))
                 if difference:
                     status = max(status, EXIT_DIFFERS)
+            if native:
+                print("native or build inputs changed, which the assembly can't show: %s" % " ".join(native))
+                status = max(status, EXIT_DIFFERS)
     except rw.CommandFailed as error:
         print("error: %s" % error, file=sys.stderr)
         return rw.EXIT_COMMAND_FAILED

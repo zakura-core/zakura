@@ -221,6 +221,11 @@ impl RecordSink for EndSeen<'_> {
         self.ended = matches!(record, Record::End(_));
         self.sink.record(record);
     }
+
+    /// Forwards to the sink.
+    fn wants_steps(&self) -> bool {
+        self.sink.wants_steps()
+    }
 }
 
 /// Checks `property`'s report in `report` against `expect`, before its

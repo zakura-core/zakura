@@ -1,0 +1,40 @@
+[package]
+name = "zakura-sim-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
+# default ASan build needs. A build with `-s none` turns it off with
+# `--no-default-features`, since the feature links against the ASan runtime.
+default = ["sanitizer"]
+sanitizer = ["zakura-scheduler/sanitizer"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+zakura-scheduler = { path = "../../../crates/zakura-scheduler" }
+zakura-sim = { path = "../../../crates/zakura-sim" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(zakura_sim)"] }
+
+[[bin]]
+name = "discovery_wait_complete"
+path = "fuzz_targets/discovery_wait_complete.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "race_fixtures"
+path = "fuzz_targets/race_fixtures.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

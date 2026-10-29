@@ -141,18 +141,7 @@ impl<F: Fixture> Subsystem for Race<F> {
     /// The scenario's workers, small stacks, and a budget far past any
     /// fixture's end.
     fn config(scenario: &Scenario) -> RunConfig {
-        RunConfig {
-            scheduler: SchedulerConfig {
-                workers: scenario.workers,
-                // Fixture tasks are tiny, and a small stack keeps the pool
-                // cheap.
-                stack_size: 64 * 1024,
-                ..SchedulerConfig::default()
-            },
-            budget: 1_000,
-            drain_bound: 1_000,
-            ..RunConfig::default()
-        }
+        race_config(scenario.workers)
     }
 
     /// Nothing to set up.
@@ -161,11 +150,7 @@ impl<F: Fixture> Subsystem for Race<F> {
     /// Spawns an unrelated task first for [`Variant::UnrelatedTask`], then
     /// the fixture.
     fn build(sim: &mut Sim, scenario: &Scenario, (): ()) -> Self {
-        if scenario.variant == Variant::UnrelatedTask {
-            sim.scheduler().spawn_root("unrelated", async {
-                sleep(Duration::from_millis(3)).await;
-            });
-        }
+        spawn_unrelated(sim, scenario.variant);
         Race(F::spawn(sim, scenario.variant))
     }
 
@@ -196,6 +181,33 @@ impl<F: Fixture> Subsystem for Race<F> {
             variant: Variant::ALL[usize::from(byte(0)) % Variant::ALL.len()],
             workers: 1 + u16::from(byte(1) & 1),
         }
+    }
+}
+
+/// A race fixture's run config: `workers` workers, small stacks, and a
+/// budget far past any fixture's end.
+fn race_config(workers: u16) -> RunConfig {
+    RunConfig {
+        scheduler: SchedulerConfig {
+            workers,
+            // Fixture tasks are tiny, and a small stack keeps the pool
+            // cheap.
+            stack_size: 64 * 1024,
+            ..SchedulerConfig::default()
+        },
+        budget: 1_000,
+        drain_bound: 1_000,
+        ..RunConfig::default()
+    }
+}
+
+/// Spawns a task unrelated to the fixture for [`Variant::UnrelatedTask`],
+/// before the fixture's tasks.
+fn spawn_unrelated(sim: &mut Sim, variant: Variant) {
+    if variant == Variant::UnrelatedTask {
+        sim.scheduler().spawn_root("unrelated", async {
+            sleep(Duration::from_millis(3)).await;
+        });
     }
 }
 
@@ -712,5 +724,237 @@ impl Fixture for AbortWithoutJoin {
             aborted = ran.ran_kind("abort");
             false
         })
+    }
+}
+
+/// Which race fixture a [`Pick`] run builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Which {
+    /// [`LostUpdate`].
+    LostUpdate,
+    /// [`SnapshotReserve`].
+    SnapshotReserve,
+    /// [`MissedNotify`].
+    MissedNotify,
+    /// [`TimerCancel`].
+    TimerCancel,
+    /// [`AbBa`].
+    AbBa,
+    /// [`AbortWithoutJoin`].
+    AbortWithoutJoin,
+}
+
+impl Which {
+    /// Every fixture, in [`Subsystem::draw`] order.
+    pub const ALL: [Which; 6] = [
+        Which::LostUpdate,
+        Which::SnapshotReserve,
+        Which::MissedNotify,
+        Which::TimerCancel,
+        Which::AbBa,
+        Which::AbortWithoutJoin,
+    ];
+
+    /// The fixture's property ID, which is also its own harness's name.
+    pub fn property(self) -> &'static str {
+        match self {
+            Which::LostUpdate => LostUpdate::NAME,
+            Which::SnapshotReserve => SnapshotReserve::NAME,
+            Which::MissedNotify => MissedNotify::NAME,
+            Which::TimerCancel => TimerCancel::NAME,
+            Which::AbBa => AbBa::NAME,
+            Which::AbortWithoutJoin => AbortWithoutJoin::NAME,
+        }
+    }
+}
+
+/// The `race_fixtures` fuzz target's expected failures: each fixture's
+/// property, which its `Base` variant violates, and how long a campaign may
+/// run before it must have found that violation (explorer implementation
+/// plan, E1b). A campaign that passes a limit without the find fails, as
+/// does any failure of a `Fixed` variant or of another property.
+pub const EXPECTED: [(&str, Duration); 6] = [
+    (LostUpdate::NAME, FIND_LIMIT),
+    (SnapshotReserve::NAME, FIND_LIMIT),
+    (MissedNotify::NAME, FIND_LIMIT),
+    (TimerCancel::NAME, FIND_LIMIT),
+    (AbBa::NAME, FIND_LIMIT),
+    (AbortWithoutJoin::NAME, FIND_LIMIT),
+];
+
+/// Each fixture's discovery limit in [`EXPECTED`].
+const FIND_LIMIT: Duration = Duration::from_secs(60);
+
+/// A [`Pick`] run's scenario.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PickScenario {
+    /// Which fixture runs.
+    pub fixture: Which,
+    /// Which version of it runs.
+    pub variant: Variant,
+    /// Simulated workers, 1 or 2.
+    pub workers: u16,
+}
+
+/// A spawned fixture without its type, so one harness can run any of them.
+trait AnyFixture {
+    /// What went wrong, if the fixture's state now shows its race after a
+    /// step that leaves the scheduler `status`.
+    fn failure(&self, status: Status) -> Option<String>;
+}
+
+impl<F: Fixture> AnyFixture for F {
+    /// [`Fixture::failure`] on the fixture's view now.
+    fn failure(&self, status: Status) -> Option<String> {
+        F::failure(&self.view(), status)
+    }
+}
+
+/// One harness over all six race fixtures, whose scenario picks the
+/// fixture, the variant and the workers. [`All`] picks any variant, and
+/// [`Fixed`] only [`Variant::Fixed`], which must never fail.
+pub struct Pick<const FIXED_ONLY: bool> {
+    fixture: Which,
+    race: Rc<dyn AnyFixture>,
+}
+
+/// Any fixture in any variant: the `race_fixtures` fuzz target's harness.
+pub type All = Pick<false>;
+
+/// Any fixture, fixed.
+pub type Fixed = Pick<true>;
+
+/// A [`Pick`] harness's view: the fixture that runs, and its state, read
+/// when a check asks, as each fixture's own harness reads it.
+pub struct PickView {
+    fixture: Which,
+    race: Rc<dyn AnyFixture>,
+}
+
+impl PickView {
+    /// The fixture that runs.
+    pub fn fixture(&self) -> Which {
+        self.fixture
+    }
+
+    /// What went wrong, if the fixture's state now shows its race after a
+    /// step that leaves the scheduler `status`.
+    pub fn failure(&self, status: Status) -> Option<String> {
+        self.race.failure(status)
+    }
+}
+
+impl<const FIXED_ONLY: bool> HasView for Pick<FIXED_ONLY> {
+    type View = PickView;
+
+    /// The fixture and its live state.
+    fn view(&self) -> PickView {
+        PickView {
+            fixture: self.fixture,
+            race: Rc::clone(&self.race),
+        }
+    }
+}
+
+impl<const FIXED_ONLY: bool> Subsystem for Pick<FIXED_ONLY> {
+    const NAME: &'static str = if FIXED_ONLY {
+        "fixtures/fixed"
+    } else {
+        "fixtures/all"
+    };
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 3;
+    type Scenario = PickScenario;
+    type Prepared = ();
+
+    /// As each fixture's own harness.
+    fn config(scenario: &PickScenario) -> RunConfig {
+        race_config(scenario.workers)
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &PickScenario) {}
+
+    /// Spawns the picked fixture, as its own harness does.
+    fn build(sim: &mut Sim, scenario: &PickScenario, (): ()) -> Self {
+        let variant = scenario.variant;
+        spawn_unrelated(sim, variant);
+        let race: Rc<dyn AnyFixture> = match scenario.fixture {
+            Which::LostUpdate => Rc::new(LostUpdate::spawn(sim, variant)),
+            Which::SnapshotReserve => Rc::new(SnapshotReserve::spawn(sim, variant)),
+            Which::MissedNotify => Rc::new(MissedNotify::spawn(sim, variant)),
+            Which::TimerCancel => Rc::new(TimerCancel::spawn(sim, variant)),
+            Which::AbBa => Rc::new(AbBa::spawn(sim, variant)),
+            Which::AbortWithoutJoin => Rc::new(AbortWithoutJoin::spawn(sim, variant)),
+        };
+        Pick {
+            fixture: scenario.fixture,
+            race,
+        }
+    }
+
+    /// Every fixture's property. Only the picked fixture's applies.
+    fn properties() -> Vec<Property<Self>> {
+        vec![
+            picked_property::<LostUpdate, FIXED_ONLY>(),
+            picked_property::<SnapshotReserve, FIXED_ONLY>(),
+            picked_property::<MissedNotify, FIXED_ONLY>(),
+            picked_property::<TimerCancel, FIXED_ONLY>(),
+            picked_property::<AbBa, FIXED_ONLY>(),
+            picked_property::<AbortWithoutJoin, FIXED_ONLY>(),
+        ]
+    }
+
+    /// The fixture's view and the step loop's task observations.
+    fn sources() -> Sources {
+        Sources::observed(&[Source::View, Source::Schedule])
+    }
+
+    /// Byte 0 picks the fixture from [`Which::ALL`], byte 1 the variant from
+    /// [`Variant::ALL`] (always [`Variant::Fixed`] for [`Fixed`]), and byte
+    /// 2's low bit 1 or 2 workers.
+    fn draw(prefix: &[u8]) -> PickScenario {
+        let byte = |i: usize| usize::from(prefix.get(i).copied().unwrap_or_default());
+        PickScenario {
+            fixture: Which::ALL[byte(0) % Which::ALL.len()],
+            variant: if FIXED_ONLY {
+                Variant::Fixed
+            } else {
+                Variant::ALL[byte(1) % Variant::ALL.len()]
+            },
+            workers: if byte(2) & 1 == 1 { 2 } else { 1 },
+        }
+    }
+}
+
+/// Fixture `F`'s property in a [`Pick`] harness: its own harness's, applied
+/// only when the scenario picks `F`.
+fn picked_property<F: Fixture, const FIXED_ONLY: bool>() -> Property<Pick<FIXED_ONLY>> {
+    Property {
+        id: PropertyId::new(F::NAME),
+        claim: F::EXPECTED,
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View, Source::Schedule],
+        status: PropertyStatus::Active,
+        check: no_race_in::<F, FIXED_ONLY>,
+        witness: Some(F::trigger_history),
+    }
+}
+
+/// [`no_race`] for fixture `F` in a [`Pick`] harness: not applicable when
+/// the scenario picked another fixture.
+fn no_race_in<F: Fixture, const FIXED_ONLY: bool>(
+    cx: &mut CheckCtx<'_, Pick<FIXED_ONLY>>,
+) -> Verdict {
+    let view = cx.view();
+    if view.fixture().property() != F::NAME || cx.status == Status::Running {
+        return Verdict::NotApplicable;
+    }
+    match view.failure(cx.status) {
+        Some(actual) => cx.violated(F::EXPECTED, actual),
+        None => Verdict::Holds,
     }
 }

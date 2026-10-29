@@ -7,6 +7,7 @@
 //! outcome at run end.
 
 mod assume;
+mod component;
 mod cx;
 mod id;
 mod registry;
@@ -15,6 +16,7 @@ mod verdict;
 use serde::{Deserialize, Serialize};
 
 pub use assume::{Assume, AssumeRecord, Assumptions};
+pub use component::ComponentKind;
 pub use cx::{Capture, CheckCtx, HasView};
 pub use id::{BadId, PropertyId};
 pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
@@ -102,6 +104,9 @@ pub enum Source {
     View,
     /// Scheduler state: tasks and preemption points.
     Schedule,
+    /// One component of the node's actual state, read at each boundary
+    /// (M6a). A tier that lacks it excludes it with a reason.
+    Component(ComponentKind),
 }
 
 /// Whether a property's violation blocks CI (properties.md, Statuses). Its

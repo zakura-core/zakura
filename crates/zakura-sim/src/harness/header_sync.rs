@@ -39,8 +39,8 @@ use crate::{
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Source,
-        Sources, Status, Verdict,
+        Assume, AssumeRecord, Assumptions, CheckCtx, ComponentKind, HasView, Kind, Property,
+        PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
@@ -597,17 +597,17 @@ impl Subsystem for HeaderWire {
         storage_properties()
     }
 
-    /// [`storage_sources`], plus the network's datagrams, the peers'
-    /// frames and the node's closes.
+    /// The storage harness's sources, plus the network's datagrams, the
+    /// peers' frames, the node's closes, and the wire tier's components.
     fn sources() -> Sources {
-        Sources::observed(&[
+        SourceManifest::wire().sources(Sources::observed(&[
             Source::Schedule,
             Source::Storage,
             Source::View,
             Source::Datagrams,
             Source::Frames,
             Source::Closes,
-        ])
+        ]))
     }
 
     /// For a scenario with an adversary, `BoundedAdversary` at
@@ -686,9 +686,186 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
 }
 
 /// What [`storage_properties`] read: the node's storage facts and the
-/// harness's view, plus the step loop's task observations.
+/// harness's view, plus the step loop's task observations, with the
+/// storage tier's components.
 pub fn storage_sources() -> Sources {
-    Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+    SourceManifest::storage().sources(Sources::observed(&[
+        Source::Schedule,
+        Source::Storage,
+        Source::View,
+    ]))
+}
+
+/// What shows that a component exists, because it acted (M6a, rule 7).
+/// Before it, the component is `Initializing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The harness built it.
+    HarnessBuilt,
+    /// The reactor's first `Resumed{arm: Start}`, which binds its task.
+    ReactorStarted,
+    /// The reactor's first `Settled`.
+    ReactorSettled,
+    /// The first `EntriesTaken`.
+    EntriesTaken,
+    /// A session's `Installed` record and its `RegistryFanout`.
+    Installed,
+    /// The first output's `Allocated`.
+    Allocated,
+    /// The first transport `Registered`.
+    Registered,
+    /// The first header stream's `Admitted`.
+    HeaderAdmitted,
+    /// The connection's first `ConnResumed{turn: 0}`.
+    ConnStarted,
+    /// The connection's first `ConnResumed` or stream event.
+    ConnActive,
+    /// The gauge's first set.
+    GaugeSet,
+}
+
+/// When a component ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndRule {
+    /// Its read reports `Gone`.
+    Gone,
+    /// Its loop's final `Settled`.
+    FinalSettled,
+    /// With the component that holds its registry.
+    With(ComponentKind),
+    /// At each output's terminal record, or pending at the freeze.
+    Terminal,
+    /// At `ConnEnded`, with no live task or permit.
+    ConnEnded,
+    /// When its last tag drops.
+    LastTag,
+    /// When the run ends.
+    RunEnd,
+}
+
+/// One component a tier has: the evidence that it exists, its end rule,
+/// and the parts a reconciliation over it names, itself included. Empty
+/// `parts` means it has no reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifestRow {
+    /// The component.
+    pub kind: ComponentKind,
+    /// What shows it exists.
+    pub exists: Evidence,
+    /// When it ends.
+    pub ends: EndRule,
+    /// The parts its reconciliation names.
+    pub parts: &'static [ComponentKind],
+}
+
+/// A header tier's components (M6a, Components and Tiers): the rows it
+/// has, and the ones it excludes, each with its reason. A property that
+/// needs an excluded component is `NotApplicable` with that reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceManifest {
+    rows: Vec<ManifestRow>,
+    excluded: Vec<(ComponentKind, &'static str)>,
+}
+
+/// A manifest row.
+const fn row(
+    kind: ComponentKind,
+    exists: Evidence,
+    ends: EndRule,
+    parts: &'static [ComponentKind],
+) -> ManifestRow {
+    ManifestRow {
+        kind,
+        exists,
+        ends,
+        parts,
+    }
+}
+
+/// The rows both header tiers have. Budget reconciliation names the
+/// reactor, since every budget write runs on its task (rule 5).
+fn node_rows() -> [ManifestRow; 5] {
+    use ComponentKind as K;
+    use EndRule as R;
+    use Evidence as E;
+    const BUDGET: &[ComponentKind] = &[K::Budget, K::Reactor, K::CallHolders, K::Transfers];
+    [
+        row(K::Reactor, E::ReactorStarted, R::FinalSettled, &[]),
+        row(K::Budget, E::ReactorSettled, R::Gone, BUDGET),
+        row(K::CallHolders, E::ReactorSettled, R::With(K::Budget), &[]),
+        row(K::Transfers, E::EntriesTaken, R::With(K::Reactor), &[]),
+        row(K::SelectedChain, E::HarnessBuilt, R::RunEnd, &[]),
+    ]
+}
+
+/// The rows only `header-sync/wire` has: its transport's, then its gauges.
+/// A connection's permits reconcile with its loop and session tasks.
+fn transport_rows() -> [ManifestRow; 8] {
+    use ComponentKind as K;
+    use EndRule as R;
+    use Evidence as E;
+    const PERMITS: &[ComponentKind] = &[K::StreamPermits, K::Connection, K::SessionTasks];
+    [
+        row(K::Publisher, E::Installed, R::Gone, &[]),
+        row(K::Output, E::Allocated, R::Terminal, &[]),
+        row(K::SupervisorMap, E::Registered, R::Gone, &[]),
+        row(K::HeaderSessions, E::HeaderAdmitted, R::Gone, &[]),
+        row(K::Connection, E::ConnStarted, R::ConnEnded, &[]),
+        row(K::SessionTasks, E::ConnActive, R::LastTag, &[]),
+        row(K::StreamPermits, E::ConnActive, R::LastTag, PERMITS),
+        row(K::Gauges, E::GaugeSet, R::RunEnd, &[]),
+    ]
+}
+
+/// Why neither header tier has session slots.
+const NO_SESSIONS: &str = "header sync reserves no sessions";
+
+impl SourceManifest {
+    /// `header-sync/wire`'s components: all but the session slots.
+    pub fn wire() -> Self {
+        SourceManifest {
+            rows: node_rows().into_iter().chain(transport_rows()).collect(),
+            excluded: vec![(ComponentKind::SessionSlots, NO_SESSIONS)],
+        }
+    }
+
+    /// `header-sync/storage`'s components: the node's. It has no transport
+    /// and no session slots, and it excludes gauges, since its mirror
+    /// reactors share the node's gauge names.
+    pub fn storage() -> Self {
+        let mut excluded: Vec<_> = transport_rows()
+            .iter()
+            .filter(|row| row.kind != ComponentKind::Gauges)
+            .map(|row| (row.kind, "no transport"))
+            .collect();
+        excluded.push((ComponentKind::SessionSlots, NO_SESSIONS));
+        excluded.push((
+            ComponentKind::Gauges,
+            "mirror reactors share the gauge names",
+        ));
+        SourceManifest {
+            rows: node_rows().to_vec(),
+            excluded,
+        }
+    }
+
+    /// Its rows, in order.
+    pub fn rows(&self) -> &[ManifestRow] {
+        &self.rows
+    }
+
+    /// `sources`, observing each row's component and excluding the others
+    /// with their reasons.
+    pub fn sources(&self, sources: Sources) -> Sources {
+        let sources = self.rows.iter().fold(sources, |sources, row| {
+            sources.observing(Source::Component(row.kind))
+        });
+        self.excluded
+            .iter()
+            .fold(sources, |sources, (kind, reason)| {
+                sources.excluding(Source::Component(*kind), reason)
+            })
+    }
 }
 
 /// A submission or completion on the node's `service` storage, instance 0.
@@ -810,8 +987,16 @@ impl OperationIds {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
-    use crate::observe::{StorageRequest, StorageResult};
+    use crate::{
+        check::Checker,
+        end::{IdleStatus, Outcome, RunEnd},
+        observe::{StorageRequest, StorageResult},
+        property::{Registry, RegistryChecker},
+        HarnessFailure, ObservationLog, PropertyOutcome,
+    };
 
     /// A submission of operation `id`.
     fn submitted(id: u64) -> StorageFact {
@@ -878,6 +1063,87 @@ mod tests {
                 None,
                 finding("operation 1 completes once", "operation 1 completed again")
             ]
+        );
+    }
+
+    /// A harness with nothing to view.
+    struct Nothing;
+
+    impl HasView for Nothing {
+        type View = ();
+
+        fn view(&self) {}
+    }
+
+    /// Never runs: its component is excluded or missing.
+    fn check_publisher(_: &mut CheckCtx<'_, Nothing>) -> Verdict {
+        Verdict::Holds
+    }
+
+    /// A checker for one property that needs the publisher, on a harness
+    /// with `sources`.
+    fn publisher_checker(sources: &Sources) -> RegistryChecker<Nothing> {
+        let property = Property {
+            id: PropertyId::new("test/publisher"),
+            claim: "a test claim on the publisher",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Component(ComponentKind::Publisher)],
+            status: Status::Active,
+            check: check_publisher,
+            witness: None,
+        };
+        RegistryChecker::new(
+            Registry::new(vec![property]).expect("one property"),
+            Rc::new(Nothing),
+            Assumptions::none(),
+            sources,
+        )
+    }
+
+    /// A property that needs the publisher on `header-sync/storage`, which
+    /// has no transport, is reported `NotApplicable` with that reason.
+    #[test]
+    fn an_excluded_component_reports_not_applicable_with_its_reason() {
+        let mut checker = publisher_checker(&storage_sources());
+        assert_eq!(checker.harness_failure(), None);
+        let end = RunEnd {
+            outcome: Outcome::Idle {
+                status: IdleStatus::Quiescent,
+            },
+            steps: 0,
+            violation: None,
+            drain: None,
+            harness: None,
+        };
+        let reports = checker.at_end(&end, &ObservationLog::default());
+        let [report] = reports.as_slice() else {
+            panic!("one property, one report: {reports:?}");
+        };
+        assert_eq!(report.property, "test/publisher");
+        assert_eq!(report.outcome, PropertyOutcome::NotApplicable);
+        assert_eq!(
+            report.excluded.as_deref(),
+            Some("Component(Publisher): no transport")
+        );
+    }
+
+    /// The same property on a harness that neither observes nor excludes
+    /// the publisher fails the run.
+    #[test]
+    fn a_missing_component_fails_the_run() {
+        assert_eq!(
+            publisher_checker(&HeaderWire::sources()).harness_failure(),
+            None,
+            "the wire tier observes the publisher"
+        );
+        let sources = Sources::observed(&[Source::Schedule, Source::Storage, Source::View]);
+        assert_eq!(
+            publisher_checker(&sources).harness_failure(),
+            Some(HarnessFailure::MissingSource {
+                property: "test/publisher".to_owned(),
+                source: "Component(Publisher)".to_owned(),
+            })
         );
     }
 }

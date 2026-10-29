@@ -204,6 +204,12 @@ impl Sources {
         }
     }
 
+    /// These sources, with `source` observed too.
+    pub fn observing(mut self, source: Source) -> Self {
+        self.observed.push(source);
+        self
+    }
+
     /// These sources, with `source` excluded for `reason`, such as "the
     /// Real tier has no view".
     pub fn excluding(mut self, source: Source, reason: &'static str) -> Self {

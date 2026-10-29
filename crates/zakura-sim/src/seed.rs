@@ -283,8 +283,8 @@ pub struct SeedReport {
     pub admitted: Vec<Seed>,
     /// The optional seeds that failed.
     pub quarantined: Vec<Failed>,
-    /// The required seeds that failed, and the files whose harness or
-    /// requirement can't be read.
+    /// The required seeds that failed, and the files whose sidecar can't be
+    /// read.
     pub rejected: Vec<Failed>,
     /// How many valid sidecars name another harness than the one asked for.
     pub other_harnesses: usize,
@@ -292,9 +292,11 @@ pub struct SeedReport {
 
 /// Reads and validates every seed in `dirs`. With `harness`, it validates
 /// only that harness's seeds and counts the rest in
-/// [`SeedReport::other_harnesses`]. A seed whose sidecar doesn't parse or
-/// names no registered harness is rejected whatever `harness` is, since
-/// nothing says which harness it was for.
+/// [`SeedReport::other_harnesses`]. A seed whose sidecar doesn't parse is
+/// rejected whatever `harness` is, since nothing says which harness or
+/// requirement it has. A seed whose sidecar names no registered harness is
+/// rejected or quarantined by its requirement whatever `harness` is, since
+/// a misspelled name could be `harness`.
 ///
 /// Fails only if a directory can't be listed.
 pub fn load(dirs: &[PathBuf], harness: Option<&str>) -> io::Result<SeedReport> {
@@ -337,11 +339,7 @@ pub fn load(dirs: &[PathBuf], harness: Option<&str>) -> io::Result<SeedReport> {
                 Ok(entry) => entry,
                 Err(_) => {
                     let error = SeedError::UnknownHarness(sidecar.harness.clone());
-                    report.rejected.push(Failed {
-                        path,
-                        sidecar: Some(sidecar),
-                        error,
-                    });
+                    report.fail(path, sidecar, error);
                     continue;
                 }
             };
@@ -355,22 +353,29 @@ pub fn load(dirs: &[PathBuf], harness: Option<&str>) -> io::Result<SeedReport> {
                     sidecar,
                     input,
                 }),
-                Err(error) => {
-                    let failed = Failed {
-                        path,
-                        error,
-                        sidecar: Some(sidecar.clone()),
-                    };
-                    if sidecar.required {
-                        report.rejected.push(failed);
-                    } else {
-                        report.quarantined.push(failed);
-                    }
-                }
+                Err(error) => report.fail(path, sidecar, error),
             }
         }
     }
     Ok(report)
+}
+
+impl SeedReport {
+    /// Records that the seed at `path` failed with `error`: rejected if
+    /// `sidecar` requires it, quarantined if not.
+    fn fail(&mut self, path: PathBuf, sidecar: Sidecar, error: SeedError) {
+        let required = sidecar.required;
+        let failed = Failed {
+            path,
+            sidecar: Some(sidecar),
+            error,
+        };
+        if required {
+            self.rejected.push(failed);
+        } else {
+            self.quarantined.push(failed);
+        }
+    }
 }
 
 /// The sidecar beside the seed at `path`.
@@ -512,7 +517,8 @@ pub fn sha256(bytes: &[u8]) -> String {
 
 /// `text` as bytes, if it's an even number of hex digits.
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    // `from_str_radix` also takes a leading `+`.
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     (0..text.len())
@@ -546,5 +552,6 @@ mod tests {
         assert_eq!(unhex(""), Some(Vec::new()));
         assert_eq!(unhex("f"), None);
         assert_eq!(unhex("zz"), None);
+        assert_eq!(unhex("ff+6"), None);
     }
 }

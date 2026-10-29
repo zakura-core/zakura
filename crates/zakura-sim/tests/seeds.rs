@@ -368,7 +368,9 @@ fn plan_seeds_take_their_scenario_from_the_prefix() {
 }
 
 /// An optional seed that fails is quarantined with its reason, and a seed
-/// of another harness than the one asked for is only counted.
+/// of another harness than the one asked for is only counted. An optional
+/// seed naming no registered harness is quarantined whichever harness is
+/// asked for.
 #[test]
 fn optional_seeds_are_quarantined_and_other_harnesses_counted() {
     let scratch = Scratch::copy(
@@ -387,4 +389,18 @@ fn optional_seeds_are_quarantined_and_other_harnesses_counted() {
     let report = scratch.load(Some("block-sync/storage"));
     assert_eq!(report.other_harnesses, 1);
     assert!(report.quarantined.is_empty());
+    let scratch = Scratch::copy(
+        "discovery-wait-complete",
+        replace(
+            "\"discovery/wait-complete\"",
+            "\"discovery/retired\"\nrequired = false",
+        ),
+    );
+    let report = scratch.load(Some("block-sync/storage"));
+    assert!(report.admitted.is_empty() && report.rejected.is_empty());
+    assert_eq!(report.other_harnesses, 0);
+    assert_eq!(
+        report.quarantined[0].error,
+        SeedError::UnknownHarness("discovery/retired".to_owned())
+    );
 }

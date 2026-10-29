@@ -29,6 +29,9 @@ zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-quic = { path = "../zakura-quic" }
+# Scripted peers draw their handshake nonces from the runtime's RNG, whose
+# traits come from `rand`.
+rand_10 = { workspace = true }
 # Header storage as an action source, and its owner types for the
 # observation encoding.
 zakura-storage = { path = "../zakura-storage" }
@@ -36,7 +39,6 @@ zakura-header-chain = { path = "../zakura-header-chain" }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
-rand_10 = { workspace = true }
 # The run-thread test checks that header preparation never started rayon's
 # global pool.
 rayon = { workspace = true }

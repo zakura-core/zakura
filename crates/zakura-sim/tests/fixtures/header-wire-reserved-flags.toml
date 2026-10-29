@@ -1,0 +1,7 @@
+# The committed fuzz input `header-wire-reserved-flags.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `reserved-flags` scenario, and
+# `header-wire-reserved-flags.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "681928cba152f2ece711e7a03968a36e4421ce650b3d192545bbf6760a64afc1"

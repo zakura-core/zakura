@@ -429,9 +429,9 @@ fn classify_table() {
                 vec![],
                 0,
             )))),
+            // The failure's own text, as the run's `end` record holds it.
             ExploreOutcome::HarnessFailure {
-                reason: harness_error(synthetic(Outcome::Harness, None, None, vec![], 0))
-                    .to_string(),
+                reason: HarnessFailure::UnknownDrawKind.to_string(),
             },
             Some(Bucket::Harness),
             vec![],
@@ -466,13 +466,22 @@ fn classify_table() {
                 2,
             ))),
             ExploreOutcome::Abandoned { leaked: 2 },
-            None,
+            Some(Bucket::Abandoned),
             vec![],
         ),
     ];
     for (row, run, outcome, bucket, notes) in rows {
         let classified = classify(&TABLE, &run);
-        assert_eq!(classified, Classified { outcome, notes }, "{row}");
+        let leaked = run.leaked();
+        assert_eq!(
+            classified,
+            Classified {
+                outcome,
+                notes,
+                leaked
+            },
+            "{row}"
+        );
         assert_eq!(classified.outcome.bucket(), bucket, "{row}");
     }
 }
@@ -533,6 +542,7 @@ fn classify_reads_every_report() {
                 (DRAFT.to_owned(), Bucket::Draft),
                 (KNOWN_TOO.to_owned(), Bucket::Known),
             ],
+            leaked: 0,
         }
     );
 

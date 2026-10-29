@@ -10,8 +10,8 @@
 //! connection (M5-Q4), keyed after the row that let it resolve. Records of
 //! one stream keep their order. A record whose stream can no longer be
 //! admitted, because the node refused it or its handshake, or tore its
-//! connection down, fails the run, so a peer's frames can't drop out of the
-//! log unseen.
+//! connection down, keeps only the `peer-emitted` row the hub logged in its
+//! own step, so it never drops out of the log.
 //!
 //! Each `PeerReceived` is followed by the frame's `NodeFrame`, which the
 //! [`SenderAdapter`] labels under the sender's rules against the peer
@@ -325,9 +325,10 @@ impl WireEvidence {
         }
     }
 
-    /// Why a record of `pending` never will be placed, if one can't.
-    pub(crate) fn lost(&self, pending: &[PeerRecord]) -> Option<String> {
-        pending.iter().find_map(|record| self.lost_one(record))
+    /// Drops each record of `pending` that never will be placed. Its
+    /// `peer-emitted` row already holds it, so it keeps only that.
+    pub(crate) fn forget_unresolvable(&self, pending: &mut Vec<PeerRecord>) {
+        pending.retain(|record| !self.unresolvable(record));
     }
 
     /// Fails the run once `remote` gets a second handshake outcome,
@@ -438,30 +439,19 @@ impl WireEvidence {
         }]))
     }
 
-    /// Why `record`, still unplaced, never will be, if the node refused its
-    /// handshake or stream or tore its connection down.
-    fn lost_one(&self, record: &PeerRecord) -> Option<String> {
-        // An end can't be lost: its `peer-emitted` row already holds it.
-        if let RecordBody::ConnEnded { .. } | RecordBody::StreamEnded { .. } = record.body {
-            return None;
-        }
-        let remote = record.remote.to_string();
-        let gone = match self.connections.get(&remote) {
-            None => self.refused_handshakes.contains(&remote),
+    /// Whether `record`, still unplaced, never will be: the node refused
+    /// its handshake or stream, or tore its connection down before admitting
+    /// the stream.
+    fn unresolvable(&self, record: &PeerRecord) -> bool {
+        match self.connections.get(&record.remote.to_string()) {
+            None => self.refused_handshakes.contains(&record.remote.to_string()),
             Some(connection) => {
                 self.torn_down.contains(connection)
                     || record.quic_stream.is_some_and(|quic_stream| {
                         self.refused_streams.contains(&(*connection, quic_stream))
                     })
             }
-        };
-        gone.then(|| {
-            format!(
-                "UnplacedRecord: {remote}'s record on stream {:?} can't get an identity, since \
-                 the node refused or closed it before admitting the stream: {:?}",
-                record.quic_stream, record.body
-            )
-        })
+        }
     }
 
     /// The P3b observation `obs` means, if any.
@@ -677,8 +667,8 @@ mod tests {
 
     /// Folds `items` through `evidence` as the hub does, with `pending` the
     /// records drained before: each row's projections, then each placement
-    /// it allows. Returns the derived observations in order, or the first
-    /// failure, a record that can never be placed included.
+    /// it allows, then forgets the records that never will be placed.
+    /// Returns the derived observations in order, or the first failure.
     fn fold(
         evidence: &mut WireEvidence,
         pending: &mut Vec<PeerRecord>,
@@ -692,10 +682,8 @@ mod tests {
             }
             derived.extend(evidence.place(pending)?.into_iter().map(|(_, obs)| obs));
         }
-        match evidence.lost(pending) {
-            Some(lost) => Err(lost),
-            None => Ok(derived),
-        }
+        evidence.forget_unresolvable(pending);
+        Ok(derived)
     }
 
     /// A transport event on `connection` from peer 0's first address.
@@ -783,11 +771,12 @@ mod tests {
         );
     }
 
-    /// A record waits while its stream may still be admitted, and fails the
-    /// run once the node refuses the stream or the handshake, or tears the
-    /// connection down first, so it can't drop out of the log unseen.
+    /// A record waits while its stream may still be admitted, and is
+    /// forgotten once the node refuses the stream or the handshake, or tears
+    /// the connection down first. Its `peer-emitted` row already holds it,
+    /// so the run goes on.
     #[test]
-    fn a_record_that_can_never_be_placed_fails_the_run() {
+    fn a_record_that_can_never_be_placed_is_forgotten() {
         let refused = TransportFact::StreamRefused {
             quic_stream: 4,
             kind: 5,
@@ -811,13 +800,16 @@ mod tests {
             }
             fold(&mut evidence, &mut pending, items).expect("the stream may still be admitted");
             assert_eq!(pending.len(), 1, "it waits");
-            let error = fold(
+            let placed = fold(
                 &mut evidence,
                 &mut pending,
                 vec![transport(2, connection, ending.clone())],
             )
-            .expect_err("the record can never be placed");
-            assert!(error.starts_with("UnplacedRecord"), "{ending:?}: {error}");
+            .expect("a record that can never be placed doesn't fail the run");
+            assert!(placed
+                .iter()
+                .all(|obs| !matches!(obs, Observation::PeerWritten { .. })));
+            assert!(pending.is_empty(), "{ending:?}: it's forgotten");
         }
     }
 

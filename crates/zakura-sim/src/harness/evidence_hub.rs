@@ -282,10 +282,8 @@ impl EvidenceHub {
                 Err(why) => failed = failed.and(Err(why)),
             }
         }
-        if let Some(peers) = &self.peers {
-            if let Some(lost) = peers.evidence.lost(&peers.pending) {
-                failed = failed.and(Err(lost));
-            }
+        if let Some(peers) = self.peers.as_mut() {
+            peers.evidence.forget_unresolvable(&mut peers.pending);
             peers.records.set_unplaced(peers.pending.len());
         }
         rows.sort_by_key(|row| row.key);
@@ -576,7 +574,8 @@ mod tests {
 
     /// Peer records on a stream the node never admits keep their own
     /// positions around the node's close of the connection, one before it
-    /// and one after, and neither resolves.
+    /// and one after, and neither resolves, even once the connection is torn
+    /// down, which doesn't fail the run.
     #[test]
     fn an_unresolved_peer_record_keeps_its_place_around_a_close() {
         let (mut hub, records) = hub();
@@ -612,6 +611,26 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(records.unplaced(), 2, "neither resolves");
+        // Once the connection is torn down, neither can, and each keeps only
+        // its row.
+        hand(
+            &hub,
+            &mut log,
+            vec![at(20, transport(TransportFact::TornDown))],
+        );
+        hub.observe(&mut log)
+            .expect("an unresolved record doesn't fail the run");
+        assert_eq!(records.unplaced(), 0, "both are forgotten");
+        let emitted = log
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.obs, Observation::PeerEmitted { .. }))
+            .count();
+        assert_eq!(emitted, 2);
+        assert!(!log
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry.obs, Observation::PeerWritten { .. })));
     }
 
     /// A source that hands the hub one row with no position at its first

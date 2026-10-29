@@ -6,11 +6,15 @@
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
+//! zakura-sim versions --sim <name>
+//! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
+//!     [--quarantine <dir>] [--report <file>]
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
-//! `cargo xtask record`, `cargo xtask replay` and `cargo xtask shrink` build
-//! and run it with that flag.
+//! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
+//! `cargo xtask sim-versions` and `cargo xtask sim-seeds` build and run it
+//! with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -40,12 +44,17 @@ fn main() {
 
 #[cfg(zakura_sim)]
 mod cli {
-    use std::{fmt::Write, path::PathBuf, time::Duration};
+    use std::{
+        fmt::Write,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use serde_json::{json, Value};
     use zakura_sim::{
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
+        seed::{self, Failed, SeedReport},
         trace::{self, shrink::REPORT_FILE, ReplayOptions, ShrinkBudget, TraceReader},
         witness::Expect,
     };
@@ -66,7 +75,10 @@ mod cli {
              [--witness <property> --expect <holds|violated|applicable>]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
-             zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n\n\
+             zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
+             zakura-sim versions --sim <name>\n  \
+             zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
+             [--quarantine <dir>] [--report <file>]\n\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
@@ -81,7 +93,16 @@ mod cli {
              `shrink` reduces a trace that ends in a violation to fewer non-default\n\
              picks, and writes the reduced trace, the original and a reduction log to\n\
              --out. It stops after --candidates candidates (default 2000) or\n\
-             --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\n\
+             --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\
+             `versions` prints the versions that fix what the harness's fuzz input means,\n\
+             as KEY=VALUE lines.\n\
+             `seeds` validates the committed seeds in each --fixtures directory (default\n\
+             crates/zakura-sim/tests/fixtures) against the current generators, and lists\n\
+             each seed as admitted, quarantined or rejected. With --sim, it checks only\n\
+             that harness's seeds, and --out writes each admitted seed's full fuzz input\n\
+             there, named by its SHA-256. --quarantine writes each quarantined seed there\n\
+             with its reason. --report writes the result as JSON. It exits 1 if any\n\
+             required seed is rejected.\n\n\
              Harnesses:\n",
         );
         for entry in HARNESSES {
@@ -102,6 +123,8 @@ mod cli {
             Some("record") => record(args.collect()),
             Some("replay") => replay(args.collect()),
             Some("shrink") => shrink(args.collect()),
+            Some("versions") => versions(args.collect()),
+            Some("seeds") => seeds(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())
@@ -408,6 +431,180 @@ mod cli {
                 out.display()
             ))),
         }
+    }
+
+    /// `versions`: prints [`seed::versions`] for one harness.
+    #[allow(clippy::print_stdout)]
+    fn versions(args: Vec<String>) -> Result<(), Error> {
+        let sim = match args.as_slice() {
+            [flag, sim] if flag == "--sim" => sim,
+            _ => return Err(Error::Usage("`versions` takes --sim <name>".to_owned())),
+        };
+        let entry = harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        for (key, value) in seed::versions(entry) {
+            println!("{key}={value}");
+        }
+        Ok(())
+    }
+
+    /// The flags `seeds` takes, as given.
+    #[derive(Default)]
+    struct SeedArgs {
+        sim: Option<String>,
+        fixtures: Vec<PathBuf>,
+        out: Option<PathBuf>,
+        quarantine: Option<PathBuf>,
+        report: Option<PathBuf>,
+    }
+
+    /// `seeds`: validates the committed seeds, prints each one's result,
+    /// and writes the admitted and quarantined ones and the report where
+    /// the flags say. Fails if any required seed is rejected.
+    #[allow(clippy::print_stdout)]
+    fn seeds(args: Vec<String>) -> Result<(), Error> {
+        let mut flags = SeedArgs::default();
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{flag} needs a value")))?;
+            let slot_taken = match flag.as_str() {
+                "--sim" => flags.sim.replace(value).is_some(),
+                "--fixtures" => {
+                    flags.fixtures.push(value.into());
+                    false
+                }
+                "--out" => flags.out.replace(value.into()).is_some(),
+                "--quarantine" => flags.quarantine.replace(value.into()).is_some(),
+                "--report" => flags.report.replace(value.into()).is_some(),
+                _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
+            };
+            if slot_taken {
+                return Err(Error::Usage(format!("{flag} given twice")));
+            }
+        }
+        if flags.sim.is_none() && (flags.out.is_some() || flags.quarantine.is_some()) {
+            return Err(Error::Usage(
+                "--out and --quarantine hold one harness's seeds, so they need --sim".to_owned(),
+            ));
+        }
+        if let Some(sim) = &flags.sim {
+            harness::find(sim).map_err(|error| Error::Usage(error.to_string()))?;
+        }
+        if flags.fixtures.is_empty() {
+            flags
+                .fixtures
+                .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+        }
+        let report = seed::load(&flags.fixtures, flags.sim.as_deref())
+            .map_err(|error| Error::Failed(format!("listing the fixtures: {error}")))?;
+        if let Some(out) = &flags.out {
+            create(out)?;
+            for seed in &report.admitted {
+                write(&out.join(seed.input_sha256()), &seed.input)?;
+            }
+        }
+        if let Some(quarantine) = &flags.quarantine {
+            create(quarantine)?;
+            for failed in &report.quarantined {
+                quarantine_seed(quarantine, failed)?;
+            }
+        }
+        for seed in &report.admitted {
+            println!(
+                "admitted {} ({}, generator {}): {}",
+                seed.path.display(),
+                seed.sidecar.harness,
+                seed.sidecar.generator,
+                seed.input_sha256()
+            );
+        }
+        for failed in &report.quarantined {
+            println!("quarantined {}: {}", failed.path.display(), failed.error);
+        }
+        for failed in &report.rejected {
+            println!("rejected {}: {}", failed.path.display(), failed.error);
+        }
+        println!(
+            "{} admitted, {} quarantined, {} rejected, {} for other harnesses",
+            report.admitted.len(),
+            report.quarantined.len(),
+            report.rejected.len(),
+            report.other_harnesses
+        );
+        if let Some(path) = &flags.report {
+            let json = report_json(&report, flags.sim.as_deref(), &flags.fixtures);
+            write(path, format!("{json:#}\n").as_bytes())?;
+        }
+        match report.rejected.len() {
+            0 => Ok(()),
+            rejected => Err(Error::Failed(format!(
+                "{rejected} required seeds failed validation"
+            ))),
+        }
+    }
+
+    /// Writes the quarantined seed's file, its sidecar and its reason into
+    /// `dir`, named by the file's SHA-256.
+    fn quarantine_seed(dir: &Path, failed: &Failed) -> Result<(), Error> {
+        let bytes = std::fs::read(&failed.path).map_err(|error| {
+            Error::Failed(format!("reading {}: {error}", failed.path.display()))
+        })?;
+        let name = seed::sha256(&bytes);
+        write(&dir.join(&name), &bytes)?;
+        let sidecar = failed.path.with_extension(seed::SIDECAR_EXTENSION);
+        let sidecar = std::fs::read(&sidecar)
+            .map_err(|error| Error::Failed(format!("reading {}: {error}", sidecar.display())))?;
+        write(&dir.join(format!("{name}.toml")), &sidecar)?;
+        write(
+            &dir.join(format!("{name}.reason")),
+            format!("{}: {}\n", failed.path.display(), failed.error).as_bytes(),
+        )
+    }
+
+    /// `report` as JSON: one row per seed, with its status, its sidecar and
+    /// either its full input's digest or its reason.
+    fn report_json(report: &SeedReport, sim: Option<&str>, fixtures: &[PathBuf]) -> Value {
+        let mut seeds = Vec::new();
+        for seed in &report.admitted {
+            seeds.push(json!({
+                "file": seed.path,
+                "status": "admitted",
+                "sidecar": seed.sidecar,
+                "input_sha256": seed.input_sha256(),
+            }));
+        }
+        for (status, failed) in report
+            .quarantined
+            .iter()
+            .map(|failed| ("quarantined", failed))
+            .chain(report.rejected.iter().map(|failed| ("rejected", failed)))
+        {
+            seeds.push(json!({
+                "file": failed.path,
+                "status": status,
+                "sidecar": failed.sidecar,
+                "reason": failed.error.to_string(),
+            }));
+        }
+        json!({
+            "harness": sim,
+            "fixtures": fixtures,
+            "seeds": seeds,
+            "other_harnesses": report.other_harnesses,
+        })
+    }
+
+    /// Creates `dir` and its parents.
+    fn create(dir: &Path) -> Result<(), Error> {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| Error::Failed(format!("creating {}: {error}", dir.display())))
+    }
+
+    /// Writes `bytes` to `path`.
+    fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+        std::fs::write(path, bytes)
+            .map_err(|error| Error::Failed(format!("writing {}: {error}", path.display())))
     }
 
     /// Reads `record`'s flags. Each takes one value and may appear once.

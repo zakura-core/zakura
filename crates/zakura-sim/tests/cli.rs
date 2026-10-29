@@ -317,3 +317,118 @@ fn observe_exports_typed_observations_in_a_fresh_process() {
         assert!(tags.iter().any(|t| t == tag), "{tag} in {tags:?}");
     }
 }
+
+/// `versions` prints the versions that fix what a harness's fuzz input
+/// means, one `KEY=VALUE` line each.
+#[test]
+fn versions_print_key_value_lines() {
+    let output = zakura_sim(&["versions", "--sim", "block-sync/storage"]);
+    assert!(output.status.success(), "{output:?}");
+    let entry = zakura_sim::harness::find("block-sync/storage").unwrap();
+    let expected: String = zakura_sim::seed::versions(entry)
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(expected.starts_with("harness=block-sync/storage\ngenerator="));
+    let output = zakura_sim(&["versions", "--sim", "no/such-harness"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+/// `seeds --sim` writes each admitted seed's full fuzz input to `--out`,
+/// named by its SHA-256, and a JSON report.
+#[test]
+fn seeds_fill_a_corpus() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("corpus");
+    let report = dir.path().join("report.json");
+    let output = zakura_sim(&[
+        "seeds",
+        "--sim",
+        "discovery/wait-complete",
+        "--out",
+        out.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let input = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-wait-complete.bin"),
+    )
+    .unwrap();
+    let digest: String = Sha256::digest(&input)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let corpus: Vec<_> = std::fs::read_dir(&out).unwrap().collect();
+    assert_eq!(corpus.len(), 1);
+    assert_eq!(std::fs::read(out.join(&digest)).unwrap(), input);
+    let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(report["seeds"][0]["status"], "admitted");
+    assert_eq!(report["seeds"][0]["input_sha256"], digest);
+    assert_eq!(
+        report["seeds"][0]["sidecar"]["harness"],
+        "discovery/wait-complete"
+    );
+    assert!(report["other_harnesses"].as_u64().unwrap() > 0);
+}
+
+/// `seeds` exits 1 when a required seed fails, and writes a failed
+/// optional seed to `--quarantine` with its reason.
+#[test]
+fn seeds_reject_and_quarantine() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let sidecar = std::fs::read_to_string(fixtures.join("discovery-wait-complete.toml")).unwrap();
+    let input = std::fs::read(fixtures.join("discovery-wait-complete.bin")).unwrap();
+    let dir = TempDir::new().unwrap();
+    let seeds = dir.path().join("seeds");
+    std::fs::create_dir(&seeds).unwrap();
+    std::fs::write(seeds.join("old.bin"), &input).unwrap();
+    std::fs::write(
+        seeds.join("old.toml"),
+        sidecar.replacen("generator = 1", "generator = 0\nrequired = false", 1),
+    )
+    .unwrap();
+    let quarantine = dir.path().join("quarantine");
+    let args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "seeds".to_owned(),
+            "--sim".to_owned(),
+            "discovery/wait-complete".to_owned(),
+            "--fixtures".to_owned(),
+            seeds.to_str().unwrap().to_owned(),
+            "--quarantine".to_owned(),
+            quarantine.to_str().unwrap().to_owned(),
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        args
+    };
+    let run = |args: Vec<String>| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(args(&[]));
+    assert!(output.status.success(), "{output:?}");
+    let digest: String = Sha256::digest(&input)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(std::fs::read(quarantine.join(&digest)).unwrap(), input);
+    let reason = std::fs::read_to_string(quarantine.join(format!("{digest}.reason"))).unwrap();
+    assert!(reason.contains("built for generator 0"), "{reason}");
+    std::fs::write(
+        seeds.join("old.toml"),
+        sidecar.replacen("generator = 1", "generator = 0", 1),
+    )
+    .unwrap();
+    let output = run(args(&[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("rejected "), "{stdout}");
+    assert!(
+        stdout.contains("0 admitted, 0 quarantined, 1 rejected"),
+        "{stdout}"
+    );
+}

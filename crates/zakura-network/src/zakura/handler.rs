@@ -3416,6 +3416,10 @@ impl ZakuraProtocolHandler {
                 debug!(?error, "Zakura stream worker failed during shutdown");
             }
         }
+        // The drain joined every worker only if it ended on an empty set
+        // rather than on its timeout.
+        #[cfg(any(test, zakura_sim))]
+        let drained = workers.is_empty();
         workers.abort_all();
         cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
@@ -3426,7 +3430,9 @@ impl ZakuraProtocolHandler {
             Some(close_cause.get_or("cancelled")),
         );
         #[cfg(any(test, zakura_sim))]
-        close_cause.torn_down();
+        if drained {
+            close_cause.torn_down();
+        }
         Ok(())
     }
 

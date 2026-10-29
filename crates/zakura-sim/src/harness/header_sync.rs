@@ -34,7 +34,7 @@ use crate::{
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, Dialer as PeerDialer,
-        PeerAction, PeerControl, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
+        PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Source,
@@ -543,7 +543,7 @@ impl Subsystem for HeaderWire {
             scenario.net.seed,
             observer,
         );
-        let failure = Rc::new(RefCell::new(None));
+        let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone(), ports.records.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =

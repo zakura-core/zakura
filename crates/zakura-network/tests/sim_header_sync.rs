@@ -1304,6 +1304,52 @@ fn a_cancellation_is_decided_when_it_happens() {
     wire.finish();
 }
 
+/// A connection whose stream worker outlives the drain timeout reports no
+/// `TornDown`, though its close is decided. The held worker is the header
+/// stream's service session, which the node aborts but can't join.
+///
+/// This fails if a timed-out drain reports `TornDown`.
+#[test]
+fn a_timed_out_drain_reports_no_teardown() {
+    let mut wire = Wire::start(
+        29,
+        Script {
+            disconnect: true,
+            ..Script::default()
+        },
+    );
+    wire.run_until(Duration::from_secs(5));
+    let (conn_id, _) = header_stream(&wire.events());
+
+    wire.held = Some("service_session");
+    wire.go.cancel();
+    // The drain gives up after 1 s.
+    wire.run_until(Duration::from_secs(15));
+    let events = wire.events();
+    assert_eq!(
+        closes(&events),
+        vec![TransportEvent::CloseDecided {
+            remote: peer_addr(),
+            conn_id: Some(conn_id),
+            cause: None,
+        }]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::TornDown { .. })),
+        "a held worker leaves the drain incomplete: {events:?}"
+    );
+
+    wire.held = None;
+    wire.run_until(Duration::from_secs(20));
+    assert!(!wire
+        .events()
+        .iter()
+        .any(|event| matches!(event, TransportEvent::TornDown { .. })));
+    wire.finish();
+}
+
 /// Installing the transport observer adds no scheduling point: one plan takes
 /// the same steps with and without it, through the handshake, admission,
 /// a whole frame and the regulation checks of a page header.

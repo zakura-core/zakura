@@ -9,29 +9,32 @@ after normalizing what moves without a code change.
 
 Generic code can be instantiated only in a downstream crate, which then
 holds its instructions and its data: constants, strings, pointer tables
-such as vtables, and panic locations. So it also emits and compares, with
-the same normalizer and masking, the assembly of every library that
-`zakurad` links and that depends on a compared package, at each setting.
-Every section the assembly defines is compared except debug info and
-unwind tables, so this covers `__const`, `__cstring` and `__DATA_CONST`
-data on macOS, or `.rodata` and `.data.rel.ro` on Linux. Last it builds
-the release `zakurad` for each and compares its text section, which also
-covers what link-time optimization inlines across crates. `--no-binary`
-skips the downstream packages and `zakurad` for quick runs.
+such as vtables, and panic locations. So it also builds the release
+`zakurad` with every workspace crate at each setting, and compares, with
+the same normalizer and masking, the binary's assembly after thin
+link-time optimization, which `--emit=asm` writes for every module the
+binary links. That covers all of the binary's code and data, from any
+crate, including what LTO inlines across crates. Every section is compared
+except debug info and unwind tables, so data in `__const`, `__cstring` and
+`__DATA_CONST` on macOS, or `.rodata` and `.data.rel.ro` on Linux, is
+covered, along with each item's section. It also compares the linked
+binary's text section byte for byte. `--no-binary` skips the binary for
+quick runs.
 
 Both sides build one at a time at the same target path, each with its own
 cache (see `side_target`), so paths that a build embeds, such as `OUT_DIR`,
-match. Build metadata is made the same
-too (see `build_env`), never masked.
+match. Build metadata is made the same too (see `build_env`), never masked.
 
 Usage:
   release-asm-diff.py --base <rev> --head <rev>
       [--package zakura-network --package zakura-rt] [--cgu 4 --cgu 1]
-      [--no-binary] [--work-dir <dir>] [--cargo <cargo>]
+      [--no-binary] [--jobs <n>] [--work-dir <dir>] [--cargo <cargo>]
 
 What the normalizer ignores, and nothing else:
   * comments, debug line directives (`.loc`, `.file`), and alignment and
     linkage directives;
+  * the `.llvm.<hash>` suffix that thin LTO gives a promoted local symbol,
+    whose hash covers the module's debug line info too;
   * the names of local labels and anonymous constants. Each function and
     data block renames them in order of first use, so each instruction
     stays tied to the constant it reads. A constant read at the same place
@@ -52,9 +55,13 @@ when a side of any comparison has no functions; 3 when a command fails.
 
 import argparse
 import collections
+import concurrent.futures
 import contextlib
 import difflib
+import io
 import json
+import multiprocessing
+import os
 import re
 import shutil
 import struct
@@ -85,8 +92,15 @@ STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
 # Assembler-local labels: Mach-O's `L` and `l` prefixes, ELF's `.L`, and
 # Mach-O's exception tables.
 LOCAL = re.compile(r"^(?:\.L|L|l|GCC_except_table\d)")
+# An anonymous constant that thin LTO promoted to a global symbol.
+PROMOTED_ANON = re.compile(r"^_?_anon\.[0-9a-f]+\.\d+$")
+# Thin LTO's suffix on a promoted local symbol.
+LLVM_SUFFIX = re.compile(r"\.llvm\.\d+\b")
 # `tracing`'s event names, `event <file>:<line>`, with `.asciz`'s NUL.
 EVENT_NAME = re.compile(rb"^event (.+\.rs):(\d+)(\x00?)$")
+# The `Metadata` static that `tracing`'s callsite macros define, `META` inside
+# `__CALLSITE`, in v0 or legacy mangling.
+CALLSITE_META = re.compile(r"CALLSITE4META(?:17h[0-9a-f]{16}E)?$")
 
 # Directives that carry no code or data: debug lines, alignment, linkage and
 # object-file bookkeeping.
@@ -189,9 +203,12 @@ def split_file(text):
 
     Returns `(functions, blocks, set_names)`: functions as `(name, lines)`,
     with local code labels kept in the body as `label:` lines, data blocks
-    as `(label, lines)`, and the names that `.set` defines.
+    as `(label, section, lines)`, and the names that `.set` defines. Each
+    function body starts with its section directive, and each block keeps
+    its own, with the item's own name in it replaced by `SELF`, so moving
+    code or data to another section is a difference.
     """
-    kind = "text"
+    kind, section = "text", ".text"
     functions, blocks, set_names = [], [], set()
     current = None
     for raw in text.splitlines():
@@ -200,7 +217,7 @@ def split_file(text):
             continue
         switched = section_kind(line)
         if switched:
-            kind, current = switched, None
+            kind, section, current = switched, line, None
             continue
         if kind == "skip" or line.startswith(DROPPED):
             continue
@@ -209,7 +226,7 @@ def split_file(text):
         if line.startswith((".zerofill", ".tbss", ".comm", ".lcomm")):
             fields = [field.strip() for field in line.split(None, 1)[1].split(",")]
             name = fields[2] if line.startswith(".zerofill") else fields[0]
-            blocks.append((name, [line.replace(name, "SELF")]))
+            blocks.append((name, ".zerofill", [line.replace(name, "SELF")]))
             current = None
             continue
         match = LABEL_LINE.match(line)
@@ -218,9 +235,12 @@ def split_file(text):
             if kind == "text" and LOCAL.match(label):
                 if current is not None:
                     current.append(label + ":")
+            elif kind == "text":
+                current = [section.replace(label, "SELF")]
+                functions.append((label, current))
             else:
                 current = []
-                (functions if kind == "text" else blocks).append((label, current))
+                blocks.append((label, section.replace(label, "SELF"), current))
             if rest and current is not None:
                 current.append(rest)
             continue
@@ -234,12 +254,15 @@ class Renamer:
 
     A label defined in a data section becomes `DATA<n>`, and its qualified
     name goes in `refs`, in order. Any other local label becomes `LOC<n>`.
+    Every other symbol is kept, and goes in `symbols`, so a block's pointer
+    to a global, such as an anonymous constant that thin LTO promoted, can
+    still be followed.
     """
 
     def __init__(self, local, data, qualify):
         """Takes the file's local labels, its data labels and how to qualify one."""
         self.local, self.data, self.qualify = local, data, qualify
-        self.names, self.refs = {}, []
+        self.names, self.refs, self.symbols = {}, [], set()
 
     def __call__(self, text):
         """Returns `text` with every local label renamed."""
@@ -249,6 +272,7 @@ class Renamer:
         """The new name for one identifier, or the identifier itself when it isn't local."""
         token = match.group(1)
         if token not in self.local:
+            self.symbols.add(token)
             return token
         if token not in self.names:
             if token in self.data:
@@ -262,28 +286,38 @@ class Renamer:
 class Block:
     """One data block: its normalized items and the local data it refers to.
 
-    Items are `("bytes", b)`, `("ref", size, expr)`, `("len",)` for a
-    string's length after a pointer to it, or `("dir", text)`.
+    Items are `("bytes", b)`, `("ref", size, expr)`, `("len", d)` for a
+    string's length after a pointer to it (see `Unit.finish`), or
+    `("dir", text)`.
     """
 
-    __slots__ = ("label", "items", "refs")
+    __slots__ = ("key", "section", "items", "refs", "symbols")
 
-    def __init__(self, label, items, refs):
-        """Stores the block's label, items and `(token, qualified label)` refs."""
-        self.label, self.items, self.refs = label, items, refs
+    def __init__(self, key, section, items, refs, symbols=()):
+        """Stores the block's unit-wide key, section, items, `(token, qualified label)` refs and global symbols."""
+        self.key, self.section, self.items, self.refs = key, section, items, refs
+        self.symbols = frozenset(symbols)
 
     def ref(self, token):
-        """The qualified label that `token`, such as `DATA0`, names, or None."""
+        """The unit-wide key that `token`, such as `DATA0` or a global symbol, names, or None."""
         for name, target in self.refs:
             if name == token:
                 return target
-        return None
+        return token if token in self.symbols else None
+
+    def targets(self):
+        """The keys of every block this block may point to: its local refs, then its global symbols."""
+        return [target for _, target in self.refs] + sorted(self.symbols)
 
     def string(self):
         """The block's bytes when it's one string or byte run, else None."""
         if len(self.items) == 1 and self.items[0][0] == "bytes":
             return self.items[0][1]
         return None
+
+    def shape(self):
+        """The block's section and items, for comparing blocks that nothing pairs."""
+        return repr((self.section, self.items))
 
 
 def int_bytes(value, size):
@@ -380,8 +414,8 @@ class Unit:
 
     def add_file(self, index, text):
         """Parses one `.s` file's text into the unit."""
-        functions, blocks, set_names = split_file(text)
-        data = {label for label, _ in blocks if LOCAL.match(label)}
+        functions, blocks, set_names = split_file(LLVM_SUFFIX.sub("", text))
+        data = {label for label, _, _ in blocks if LOCAL.match(label)}
         local = set(data) | {n for n in set_names if LOCAL.match(n)}
         for _, lines in functions:
             for line in lines:
@@ -396,20 +430,23 @@ class Unit:
             rename = Renamer(local, data, qualify)
             body = tuple(rename(line) for line in lines)
             self.functions[name].append((body, rename.refs))
-        for label, lines in blocks:
+        for label, section, lines in blocks:
             rename = Renamer(local, data, qualify)
-            block = Block(label, data_items(lines, rename), rename.refs)
+            key = qualify(label) if label in data else label
+            block = Block(key, rename(section), data_items(lines, rename), rename.refs, rename.symbols)
             if label in data:
-                self.local[qualify(label)] = block
+                self.local[key] = block
             else:
                 self.named[label].append(block)
 
     def finish(self):
-        """Marks each string length that follows a pointer to the string.
+        """Marks string lengths, then finds where `tracing` callsites keep their line.
 
         A pointer and length pair to a local string becomes `("ref", ...)`
-        then `("len",)`, so the length isn't compared as bytes. The string's
-        own contents are still compared through the pair.
+        then `("len", d)`, where `d` is the string's size minus the length,
+        0 or 1 for `.asciz`'s NUL. So a length that changes along with its
+        string isn't compared as bytes, but one that changes alone is. The
+        string's own contents are still compared through the pair.
         """
         for block in self.blocks():
             items, out = block.items, []
@@ -417,22 +454,65 @@ class Unit:
                 prev = out[-1] if out else None
                 if (item[0] == "bytes" and prev and prev[0] == "ref" and prev[1] == 8
                         and len(item[1]) >= 8):
-                    target = self.local.get(block.ref(prev[2]))
+                    target = self.block(block.ref(prev[2]))
                     text = target.string() if target else None
                     length = int.from_bytes(item[1][:8], "little")
                     if text is not None and (length == len(text) or (text.endswith(b"\0") and length == len(text) - 1)):
-                        out.append(("len",))
+                        out.append(("len", len(text) - length))
                         if len(item[1]) > 8:
                             out.append(("bytes", item[1][8:]))
                         continue
                 out.append(item)
             block.items = tuple(out)
+        self.callsite_line, self.callsite_names = find_callsite_layout(self)
+
+    def block(self, key):
+        """The block a key names: a local block, or a global one with one copy, else None."""
+        if key in self.local:
+            return self.local[key]
+        copies = self.named.get(key, ())
+        return copies[0] if len(copies) == 1 else None
 
     def blocks(self):
         """Every data block, named and local."""
         for copies in self.named.values():
             yield from copies
         yield from self.local.values()
+
+
+def is_callsite(block):
+    """Whether a block is a `tracing` callsite's `Metadata` static, by its symbol."""
+    return bool(CALLSITE_META.search(block.key))
+
+
+def find_callsite_layout(unit):
+    """Where this unit's `tracing` callsites keep their line, from its event callsites.
+
+    An event callsite's name is `event <file>:<line>`, so its `Some(line)`
+    word can be found by value. Every event callsite must agree on that
+    word's offset, which then applies to span callsites too, since they
+    share the `Metadata` type. Returns `(offset, names)`: the offset, or None
+    when there are no event callsites or they disagree, and the keys of the
+    event name strings.
+    """
+    offsets, names = set(), set()
+    for copies in unit.named.values():
+        for block in copies:
+            if not is_callsite(block):
+                continue
+            for target in block.targets():
+                found = unit.block(target)
+                text = found.string() if found else None
+                match = EVENT_NAME.match(text) if text is not None else None
+                if not match:
+                    continue
+                names.add(target)
+                flat = flatten(block.items)
+                want = [1, 0, 0, 0] + list(int(match.group(2)).to_bytes(4, "little"))
+                found = [w for w in range(4, len(flat or []) - 3, 4) if flat[w - 4:w + 4] == want]
+                offsets.update(found if len(found) == 1 else [None])
+    offset = offsets.pop() if len(offsets) == 1 else None
+    return offset, names
 
 
 def load_unit(paths):
@@ -540,9 +620,9 @@ class Report:
         self.differences.append(text)
 
 
-def source_path(unit, qualified):
-    """The source file path that a local string block holds, or None."""
-    block = unit.local.get(qualified)
+def source_path(unit, key):
+    """The source file path that a string block holds, or None."""
+    block = unit.block(key)
     text = block.string() if block else None
     if text is None:
         return None
@@ -571,28 +651,35 @@ def flatten(items):
 
 
 def is_location(block, unit):
-    """Whether the block starts like a `core::panic::Location`: a path pointer, its length, line, column."""
+    """Whether an anonymous block is a `core::panic::Location`: a path pointer, its length, line and column."""
     items = block.items
     return (
-        len(items) >= 3 and items[0][0] == "ref" and items[0][1] == 8 and items[1] == ("len",)
-        and items[2][0] == "bytes" and len(items[2][1]) >= 8
+        (block.key in unit.local or PROMOTED_ANON.match(block.key)) and len(items) == 3
+        and items[0][0] == "ref" and items[0][1] == 8 and items[1][0] == "len"
+        and items[2][0] == "bytes" and len(items[2][1]) == 8
         and source_path(unit, block.ref(items[0][2])) is not None
     )
 
 
 def compare_blocks(bunit, base, hunit, head, line_map):
-    """Compares a data block pair, masking moved source lines.
+    """Compares a data block pair, masking source lines that moved.
 
     Returns `(reason, masked)`: `reason` is None when they match, and
-    `masked` lists the `(path, base_line, head_line)` lines that matched
-    only through `line_map`.
+    `masked` lists the `(path, base_line, head_line, kind)` lines that
+    matched only through `line_map`. Only three fields can differ: a
+    `Location`'s line, a `tracing` callsite's line at its unit's learned
+    offset (see `find_callsite_layout`), and the line in a callsite's
+    `event <file>:<line>` name.
     """
+    if base.section != head.section:
+        return "section %s -> %s" % (base.section, head.section), []
     if base.items == head.items:
         return None, []
     btext, htext = base.string(), head.string()
     if btext is not None and htext is not None:
         bm, hm = EVENT_NAME.match(btext), EVENT_NAME.match(htext)
-        if bm and hm and (bm.group(1), bm.group(3)) == (hm.group(1), hm.group(3)):
+        named = base.key in bunit.callsite_names and head.key in hunit.callsite_names
+        if named and bm and hm and (bm.group(1), bm.group(3)) == (hm.group(1), hm.group(3)):
             path, bline, hline = bm.group(1).decode(errors="replace"), int(bm.group(2)), int(hm.group(2))
             if line_map(path, bline) == hline:
                 return None, [(path, bline, hline, "callsite name")]
@@ -602,15 +689,19 @@ def compare_blocks(bunit, base, hunit, head, line_map):
         b != h for b, h in zip(base.items, head.items) if not (b[0] == h[0] == "bytes" and len(b[1]) == len(h[1]))
     ):
         return "layout differs", []
-    paths = {source_path(bunit, target) for _, target in base.refs} - {None}
-    hpaths = {source_path(hunit, target) for _, target in head.refs} - {None}
+    location = is_location(base, bunit) and is_location(head, hunit)
+    line_offset = bunit.callsite_line if bunit.callsite_line == hunit.callsite_line else None
+    callsite = is_callsite(base) and is_callsite(head) and line_offset is not None
+    if not location and not callsite:
+        return "contents differ", []
+    paths = {source_path(bunit, target) for target in base.targets()} - {None}
+    hpaths = {source_path(hunit, target) for target in head.targets()} - {None}
     if len(paths) != 1 or paths != hpaths:
         return "contents differ", []
     path = paths.pop()
     bflat, hflat = flatten(base.items), flatten(head.items)
     if bflat is None or hflat is None:
         return "contents differ", []
-    location = is_location(base, bunit) and is_location(head, hunit)
     masked = []
     words = sorted({i - i % 4 for i, (b, h) in enumerate(zip(bflat, hflat)) if b != h})
     for word in words:
@@ -618,12 +709,12 @@ def compare_blocks(bunit, base, hunit, head, line_map):
         if None in bword or None in hword or len(bword) < 4:
             return "contents differ", []
         # A Location's line follows its path pointer and length, at offset
-        # 16. A callsite's line is an `Option<u32>`, so a word after a `Some`
-        # tag of 1.
+        # 16. A callsite's line is an `Option<u32>` at the learned offset,
+        # after a `Some` tag of 1.
         if location:
             slot = word == 16
         else:
-            slot = word >= 4 and bflat[word - 4:word] == [1, 0, 0, 0] == hflat[word - 4:word]
+            slot = word == line_offset and bflat[word - 4:word] == [1, 0, 0, 0] == hflat[word - 4:word]
         if not slot:
             return "bytes differ at offset %d" % word, []
         bline, hline = int.from_bytes(bytes(bword), "little"), int.from_bytes(bytes(hword), "little")
@@ -661,8 +752,8 @@ def compare_units(base, head, line_map):
             for (_, brefs), (_, hrefs) in zip(bcopies, hcopies):
                 pairs.extend((b[1], h[1], name) for b, h in zip(brefs, hrefs))
     for name in sorted(set(base.named) | set(head.named)):
-        bcopies = sorted(base.named.get(name, []), key=lambda block: repr(block.items))
-        hcopies = sorted(head.named.get(name, []), key=lambda block: repr(block.items))
+        bcopies = sorted(base.named.get(name, []), key=Block.shape)
+        hcopies = sorted(head.named.get(name, []), key=Block.shape)
         report.blocks += 1
         if len(bcopies) != len(hcopies):
             report.differ("data %s: %d copies in base, %d in head" % (name, len(bcopies), len(hcopies)))
@@ -693,8 +784,8 @@ def compare_units(base, head, line_map):
             continue
         report.masked.update(masked)
         pairs.extend((b[1], h[1], via) for b, h in zip(bblock.refs, hblock.refs))
-    bleft = collections.Counter(repr(b.items) for q, b in base.local.items() if q not in bseen)
-    hleft = collections.Counter(repr(b.items) for q, b in head.local.items() if q not in hseen)
+    bleft = collections.Counter(b.shape() for q, b in base.local.items() if q not in bseen)
+    hleft = collections.Counter(b.shape() for q, b in head.local.items() if q not in hseen)
     for items, count in (bleft - hleft).items():
         report.differ("unreferenced constant only in base (x%d): %s" % (count, items[:120]))
     for items, count in (hleft - bleft).items():
@@ -757,7 +848,7 @@ def compare_text(base, head):
 # ---------------------------------------------------------------------------
 
 
-def build_env(tree, target):
+def build_env(tree, target, extra=None):
     """The environment for a build of `tree`, with build metadata made the same on both sides.
 
     `zakurad`'s build script embeds the revision's Git SHA, description and
@@ -767,7 +858,9 @@ def build_env(tree, target):
     metadata on either side, as for a source archive build. No data is
     masked for it.
     """
-    return rw.cargo_env(target, {"GIT_CEILING_DIRECTORIES": str(tree), "SOURCE_DATE_EPOCH": "0"})
+    env = {"GIT_CEILING_DIRECTORIES": str(tree), "SOURCE_DATE_EPOCH": "0"}
+    env.update(extra or {})
+    return rw.cargo_env(target, env)
 
 
 @contextlib.contextmanager
@@ -791,10 +884,20 @@ def side_target(work, side):
             active.rename(saved)
 
 
+def collect_asm(deps, prefix, out_dir):
+    """Moves the `.s` files in `deps` that start with `prefix` to a fresh `out_dir`, and lists them."""
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    for path in deps.glob(prefix + "*.s"):
+        shutil.move(str(path), str(out_dir / path.name))
+    return sorted(out_dir.glob("*.s"))
+
+
 def emit_asm(cargo, tree, target, package, crate, cgu, out_dir):
     """Emits `package`'s release library assembly, and moves its `.s` files to `out_dir`.
 
-    `crate` is the library's crate name, and `cgu` the codegen-units setting.
+    `crate` is the library's crate name, and `cgu` the codegen-units setting
+    for that crate.
     """
     deps = target / "release" / "deps"
     for stale in deps.glob(crate + "-*.s"):
@@ -805,46 +908,28 @@ def emit_asm(cargo, tree, target, package, crate, cgu, out_dir):
          "--emit=asm,link", "-C", "codegen-units=%d" % cgu],
         cwd=tree, env=build_env(tree, target),
     )
-    shutil.rmtree(out_dir, ignore_errors=True)
-    out_dir.mkdir(parents=True)
-    for path in deps.glob(crate + "-*.s"):
-        shutil.move(str(path), str(out_dir / path.name))
-    return sorted(out_dir.glob("*.s"))
+    return collect_asm(deps, crate + "-", out_dir)
 
 
-def downstream_packages(metadata, packages):
-    """The library packages that `zakurad` links and that depend on any of `packages`.
+def emit_binary(cargo, tree, target, cgu, out_dir):
+    """Builds the release `zakurad` with every workspace crate at `cgu` codegen units.
 
-    Reads `cargo metadata --no-deps` output. Generic code from `packages` can
-    be instantiated in these, with its constants, strings and panic
-    locations, so their assembly is compared too. Only normal dependencies
-    count, so test-only and simulator crates are left out.
+    With the release profile's thin LTO, `--emit=asm` on the binary writes
+    the assembly of every module after link-time optimization: all the code
+    and data the binary holds, whichever crate instantiated it. Returns that
+    assembly, moved to `out_dir`, and the binary's text section.
     """
-    workspace = {package["name"]: package for package in metadata["packages"]}
-    deps = {
-        name: {dep["name"] for dep in package["dependencies"]
-               if dep["name"] in workspace and dep.get("kind") is None}
-        for name, package in workspace.items()
-    }
-    linked, todo = set(), [BINARY_PACKAGE]
-    while todo:
-        name = todo.pop()
-        if name in workspace and name not in linked:
-            linked.add(name)
-            todo.extend(deps[name])
-
-    def reaches(name, seen):
-        """Whether `name` depends, directly or not, on any of `packages`."""
-        if name in seen:
-            return False
-        seen.add(name)
-        return any(dep in packages or reaches(dep, seen) for dep in deps[name])
-
-    return sorted(
-        name for name in linked
-        if name not in packages and reaches(name, set())
-        and any("lib" in target["kind"] for target in workspace[name]["targets"])
+    deps = target / "release" / "deps"
+    for stale in deps.glob(BINARY + "-*.s"):
+        stale.unlink()
+    print("== %s: release %s, codegen-units=%d" % (tree.name, BINARY, cgu), flush=True)
+    rw.run(
+        [cargo, "rustc", "--release", "--locked", "-p", BINARY_PACKAGE, "--bin", BINARY, "--",
+         "--emit=asm,link"],
+        cwd=tree, env=build_env(tree, target, {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": str(cgu)}),
     )
+    text = text_section(target / "release" / BINARY)
+    return collect_asm(deps, BINARY + "-", out_dir), text
 
 
 def read_metadata(cargo, tree):
@@ -863,41 +948,48 @@ def lib_crates(metadata):
     }
 
 
-def comparisons(asm, packages, cgus, downstream):
+def comparisons(asm, packages, cgus, binary):
     """The `(title, base files, head files)` comparisons to run, from emitted `asm`.
 
-    Each of `packages`, then each `downstream` package, at each of `cgus`. A
-    downstream package that one side doesn't have gets None on that side.
+    Each of `packages` at each of `cgus`, then, with `binary`, the release
+    `zakurad`'s assembly at each of `cgus`.
     """
     out = []
-    for kind, names in (("", packages), ("downstream ", downstream)):
-        for package in names:
-            for cgu in cgus:
-                out.append(("%s%s codegen-units=%d" % (kind, package, cgu),
-                            asm.get(("base", package, cgu)), asm.get(("head", package, cgu))))
+    names = list(packages) + ([BINARY] if binary else [])
+    for name in names:
+        for cgu in cgus:
+            title = "%s%s codegen-units=%d" % ("binary " if name == BINARY else "", name, cgu)
+            out.append((title, asm.get(("base", name, cgu), []), asm.get(("head", name, cgu), [])))
     return out
 
 
-def run_comparisons(items, line_map):
-    """Runs and prints each comparison, returning the worst exit status."""
+def comparison_job(item, line_map):
+    """Runs one comparison, returning its exit status and what it printed."""
+    title, bfiles, hfiles = item
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        status = compare_side_files(title, bfiles, hfiles, line_map)
+    return status, out.getvalue()
+
+
+def run_comparisons(items, line_map, jobs=1):
+    """Runs each comparison, `jobs` at a time, prints them in order, and returns the worst exit status.
+
+    Each comparison parses its own two sides, so they run in forked worker
+    processes when `jobs` is more than 1.
+    """
+    if jobs > 1 and len(items) > 1:
+        context = multiprocessing.get_context("fork")
+        with concurrent.futures.ProcessPoolExecutor(min(jobs, len(items)), mp_context=context) as pool:
+            results = list(pool.map(comparison_job, items, [line_map] * len(items)))
+    else:
+        results = [comparison_job(item, line_map) for item in items]
     status = EXIT_SAME
-    for title, bfiles, hfiles in items:
-        if bfiles is None or hfiles is None:
-            print("%s: package only in %s" % (title, "head" if bfiles is None else "base"))
-            status = max(status, EXIT_DIFFERS)
-            continue
-        status = max(status, compare_side_files(title, bfiles, hfiles, line_map))
+    for result, text in results:
+        sys.stdout.write(text)
+        status = max(status, result)
+    sys.stdout.flush()
     return status
-
-
-def build_binary(cargo, tree, target):
-    """Builds the release `zakurad` in `tree`, and returns its path."""
-    print("== %s: release %s" % (tree.name, BINARY), flush=True)
-    rw.run(
-        [cargo, "build", "--release", "--locked", "-p", BINARY_PACKAGE, "--bin", BINARY],
-        cwd=tree, env=build_env(tree, target),
-    )
-    return target / "release" / BINARY
 
 
 def print_report(title, report):
@@ -939,7 +1031,9 @@ def parse_args(argv):
                         % " ".join(DEFAULT_PACKAGES))
     parser.add_argument("--cgu", action="append", type=int, help="a codegen-units setting (default: 4 and 1)")
     parser.add_argument("--no-binary", action="store_true",
-                        help="skip the downstream packages and the release zakurad build, for quick runs")
+                        help="skip the release zakurad builds and their comparison, for quick runs")
+    parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1),
+                        help="comparisons to run at once (default: up to 8)")
     parser.add_argument("--work-dir", help="keep worktrees' build caches here for reuse (default: a temporary directory)")
     parser.add_argument("--cargo", default="cargo", help="the cargo command (default: cargo)")
     parser.add_argument("--repo", default=".", help="the repository (default: the current one)")
@@ -951,39 +1045,38 @@ def main(argv=None):
     args = parse_args(argv)
     packages = args.package or DEFAULT_PACKAGES
     cgus = args.cgu or DEFAULT_CGUS
-    status = EXIT_SAME
     try:
         repo = rw.repo_root(args.repo)
         base, head = rw.resolve(repo, args.base), rw.resolve(repo, args.head)
         print("base %s, head %s" % (base, head), flush=True)
         line_map = GitLineMap(repo, base, head)
         with rw.Worktrees(repo, base, head, args.work_dir) as trees:
-            asm, downstream, texts = {}, set(), {}
+            asm, texts = {}, {}
             for side in ("base", "head"):
                 tree = trees.tree(side)
-                metadata = read_metadata(args.cargo, tree)
-                crates = lib_crates(metadata)
-                linked = [] if args.no_binary else downstream_packages(metadata, set(packages))
-                downstream.update(linked)
+                crates = lib_crates(read_metadata(args.cargo, tree))
                 with side_target(trees.work, side) as target:
-                    for package in list(packages) + linked:
+                    for package in packages:
+                        crate = crates.get(package, package.replace("-", "_"))
                         for cgu in cgus:
                             out = trees.work / "asm" / side / ("%s-cgu%d" % (package, cgu))
-                            crate = crates.get(package, package.replace("-", "_"))
                             asm[side, package, cgu] = emit_asm(
                                 args.cargo, tree, target, package, crate, cgu, out)
                     if not args.no_binary:
-                        texts[side] = text_section(build_binary(args.cargo, tree, target))
-            if not args.no_binary:
-                print("downstream packages: %s" % (" ".join(sorted(downstream)) or "none"), flush=True)
-            status = run_comparisons(comparisons(asm, packages, cgus, sorted(downstream)), line_map)
-            if not args.no_binary:
-                difference = compare_text(texts["base"], texts["head"])
-                print("%s text section: %s" % (BINARY, difference or "identical (%d bytes)" % len(texts["base"])))
+                        for cgu in cgus:
+                            out = trees.work / "asm" / side / ("%s-cgu%d" % (BINARY, cgu))
+                            asm[side, BINARY, cgu], texts[side, cgu] = emit_binary(
+                                args.cargo, tree, target, cgu, out)
+            status = run_comparisons(comparisons(asm, packages, cgus, not args.no_binary), line_map, args.jobs)
+            for cgu in cgus:
+                if args.no_binary:
+                    print("%s text section: skipped (--no-binary)" % BINARY)
+                    break
+                difference = compare_text(texts["base", cgu], texts["head", cgu])
+                print("%s text section codegen-units=%d: %s" % (
+                    BINARY, cgu, difference or "identical (%d bytes)" % len(texts["base", cgu])))
                 if difference:
                     status = max(status, EXIT_DIFFERS)
-            else:
-                print("%s text section: skipped (--no-binary)" % BINARY)
     except rw.CommandFailed as error:
         print("error: %s" % error, file=sys.stderr)
         return rw.EXIT_COMMAND_FAILED

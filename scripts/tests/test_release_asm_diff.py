@@ -111,41 +111,42 @@ __RNvNvCs1_5crate4emit8CALLSITE4META:
 	.quad	l_anon.{h}.5
 	.asciz	"{namelen}\000\000\000\000\000\000"
 	.quad	l_anon.{h}.6
-	.ascii	"\023\000\000\000\000\000\000\000\002"
+	.ascii	"\023\000\000\000\000\000\000\000{level}"
 	.space	7
 """
 
-# A record that holds a location and its message inline.
-PANIC_SITE = r"""
+# An ordinary record laid out like a callsite's first words, a count of 1,
+# a flag of 1 and a limit of `{line}`, then a pointer to a source path.
+CONFIG = r"""
 	.section	__TEXT,__text,regular,pure_instructions
-	.globl	__RNvCs1_5crate4site
+	.globl	__RNvCs1_5crate4conf
 	.p2align	2
-__RNvCs1_5crate4site:
-	adrp	x0, __RNvCs1_5crate4SITE@PAGE
+__RNvCs1_5crate4conf:
+	adrp	x0, __RNvCs1_5crate6CONFIG@PAGE
 	ret
 
-	.section	__TEXT,__cstring,cstring_literals
+	.section	__TEXT,__const
 l_anon.{h}.7:
-	.asciz	"crates/x/src/lib.rs"
+	.ascii	"crates/x/src/lib.rs"
 
 	.section	__DATA,__const
-	.globl	__RNvCs1_5crate4SITE
+	.globl	__RNvCs1_5crate6CONFIG
 	.p2align	3, 0x0
-__RNvCs1_5crate4SITE:
+__RNvCs1_5crate6CONFIG:
+	.asciz	"\001\000\000\000\000\000\000\000\001\000\000\000{lineoctal}\000\000"
 	.quad	l_anon.{h}.7
-	.ascii	"\023\000\000\000\000\000\000\000{lineoctal}\000\000\000\005\000\000\000"
-	.ascii	"{msg}"
+	.asciz	"\023\000\000\000\000\000\000"
 """
 
 
-def render(template, h="aaaa", f="0", line=10, msg="bad peer", limit=1000, extra_function=""):
+def render(template, h="aaaa", f="0", line=10, msg="bad peer", limit=1000, extra_function="", level=2):
     """Fills in one of the crafted templates."""
     return (
         template.replace("{h}", h).replace("{f}", f).replace("{line}", str(line))
         .replace("{lineoctal}", "\\%03o" % line).replace("{msg}", msg)
         .replace("{msglen}", str(len(msg))).replace("{limit}", str(limit))
         .replace("{namelen}", "\\%03o" % len("event crates/x/src/lib.rs:%d" % line))
-        .replace("{extra_function}", extra_function)
+        .replace("{extra_function}", extra_function).replace("{level}", "\\%03o" % level)
     )
 
 
@@ -212,13 +213,53 @@ class ComparatorTests(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("masked location crates/x/src/lib.rs:10 -> 11", out)
 
+    def test_a_moved_promoted_location_passes(self):
+        """A location and path string that thin LTO promoted to global symbols are still masked."""
+
+        def promoted(text):
+            """Renames the location and its path string as thin LTO promotes them."""
+            return text.replace("l_anon.aaaa.1", "_anon.aaaa.1").replace("l_anon.aaaa.2", "_anon.aaaa.2")
+
+        status, out = compare([promoted(render(BASE))], [promoted(render(BASE, line=11))], inserted_above(7))
+        self.assertEqual(status, 0, out)
+        self.assertIn("masked location crates/x/src/lib.rs:10 -> 11", out)
+
     def test_a_changed_panic_message_fails(self):
-        """A message change fails, even beside a location that moved and is masked."""
+        """A message change fails beside a moved, masked location, and so does a callsite's other field."""
         status, out = compare([render(BASE)], [render(BASE, line=11, msg="bad Peer")], inserted_above(7))
         self.assertEqual(status, 1, out)
-        status, out = compare([render(PANIC_SITE)], [render(PANIC_SITE, line=11, msg="bad Peer")], inserted_above(7))
+        self.assertIn("constant 0:l_anon.aaaa.0 read by __RNvCs1_5crate5check", out)
+        status, out = compare([render(CALLSITE, line=99)], [render(CALLSITE, line=100, level=3)], inserted_above(7))
         self.assertEqual(status, 1, out)
-        self.assertIn("data differs: __RNvCs1_5crate4SITE (bytes differ at offset 28)", out)
+        self.assertIn("CALLSITE4META (bytes differ at offset 48)", out)
+
+    def test_an_ordinary_record_is_not_masked_as_a_callsite(self):
+        """A record that isn't a callsite fails when a word after a 1 changes, even to a mapped line."""
+        status, out = compare([render(CALLSITE, line=99) + render(CONFIG, line=10)],
+                              [render(CALLSITE, line=100) + render(CONFIG, line=11)], inserted_above(7))
+        self.assertEqual(status, 1, out)
+        self.assertIn("data differs: __RNvCs1_5crate6CONFIG (contents differ)", out)
+
+    def test_a_changed_string_length_fails(self):
+        """A string length that changes alone fails, though the string is the same."""
+        head = render(BASE).replace('"\\023\\000\\000\\000', '"\\024\\000\\000\\000', 1)
+        self.assertNotEqual(head, render(BASE))
+        status, out = compare([render(BASE)], [head])
+        self.assertEqual(status, 1, out)
+
+    def test_a_moved_section_fails(self):
+        """Unchanged data moved to another section fails."""
+        head = render(BASE).replace("__TEXT,__literal8,8byte_literals", "__DATA,__mod_init_func,mod_init_funcs")
+        status, out = compare([render(BASE)], [head])
+        self.assertEqual(status, 1, out)
+        self.assertIn("section", out)
+
+    def test_thinlto_suffixes_are_ignored(self):
+        """Thin LTO's `.llvm.<hash>` suffixes on promoted locals aren't differences."""
+        base = render(BASE).replace("__RNvNtCs2_4core6option13expect_failed", "__RNvCs1_5crate4help.llvm.111")
+        head = render(BASE).replace("__RNvNtCs2_4core6option13expect_failed", "__RNvCs1_5crate4help.llvm.222")
+        status, out = compare([base], [head])
+        self.assertEqual(status, 0, out)
 
     def test_a_moved_release_line_fails(self):
         """A location whose line moved with no diff mapping fails."""
@@ -236,13 +277,13 @@ class ComparatorTests(unittest.TestCase):
         self.assertEqual(status, 1, out)
 
 
-class DownstreamTests(unittest.TestCase):
-    def test_a_generic_change_shows_only_downstream(self):
-        """A constant that only a downstream crate's instantiation holds fails there."""
+class BinaryTests(unittest.TestCase):
+    def test_a_generic_change_shows_in_the_binary(self):
+        """A constant that only a downstream instantiation holds fails in the binary's assembly."""
         with tempfile.TemporaryDirectory() as tmp:
             files = {}
             for name, text in (("lib-base", render(BASE)), ("lib-head", render(BASE, h="bbbb")),
-                               ("down-base", render(BASE)), ("down-head", render(BASE, limit=1001))):
+                               ("bin-base", render(BASE)), ("bin-head", render(BASE, limit=1001))):
                 path = Path(tmp) / name / "x.s"
                 path.parent.mkdir()
                 path.write_text(text)
@@ -250,39 +291,17 @@ class DownstreamTests(unittest.TestCase):
             asm = {
                 ("base", "zakura-network", 4): files["lib-base"],
                 ("head", "zakura-network", 4): files["lib-head"],
-                ("base", "zakura", 4): files["down-base"],
-                ("head", "zakura", 4): files["down-head"],
+                ("base", "zakurad", 4): files["bin-base"],
+                ("head", "zakurad", 4): files["bin-head"],
             }
             out = io.StringIO()
             with redirect_stdout(out):
-                status = asm_diff.run_comparisons(
-                    asm_diff.comparisons(asm, ["zakura-network"], [4], ["zakura"]), no_map)
+                status = asm_diff.run_comparisons(asm_diff.comparisons(asm, ["zakura-network"], [4], True), no_map)
         self.assertEqual(status, 1, out.getvalue())
-        self.assertIn("zakura-network codegen-units=4: 1 functions", out.getvalue())
-        self.assertIn("downstream zakura codegen-units=4: 1 functions, 4 data blocks compared, 0 lines masked: differs",
+        self.assertIn("zakura-network codegen-units=4: 1 functions, 4 data blocks compared, 0 lines masked: identical",
                       out.getvalue())
-
-    def test_downstream_packages_are_linked_dependents(self):
-        """Downstream packages are libraries `zakurad` links that depend on a compared one."""
-
-        def package(name, deps, kinds=("lib",)):
-            """One `cargo metadata` package entry."""
-            return {"name": name, "targets": [{"kind": [kind]} for kind in kinds],
-                    "dependencies": [{"name": dep, "kind": kind} for dep, kind in deps]}
-
-        metadata = {"packages": [
-            package("zakura", [("zakura-network", None), ("zakura-rpc", None), ("zakura-sim", "dev")],
-                    ("lib", "bin")),
-            package("zakura-rpc", [("zakura-network", None)]),
-            package("zakura-network", [("zakura-rt", None)]),
-            package("zakura-rt", []),
-            package("zakura-chain", []),
-            package("zakura-sim", [("zakura-network", None)]),
-        ]}
-        self.assertEqual(asm_diff.downstream_packages(metadata, {"zakura-rt"}),
-                         ["zakura", "zakura-network", "zakura-rpc"])
-        self.assertEqual(asm_diff.downstream_packages(metadata, {"zakura-network", "zakura-rt"}),
-                         ["zakura", "zakura-rpc"])
+        self.assertIn("binary zakurad codegen-units=4: 1 functions, 4 data blocks compared, 0 lines masked: differs",
+                      out.getvalue())
 
 
 class LineMapTests(unittest.TestCase):
@@ -343,6 +362,36 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(status, 3, output)
             self.assertIn("exit status 7", output)
             self.assertFalse((Path(tmp) / "work" / "base").exists())
+
+    def test_an_unrelated_work_dir_is_refused(self):
+        """A work directory that holds files no run made is refused, and nothing in it is deleted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = Path(tmp) / "work" / "base" / "keep.txt"
+            keep.parent.mkdir(parents=True)
+            keep.write_text("mine\n")
+            status, output, _ = self.run_fake(tmp)
+            self.assertEqual(status, 3, output)
+            self.assertIn("isn't empty and no earlier run made it", output)
+            self.assertEqual(keep.read_text(), "mine\n")
+
+    def test_build_overrides_are_dropped(self):
+        """A caller's compiler flags and profile overrides don't reach the builds."""
+        names = ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+                 "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS", "CARGO_INCREMENTAL"]
+        saved = {name: os.environ.get(name) for name in names}
+        try:
+            for name in names:
+                os.environ[name] = "--cfg zakura_sim"
+            env = asm_diff.build_env(Path("/tree"), Path("/target"), {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1"})
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        self.assertEqual([name for name in names if name in env], ["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"])
+        self.assertEqual(env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"], "1")
+        self.assertEqual(env["CARGO_TARGET_DIR"], "/target")
 
     def test_builds_see_no_git_metadata(self):
         """A build can't find the revision's Git repository, so `zakurad`'s build metadata is the same on both sides."""

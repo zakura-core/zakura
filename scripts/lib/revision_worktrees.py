@@ -13,6 +13,7 @@ as `CARGO_MANIFEST_DIR`, can't shift the layout of one side's binary.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -20,6 +21,19 @@ from pathlib import Path
 
 # The exit status for a failed command, shared by both scripts.
 EXIT_COMMAND_FAILED = 3
+
+# The file that marks a work directory as this tool's, so it never deletes
+# anything in a directory it didn't make.
+MARKER = ".zakura-revision-diff"
+
+# Caller settings that would change what cargo builds: compiler flags such as
+# an inherited `--cfg zakura_sim`, profile overrides, a target or wrapper, and
+# incremental builds.
+BUILD_OVERRIDES = re.compile(
+    r"^(RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_\w+_RUSTFLAGS"
+    r"|CARGO_PROFILE_\w+|CARGO_BUILD_TARGET|CARGO_INCREMENTAL|RUSTC_WRAPPER"
+    r"|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER)$"
+)
 
 
 class CommandFailed(Exception):
@@ -62,8 +76,13 @@ def resolve(repo, rev):
 
 
 def cargo_env(target_dir, extra=None):
-    """This process's environment with `CARGO_TARGET_DIR` set to `target_dir`, plus `extra`."""
-    env = dict(os.environ)
+    """This process's environment for a build, with `CARGO_TARGET_DIR` set to `target_dir`, plus `extra`.
+
+    Drops every `BUILD_OVERRIDES` variable first, so both sides build exactly
+    as the repository's own configuration says, whatever the caller's shell
+    has set.
+    """
+    env = {name: value for name, value in os.environ.items() if not BUILD_OVERRIDES.match(name)}
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env.update(extra or {})
     return env
@@ -75,7 +94,8 @@ class Worktrees:
     With no `work_dir`, it makes a temporary one and deletes it on exit, build
     caches included. A given `work_dir` is kept, so a later run with the same
     directory reuses its target directories. The worktrees themselves are
-    always removed on exit.
+    always removed on exit. A given directory must be new, empty or marked
+    with `MARKER` by an earlier run, so nothing else in it is ever deleted.
     """
 
     def __init__(self, repo, base, head, work_dir=None):
@@ -91,6 +111,10 @@ class Worktrees:
             self.work = Path(tempfile.mkdtemp(prefix="zakura-revision-diff-"))
         self.work = self.work.resolve()
         self.work.mkdir(parents=True, exist_ok=True)
+        if not (self.work / MARKER).exists():
+            if any(self.work.iterdir()):
+                raise CommandFailed(["--work-dir", self.work], "it isn't empty and no earlier run made it")
+            (self.work / MARKER).write_text("made by scripts/lib/revision_worktrees.py\n")
         try:
             for side, rev in self.revs.items():
                 tree = self.tree(side)

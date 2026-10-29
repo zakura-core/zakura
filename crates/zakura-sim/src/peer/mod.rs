@@ -166,8 +166,9 @@ impl PeerAction {
     }
 }
 
-/// Why a scripted action couldn't run, which ends the run as a harness
-/// failure: the scenario asked for something its peer can't do.
+/// Why a peer couldn't go on, which ends the run as a harness failure: the
+/// scenario asked for something its peer can't do, or the node opened a
+/// header stream at a version the peer doesn't speak.
 pub type PeerFailure = Rc<RefCell<Option<String>>>;
 
 /// Whether a peer may be offered its next action, shared by its task and
@@ -331,6 +332,9 @@ enum StreamEvent {
     Header { id: u64, send: SendStream },
     /// The node's first whole frame arrived on header stream `id`.
     FirstFrame { id: u64 },
+    /// The node opened header stream `id` at a version other than
+    /// [`ZAKURA_HEADER_SYNC_STREAM_VERSION`].
+    BadVersion { id: u64, version: u16 },
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
@@ -399,7 +403,9 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
 }
 
 /// Serves one stream the node opened: a header stream goes to the peer and
-/// is read, and any other is held and drained until it ends.
+/// is read, and any other is held and drained until it ends. A header
+/// stream at a version the peer doesn't speak is reported instead, since
+/// the node only opens the version it negotiated.
 async fn serve_stream(
     send: SendStream,
     mut recv: RecvStream,
@@ -410,6 +416,11 @@ async fn serve_stream(
     };
     if prelude.stream_kind == ZAKURA_STREAM_HEADER_SYNC {
         let id = recv.id();
+        if prelude.stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION {
+            let version = prelude.stream_version;
+            let _ = events.send(StreamEvent::BadVersion { id, version });
+            return;
+        }
         if events.send(StreamEvent::Header { id, send }).is_ok() {
             read_frames(id, recv, events).await;
         }
@@ -441,7 +452,7 @@ impl PeerTask {
         std::future::pending::<()>().await;
     }
 
-    /// Records that the scenario asked for something the peer can't do.
+    /// Records why the peer can't go on, as [`PeerFailure`] describes.
     fn fail(&self, why: impl std::fmt::Display) -> Ended {
         self.failure
             .borrow_mut()
@@ -568,6 +579,12 @@ impl PeerTask {
                     StreamEvent::Header { id, send } => header = Some((id, send)),
                     StreamEvent::FirstFrame { id } => {
                         settled |= header.as_ref().is_some_and(|(current, _)| *current == id);
+                    }
+                    StreamEvent::BadVersion { id, version } => {
+                        return self.fail(format!(
+                            "the node opened header stream {id} at version {version}, not \
+                             {ZAKURA_HEADER_SYNC_STREAM_VERSION}"
+                        ));
                     }
                 },
                 Some(action) = self.commands.recv() => {

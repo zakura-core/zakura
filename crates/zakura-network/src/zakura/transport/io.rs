@@ -93,6 +93,22 @@ impl FramedRecv {
             .is_some_and(|slot| slot.attach(precheck))
     }
 
+    /// The transport observer of this stream's reader, if it has one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn stream_tap(&self) -> Option<&Arc<super::StreamTap>> {
+        self.precheck.as_ref().and_then(PrecheckSlot::tap)
+    }
+
+    /// Take the tag of the frame [`Self::recv`] or [`Self::try_recv`] is
+    /// returning, so the regulation events it causes name it. Both call it
+    /// once per frame they return, and never for a frame they skip.
+    #[cfg(any(test, zakura_sim))]
+    fn take_tag(&self) {
+        if let Some(tap) = self.stream_tap() {
+            tap.take_tag();
+        }
+    }
+
     /// Failure of any member, retained through session cancellation for service policy.
     pub(crate) fn failure(&self) -> Option<OrderedStreamFailure> {
         self.failure_cause.as_ref().and_then(|cause| cause.get())
@@ -112,9 +128,21 @@ impl FramedRecv {
             precheck.start();
         }
         match &mut self.receiver {
+            // The release arm stays a bare expression, so its build is unchanged.
+            #[cfg(not(any(test, zakura_sim)))]
             FramedReceiver::Plain(receiver) => receiver.try_recv(),
+            #[cfg(any(test, zakura_sim))]
+            FramedReceiver::Plain(receiver) => {
+                let frame = receiver.try_recv();
+                if frame.is_ok() {
+                    self.take_tag();
+                }
+                frame
+            }
             FramedReceiver::Queued(receiver) => loop {
                 if let Some(frame) = receiver.try_recv()?.receive() {
+                    #[cfg(any(test, zakura_sim))]
+                    self.take_tag();
                     return Ok(frame);
                 }
             },
@@ -127,10 +155,22 @@ impl FramedRecv {
             precheck.start();
         }
         match &mut self.receiver {
+            // As in `try_recv`, the release arm is unchanged.
+            #[cfg(not(any(test, zakura_sim)))]
             FramedReceiver::Plain(receiver) => receiver.recv().await,
+            #[cfg(any(test, zakura_sim))]
+            FramedReceiver::Plain(receiver) => {
+                let frame = receiver.recv().await;
+                if frame.is_some() {
+                    self.take_tag();
+                }
+                frame
+            }
             FramedReceiver::Queued(receiver) => {
                 while let Some(queued) = receiver.recv().await {
                     if let Some(frame) = queued.receive() {
+                        #[cfg(any(test, zakura_sim))]
+                        self.take_tag();
                         return Some(frame);
                     }
                 }

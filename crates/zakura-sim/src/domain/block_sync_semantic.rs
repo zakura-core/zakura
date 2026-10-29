@@ -1307,6 +1307,7 @@ mod tests {
             self.log.push(Observation::PeerFrame {
                 connection,
                 stream,
+                quic_stream: None,
                 seq,
                 row: Some("block".to_owned()),
                 rule_stream: stream,

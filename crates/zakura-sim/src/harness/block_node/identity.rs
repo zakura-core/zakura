@@ -152,6 +152,7 @@ impl Adapter {
                 log.push(Observation::FrameJudged {
                     connection,
                     stream: stream(),
+                    quic_stream: None,
                     seq,
                 });
             }
@@ -194,6 +195,7 @@ impl Adapter {
                 log.push(Observation::FrameJudged {
                     connection,
                     stream: stream(),
+                    quic_stream: None,
                     seq,
                 });
             }
@@ -256,6 +258,7 @@ impl Adapter {
         log.push(Observation::FrameJudged {
             connection,
             stream: stream(),
+            quic_stream: None,
             seq,
         });
     }
@@ -475,6 +478,7 @@ impl Adapter {
                 log.push(Observation::FrameJudged {
                     connection,
                     stream: stream(),
+                    quic_stream: None,
                     seq: judged,
                 });
             }

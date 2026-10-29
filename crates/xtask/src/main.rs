@@ -122,6 +122,7 @@ fn try_main() -> Result<(), BoxError> {
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
+        Some("shrink") => sim::run(&repo_root()?, "shrink", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -336,7 +337,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "  cargo xtask replay <dir> [--allow-build-mismatch] [--prefix] [--observe]"
+        "  cargo xtask replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]"
+    )?;
+    writeln!(
+        output,
+        "  cargo xtask shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]"
     )?;
     writeln!(output)?;
     writeln!(
@@ -395,5 +400,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Replays a zakura-sim trace Exact in the simulator build, on an equivalent build only."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Shrinks a zakura-sim trace that ends in a violation to fewer non-default picks."
     )
 }

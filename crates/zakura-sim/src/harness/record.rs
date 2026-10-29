@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{HarnessEntry, HarnessError};
 use crate::{
     trace::{
-        meta::{hex, InputRef},
+        meta::{hex, Derivation, InputRef},
         read::refuse_symlinked_dir,
         FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, TRACE_FILE,
     },
@@ -38,6 +38,15 @@ pub enum RecordInput<'a> {
         /// The Plan bytes.
         plan: &'a [u8],
     },
+    /// A scripted Plan against a given scenario. No `input.bin` is written.
+    Script {
+        /// The serialized scenario.
+        scenario: &'a Value,
+        /// The Plan.
+        plan: &'a Plan,
+        /// The trace the Plan came from, for `meta.derived_from`.
+        derived_from: Option<&'a Derivation>,
+    },
 }
 
 /// Why [`record`] wrote no complete trace.
@@ -61,6 +70,18 @@ pub enum RecordError {
     /// The witness test couldn't run: the harness doesn't register the
     /// property, or the property has no trigger-history check.
     Witness(WitnessError),
+    /// The run [`crate::trace::record_failure`] was handed doesn't violate
+    /// the property it was asked to record.
+    NotViolated {
+        /// The property.
+        property: String,
+    },
+    /// A rerun of a failing run didn't do what that run did, so
+    /// [`crate::trace::record_failure`] kept no trace.
+    Nondeterministic {
+        /// What differed.
+        detail: String,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -76,6 +97,12 @@ impl fmt::Display for RecordError {
             RecordError::Io(error) => write!(f, "writing the trace failed: {error}"),
             RecordError::Read(error) => write!(f, "the trace didn't read back: {error}"),
             RecordError::Witness(error) => write!(f, "the witness test can't run: {error}"),
+            RecordError::NotViolated { property } => {
+                write!(f, "the run doesn't violate {property}")
+            }
+            RecordError::Nondeterministic { detail } => {
+                write!(f, "the rerun is nondeterministic: {detail}")
+            }
         }
     }
 }
@@ -141,16 +168,46 @@ fn record_with<T>(
     out: &Path,
     run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
 ) -> Result<(Trace, T), RecordError> {
-    let (scenario, plan, input) = match what {
+    let (scenario, plan, input, derived_from) = match what {
         RecordInput::Input(input) => {
             let split = harness.scenario_bytes.min(input.len());
             let mut prefix = input[..split].to_vec();
             prefix.resize(harness.scenario_bytes, 0);
-            ((harness.draw)(&prefix), &input[split..], Some(input))
+            let plan = Plan::from_fuzz(&input[split..]);
+            ((harness.draw)(&prefix), plan, Some(input), None)
         }
-        RecordInput::Plan { scenario, plan } => (scenario.clone(), plan, None),
+        RecordInput::Plan { scenario, plan } => {
+            (scenario.clone(), Plan::from_fuzz(plan), None, None)
+        }
+        RecordInput::Script {
+            scenario,
+            plan,
+            derived_from,
+        } => (
+            scenario.clone(),
+            PlanInput::Script(plan.clone()),
+            None,
+            derived_from.cloned(),
+        ),
     };
-    let mut meta = (harness.meta)(&scenario).map_err(RecordError::Harness)?;
+    write_trace(harness, &scenario, plan, input, derived_from, out, run)
+}
+
+/// Writes the trace of `run` on `scenario` and `plan` to `out`, as
+/// [`record`] describes, and returns it with `run`'s result. `input`, the
+/// full fuzz input, becomes `input.bin` when it's given, and
+/// `derived_from` becomes `meta.derived_from`.
+pub(crate) fn write_trace<T>(
+    harness: &HarnessEntry,
+    scenario: &Value,
+    plan: PlanInput,
+    input: Option<&[u8]>,
+    derived_from: Option<Derivation>,
+    out: &Path,
+    run: impl FnOnce(&Value, PlanInput, &mut dyn RecordSink) -> Result<T, RecordError>,
+) -> Result<(Trace, T), RecordError> {
+    let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
+    meta.derived_from = derived_from;
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
     if fs::symlink_metadata(out.join(TRACE_FILE)).is_ok() {
         return Err(RecordError::Io(io::Error::new(
@@ -171,7 +228,7 @@ fn record_with<T>(
         write_input(out, input).map_err(RecordError::Io)?;
     }
     let mut sink = FileSink::create(out, &meta).map_err(RecordError::Io)?;
-    let result = run(&meta.scenario, Plan::from_fuzz(plan), &mut sink)?;
+    let result = run(&meta.scenario, plan, &mut sink)?;
     sink.finish().map_err(RecordError::Io)?;
     let trace = TraceReader::open(out).map_err(RecordError::Read)?;
     Ok((trace, result))

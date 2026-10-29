@@ -10,8 +10,13 @@
 //!
 //! The first directory holds a warm-up input and input A, and the second
 //! holds input B; then A and B swap. A merge's inner process runs the first
-//! directory's inputs first, so the warm-up takes the process's one-time
-//! code paths, and A and B both run after it. Each merge runs twice:
+//! directory's inputs before the second's. The warm-up and A have the same
+//! size, so libFuzzer doesn't fix their order. Whichever runs first takes
+//! the process's one-time code paths, such as a `OnceLock`'s
+//! initialization. The other runs after it, as B does, so the corpus covers
+//! the code paths every later input takes. libFuzzer's fuzzing loop runs an
+//! empty input first for the same reason, but a merge skips empty files.
+//! Each merge runs twice:
 //!
 //! - With `ZAKURA_SIM_FEEDBACK=off`, the collector writes to counters
 //!   libFuzzer never reads. The merge must add nothing, so libFuzzer sees

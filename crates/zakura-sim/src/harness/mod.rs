@@ -20,6 +20,7 @@ pub mod header_node;
 pub mod header_sync;
 pub mod policy;
 mod record;
+pub mod scenario;
 pub mod wire_node;
 pub mod wire_plans;
 

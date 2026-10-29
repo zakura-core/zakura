@@ -5,6 +5,8 @@
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1).
 
+pub mod grammar;
+
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
@@ -159,7 +161,8 @@ pub struct MirrorSpec {
     pub dialer: Dialer,
 }
 
-/// The `header-sync/storage` scenario.
+/// The `header-sync/storage` scenario. A fuzz input's prefix encodes it as
+/// [`grammar`] describes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageScenario {
@@ -233,8 +236,8 @@ impl HasView for Storage {
 
 impl Subsystem for Storage {
     const NAME: &'static str = "header-sync/storage";
-    const GENERATOR: u32 = 1;
-    const SCENARIO_BYTES: usize = 0;
+    const GENERATOR: u32 = grammar::GENERATOR;
+    const SCENARIO_BYTES: usize = grammar::LAYOUT.len();
     type Scenario = StorageScenario;
     type Prepared = Ports;
 
@@ -354,9 +357,11 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The default scenario.
-    fn draw(_: &[u8]) -> StorageScenario {
-        StorageScenario::default()
+    /// The scenario [`grammar::decode`] reads from `prefix`. A prefix the
+    /// grammar rejects, one written for another generator, draws the
+    /// default scenario.
+    fn draw(prefix: &[u8]) -> StorageScenario {
+        grammar::decode(prefix).unwrap_or_default()
     }
 }
 

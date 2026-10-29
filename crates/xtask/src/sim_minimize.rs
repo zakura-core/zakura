@@ -34,7 +34,7 @@ use std::{
     ffi::OsString,
     fmt, fs,
     io::{self, Read as _},
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -204,7 +204,9 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
         Ok(Duration::from_secs(secs))
     };
     let property = need(take("--property"), "--property")?;
-    let out = PathBuf::from(need(take("--out"), "--out")?);
+    // `cargo fuzz` runs in the fuzz package, so every path it gets is
+    // absolute.
+    let out = path::absolute(need(take("--out"), "--out")?)?;
     let runs: u32 = need(take("--runs"), "--runs")?
         .parse()
         .map_err(|error| format!("--runs: {error}"))?;
@@ -225,7 +227,7 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
     Ok(Request {
         target,
         harness: harness.to_owned(),
-        input: PathBuf::from(input),
+        input: path::absolute(input)?,
         property,
         out,
         budget: Budget { runs, wall, child },
@@ -372,18 +374,9 @@ fn build_tools(
     let fuzz = bin.join(&request.target);
     fs::copy(&tmin_binary, &fuzz)?;
 
-    let (target, runs) = (request.target.clone(), request.budget.runs);
-    let tmin = move |input: &Path, artifacts: &Path| {
-        let mut command = fuzz_build.command("tmin");
-        command
-            .arg("--runs")
-            .arg(runs.to_string())
-            .arg(&target)
-            .arg(input)
-            .arg("--")
-            .arg(format!("-artifact_prefix={}/", artifacts.display()));
-        command
-    };
+    let (target, budget) = (request.target.clone(), request.budget);
+    let tmin =
+        move |input: &Path, artifacts: &Path| fuzz_build.tmin(&target, budget, input, artifacts);
     Ok(Some(Tools {
         sim,
         fuzz,
@@ -422,6 +415,21 @@ impl FuzzBuild {
             .current_dir(&self.fuzz_dir);
         command
     }
+
+    /// `cargo fuzz tmin` of `target` on `input`, with `budget`'s attempts
+    /// per step and per-input timeout, writing into `artifacts`.
+    fn tmin(&self, target: &str, budget: Budget, input: &Path, artifacts: &Path) -> Command {
+        let mut command = self.command("tmin");
+        command
+            .arg("--runs")
+            .arg(budget.runs.to_string())
+            .arg(target)
+            .arg(input)
+            .arg("--")
+            .arg(format!("-timeout={}", budget.child.as_secs()))
+            .arg(format!("-artifact_prefix={}/", artifacts.display()));
+        command
+    }
 }
 
 /// Runs a build, logging to `log`. `false` if interrupted.
@@ -456,9 +464,15 @@ fn fuzz_binary(target_dir: &Path, target: &str) -> Result<PathBuf, BoxError> {
 }
 
 /// The checkout's commit and whether it's dirty, as far as git says.
-fn source(repo_root: &Path) -> Source {
+///
+/// A plain `git status` refreshes the index and so touches the git dir,
+/// which `zakura-sim`'s build script watches. `cargo fuzz tmin` would then
+/// rebuild the target inside the `--wall-secs` budget, so git runs without
+/// optional locks.
+pub(super) fn source(repo_root: &Path) -> Source {
     let git = |args: &[&str]| {
         Command::new("git")
+            .arg("--no-optional-locks")
             .arg("-C")
             .arg(repo_root)
             .args(args)

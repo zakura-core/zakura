@@ -625,6 +625,10 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
     let full = "race_fixtures crash --property race/lost-update --out out --runs 64 --wall-secs 60 --child-secs 10";
     let request = parse_args(full).unwrap();
     assert_eq!(request.harness, "fixtures/all");
+    // `tmin` runs in the fuzz package, so relative paths become absolute.
+    let cwd = env::current_dir().unwrap();
+    assert_eq!(request.out, cwd.join("out"));
+    assert_eq!(request.input, cwd.join("crash"));
     assert_eq!(
         request.budget,
         Budget {
@@ -670,6 +674,48 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
     }
 }
 
+/// `tmin` gets the attempts per step, and `--child-secs` as libFuzzer's
+/// timeout for one input.
+#[test]
+fn tmin_gets_the_budget() {
+    let build = FuzzBuild {
+        fuzz_dir: PathBuf::from("/fuzz"),
+        target_dir: PathBuf::from("/target"),
+        sanitizer: Sanitizer::None,
+    };
+    let budget = Budget {
+        runs: 64,
+        wall: Duration::from_secs(60),
+        child: Duration::from_secs(7),
+    };
+    let command = build.tmin("race_fixtures", budget, Path::new("/in"), Path::new("/out"));
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    let tail = args.iter().position(|arg| *arg == "tmin").unwrap();
+    assert_eq!(
+        args[tail..],
+        [
+            "tmin",
+            "--fuzz-dir",
+            "/fuzz",
+            "--target-dir",
+            "/target",
+            "-s",
+            "none",
+            "--no-default-features",
+            "--runs",
+            "64",
+            "race_fixtures",
+            "/in",
+            "--",
+            "-timeout=7",
+            "-artifact_prefix=/out/",
+        ]
+    );
+}
+
 /// Every target the wrapper maps is a `[[bin]]` of the fuzz package.
 #[test]
 fn every_mapped_target_is_declared() {
@@ -677,6 +723,36 @@ fn every_mapped_target_is_declared() {
     for (target, harness) in TARGETS {
         assert_eq!(resolve_target(&root, target).unwrap(), harness);
     }
+}
+
+/// Reading the checkout's provenance leaves the git dir alone, so `cargo
+/// fuzz tmin` doesn't rebuild the target `zakura-sim`'s build script ties
+/// to it.
+#[test]
+fn reading_the_source_leaves_the_git_dir_alone() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    fs::write(repo.join("a"), "a").unwrap();
+    git(&["add", "a"]);
+    git(&["commit", "-q", "-m", "a"]);
+    let modified = || fs::metadata(repo.join(".git")).unwrap().modified().unwrap();
+    let before = modified();
+    let source = source(repo);
+    assert_eq!(modified(), before);
+    assert_eq!(source.git.len(), 40, "{source:?}");
+    assert!(!source.dirty, "{source:?}");
 }
 
 /// SIGINT sets the interrupt flag instead of killing the wrapper.

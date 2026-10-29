@@ -18,7 +18,11 @@
 //! fresh process from the trace it wrote, by the same rules, and adds how
 //! the process ended. [`save_input`] and [`save_failure`] keep a failing
 //! input on disk before anything reruns it.
+//!
+//! [`feedback`] turns abstract protocol states into features libFuzzer
+//! reads beside its code edges (E2a).
 
+pub mod feedback;
 mod process;
 mod save;
 mod worker;

@@ -13,6 +13,7 @@ mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
+mod sim_feedback;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -125,6 +126,14 @@ fn try_main() -> Result<(), BoxError> {
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
         Some("sim-versions") => sim::run(&repo_root()?, "versions", args),
         Some("sim-seeds") => sim::run(&repo_root()?, "seeds", args),
+        Some("sim-feedback") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask sim-feedback` does not accept arguments",
+                )));
+            }
+            sim_feedback::run(&repo_root()?)
+        }
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -350,6 +359,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask sim-seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>] [--quarantine <dir>] [--report <file>]"
     )?;
+    writeln!(output, "  cargo xtask sim-feedback")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -426,5 +436,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "with --out writes one harness's admitted seeds there as a fuzz corpus."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Builds the simulator's feedback_probe fuzz target with pinned nightly cargo-fuzz, and"
+    )?;
+    writeln!(
+        output,
+        "checks that libFuzzer keeps an input for a semantic feature alone."
     )
 }

@@ -164,7 +164,10 @@ candidates remain in the JSON artifact when synthesis cannot finish.
 
 The report contains the baseline and head commits, reviewer commit, prompt
 digest, provider/model, reasoning effort, pricing, usage, duration, findings,
-and coverage. The PR
+and coverage. The PR summary leads with the verdict, coverage, model, estimated
+cost, and findings. Prompt digests, cache-token counts, and detailed continuation
+history stay in the full reports. Coverage gaps are expandable, while the
+incomplete status and failure reasons remain visible. The PR
 comment links to commit-pinned source because the release PR's ordinary diff may
 contain only preparation changes. All findings in this first stage are supported
 by source evidence; no reproduction is claimed.

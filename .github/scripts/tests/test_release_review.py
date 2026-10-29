@@ -727,6 +727,39 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertIn("Configured exclusions", render(report))
         self.assertIn("file\\-24", render(report))
 
+    def test_comment_prioritizes_results_and_keeps_diagnostics_in_full_report(self):
+        report = {"repository": "zakura-core/zakura", "head_sha": HEAD, "base_sha": BASE, "base_tag": "v1.0.0",
+                  "status": "complete", "synthesis_complete": True, "model": "gpt-6.1-sol",
+                  "reasoning_effort": "medium", "prompt_digest": "diagnostic-prompt-hash",
+                  "coverage": [{"path": "validator.rs", "status": "reviewed"}],
+                  "usage": {"estimated_usd_including_uncertain_calls": "18.1124639", "budget_usd": "25",
+                            "cached_input_tokens": 4779214}, "duration_seconds": 120,
+                  "resume_history": [{"duration_seconds": 60}]}
+        comment = render(report, comment=True)
+        self.assertIn("**No supported release-blocking bugs found in the reviewed scope.**", comment)
+        self.assertIn("**1/1 files reviewed**", comment)
+        self.assertIn("$18.11 / $25.00", comment)
+        self.assertIn("3.0 minutes", comment)
+        self.assertIn(f"/commit/{HEAD}", comment)
+        self.assertIn(f"/compare/{BASE}...{HEAD}", comment)
+        for diagnostic in ("diagnostic-prompt-hash", "4779214", "saved attempt", "Reviewer revision"):
+            self.assertNotIn(diagnostic, comment)
+        full = render(report)
+        self.assertIn("diagnostic-prompt-hash", full)
+        self.assertIn("4779214", full)
+        self.assertEqual(report["usage"]["estimated_usd_including_uncertain_calls"], "18.1124639")
+
+    def test_incomplete_comment_keeps_failure_visible_and_folds_file_list(self):
+        report = {"head_sha": HEAD, "status": "incomplete", "errors": ["API budget exhausted"],
+                  "coverage": [{"path": "validator.rs", "status": "pending", "reason": ""}]}
+        comment = render(report, comment=True)
+        self.assertIn("INCOMPLETE", comment)
+        self.assertIn("not a clean review", comment)
+        self.assertLess(comment.index("API budget exhausted"), comment.index("<details>"))
+        self.assertIn("<summary>Coverage gaps (1 file)</summary>", comment)
+        self.assertIn("Final findings are not available", comment)
+        self.assertIn("Unavailable / $25.00", comment)
+
     def test_model_prices_and_context_are_explicit(self):
         for changes in ({"model": ""}, {"input_usd_per_million": None}, {"output_usd_per_million": "NaN"},
                         {"max_input_bytes": None}):
@@ -766,6 +799,11 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertNotIn("@everyone", markdown)
         self.assertNotIn("<script>", markdown)
         self.assertNotIn("[click]", markdown)
+        comment = render(report, comment=True)
+        self.assertNotIn("@everyone", comment)
+        self.assertNotIn("<script>", comment)
+        self.assertNotIn("[click]", comment)
+        self.assertIn("- **Trigger:**", comment)
 
 
 class CommandTests(GitFixture):

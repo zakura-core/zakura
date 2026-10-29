@@ -242,7 +242,7 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 /// that wakes the waiting fork body. Before #1523's fix, that body stayed
 /// unsubmitted until the node waited on time. The witness requires that
 /// order: the verified tip reached the released submission's height, and
-/// no `applying` entry holds it. The run takes 470,000 steps.
+/// no `applying` entry holds it.
 #[test]
 #[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
 fn the_frontier_first_input_holds_capacity_release_wakes() {
@@ -257,7 +257,7 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
 /// reply first, before the frontier releases height 1, so the freed room
 /// wakes the waiting fork body. Room frees beside the waiting body, but not
 /// in the frontier-first order, so this run isn't the property's witness: the test
-/// checks the run directly. The run takes 470,000 steps.
+/// checks the run directly.
 #[test]
 #[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
 fn the_reply_first_input_holds_capacity_release_wakes() {

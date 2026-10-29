@@ -24,6 +24,11 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 ## Targets
 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
+- `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
+  encodes the scenario in the action grammar of
+  `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
+  isn't the harness's generator, 2, runs the default scenario. Pass
+  `-max_len=4096`, the input size the grammar is built for.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 

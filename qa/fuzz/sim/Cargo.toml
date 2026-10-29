@@ -31,6 +31,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "header_sync_storage"
+path = "fuzz_targets/header_sync_storage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "race_fixtures"
 path = "fuzz_targets/race_fixtures.rs"
 test = false

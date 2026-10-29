@@ -41,7 +41,10 @@ use super::{
 };
 use crate::{
     model::{FrameHeader, Label},
-    observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
+    observe::{
+        ConnEnd, Direction, EmittedBody, PeerCredit, ReactorFact, StreamEnd, StreamId,
+        TransitionFact, TransportFact,
+    },
     Observation,
 };
 
@@ -109,9 +112,55 @@ pub(crate) struct PeerRecord {
     /// The peer's address on the connection, which the node sees as the
     /// remote.
     pub(crate) remote: SocketAddr,
-    /// The QUIC stream.
-    pub(crate) quic_stream: u64,
+    /// The QUIC stream, or `None` for a record made before any stream.
+    pub(crate) quic_stream: Option<u64>,
     pub(crate) body: RecordBody,
+}
+
+impl PeerRecord {
+    /// The record's row under the identity the peer knows, for the step it
+    /// was made in.
+    pub(crate) fn emitted(&self) -> Observation {
+        let body = match &self.body {
+            RecordBody::Frame {
+                seq,
+                row,
+                label,
+                payload,
+                ..
+            } => EmittedBody::Frame {
+                seq: *seq,
+                row: row.clone(),
+                label: *label,
+                payload: *payload,
+            },
+            RecordBody::Written { seq } => EmittedBody::Written { seq: *seq },
+            RecordBody::Closed => EmittedBody::Closed,
+            RecordBody::Received {
+                seq,
+                message_type,
+                payload,
+                ..
+            } => EmittedBody::Received {
+                seq: *seq,
+                message_type: *message_type,
+                payload: *payload,
+            },
+            RecordBody::Handled { seq } => EmittedBody::Handled { seq: *seq },
+            RecordBody::ConnEnded { reason } => EmittedBody::ConnEnded {
+                reason: reason.clone(),
+            },
+            RecordBody::StreamEnded { direction, end } => EmittedBody::StreamEnded {
+                direction: *direction,
+                end: end.clone(),
+            },
+        };
+        Observation::PeerEmitted {
+            remote: self.remote.to_string(),
+            quic_stream: self.quic_stream,
+            body,
+        }
+    }
 }
 
 /// A [`PeerRecord`]'s observation, without its connection.
@@ -141,6 +190,16 @@ pub(crate) enum RecordBody {
         credit: Option<PeerCredit>,
         frame: Frame,
         at: Duration,
+    },
+    /// The peer's task handled the received frame `seq`. It resolves to no
+    /// row of its own: its `peer-emitted` row is the evidence.
+    Handled { seq: u64 },
+    /// [`Observation::PeerConnEnded`].
+    ConnEnded { reason: ConnEnd },
+    /// [`Observation::PeerStreamEnded`].
+    StreamEnded {
+        direction: Direction,
+        end: StreamEnd,
     },
 }
 
@@ -293,9 +352,19 @@ impl WireEvidence {
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
     fn place_one(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
+        if let RecordBody::Handled { .. } = record.body {
+            return Some(Ok(Vec::new()));
+        }
         let connection = *self.connections.get(&record.remote.to_string())?;
-        let stream = *self.streams.get(&(connection, record.quic_stream))?;
-        let quic_stream = record.quic_stream;
+        if let RecordBody::ConnEnded { reason } = &record.body {
+            return Some(Ok(vec![Observation::PeerConnEnded {
+                connection,
+                quic_stream: record.quic_stream,
+                reason: reason.clone(),
+            }]));
+        }
+        let quic_stream = record.quic_stream?;
+        let stream = *self.streams.get(&(connection, quic_stream))?;
         Some(Ok(vec![match record.body.clone() {
             RecordBody::Frame {
                 seq,
@@ -329,6 +398,15 @@ impl WireEvidence {
                 connection,
                 quic_stream,
             },
+            RecordBody::StreamEnded { direction, end } => Observation::PeerStreamEnded {
+                connection,
+                quic_stream,
+                direction,
+                end,
+            },
+            RecordBody::Handled { .. } | RecordBody::ConnEnded { .. } => {
+                unreachable!("placed above without a stream")
+            }
             RecordBody::Received {
                 seq,
                 message_type,
@@ -363,20 +441,24 @@ impl WireEvidence {
     /// Why `record`, still unplaced, never will be, if the node refused its
     /// handshake or stream or tore its connection down.
     fn lost_one(&self, record: &PeerRecord) -> Option<String> {
+        // An end can't be lost: its `peer-emitted` row already holds it.
+        if let RecordBody::ConnEnded { .. } | RecordBody::StreamEnded { .. } = record.body {
+            return None;
+        }
         let remote = record.remote.to_string();
         let gone = match self.connections.get(&remote) {
             None => self.refused_handshakes.contains(&remote),
             Some(connection) => {
                 self.torn_down.contains(connection)
-                    || self
-                        .refused_streams
-                        .contains(&(*connection, record.quic_stream))
+                    || record.quic_stream.is_some_and(|quic_stream| {
+                        self.refused_streams.contains(&(*connection, quic_stream))
+                    })
             }
         };
         gone.then(|| {
             format!(
-                "UnplacedRecord: {remote}'s record on stream {} can't get an identity, since the \
-                 node refused or closed it before admitting the stream: {:?}",
+                "UnplacedRecord: {remote}'s record on stream {:?} can't get an identity, since \
+                 the node refused or closed it before admitting the stream: {:?}",
                 record.quic_stream, record.body
             )
         })
@@ -645,7 +727,7 @@ mod tests {
         PeerRecord {
             pos: Some(1),
             remote: peer_addr(0, 0),
-            quic_stream: 4,
+            quic_stream: Some(4),
             body,
         }
     }

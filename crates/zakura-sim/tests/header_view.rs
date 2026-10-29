@@ -12,7 +12,6 @@ mod support;
 use std::{fs, path::PathBuf, rc::Rc};
 
 use zakura_network::zakura::v9::RegtestMessage;
-use zakura_sim::peer::adversary::Act;
 use zakura_sim::{
     harness::{
         header_node::{
@@ -29,6 +28,11 @@ use zakura_sim::{
     table::{sender_properties, table_properties},
     Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyReport,
     RunEnd, RunReport, StepCtx, Violation,
+};
+use zakura_sim::{
+    model::is_fault_cause,
+    observe::{ConnEnd, Direction, EmittedBody, StreamEnd, TransportFact},
+    peer::{adversary::Act, honest::HonestSpec, PeerAction, PeerSpec},
 };
 
 /// Runs `S`'s `scenario` under `plan` with `extra` beside the harness's own
@@ -443,4 +447,248 @@ fn existing_runs_keep_their_records() {
         );
     }
     assert_eq!(seen, [true; 7], "the saved Plans log every source's rows");
+}
+
+/// An honest peer holding 120 headers that dials the node at 50, with
+/// `script`.
+fn honest(script: Vec<PeerAction>) -> WireScenario {
+    WireScenario {
+        node: Chain::main(50),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: 120,
+                subscribe: None,
+            }),
+            script,
+            ..PeerSpec::dialing()
+        }],
+        ..WireScenario::default()
+    }
+}
+
+/// The honest peer writes its first frame as soon as its stream opens,
+/// steps before the node admits the stream, with other node records in
+/// between. The frame's `peer-emitted` row is in its own step, and its
+/// resolved `peer-frame` names that row's position and lands before the
+/// node's `header-read` of it. Each step's digest is the same on replay.
+#[test]
+fn a_delayed_peer_record_is_logged_in_its_own_step() {
+    let (report, lines) =
+        run::<HeaderWire>(&honest(Vec::new()), Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let first =
+        |pred: &dyn Fn(&Observation) -> bool| entries.iter().position(|entry| pred(&entry.obs));
+    let emitted = first(&|obs| {
+        matches!(
+            obs,
+            Observation::PeerEmitted {
+                body: EmittedBody::Frame { seq: 0, .. },
+                ..
+            }
+        )
+    })
+    .expect("the peer writes a frame");
+    let admitted = first(&|obs| matches!(obs, Observation::Session { .. }))
+        .expect("the node admits the stream");
+    let (written, admission) = (entries[emitted].step, entries[admitted].step);
+    assert!(
+        written < admission,
+        "written at {written}, admitted at {admission}"
+    );
+    let between = entries[emitted..admitted]
+        .iter()
+        .filter(|entry| entry.step > written && entry.step < admission)
+        .any(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Transport { .. } | Observation::Datagram { .. }
+            )
+        });
+    assert!(
+        between,
+        "node records come between the write and the admission"
+    );
+    let frame = first(&|obs| matches!(obs, Observation::PeerFrame { seq: 0, .. }))
+        .expect("the frame resolves");
+    assert_eq!(entries[frame].origin, Some(entries[emitted].pos));
+    assert_eq!(
+        entries[frame].step, admission,
+        "it resolves at the admission"
+    );
+    let read = first(&|obs| {
+        matches!(
+            obs,
+            Observation::Transport {
+                event: TransportFact::HeaderRead { seq: 0, .. },
+                ..
+            }
+        )
+    })
+    .expect("the node reads the frame");
+    assert!(frame < read);
+    let (_, replayed) = run::<HeaderWire>(&honest(Vec::new()), Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(lines, replayed, "every step's digest replays");
+}
+
+/// When the node faults the peer's session, the peer sees its stream reset
+/// with code 0 and its connection closed with the node's code 0, the codes
+/// the node's close sends, never values from the node's decision. A peer
+/// that closes the connection itself sees its own close.
+#[test]
+fn the_peer_sees_the_close() {
+    let (scenario, _) = saved(SavedPlan::Act(Act::OverCreditHeader));
+    let (report, _) = run::<HeaderWire>(&scenario, Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let rows: Vec<&Observation> = report
+        .log
+        .entries()
+        .iter()
+        .map(|entry| &entry.obs)
+        .collect();
+    assert!(
+        rows.iter().any(|obs| matches!(obs, Observation::ConnectionClosed { cause, .. } if is_fault_cause(cause))),
+        "the node faults the session"
+    );
+    assert!(rows.iter().any(|obs| matches!(
+        obs,
+        Observation::PeerStreamEnded {
+            direction: Direction::Receive,
+            end: StreamEnd::Reset { code: 0 },
+            ..
+        }
+    )));
+    let ends: Vec<&ConnEnd> = rows
+        .iter()
+        .filter_map(|obs| match obs {
+            Observation::PeerConnEnded { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert!(!ends.is_empty(), "the peer sees the close");
+    assert!(
+        ends.iter()
+            .all(|reason| **reason == ConnEnd::ReceivedClose { code: 0 }),
+        "{ends:?}"
+    );
+
+    let (report, _) = run::<HeaderWire>(
+        &honest(vec![PeerAction::Close]),
+        Plan::from_fuzz(&[]),
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let ends: Vec<&ConnEnd> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::PeerConnEnded { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert!(!ends.is_empty(), "the peer sees its own close");
+    assert!(
+        ends.iter().all(|reason| **reason == ConnEnd::LocalClose),
+        "{ends:?}"
+    );
+}
+
+/// Once the peer finishes its half of the header stream it has nothing
+/// more to write, and the node resets the peer's receiving half. The peer's
+/// reader reports the reset with its code while the connection lives, long
+/// before the idle timeout closes it.
+#[test]
+fn a_reset_reaches_the_reader_without_a_write() {
+    let (report, _) = run::<HeaderWire>(
+        &honest(vec![PeerAction::FinishHeader]),
+        Plan::from_fuzz(&[]),
+        &mut NoChecks,
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let finished = report
+        .picks
+        .iter()
+        .find(|pick| pick.identity == "peer:peer-0:finish-header")
+        .expect("the peer finishes its header stream")
+        .step;
+    let wrote_after = entries.iter().any(|entry| {
+        entry.step > finished
+            && matches!(
+                entry.obs,
+                Observation::PeerEmitted {
+                    body: EmittedBody::Frame { .. },
+                    ..
+                }
+            )
+    });
+    assert!(!wrote_after, "the peer writes nothing after it finishes");
+    let reset = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry.obs,
+                Observation::PeerStreamEnded {
+                    direction: Direction::Receive,
+                    end: StreamEnd::Reset { .. },
+                    ..
+                }
+            )
+        })
+        .expect("the reader reports the reset");
+    let lost = entries.iter().position(|entry| {
+        matches!(
+            entry.obs,
+            Observation::PeerConnEnded { .. } | Observation::ConnectionClosed { .. }
+        )
+    });
+    assert!(
+        lost.is_none_or(|lost| reset < lost),
+        "{lost:?} before {reset}"
+    );
+}
+
+/// A frame the peer's reader finished is received at the read's boundary,
+/// with the frame it read, even when the peer's task handles it in a later
+/// step. The history where the connection closes before the task handles
+/// it isn't reached by any saved Plan or script, so this covers the later
+/// handling only.
+#[test]
+fn a_received_frame_keeps_its_read_boundary() {
+    let (report, _) = run::<HeaderWire>(&honest(Vec::new()), Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let mut later = 0;
+    for (at, entry) in entries.iter().enumerate() {
+        let Observation::PeerEmitted {
+            remote,
+            quic_stream,
+            body: EmittedBody::Received { seq, .. },
+        } = &entry.obs
+        else {
+            continue;
+        };
+        let handled = entries[at..]
+            .iter()
+            .find(|later| {
+                matches!(&later.obs, Observation::PeerEmitted {
+                    remote: r, quic_stream: q, body: EmittedBody::Handled { seq: s },
+                } if (r, q, s) == (remote, quic_stream, seq))
+            })
+            .expect("the peer's task handles every frame in this run");
+        let resolved = entries
+            .iter()
+            .find(|row| {
+                matches!(row.obs, Observation::PeerReceived { seq: s, .. } if s == *seq)
+                    && row.origin == Some(entry.pos)
+            })
+            .expect("the receipt resolves");
+        assert!(
+            resolved.pos <= handled.pos,
+            "the receipt resolves before it's handled"
+        );
+        later += usize::from(handled.step > entry.step);
+    }
+    assert!(later > 0, "no frame was handled after its read's step");
 }

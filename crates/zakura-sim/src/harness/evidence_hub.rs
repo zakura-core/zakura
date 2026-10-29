@@ -216,6 +216,12 @@ impl EvidenceHub {
                     identity
                 }
                 Item::Emitted(record) => {
+                    // Logged in its own step, whether or not it resolves.
+                    rows.push(Keyed {
+                        key: (pos, sub),
+                        origin: None,
+                        obs: record.emitted(),
+                    });
                     if let Some(peers) = self.peers.as_mut() {
                         peers.pending.push(record);
                     }
@@ -524,6 +530,46 @@ mod tests {
         }
     }
 
+    /// Peer records on a stream the node never admits keep their own
+    /// positions around the node's close of the connection, one before it
+    /// and one after, and neither resolves.
+    #[test]
+    fn an_unresolved_peer_record_keeps_its_place_around_a_close() {
+        let (mut hub, records) = hub();
+        let mut log = ObservationLog::default();
+        for pos in [5, 15] {
+            records.push(PeerRecord {
+                pos: Some(pos),
+                remote: peer_addr(0, 0),
+                quic_stream: Some(4),
+                body: RecordBody::Written { seq: pos },
+            });
+        }
+        let registered = transport(TransportFact::Registered);
+        hand(&hub, &mut log, vec![at(1, registered), at(10, close())]);
+        hub.observe(&mut log)
+            .expect("the stream may still be admitted");
+        let rows: Vec<(u64, &Observation)> = log
+            .entries()
+            .iter()
+            .map(|entry| (entry.pos, &entry.obs))
+            .collect();
+        assert!(
+            matches!(
+                rows[..],
+                [
+                    (1, Observation::Transport { .. }),
+                    (5, Observation::PeerEmitted { .. }),
+                    (10, Observation::Transport { .. }),
+                    (10, Observation::ConnectionClosed { .. }),
+                    (15, Observation::PeerEmitted { .. }),
+                ]
+            ),
+            "{rows:?}"
+        );
+        assert_eq!(records.unplaced(), 2, "neither resolves");
+    }
+
     /// A source that hands the hub one row with no position at its first
     /// observation.
     struct Unstamped(Out);
@@ -645,7 +691,7 @@ mod tests {
         records.push(PeerRecord {
             pos: Some(3),
             remote: peer_addr(0, 0),
-            quic_stream: 4,
+            quic_stream: Some(4),
             body: RecordBody::Frame {
                 seq: 0,
                 row: Some("status".to_owned()),

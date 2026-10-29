@@ -413,6 +413,45 @@ pub enum Observation {
         /// The credit an update adds, for an `Open` or `Grant`.
         credit: Option<PeerCredit>,
     },
+    /// A scripted peer's record, logged in the step it was made at its own
+    /// position, under the identity the peer knows: its address and the
+    /// QUIC stream. Its resolved rows, such as the `PeerFrame` once the
+    /// node admits the stream, come later and name this position as their
+    /// origin. A record that never resolves keeps only this row.
+    PeerEmitted {
+        /// The peer's address on the connection, which the node sees as the
+        /// remote.
+        remote: String,
+        /// The QUIC stream, or `None` for a record made before any stream,
+        /// such as a failed open.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
+        /// What the peer did.
+        body: EmittedBody,
+    },
+    /// A scripted peer saw its connection end: a write or read returned
+    /// `ConnectionLost`, `Conn::closed` returned, or the peer closed it.
+    PeerConnEnded {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream it was using, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
+        /// Why.
+        reason: ConnEnd,
+    },
+    /// A scripted peer saw one direction of a header stream end while its
+    /// connection may still live.
+    PeerStreamEnded {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// Which half ended.
+        direction: Direction,
+        /// How.
+        end: StreamEnd,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -435,6 +474,117 @@ impl Observation {
             _ => None,
         }
     }
+}
+
+/// A [`Observation::PeerEmitted`] record's content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "record", rename_all = "kebab-case")]
+pub enum EmittedBody {
+    /// A frame the peer is about to write, as its models labelled it.
+    Frame {
+        /// Its position among the peer's frames on the stream, from 0.
+        seq: u64,
+        /// The row whose rule its label enforces.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        row: Option<String>,
+        /// Its label.
+        label: Label,
+        /// Its payload's length in bytes.
+        payload: u64,
+    },
+    /// The peer's write of frame `seq` returned.
+    Written {
+        /// The frame.
+        seq: u64,
+    },
+    /// The peer closed its connection.
+    Closed,
+    /// The peer's reader finished reading one of the node's frames.
+    Received {
+        /// Its position among the node's frames on the stream, from 0.
+        seq: u64,
+        /// Its message type.
+        message_type: u16,
+        /// Its payload's length in bytes.
+        payload: u64,
+    },
+    /// The peer's task handled the node's frame `seq`, which its reader
+    /// had received.
+    Handled {
+        /// The frame.
+        seq: u64,
+    },
+    /// The peer saw its connection end.
+    ConnEnded {
+        /// Why.
+        reason: ConnEnd,
+    },
+    /// The peer saw one direction of the stream end.
+    StreamEnded {
+        /// Which half.
+        direction: Direction,
+        /// How.
+        end: StreamEnd,
+    },
+}
+
+/// Why a scripted peer's connection ended, as its QUIC error says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "kebab-case")]
+pub enum ConnEnd {
+    /// The node closed it with this application code.
+    ReceivedClose {
+        /// The code.
+        code: u64,
+    },
+    /// A transport error or timeout ended it.
+    TransportError {
+        /// The error.
+        detail: String,
+    },
+    /// The peer closed it itself.
+    LocalClose,
+}
+
+/// One half of a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    /// The peer's sending half.
+    Send,
+    /// The peer's receiving half.
+    Receive,
+}
+
+/// How one half of a scripted peer's stream ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "end", rename_all = "kebab-case")]
+pub enum StreamEnd {
+    /// The node stopped the peer's sending half with this code.
+    Stopped {
+        /// The code.
+        code: u64,
+    },
+    /// The node reset the peer's receiving half with this code.
+    Reset {
+        /// The code.
+        code: u64,
+    },
+    /// The half was already finished, reset or stopped.
+    ClosedStream,
+    /// The node finished the stream at a frame boundary.
+    Finished,
+    /// The node finished the stream partway through a frame, after `read`
+    /// of its bytes.
+    Truncated {
+        /// The bytes of the frame read.
+        read: u64,
+    },
+    /// A frame header announced `len` payload bytes, over the stream's cap.
+    Oversized {
+        /// The announced length.
+        len: u64,
+    },
 }
 
 /// A storage fact in plain fields: hashes and peers in hex, counters as

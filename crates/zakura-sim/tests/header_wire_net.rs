@@ -31,7 +31,7 @@ use zakura_sim::{
         run_prepared, HarnessError, LinkEntry, LinkSpec, NetScenario, Subsystem,
     },
     model::{is_fault_cause, Label},
-    observe::{DatagramOutcome, Entry, TransportFact},
+    observe::{DatagramOutcome, EmittedBody, Entry, TransportFact},
     peer::{
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         peer_addr, PeerSpec, NODE_ADDR,
@@ -588,13 +588,21 @@ fn node_read(entries: &[Entry], connection: u64, frame: Named) -> Option<usize> 
     })
 }
 
-/// Where the peer's `NodeFrame` of the node's `frame` sits: the peer read
-/// and labelled it.
+/// Where the peer's task handled the node's `frame`, after its reader
+/// received it and the peer labelled it with its `NodeFrame`.
 fn peer_read(entries: &[Entry], connection: u64, frame: Named) -> Option<usize> {
-    find(entries, |obs| {
+    let labelled = find(entries, |obs| {
         matches!(obs, Observation::NodeFrame { connection: c, quic_stream: Some(q), seq, .. }
             if (*c, *q, *seq) == (connection, frame.quic_stream, frame.seq))
-    })
+    })?;
+    let handled = find(&entries[labelled..], |obs| {
+        matches!(obs, Observation::PeerEmitted {
+            quic_stream: Some(q),
+            body: EmittedBody::Handled { seq },
+            ..
+        } if (*q, *seq) == (frame.quic_stream, frame.seq))
+    })?;
+    Some(labelled + handled)
 }
 
 /// The named frames of the crossing run, as far as `entries` reaches: the
@@ -702,8 +710,9 @@ impl Crossing {
 /// `PeerWritten`. From the peer's first `Grant` on, they wait until it and
 /// the node's second page have been handed over. Each pair was written
 /// before the opposite frame was read: the node's reader got the peer's
-/// frame's header after its own write, and the peer labelled the node's
-/// frame as a `NodeFrame` after its own. Frames are matched by connection,
+/// frame's header after its own write, and the peer's task handled the
+/// node's frame after its own, though its reader may have received the
+/// frame sooner. Frames are matched by connection,
 /// QUIC stream and `seq`, never by datagram order, and the datagram records
 /// only show that the network carried both ways.
 ///

@@ -179,8 +179,9 @@ pub enum TransportEvent {
         cause: Option<&'static str>,
     },
     /// The connection's workers drained and its peer was unregistered. A
-    /// serving future that is dropped instead reports no `TornDown`, though
-    /// its close is still decided.
+    /// drain that times out with a worker still running reports no
+    /// `TornDown`, and neither does a serving future that is dropped. Each
+    /// close is still decided.
     TornDown {
         /// The connection.
         conn_id: ZakuraConnId,

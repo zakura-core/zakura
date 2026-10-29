@@ -43,6 +43,9 @@ def render(report: dict, *, comment: bool = False) -> str:
     if report.get("resume_history"):
         lines.append(f"Continued from {len(report['resume_history'])} saved attempt(s); "
                      "coverage and usage include those attempts under the same API ceiling.")
+    if usage.get("cached_input_tokens"):
+        lines.append(f"Provider-reported cached input: {usage['cached_input_tokens']} tokens. "
+                     "Any configured cache discount applies only after successful usage reporting.")
     if report.get("run_url"):
         lines.extend(["", f"[Workflow run and full report artifacts]({report['run_url']})"])
     if not complete:

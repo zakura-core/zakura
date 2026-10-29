@@ -45,7 +45,8 @@ class CheckpointTests(GitFixture):
         prior = self.partial_review()
         for changes in ({"excluded_paths": ("release.txt",)}, {"prompt_digest": "different"},
                         {"model": "another-model"}, {"reasoning_effort": "high"},
-                        {"input_price": Decimal(3)}, {"max_output_tokens": 8192}):
+                        {"input_price": Decimal(3)}, {"cached_input_price": Decimal("0.1")},
+                        {"max_output_tokens": 8192}):
             provider = ScriptedProvider([])
             with self.subTest(changes=changes), self.assertRaisesRegex(ReviewError, "checkpoint revisions"):
                 review(self.repository, provider, settings(**changes), self.metadata(), lambda _: None, prior_report=prior)
@@ -88,3 +89,20 @@ class CheckpointTests(GitFixture):
         prior["summaries"].append(prior["summaries"][0])
         with self.assertRaisesRegex(ReviewError, "duplicated completed units"):
             review(self.repository, ScriptedProvider([]), settings(), self.metadata(), lambda _: None, prior_report=prior)
+
+    def test_cached_usage_survives_continuation_without_resetting_prior_cost(self):
+        from release_review.checkpoints import contract_digest
+
+        prior = self.partial_review()
+        config = settings(cached_input_price=Decimal("0.1"))
+        units, coverage = self.repository.units(config.unit_bytes, config.excluded_paths)
+        prior["resume_contract_digest"] = contract_digest(self.repository, config, units, coverage)
+        prior["usage"]["cached_input_tokens"] = 80
+        original_charge = Decimal(prior["usage"]["estimated_usd_including_uncertain_calls"])
+        report = self.metadata()
+        review(self.repository, ScriptedProvider([completed(), completed()]), config, report, lambda _: None,
+               prior_report=prior)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["usage"]["cached_input_tokens"], 80)
+        self.assertEqual(Decimal(report["usage"]["estimated_usd_including_uncertain_calls"]),
+                         original_charge + Decimal("0.0006"))

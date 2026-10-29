@@ -58,6 +58,19 @@ def token_count(usage: dict, name: str) -> int:
     return value
 
 
+def cached_tokens(usage: dict, input_tokens: int) -> int:
+    """Discount only explicitly reported cache reads; absent details earn no credit."""
+    details = usage.get("input_tokens_details", {})
+    if not isinstance(details, dict):
+        raise ProviderError("provider returned invalid cached input usage")
+    cached = details.get("cached_tokens", 0)
+    written = details.get("cache_write_tokens", 0)
+    if (type(cached) is not int or not 0 <= cached <= input_tokens
+            or type(written) is not int or not 0 <= written <= input_tokens - cached):
+        raise ProviderError("provider returned invalid cached input usage")
+    return cached
+
+
 class OpenAIProvider:
     def __init__(self, settings: Settings, key: str, transport: JsonTransport):
         self.settings, self.key, self.transport = settings, key, transport
@@ -83,8 +96,10 @@ class OpenAIProvider:
             if data.get("service_tier") != "default":
                 raise ProviderError("OpenAI did not confirm standard service pricing; further calls stopped")
             text = "".join(part["text"] for part in parts if part.get("type") == "output_text")
-            return ModelReply(text, token_count(data["usage"], "input_tokens"),
-                              token_count(data["usage"], "output_tokens"))
+            usage = data["usage"]
+            input_tokens = token_count(usage, "input_tokens")
+            return ModelReply(text, input_tokens, token_count(usage, "output_tokens"),
+                              cached_tokens(usage, input_tokens))
         except (KeyError, TypeError, AttributeError):
             raise ProviderError("OpenAI returned an invalid response envelope") from None
 
@@ -124,9 +139,12 @@ class Spending:
     output_tokens: int = 0
     calls: int = 0
     uncertain_calls: int = 0
+    cached_input_tokens: int = 0
 
-    def price(self, input_tokens: int, output_tokens: int) -> Decimal:
-        return (self.settings.input_price * input_tokens
+    def price(self, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> Decimal:
+        cached_price = self.settings.cached_input_price or self.settings.input_price
+        return (self.settings.input_price * (input_tokens - cached_input_tokens)
+                + cached_price * cached_input_tokens
                 + self.settings.output_price * output_tokens) / 1_000_000
 
     @staticmethod
@@ -160,10 +178,13 @@ class Spending:
                     raise
                 sleep(2 ** attempt)
                 continue
-            actual = self.price(reply.input_tokens, reply.output_tokens)
+            if type(reply.cached_input_tokens) is not int or not 0 <= reply.cached_input_tokens <= reply.input_tokens:
+                raise ReviewError("provider returned invalid cached input usage; reserved cost is retained")
+            actual = self.price(reply.input_tokens, reply.output_tokens, reply.cached_input_tokens)
             self.uncertain_calls -= 1
             self.input_tokens += reply.input_tokens
             self.output_tokens += reply.output_tokens
+            self.cached_input_tokens += reply.cached_input_tokens
             if reply.input_tokens > input_bound or reply.output_tokens > request.max_output_tokens:
                 self.charged += max(Decimal(0), actual - reserve)
                 raise ReviewError("provider usage exceeded its reservation; further calls stopped")
@@ -175,4 +196,4 @@ class Spending:
         return {"estimated_usd_including_uncertain_calls": str(self.charged),
                 "budget_usd": str(self.settings.budget), "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens, "calls": self.calls,
-                "uncertain_calls": self.uncertain_calls}
+                "uncertain_calls": self.uncertain_calls, "cached_input_tokens": self.cached_input_tokens}

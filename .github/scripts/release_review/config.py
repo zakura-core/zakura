@@ -42,6 +42,7 @@ class Settings:
     instructions: str
     prompt_digest: str
     excluded_paths: tuple[str, ...] = ()
+    cached_input_price: Decimal | None = None
 
 
 def load_settings(root: Path, provider: str, profile: str, models_json: str) -> Settings:
@@ -75,6 +76,11 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
         endpoint = base.rstrip("/") + "/chat/completions"
     input_price = positive_decimal(model.get("input_usd_per_million"), "input price")
     output_price = positive_decimal(model.get("output_usd_per_million"), "output price")
+    cached_price = model.get("cached_input_usd_per_million")
+    if cached_price is not None:
+        cached_price = positive_decimal(cached_price, "cached input price")
+        if provider != "openai" or cached_price > input_price:
+            raise ReviewError("cached input pricing requires OpenAI and cannot exceed the input price")
     max_input = model.get("max_input_bytes")
     max_output = model.get("max_output_tokens", 4096)
     if type(max_input) is not int or not 16000 <= max_input <= 500000:
@@ -108,4 +114,4 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
         raise ReviewError("invalid review work limits")
     return Settings(provider, name, endpoint, input_price, output_price, budget,
                     max_input, max_output, effort, unit_bytes, rounds, seconds,
-                    prompt, hashlib.sha256(prompt.encode()).hexdigest(), exclusions)
+                    prompt, hashlib.sha256(prompt.encode()).hexdigest(), exclusions, cached_price)

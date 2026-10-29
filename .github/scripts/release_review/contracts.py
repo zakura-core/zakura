@@ -30,6 +30,7 @@ class ModelReply:
     text: str
     input_tokens: int
     output_tokens: int
+    cached_input_tokens: int = 0
 
 
 class ModelProvider(Protocol):

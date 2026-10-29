@@ -22,6 +22,7 @@ def contract_digest(repo, settings, units, coverage) -> str:
         "endpoint": settings.endpoint, "reasoning_effort": settings.reasoning_effort,
         "prompt_digest": settings.prompt_digest, "excluded_paths": settings.excluded_paths,
         "input_price": str(settings.input_price), "output_price": str(settings.output_price),
+        "cached_input_price": str(settings.cached_input_price),
         "budget": str(settings.budget), "max_input_bytes": settings.max_input_bytes,
         "max_output_tokens": settings.max_output_tokens, "unit_bytes": settings.unit_bytes,
         "units": [(unit.id, unit.path, unit.part, hashlib.sha256(unit.patch.encode()).hexdigest()) for unit in units],
@@ -45,12 +46,14 @@ def restore(prior: dict, report: dict, repo, settings, units, changed: set[str])
     except (KeyError, InvalidOperation, TypeError, ValueError):
         raise ReviewError("checkpoint has invalid billing information") from None
     counts = {key: usage.get(key) for key in ("input_tokens", "output_tokens", "calls", "uncertain_calls")}
+    counts["cached_input_tokens"] = usage.get("cached_input_tokens", 0)
     if (not charged.is_finite() or not 0 <= charged <= settings.budget or budget != settings.budget
             or any(type(value) is not int or value < 0 for value in counts.values())
-            or counts["uncertain_calls"] > counts["calls"]):
+            or counts["uncertain_calls"] > counts["calls"]
+            or counts["cached_input_tokens"] > counts["input_tokens"]):
         raise ReviewError("checkpoint has invalid billing information")
     spending = Spending(settings, charged=charged, **counts)
-    if spending.price(counts["input_tokens"], counts["output_tokens"]) > charged:
+    if spending.price(counts["input_tokens"], counts["output_tokens"], counts["cached_input_tokens"]) > charged:
         raise ReviewError("checkpoint billing omits known token usage")
     known = {unit.id: unit.path for unit in units}
     completed = set()

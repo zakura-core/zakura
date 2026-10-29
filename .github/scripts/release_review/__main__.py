@@ -56,7 +56,9 @@ def run_review(args) -> int:
             raise ReviewError("selected provider API key is not configured in GitHub secrets")
         provider_type = OpenAIProvider if settings.provider == "openai" else AbliteratedProvider
         report["pricing"] = {"input_usd_per_million": str(settings.input_price),
-                             "output_usd_per_million": str(settings.output_price)}
+                             "output_usd_per_million": str(settings.output_price),
+                             "cached_input_usd_per_million": (str(settings.cached_input_price)
+                                                              if settings.cached_input_price is not None else None)}
         prior = json.loads(args.resume_report.read_text()) if args.resume_report else None
         review(repository, provider_type(settings, key, JsonTransport()), settings, report,
                lambda current: write_report(args.output, current), prior_report=prior)

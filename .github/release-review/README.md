@@ -28,14 +28,18 @@ Set the repository variable `RELEASE_REVIEW_MODELS` to a JSON object keyed by
 | `model` | Explicit API model identifier; there is no implicit default. |
 | `input_usd_per_million` | Positive current input price, as a number or decimal string. |
 | `output_usd_per_million` | Positive current output price, including reasoning tokens. |
+| `cached_input_usd_per_million` | Optional OpenAI cache-read price; applied only to provider-reported cached input tokens. Omit to charge all input at the conservative rate. |
 | `max_input_bytes` | Conservative request allowance, including JSON, schema, and framing. Use at most the model's input-token limit minus the output reservation. |
 | `max_output_tokens` | Optional output/reasoning reservation; defaults to 4096. |
 | `reasoning_effort` | OpenAI only: `none`, `low`, `medium` (default), or `high`. `none` omits the API option. |
 | `base_url` | Abliterated only: HTTPS API prefix, normally ending in `/v1`; no embedded credentials. |
 
 Configure only providers you actually use. Use the highest applicable input and
-output prices for the selected model and request size; do not assume prompt-cache
-discounts. Include any cache-write premium in the conservative input rate.
+output prices for the selected model and request size. Include any cache-write
+premium in the conservative input rate. Cache reads can use a separately
+configured price only after the provider reports valid cached-token usage;
+missing cache details earn no discount. All other input, including cache writes,
+uses the conservative input rate. Reservations always assume zero cache hits.
 Price changes require updating this variable. The $25 ceiling is an
 estimate based on these configured rates, not a provider billing guarantee.
 OpenAI requests explicitly use the standard service tier so project-level

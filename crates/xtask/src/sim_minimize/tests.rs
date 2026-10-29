@@ -12,8 +12,8 @@ use super::*;
 
 /// `zakura-sim`: `confirm` writes a confirmation whose status the input's
 /// keywords pick, and `replay` fails for a trace named `bad`. A keyword can
-/// also make `confirm` hang, die from a signal, or fail without a
-/// confirmation.
+/// also make `confirm` hang, die from a signal, fail without a
+/// confirmation, or refuse its arguments.
 const SIM: &str = r#"#!/bin/sh
 cmd=$1; shift
 case "$cmd" in
@@ -33,6 +33,7 @@ confirm)
     *hang-confirm*) sleep 30;;
     *segv-confirm*) kill -SEGV $$;;
     *fail-confirm*) echo "the trace can't go there" >&2; exit 1;;
+    *refuse-confirm*) echo "fixtures/all doesn't register it" >&2; exit 2;;
   esac
   status=confirmed
   case "$body" in
@@ -121,6 +122,9 @@ impl Fake {
             fs::write(&path, script).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        for name in ["sim", "fuzz", "tmin"] {
+            wait_until_executable(&dir.path().join(name));
+        }
         let staged_dir = dir.path().join("staged");
         fs::create_dir(&staged_dir).unwrap();
         for (index, bytes) in staged.iter().enumerate() {
@@ -203,6 +207,28 @@ impl Fake {
     /// The report as written.
     fn written(&self) -> Value {
         read_json(&self.out(REPORT_FILE)).unwrap()
+    }
+}
+
+/// Runs `script` until it starts. A child that another test's thread forks
+/// while a script is open for writing keeps it open until that child execs,
+/// and running the script meanwhile fails with ETXTBSY. Once it starts, no
+/// process holds it open for writing, and no test writes it again.
+fn wait_until_executable(script: &Path) {
+    loop {
+        match Command::new(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            status => {
+                status.unwrap();
+                return;
+            }
+        }
     }
 }
 
@@ -386,7 +412,7 @@ fn equal_candidates_count_once() {
 fn misbehaving_children_reject_the_candidate() {
     let staged: [&[u8]; 3] = [b"hang-confirm", b"segv-confirm", b"fail-confirm"];
     let mut fake = Fake::new(ORIGINAL, &staged);
-    fake.request.budget.child = Duration::from_millis(300);
+    fake.request.budget.child = Duration::from_secs(2);
     let started = Instant::now();
     let report = fake.run(TminScript::default());
     assert!(
@@ -465,6 +491,32 @@ fn an_unconfirmed_original_is_rejected() {
         assert_eq!(report.candidates, []);
         assert_eq!(fake.written()["status"], "original-rejected");
     }
+}
+
+/// When the wrapper itself fails, here on a `zakura-sim confirm` that
+/// refuses its arguments, the run still ends with a report: `error`, with
+/// the error as its reason, and the original kept. The command still fails.
+#[test]
+fn a_wrapper_failure_still_writes_a_report() {
+    let original = b"refuse-confirm original input";
+    let fake = Fake::new(original, &[b"good"]);
+    let report = fake.run(TminScript::default());
+    assert_eq!(report.status, Status::Error, "{report:#?}");
+    let reason = report.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("zakura-sim confirm refused its arguments; see "),
+        "{reason}"
+    );
+    assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+    assert_eq!(fs::read(fake.out(&report.original.path)).unwrap(), original);
+    let written = fake.written();
+    assert_eq!(written["status"], "error");
+    assert_eq!(written["reason"], reason);
+    let error = finish(&fake.request, &report).unwrap_err().to_string();
+    assert!(
+        error.starts_with("error: zakura-sim confirm refused"),
+        "{error}"
+    );
 }
 
 /// An interrupt while `tmin` runs kills it, keeps the original and `tmin`'s
@@ -755,14 +807,18 @@ fn reading_the_source_leaves_the_git_dir_alone() {
     assert!(!source.dirty, "{source:?}");
 }
 
-/// SIGINT sets the interrupt flag instead of killing the wrapper.
+/// SIGINT, SIGTERM and SIGHUP set the interrupt flag instead of killing
+/// the wrapper.
 #[test]
-fn sigint_sets_the_interrupt_flag() {
+fn signals_set_the_interrupt_flag() {
     install_interrupt_handler();
-    // SAFETY: `raise` has no memory-safety preconditions, and the handler
-    // only stores to an atomic.
-    unsafe {
-        libc::raise(libc::SIGINT);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        // SAFETY: `raise` has no memory-safety preconditions, and the
+        // handler only stores to an atomic.
+        unsafe {
+            libc::raise(signal);
+        }
+        assert!(INTERRUPTED.load(Ordering::SeqCst), "signal {signal}");
     }
-    assert!(INTERRUPTED.load(Ordering::SeqCst));
 }

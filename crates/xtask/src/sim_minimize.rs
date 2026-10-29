@@ -77,7 +77,7 @@ const NON_UNWINDING: &str = "panic in a function that cannot unwind";
 /// How often the wrapper checks a child, the deadline and the interrupt.
 const POLL: Duration = Duration::from_millis(20);
 
-/// Set by SIGINT or SIGTERM.
+/// Set by SIGINT, SIGTERM or SIGHUP.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// What the caller asked for.
@@ -305,24 +305,45 @@ fn minimize(
 ) -> Result<Report, BoxError> {
     let started = Instant::now();
     let original = preserve_original(request)?;
-    let logs = request.out.join(LOGS_DIR);
-    fs::create_dir_all(&logs)?;
-    let built = match build_tools(repo_root, request, &logs, interrupt) {
-        Ok(Some(tools)) => tools,
-        Err(error) => {
-            let report = Report::new(request, original, Status::BuildFailed, started)
-                .with_reason(error.to_string());
+    let built = match build_tools(repo_root, request, interrupt) {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(Stop::Failed(reason))) => {
+            let report =
+                Report::new(request, original, Status::BuildFailed, started).with_reason(reason);
             return write_report(request, report, started);
         }
-        Ok(None) => {
+        Ok(Err(Stop::Interrupted)) => {
             return write_report(
                 request,
                 interrupted_before_start(request, original, started),
                 started,
             )
         }
+        Err(error) => return wrapper_failed(request, original, started, error),
     };
     minimize_with(request, &built, original, started, interrupt)
+}
+
+/// Why building the tools stopped short of them, when the wrapper itself
+/// didn't fail.
+enum Stop {
+    /// A build failed; the reason names its log.
+    Failed(String),
+    /// An interrupt came first.
+    Interrupted,
+}
+
+/// Writes the report of a run the wrapper itself failed, with `error` as its
+/// reason, and returns it. If even that report can't be written, `error`.
+fn wrapper_failed(
+    request: &Request,
+    original: Original,
+    started: Instant,
+    error: BoxError,
+) -> Result<Report, BoxError> {
+    let report =
+        Report::new(request, original, Status::Error, started).with_reason(error.to_string());
+    write_report(request, report, started).map_err(|_| error)
 }
 
 /// A report for a run interrupted before its tools were ready.
@@ -331,14 +352,15 @@ fn interrupted_before_start(request: &Request, original: Original, started: Inst
         .with_reason("interrupted while building the tools")
 }
 
-/// Builds `zakura-sim` and the fuzz target, and copies both into
-/// `<out>/bin/`. `None` if interrupted.
+/// Builds `zakura-sim` and the fuzz target, logging into `<out>/logs/`, and
+/// copies both into `<out>/bin/`.
 fn build_tools(
     repo_root: &Path,
     request: &Request,
-    logs: &Path,
     interrupt: &AtomicBool,
-) -> Result<Option<Tools>, BoxError> {
+) -> Result<Result<Tools, Stop>, BoxError> {
+    let logs = request.out.join(LOGS_DIR);
+    fs::create_dir_all(&logs)?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let sim_target = repo_root.join("target").join("sim");
     let mut build_sim = Command::new(&cargo);
@@ -350,8 +372,8 @@ fn build_tools(
         .arg("--manifest-path")
         .arg(repo_root.join("Cargo.toml"))
         .args(["-p", "zakura-sim", "--bin", "zakura-sim"]);
-    if !build(&mut build_sim, &logs.join("build-sim.log"), interrupt)? {
-        return Ok(None);
+    if let Err(stop) = build(&mut build_sim, &logs.join("build-sim.log"), interrupt)? {
+        return Ok(Err(stop));
     }
 
     let fuzz_target = repo_root.join("target").join("sim-fuzz");
@@ -362,8 +384,8 @@ fn build_tools(
     };
     let mut build_fuzz = fuzz_build.command("build");
     build_fuzz.arg(&request.target);
-    if !build(&mut build_fuzz, &logs.join("build-fuzz.log"), interrupt)? {
-        return Ok(None);
+    if let Err(stop) = build(&mut build_fuzz, &logs.join("build-fuzz.log"), interrupt)? {
+        return Ok(Err(stop));
     }
 
     let bin = request.out.join(BIN_DIR);
@@ -377,7 +399,7 @@ fn build_tools(
     let (target, budget) = (request.target.clone(), request.budget);
     let tmin =
         move |input: &Path, artifacts: &Path| fuzz_build.tmin(&target, budget, input, artifacts);
-    Ok(Some(Tools {
+    Ok(Ok(Tools {
         sim,
         fuzz,
         tmin_binary,
@@ -432,14 +454,21 @@ impl FuzzBuild {
     }
 }
 
-/// Runs a build, logging to `log`. `false` if interrupted.
-fn build(command: &mut Command, log: &Path, interrupt: &AtomicBool) -> Result<bool, BoxError> {
+/// Runs a build, logging to `log`.
+fn build(
+    command: &mut Command,
+    log: &Path,
+    interrupt: &AtomicBool,
+) -> Result<Result<(), Stop>, BoxError> {
     crate::print_command(command);
-    match run_child(command, log, None, interrupt)? {
-        ChildEnd::Exited(0) => Ok(true),
-        ChildEnd::Interrupted => Ok(false),
-        end => Err(format!("the build {end}; see {}", log.display()).into()),
-    }
+    Ok(match run_child(command, log, None, interrupt)? {
+        ChildEnd::Exited(0) => Ok(()),
+        ChildEnd::Interrupted => Err(Stop::Interrupted),
+        end => Err(Stop::Failed(format!(
+            "the build {end}; see {}",
+            log.display()
+        ))),
+    })
 }
 
 /// The fuzz target binary cargo-fuzz built under `target_dir`, in its one
@@ -567,12 +596,16 @@ pub(super) enum Status {
     OriginalKept,
     /// The original failed a check, so nothing was reduced.
     OriginalRejected,
-    /// SIGINT or SIGTERM stopped the run. The original's copy, and any
+    /// SIGINT, SIGTERM or SIGHUP stopped the run. The original's copy, and any
     /// candidate accepted before, are kept.
     Interrupted,
     /// The simulator binary or the fuzz target didn't build, so no check
     /// ran. The original's copy is kept.
     BuildFailed,
+    /// The wrapper itself failed, such as on an I/O error or a child that
+    /// refused its arguments; the reason is the error. The original's copy
+    /// is kept.
+    Error,
 }
 
 impl fmt::Display for Status {
@@ -584,6 +617,7 @@ impl fmt::Display for Status {
             Status::OriginalRejected => "original-rejected",
             Status::Interrupted => "interrupted",
             Status::BuildFailed => "build-failed",
+            Status::Error => "error",
         })
     }
 }
@@ -857,9 +891,22 @@ impl Report {
 }
 
 /// Confirms the original, runs `tmin`, and confirms its candidates, with
-/// `tools`. Writes and returns the report. The original must already be
-/// preserved ([`preserve_original`]).
+/// `tools`. Writes and returns the report, an [`Status::Error`] one if the
+/// wrapper itself fails. The original must already be preserved
+/// ([`preserve_original`]).
 pub(super) fn minimize_with(
+    request: &Request,
+    tools: &Tools,
+    original: Original,
+    started: Instant,
+    interrupt: &AtomicBool,
+) -> Result<Report, BoxError> {
+    reduce(request, tools, original.clone(), started, interrupt)
+        .or_else(|error| wrapper_failed(request, original, started, error))
+}
+
+/// [`minimize_with`]'s steps, with the wrapper's own failures as errors.
+fn reduce(
     request: &Request,
     tools: &Tools,
     original: Original,
@@ -1467,7 +1514,7 @@ fn signal(_: ExitStatus) -> i32 {
     0
 }
 
-/// Sets [`INTERRUPTED`] on SIGINT and SIGTERM. Children run in their own
+/// Sets [`INTERRUPTED`] on SIGINT, SIGTERM and SIGHUP. Children run in their own
 /// process groups, so a terminal's Ctrl-C reaches only the wrapper, which
 /// then kills the running child and writes the report.
 #[cfg(unix)]
@@ -1476,7 +1523,7 @@ fn install_interrupt_handler() {
         INTERRUPTED.store(true, Ordering::SeqCst);
     }
     let handler = interrupted as extern "C" fn(libc::c_int);
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: the handler only stores to an atomic, which is
         // async-signal-safe.
         unsafe {

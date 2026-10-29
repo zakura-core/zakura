@@ -26,6 +26,28 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
+- `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
+  in data, with a collector that turns each run's end time into a feature.
+  It checks the feedback transport and searches for nothing.
+
+## Semantic feedback
+
+A target with a collector, `sim_target!(Harness, collector)`, adds abstract
+protocol states to libFuzzer's code edges. The collector writes one counter
+per feature into the `__libfuzzer_extra_counters` section. libFuzzer clears
+the section before each input and reads each nonzero counter as a feature,
+so an input that reaches a new state through covered code still joins the
+corpus. The section works on Linux only.
+
+`ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
+doesn't read. The collector still runs, so `on` and `off` runs take the same
+code path and differ only in what libFuzzer reads. Each target with a
+collector logs its backend, version, feature count and mode at startup.
+
+`cargo xtask sim-feedback` builds `feedback_probe` and runs libFuzzer's
+corpus merge with feedback `off` and `on`. With feedback off, an input whose
+code edges another input already covered adds nothing. With feedback on,
+libFuzzer adds it for its one new feature.
 
 ## What a target does with a run
 

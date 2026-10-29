@@ -13,6 +13,7 @@ mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
+mod sim_feedback;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -123,6 +124,14 @@ fn try_main() -> Result<(), BoxError> {
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
+        Some("sim-feedback") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask sim-feedback` does not accept arguments",
+                )));
+            }
+            sim_feedback::run(&repo_root()?)
+        }
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -343,6 +352,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]"
     )?;
+    writeln!(output, "  cargo xtask sim-feedback")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -405,5 +415,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Shrinks a zakura-sim trace that ends in a violation to fewer non-default picks."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Builds the simulator's feedback_probe fuzz target with pinned nightly cargo-fuzz, and"
+    )?;
+    writeln!(
+        output,
+        "checks that libFuzzer keeps an input for a semantic feature alone."
     )
 }

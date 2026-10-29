@@ -10,7 +10,11 @@
 //! A [`Worker`] runs inputs one at a time on a thread of its own. After a
 //! run whose shutdown abandoned tasks, it retires that thread and starts a
 //! fresh one (#1694).
+//!
+//! [`feedback`] turns abstract protocol states into features libFuzzer
+//! reads beside its code edges (E2a).
 
+pub mod feedback;
 mod worker;
 
 use serde::Serialize;

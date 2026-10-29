@@ -597,6 +597,39 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+  # The simulator's fuzz targets feed libFuzzer semantic features through its
+  # extra counters. `cargo xtask sim-feedback` builds the `feedback_probe`
+  # target with the pinned nightly and cargo-fuzz, and checks that libFuzzer
+  # keeps an input for a semantic feature alone. The ASan fuzz build takes
+  # minutes, so it runs nightly and on manual dispatch, never on pull
+  # requests or pushes.
+  sim-feedback:
+    name: zakura_sim feedback
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
+      CXXFLAGS: -include cstdint
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          # The nightly `header-fuzz.yml` and `cargo xtask sim-feedback` pin.
+          toolchain: nightly-2026-07-15
+          cache-shared-key: zakura-sim-feedback
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Check libFuzzer reads semantic features
+        run: cargo +nightly-2026-07-15 xtask sim-feedback
+
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:
   # it dry-run-publishes the real publish set against the live crates.io
@@ -672,6 +705,7 @@ jobs:
       - sim-build
       - sim-planted
       - sim-sanitizers
+      - sim-feedback
       - zakura-testkit
     timeout-minutes: 30
     steps:
@@ -685,11 +719,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build, sim-planted and sim-sanitizers run only on the nightly
+          # sim-build, sim-planted, sim-sanitizers and sim-feedback run only on the nightly
           # schedule and manual dispatch, so a nightly failure still fails
           # this status and reaches report-nightly-result.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, sim-feedback, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

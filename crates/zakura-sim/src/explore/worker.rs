@@ -17,8 +17,8 @@ use std::{
     thread,
 };
 
-use super::{classify, Classified, ExploreRun};
-use crate::{harness::HarnessEntry, NullSink};
+use super::{classify, feedback::Feedback, Classified, ExploreRun};
+use crate::{harness::HarnessEntry, Checker, NullSink};
 
 /// One input's work, run on the worker's thread. Returns true if the thread
 /// must retire.
@@ -55,11 +55,27 @@ impl Worker {
         input: &[u8],
         then: impl FnOnce(&[u8], &ExploreRun, &Classified) -> R + Send + 'static,
     ) -> R {
+        self.explore_with(entry, input, None, then)
+    }
+
+    /// [`Worker::explore`], with `feedback`'s collector running after the
+    /// harness's checker. The collector starts fresh for the input, on the
+    /// worker's thread, and its counters hold the run's features once this
+    /// returns.
+    pub fn explore_with<R: Send + 'static>(
+        &mut self,
+        entry: &'static HarnessEntry,
+        input: &[u8],
+        feedback: Option<Feedback>,
+        then: impl FnOnce(&[u8], &ExploreRun, &Classified) -> R + Send + 'static,
+    ) -> R {
         let input = input.to_vec();
         let (done, result) = mpsc::sync_channel::<(Result<R, Box<dyn Any + Send>>, bool)>(1);
         let job: Job = Box::new(move || {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                let run = (entry.run_bytes)(&input, &mut NullSink, None);
+                let mut collecting = feedback.as_ref().map(Feedback::start);
+                let extra = collecting.as_mut().map(|c| c as &mut dyn Checker);
+                let run = (entry.run_bytes)(&input, &mut NullSink, extra);
                 let classified = classify(entry, &run);
                 (then(&input, &run, &classified), run.leaked() > 0)
             }));

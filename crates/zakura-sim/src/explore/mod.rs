@@ -130,7 +130,7 @@ pub enum Bucket {
     Nondeterministic,
     /// The process exited with code 0 but wrote no `end` record, so the run
     /// never finished.
-    Incomplete,
+    NoEnd,
 }
 
 impl Bucket {
@@ -144,7 +144,7 @@ impl Bucket {
             Bucket::Crash => "crash",
             Bucket::Abandoned => "abandoned",
             Bucket::Nondeterministic => "nondeterministic",
-            Bucket::Incomplete => "incomplete",
+            Bucket::NoEnd => "no-end",
         }
     }
 }

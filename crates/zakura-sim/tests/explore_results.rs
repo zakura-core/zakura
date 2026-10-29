@@ -26,7 +26,7 @@ use zakura_sim::{
     },
     harness::{entry, record, HarnessEntry, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    trace::{FileSink, TraceReader, INPUT_FILE, TRACES_DIR},
+    trace::{FileSink, TraceReader, INPUT_FILE, TRACES_DIR, TRACE_FILE},
     Checker, HarnessFailure, NullSink, ObservationLog, PropertyOutcome, PropertyReport, RunConfig,
     RunEnd, Sim, StepCtx, Violation,
 };
@@ -401,25 +401,25 @@ fn a_failure_keeps_its_abandonment() {
     assert_eq!(traced.result, ProcessResult::Ended(classified));
 }
 
-/// A process that exits with code 0 before its `end` record is incomplete,
+/// A process that exits with code 0 before its `end` record is `no-end`,
 /// never a pass. One that never wrote its trace is too.
 #[test]
-fn a_run_without_end_is_incomplete() {
+fn a_run_without_end_is_no_end() {
     let dir = TempDir::new().unwrap();
     let output = child(&format!("record:{EXIT_CASE}:{}", dir.path().display()));
     let exit = ProcessExit::from(output.status);
     assert_eq!(exit, ProcessExit::Code(0), "{output:?}");
-    let incomplete = from_trace(exit, &output.stderr, dir.path());
-    assert_eq!(incomplete.result, ProcessResult::Incomplete);
-    assert_eq!(incomplete.bucket(), Some(Bucket::Incomplete));
-    assert!(incomplete.steps >= 1, "{incomplete:?}");
+    let no_end = from_trace(exit, &output.stderr, dir.path());
+    assert_eq!(no_end.result, ProcessResult::NoEnd);
+    assert_eq!(no_end.bucket(), Some(Bucket::NoEnd));
+    assert!(no_end.steps >= 1, "{no_end:?}");
 
     let empty = TempDir::new().unwrap();
     let none = from_trace(ProcessExit::Code(0), b"", empty.path());
     assert_eq!(
         none,
         ProcessClassified {
-            result: ProcessResult::Incomplete,
+            result: ProcessResult::NoEnd,
             steps: 0,
         }
     );
@@ -521,6 +521,29 @@ fn a_crash_after_end_keeps_the_run() {
         }
     );
     assert_eq!(crashed.bucket(), Some(Bucket::Crash));
+}
+
+/// A failed process whose trace doesn't read as a valid prefix is still a
+/// crash. Only a process that didn't fail makes such a trace an error.
+#[test]
+fn a_crash_with_an_invalid_trace_is_a_crash() {
+    let (_, dir) = run_in_process(CLEAN, false);
+    let mut trace = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(TRACE_FILE))
+        .unwrap();
+    std::io::Write::write_all(&mut trace, b"not a record\n").unwrap();
+    assert_eq!(
+        from_trace(ProcessExit::Signal(11), b"", dir.path()),
+        ProcessClassified {
+            result: ProcessResult::Crashed {
+                failure: ProcessFailure::Signal { signal: 11 },
+                end: None,
+            },
+            steps: 0,
+        }
+    );
+    assert!(classify_process(&RESULTS, ProcessExit::Code(0), b"", dir.path()).is_err());
 }
 
 /// Acceptance test 3, the worker: a process killed while it reruns a

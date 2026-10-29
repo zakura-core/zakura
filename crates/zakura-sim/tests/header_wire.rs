@@ -111,10 +111,76 @@ struct Session {
     session_id: u64,
 }
 
+/// A session's identity as (connection, quic_stream, kind, version,
+/// session_id).
+type SessionKey = (u64, u64, u16, u16, u64);
+
+/// The identity `obs` admits, if it's a transport `Admitted` event.
+fn admitted_key(obs: &Observation) -> Option<SessionKey> {
+    match obs {
+        Observation::Transport {
+            connection,
+            event:
+                TransportFact::Admitted {
+                    quic_stream,
+                    kind,
+                    version,
+                    session_id,
+                    ..
+                },
+            ..
+        } => Some((
+            connection.expect("an admission names its connection"),
+            *quic_stream,
+            *kind,
+            *version,
+            *session_id,
+        )),
+        _ => None,
+    }
+}
+
+/// The identity `obs` names, if it's a `Session` row.
+fn row_key(obs: &Observation) -> Option<SessionKey> {
+    match obs {
+        Observation::Session {
+            connection,
+            quic_stream,
+            kind,
+            version,
+            session_id,
+            ..
+        } => Some((*connection, *quic_stream, *kind, *version, *session_id)),
+        _ => None,
+    }
+}
+
 /// The transport events and session rows in `report`'s log, in order.
+/// Every `Admitted` event must be followed directly by its `Session` row,
+/// equal on all five identity fields, and every row must follow one, since
+/// peer evidence maps sessions to connections through these rows.
 fn read(report: &RunReport) -> (Vec<Event>, Vec<Session>) {
     let (mut events, mut sessions) = (Vec::new(), Vec::new());
-    for entry in report.log.entries() {
+    let entries = report.log.entries();
+    for (index, entry) in entries.iter().enumerate() {
+        let before = index
+            .checked_sub(1)
+            .and_then(|before| admitted_key(&entries[before].obs));
+        if let Some(row) = row_key(&entry.obs) {
+            assert_eq!(
+                before,
+                Some(row),
+                "the session row at entry {index} matches the admission it follows"
+            );
+        }
+        if admitted_key(&entry.obs).is_some() {
+            assert!(
+                entries
+                    .get(index + 1)
+                    .is_some_and(|next| row_key(&next.obs).is_some()),
+                "the admission at entry {index} is followed by its session row"
+            );
+        }
         match &entry.obs {
             Observation::Transport {
                 connection,

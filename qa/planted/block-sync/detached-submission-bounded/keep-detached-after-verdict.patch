@@ -1,16 +1,12 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
-index c71ad5743..8bd0b8889 100644
+index c71ad5743..df71f0e76 100644
 --- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
-@@ -994,7 +994,10 @@ impl Sequencer {
-             .in_flight_submissions
-             .get(&token)
-             .is_some_and(|submission| {
--                submission.height == height && submission.hash == hash && submission.bytes == bytes
-+                submission.height == height
-+                    && submission.hash == hash
-+                    && submission.bytes == bytes
-+                    && !submission.detached
-             });
-         if matches {
-             let submission = self
+@@ -929,6 +929,7 @@ impl Sequencer {
+             || submission.source != source
+             || submission.height != height
+             || submission.hash != hash
++            || submission.detached
+         {
+             return false;
+         }

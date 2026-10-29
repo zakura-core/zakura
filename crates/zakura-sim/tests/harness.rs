@@ -471,7 +471,7 @@ fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), St
 }
 
 #[test]
-fn every_coverage_witness_exists_and_ci_runs_it() {
+fn every_coverage_witness_exists_and_runs_where_it_says() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();

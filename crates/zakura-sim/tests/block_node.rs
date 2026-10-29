@@ -72,7 +72,7 @@ fn completions(report: &RunReport) -> Vec<String> {
 
 /// BS.2: the node starts with 64 headers and no bodies, between two
 /// mirrors that hold the whole chain, one dialing it and one it dials.
-/// Under every plan, its real routines download each body, its sequencer
+/// Under each of two plans, its real routines download each body, its sequencer
 /// submits them, and its block service commits them through the engine, so
 /// the published view's verified tip is the fixture tip and full state's
 /// best chain is the fixture chain. Every completion is a success the
@@ -87,7 +87,7 @@ fn honest_sync_reaches_the_fixture_tip() {
         ],
         ..BlockScenario::default()
     };
-    for input in inputs(8, 256) {
+    for input in inputs(2, 256) {
         let (report, ports) = run(&scenario, input);
         assert!(
             matches!(

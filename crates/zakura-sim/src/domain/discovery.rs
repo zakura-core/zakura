@@ -155,7 +155,7 @@ impl WaitState {
         }
         for entry in step {
             match &entry.obs {
-                Observation::TaskReached { task, at, site } => {
+                Observation::TaskReached { task, at, site, .. } => {
                     if is_source(task) {
                         self.source_parked = false;
                     }
@@ -365,6 +365,7 @@ mod tests {
                 Some((at, line)) => Observation::TaskReached {
                     task,
                     at: at.to_owned(),
+                    object: None,
                     site: Some(format!("{}:{line}", sites().file)),
                 },
                 None => Observation::TaskWaiting { task },

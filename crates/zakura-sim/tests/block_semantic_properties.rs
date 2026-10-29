@@ -133,6 +133,8 @@ fn each_committed_input_draws_its_scenario() {
         (
             DECODED_TARGET_RESET_INPUT,
             BlockScenario::decoded_target_reset(),
+        ),
+        (
             DECODED_INPUT_STALL_INPUT,
             BlockScenario::decoded_input_stall(),
         ),

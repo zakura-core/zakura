@@ -142,8 +142,9 @@ mod tests {
             Subsystem,
         },
         property::{
-            require, require_every, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId,
-            Registry, RegistryChecker, Source, Sources, State, Status, Verdict,
+            require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind,
+            Property, PropertyId, Registry, RegistryChecker, Source, Sources, State, Status,
+            Verdict,
         },
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NullSink, ObservationLog,
         Plan, RunConfig, RunReport, Sim,
@@ -256,6 +257,17 @@ mod tests {
         properties: Vec<Property<Owners>>,
         sources: &Sources,
     ) -> (RunReport, Owned) {
+        run_assuming(ops, steps, properties, sources, Assumptions::none())
+    }
+
+    /// [`run`], with the scenario declaring `assumptions`.
+    fn run_assuming(
+        ops: Vec<(u64, Op)>,
+        steps: u64,
+        properties: Vec<Property<Owners>>,
+        sources: &Sources,
+        assumptions: Assumptions<Owners>,
+    ) -> (RunReport, Owned) {
         let view: Owned = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
         let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
         let mut hub = EvidenceHub::new();
@@ -270,7 +282,7 @@ mod tests {
         let mut checker = RegistryChecker::new(
             Registry::new(properties).expect("the IDs are unique"),
             Rc::new(Owners(view.clone())),
-            Assumptions::none(),
+            assumptions,
             sources,
         );
         (sim.run(&mut checker, &mut MemorySink::default()), view)
@@ -501,5 +513,49 @@ mod tests {
         let every = report(&run, "test/require-every");
         assert_eq!(every.outcome, inconclusive("state-unobserved"));
         assert_eq!(every.gaps, gap);
+    }
+
+    /// Holds unless the budget reads 2, the value at which
+    /// [`gap_runs_end_where_the_check_skips_a_boundary`]'s scenario stops
+    /// holding.
+    fn unless_two(owners: &Owners, _: Assume) -> bool {
+        let view = owners.0.borrow();
+        let budget = view
+            .component(BUDGET)
+            .expect("the wire tier has the budget");
+        budget.state() != State::Current { state: &2 }
+    }
+
+    /// Two transitions with a boundary between them where the property's
+    /// assumption doesn't hold, so its check never runs there, are two gap
+    /// runs, not one across the skipped boundary.
+    #[test]
+    fn gap_runs_end_where_the_check_skips_a_boundary() {
+        let mut assuming = requiring();
+        assuming.assumes = &[Assume::HonestPeer];
+        let ops = reads(
+            current(0..=2, 1)
+                .into_iter()
+                .chain(held([3]))
+                .chain(current([4], 2))
+                .chain(held([5]))
+                .chain(current([6], 1)),
+        );
+        let declared = Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::HonestPeer,
+            params: serde_json::Value::Null,
+        }])
+        .holds_when(unless_two);
+        let (run, view) = run_assuming(ops, 6, vec![assuming], &wire(), declared);
+        assert_eq!(run.end.harness, None);
+        assert_eq!(view.borrow().component(BUDGET).map(Component::seq), Some(5));
+        let report = report(&run, "test/require");
+        assert_eq!(report.holds_since, Some(5), "step 4 broke the assumption");
+        let gap = |at| Gap {
+            component: "Budget".to_owned(),
+            from: at,
+            through: at,
+        };
+        assert_eq!(report.gaps, [gap(3), gap(5)]);
     }
 }

@@ -534,6 +534,9 @@ fn step_property<S: HasView>(
             _ => {}
         }
         if !hold {
+            // A boundary the check skipped ends its gap runs, so a later gap
+            // doesn't claim the boundaries between.
+            state.gapped.clear();
             return Vec::new();
         }
     }

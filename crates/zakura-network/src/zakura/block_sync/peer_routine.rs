@@ -24,7 +24,7 @@ use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 use zakura_rt::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         futures::Notified,
         mpsc, watch, CancellationToken, Mutex,
     },
@@ -338,6 +338,32 @@ impl Disposition {
     }
 }
 
+/// Marks a routine blocked on its sequencer handoff, from creation until
+/// drop. Other routines skip a blocked routine as a floor carrier
+/// ([`PeerRegistry::floor_has_preferred_unsaturated_server`]), because it
+/// can't request the floor until its handoff completes. Dropping the guard,
+/// including by cancelling the wait, clears the flag.
+struct HandoffBlocked<'a>(&'a AtomicBool);
+
+impl<'a> HandoffBlocked<'a> {
+    /// Sets `routine`'s flag. A routine that published a free slot may be
+    /// some other routine's preferred floor carrier, so this wakes them to
+    /// rank the floor again.
+    fn start(routine: &'a PeerRoutine) -> Self {
+        routine.handoff_blocked.store(true, Ordering::Relaxed);
+        if routine.published_free_slots {
+            routine.registry.notify_floor_ranking_changed();
+        }
+        HandoffBlocked(&routine.handoff_blocked)
+    }
+}
+
+impl Drop for HandoffBlocked<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// The per-peer pipe-routine. Owns its `FramedRecv` (transport read), the session
 /// clone, the download window, the `outstanding` requests, the servable caps /
 /// `received_status` it learns from `Status` frames, and holds clones of the
@@ -389,6 +415,9 @@ pub(super) struct PeerRoutine {
     published_limits: (u32, u32, u32),
     /// Whether the last slot publication showed a requester that refuses work.
     published_requester_stopped: bool,
+    /// Whether the last slot publication showed a free slot, so other
+    /// routines may defer the floor to this one.
+    published_free_slots: bool,
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -415,6 +444,9 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    /// This generation's registry flag, set while the routine is blocked on
+    /// its sequencer handoff (see [`HandoffBlocked`]).
+    handoff_blocked: Arc<AtomicBool>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -491,6 +523,7 @@ impl PeerRoutine {
             max_response_bytes,
             window.max_inflight_requests,
         );
+        let handoff_blocked = registry.handoff_blocked_flag(&peer, generation);
         PeerRoutine {
             requester,
             request_pool_waiting: false,
@@ -513,6 +546,7 @@ impl PeerRoutine {
             status_range_bypass_available: false,
             published_limits,
             published_requester_stopped: false,
+            published_free_slots: false,
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
@@ -525,6 +559,7 @@ impl PeerRoutine {
             sequencer_input,
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
+            handoff_blocked,
             routine_to_reactor,
             checked_revocations,
             sequencer_view,
@@ -961,12 +996,20 @@ impl PeerRoutine {
         let _read_pause = self.requester.pause_reading();
         let capacity_before = self.sequencer_input.capacity();
         let started = time::Instant::now();
-        let permit = self
-            .sequencer_input
-            .clone()
-            .reserve_owned()
-            .await
-            .map_err(|_| SinkReject::local("block-sync sequencer body input closed"))?;
+        let closed = || SinkReject::local("block-sync sequencer body input closed");
+        let permit = match self.sequencer_input.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(sequencer_input)) => {
+                // The input queue is full, so this routine parks until the
+                // sequencer drains a body.
+                let _blocked = HandoffBlocked::start(self);
+                sequencer_input
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| closed())?
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
+        };
         self.trace_body_decode_permit(started.elapsed(), capacity_before);
         Ok(permit)
     }
@@ -2188,6 +2231,11 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
+        // The flag stays set through the budget release below, so a routine
+        // stalled anywhere in its handoff isn't a floor carrier. A
+        // `HandoffBlocked` guard can't span the release, which borrows `self`
+        // mutably; `Drop` clears the flag if the routine ends in between.
+        self.handoff_blocked.store(true, Ordering::Relaxed);
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(outstanding_owner, height, reserved_estimate);
         self.forward_body_to_sequencer(
@@ -2206,6 +2254,7 @@ impl PeerRoutine {
         self.budget.release(reserved_estimate);
         #[cfg(any(test, zakura_sim))]
         self.release_handoff(outstanding_owner, height, reserved_estimate);
+        self.handoff_blocked.store(false, Ordering::Relaxed);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -2490,6 +2539,8 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
+        // Set through the release below, as on the matched path.
+        self.handoff_blocked.store(true, Ordering::Relaxed);
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(owner, height, ended_reservation);
         self.forward_body_to_sequencer(
@@ -2512,6 +2563,7 @@ impl PeerRoutine {
         self.budget.release(ended_reservation);
         #[cfg(any(test, zakura_sim))]
         self.release_handoff(owner, height, ended_reservation);
+        self.handoff_blocked.store(false, Ordering::Relaxed);
         true
     }
 
@@ -2783,6 +2835,7 @@ impl PeerRoutine {
         } else {
             self.window.available_slots()
         };
+        self.published_free_slots = available_slots > 0;
         self.registry.publish_slots(
             &self.peer,
             self.generation,
@@ -2881,6 +2934,8 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
+        // A routine dropped inside its handoff no longer blocks on it.
+        self.handoff_blocked.store(false, Ordering::Relaxed);
         self.return_unreceived_requests("peer_routine_drop");
         // The routine's last snapshot, after it returned its work.
         #[cfg(any(test, zakura_sim))]

@@ -1,11 +1,11 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-index c1dfc3d1a..6764e14d7 100644
+index c101954cd..ad4b1a5d3 100644
 --- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
-@@ -2848,7 +2848,6 @@ impl Drop for PeerRoutine {
-     /// The reactor owns entry insert (on connect) and remove (on disconnect/
-     /// admission-reject); see `handle_peer_disconnected`.
+@@ -2936,7 +2936,6 @@ impl Drop for PeerRoutine {
      fn drop(&mut self) {
+         // A routine dropped inside its handoff no longer blocks on it.
+         self.handoff_blocked.store(false, Ordering::Relaxed);
 -        self.return_unreceived_requests("peer_routine_drop");
          // The routine's last snapshot, after it returned its work.
          #[cfg(any(test, zakura_sim))]

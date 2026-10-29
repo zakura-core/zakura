@@ -795,8 +795,8 @@ fn duplicate_id_rejected() {
     assert_eq!(result.err(), Some(RegistryError::DuplicateId { id: LEVEL }));
 }
 
-/// `Registry::new` rejects an `Ops` bound that names an object until
-/// zakura#1643 keeps `Point.object`.
+/// `Registry::new` rejects an `Ops` bound that names an object until objects
+/// carry creation labels.
 #[test]
 fn ops_bound_with_object_rejected() {
     let property = request_served(

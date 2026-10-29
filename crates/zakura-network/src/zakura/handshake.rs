@@ -430,6 +430,10 @@ pub enum ZakuraValidationError {
     /// The control acknowledgement did not bind to the exact nonce exchange.
     #[error("Zakura control nonce mismatch")]
     ControlNonceMismatch,
+
+    /// The control acknowledgement accepted a capability the hello did not offer.
+    #[error("Zakura control ack accepted an unoffered capability")]
+    UnofferedCapability,
 }
 
 impl ZakuraValidationError {
@@ -1190,6 +1194,7 @@ impl ZakuraControlAck {
         selected_zakura_protocol: u16,
         local_peer_nonce: [u8; 32],
         remote_peer_nonce: [u8; 32],
+        offered_capabilities: u64,
         requested_limits: &ZakuraInitialLimits,
         local: &ZakuraHandshakeConfig,
     ) -> Result<(), ZakuraValidationError> {
@@ -1201,6 +1206,9 @@ impl ZakuraControlAck {
         }
         if self.remote_peer_nonce != local_peer_nonce || self.peer_nonce != remote_peer_nonce {
             return Err(ZakuraValidationError::ControlNonceMismatch);
+        }
+        if self.accepted_capabilities & !offered_capabilities != 0 {
+            return Err(ZakuraValidationError::UnofferedCapability);
         }
         validate_initial_limits(self.accepted_limits, local)
             .map_err(ZakuraValidationError::from_wire_reject)?;
@@ -1874,6 +1882,7 @@ mod tests {
     use tokio_util::codec::{FramedRead, FramedWrite};
 
     use crate::protocol::external::{types::*, AddrInVersion, Codec, Message};
+    use crate::zakura::{ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC};
 
     fn local_config() -> ZakuraHandshakeConfig {
         ZakuraHandshakeConfig::for_network(&Network::Mainnet)
@@ -2280,6 +2289,7 @@ mod tests {
                 ZAKURA_PROTOCOL_VERSION_CURRENT,
                 [1; 32],
                 [2; 32],
+                0,
                 &requested_limits,
                 &local
             ),
@@ -2290,6 +2300,7 @@ mod tests {
                 ZAKURA_PROTOCOL_VERSION_CURRENT,
                 [9; 32],
                 [2; 32],
+                0,
                 &requested_limits,
                 &local
             ),
@@ -2308,6 +2319,7 @@ mod tests {
                 ZAKURA_PROTOCOL_VERSION_CURRENT,
                 [1; 32],
                 [2; 32],
+                0,
                 &requested_limits,
                 &local
             ),
@@ -2343,6 +2355,7 @@ mod tests {
                     ZAKURA_PROTOCOL_VERSION_CURRENT,
                     [1; 32],
                     [2; 32],
+                    0,
                     &requested_limits,
                     &local
                 ),
@@ -2391,12 +2404,61 @@ mod tests {
                     ZAKURA_PROTOCOL_VERSION_CURRENT,
                     [1; 32],
                     [2; 32],
+                    0,
                     &requested,
                     &local
                 ),
                 Err(ZakuraValidationError::ResourceLimit)
             );
         }
+    }
+
+    #[test]
+    fn control_ack_accepts_only_offered_capabilities() {
+        let offered = ZAKURA_CAP_HEADER_SYNC;
+        let ack = ZakuraControlAck {
+            magic: CONTROL_ACK_MAGIC,
+            control_version: CONTROL_VERSION,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            peer_nonce: [2; 32],
+            remote_peer_nonce: [1; 32],
+            accepted_capabilities: offered,
+            accepted_channels: 0,
+            accepted_limits: ZakuraAcceptedLimits {
+                max_frame_bytes: 1024,
+                max_message_bytes: 2048,
+                max_open_streams: 8,
+                max_inbound_queue_depth: 8,
+                idle_timeout_millis: 1000,
+            },
+        };
+        let requested_limits = ack.accepted_limits;
+        let local = local_config();
+        let validate = |accepted_capabilities| {
+            ZakuraControlAck {
+                accepted_capabilities,
+                ..ack.clone()
+            }
+            .validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                offered,
+                &requested_limits,
+                &local,
+            )
+        };
+
+        assert_eq!(validate(offered), Ok(()));
+        assert_eq!(validate(0), Ok(()));
+        assert_eq!(
+            validate(offered | ZAKURA_CAP_BLOCK_SYNC_REGULATED),
+            Err(ZakuraValidationError::UnofferedCapability)
+        );
+        assert_eq!(
+            validate(ZAKURA_CAP_BLOCK_SYNC_REGULATED),
+            Err(ZakuraValidationError::UnofferedCapability)
+        );
     }
 
     #[test]
@@ -2867,6 +2929,7 @@ mod tests {
                 ZAKURA_PROTOCOL_VERSION_CURRENT,
                 [1; 32],
                 [2; 32],
+                decoded.accepted_capabilities,
                 &decoded.accepted_limits,
                 &local
             ),

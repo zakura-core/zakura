@@ -17,7 +17,7 @@ use zakura_sim::{
         RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND, TEARDOWN_RETURNS_BASELINE,
     },
     harness::{
-        block_sync::{BlockScenario, MirrorSpec, Ports, Storage},
+        block_sync::{BlockScenario, HandoffPause, MirrorSpec, Ports, Storage},
         header_sync::Dialer,
         run_prepared, Subsystem,
     },
@@ -229,6 +229,85 @@ fn the_floor_churn_holds_the_reserved_bound() {
     assert!(
         peaks["reserved-estimate-bytes"] <= limits.reserved_bound(peaks["open-handoffs"]),
         "{peaks:?}"
+    );
+}
+
+/// A fuzz prefix of `len` bytes from xorshift64 seeded with `seed`.
+fn fuzz_prefix(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+/// Whether the node asks for height 7, which every mirror withholds,
+/// before the chain resets.
+fn asks_for_the_withheld_floor_before_the_reset(report: &RunReport) -> bool {
+    let reset = report
+        .picks
+        .iter()
+        .find(|pick| pick.identity == "peer:chain:reset")
+        .map(|pick| pick.step)
+        .expect("the chain resets");
+    report.log.entries().iter().any(|entry| {
+        entry.step < reset
+            && matches!(&entry.obs, Observation::BlockSync {
+                event: BlockSyncFact::Request { heights, step, .. },
+                ..
+            } if step == "written" && heights.contains(&7))
+    })
+}
+
+/// The floor churn with routines paused in their handoffs from height 5,
+/// stopped at 16,000 steps, after the reset at about 13,000.
+fn floor_churn_from_height_5() -> BlockScenario {
+    BlockScenario {
+        handoff_pause: Some(HandoffPause {
+            from_height: 5,
+            steps: 20_000,
+        }),
+        steps: Some(16_000),
+        ..BlockScenario::floor_churn()
+    }
+}
+
+/// #1812: with the pause from height 5, this plan leaves free only a
+/// routine with no RTprop sample. On main, it deferred the floor to the
+/// routines paused in their handoffs, so no routine asked for height 7
+/// before the reset.
+#[test]
+fn an_unmeasured_routine_asks_for_the_floor_while_the_others_are_paused() {
+    let report = node_run(
+        &floor_churn_from_height_5(),
+        Plan::from_fuzz(&fuzz_prefix(2, 64)),
+    );
+    assert!(asks_for_the_withheld_floor_before_the_reset(&report));
+}
+
+/// [`an_unmeasured_routine_asks_for_the_floor_while_the_others_are_paused`]
+/// on 24 plans of each prefix length. On main, 7 of the 48 plans never ask
+/// for height 7 before the reset.
+#[test]
+#[ignore = "48 debug runs take about 80 s; run it on demand with `--ignored`"]
+fn every_floor_churn_plan_asks_for_the_floor_before_the_reset() {
+    let scenario = floor_churn_from_height_5();
+    let stalled: Vec<_> = [64, 32]
+        .into_iter()
+        .flat_map(|len| (1..=24).map(move |seed| (len, seed)))
+        .filter(|&(len, seed)| {
+            let report = node_run(&scenario, Plan::from_fuzz(&fuzz_prefix(seed, len)));
+            !asks_for_the_withheld_floor_before_the_reset(&report)
+        })
+        .collect();
+    assert_eq!(
+        stalled,
+        [],
+        "(prefix length, seed) plans that stall the floor"
     );
 }
 

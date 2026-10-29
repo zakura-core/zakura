@@ -65,18 +65,18 @@ use crate::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, spawn_block_sync_reactor, spawn_header_sync_reactor, supported_p2p_v2_alpns,
-        zakura_protocol_for_alpn, AuthenticatedPeerRegistration, BlockSyncAction,
-        BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, BoxRunFuture,
-        Clock, CloseCause, Frame, FrameFilter, FrameRejection, FramedRecv, FramedSend,
-        FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
-        InboundReader, MessageRule, Peer, RealClock, Service, ServicePeerDirection,
-        ServiceRegistry, ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject,
-        Stream, StreamMode, StreamPrelude, StreamQueueDepths, StreamWritePolicy,
-        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
-        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        canonical_ip, frame_cap_carries_payload, spawn_block_sync_reactor,
+        spawn_header_sync_reactor, supported_p2p_v2_alpns, zakura_protocol_for_alpn,
+        AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
+        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
+        FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
+        HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionOpening,
+        SessionPolicy, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
+        StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraServiceId, ZakuraUpgradeDialStart, ZakuraValidationError, CONTROL_ACK_MAGIC,
         CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
         STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
@@ -3641,6 +3641,25 @@ impl ZakuraProtocolHandler {
                 return None;
             }
 
+            // The prelude cap becomes our outbound frame cap for this stream,
+            // so it must fit a frame header and at least one payload byte.
+            if !frame_cap_carries_payload(prelude.max_frame_bytes) {
+                debug!(
+                    max_frame_bytes = prelude.max_frame_bytes,
+                    "rejecting Zakura stream whose frame cap cannot carry a payload"
+                );
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                close_cause.record("undersized_frame_cap");
+                connection_token.cancel();
+                metrics::counter!("zakura.p2p.stream.rejected.undersized_frame_cap").increment(1);
+                conn.trace_stream(
+                    "rejected.undersized_frame_cap",
+                    stream_id,
+                    Some(stream_kind),
+                );
+                return None;
+            }
+
             if stream.mode == StreamMode::Persistent
                 && !may_open_ordered_stream(registry.session_policy(stream.kind), !is_initiator)
             {
@@ -4910,6 +4929,21 @@ fn bounded_stream_queue_depths(
 #[error("Zakura outbound frame write timed out")]
 struct OrderedFrameWriteTimeout;
 
+/// A queued ordered-stream frame that the writer refused before writing it.
+#[derive(Debug, Error)]
+enum OrderedFrameEncodeError {
+    #[error(
+        "Zakura outbound ordered frame payload {payload_len} exceeds negotiated \
+         max_message_bytes {max_message_bytes}"
+    )]
+    OverMessageCap {
+        payload_len: usize,
+        max_message_bytes: u32,
+    },
+    #[error("Zakura outbound ordered frame does not fit the stream's frame cap: {0}")]
+    Encode(ZakuraProtocolError),
+}
+
 #[cfg(test)]
 async fn persistent_stream_worker(
     send: SendStream,
@@ -5113,10 +5147,16 @@ async fn persistent_stream_worker_with_policy(
                             biased;
                             _ = context.connection_token.cancelled() => break,
                             _ = context.stream_token.cancelled() => break,
-                            result = queued_frame.write_with(|frame| async {
-                                let result = sim_arg!(write_ordered_frame_with_policy(
-                                    &mut send, frame, context.limits,
-                                    context.outbound_frame_cap, context.write_policy,
+                            // Encode before the request claim, so a frame that
+                            // doesn't fit starts no exchange and its session can
+                            // retire without closing the connection.
+                            result = queued_frame.encode_and_write_with(
+                                |frame| encode_ordered_frame(
+                                    frame, context.limits, context.outbound_frame_cap,
+                                ),
+                                |encoded| async {
+                                let result = sim_arg!(write_encoded_ordered_frame(
+                                    &mut send, encoded, context.write_policy,
                                 ); context.precheck.tap()).await;
                                 // A failed request claim can cancel the session on
                                 // drop. Record the cause while it is still alive.
@@ -5140,6 +5180,20 @@ async fn persistent_stream_worker_with_policy(
                             }
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
+                                break;
+                            }
+                            // A local frame that does not fit the stream is not a
+                            // connection fault. Retire only this session, as the
+                            // request worker resets only its own stream.
+                            if error.is::<OrderedFrameEncodeError>() {
+                                debug!(stream_kind, stream_id = context.stream_id, ?error,
+                                    "retiring Zakura service session after a local frame encode error");
+                                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
+                                context.conn.trace_stream(
+                                    "reset.local_oversize",
+                                    context.stream_id,
+                                    Some(stream_kind_label(stream_kind)),
+                                );
                                 break;
                             }
                             debug!(stream_kind, stream_id = context.stream_id, ?error, "closing Zakura ordered stream writer");
@@ -5579,27 +5633,31 @@ async fn write_ordered_frame(
     limits: ZakuraConnectionLimits,
     max_frame_bytes: u32,
 ) -> Result<(), BoxError> {
-    write_ordered_frame_with_policy(
+    let encoded = encode_ordered_frame(frame, limits, max_frame_bytes)?;
+    write_encoded_ordered_frame(
         send,
-        frame,
-        limits,
-        max_frame_bytes,
+        encoded,
         StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
         None,
     )
     .await
 }
 
-/// Writes one ordered-stream frame under `write_policy`. In test and
-/// simulator builds, `tap` reports when its write starts and finishes.
-async fn write_ordered_frame_with_policy(
-    send: &mut SendStream,
+/// An ordered-stream frame encoded under its stream's frame cap.
+struct EncodedOrderedFrame {
+    bytes: Vec<u8>,
+    #[cfg(any(test, zakura_sim))]
+    message_type: u16,
+}
+
+/// Encodes one ordered-stream frame, or refuses it with
+/// [`OrderedFrameEncodeError`] if it exceeds the message cap or
+/// `max_frame_bytes`.
+fn encode_ordered_frame(
     frame: Frame,
     limits: ZakuraConnectionLimits,
     max_frame_bytes: u32,
-    write_policy: StreamWritePolicy,
-    #[cfg(any(test, zakura_sim))] tap: Option<&Arc<super::StreamTap>>,
-) -> Result<(), BoxError> {
+) -> Result<EncodedOrderedFrame, BoxError> {
     // Mirror `write_response_frame`: a persistent ordered-stream frame whose
     // payload exceeds the peer's negotiated `max_message_bytes` would be
     // rejected by the peer as oversize, so reject it locally before wasting
@@ -5607,20 +5665,35 @@ async fn write_ordered_frame_with_policy(
     // handshake clamps `max_frame_bytes` and `max_message_bytes` independently,
     // so the frame cap alone does not bound this.
     if frame.payload.len() > limits.max_message_bytes as usize {
-        return Err(format!(
-            "Zakura outbound ordered frame payload {} exceeds negotiated max_message_bytes {}",
-            frame.payload.len(),
-            limits.max_message_bytes,
-        )
+        return Err(OrderedFrameEncodeError::OverMessageCap {
+            payload_len: frame.payload.len(),
+            max_message_bytes: limits.max_message_bytes,
+        }
         .into());
     }
-    let encoded = frame.encode(max_frame_bytes)?;
+    let bytes = frame
+        .encode(max_frame_bytes)
+        .map_err(OrderedFrameEncodeError::Encode)?;
+    // Return only the encoded bytes: the write can wait on QUIC credit, and
+    // holding both copies until then doubles every queued body.
+    Ok(EncodedOrderedFrame {
+        bytes,
+        #[cfg(any(test, zakura_sim))]
+        message_type: frame.message_type,
+    })
+}
+
+/// Writes one encoded ordered-stream frame under `write_policy`. In test and
+/// simulator builds, `tap` reports when its write starts and finishes.
+async fn write_encoded_ordered_frame(
+    send: &mut SendStream,
+    encoded: EncodedOrderedFrame,
+    write_policy: StreamWritePolicy,
+    #[cfg(any(test, zakura_sim))] tap: Option<&Arc<super::StreamTap>>,
+) -> Result<(), BoxError> {
     #[cfg(any(test, zakura_sim))]
-    let message_type = frame.message_type;
-    // Free the payload now: the write can wait on QUIC credit, and holding
-    // both copies until then doubles every queued body.
-    drop(frame);
-    let frame = encoded;
+    let message_type = encoded.message_type;
+    let frame = encoded.bytes;
     #[cfg(any(test, zakura_sim))]
     let seq = tap.map(|tap| tap.write_started(message_type));
     match write_policy {

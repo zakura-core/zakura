@@ -8,15 +8,15 @@
 
 mod support;
 
-use std::{cell::Cell, fs, path::PathBuf, rc::Rc, time::Duration};
+use std::{cell::Cell, fs, path::PathBuf, time::Duration};
 
 use sha2::{Digest, Sha256};
 use support::{
     inputs,
-    steer::{before, steer, Pair, Steer},
+    steer::{before, steer, Steer},
 };
-use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
+    domain::session::HONEST_NEVER_PUNISHED,
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -33,8 +33,6 @@ use zakura_sim::{
         StorageResult, TransportFact,
     },
     peer::{honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    table::{sender_properties, table_properties},
     Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
@@ -48,49 +46,17 @@ const NEVER_CLOSES: &str = "header-sync/s5v9/conformant-never-closes";
 /// The reactor's request deadline, which every hold releases before.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
-/// Every generated receiver and sender property of header sync's table,
-/// assembled in the test (M5-Q13).
-fn table_checker() -> RegistryChecker<Logged> {
-    let mut properties: Vec<Property<Logged>> =
-        table_properties("header-sync", &RegtestMessage::LAYOUT);
-    properties.extend(sender_properties("header-sync", &RegtestMessage::LAYOUT));
-    RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
-/// Runs `scenario` under `plan` with the table checker and `extra`, and
-/// returns the report, even of a run that ended in a harness failure, with
-/// its records and the ports.
+/// Runs `scenario` under `plan` with `extra`, and returns the report, even
+/// of a run that ended in a harness failure, with its records and the
+/// ports.
 fn run_with(
     scenario: &WireScenario,
     plan: PlanInput,
     extra: &mut dyn Checker,
 ) -> (RunReport, Vec<String>, WirePorts) {
     let ports = HeaderWire::prepare(scenario);
-    let mut table = table_checker();
     let mut sink = MemorySink::default();
-    let ran = run_prepared::<HeaderWire>(
-        scenario,
-        ports.clone(),
-        plan,
-        &mut sink,
-        Some(&mut Pair(&mut table, extra)),
-    );
+    let ran = run_prepared::<HeaderWire>(scenario, ports.clone(), plan, &mut sink, Some(extra));
     let report = match ran {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,
@@ -807,9 +773,8 @@ fn committed(plan: SavedPlan) -> (Vec<u8>, String) {
 }
 
 /// Runs a committed input as `zakura-sim record --input` does: its prefix
-/// picks the scenario, and the rest is the Plan. Checks the table's
-/// properties beside the harness's, and returns the report with its end
-/// record's line.
+/// picks the scenario, and the rest is the Plan. Returns the report with
+/// its end record's line.
 fn replay(input: &[u8]) -> (RunReport, String, WirePorts) {
     let (prefix, plan) = input.split_at(HeaderWire::SCENARIO_BYTES);
     let scenario = HeaderWire::draw(prefix);
@@ -829,11 +794,10 @@ fn judging(label: Label, row: &str) -> String {
 
 /// Each saved Plan, committed under `tests/fixtures/header-wire-*.bin`
 /// with its sidecar, replays to its pinned end record,
-/// `header-wire-*.end.json`, with the table's properties checked beside
-/// the harness's. Its prefix picks the saved scenario. The honest sync
-/// reaches the 120-header tip with `conformant-never-closes` held, and each
-/// act's frame gets its label with the matching `<label>-closes` held,
-/// applied. No run fails.
+/// `header-wire-*.end.json`. Its prefix picks the saved scenario. The
+/// honest sync reaches the 120-header tip with `conformant-never-closes`
+/// and `session/honest-never-punished` held, and each act's frame gets its
+/// label with the matching `<label>-closes` held, applied. No run fails.
 ///
 /// This fails if a saved Plan's end record changes. After a deliberate
 /// change, regenerate them with `regenerate_saved_plans`.
@@ -877,6 +841,7 @@ fn saved_plans_replay_their_end_records() {
         match plan {
             SavedPlan::HonestSync => {
                 held(NEVER_CLOSES);
+                held(HONEST_NEVER_PUNISHED);
                 assert_eq!(ports.selected_tip(), Chain::main(120).tip(&ports.fixture));
             }
             SavedPlan::Act(act) => {

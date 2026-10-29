@@ -18,8 +18,9 @@ Usage:
       [--sim header-sync/wire] [--fixtures <glob>]
       [--work-dir <dir>] [--cargo <cargo>]
 
-Exit status: 0 when every trace's choices match, 1 when any differ, 2 when
-the glob matches no fixture, and 3 when a command fails.
+Exit status: 0 when every trace's choices match; 1 when any differ, a run
+ends in a harness failure, or a base fixture is missing from head; 2 when
+the glob matches no fixture; 3 when a command fails.
 """
 
 import argparse
@@ -55,8 +56,25 @@ def choices(lines):
     return out
 
 
+def end_outcome(lines):
+    """The outcome a trace's `end` record names, or None when it has none."""
+    for line in reversed(lines):
+        if line.strip():
+            record = json.loads(line)
+            return record["end"].get("outcome") if "end" in record else None
+    return None
+
+
 def compare_traces(base_lines, head_lines):
-    """None when two traces' choices match, else a description of the first difference."""
+    """None when two traces' choices match, else a description of the first difference.
+
+    A trace without an `end` record, or whose run ended in a harness
+    failure, fails too, since its choices stop short of a whole run.
+    """
+    for side, lines in (("base", base_lines), ("head", head_lines)):
+        outcome = end_outcome(lines)
+        if outcome is None or outcome == "harness":
+            return "%s run %s" % (side, "has no end record" if outcome is None else "ended in a harness failure")
     base, head = choices(base_lines), choices(head_lines)
     for index, (b, h) in enumerate(zip(base, head)):
         if b != h:
@@ -66,6 +84,19 @@ def compare_traces(base_lines, head_lines):
     if len(base) != len(head):
         return "base has %d choice records, head %d" % (len(base), len(head))
     return None
+
+
+def find_fixtures(base_tree, head_tree, pattern):
+    """The head's fixtures matching `pattern`, and the names of base fixtures head lacks.
+
+    Removing a fixture would quietly shrink what the gate checks, so a
+    fixture only base has is reported as missing.
+    """
+    head = sorted(head_tree.glob(pattern))
+    names = {path.relative_to(head_tree) for path in head}
+    missing = sorted(str(path.relative_to(base_tree)) for path in base_tree.glob(pattern)
+                     if path.relative_to(base_tree) not in names)
+    return head, missing
 
 
 def build_sim(cargo, tree, target):
@@ -109,10 +140,13 @@ def main(argv=None):
         base, head = rw.resolve(repo, args.base), rw.resolve(repo, args.head)
         print("base %s, head %s" % (base, head), flush=True)
         with rw.Worktrees(repo, base, head, args.work_dir) as trees:
-            fixtures = sorted(trees.tree("head").glob(args.fixtures))
+            fixtures, missing = find_fixtures(trees.tree("base"), trees.tree("head"), args.fixtures)
             if not fixtures:
                 print("error: %s matches no fixture" % args.fixtures, file=sys.stderr)
                 return EXIT_NO_FIXTURES
+            for name in missing:
+                print("%s: only in base" % name)
+                status = EXIT_DIFFERS
             binaries = {side: build_sim(args.cargo, trees.tree(side), trees.target(side))
                         for side in ("base", "head")}
             for fixture in fixtures:

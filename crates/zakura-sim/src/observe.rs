@@ -505,8 +505,13 @@ pub enum EmittedBody {
         seq: u64,
         /// Its message type.
         message_type: u16,
+        /// Its flags.
+        flags: u16,
         /// Its payload's length in bytes.
         payload: u64,
+        /// The first 8 bytes of SHA-256 over its payload, in hex, so two
+        /// frames of one type and length stay apart.
+        digest: String,
     },
     /// The peer's task handled the node's frame `seq`, which its reader
     /// had received.

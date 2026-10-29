@@ -33,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule};
 
 use super::{
@@ -140,11 +141,17 @@ impl PeerRecord {
                 seq,
                 message_type,
                 payload,
+                frame,
                 ..
             } => EmittedBody::Received {
                 seq: *seq,
                 message_type: *message_type,
+                flags: frame.flags,
                 payload: *payload,
+                digest: Sha256::digest(&frame.payload)[..8]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
             },
             RecordBody::Handled { seq } => EmittedBody::Handled { seq: *seq },
             RecordBody::ConnEnded { reason } => EmittedBody::ConnEnded {

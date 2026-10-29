@@ -651,24 +651,64 @@ fn a_reset_reaches_the_reader_without_a_write() {
 
 /// A frame the peer's reader finished is received at the read's boundary,
 /// with the frame it read, even when the peer's task handles it in a later
-/// step. The history where the connection closes before the task handles
-/// it isn't reached by any saved Plan or script, so this covers the later
-/// handling only.
+/// step: its `peer-emitted` receipt holds the frame's flags and payload
+/// digest, and the stream is admitted already, so its one `peer-received`
+/// and one `node-frame` resolve in the receipt's own step, naming it. The
+/// history where the connection closes before the task handles it isn't
+/// reached by any saved Plan or script, so this covers the later handling
+/// only.
 #[test]
 fn a_received_frame_keeps_its_read_boundary() {
     let (report, _) = run::<HeaderWire>(&honest(Vec::new()), Plan::from_fuzz(&[]), &mut NoChecks);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     let entries = report.log.entries();
     let mut later = 0;
+    let mut digests = std::collections::BTreeMap::new();
     for (at, entry) in entries.iter().enumerate() {
         let Observation::PeerEmitted {
             remote,
             quic_stream,
-            body: EmittedBody::Received { seq, .. },
+            body:
+                EmittedBody::Received {
+                    seq,
+                    message_type,
+                    payload,
+                    digest,
+                    ..
+                },
         } = &entry.obs
         else {
             continue;
         };
+        assert_eq!(digest.len(), 16, "the receipt holds its payload's digest");
+        digests
+            .entry((*message_type, *payload))
+            .or_insert_with(std::collections::BTreeSet::new)
+            .insert(digest.clone());
+        let resolved: Vec<&Entry> = entries
+            .iter()
+            .filter(|row| row.origin == Some(entry.pos))
+            .collect();
+        assert!(
+            matches!(
+                resolved[..],
+                [
+                    Entry {
+                        obs: Observation::PeerReceived { seq: s, .. },
+                        ..
+                    },
+                    Entry {
+                        obs: Observation::NodeFrame { seq: n, .. },
+                        ..
+                    },
+                ] if s == seq && n == seq
+            ),
+            "frame {seq}: {resolved:?}"
+        );
+        assert!(
+            resolved.iter().all(|row| row.step == entry.step),
+            "frame {seq} resolves at its read"
+        );
         let handled = entries[at..]
             .iter()
             .find(|later| {
@@ -677,18 +717,11 @@ fn a_received_frame_keeps_its_read_boundary() {
                 } if (r, q, s) == (remote, quic_stream, seq))
             })
             .expect("the peer's task handles every frame in this run");
-        let resolved = entries
-            .iter()
-            .find(|row| {
-                matches!(row.obs, Observation::PeerReceived { seq: s, .. } if s == *seq)
-                    && row.origin == Some(entry.pos)
-            })
-            .expect("the receipt resolves");
-        assert!(
-            resolved.pos <= handled.pos,
-            "the receipt resolves before it's handled"
-        );
         later += usize::from(handled.step > entry.step);
     }
     assert!(later > 0, "no frame was handled after its read's step");
+    assert!(
+        digests.values().any(|seen| seen.len() > 1),
+        "two frames of one type and length have different digests"
+    );
 }

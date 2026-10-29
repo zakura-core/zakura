@@ -128,9 +128,12 @@ impl FramedRecv {
             precheck.start();
         }
         match &mut self.receiver {
+            // The release arm stays a bare expression, so its build is unchanged.
+            #[cfg(not(any(test, zakura_sim)))]
+            FramedReceiver::Plain(receiver) => receiver.try_recv(),
+            #[cfg(any(test, zakura_sim))]
             FramedReceiver::Plain(receiver) => {
                 let frame = receiver.try_recv();
-                #[cfg(any(test, zakura_sim))]
                 if frame.is_ok() {
                     self.take_tag();
                 }
@@ -152,9 +155,12 @@ impl FramedRecv {
             precheck.start();
         }
         match &mut self.receiver {
+            // As in `try_recv`, the release arm is unchanged.
+            #[cfg(not(any(test, zakura_sim)))]
+            FramedReceiver::Plain(receiver) => receiver.recv().await,
+            #[cfg(any(test, zakura_sim))]
             FramedReceiver::Plain(receiver) => {
                 let frame = receiver.recv().await;
-                #[cfg(any(test, zakura_sim))]
                 if frame.is_some() {
                     self.take_tag();
                 }

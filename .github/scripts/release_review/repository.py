@@ -22,6 +22,12 @@ BASE_MARKER = re.compile(r"<!-- release-review-base: (.*?) -->")
 MAX_BLOB = 2_000_000
 
 
+def base_environment() -> dict[str, str]:
+    """Forward only process basics to Git, never tokens or inherited Git settings."""
+    return {key: value for key, value in os.environ.items()
+            if key in {"PATH", "HOME", "SYSTEMROOT", "TMPDIR"}}
+
+
 @dataclass(frozen=True)
 class ReviewUnit:
     id: str
@@ -56,8 +62,7 @@ class Repository:
     def git(self, *args: str, allowed: tuple[int, ...] = (0,),
             max_bytes: int = 8_000_000, truncate: bool = False) -> bytes:
         """Run a fixed Git read command with hooks, pagers, and external diffs disabled."""
-        env = {key: value for key, value in os.environ.items()
-               if key in {"PATH", "HOME", "SYSTEMROOT", "TMPDIR"}}
+        env = base_environment()
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                    GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat", LC_ALL="C")
         try:
@@ -180,8 +185,7 @@ class Repository:
         lines = self.review_text(revision, path).splitlines()
         if start > len(lines):
             raise ReviewError("requested source line does not exist")
-        selected = "\n".join(f"{index + 1}: {line}" for index, line in enumerate(lines)
-                             if start <= index + 1 <= end)
+        selected = "\n".join(f"{number}: {line}" for number, line in enumerate(lines[start - 1:end], start))
         return {"revision": revision, "path": path, "text": selected[:20000],
                 "representation": "structured binary" if path in ASSET_PATHS else "UTF-8 source",
                 "truncated": len(selected) > 20000 or end > len(lines)}
@@ -202,13 +206,11 @@ class Repository:
         sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
                    for revision in ("base", "head")}
         if path in ASSET_PATHS:
-            patch = "".join(difflib.unified_diff(
+            return "".join(difflib.unified_diff(
                 sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
                 fromfile="base/" + path, tofile="head/" + path, n=12))
-        else:
-            patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                             "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
-        return patch
+        return self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                        "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
 
     def units(self, limit: int, excluded_paths: tuple[str, ...] = ()) -> tuple[list[ReviewUnit], list[dict]]:
         paths = self.git("diff", "--name-only", "-z", "--no-renames", self.refs["base"], self.refs["head"])

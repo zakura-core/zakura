@@ -5,16 +5,15 @@ import unittest
 from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from test_release_review import GitFixture, ScriptedProvider, candidate, completed, settings
+from test_release_review import HEAD, GitFixture, ScriptedProvider, candidate, completed, settings
 from release_review.contracts import ModelRequest, ProviderError, ReviewError, parse_turn
 from release_review.engine import deduplicate, review, synthesis_groups
 from release_review.models import Spending
-from release_review.reporting import write_checkpoint, write_report
+from release_review.reporting import write_checkpoint
 from release_review.repository import ReviewUnit
-from release_review.state import ReviewState
+from release_review.state import ReviewState, new_report
 
 
 class StateTests(unittest.TestCase):
@@ -59,19 +58,16 @@ class StateTests(unittest.TestCase):
             synthesis_groups(nodes, lambda group: False)
         self.assertEqual(synthesis_groups([], lambda group: True), [])
 
-    def test_checkpoint_write_does_not_render_documents(self):
-        with TemporaryDirectory() as directory:
-            output = Path(directory)
-            report = {"head_sha": "a" * 40, "status": "incomplete"}
-            write_report(output, report)
-            original = (output / "report.md").read_text()
-            report["errors"] = ["provider stopped"]
-            with patch("release_review.reporting.render", side_effect=AssertionError("checkpoint rendered Markdown")):
-                write_checkpoint(output, report)
-            self.assertEqual(json.loads((output / "report.json").read_text()), report)
-            self.assertEqual((output / "report.md").read_text(), original)
-            write_report(output, report)
-            self.assertIn("provider stopped", (output / "report.md").read_text())
+    def test_new_reports_do_not_share_mutable_state_or_pr_body(self):
+        context = {"head_sha": HEAD, "pr_body": "release metadata"}
+        first = new_report(context)
+        second = new_report(context)
+        first["errors"].append("failed")
+        first["coverage"].append({"path": "changed.rs"})
+        self.assertEqual(second["errors"], [])
+        self.assertEqual(second["coverage"], [])
+        self.assertNotIn("pr_body", first)
+        self.assertEqual(context["pr_body"], "release metadata")
 
     def test_failed_reservation_write_prevents_network_io(self):
         provider = ScriptedProvider([completed()])

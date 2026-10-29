@@ -12,6 +12,8 @@ from urllib.parse import quote
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from .contracts import SEVERITIES
+
 
 def plain(value: str) -> str:
     value = html.escape(str(value)).replace("@", "&#64;")
@@ -40,7 +42,6 @@ def template_context(report: dict) -> dict:
     """Compute shared display values once for both report layouts."""
     coverage = report.get("coverage", [])
     excluded = [entry for entry in coverage if entry["status"] == "out_of_scope"]
-    findings = report.get("findings", [])
     durations = [report.get("duration_seconds"),
                  *(entry.get("duration_seconds") for entry in report.get("resume_history", []))]
     known = [value for value in durations if type(value) in (int, float) and math.isfinite(value) and value >= 0]
@@ -48,14 +49,12 @@ def template_context(report: dict) -> dict:
     if report.get("repository") and report.get("base_sha"):
         diff_url = (f"https://github.com/{report['repository']}/compare/"
                     f"{quote(report['base_sha'], safe='')}...{quote(report['head_sha'], safe='')}")
-    finding_urls = []
-    for finding in findings:
+    findings = []
+    for finding in report.get("findings", []):
         ref = finding["reference"]
         sha = report["base_sha"] if ref["revision"] == "base" else report["head_sha"]
-        finding_urls.append(
-            f"https://github.com/{report['repository']}/blob/{sha}/{quote(ref['path'], safe='/')}"
-            f"#L{ref['start']}-L{ref['end']}"
-        )
+        findings.append(finding | {"url": f"https://github.com/{report['repository']}/blob/{sha}/"
+                                          f"{quote(ref['path'], safe='/')}#L{ref['start']}-L{ref['end']}"})
     return {
         "report": report,
         "complete": report.get("status") == "complete",
@@ -73,26 +72,24 @@ def template_context(report: dict) -> dict:
         "head_link": revision_link(report, "head_sha", report["head_sha"][:8]),
         "diff_url": diff_url,
         "findings": findings,
-        "finding_urls": finding_urls,
-        "finding_fields": (("Trigger", "trigger"), ("Impact", "impact"), ("Evidence", "explanation"),
-                           ("Connection to this release", "release_connection"), ("Suggested verification", "verification")),
-        "counts": " · ".join(f"{level}: {sum(f['severity'] == level for f in findings)}"
-                             for level in ("Critical", "High", "Medium")),
+        "counts": " · ".join(f"{level}: {sum(f['severity'] == level for f in findings)}" for level in SEVERITIES),
     }
+
+
+TEMPLATES = Environment(
+    loader=FileSystemLoader(Path(__file__).with_name("templates")),
+    undefined=StrictUndefined,
+    autoescape=False,  # Markdown uses plain(), not HTML autoescaping.
+    trim_blocks=True,
+    lstrip_blocks=True,
+    keep_trailing_newline=True,
+)
+TEMPLATES.filters.update(plain=plain, money=money)
 
 
 def render(report: dict, *, comment: bool = False) -> str:
     """Render trusted templates with explicit escaping for model-authored text."""
-    environment = Environment(
-        loader=FileSystemLoader(Path(__file__).with_name("templates")),
-        undefined=StrictUndefined,
-        autoescape=False,  # Markdown uses plain(), not HTML autoescaping.
-        trim_blocks=True,
-        lstrip_blocks=True,
-        keep_trailing_newline=True,
-    )
-    environment.filters.update(plain=plain, money=money)
-    template = environment.get_template("comment.md.jinja" if comment else "report.md.jinja")
+    template = TEMPLATES.get_template("comment.md.jinja" if comment else "report.md.jinja")
     text = template.render(**template_context(report), comment=comment)
     if comment and len(text) > 55000:
         text = text[:50000] + "\n\n**Comment abbreviated. See the full workflow report artifact.**\n"

@@ -9,7 +9,7 @@ from dataclasses import asdict
 
 from .checkpoints import contract_digest, restore
 from .config import Settings
-from .contracts import Finding, ModelProvider, ModelRequest, ModelTurn, ReviewError, parse_turn
+from .contracts import SEVERITIES, Finding, ModelProvider, ModelRequest, ModelTurn, ReviewError, parse_turn
 from .models import Spending
 from .repository import Repository, ReviewUnit
 from .state import ReviewState
@@ -46,14 +46,18 @@ def batch_units(units: list[ReviewUnit], limit: int):
         yield batch
 
 
+def opening_messages(settings: Settings, content: dict) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": settings.instructions},
+        {"role": "user", "content": json.dumps(content, ensure_ascii=False)},
+    ]
+
+
 def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
                  spending: Spending, content: dict, *, deadline: float,
                  persist_checkpoint: Callable[[], None]) -> ModelTurn:
     """Request evidence until the model finishes, subject to shared run safeguards."""
-    messages = [
-        {"role": "system", "content": settings.instructions},
-        {"role": "user", "content": json.dumps(content, ensure_ascii=False)},
-    ]
+    messages = opening_messages(settings, content)
     while True:
         if time.monotonic() >= deadline:
             raise ReviewError("review time budget exhausted")
@@ -80,14 +84,10 @@ def inspect_unit(repo: Repository, provider: ModelProvider, settings: Settings,
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
     """Collapse identical source/risk reports; retain distinct bugs at the same location."""
-    result, seen = [], set()
+    unique = {}
     for finding in findings:
-        key = (finding.category, finding.reference, finding.trigger)
-        if key not in seen:
-            result.append(finding)
-            seen.add(key)
-    order = {"Critical": 0, "High": 1, "Medium": 2}
-    return sorted(result, key=lambda finding: (order[finding.severity], finding.reference.path))
+        unique.setdefault((finding.category, finding.reference, finding.trigger), finding)
+    return sorted(unique.values(), key=lambda finding: (SEVERITIES.index(finding.severity), finding.reference.path))
 
 
 def synthesis_groups(nodes: list[dict], fits: Callable[[list[dict]], bool]) -> list[list[dict]]:
@@ -125,10 +125,7 @@ def synthesize(repo: Repository, provider: ModelProvider, settings: Settings,
         }
 
     def fits(group):
-        request = ModelRequest([
-            {"role": "system", "content": settings.instructions},
-            {"role": "user", "content": json.dumps(content(group), ensure_ascii=False)},
-        ], settings.max_output_tokens)
+        request = ModelRequest(opening_messages(settings, content(group)), settings.max_output_tokens)
         # Leave room for subsequent source requests and their results. Spending.call
         # still checks the full request before every actual provider call.
         return spending.input_bound(request) <= settings.max_input_bytes - min(20000, settings.max_input_bytes // 4)
@@ -155,10 +152,9 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
     """Review pending batches, synthesize their evidence, and persist each transition."""
     state = ReviewState()
     spending = Spending(settings)
-    report.update(state.snapshot())
     report.update(provider=settings.provider, model=settings.model,
                   reasoning_effort=settings.reasoning_effort if settings.provider == "openai" else "provider default",
-                  prompt_digest=settings.prompt_digest,
+                  prompt_digest=settings.prompt_digest, pricing=settings.pricing(),
                   excluded_paths=list(settings.excluded_paths),
                   usage=spending.report())
     deadline = time.monotonic() + settings.max_seconds

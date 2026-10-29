@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .contracts import ReviewError
+from .contracts import PROVIDERS, ReviewError
 from .scope import exclusion_paths
 
 
@@ -23,6 +23,12 @@ def positive_decimal(value, name: str) -> Decimal:
     if not number.is_finite() or number <= 0:
         raise ReviewError(f"{name} must be an explicit positive number")
     return number
+
+
+def bounded_int(value, low: int, high: int, message: str) -> int:
+    if type(value) is not int or not low <= value <= high:
+        raise ReviewError(message)
+    return value
 
 
 @dataclass(frozen=True)
@@ -43,10 +49,16 @@ class Settings:
     excluded_paths: tuple[str, ...] = ()
     cached_input_price: Decimal | None = None
 
+    def pricing(self) -> dict:
+        cached = self.cached_input_price
+        return {"input_usd_per_million": str(self.input_price),
+                "output_usd_per_million": str(self.output_price),
+                "cached_input_usd_per_million": None if cached is None else str(cached)}
+
 
 def load_settings(root: Path, provider: str, profile: str, models_json: str) -> Settings:
     """Read only the trusted control checkout; PR content cannot select an endpoint."""
-    if provider not in {"openai", "abliterated"}:
+    if provider not in PROVIDERS:
         raise ReviewError("unknown model provider")
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", profile):
         raise ReviewError("invalid prompt profile")
@@ -80,12 +92,10 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
         cached_price = positive_decimal(cached_price, "cached input price")
         if provider != "openai" or cached_price > input_price:
             raise ReviewError("cached input pricing requires OpenAI and cannot exceed the input price")
-    max_input = model.get("max_input_bytes")
-    max_output = model.get("max_output_tokens", 4096)
-    if type(max_input) is not int or not 16000 <= max_input <= 500000:
-        raise ReviewError("configure max_input_bytes between 16000 and 500000 for this model")
-    if type(max_output) is not int or not 1024 <= max_output <= 32768:
-        raise ReviewError("max_output_tokens must be between 1024 and 32768")
+    max_input = bounded_int(model.get("max_input_bytes"), 16000, 500000,
+                            "configure max_input_bytes between 16000 and 500000 for this model")
+    max_output = bounded_int(model.get("max_output_tokens", 4096), 1024, 32768,
+                             "max_output_tokens must be between 1024 and 32768")
     effort = model.get("reasoning_effort", "medium")
     if effort not in {"none", "low", "medium", "high"}:
         raise ReviewError("reasoning_effort must be none, low, medium, or high")
@@ -104,11 +114,8 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
     budget = positive_decimal(limits["budget_usd"], "budget")
     if budget > 25:
         raise ReviewError("this workflow is authorized for at most $25 per run")
-    unit_bytes = limits["unit_bytes"]
-    seconds = limits["max_seconds"]
-    if (type(unit_bytes) is not int or not 1000 <= unit_bytes <= 48000
-            or type(seconds) is not int or not 60 <= seconds <= 10800):
-        raise ReviewError("invalid review work limits")
+    unit_bytes = bounded_int(limits["unit_bytes"], 1000, 48000, "invalid review work limits")
+    seconds = bounded_int(limits["max_seconds"], 60, 10800, "invalid review work limits")
     return Settings(
         provider=provider,
         model=name,

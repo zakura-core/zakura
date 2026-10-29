@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation
@@ -51,11 +50,10 @@ def restore_spending(usage: dict, settings) -> Spending:
         raise ReviewError("checkpoint has invalid billing information") from None
     counts = {key: usage.get(key) for key in ("input_tokens", "output_tokens", "calls", "uncertain_calls")}
     counts["cached_input_tokens"] = usage.get("cached_input_tokens", 0)
-    if not charged.is_finite() or not 0 <= charged <= settings.budget or budget != settings.budget:
-        raise ReviewError("checkpoint has invalid billing information")
-    if any(type(value) is not int or value < 0 for value in counts.values()):
-        raise ReviewError("checkpoint has invalid billing information")
-    if counts["uncertain_calls"] > counts["calls"] or counts["cached_input_tokens"] > counts["input_tokens"]:
+    if (not charged.is_finite() or not 0 <= charged <= settings.budget or budget != settings.budget
+            or any(type(value) is not int or value < 0 for value in counts.values())
+            or counts["uncertain_calls"] > counts["calls"]
+            or counts["cached_input_tokens"] > counts["input_tokens"]):
         raise ReviewError("checkpoint has invalid billing information")
     spending = Spending(settings, charged=charged, **counts)
     if spending.price(counts["input_tokens"], counts["output_tokens"], counts["cached_input_tokens"]) > charged:
@@ -68,17 +66,12 @@ def restore_completed_units(summaries: list[dict], units) -> set[str]:
     known = {unit.id: unit.path for unit in units}
     completed = set()
     for summary in summaries:
-        if not isinstance(summary, dict) or not isinstance(summary.get("summary"), str):
-            raise ReviewError("checkpoint contains invalid or duplicated completed units")
-        batch = summary.get("units")
-        if not isinstance(batch, list) or not batch:
-            raise ReviewError("checkpoint contains invalid or duplicated completed units")
-        if any(not isinstance(unit, str) or unit not in known or unit in completed for unit in batch):
-            raise ReviewError("checkpoint contains invalid or duplicated completed units")
-        if len(set(batch)) != len(batch):
-            raise ReviewError("checkpoint contains invalid or duplicated completed units")
-        expected_paths = list(dict.fromkeys(known[unit] for unit in batch))
-        if summary.get("paths") != expected_paths:
+        batch = summary.get("units") if isinstance(summary, dict) else None
+        # Each check guards the next: batch entries are known strings before path lookup.
+        if (not isinstance(batch, list) or not batch or not isinstance(summary.get("summary"), str)
+                or any(not isinstance(unit, str) or unit not in known or unit in completed for unit in batch)
+                or len(set(batch)) != len(batch)
+                or summary.get("paths") != list(dict.fromkeys(known[unit] for unit in batch))):
             raise ReviewError("checkpoint contains invalid or duplicated completed units")
         completed.update(batch)
     return completed
@@ -104,11 +97,12 @@ def restore(prior: dict, report: dict, state: ReviewState, repo, settings, units
         finding = Finding.from_validated(value)
         repo.validate_finding(finding, changed)
         findings.append(finding)
-    state.summaries = copy.deepcopy(summaries)
+    # Review never mutates the prior report, so restored state can share its entries.
+    state.summaries = list(summaries)
     state.candidates = findings
     state.completed = completed
     state.update_coverage()
-    state.resume_history = copy.deepcopy(history) + [{
+    state.resume_history = [*history, {
         "control_sha": prior.get("control_sha"), "errors": prior.get("errors", []),
         "duration_seconds": prior.get("duration_seconds"), "usage": usage,
         "completed_units": len(completed),

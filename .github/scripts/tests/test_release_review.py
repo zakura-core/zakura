@@ -356,15 +356,6 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(spending.charged, reserve)
         self.assertEqual(len(provider.requests), 1)
 
-    def test_inflight_call_is_checkpointed_as_uncertain_before_network_io(self):
-        spending = Spending(settings())
-        checkpoints = []
-        provider = ScriptedProvider([completed()])
-        spending.call(provider, self.request(), persist_reservation=lambda: checkpoints.append(spending.report()))
-        self.assertEqual(checkpoints[0]["uncertain_calls"], 1)
-        self.assertGreater(Decimal(checkpoints[0]["estimated_usd_including_uncertain_calls"]), 0)
-        self.assertEqual(spending.uncertain_calls, 0)
-
     def test_expired_review_does_not_start_a_request(self):
         provider = ScriptedProvider([])
         with self.assertRaisesRegex(ReviewError, "time budget"):

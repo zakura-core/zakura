@@ -11,9 +11,11 @@ Final findings are not available until the review finishes.
 {% for finding in findings %}
 ### {{ loop.index }}. {{ finding.severity }}: {{ finding.title | plain }}
 
-[{{ finding.reference.path | plain }}:{{ finding.reference.start }}]({{ finding_urls[loop.index0] }}) · {{ finding.category }} · supported by source evidence
+[{{ finding.reference.path | plain }}:{{ finding.reference.start }}]({{ finding.url }}) · {{ finding.category }} · supported by source evidence
 
-{% for label, key in finding_fields %}
+{% for label, key in [('Trigger', 'trigger'), ('Impact', 'impact'), ('Evidence', 'explanation'),
+                      ('Connection to this release', 'release_connection'),
+                      ('Suggested verification', 'verification')] %}
 {{ '- ' if comment else '' }}**{{ label }}:** {{ finding[key] | plain }}
 {% endfor %}
 

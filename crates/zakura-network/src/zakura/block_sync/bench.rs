@@ -39,8 +39,8 @@ use super::{
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
-        handoff_resident_decoded_bytes, initial_view, SequencedBody, SequencerControlInput,
-        SequencerTask, SequencerView,
+        charge_decoded_handoff, initial_view, SequencedBody, SequencerControlInput, SequencerTask,
+        SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
     trace::{height as trace_height, BlockTraceEvent},
@@ -262,16 +262,18 @@ impl BenchBodyFeeder {
             .expect("a chain block encodes within the block-sync message limits")
             .into();
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        let charged = charge_decoded_handoff(
+            &self.body_input_decoded_attributed_memory_bytes,
+            &self.view,
+            decoded_attributed_memory_size_bytes,
+        );
         let body = BufferedBlockBody::for_handoff(
             block,
             raw_frame_payload,
             decoded_attributed_memory_size_bytes,
-            handoff_resident_decoded_bytes(
-                &self.body_input_decoded_attributed_memory_bytes,
-                &self.view,
-            ),
+            charged,
         );
-        let body = SequencedBody::new_queued(
+        let body = SequencedBody::new_handed_off(
             self.owner,
             self.source,
             height,

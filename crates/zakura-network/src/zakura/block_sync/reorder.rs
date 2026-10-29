@@ -320,9 +320,9 @@ impl BufferedBlockBody {
 
     /// The body a peer routine hands the sequencer for `block`, which it
     /// decoded from `raw_frame_payload`. The body keeps the decoded block only
-    /// while the decoded budget has room for it: `resident_decoded_bytes`, the
-    /// decoded bytes the input queue and `applying` hold, plus the block's
-    /// measured size fit under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
+    /// when `charged`, that is when
+    /// [`charge_decoded_handoff`](super::sequencer_task::charge_decoded_handoff)
+    /// found room for it under [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`].
     /// Otherwise the body keeps the raw frame payload alone, and the sequencer
     /// decodes it when it submits it (#1522).
     ///
@@ -332,11 +332,9 @@ impl BufferedBlockBody {
         block: Arc<block::Block>,
         raw_frame_payload: Arc<[u8]>,
         decoded_attributed_memory_size_bytes: u64,
-        resident_decoded_bytes: u64,
+        charged: bool,
     ) -> Self {
-        if resident_decoded_bytes.saturating_add(decoded_attributed_memory_size_bytes)
-            <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-        {
+        if charged {
             BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
                 raw_frame_payload,

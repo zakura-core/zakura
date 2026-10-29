@@ -5912,6 +5912,37 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     task.abort();
 }
 
+/// v12 F-314: a raw body's decode estimate counts until `prepare_submit`
+/// replaces it with the measured size, so the sequencer task can publish the
+/// estimate before it decodes.
+#[test]
+fn a_raw_body_reports_its_decode_estimate_until_submitted() {
+    let blocks = fake_sequential_blocks(1);
+    let block = &blocks[0];
+    let mut sequencer = Sequencer::new(block::Height(0), 1);
+    sequencer.accept_buffered_body(
+        test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        block.hash(),
+        block.header.previous_block_hash,
+        BufferedBlockBody::RawFramePayload(raw_block_payload(block)),
+        100,
+        None,
+        peer(0),
+    );
+    let _ = sequencer.drain_ready_into_applying();
+
+    assert_eq!(
+        sequencer.submission_decode_charge_at(block::Height(1)),
+        100 * DESERIALIZED_MEM_FACTOR
+    );
+    sequencer
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    assert_eq!(sequencer.submission_decode_charge_at(block::Height(1)), 0);
+}
+
 #[test]
 fn sequencer_accept_body_rejects_at_or_below_floor() {
     let mut seq = test_sequencer(5, 4);

@@ -688,6 +688,15 @@ impl Sequencer {
             )
     }
 
+    /// Decoded bytes that submitting the unsubmitted body at `height` adds.
+    /// See [`Self::submission_decode_charge`].
+    pub(super) fn submission_decode_charge_at(&self, height: block::Height) -> u64 {
+        self.applying
+            .get(&height)
+            .filter(|applying| !applying.submitted)
+            .map_or(0, Self::submission_decode_charge)
+    }
+
     /// Decoded bytes that submitting `applying` adds: none when it is already
     /// decoded, otherwise the raw-body estimate.
     fn submission_decode_charge(applying: &ApplyingBlock) -> u64 {

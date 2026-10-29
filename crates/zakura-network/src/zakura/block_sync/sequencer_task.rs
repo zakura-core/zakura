@@ -60,26 +60,77 @@ pub(super) struct SequencedBody {
     queue_accounting: SequencerInputAccounting,
 }
 
-/// The decoded bytes the input queue and `applying` hold, which a handoff's
-/// room check reads (see [`BufferedBlockBody::for_handoff`]).
+/// Charges a handed-off body's `decoded_bytes` to the input queue when the
+/// queue, `applying` and the body fit under
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], and returns whether it did.
+///
+/// The charge comes before the check, so routines that hand off at once each
+/// count the others' bodies, and no two take the same room. A routine whose
+/// check fails takes its charge back, and its body keeps only raw bytes.
 ///
 /// The sequencer task publishes a body's decoded bytes in `applying` before it
-/// releases the body's input-queue charge. So reading the queue first never
-/// misses a body that moves between the two. Routines that check at once can
-/// each see the same room, so the queue can pass the cap by one body per
-/// routine.
-pub(super) fn handoff_resident_decoded_bytes(
+/// releases the body's input-queue charge, so a body that moves between the
+/// two is always counted.
+pub(super) fn charge_decoded_handoff(
     input_decoded_attributed_memory_bytes: &AtomicU64,
     view: &watch::Receiver<SequencerView>,
-) -> u64 {
-    input_decoded_attributed_memory_bytes
-        .load(Ordering::Acquire)
-        .saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+    decoded_bytes: u64,
+) -> bool {
+    let queued = input_decoded_attributed_memory_bytes
+        .fetch_add(decoded_bytes, Ordering::AcqRel)
+        .saturating_add(decoded_bytes);
+    if queued.saturating_add(view.borrow().applying_decoded_attributed_memory_bytes)
+        <= BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+    {
+        return true;
+    }
+    release_atomic_bytes(input_decoded_attributed_memory_bytes, decoded_bytes);
+    false
 }
 
 impl SequencedBody {
+    /// Queue `body`, charging its wire bytes and decoded bytes to the input
+    /// queue.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous_block_hash: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        admitted_estimate_bytes: Option<u64>,
+        peer: ZakuraPeerId,
+        received_at: Instant,
+        input_bytes: Arc<AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        add_atomic_bytes(
+            &input_decoded_attributed_memory_bytes,
+            body.decoded_attributed_memory_size_bytes(),
+        );
+        Self::new_handed_off(
+            owner,
+            source,
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            admitted_estimate_bytes,
+            peer,
+            received_at,
+            input_bytes,
+            input_decoded_attributed_memory_bytes,
+        )
+    }
+
+    /// Queue `body`, whose decoded bytes [`charge_decoded_handoff`] already
+    /// charged to the input queue, and charge its wire bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_handed_off(
         owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         height: block::Height,
@@ -148,6 +199,9 @@ struct SequencerInputAccounting {
 }
 
 impl SequencerInputAccounting {
+    /// Charge `bytes` to the input queue's wire counter, and take over the
+    /// `decoded_attributed_memory_size_bytes` the caller already charged to its
+    /// decoded counter.
     fn new(
         input_bytes: Arc<AtomicU64>,
         bytes: u64,
@@ -158,10 +212,6 @@ impl SequencerInputAccounting {
         // Gauge increments commute, so concurrent charges and releases leave the
         // gauge equal to the counter. This lossy cast is metrics-only.
         metrics::gauge!("sync.block.sequencer_input.queued_bytes").increment(bytes as f64);
-        add_atomic_bytes(
-            &input_decoded_attributed_memory_bytes,
-            decoded_attributed_memory_size_bytes,
-        );
         Self {
             input_bytes,
             bytes,
@@ -1209,7 +1259,15 @@ impl SequencerTask {
             if !self.sequencer.submission_fits_decoded_window(height) {
                 break;
             }
+            // A raw body is resident twice while it decodes. Publish its
+            // estimate first, so a routine's handoff room check counts the
+            // decode before `applying` holds its measured size.
+            let decode_charge = self.sequencer.submission_decode_charge_at(height);
+            if decode_charge > 0 {
+                self.publish_decoded_ownership_view_with(decode_charge);
+            }
             let Some(item) = self.sequencer.prepare_submit(height) else {
+                self.publish_decoded_ownership_view();
                 continue;
             };
 
@@ -1435,13 +1493,21 @@ impl SequencerTask {
     }
 
     fn publish_decoded_ownership_view(&self) {
+        self.publish_decoded_ownership_view_with(0);
+    }
+
+    /// [`Self::publish_decoded_ownership_view`], with `decoding_bytes` added to
+    /// `applying` for a body about to be decoded.
+    fn publish_decoded_ownership_view_with(&self, decoding_bytes: u64) {
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
         let reorder_decoded_attributed_memory_bytes =
             self.sequencer.reorder_decoded_attributed_memory_bytes();
-        let applying_decoded_attributed_memory_bytes =
-            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes = self
+            .sequencer
+            .applying_decoded_attributed_memory_bytes()
+            .saturating_add(decoding_bytes);
         let active_pipeline_decoded_attributed_memory_bytes =
             sequencer_input_decoded_attributed_memory_bytes
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
@@ -2870,6 +2936,22 @@ mod tests {
         ));
 
         task.abort();
+    }
+
+    /// v12 F-313: two routines hand off at once into room for one body. The
+    /// second charge counts the first, so only one body keeps its decoded copy.
+    #[test]
+    fn simultaneous_handoffs_cannot_share_one_body_of_room() {
+        const BODY: u64 = 1_000;
+        let input_decoded = AtomicU64::new(0);
+        let mut view = initial_view(genesis_frontiers());
+        view.applying_decoded_attributed_memory_bytes =
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
+        let (_view_tx, view_rx) = watch::channel(view);
+
+        assert!(charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        assert!(!charge_decoded_handoff(&input_decoded, &view_rx, BODY));
+        assert_eq!(input_decoded.load(Ordering::Relaxed), BODY);
     }
 
     #[test]

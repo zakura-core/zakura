@@ -44,7 +44,7 @@ use super::{
     regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
-    sequencer_task::{handoff_resident_decoded_bytes, SequencedBody, SequencerView},
+    sequencer_task::{charge_decoded_handoff, SequencedBody, SequencerView},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, RequestKey,
         ThroughputMeter,
@@ -1622,14 +1622,6 @@ impl PeerRoutine {
         [timed, ending].into_iter().flatten().min()
     }
 
-    /// See [`handoff_resident_decoded_bytes`].
-    fn handoff_resident_decoded_bytes(&self) -> u64 {
-        handoff_resident_decoded_bytes(
-            &self.sequencer_input_decoded_attributed_memory_bytes,
-            &self.sequencer_view,
-        )
-    }
-
     /// Read the admission inputs and publish the above-floor reservation that
     /// admission compares with the look-ahead limit.
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
@@ -2196,21 +2188,15 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
-        let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::for_handoff(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-            self.handoff_resident_decoded_bytes(),
-        );
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(outstanding_owner, height, reserved_estimate);
         self.forward_body_to_sequencer(
             outstanding_owner,
             height,
             hash,
-            previous_block_hash,
-            body,
+            block,
+            raw_block_payload,
+            decoded_attributed_memory_size_bytes,
             serialized_bytes,
             Some(estimated_bytes),
             body_permit,
@@ -2290,15 +2276,29 @@ impl PeerRoutine {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         hash: block::Hash,
-        previous_block_hash: block::Hash,
-        body: BufferedBlockBody,
+        block: Arc<block::Block>,
+        raw_block_payload: Arc<[u8]>,
+        decoded_attributed_memory_size_bytes: u64,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
-        let body = SequencedBody::new_queued(
+        let previous_block_hash = block.header.previous_block_hash;
+        // The body owns the decoded charge from here, with no await between.
+        let charged = charge_decoded_handoff(
+            &self.sequencer_input_decoded_attributed_memory_bytes,
+            &self.sequencer_view,
+            decoded_attributed_memory_size_bytes,
+        );
+        let body = BufferedBlockBody::for_handoff(
+            block,
+            raw_block_payload,
+            decoded_attributed_memory_size_bytes,
+            charged,
+        );
+        let body = SequencedBody::new_handed_off(
             owner,
             self.source,
             height,
@@ -2490,21 +2490,15 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
-        let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::for_handoff(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-            self.handoff_resident_decoded_bytes(),
-        );
         #[cfg(any(test, zakura_sim))]
         self.observe_handoff_started(owner, height, ended_reservation);
         self.forward_body_to_sequencer(
             owner,
             height,
             hash,
-            previous_block_hash,
-            body,
+            block,
+            raw_block_payload,
+            decoded_attributed_memory_size_bytes,
             serialized_bytes,
             admitted_estimate_bytes,
             body_permit,

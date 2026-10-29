@@ -83,7 +83,7 @@ Edit `[scope].exclude_paths` in `.github/release-review/config.toml`:
 ```toml
 [scope]
 exclude_paths = [
-  ".github/workflows/", # Skip this directory and all descendants (enabled demo).
+  ".github/",          # Skip this directory and all descendants (enabled default).
   "docs/example.md",   # Skip exactly this file (optional example).
 ]
 ```
@@ -98,8 +98,9 @@ Changes take effect from the trusted reviewer revision on `main`.
 Matching diffs are omitted from model review requests. Related source remains
 available through read-only context tools, so this is a review-scope setting,
 not a confidentiality boundary. Findings must identify an included change.
-Every excluded file and its matching rule remain in the coverage manifest and
-are listed separately from unexpected coverage gaps. Reports record the rules
+Every excluded file and its matching rule remain in the JSON coverage manifest
+and full Markdown report, separately from unexpected coverage gaps. PR comments
+show only the excluded count, without listing rules or files. Reports record the rules
 and say when completion applies only to the configured scope. Excluding every
 changed file produces an incomplete report without making model calls.
 

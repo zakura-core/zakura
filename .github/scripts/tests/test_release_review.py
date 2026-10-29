@@ -669,7 +669,7 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertEqual(len(conf.prompt_digest), 64)
         self.assertIn("Do not invent measurements", conf.instructions)
         self.assertEqual(conf.budget, Decimal(25))
-        self.assertEqual(conf.excluded_paths, (".github/workflows/",))
+        self.assertEqual(conf.excluded_paths, (".github/",))
 
     def test_exclusions_reject_ambiguous_or_unsafe_configuration(self):
         for value in ("*.rs", [""], ["/"], ["/etc/passwd"], ["../file"], ["dir/../file"],
@@ -682,11 +682,15 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertEqual(exclusion_paths({}), ())
         self.assertEqual(exclusion_paths({"exclude_paths": ["file", "dir/", "file"]}), ("file", "dir/"))
 
-    def test_comment_bounds_exclusion_list_without_losing_full_artifact_coverage(self):
+    def test_comment_omits_exclusion_paths_but_preserves_counts_and_full_artifact(self):
         report = {"head_sha": HEAD, "status": "complete", "excluded_paths": ["docs/"],
                   "coverage": [{"path": f"docs/file-{i}.md", "status": "out_of_scope",
                                 "exclusion_rule": "docs/"} for i in range(25)]}
-        self.assertIn("5 additional excluded files", render(report, comment=True))
+        comment = render(report, comment=True)
+        self.assertIn("25 excluded by configuration", comment)
+        self.assertNotIn("Configured exclusions", comment)
+        self.assertNotIn("docs/", comment)
+        self.assertIn("Configured exclusions", render(report))
         self.assertIn("file\\-24", render(report))
 
     def test_model_prices_and_context_are_explicit(self):

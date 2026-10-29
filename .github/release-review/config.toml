@@ -6,7 +6,7 @@ max_seconds = 3300
 
 [scope]
 # Literal file paths, or directory paths ending in / (including descendants).
-exclude_paths = [".github/workflows/"]
+exclude_paths = [".github/"]
 
 [profiles.default]
 prompts = ["prompts/reviewer.md", "prompts/focus.md"]

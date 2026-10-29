@@ -30,7 +30,7 @@ def render(report: dict, *, comment: bool = False) -> str:
     lines.append(f"Coverage: {reviewed}/{len(coverage) - len(excluded)} in-scope changed files reviewed "
                  f"({len(coverage)} total changed files; {len(excluded)} excluded by configuration); "
                  f"cross-component synthesis {'completed' if report.get('synthesis_complete') else 'not completed'}.")
-    if report.get("excluded_paths"):
+    if not comment and report.get("excluded_paths"):
         lines.append("Configured exclusions: " + ", ".join(plain(path) for path in report["excluded_paths"]) + ".")
     if excluded:
         lines.append("Excluded changes were not reviewed. Completion applies only to the configured scope.")
@@ -58,12 +58,10 @@ def render(report: dict, *, comment: bool = False) -> str:
                            ("Connection to this release", "release_connection"), ("Suggested verification", "verification")):
             lines.append(f"**{label}:** {plain(finding[key])}")
         lines.append("")
-    if excluded:
+    if excluded and not comment:
         lines.extend(["", "### Configured exclusions", ""])
-        for entry in excluded[:20] if comment else excluded:
+        for entry in excluded:
             lines.append(f"- {plain(entry['path'])}: matched {plain(entry['exclusion_rule'])}")
-        if comment and len(excluded) > 20:
-            lines.append(f"- {len(excluded) - 20} additional excluded files are listed in the report artifact.")
     missing = [entry for entry in coverage if entry["status"] not in {"reviewed", "out_of_scope"}]
     if missing:
         lines.extend(["", "### Coverage gaps", ""])

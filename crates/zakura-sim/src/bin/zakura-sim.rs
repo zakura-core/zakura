@@ -54,7 +54,7 @@ mod cli {
     use zakura_sim::{
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
-        seed::{self, Failed, SeedReport},
+        seed::{self, Failed, SeedReport, Sidecar},
         trace::{self, shrink::REPORT_FILE, ReplayOptions, ShrinkBudget, TraceReader},
         witness::Expect,
     };
@@ -533,8 +533,8 @@ mod cli {
             report.other_harnesses
         );
         if let Some(path) = &flags.report {
-            let json = report_json(&report, flags.sim.as_deref(), &flags.fixtures);
-            write(path, format!("{json:#}\n").as_bytes())?;
+            let json = report_json(&report, flags.sim.as_deref(), &flags.fixtures)?;
+            write(path, json.as_bytes())?;
         }
         match report.rejected.len() {
             0 => Ok(()),
@@ -562,17 +562,46 @@ mod cli {
         )
     }
 
-    /// `report` as JSON: one row per seed, with its status, its sidecar and
+    /// `seeds --report`'s JSON.
+    #[derive(serde::Serialize)]
+    struct Report<'a> {
+        harness: Option<&'a str>,
+        fixtures: Vec<PathBuf>,
+        seeds: Vec<ReportRow<'a>>,
+        other_harnesses: usize,
+    }
+
+    /// One seed in [`Report`]: its status, its sidecar if it parsed, and
     /// either its full input's digest or its reason.
-    fn report_json(report: &SeedReport, sim: Option<&str>, fixtures: &[PathBuf]) -> Value {
+    #[derive(serde::Serialize)]
+    struct ReportRow<'a> {
+        file: PathBuf,
+        status: &'static str,
+        sidecar: Option<&'a Sidecar>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    }
+
+    /// `report` as JSON, one row per seed. It serializes structs rather than
+    /// a `Value`, so its key order doesn't depend on `serde_json`'s
+    /// `preserve_order`, and it gives paths in the repository relative to
+    /// the repository's root, so it doesn't depend on where the checkout is.
+    fn report_json(
+        report: &SeedReport,
+        sim: Option<&str>,
+        fixtures: &[PathBuf],
+    ) -> Result<String, Error> {
         let mut seeds = Vec::new();
         for seed in &report.admitted {
-            seeds.push(json!({
-                "file": seed.path,
-                "status": "admitted",
-                "sidecar": seed.sidecar,
-                "input_sha256": seed.input_sha256(),
-            }));
+            seeds.push(ReportRow {
+                file: from_root(&seed.path),
+                status: "admitted",
+                sidecar: Some(&seed.sidecar),
+                input_sha256: Some(seed.input_sha256()),
+                reason: None,
+            });
         }
         for (status, failed) in report
             .quarantined
@@ -580,19 +609,34 @@ mod cli {
             .map(|failed| ("quarantined", failed))
             .chain(report.rejected.iter().map(|failed| ("rejected", failed)))
         {
-            seeds.push(json!({
-                "file": failed.path,
-                "status": status,
-                "sidecar": failed.sidecar,
-                "reason": failed.error.to_string(),
-            }));
+            seeds.push(ReportRow {
+                file: from_root(&failed.path),
+                status,
+                sidecar: failed.sidecar.as_ref(),
+                input_sha256: None,
+                reason: Some(failed.error.to_string()),
+            });
         }
-        json!({
-            "harness": sim,
-            "fixtures": fixtures,
-            "seeds": seeds,
-            "other_harnesses": report.other_harnesses,
-        })
+        let report = Report {
+            harness: sim,
+            fixtures: fixtures.iter().map(|dir| from_root(dir)).collect(),
+            seeds,
+            other_harnesses: report.other_harnesses,
+        };
+        serde_json::to_string_pretty(&report)
+            .map(|json| json + "\n")
+            .map_err(|error| Error::Failed(format!("serializing the report: {error}")))
+    }
+
+    /// `path` relative to the repository's root if it's in the repository,
+    /// and as given if not.
+    fn from_root(path: &Path) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        path.canonicalize()
+            .ok()
+            .zip(root.canonicalize().ok())
+            .and_then(|(path, root)| path.strip_prefix(root).ok().map(Path::to_owned))
+            .unwrap_or_else(|| path.to_owned())
     }
 
     /// Creates `dir` and its parents.
@@ -601,10 +645,18 @@ mod cli {
             .map_err(|error| Error::Failed(format!("creating {}: {error}", dir.display())))
     }
 
-    /// Writes `bytes` to `path`.
+    /// Writes `bytes` to a temporary file beside `path`, then renames it
+    /// to `path`, so an interrupted write never leaves a partial file under
+    /// a seed's digest.
     fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-        std::fs::write(path, bytes)
-            .map_err(|error| Error::Failed(format!("writing {}: {error}", path.display())))
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let partial = path.with_file_name(format!(".{name}.{}.partial", std::process::id()));
+        std::fs::write(&partial, bytes)
+            .and_then(|()| std::fs::rename(&partial, path))
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&partial);
+                Error::Failed(format!("writing {}: {error}", path.display()))
+            })
     }
 
     /// Reads `record`'s flags. Each takes one value and may appear once.

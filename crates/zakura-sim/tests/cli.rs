@@ -336,7 +336,8 @@ fn versions_print_key_value_lines() {
 }
 
 /// `seeds --sim` writes each admitted seed's full fuzz input to `--out`,
-/// named by its SHA-256, and a JSON report.
+/// named by its SHA-256, and a JSON report that gives paths in the
+/// repository relative to its root.
 #[test]
 fn seeds_fill_a_corpus() {
     let dir = TempDir::new().unwrap();
@@ -365,6 +366,11 @@ fn seeds_fill_a_corpus() {
     assert_eq!(std::fs::read(out.join(&digest)).unwrap(), input);
     let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
     assert_eq!(report["seeds"][0]["status"], "admitted");
+    assert_eq!(
+        report["seeds"][0]["file"],
+        "crates/zakura-sim/tests/fixtures/discovery-wait-complete.bin"
+    );
+    assert_eq!(report["fixtures"][0], "crates/zakura-sim/tests/fixtures");
     assert_eq!(report["seeds"][0]["input_sha256"], digest);
     assert_eq!(
         report["seeds"][0]["sidecar"]["harness"],

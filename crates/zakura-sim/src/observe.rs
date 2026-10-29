@@ -24,6 +24,11 @@ pub enum Observation {
         task: String,
         /// The point, such as `lock#2`.
         at: String,
+        /// The runtime object the point touches, if the primitive reports
+        /// one, as `<creator>:object#<n>`: the creating task's name, or
+        /// `setup`, and the creator's `n`-th object.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
         /// The point's source location, as `file:line`.
         #[serde(skip_serializing_if = "Option::is_none")]
         site: Option<String>,

@@ -145,7 +145,12 @@ mod tests {
 
     /// A task resuming at its `n`-th point of kind `op`.
     fn at(op: Op, n: u32) -> At {
-        At { op, n, site: None }
+        At {
+            op,
+            n,
+            object: None,
+            site: None,
+        }
     }
 
     #[test]

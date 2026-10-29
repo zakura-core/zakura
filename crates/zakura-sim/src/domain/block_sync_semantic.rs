@@ -126,7 +126,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_detached_submission_bounded::<S>,
-            witness: Some(reset_while_storage_held),
+            witness: Some(reset_or_verdict_while_held),
         },
         Property {
             id: PropertyId::new(INPUT_DECODED_BOUND),
@@ -300,6 +300,9 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether a verdict reached block sync while a submission holder still
+    /// held its token.
+    pub saw_verdict_while_held: bool,
     /// Whether it did so while the decoded bytes storage held left no room
     /// under the decoded-byte target for another body of the same size.
     pub saw_reset_at_byte_target: bool,
@@ -678,7 +681,13 @@ impl SemanticModel {
             }
         }
         self.judge_stale(step, &changes);
-        self.completed_held.extend(&changes.delivered);
+        let submissions = &self.submissions;
+        let held = changes
+            .delivered
+            .iter()
+            .filter(|token| submissions.get(token).is_some_and(|held| *held != (0, 0)));
+        self.completed_held.extend(held);
+        self.saw_verdict_while_held |= !self.completed_held.is_empty();
         for token in &changes.emptied {
             if self.submissions.get(token) == Some(&(0, 0)) {
                 self.submissions.remove(token);
@@ -1118,9 +1127,12 @@ fn room_freed_past_the_frontier(log: &ObservationLog) -> bool {
 
 /// [`DETACHED_SUBMISSION_BOUNDED`]'s trigger history: the run reached a
 /// newer body-work epoch while storage held a submission from an older
-/// one, which the sequencer had to detach.
-fn reset_while_storage_held(log: &ObservationLog) -> bool {
-    SemanticModel::of(log).saw_reset_while_held
+/// one, which the sequencer had to detach, or a verdict reached block sync
+/// while a holder still held its submission, which the sequencer then had
+/// to release.
+fn reset_or_verdict_while_held(log: &ObservationLog) -> bool {
+    let model = SemanticModel::of(log);
+    model.saw_reset_while_held || model.saw_verdict_while_held
 }
 
 /// [`INPUT_DECODED_BOUND`]'s trigger history: virtual time advanced, which

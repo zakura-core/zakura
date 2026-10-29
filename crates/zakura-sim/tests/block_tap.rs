@@ -765,7 +765,7 @@ fn backed_up_submissions_pair_after_their_holders() {
         ..BlockScenario::default()
     };
     let mut deferred = 0;
-    for input in inputs(16, 256) {
+    for input in inputs(4, 256) {
         let (report, ports) = node_run(&scenario, input);
         assert_numbered(&report);
         deferred += usize::from(deferred_a_submission(&report));

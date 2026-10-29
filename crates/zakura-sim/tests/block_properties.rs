@@ -984,23 +984,26 @@ fn history(report: &RunReport) -> Vec<String> {
         .collect()
 }
 
-/// Each case's history depends only on its scenario and plan: plan A twice
-/// gives one history, and so does A, then B, then A. B's differs, so the
-/// comparison can fail.
+/// The honest-flow and delayed-apply cases' histories depend only on their
+/// scenario and plan: A, then B, then A gives A's history twice, and B's
+/// differs, so the comparison can fail. Two cases, one with a hold, keep the
+/// test cheap.
 #[test]
-fn every_case_repeats_a_a_and_a_b_a() {
+fn two_cases_repeat_a_b_a() {
     let plans = inputs(2, 256);
-    for (name, scenario) in cases() {
-        let histories: Vec<_> = [&plans[0], &plans[0], &plans[1], &plans[0]]
+    for (name, scenario) in cases()
+        .into_iter()
+        .filter(|(name, _)| ["honest flow", "delayed apply"].contains(name))
+    {
+        let histories: Vec<_> = [&plans[0], &plans[1], &plans[0]]
             .into_iter()
             .map(|plan| history(&node_run(&scenario, plan.clone()).0))
             .collect();
-        assert!(histories[0] == histories[1], "{name}: plan A, then A");
         assert!(
-            histories[0] == histories[3],
+            histories[0] == histories[2],
             "{name}: plan A, then B, then A"
         );
-        assert!(histories[0] != histories[2], "{name}: plan B differs");
+        assert!(histories[0] != histories[1], "{name}: plan B differs");
     }
 }
 

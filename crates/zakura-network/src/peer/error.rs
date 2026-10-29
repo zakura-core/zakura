@@ -17,7 +17,7 @@ use crate::{
 /// branch on the `notfound` kind without string-matching `Debug` output (which a variant rename
 /// would silently break, disabling the syncer's retry paths).
 #[derive(Debug, Clone)]
-pub struct SharedPeerError(Arc<PeerError>, NotFoundClass);
+pub struct SharedPeerError(Arc<PeerError>, NotFoundClass, bool);
 
 /// Typed classification of `notfound`-style peer errors, computed when a [`SharedPeerError`] is
 /// constructed (the only construction path is the `From` impl below, so this stays in sync with
@@ -57,11 +57,23 @@ where
             PeerError::NotFoundRegistry(_) => NotFoundClass::Registry,
             _ => NotFoundClass::Other,
         };
-        Self(Arc::new(inner), class)
+        let remote_failure = matches!(
+            inner,
+            PeerError::ConnectionReceiveTimeout
+                | PeerError::ConnectionClosed
+                | PeerError::DuplicateHandshake
+                | PeerError::NotFoundResponse(_)
+        );
+        Self(Arc::new(inner), class, remote_failure)
     }
 }
 
 impl SharedPeerError {
+    /// Reports remote response failures without attributing local overload or cancellation.
+    pub(crate) fn is_remote_response_failure(&self) -> bool {
+        self.2
+    }
+
     /// Returns a debug-formatted string describing the inner [`PeerError`].
     pub fn inner_debug(&self) -> String {
         format!("{:?}", self.0.as_ref())
@@ -369,5 +381,30 @@ mod tests {
             SharedPeerError::from(PeerError::NoReadyPeers).not_found_class(),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_failure_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_distinguishes_remote_deadlines_from_local_failures() {
+        for error in [
+            PeerError::ConnectionReceiveTimeout,
+            PeerError::ConnectionClosed,
+        ] {
+            assert!(SharedPeerError::from(error).is_remote_response_failure());
+        }
+        for error in [
+            PeerError::ConnectionDropped,
+            PeerError::ClientDropped,
+            PeerError::Overloaded,
+            PeerError::InboundTimeout,
+            PeerError::ServiceShutdown,
+            PeerError::ConnectionSendTimeout,
+        ] {
+            assert!(!SharedPeerError::from(error).is_remote_response_failure());
+        }
     }
 }

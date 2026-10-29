@@ -116,7 +116,7 @@ fn response_summary(response: &Response) -> (&'static str, u64, u64) {
                     .count(),
             ),
         ),
-        Response::BlockHashes(hashes) => ("BlockHashes", bounded_u64(hashes.len()), 0),
+        Response::BlockHashes { hashes, .. } => ("BlockHashes", bounded_u64(hashes.len()), 0),
         Response::BlockHeaders(headers) => ("BlockHeaders", bounded_u64(headers.len()), 0),
         Response::TransactionIds(ids) => ("TransactionIds", bounded_u64(ids.len()), 0),
         Response::Pong(_) => ("Pong", 1, 0),

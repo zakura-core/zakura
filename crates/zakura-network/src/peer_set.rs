@@ -17,3 +17,6 @@ pub(crate) use set::PeerSet;
 pub use initialize::init_with_zakura;
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use initialize::{init, init_with_zakura_header_sync};
+
+mod discovery_feedback;
+pub use discovery_feedback::DiscoveryFeedback;

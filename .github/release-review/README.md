@@ -104,6 +104,14 @@ show only the excluded count, without listing rules or files. Reports record the
 and say when completion applies only to the configured scope. Excluding every
 changed file produces an incomplete report without making model calls.
 
+The default scope also excludes simulation infrastructure, test helpers,
+standalone test/benchmark modules, QA, documentation, and deployment automation.
+These are explicit paths, including test module boundaries checked against their
+conditional compilation. Production module declarations, dependency manifests,
+and build/packaging code remain included. Inline tests are not stripped from
+production files. Add new test paths to the list when their boundaries are known;
+there is no blanket filename or extension filter.
+
 ## Interpret the result
 
 Every changed file is listed in the JSON coverage manifest. Text diffs are split
@@ -119,7 +127,16 @@ challenges candidates and examines cross-component interactions.
 Large sets of summaries are reduced in bounded groups before the final synthesis;
 every intermediate synthesis is retained in the JSON evidence.
 
-Binary files, symlinks, oversized sources or lines, unfinished units, invalid
+The embedded `mainnet-frontier.bin` and `mainnet-subtrees.bin` assets have
+lossless read-only text views covering every encoded field or tree byte.
+Their changes form bounded diff units and can be read at either pinned revision.
+The trusted reader checks framing and the subtree artifact's SHA-256 checksum;
+it does not execute reviewed Rust code, deserialize cryptographic trees, or
+authenticate the data against the chain. Findings cite the consuming Rust code
+or textual manifest rather than synthetic line numbers in a binary file.
+Malformed or unsupported formats remain coverage gaps.
+
+Other binary files, symlinks, oversized sources or lines, unfinished units, invalid
 responses, and an unfinished synthesis are explicit gaps. Filling the finding
 limit also makes the result incomplete, since more findings may be missing.
 An incomplete review fails the advisory workflow and says **INCOMPLETE** in its comment. No finding

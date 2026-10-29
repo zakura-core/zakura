@@ -34,6 +34,9 @@ def render(report: dict, *, comment: bool = False) -> str:
         lines.append("Configured exclusions: " + ", ".join(plain(path) for path in report["excluded_paths"]) + ".")
     if excluded:
         lines.append("Excluded changes were not reviewed. Completion applies only to the configured scope.")
+    if any(entry.get("representation") == "structured binary" for entry in coverage):
+        lines.append("Embedded state assets are reviewed through lossless field/byte diffs. "
+                     "Framing and the subtree checksum are checked; chain provenance and cryptographic roots are not authenticated.")
     usage = report.get("usage", {})
     lines.append(f"Estimated API cost, including uncertain requests: ${usage.get('estimated_usd_including_uncertain_calls', '0')} "
                  f"of ${usage.get('budget_usd', '25')}; {usage.get('calls', 0)} requests.")

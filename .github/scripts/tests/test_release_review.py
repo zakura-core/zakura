@@ -41,7 +41,7 @@ from release_review.models import (
 )
 from release_review.reporting import render, write_report
 from release_review.repository import Repository, ReviewUnit
-from release_review.scope import exclusion_paths
+from release_review.scope import exclusion_paths, matching_exclusion
 
 ROOT = Path(__file__).resolve().parents[2]
 HEAD = "b" * 40
@@ -669,7 +669,14 @@ class ConfigurationAndReportTests(unittest.TestCase):
         self.assertEqual(len(conf.prompt_digest), 64)
         self.assertIn("Do not invent measurements", conf.instructions)
         self.assertEqual(conf.budget, Decimal(25))
-        self.assertEqual(conf.excluded_paths, (".github/",))
+        for path in (".github/workflows/example.yml", "crates/zakura-sim/src/lib.rs",
+                     "crates/zakura-rt/src/sim/task.rs", "crates/zakura-consensus/src/block/tests.rs",
+                     "crates/zakurad/tests/acceptance.rs", "docs/specs/zakura-quic.md"):
+            self.assertIsNotNone(matching_exclusion(path, conf.excluded_paths))
+        for path in ("Cargo.lock", "crates/zakura-chain/Cargo.toml", "crates/zakura-rt/src/lib.rs",
+                     "crates/zakura-network/src/zakura/block_sync.rs", "crates/xtask/src/main.rs",
+                     "crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin"):
+            self.assertIsNone(matching_exclusion(path, conf.excluded_paths))
 
     def test_exclusions_reject_ambiguous_or_unsafe_configuration(self):
         for value in ("*.rs", [""], ["/"], ["/etc/passwd"], ["../file"], ["dir/../file"],

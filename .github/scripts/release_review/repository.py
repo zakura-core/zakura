@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .assets import ASSET_PATHS, asset_text
 from .contracts import ReviewError
 from .scope import matching_exclusion, safe_path
 
@@ -128,7 +130,8 @@ class Repository:
                 files[path.decode("utf-8", errors="replace")] = (mode, oid)
         return files
 
-    def source(self, revision: str, path: str) -> str:
+    def blob(self, revision: str, path: str) -> bytes:
+        """Read a bounded regular Git blob; never dereference a working-tree path."""
         if revision not in self.refs or not safe_path(path):
             raise ReviewError("invalid repository revision or path")
         entry = self.trees[revision].get(path)
@@ -137,7 +140,10 @@ class Repository:
         size = int(self.git("cat-file", "-s", entry[1]))
         if size > MAX_BLOB:
             raise ReviewError("requested source exceeds the two-megabyte read limit")
-        blob = self.git("cat-file", "blob", entry[1])
+        return self.git("cat-file", "blob", entry[1])
+
+    def source(self, revision: str, path: str) -> str:
+        blob = self.blob(revision, path)
         if b"\0" in blob:
             raise ReviewError("requested source is binary")
         try:
@@ -145,15 +151,22 @@ class Repository:
         except UnicodeError:
             raise ReviewError("requested source is not UTF-8 text") from None
 
+    def review_text(self, revision: str, path: str) -> str:
+        """Expose known embedded formats losslessly while other sources remain UTF-8."""
+        if path in ASSET_PATHS:
+            return asset_text(path, self.blob(revision, path))
+        return self.source(revision, path)
+
     def read(self, revision: str, path: str, start: int, end: int) -> dict:
         if type(start) is not int or type(end) is not int or start < 1 or end < start or end - start >= 200:
             raise ReviewError("source reads must request between one and 200 lines")
-        lines = self.source(revision, path).splitlines()
+        lines = self.review_text(revision, path).splitlines()
         if start > len(lines):
             raise ReviewError("requested source line does not exist")
         selected = "\n".join(f"{index + 1}: {line}" for index, line in enumerate(lines)
                              if start <= index + 1 <= end)
         return {"revision": revision, "path": path, "text": selected[:20000],
+                "representation": "structured binary" if path in ASSET_PATHS else "UTF-8 source",
                 "truncated": len(selected) > 20000 or end > len(lines)}
 
     def search(self, revision: str, query: str, path: str = "") -> dict:
@@ -184,11 +197,16 @@ class Repository:
                     entry.update(status="out_of_scope", reason="excluded by configuration",
                                  exclusion_rule=rule)
                     continue
-                for revision in ("base", "head"):
-                    if path in self.trees[revision]:
-                        self.source(revision, path)
-                patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                                 "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
+                sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
+                           for revision in ("base", "head")}
+                if path in ASSET_PATHS:
+                    entry["representation"] = "structured binary"
+                    patch = "".join(difflib.unified_diff(
+                        sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
+                        fromfile="base/" + path, tofile="head/" + path, n=12))
+                else:
+                    patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                                     "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
                 if len(patch.encode()) > 8_000_000:
                     raise ReviewError("file diff exceeds the eight-megabyte review limit")
                 chunks, current, size = [], [], 0

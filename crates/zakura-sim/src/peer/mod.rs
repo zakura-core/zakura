@@ -185,6 +185,19 @@ impl PeerSpec {
             ..PeerSpec::dialing()
         }
     }
+
+    /// True if the peer is `HonestPeer`: it runs the honest script, takes
+    /// no adversarial act, echoes the node's nonce rightly, and opens no
+    /// stream outside the honest script.
+    pub fn is_honest(&self) -> bool {
+        self.honest.is_some()
+            && self.adversary.is_none()
+            && !self.bad_nonce_echo
+            && !self
+                .script
+                .iter()
+                .any(|action| matches!(action, PeerAction::Open { .. }))
+    }
 }
 
 /// Something a scripted peer does on its connection when the `Plan` picks

@@ -6,7 +6,7 @@ use std::time::Duration;
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::framed_channel;
+use crate::zakura::{framed_channel, transport::worker_framed_channel};
 
 fn fence() -> (WriterFence, CancellationToken, CloseCause) {
     let connection = CancellationToken::new();
@@ -171,6 +171,42 @@ async fn a_fenced_send_writes_only_before_retirement() {
             exchange.end();
             assert!(fence.retire());
             assert!(!connection.is_cancelled());
+        }
+    }
+}
+
+/// A fenced request that fails to encode starts no exchange, so retiring its
+/// session leaves the connection up.
+#[tokio::test]
+async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
+    for encodes in [false, true] {
+        let (fence, connection, cause) = fence();
+        let (send, mut output) = worker_framed_channel(1);
+        let exchange = fence.open().unwrap();
+        let frame = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![7],
+        };
+        send.send_fenced(frame, &exchange.writer()).await.unwrap();
+        let queued = output.recv().await.unwrap();
+        let result = queued
+            .encode_and_write_with(
+                |frame| {
+                    if encodes {
+                        Ok(frame)
+                    } else {
+                        Err("does not fit")
+                    }
+                },
+                |_| async { Ok(()) },
+            )
+            .await;
+        assert_eq!(result.is_ok(), encodes);
+        assert_eq!(fence.retire(), !encodes);
+        assert_eq!(connection.is_cancelled(), encodes);
+        if encodes {
+            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
         }
     }
 }

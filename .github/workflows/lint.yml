@@ -26,6 +26,7 @@ on:
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
+      - ".github/release-review/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -52,6 +53,7 @@ on:
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
+      - ".github/release-review/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -214,6 +216,10 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check -r .github/workflows/scripts/requirements-ci-alerts.txt
           python3 .github/workflows/scripts/test_ci_alert.py
+
+      - name: Read-only release review tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

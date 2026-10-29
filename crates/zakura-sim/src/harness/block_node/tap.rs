@@ -108,6 +108,8 @@ struct TapState {
     /// The heights of each task's open handoffs, by the task that recorded
     /// each start.
     handoffs: Mutex<BTreeMap<TaskId, Vec<u32>>>,
+    /// The task that recorded the sequencer's ownership snapshots.
+    sequencer: Mutex<Option<TaskId>>,
 }
 
 /// Events recorded and not yet drained.
@@ -182,7 +184,7 @@ impl TapClock {
 }
 
 /// Which tasks are handing a body to the sequencer, by the tasks that
-/// recorded each handoff's start and end.
+/// recorded each handoff's start and end, and which task is the sequencer.
 #[derive(Clone)]
 pub struct TapHandoffs(Arc<TapState>);
 
@@ -197,6 +199,15 @@ impl TapHandoffs {
             .get(&task)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The sequencer's task, once it recorded an ownership snapshot.
+    pub fn sequencer(&self) -> Option<TaskId> {
+        *self
+            .0
+            .sequencer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -227,6 +238,12 @@ impl BlockSyncObserver for TapObserver {
             }
         };
         if let Some(task) = hooks::current_task() {
+            if matches!(event, BlockEvent::Sequencer(_)) {
+                *state
+                    .sequencer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(task);
+            }
             let mut handoffs = state
                 .handoffs
                 .lock()
@@ -286,6 +303,7 @@ impl BlockTap {
                 closed: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 handoffs: Mutex::default(),
+                sequencer: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -565,6 +583,7 @@ impl BlockTap {
                             bytes: submission.bytes,
                         },
                         token: submission.token,
+                        decoded_attributed_memory_bytes: submission.decoded_attributed_memory_bytes,
                         detached: submission.detached,
                     })
                     .collect(),
@@ -599,8 +618,12 @@ impl Allocations {
     /// `holder` of `body` in plain fields.
     fn holder(&mut self, holder: Holder, held: &HeldBody) -> BlockSyncHolder {
         match holder {
-            Holder::Queued { allocation } => BlockSyncHolder::Queued {
+            Holder::Queued {
+                allocation,
+                decoded_attributed_memory_bytes,
+            } => BlockSyncHolder::Queued {
                 allocation: self.number(allocation, *held),
+                decoded_attributed_memory_bytes,
             },
             Holder::Reorder { allocation } => BlockSyncHolder::Reorder {
                 allocation: self.number(allocation, *held),
@@ -624,6 +647,7 @@ impl Allocations {
             body: body(&held),
             admitted_estimate_bytes: retained.admitted_estimate_bytes,
             allocation: self.number(retained.allocation, held),
+            decoded_attributed_memory_bytes: retained.decoded_attributed_memory_bytes,
         }
     }
 }

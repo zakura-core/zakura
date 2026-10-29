@@ -364,6 +364,7 @@ mod tests {
                 bytes: held.bytes,
                 admitted_estimate_bytes: None,
                 allocation,
+                decoded_attributed_memory_bytes: 0,
             }],
             applying: Vec::new(),
             submissions: submitted
@@ -372,6 +373,7 @@ mod tests {
                     owner: held.owner,
                     token: 9,
                     bytes: held.bytes,
+                    decoded_attributed_memory_bytes: 0,
                     detached: false,
                 })
                 .into_iter()
@@ -414,7 +416,10 @@ mod tests {
     fn a_snapshot_must_match_the_holder_events() {
         let mut view = BlockSyncView::default();
         view.fold(&holder(
-            Holder::Queued { allocation: 1 },
+            Holder::Queued {
+                allocation: 1,
+                decoded_attributed_memory_bytes: 0,
+            },
             HolderChange::Retained,
         ));
         view.fold(&holder(

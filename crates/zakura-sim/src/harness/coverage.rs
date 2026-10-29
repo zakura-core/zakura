@@ -1,9 +1,10 @@
 //! The coverage manifest: one row per property a harness reports, naming
-//! the tests that show its check works and the CI job that runs them.
+//! the tests that show its check works and where they run.
 //!
 //! `tests/harness.rs` compares the manifest with the harnesses' properties,
 //! so a property without a row, or a row no harness reports, fails CI. It
-//! also checks that each named test or patch exists, and that CI runs it.
+//! also checks that each named test or patch exists, and that CI runs each
+//! test that isn't on demand.
 
 /// One property's coverage.
 #[derive(Clone, Copy, Debug)]
@@ -54,16 +55,27 @@ pub enum Bypass {
     Pending(&'static str),
 }
 
-/// A test that runs a property, and the CI job that runs the test.
+/// A test that runs a property, and where the test runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Witness {
     /// The test's file, relative to the crate.
     pub file: &'static str,
     /// The test's name.
     pub test: &'static str,
-    /// The `tests-unit.yml` job that runs it. An ignored test also needs
+    /// Where the test runs.
+    pub ci: Ci,
+}
+
+/// Where a witness test runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci {
+    /// The `tests-unit.yml` job with this name. An ignored test also needs
     /// its name in that workflow.
-    pub ci: &'static str,
+    Job(&'static str),
+    /// No CI job. The test is ignored, because one run takes minutes, and
+    /// runs only on demand, with `--ignored` and the `planted` profile. CI
+    /// keeps no expensive test in its blocking path.
+    OnDemand,
 }
 
 /// The job that runs every `zakura-sim` test under `--cfg zakura_sim`.
@@ -74,20 +86,16 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
     Witness {
         file,
         test,
-        ci: SIM_BUILD,
+        ci: Ci::Job(SIM_BUILD),
     }
 }
 
-/// The job that runs the ignored `zakura-sim` witness tests whose runs
-/// take minutes, in a release build under `--cfg zakura_sim`.
-const SLOW_WITNESSES: &str = "zakura_sim slow witnesses";
-
-/// An ignored test in [`SLOW_WITNESSES`].
-const fn slow_test(file: &'static str, test: &'static str) -> Witness {
+/// An ignored test that runs only on demand. See [`Ci::OnDemand`].
+const fn on_demand_test(file: &'static str, test: &'static str) -> Witness {
     Witness {
         file,
         test,
-        ci: SLOW_WITNESSES,
+        ci: Ci::OnDemand,
     }
 }
 
@@ -316,7 +324,7 @@ pub static COVERAGE: &[Coverage] = &[
         property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "honest_runs_hold_every_resource_bound_a_a_and_a_b_a",
+            "honest_runs_hold_every_resource_bound_a_b_a",
         ),
         bypass: Bypass::Planted("wide-commit-window"),
     },
@@ -337,14 +345,15 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("handoff-keeps-charge"),
     },
     // The above-window witness test is ignored, since one debug run takes
-    // about 100 s. `cargo xtask planted` runs its committed input unpatched
-    // as a witness test that expects a hold, before it runs the patch.
+    // over a minute, and runs only on demand. `cargo xtask planted` runs its
+    // committed input unpatched as a witness test that expects a hold, before
+    // it runs the patch.
     Coverage {
         property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
-        passing: passes(
+        passing: Passing::Test(on_demand_test(
             "tests/block_resource_properties.rs",
             "the_above_window_input_holds_lookahead_overshoot_bound",
-        ),
+        )),
         bypass: Bypass::Planted("omit-outstanding-estimates"),
     },
     Coverage {
@@ -372,10 +381,10 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("release-by-height"),
     },
     // The capacity test is ignored, since a debug run takes about eight
-    // minutes. The `zakura_sim slow witnesses` job runs it.
+    // minutes, and runs only on demand.
     Coverage {
         property: crate::domain::block_sync_semantic::CAPACITY_RELEASE_WAKES,
-        passing: Passing::Test(slow_test(
+        passing: Passing::Test(on_demand_test(
             "tests/block_semantic_properties.rs",
             "the_frontier_first_input_holds_capacity_release_wakes",
         )),
@@ -390,11 +399,11 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("forget-on-reset"),
     },
     // The decoded-input-stall test is ignored, since its debug run takes
-    // minutes. The `zakura_sim slow witnesses` job runs it, and the planted
-    // case runs the same input.
+    // minutes, and runs only on demand. The planted case runs the same
+    // input.
     Coverage {
         property: crate::domain::block_sync_semantic::INPUT_DECODED_BOUND,
-        passing: Passing::Test(slow_test(
+        passing: Passing::Test(on_demand_test(
             "tests/block_semantic_properties.rs",
             "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),

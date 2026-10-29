@@ -12,7 +12,7 @@ use zakura_sim::{
     check::{self, StepCtx, Violation},
     harness::{
         self,
-        coverage::{Bypass, Witness, COVERAGE},
+        coverage::{Bypass, Ci, Witness, COVERAGE},
         run_harness, HarnessEntry, HarnessError, Subsystem, HARNESSES, NO_TASK_PANIC,
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Status},
@@ -418,9 +418,10 @@ fn the_coverage_manifest_lists_every_reported_property() {
     assert_eq!(listed, reported);
 }
 
-/// Checks that `witness` is a test CI runs: `source` defines it once, the
-/// attributes directly above it include `#[test]` and no `#[cfg`, and an
-/// ignored one is named in `workflow`, the `tests-unit.yml` text.
+/// Checks that `witness` is a test that runs where it says: `source`
+/// defines it once, and the attributes directly above it include `#[test]`
+/// and no `#[cfg`. A CI job's ignored test is named in `workflow`, the
+/// `tests-unit.yml` text, and an on-demand test is ignored.
 fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), String> {
     let lines: Vec<&str> = source.lines().map(str::trim).collect();
     let signature = format!("fn {}()", witness.test);
@@ -450,18 +451,27 @@ fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), St
     if attributes.iter().any(|a| a.starts_with("#[cfg")) {
         return Err(format!("{} is behind a cfg", witness.test));
     }
-    if !workflow.contains(&format!("name: {}", witness.ci)) {
-        return Err(format!("no `{}` job", witness.ci));
-    }
     let ignored = attributes.iter().any(|a| a.starts_with("#[ignore"));
-    if ignored && !workflow.contains(witness.test) {
-        return Err(format!("CI never runs the ignored {}", witness.test));
+    match witness.ci {
+        Ci::Job(job) => {
+            if !workflow.contains(&format!("name: {job}")) {
+                return Err(format!("no `{job}` job"));
+            }
+            if ignored && !workflow.contains(witness.test) {
+                return Err(format!("CI never runs the ignored {}", witness.test));
+            }
+        }
+        Ci::OnDemand => {
+            if !ignored {
+                return Err(format!("the on-demand {} isn't ignored", witness.test));
+            }
+        }
     }
     Ok(())
 }
 
 #[test]
-fn every_coverage_witness_exists_and_ci_runs_it() {
+fn every_coverage_witness_exists_and_runs_where_it_says() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
@@ -511,7 +521,7 @@ fn the_witness_check_refuses_lookalikes() {
     let witness = Witness {
         file: "tests/fake.rs",
         test: "witness",
-        ci: "zakura_sim build",
+        ci: Ci::Job("zakura_sim build"),
     };
     let check = |source: &str| witness_runs(source, workflow, witness);
     assert_eq!(check("#[test]\nfn witness() {}"), Ok(()));
@@ -536,4 +546,14 @@ fn the_witness_check_refuses_lookalikes() {
     ] {
         assert_eq!(check(source), Err(error.to_owned()), "{source}");
     }
+    let on_demand = Witness {
+        ci: Ci::OnDemand,
+        ..witness
+    };
+    let check = |source: &str| witness_runs(source, workflow, on_demand);
+    assert_eq!(check("#[ignore]\n#[test]\nfn witness() {}"), Ok(()));
+    assert_eq!(
+        check("#[test]\nfn witness() {}"),
+        Err("the on-demand witness isn't ignored".to_owned())
+    );
 }

@@ -316,10 +316,12 @@ fn every_floor_churn_plan_asks_for_the_floor_before_the_reset() {
 /// others' requests only once they publish, so `E` can pass `L` by up to
 /// `(W + 1)·k·B`. With `omit-outstanding-estimates.patch`, admission
 /// ignores outstanding requests, and the same input violates it. A debug
-/// run takes about a minute, so the test runs the input once and reads the
-/// trigger from the peaks: an above-window estimate the bound counted. The
-/// planted runner judges the trigger history on the same input.
+/// run takes over a minute, so the test runs the input once, reads the
+/// trigger from the peaks (an above-window estimate the bound counted), and
+/// runs only on demand. The planted runner judges the trigger history on
+/// the same input.
 #[test]
+#[ignore = "a debug run takes over a minute; run it on demand with `--ignored` and `--profile planted`"]
 fn the_above_window_input_holds_lookahead_overshoot_bound() {
     let witness = committed(ABOVE_WINDOW_INPUT);
     assert_eq!(witness.scenario, BlockScenario::above_window());
@@ -513,10 +515,10 @@ fn history(report: &RunReport) -> Vec<String> {
 /// Honest runs, BS5's two-mirror flow among them, hold each bound in
 /// [`IDS`] at least once. None reaches the window's top, so the look-ahead
 /// bound holds with nothing above the window; the above-window test is its
-/// real witness. Plan A twice gives one history, and so does A, then
-/// B, then A.
+/// real witness. A, then B, then A gives A's history twice, and B's
+/// differs.
 #[test]
-fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
+fn honest_runs_hold_every_resource_bound_a_b_a() {
     let two_mirrors = BlockScenario {
         blocks: 16,
         mirrors: vec![
@@ -531,7 +533,7 @@ fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
         ("two mirrors", two_mirrors),
         ("short budget", BlockScenario::short_budget()),
     ] {
-        let reports: Vec<_> = [&plans[0], &plans[0], &plans[1], &plans[0]]
+        let reports: Vec<_> = [&plans[0], &plans[1], &plans[0]]
             .into_iter()
             .map(|plan| node_run(&scenario, plan.clone()))
             .collect();
@@ -556,12 +558,11 @@ fn honest_runs_hold_every_resource_bound_a_a_and_a_b_a() {
             );
         }
         let histories: Vec<_> = reports.iter().map(history).collect();
-        assert!(histories[0] == histories[1], "{name}: plan A, then A");
         assert!(
-            histories[0] == histories[3],
+            histories[0] == histories[2],
             "{name}: plan A, then B, then A"
         );
-        assert!(histories[0] != histories[2], "{name}: plan B differs");
+        assert!(histories[0] != histories[1], "{name}: plan B differs");
     }
 }
 

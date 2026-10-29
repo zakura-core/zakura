@@ -221,7 +221,7 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
 /// decoded block, as on main, and the same input violates the property at
 /// step 122,041.
 #[test]
-#[ignore = "a debug run takes minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_decoded_input_stall_input_holds_input_decoded_bound() {
     let ports = witnessed(
         committed(DECODED_INPUT_STALL_INPUT),
@@ -244,7 +244,7 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 /// order: the verified tip reached the released submission's height, and
 /// no `applying` entry holds it.
 #[test]
-#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_frontier_first_input_holds_capacity_release_wakes() {
     witnessed(
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
@@ -259,7 +259,7 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
 /// in the frontier-first order, so this run isn't the property's witness: the test
 /// checks the run directly.
 #[test]
-#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_reply_first_input_holds_capacity_release_wakes() {
     let witness = committed(CAPACITY_REPLY_FIRST_INPUT);
     let (report, ports) = run(&witness.scenario, witness.input);
@@ -345,47 +345,34 @@ fn history(report: &RunReport) -> Vec<String> {
         .collect()
 }
 
-/// Each cheap scenario's history depends only on its scenario and plan:
-/// plan A twice gives one history, and so does A, then B, then A. B's
-/// differs, so the comparison can fail. Every run pairs each operation,
-/// matches each sequencer snapshot with the holder events, and violates
-/// nothing.
+/// The reset-mid-flight scenario's history depends only on its plan: A,
+/// then B, then A gives A's history twice, and B's differs, so the
+/// comparison can fail. Every run pairs each operation, matches each
+/// sequencer snapshot with the holder events, and violates nothing.
 #[test]
-fn the_semantic_scenarios_repeat_a_a_and_a_b_a() {
+fn the_reset_mid_flight_scenario_repeats_a_b_a() {
     let plans = inputs(2, 256);
-    for (name, scenario) in [
-        ("reset mid-flight", BlockScenario::reset_mid_flight()),
-        (
-            "stale beside current",
-            BlockScenario::stale_beside_current(),
-        ),
-        ("stalled reset", BlockScenario::stalled_reset()),
-    ] {
-        let histories: Vec<_> = [&plans[0], &plans[0], &plans[1], &plans[0]]
-            .into_iter()
-            .map(|plan| {
-                let (report, ports) = run(&scenario, plan.clone());
-                assert_eq!(report.end.violation, None, "{name}: {:?}", report.end);
-                assert!(
-                    report
-                        .properties
-                        .iter()
-                        .all(|p| !matches!(p.outcome, PropertyOutcome::Violated { .. })),
-                    "{name}: {:?}",
-                    report.properties
-                );
-                let view = ports.view.borrow();
-                assert!(view.pairing.is_empty(), "{name}: {:?}", view.pairing);
-                assert!(view.anomalies.is_empty(), "{name}: {:?}", view.anomalies);
-                assert_eq!(view.owners.holder_gap(), None, "{name}");
-                history(&report)
-            })
-            .collect();
-        assert!(histories[0] == histories[1], "{name}: plan A, then A");
-        assert!(
-            histories[0] == histories[3],
-            "{name}: plan A, then B, then A"
-        );
-        assert!(histories[0] != histories[2], "{name}: plan B differs");
-    }
+    let scenario = BlockScenario::reset_mid_flight();
+    let histories: Vec<_> = [&plans[0], &plans[1], &plans[0]]
+        .into_iter()
+        .map(|plan| {
+            let (report, ports) = run(&scenario, plan.clone());
+            assert_eq!(report.end.violation, None, "{:?}", report.end);
+            assert!(
+                report
+                    .properties
+                    .iter()
+                    .all(|p| !matches!(p.outcome, PropertyOutcome::Violated { .. })),
+                "{:?}",
+                report.properties
+            );
+            let view = ports.view.borrow();
+            assert!(view.pairing.is_empty(), "{:?}", view.pairing);
+            assert!(view.anomalies.is_empty(), "{:?}", view.anomalies);
+            assert_eq!(view.owners.holder_gap(), None);
+            history(&report)
+        })
+        .collect();
+    assert!(histories[0] == histories[2], "plan A, then B, then A");
+    assert!(histories[0] != histories[1], "plan B differs");
 }

@@ -52,7 +52,10 @@ use super::{
     Subsystem,
 };
 use crate::{
-    domain::block_sync::{resource_properties, Limits, OwnerModel, OwnerView},
+    domain::{
+        block_sync::{resource_properties, Limits, OwnerModel, OwnerView},
+        block_sync_semantic::{semantic_properties, SemanticModel, SemanticView},
+    },
     property::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
     },
@@ -625,6 +628,7 @@ impl Subsystem for Storage {
         );
         ports.view.borrow_mut().owners = OwnerModel::new(limits, verified_tip);
         let view = ports.view.clone();
+        view.borrow().semantic.borrow_mut().set_limit(&config);
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());
@@ -695,12 +699,13 @@ impl Subsystem for Storage {
         }
     }
 
-    /// [`storage_properties`], [`table_wiring_properties`], then the
-    /// resource properties.
+    /// [`storage_properties`], [`table_wiring_properties`], the resource
+    /// properties, then the [semantic properties](semantic_properties).
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
         properties.extend(table_wiring_properties());
         properties.extend(resource_properties());
+        properties.extend(semantic_properties());
         properties
     }
 
@@ -711,10 +716,15 @@ impl Subsystem for Storage {
 
     /// The scenario the prefix's two bytes pick: [`STUCK_FLOOR_TAG`],
     /// [`PAUSED_HANDOFFS_TAG`], [`ABOVE_WINDOW_TAG`] and [`PEERS_LEAVE_TAG`]
-    /// pick theirs; otherwise an odd first byte picks the short budget, and
-    /// an even one the default. Each tagged run is long or narrow, so
+    /// pick theirs, as do the semantic scenarios' tags
+    /// ([`BlockScenario::semantic_drawn`]). All of them start with `ff`, so
+    /// they come before the odd-first-byte arm. Otherwise an odd first byte
+    /// picks the short budget, and an even one the default. Each tagged run is long or narrow, so
     /// fuzzing draws each on one prefix in 65,536.
     fn draw(prefix: &[u8]) -> BlockScenario {
+        if let Some(scenario) = BlockScenario::semantic_drawn(prefix) {
+            return scenario;
+        }
         match prefix {
             [first, second, ..] if [*first, *second] == STUCK_FLOOR_TAG => {
                 BlockScenario::stuck_floor()
@@ -787,6 +797,13 @@ impl TaskHold for PausedHandoffs {
             self.first.set(Some(step));
         }
         true
+    }
+}
+
+/// The semantic properties share the model in the node's view.
+impl SemanticView for Rc<RefCell<BlockSyncView>> {
+    fn semantic(&self) -> Rc<RefCell<SemanticModel>> {
+        self.borrow().semantic.clone()
     }
 }
 

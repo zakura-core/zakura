@@ -1212,3 +1212,176 @@ fn no_observer_evaluates_nothing() {
         }]
     );
 }
+
+/// The `Misbehavior` events in `events`.
+fn misbehaviors(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    events
+        .into_iter()
+        .filter(|event| matches!(event, ReactorEvent::Misbehavior { .. }))
+        .collect()
+}
+
+/// A page from session `session_id` whose parent is no sent locator, so the
+/// reactor's own response check reports it.
+fn page_off_the_locator(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: &ZakuraPeerId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+) -> Headers {
+    let active = reactor
+        .peer_work_queue
+        .active_mut(peer)
+        .expect("the seeded request is active");
+    let wrong_ancestor = zakura_header_chain::Frontier::new(
+        snapshot.frontiers.finalized.height,
+        block::Hash([0x41; 32]),
+    );
+    let mut header = *active.entries[0].header;
+    header.previous_block_hash = wrong_ancestor.hash;
+    active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = None;
+    active.entries.clear();
+    Headers {
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        common_ancestor_height: wrong_ancestor.height,
+        common_ancestor_hash: wrong_ancestor.hash,
+        reaches_initial_target: false,
+        tree_aux_schema: AuxSchema::None,
+        entries: vec![HeaderEntry {
+            header: Arc::new(header),
+            body_size: 0,
+            tree_aux: None,
+        }],
+    }
+}
+
+/// A fault in the live session's message or work names that session as both
+/// the origin and the current session, whether the reactor's own check found
+/// it or storage did.
+#[test]
+fn current_session_failures_name_their_origin() {
+    let peer = peer();
+
+    // The reactor's own check of a page from session 1.
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let _outbound = connect(&mut reactor, &peer, 1);
+    let (_, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    let page = page_off_the_locator(&mut reactor, &snapshot, &peer, owner);
+    recorder.take();
+    reactor.deliver_page(peer.clone(), 1, page);
+    assert_eq!(
+        misbehaviors(recorder.take()),
+        vec![ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::MalformedMessage,
+            origin: Some(1),
+            current: Some(1),
+        }],
+        "the reported page names its session"
+    );
+
+    // A typed prepare failure for session 1's work.
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let _outbound = connect(&mut reactor, &peer, 1);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the seeded request is active")
+        .phase = HeaderTargetPhase::Preparing;
+    recorder.take();
+    reactor.handle_header_target_prepared(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+    );
+    assert_eq!(
+        misbehaviors(recorder.take()),
+        vec![ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: Some(1),
+        }],
+        "the typed failure names its owner's session"
+    );
+}
+
+/// A prepare for session 1 that fails after session 2 replaced it is
+/// discarded before any dispatch, so it reports no misbehavior.
+#[test]
+fn stale_prepare_emits_no_misbehavior() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _old_outbound = connect(&mut reactor, &peer, 1);
+    let (source, old_owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    let _new_outbound = connect(&mut reactor, &peer, 2);
+    seed_applying_request(&mut reactor, &snapshot, peer.clone(), 2);
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the replacement is active")
+        .phase = HeaderTargetPhase::Preparing;
+    let replacement = active(&reactor, &peer);
+    recorder.take();
+
+    reactor.handle_header_target_prepared(
+        peer.clone(),
+        source,
+        old_owner,
+        HeaderTargetPreparationResult::Failed(invalid_header_failure(source, old_owner)),
+    );
+    assert_eq!(misbehaviors(recorder.take()), vec![]);
+    assert_eq!(active(&reactor, &peer), replacement);
+}
+
+/// A dispatch for session 1's work while session 2 is current reports both
+/// sessions, so the harness never charges the replacement.
+#[test]
+fn dispatch_reports_distinct_origin_and_current() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _old_outbound = connect(&mut reactor, &peer, 1);
+    let (_, old_owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    let _new_outbound = connect(&mut reactor, &peer, 2);
+    recorder.take();
+
+    reactor.dispatch_misbehavior(
+        peer.clone(),
+        HeaderSyncMisbehavior::InvalidHeader,
+        Some(old_owner),
+        None,
+    );
+    assert_eq!(
+        misbehaviors(recorder.take()),
+        vec![ReactorEvent::Misbehavior {
+            peer,
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: Some(2),
+        }]
+    );
+}

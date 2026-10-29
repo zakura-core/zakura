@@ -481,6 +481,18 @@ fn every_coverage_witness_exists_and_ci_runs_it() {
                 );
                 vec![row.passing.witness()]
             }
+            Bypass::Pending(_) => {
+                let statuses: Vec<_> = HARNESSES
+                    .iter()
+                    .filter_map(|entry| entry.status(row.property))
+                    .collect();
+                assert!(
+                    !statuses.is_empty() && statuses.iter().all(|status| *status == Status::Draft),
+                    "{}: only a draft's bypass is pending, not {statuses:?}'s",
+                    row.property
+                );
+                vec![row.passing.witness()]
+            }
         };
         for witness in witnesses {
             let source = std::fs::read_to_string(crate_dir.join(witness.file))

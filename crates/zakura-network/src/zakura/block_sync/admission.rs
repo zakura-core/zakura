@@ -28,8 +28,9 @@ const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// [`estimated_resident_pipeline_bytes`].
 ///
 // The factor is a calibration from the measured ~3.3–4x wire→resident ratio of real
-// blocks. It is an average, not a bound: a consensus-valid block can decode at about
-// 26x. Admission charges the measured decoded heap whenever it exceeds this estimate.
+// blocks before legacy bundles were boxed. It is an average, not a bound: small
+// transparent transactions can still exceed it. Admission charges the measured
+// decoded heap whenever it exceeds this estimate.
 pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 
 /// Pure inputs for deciding whether a block request may consume budget.

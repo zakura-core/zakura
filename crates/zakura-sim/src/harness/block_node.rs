@@ -37,8 +37,9 @@ pub mod view;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
+    num::NonZeroU64,
     pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -48,7 +49,7 @@ use std::{
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use zakura_header_chain::{ErrorCategory, Frontier};
+use zakura_header_chain::{BodyWorkOwner, ErrorCategory, Frontier};
 use zakura_network::{
     zakura::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
@@ -1354,6 +1355,52 @@ impl Topology {
         if BlockReplies::send(&handle, event).is_err() {
             self.fail("the node's reactor is gone");
         }
+    }
+
+    /// The bypass witness for an alternate submission callback: hands the
+    /// node's block service a `SubmitBlock` for the body of the node's
+    /// oldest pending submission, straight to the service rather than
+    /// through block sync's action channel, under an owner no request of
+    /// the node's names: that submission's authority and session, with the
+    /// largest request ID, which no routine reaches. Its token is the
+    /// largest too, which the sequencer never issues, so block sync ignores
+    /// the verdict. Records a failure if no submission is pending.
+    pub(crate) fn submit_unrequested(&self) {
+        let Some((_, pending)) = self.bypass_parts() else {
+            return;
+        };
+        let Some((owner, source, height)) = pending.into_iter().find_map(|request| match request {
+            RequestIdentity::Submit {
+                owner,
+                source,
+                height: Some(height),
+                ..
+            } => Some((owner, source, height)),
+            _ => None,
+        }) else {
+            self.fail("no submission is pending to copy");
+            return;
+        };
+        let Some(body) = self
+            .chain
+            .blocks()
+            .into_iter()
+            .find(|body| body.height == height)
+        else {
+            self.fail("the pending submission's height is off the live chain");
+            return;
+        };
+        let action = BlockSyncAction::SubmitBlock {
+            owner: BodyWorkOwner {
+                request_id: NonZeroU64::MAX,
+                ..owner
+            },
+            source,
+            token: u64::MAX,
+            block: body.block,
+        };
+        self.node_service()
+            .take_received(action, &mut VecDeque::new());
     }
 
     /// Sends `frames` from the probe, in order, stopping at the first the

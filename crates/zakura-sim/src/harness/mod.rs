@@ -11,6 +11,7 @@
 //! scenario's [`Assume::BoundedAdversary`] holds ([`run_config`]).
 
 pub mod block_node;
+pub mod block_semantic;
 pub mod block_sync;
 pub mod coverage;
 pub mod discovery;
@@ -19,11 +20,14 @@ pub mod header_node;
 pub mod header_sync;
 pub mod policy;
 mod record;
+pub mod wire_node;
+pub mod wire_plans;
 
-use std::{fmt, rc::Rc};
+use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use zakura_quic::sim::{Link, LinkModel, SimNet};
 
 pub(crate) use record::write_trace;
 pub use record::{record, record_witness, RecordError, RecordInput, WITNESS_FILE};
@@ -32,6 +36,7 @@ use crate::{
     check::{Checker, Phase, PropertyReport, StepCtx, Violation},
     end::{HarnessFailure, Outcome, RunEnd},
     explore::{self, ExploreRun},
+    net::Net,
     observe::Exit,
     property::{
         Assume, Assumptions, CheckCtx, CheckEvent, HasView, Kind, Property, PropertyId, Registry,
@@ -409,6 +414,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
     entry::<block_sync::Storage>(),
+    entry::<header_sync::HeaderWire>(),
 ];
 
 /// The harness named `name`.
@@ -460,6 +466,93 @@ fn witness_value<S: Subsystem>(
 fn draw_value<S: Subsystem>(prefix: &[u8]) -> Value {
     serde_json::to_value(S::draw(prefix))
         .expect("scenarios are plain data, and serde_json serializes plain data")
+}
+
+/// The simulated network a scenario that runs real QUIC carries as its
+/// `net`: the QUIC seed, each directed link's model, and the loss gate.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetScenario {
+    /// The seed of every endpoint's `SeededInputs` and node key.
+    pub seed: [u8; 32],
+    /// The model of every link `links` doesn't name.
+    pub default_link: LinkSpec,
+    /// The models of particular directed links.
+    pub links: Vec<LinkEntry>,
+    /// Whether no link drops a datagram until [`Net::admitted`] opens it,
+    /// so loss stays away from the handshake.
+    pub loss_after_admission: bool,
+}
+
+impl NetScenario {
+    /// A network with these links and its source.
+    ///
+    /// # Panics
+    ///
+    /// Outside a run, as [`Net::new`], or if a link's `min_delay_ms` exceeds
+    /// its `max_delay_ms`.
+    pub fn net(&self) -> Net {
+        let sim = SimNet::new(self.default_link.into());
+        for entry in &self.links {
+            let link = Link {
+                src: entry.src,
+                dst: entry.dst,
+            };
+            sim.set_link(link, entry.model.into());
+        }
+        Net::new(sim, self.loss_after_admission)
+    }
+}
+
+/// A `LinkModel` in scenario form, with whole-millisecond delays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkSpec {
+    /// The earliest a datagram may arrive after its send.
+    pub min_delay_ms: u64,
+    /// The latest a datagram may arrive after its send.
+    pub max_delay_ms: u64,
+    /// Whether any eligible datagram may arrive next, or only the oldest.
+    pub reorder: bool,
+    /// How many datagrams the link may lose over the run.
+    pub loss_budget: u64,
+}
+
+impl Default for LinkSpec {
+    /// sim.md's header-sync link: 0 to 100 ms, reordering, no loss, as
+    /// `LinkModel::default()`.
+    fn default() -> Self {
+        LinkSpec {
+            min_delay_ms: 0,
+            max_delay_ms: 100,
+            reorder: true,
+            loss_budget: 0,
+        }
+    }
+}
+
+impl From<LinkSpec> for LinkModel {
+    /// The same model, with its delays as durations.
+    fn from(spec: LinkSpec) -> Self {
+        LinkModel {
+            min_delay: Duration::from_millis(spec.min_delay_ms),
+            max_delay: Duration::from_millis(spec.max_delay_ms),
+            reorder: spec.reorder,
+            loss_budget: spec.loss_budget,
+        }
+    }
+}
+
+/// One directed link's model in a [`NetScenario`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkEntry {
+    /// The sending address.
+    pub src: SocketAddr,
+    /// The address the datagrams go to.
+    pub dst: SocketAddr,
+    /// The link's model.
+    pub model: LinkSpec,
 }
 
 /// A borrowed checker as a sized [`Checker`], so it can sit in a [`Tee`].

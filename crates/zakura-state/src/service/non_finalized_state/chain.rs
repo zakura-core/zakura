@@ -2289,7 +2289,7 @@ impl
 
 impl
     UpdateWith<(
-        &Option<transaction::JoinSplitData<Groth16Proof>>,
+        &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
         &SpendingTransactionId,
     )> for Chain
 {
@@ -2297,7 +2297,7 @@ impl
     fn update_chain_tip_with(
         &mut self,
         &(joinsplit_data, revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2322,7 +2322,7 @@ impl
     fn revert_chain_with(
         &mut self,
         &(joinsplit_data, _revealing_tx_id): &(
-            &Option<transaction::JoinSplitData<Groth16Proof>>,
+            &Option<Box<transaction::JoinSplitData<Groth16Proof>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2342,7 +2342,7 @@ impl
 
 impl<AnchorV>
     UpdateWith<(
-        &Option<sapling::ShieldedData<AnchorV>>,
+        &Option<Box<sapling::ShieldedData<AnchorV>>>,
         &SpendingTransactionId,
     )> for Chain
 where
@@ -2352,7 +2352,7 @@ where
     fn update_chain_tip_with(
         &mut self,
         &(sapling_shielded_data, revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2377,7 +2377,7 @@ where
     fn revert_chain_with(
         &mut self,
         &(sapling_shielded_data, _revealing_tx_id): &(
-            &Option<sapling::ShieldedData<AnchorV>>,
+            &Option<Box<sapling::ShieldedData<AnchorV>>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2395,12 +2395,12 @@ where
     }
 }
 
-impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Chain {
+impl UpdateWith<(&Option<Box<orchard::ShieldedData>>, &SpendingTransactionId)> for Chain {
     #[instrument(skip(self, orchard_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(orchard_shielded_data, revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2425,7 +2425,7 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
     fn revert_chain_with(
         &mut self,
         (orchard_shielded_data, _revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            &Option<Box<orchard::ShieldedData>>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,

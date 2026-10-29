@@ -2,4 +2,5 @@
 //! [`Property`](crate::property::Property) a harness registers.
 
 pub mod block_sync;
+pub mod block_sync_semantic;
 pub mod discovery;

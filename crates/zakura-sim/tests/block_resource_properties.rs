@@ -293,7 +293,7 @@ fn an_unmeasured_routine_asks_for_the_floor_while_the_others_are_paused() {
 /// on 24 plans of each prefix length. On main, 7 of the 48 plans never ask
 /// for height 7 before the reset.
 #[test]
-#[ignore = "nightly: 48 debug runs take about 80 s"]
+#[ignore = "48 debug runs take about 80 s; run it on demand with `--ignored`"]
 fn every_floor_churn_plan_asks_for_the_floor_before_the_reset() {
     let scenario = floor_churn_from_height_5();
     let stalled: Vec<_> = [64, 32]

@@ -11,7 +11,7 @@
 
 mod support;
 
-use std::{collections::BTreeMap, rc::Rc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use support::inputs;
 use zakura_chain::parameters::Network;
@@ -23,6 +23,7 @@ use zakura_network::{
     Config,
 };
 use zakura_sim::{
+    domain::session::HONEST_NEVER_PUNISHED,
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -39,8 +40,6 @@ use zakura_sim::{
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         PeerAction, PeerSpec,
     },
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    table::table_properties,
     Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -285,17 +284,6 @@ fn node_syncs_the_fixture_tip_from_an_honest_peer() {
     }
 }
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
 /// The ID of header sync's generated `conformant-never-closes`.
 fn conformant_never_closes() -> String {
     format!(
@@ -303,28 +291,10 @@ fn conformant_never_closes() -> String {
     )
 }
 
-/// A checker of [`conformant_never_closes`] alone, assembled from the
-/// generated table properties (M5-Q13).
-fn never_closes_checker() -> RegistryChecker<Logged> {
-    let id = conformant_never_closes();
-    let properties: Vec<Property<Logged>> =
-        table_properties("header-sync", &RegtestMessage::LAYOUT)
-            .into_iter()
-            .filter(|property| property.id.as_str() == id)
-            .collect();
-    assert_eq!(properties.len(), 1, "{id} is generated");
-    RegistryChecker::new(
-        Registry::new(properties).expect("one property"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
 /// Over M5.1's 64 plans, every frame the honest peer sends is labelled
 /// `Conformant` by its models, each one the node reads is judged,
-/// `conformant-never-closes` holds where it applies, and the node decides no
-/// close with a fault cause.
+/// `conformant-never-closes` and `session/honest-never-punished` hold
+/// where they apply, and the node decides no close with a fault cause.
 ///
 /// This fails if the node punishes a conformant peer: a node patched to
 /// refuse the peer's `Status` closes with `service_protocol_reject`.
@@ -332,17 +302,18 @@ fn never_closes_checker() -> RegistryChecker<Logged> {
 fn honest_runs_never_close() {
     let scenario = sync_scenario();
     for plan in sync_plans() {
-        let mut checker = never_closes_checker();
-        let (report, _) = run_with(&scenario, plan, Some(&mut checker));
-        let outcome = report
-            .properties
-            .iter()
-            .find(|property| property.property == conformant_never_closes())
-            .map(|property| &property.outcome);
-        assert!(
-            matches!(outcome, Some(PropertyOutcome::Held { applicable }) if *applicable > 0),
-            "{outcome:?}"
-        );
+        let (report, _) = run(&scenario, plan);
+        for id in [conformant_never_closes(), HONEST_NEVER_PUNISHED.to_owned()] {
+            let outcome = report
+                .properties
+                .iter()
+                .find(|property| property.property == id)
+                .map(|property| &property.outcome);
+            assert!(
+                matches!(outcome, Some(PropertyOutcome::Held { applicable }) if *applicable > 0),
+                "{id}: {outcome:?}"
+            );
+        }
         let mut rows = std::collections::BTreeSet::new();
         let (mut read, mut judged) = (0, 0);
         for entry in report.log.entries() {

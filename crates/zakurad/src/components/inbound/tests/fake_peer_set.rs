@@ -1431,6 +1431,7 @@ async fn setup_with_misbehavior_receiver(
         chain_tip_change.clone(),
         misbehavior_sender.clone(),
         Vec::new(),
+        zakura_network::UnconditionalPeers::default(),
     );
 
     // Pretend we're close to tip

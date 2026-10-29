@@ -89,6 +89,7 @@ hyper = "1.6"
 hyper-util = "0.1.11"
 indexmap = "2.8"
 insta = "1.42"
+ipnet = "2.12"
 itertools = "0.14"
 jubjub = { version = "=4.0.0", package = "zakura-jubjub" }
 async-trait = "0.1.89"

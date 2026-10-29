@@ -157,6 +157,46 @@ async fn misbehavior_reports_are_batched_for_five_seconds() {
         .expect("misbehavior batcher task should not panic");
 }
 
+/// The address book updater drops misbehavior reports for configured
+/// unconditional peers, and still bans other peers.
+#[tokio::test]
+async fn address_book_updater_ignores_unconditional_peer_misbehavior() {
+    let _init_guard = zakura_test::init();
+
+    let unconditional_addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let other_addr: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+
+    let config: Config = toml::from_str("unconditional_peers = ['127.0.0.1']")
+        .expect("unconditional peer config parses");
+    let (_address_book, bans, address_book_updater, _address_metrics, _updater_guard) =
+        AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
+
+    // The updater applies changes in order, so the unconditional peer's report
+    // has been handled once the other peer is banned.
+    for addr in [unconditional_addr, other_addr] {
+        address_book_updater
+            .send(MetaAddr::new_misbehavior(
+                addr,
+                constants::MAX_PEER_MISBEHAVIOR_SCORE,
+            ))
+            .await
+            .expect("address book updater is running");
+    }
+
+    tokio::time::timeout(CRAWLER_TEST_TIMEOUT, async {
+        while !bans.contains(other_addr.ip()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the address book updater should ban the other peer");
+
+    assert!(
+        !bans.contains(unconditional_addr.ip()),
+        "unconditional peers must never be banned"
+    );
+}
+
 /// Test that zakura-network discovers dynamic bind-to-all-interfaces listener ports,
 /// and sends them to the `AddressBook`.
 ///

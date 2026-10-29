@@ -63,6 +63,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
+ipnet = { workspace = true }
 itertools = { workspace = true }
 pin-project = { workspace = true }
 rand_10 = { workspace = true }

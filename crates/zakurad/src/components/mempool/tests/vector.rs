@@ -912,6 +912,45 @@ async fn zcashd_compat_peer_is_never_penalized() -> Result<(), Report> {
     Ok(())
 }
 
+/// Unconditional IPs and ranges bypass mempool penalties, including mapped IPs.
+#[tokio::test(flavor = "multi_thread")]
+async fn unconditional_peers_are_never_penalized() {
+    let config: zn::Config =
+        toml::from_str("unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::/32']")
+            .unwrap();
+    for (address, trusted) in [
+        ("192.0.2.1:8233", true),
+        ("[::ffff:192.0.2.1]:8233", true),
+        ("198.51.100.7:8233", true),
+        ("[::ffff:198.51.100.7]:8233", true),
+        ("[2001:db8::7]:8233", true),
+        ("192.0.2.2:8233", false),
+        ("198.51.101.7:8233", false),
+        ("[2001:db9::7]:8233", false),
+    ] {
+        let peer = address.parse().unwrap();
+        for (error, expected) in [
+            (
+                TransactionError::Script(zakura_script::Error::ScriptInvalid),
+                (!trusted, false),
+            ),
+            (TransactionError::NoInputs, (false, !trusted)),
+        ] {
+            assert_eq!(
+                peer_penalties_with_unconditional(
+                    peer,
+                    error,
+                    &Network::Mainnet,
+                    config.unconditional_peers.clone(),
+                )
+                .await,
+                expected,
+                "peer {address}",
+            );
+        }
+    }
+}
+
 /// A v4 signature hash uses the tip's branch ID, so a peer that lags an upgrade
 /// activation relays v4 transactions that fail script checks. Those failures
 /// start no cooldown in the upgrade's grace period.
@@ -951,6 +990,16 @@ async fn peer_penalties(
     error: TransactionError,
     network: &Network,
 ) -> (bool, bool) {
+    peer_penalties_with_unconditional(peer, error, network, zn::UnconditionalPeers::default()).await
+}
+
+/// Exercise the failure-handling path with a configured unconditional allowlist.
+async fn peer_penalties_with_unconditional(
+    peer: PeerSocketAddr,
+    error: TransactionError,
+    network: &Network,
+    unconditional_peers: zn::UnconditionalPeers,
+) -> (bool, bool) {
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(2..)
         .next()
@@ -968,6 +1017,15 @@ async fn peer_penalties(
     ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
     let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
     mempool.misbehavior_sender = misbehavior_sender;
+    // An expired prior cooldown would make the next penalty disconnect the peer.
+    // Trusted peers must bypass that escalation as well as the first cooldown.
+    if unconditional_peers.contains(peer.ip()) {
+        mempool.peer_cooldowns.record_invalid_transaction(
+            peer.ip(),
+            Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
+        );
+    }
+    mempool.unconditional_peers = unconditional_peers;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(network);
@@ -1024,6 +1082,8 @@ async fn peer_penalties(
         }
         Err(_) => false,
     };
+
+    peer_set.expect_no_requests().await;
 
     (cooling_down, banned)
 }
@@ -3768,6 +3828,7 @@ async fn setup_with_mempool_config(
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
+        zn::UnconditionalPeers::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

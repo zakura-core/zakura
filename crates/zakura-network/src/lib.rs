@@ -179,7 +179,7 @@ pub use crate::{
 pub use crate::{
     address_book::{AddressBook, BannedIps},
     address_book_peers::AddressBookPeers,
-    config::{CacheDir, Config, P2pStack},
+    config::{CacheDir, Config, P2pStack, UnconditionalPeers},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,

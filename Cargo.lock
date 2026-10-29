@@ -3098,6 +3098,7 @@ dependencies = [
  "futures",
  "hex",
  "indexmap",
+ "ipnet",
  "itertools 0.14.0",
  "metrics",
  "pin-project",

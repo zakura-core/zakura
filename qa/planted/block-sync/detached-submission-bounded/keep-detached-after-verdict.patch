@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer.rs b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+index c71ad5743..df71f0e76 100644
+--- a/crates/zakura-network/src/zakura/block_sync/sequencer.rs
++++ b/crates/zakura-network/src/zakura/block_sync/sequencer.rs
+@@ -929,6 +929,7 @@ impl Sequencer {
+             || submission.source != source
+             || submission.height != height
+             || submission.hash != hash
++            || submission.detached
+         {
+             return false;
+         }

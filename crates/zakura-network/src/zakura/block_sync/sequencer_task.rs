@@ -992,6 +992,9 @@ impl SequencerTask {
         committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
     ) -> (bool, bool) {
         let result = outcome.result();
+        if matches!(result, BlockApplyResult::Rejected) {
+            self.sequencer.forget_measured_decoded_bytes(height, hash);
+        }
         // Frontier updates can remove applying entries before their completions.
         // Every committed exit below retires the exact submission, so a repeated
         // completion cannot count its cached wire size again.
@@ -1340,7 +1343,7 @@ impl SequencerTask {
                 self.submission_retry_attempt = 0;
             }
             self.sequencer
-                .record_submitted_apply(item.height, item.hash);
+                .record_submitted_apply(item.height, item.hash, item.decoded_bytes);
             self.trace_body_submitted(item.height, item.token);
         }
     }

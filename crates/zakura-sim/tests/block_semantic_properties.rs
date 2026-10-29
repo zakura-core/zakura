@@ -184,7 +184,7 @@ fn the_stale_beside_current_input_holds_stale_completion_inert() {
 
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset
 /// detaches the held submission, which keeps its holder and its place
-/// under the limit. The draft holds. With `forget-on-reset.patch`, the
+/// under the limit. The property holds. With `forget-on-reset.patch`, the
 /// reset forgets the submission, and the same input violates it.
 #[test]
 fn the_stalled_reset_input_holds_detached_submission_bounded() {

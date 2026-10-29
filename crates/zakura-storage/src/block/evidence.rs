@@ -58,6 +58,9 @@ pub enum RequestIdentity {
         parent: block::Hash,
         /// The verifier it goes to.
         class: ApplyClass,
+        /// The submitted block's decoded size,
+        /// [`block::Block::attributed_memory_size_bytes`].
+        decoded_bytes: u64,
     },
     /// A body-evidence record.
     Record {
@@ -139,6 +142,7 @@ impl RequestIdentity {
                 hash: block.hash(),
                 parent: block.header.previous_block_hash,
                 class,
+                decoded_bytes: block.attributed_memory_size_bytes(),
             },
             BlockSyncAction::RecordBodyUnavailable {
                 expected_version,

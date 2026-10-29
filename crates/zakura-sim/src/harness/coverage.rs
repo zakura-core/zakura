@@ -156,6 +156,58 @@ const OVER_MARGIN: &str = "requests_past_twice_the_serving_limit_reach_over_marg
 /// The witness that no scenario reaches an [`unreachable`] row.
 const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
 
+/// The file of `header-sync/wire`'s witness tests (P3d).
+const HEADER_WITNESSES: &str = "tests/header_wire_witness.rs";
+
+/// A header-sync generated property's row: its witness test in
+/// [`HEADER_WITNESSES`], and the scripted bypass there that violates every
+/// generated header-sync ID.
+const fn header(property: &'static str, passing: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(HEADER_WITNESSES, passing),
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// A header-sync generated property no scenario reaches, for `reason`:
+/// `witness` shows it stays `NotApplicable`, and the scripted bypass still
+/// violates it.
+const fn header_unreachable(
+    property: &'static str,
+    reason: &'static str,
+    witness: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(HEADER_WITNESSES, witness),
+        },
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// The scripted bypass that violates every header-sync generated ID.
+const HEADER_BYPASS: Bypass = Bypass::Test(sim_test(
+    HEADER_WITNESSES,
+    "scripted_bypasses_violate_every_generated_header_id",
+));
+
+/// The honest witness, and the check that the witnesses list every ID.
+const EVERY: &str = "every_generated_property_applies_in_its_witness";
+/// The `undeclared-type` and `status` fault witnesses.
+const STATUS: &str = "status_faults_apply_in_their_witnesses";
+/// The `subscribe-headers` fault witnesses.
+const SUBSCRIBE: &str = "subscribe_headers_faults_apply_in_their_witnesses";
+/// The `headers` fault witnesses.
+const HEADERS: &str = "headers_faults_apply_in_their_witnesses";
+/// The `headers-outcome` fault witnesses.
+const OUTCOME: &str = "headers_outcome_faults_apply_in_their_witnesses";
+/// Why no header-sync scenario reaches an `over-owed-closes` ID.
+const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
+                        so the models label an overrun over-credit, never over-owed";
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
@@ -317,6 +369,103 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
+    header("header-sync/s5v9/conformant-never-closes", EVERY),
+    header("header-sync/s5v9/status/sender-cadence", EVERY),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-live",
+        EVERY,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        EVERY,
+    ),
+    header("header-sync/s5v9/headers/sender-answers-open", EVERY),
+    header("header-sync/s5v9/headers-outcome/sender-ends-once", EVERY),
+    header("header-sync/s5v9/undeclared-type-closes", STATUS),
+    header("header-sync/s5v9/status/reserved-flags-closes", STATUS),
+    header("header-sync/s5v9/status/short-payload-closes", STATUS),
+    header("header-sync/s5v9/status/long-payload-closes", STATUS),
+    header("header-sync/s5v9/status/bad-content-closes", STATUS),
+    header("header-sync/s5v9/status/cadence-never-closes", STATUS),
+    header(
+        "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/short-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/long-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-live-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-credit-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/after-close-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-content-closes",
+        SUBSCRIBE,
+    ),
+    header("header-sync/s5v9/headers/reserved-flags-closes", HEADERS),
+    header("header-sync/s5v9/headers/short-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/long-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/unsolicited-closes", HEADERS),
+    header("header-sync/s5v9/headers/bad-content-closes", HEADERS),
+    header(
+        "header-sync/s5v9/headers-outcome/reserved-flags-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/short-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/long-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/unsolicited-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/bad-content-closes",
+        OUTCOME,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers/over-owed-closes",
+        NOT_OWED,
+        HEADERS,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers-outcome/over-owed-closes",
+        NOT_OWED,
+        OUTCOME,
+    ),
+    // Any production change that punishes an honest header-sync peer also
+    // violates `conformant-never-closes`, and a planted case's input must
+    // violate its property alone. The scripted bypass punishes an honest
+    // peer whose frame a label excuses.
+    Coverage {
+        property: crate::domain::session::HONEST_NEVER_PUNISHED,
+        passing: passes(HEADER_WITNESSES, "honest_peer_never_punished"),
+        bypass: Bypass::Test(sim_test(
+            HEADER_WITNESSES,
+            "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
+        )),
+    },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its committed input unpatched as a
     // witness test that expects a hold, before it runs the patch.

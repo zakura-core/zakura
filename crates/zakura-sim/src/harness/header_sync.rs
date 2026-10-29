@@ -3,7 +3,8 @@
 //! on controlled storage with mirror peers (M4), with the node's reactor
 //! tapped. `header-sync/wire` runs the same node behind its real transport
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
-//! adversaries (M5-E1).
+//! adversaries (M5-E1), checked by header sync's generated table properties
+//! and `session/honest-never-punished` (P3d).
 
 use std::{any::Any, borrow::Borrow, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
@@ -11,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, ZakuraHeaderSyncConfig,
-    LOCAL_MAX_MESSAGE_BYTES,
+    spawn_header_sync_reactor, v9::RegtestMessage, FullStateFrontiers, HeaderSyncStartup,
+    ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
 };
 use zakura_node_services::header_chain::InertHeaderChainPort;
 use zakura_scheduler::SchedulerConfig;
@@ -34,6 +35,7 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
+    domain::session::{honest_never_punished, HonestPeers},
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, Dialer as PeerDialer,
@@ -44,6 +46,7 @@ use crate::{
         Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
+    table::{sender_properties, table_properties},
     Observation, RunConfig, Sim,
 };
 
@@ -220,6 +223,16 @@ pub struct StorageView {
     pub port: Arc<ControlledPort>,
     /// Whether any reactor dispatched a storage call externally.
     pub direct_dispatch_broken: bool,
+    /// The peers the scenario marks `HonestPeer`, by index. Only
+    /// `header-sync/wire` has peers to mark.
+    pub honest_peers: Rc<BTreeSet<usize>>,
+}
+
+impl HonestPeers for StorageView {
+    /// True if `index` is in [`StorageView::honest_peers`].
+    fn is_honest(&self, index: usize) -> bool {
+        self.honest_peers.contains(&index)
+    }
 }
 
 /// What both header tiers' checks read between steps: the storage view,
@@ -238,17 +251,26 @@ impl Borrow<StorageView> for HeaderWireView {
     }
 }
 
-/// The composite view of a header tier's `port`, `dispatch` flag and
-/// `owners`.
+impl HonestPeers for HeaderWireView {
+    /// The storage view's answer.
+    fn is_honest(&self, index: usize) -> bool {
+        self.storage.is_honest(index)
+    }
+}
+
+/// The composite view of a header tier's `port`, `dispatch` flag, `honest`
+/// peers and `owners`.
 fn header_view(
     port: &Arc<ControlledPort>,
     dispatch: &DispatchFlag,
+    honest: &Rc<BTreeSet<usize>>,
     owners: &Rc<RefCell<HeaderSyncView>>,
 ) -> HeaderWireView {
     HeaderWireView {
         storage: StorageView {
             port: port.clone(),
             direct_dispatch_broken: dispatch.get(),
+            honest_peers: honest.clone(),
         },
         owners: owners.clone(),
     }
@@ -257,9 +279,10 @@ fn header_view(
 impl HasView for Storage {
     type View = HeaderWireView;
 
-    /// The node's port, the dispatch guard's flag and the owners.
+    /// The node's port, the dispatch guard's flag and the owners. Only
+    /// `header-sync/wire` has peers to mark honest.
     fn view(&self) -> HeaderWireView {
-        header_view(&self.port, &self.dispatch, &self.owners)
+        header_view(&self.port, &self.dispatch, &Rc::default(), &self.owners)
     }
 
     /// The boundary the hub last closed.
@@ -418,6 +441,18 @@ pub struct WireScenario {
     pub policy: Policy,
 }
 
+impl WireScenario {
+    /// The peers the scenario marks `HonestPeer`, by index: each that
+    /// [`PeerSpec::is_honest`].
+    pub fn honest_peers(&self) -> BTreeSet<usize> {
+        (0..)
+            .zip(&self.peers)
+            .filter(|(_, peer)| peer.is_honest())
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
 impl Default for WireScenario {
     /// The node at genesis, dialed by one peer that offers header sync
     /// alone, under the converging policy.
@@ -466,11 +501,13 @@ impl WirePorts {
 
 /// The node under test, named `node`, on a controlled port behind its real
 /// transport on simulated QUIC, with scripted peers. It's checked by
-/// [`storage_properties`].
+/// [`wire_properties`].
 pub struct HeaderWire {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
     owners: Rc<RefCell<HeaderSyncView>>,
+    /// The peers the scenario marks `HonestPeer`.
+    honest: Rc<BTreeSet<usize>>,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -479,9 +516,10 @@ pub struct HeaderWire {
 impl HasView for HeaderWire {
     type View = HeaderWireView;
 
-    /// The node's port, the dispatch guard's flag and the owners.
+    /// The node's port, the dispatch guard's flag, the honest peers and the
+    /// owners.
     fn view(&self) -> HeaderWireView {
-        header_view(&self.port, &self.dispatch, &self.owners)
+        header_view(&self.port, &self.dispatch, &self.honest, &self.owners)
     }
 
     /// The boundary the hub last closed.
@@ -633,13 +671,14 @@ impl Subsystem for HeaderWire {
             port: ports.node,
             dispatch,
             owners,
+            honest: Rc::new(scenario.honest_peers()),
             _keep: Box::new(node),
         }
     }
 
-    /// [`storage_properties`].
+    /// [`wire_properties`].
     fn properties() -> Vec<Property<Self>> {
-        storage_properties()
+        wire_properties()
     }
 
     /// The storage harness's sources, plus the network's datagrams, the
@@ -658,15 +697,26 @@ impl Subsystem for HeaderWire {
     /// For a scenario with an adversary, `BoundedAdversary` at
     /// [`ADVERSARY_RATE`] actions per virtual second, the budget
     /// [`PeerControl`] holds every adversary to (M5-Q9). A scenario of
-    /// honest and scripted peers has no hostile peer to bound.
+    /// honest and scripted peers has no hostile peer to bound. For a
+    /// scenario with honest peers, `HonestPeer` with their names
+    /// ([`WireScenario::honest_peers`]).
     fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
-        if scenario.peers.iter().all(|peer| peer.adversary.is_none()) {
-            return Assumptions::none();
+        let mut declared = Vec::new();
+        if scenario.peers.iter().any(|peer| peer.adversary.is_some()) {
+            declared.push(AssumeRecord {
+                assume: Assume::BoundedAdversary,
+                params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
+            });
         }
-        Assumptions::declare(vec![AssumeRecord {
-            assume: Assume::BoundedAdversary,
-            params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
-        }])
+        let honest = scenario.honest_peers();
+        if !honest.is_empty() {
+            let names: Vec<String> = honest.iter().map(|index| format!("peer-{index}")).collect();
+            declared.push(AssumeRecord {
+                assume: Assume::HonestPeer,
+                params: serde_json::json!({ "peers": names }),
+            });
+        }
+        Assumptions::declare(declared)
     }
 
     /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), or
@@ -699,6 +749,24 @@ pub fn storage_config() -> RunConfig {
         drain_bound: 1_000,
         ..RunConfig::default()
     }
+}
+
+/// The family header sync's generated property IDs name.
+pub const FAMILY: &str = "header-sync";
+
+/// `header-sync/wire`'s properties: [`storage_properties`], then header
+/// sync's generated receiver and sender properties (M5-Q13), then
+/// `session/honest-never-punished`. Header sync's adapter observes none of
+/// the downstream templates' effects, so it registers none of them.
+pub fn wire_properties<S: HasView>() -> Vec<Property<S>>
+where
+    S::View: Borrow<StorageView> + HonestPeers,
+{
+    let mut properties = storage_properties();
+    properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
+    properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
+    properties.push(honest_never_punished());
+    properties
 }
 
 /// The storage harness's properties, [`OPERATION_IDS`] then

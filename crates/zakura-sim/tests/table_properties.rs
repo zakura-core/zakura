@@ -181,6 +181,7 @@ fn consequences_follow_the_table() {
     }
     assert!(is_fault_cause("service_protocol_reject"));
     assert!(is_fault_cause("ordered_read_rejected"));
+    assert!(is_fault_cause("undersized_frame_cap"));
     for neutral in [
         "idle_timeout",
         "ordered_read_timeout",

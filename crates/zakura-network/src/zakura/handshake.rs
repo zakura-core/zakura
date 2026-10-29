@@ -137,6 +137,14 @@ const ACCEPT_DISCRIMINATOR: u8 = 2;
 const REJECT_DISCRIMINATOR: u8 = 3;
 pub(crate) const FRAME_HEADER_BYTES: usize = 2 + 2 + 4;
 
+/// Whether a frame cap fits a frame header and at least one payload byte.
+///
+/// A peer's frame cap bounds every frame we send it, so a cap that fails this
+/// check leaves us unable to send any payload.
+pub(crate) fn frame_cap_carries_payload(max_frame_bytes: u32) -> bool {
+    usize::try_from(max_frame_bytes).is_ok_and(|cap| cap > FRAME_HEADER_BYTES)
+}
+
 /// A bounded authenticated Zakura peer identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(
@@ -1680,7 +1688,7 @@ fn validate_initial_limits(
 ) -> Result<(), ZakuraRejectReason> {
     // This negotiated ceiling is wider than most stream kinds need; per-kind
     // frame handling applies the effective cap before payload allocation.
-    if limits.max_frame_bytes == 0
+    if !frame_cap_carries_payload(limits.max_frame_bytes)
         || limits.max_frame_bytes > local.max_message_bytes
         || limits.max_message_bytes == 0
         || limits.max_message_bytes > local.max_message_bytes
@@ -2409,6 +2417,26 @@ mod tests {
                     &local
                 ),
                 Err(ZakuraValidationError::ResourceLimit)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_limits_refuse_a_frame_cap_without_payload_room() {
+        let local = local_config();
+        let header = u32::try_from(FRAME_HEADER_BYTES).unwrap();
+        for (max_frame_bytes, accepted) in [(0, false), (header, false), (header + 1, true)] {
+            let limits = ZakuraInitialLimits {
+                max_frame_bytes,
+                max_message_bytes: local.max_message_bytes,
+                max_open_streams: local.max_open_streams,
+                max_inbound_queue_depth: local.max_inbound_queue_depth,
+                idle_timeout_millis: local.max_idle_timeout_millis,
+            };
+            assert_eq!(
+                validate_initial_limits(limits, &local).is_ok(),
+                accepted,
+                "max_frame_bytes {max_frame_bytes}"
             );
         }
     }

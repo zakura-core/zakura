@@ -504,6 +504,19 @@ impl Outgoing {
         })
     }
 
+    /// Whether any frame here found its cadence bucket empty when charged.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.records.iter().any(|record| {
+            matches!(
+                record,
+                RecordBody::Frame {
+                    exhausted: true,
+                    ..
+                }
+            )
+        })
+    }
+
     /// `frames` in order, written with one call, so a burst's writes don't
     /// each take their own steps.
     pub(crate) fn burst(frames: Vec<Outgoing>) -> Outgoing {
@@ -715,13 +728,6 @@ impl StreamModels {
                 payload: header.payload_len as u64,
             }],
         }
-    }
-
-    /// The cadence tokens left in `message_type`'s bucket, if it has been
-    /// charged.
-    pub(crate) fn tokens(&self, message_type: u16) -> Option<u32> {
-        self.cadence
-            .tokens(SESSION, RegtestMessage::LAYOUT[0].version, message_type)
     }
 
     /// Every label of `frame`: its header's faults, its role's under the

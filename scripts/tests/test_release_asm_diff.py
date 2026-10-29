@@ -83,21 +83,36 @@ def macho_object(symbols, relocations, bitcode=b"bc"):
     return header + segment + symtab + text + bitcode + relocs + entries + strings
 
 
-def elf(sections):
-    """A minimal 64-bit ELF file. `sections` lists `(name, type, flags, contents, info)`."""
-    names = b"\0" + b"".join(name.encode() + b"\0" for name, *_ in sections) + b".shstrtab\0"
-    payload, headers, offset, name_at = b"", [b"\0" * 64], 64, 1
-    for name, stype, flags, contents, info in sections:
+def elf(sections, elf_type=2, program_headers=()):
+    """A minimal 64-bit ELF file.
+
+    `sections` lists `(name, type, flags, contents, info, link)`, and
+    `program_headers` lists `(type, flags)`.
+    """
+    names = b"\0" + b"".join(section[0].encode() + b"\0" for section in sections) + b".shstrtab\0"
+    phdrs = b"".join(struct.pack("<IIQQQQQQ", ptype, flags, 0, 0, 0, 0, 0, 16) for ptype, flags in program_headers)
+    offset = 64 + len(phdrs)
+    payload, headers, name_at = b"", [b"\0" * 64], 1
+    for name, stype, flags, contents, info, link in sections:
         headers.append(struct.pack("<IIQQQQIIQQ", name_at, stype, flags, 0, offset + len(payload),
-                                   len(contents), 0, info, 1, 0))
+                                   len(contents), link, info, 1, 24 if stype == 2 else 0))
         name_at += len(name) + 1
         payload += contents
     headers.append(struct.pack("<IIQQQQIIQQ", name_at, 3, 0, 0, offset + len(payload), len(names), 0, 0, 1, 0))
     payload += names
     header = (b"\x7fELF\x02\x01\x01" + b"\0" * 9
-              + struct.pack("<HHIQQQIHHHHHH", 2, 0xB7, 1, 0x400000, 0, offset + len(payload), 0, 64, 0, 0, 64,
-                            len(headers), len(headers) - 1))
-    return header + payload + b"".join(headers)
+              + struct.pack("<HHIQQQIHHHHHH", elf_type, 0xB7, 1, 0x400000, 64 if phdrs else 0, offset + len(payload),
+                            0, 64, 56, len(program_headers), 64, len(headers), len(headers) - 1))
+    return header + phdrs + payload + b"".join(headers)
+
+
+def elf_object(target):
+    """A minimal ELF object whose one `.text` relocation targets section symbol 1 (`.data.x`) or 2 (`.data.y`)."""
+    symbols = (b"\0" * 24 + struct.pack("<IBBHQQ", 0, 3, 0, 2, 0, 0) + struct.pack("<IBBHQQ", 0, 3, 0, 3, 0, 0))
+    rela = struct.pack("<QQq", 0, (target << 32) | 257, 0)
+    return elf([(".text", 1, 6, b"code", 0, 0), (".data.x", 1, 3, b"xxxxxxxx", 0, 0), (".data.y", 1, 3, b"yyyyyyyy", 0, 0),
+                (".rela.text", 4, 0x40, rela, 1, 5), (".symtab", 2, 0, symbols, 3, 6), (".strtab", 3, 0, b"\0", 0, 0)],
+               elf_type=1)
 
 
 TEXT = ("__TEXT", "__text", b"\x1f\x20\x03\xd5" * 4, 0x80000400)
@@ -210,15 +225,30 @@ class ImageTests(unittest.TestCase):
 
         def build(rela=b"r1", debug=b"d1", build_id=b"b1"):
             """A crafted ELF file with one changeable section of each kind, `.rela.text` applying to `.text`."""
-            return elf([(".text", 1, 6, b"code", 0), (".data.rel.ro", 1, 3, b"vtable", 0),
-                        (".rela.text", 4, 0x40, rela, 1), (".debug_info", 1, 0, debug, 0),
-                        (".note.gnu.build-id", 7, 2, build_id, 0)])
+            return elf([(".text", 1, 6, b"code", 0, 0), (".data.rel.ro", 1, 3, b"vtable", 0, 0),
+                        (".rela.text", 4, 0x40, rela, 1, 0), (".debug_info", 1, 0, debug, 0, 0),
+                        (".note.gnu.build-id", 7, 2, build_id, 0, 0)])
 
         status, out = image_status(build(), build(debug=b"d2", build_id=b"b2"))
         self.assertEqual(status, 0, out)
         status, out = image_status(build(), build(rela=b"r2"))
         self.assertEqual(status, 1, out)
         self.assertIn("section .rela.text", out)
+
+    def test_elf_section_symbol_targets_stay_apart(self):
+        """An ELF object relocation that moves between two unnamed section symbols fails."""
+        status, out = image_status(elf_object(1), elf_object(1))
+        self.assertEqual(status, 0, out)
+        status, out = image_status(elf_object(1), elf_object(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.text", out)
+
+    def test_elf_program_headers_count(self):
+        """An executable stack, which only a program header records, fails."""
+        stack = 0x6474E551
+        status, out = image_status(elf([], program_headers=[(stack, 6)]), elf([], program_headers=[(stack, 7)]))
+        self.assertEqual(status, 1, out)
+        self.assertIn("program header 0", out)
 
     def test_a_generic_change_shows_in_the_binary(self):
         """A change that only the binary holds fails there, though every library matches."""
@@ -240,15 +270,18 @@ class ImageTests(unittest.TestCase):
         self.assertIn("binary zakurad codegen-units=4: 1 files: differs", out.getvalue())
 
 
-def aligned(base_text, head_text):
+def aligned(base_text, head_text, extra=None):
     """Pads two versions of one `.rs` file as the gate does, through a real `git diff`.
 
-    Returns each side's padded lines and the paddings each side made.
+    `extra` maps other file names to text both versions share. Returns each
+    side's padded lines and the paddings each side made.
     """
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
+        for name, text in (extra or {}).items():
+            (repo / name).write_text(text)
         revs = []
         for text in (base_text, head_text):
             (repo / "lib.rs").write_text(text)
@@ -297,6 +330,21 @@ class AlignmentTests(unittest.TestCase):
             head = "fn f() {\n    let s = %sone\nthree\nfour\ntwo%s;\n}\n" % (opener, closer)
             with self.assertRaises(asm_diff.PaddingError, msg=opener):
                 aligned(base, head)
+
+    def test_padding_above_a_line_value_is_refused(self):
+        """Padding above a `line!()` would change a value the program computes with, so it's refused."""
+        base = ["fn f() {", "    let a = 1;", "}", "fn here() -> u32 {", "    line!()", "}", ""]
+        head = base[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + base[2:]
+        with self.assertRaises(asm_diff.PaddingError):
+            aligned("\n".join(base), "\n".join(head))
+
+    def test_padding_an_embedded_file_with_only_blank_lines_is_refused(self):
+        """A blank-line change to a file another embeds would pad to the same text, so it's refused."""
+        embeds = {"main.rs": "const SOURCE: &str = include_str!(\"lib.rs\");\n"}
+        with self.assertRaises(asm_diff.PaddingError):
+            aligned("\n".join(SOURCE), "\n".join(SOURCE[:2] + ["", ""] + SOURCE[2:]), embeds)
+        _, made = aligned("\n".join(SOURCE), "\n".join(SOURCE[:2] + ["    let b = 2;"] + SOURCE[2:]), embeds)
+        self.assertEqual(made, [[("lib.rs", 2, 1)], []])
 
     def test_literals_and_lifetimes_are_told_apart(self):
         """Char literals, lifetimes, nested comments, escaped newlines and raw strings are lexed right."""

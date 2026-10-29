@@ -23,9 +23,11 @@ that only real changes differ:
     `tracing` callsites. So for each hunk of `git diff base head`, the
     shorter side is padded with blank lines to the longer side's length.
     Every unchanged line then has the same number on both sides. A blank
-    line changes no token, so each side still builds the same code. Padding
-    inside a string literal or block comment would change a token, so the
-    tool refuses then (see `safe_boundaries`). Every padding is printed.
+    line changes no token, so each side still builds the same code. The
+    tool refuses padding that could hide more than line numbers in panic
+    and log metadata: inside a string literal or block comment, above a
+    `line!()`, or of a blank-line-only change to a file another embeds (see
+    `align_tree`). Every padding is printed.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
@@ -90,9 +92,18 @@ def parse_hunks(diff_text):
     ]
 
 
+class FileHunks(dict):
+    """`{path: hunks}` for the files both sides have, and in `blank_only` the ones whose every changed line is blank."""
+
+    def __init__(self):
+        """Starts empty."""
+        super().__init__()
+        self.blank_only = set()
+
+
 def parse_file_hunks(diff_text):
-    """Splits a `-U0` diff into `{path: hunks}` for files that both sides have."""
-    files, path = {}, None
+    """Splits a `-U0` diff into a `FileHunks` for files that both sides have."""
+    files, path = FileHunks(), None
     old = None
     for line in diff_text.splitlines():
         if line.startswith("--- "):
@@ -102,8 +113,11 @@ def parse_file_hunks(diff_text):
             path = new[2:] if old != "/dev/null" and new != "/dev/null" else None
             if path is not None:
                 files[path] = []
+                files.blank_only.add(path)
         elif line.startswith("@@") and path is not None:
             files[path].extend(parse_hunks(line))
+        elif line.startswith(("+", "-")) and path is not None and line[1:].strip():
+            files.blank_only.discard(path)
     return files
 
 
@@ -196,20 +210,64 @@ def pad_text(text, inserts, path="<text>"):
     return "\n".join(lines)
 
 
+LINE_MACRO = re.compile(r"\bline!\s*\(")
+INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?!\s*\(\s*\"([^\"]+)\"")
+
+
+def check_line_values(text, inserts, path):
+    """Refuses padding above a `line!()` written in the file itself.
+
+    Padding moves the line numbers below it, which is fine where they only
+    label panics and log lines, but `line!()` makes a line number a value
+    the program computes with, which the real head may not share.
+    """
+    first = min(after for after, _ in inserts)
+    for number, line in enumerate(text.split("\n"), 1):
+        if number > first and LINE_MACRO.search(line.split("//", 1)[0]):
+            raise PaddingError("padding after %s:%d would move the value of line!() at line %d" % (path, first, number))
+
+
+def check_includes(tree, padded):
+    """Refuses padding a file that another source file embeds, when the file's only change is blank lines.
+
+    `include!`, `include_str!` and `include_bytes!` make a file's text part
+    of the program. A real change to that text still differs after padding,
+    so the bytes catch it, but a change of only blank lines would pad to the
+    same text on both sides.
+    """
+    for source in tree.rglob("*.rs"):
+        if "target" in source.relative_to(tree).parts[:1]:
+            continue
+        text = source.read_bytes().decode(errors="replace")
+        for included in INCLUDE.findall(text):
+            target = (source.parent / included).resolve()
+            if target in padded:
+                raise PaddingError("%s embeds %s, which padding changes" % (source.relative_to(tree), included))
+
+
 def align_tree(tree, file_hunks, side):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Returns the `(path, after_line, count)` paddings it made.
+    Refuses padding inside a literal (see `pad_text`), above a `line!()`
+    (see `check_line_values`), or of a blank-line-only change in a file
+    another one embeds (see `check_includes`). Returns the
+    `(path, after_line, count)` paddings it made.
     """
-    made = []
+    made, padded = [], set()
+    blank_only = getattr(file_hunks, "blank_only", set())
     for path, hunks in sorted(file_hunks.items()):
         inserts = paddings(hunks)[0 if side == "base" else 1]
         if not inserts:
             continue
         file = tree / path
-        file.write_bytes(pad_text(file.read_bytes().decode(errors="surrogateescape"), inserts, path)
-                         .encode(errors="surrogateescape"))
+        text = file.read_bytes().decode(errors="surrogateescape")
+        check_line_values(text, inserts, path)
+        file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
+        if path in blank_only:
+            padded.add(file.resolve())
+    if padded:
+        check_includes(tree, padded)
     return made
 
 
@@ -261,13 +319,18 @@ def macho_symbols(data, commands):
 
 
 def macho_relocations(data, reloff, nreloc, symbols, cputype):
-    """A section's relocations, with each external one naming its symbol rather than its index."""
+    """A section's relocations, each external one naming its symbol rather than its index.
+
+    A symbol is named by its name, type, section and value, so two symbols
+    that drop to the same name (see `LLVM_SUFFIX`) stay apart unless they
+    are the same address.
+    """
     out = []
     for k in range(nreloc):
         address, packed = struct.unpack_from("<iI", data, reloff + 8 * k)
         target, extern, rtype = packed & 0xFFFFFF, packed >> 27 & 1, packed >> 28
         if extern and not (cputype == CPU_ARM64 and rtype == ARM64_RELOC_ADDEND) and target < len(symbols):
-            target = symbols[target][0]
+            target = symbols[target]
         out.append(b"%d %d %r" % (address, packed >> 24, target))
     return b"\n".join(out)
 
@@ -335,16 +398,19 @@ ELF_MAGIC = b"\x7fELF\x02\x01"
 SHF_ALLOC = 0x2
 SHT_NOBITS, SHT_SYMTAB, SHT_RELA, SHT_REL = 8, 2, 4, 9
 ET_REL = 1
+STT_SECTION = 3
 
 
 def elf_image(data):
     """The runtime parts of a 64-bit little-endian ELF file, as `{name: bytes}`.
 
-    Keeps every allocated section's header and contents except the build
-    ID, and every relocation section that applies to one. In an object file,
-    relocations name their symbols, and its symbols are kept, their names
-    without LLVM's promotion suffix (see `LLVM_SUFFIX`). Debug and other
-    unallocated sections, embedded bitcode among them, are skipped.
+    Keeps every program header, every allocated section's header and
+    contents except the build ID, and every relocation section that applies
+    to one. In an object file, relocations name their symbols by name, type,
+    section and value, a section symbol by its section, and the symbols are
+    kept with their names without LLVM's promotion suffix (see
+    `LLVM_SUFFIX`). Debug and other unallocated sections, embedded bitcode
+    among them, are skipped.
     """
     image = {"header": data[16:24] + data[24:32]}
     obj = struct.unpack_from("<H", data, 16)[0] == ET_REL
@@ -358,13 +424,22 @@ def elf_image(data):
         start = names_at + header[0]
         return data[start:data.index(b"\0", start)].decode()
 
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    for k in range(phnum):
+        # Every program header: type, permissions, mapping and alignment.
+        image["program header %d" % k] = data[phoff + k * phentsize:phoff + (k + 1) * phentsize]
     symbols = []
     for header in headers:
         if header[1] == SHT_SYMTAB and obj:
             strings = headers[header[6]][4]
             for k in range(header[5] // 24):
                 strx, info, other, shndx, value, size = struct.unpack_from("<IBBHQQ", data, header[4] + 24 * k)
-                symbols.append((symbol_name(data, strings, strx), info, other, shndx, value, size))
+                sym = symbol_name(data, strings, strx)
+                if info & 0xF == STT_SECTION and shndx < count:
+                    # A section symbol has no name of its own.
+                    sym = b"section " + name(headers[shndx]).encode()
+                symbols.append((sym, info, other, shndx, value, size))
             image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
     for header in headers:
         sname, stype, flags, addr, start, length, link, info, align, _ = header
@@ -377,7 +452,7 @@ def elf_image(data):
                 offset, rinfo = struct.unpack_from("<QQ", data, start + width * k)
                 addend = struct.unpack_from("<q", data, start + width * k + 16)[0] if width == 24 else 0
                 index = rinfo >> 32
-                target = symbols[index][0] if index < len(symbols) else index
+                target = symbols[index] if index < len(symbols) else index
                 entries.append(b"%d %d %r %d" % (offset, rinfo & 0xFFFFFFFF, target, addend))
             image["section %s" % name(header)] = struct.pack("<IQ", stype, flags) + b"\n".join(entries)
         elif keep or relocates:

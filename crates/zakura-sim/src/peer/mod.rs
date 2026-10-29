@@ -15,11 +15,12 @@
 pub(crate) mod handshake;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     future::Future,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -168,8 +169,30 @@ impl PeerAction {
 
 /// Why a peer couldn't go on, which ends the run as a harness failure: the
 /// scenario asked for something its peer can't do, or the node opened a
-/// header stream at a version the peer doesn't speak.
-pub type PeerFailure = Rc<RefCell<Option<String>>>;
+/// header stream at a version the peer doesn't speak. The first failure
+/// recorded stands. Stream tasks record into it directly, so a failure
+/// still counts after its connection closes.
+#[derive(Clone, Debug, Default)]
+pub struct PeerFailure(Arc<Mutex<Option<String>>>);
+
+impl PeerFailure {
+    /// Records `why`, unless a failure is already recorded. The lock is
+    /// never held across another call.
+    fn record(&self, why: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(why);
+    }
+
+    /// The failure recorded, if any.
+    fn get(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
 
 /// Whether a peer may be offered its next action, shared by its task and
 /// [`PeerControl`]. A queued action keeps the peer unready until its task
@@ -292,7 +315,7 @@ impl ActionSource for PeerControl {
 
     /// Fails the run once a peer couldn't carry out an action.
     fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
-        match self.failure.borrow().as_ref() {
+        match self.failure.get() {
             Some(failure) => Err(format!("PeerActionFailed: {failure}")),
             None => Ok(()),
         }
@@ -332,9 +355,6 @@ enum StreamEvent {
     Header { id: u64, send: SendStream },
     /// The node's first whole frame arrived on header stream `id`.
     FirstFrame { id: u64 },
-    /// The node opened header stream `id` at a version other than
-    /// [`ZAKURA_HEADER_SYNC_STREAM_VERSION`].
-    BadVersion { id: u64, version: u16 },
 }
 
 /// One socket at `addr`, with room for the streams a scenario opens.
@@ -402,14 +422,17 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
     }
 }
 
-/// Serves one stream the node opened: a header stream goes to the peer and
-/// is read, and any other is held and drained until it ends. A header
-/// stream at a version the peer doesn't speak is reported instead, since
-/// the node only opens the version it negotiated.
+/// Serves one stream the node opened on peer `name`'s connection: a header
+/// stream goes to the peer and is read, and any other is held and drained
+/// until it ends. A header stream at a version the peer doesn't speak fails
+/// the run through `failure` instead, since the node only opens the version
+/// it negotiated.
 async fn serve_stream(
     send: SendStream,
     mut recv: RecvStream,
     events: mpsc::UnboundedSender<StreamEvent>,
+    name: String,
+    failure: PeerFailure,
 ) {
     let Ok(prelude) = handshake::read_prelude(&mut recv).await else {
         return;
@@ -417,8 +440,11 @@ async fn serve_stream(
     if prelude.stream_kind == ZAKURA_STREAM_HEADER_SYNC {
         let id = recv.id();
         if prelude.stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION {
-            let version = prelude.stream_version;
-            let _ = events.send(StreamEvent::BadVersion { id, version });
+            failure.record(format!(
+                "{name}: the node opened header stream {id} at version {}, not \
+                 {ZAKURA_HEADER_SYNC_STREAM_VERSION}",
+                prelude.stream_version
+            ));
             return;
         }
         if events.send(StreamEvent::Header { id, send }).is_ok() {
@@ -430,10 +456,17 @@ async fn serve_stream(
     }
 }
 
-/// Accepts every stream the node opens on `conn`, each in its own task.
-async fn accept_streams(conn: Conn, events: mpsc::UnboundedSender<StreamEvent>) {
+/// Accepts every stream the node opens on peer `name`'s `conn`, each in its
+/// own task, with failures going to `failure`.
+async fn accept_streams(
+    conn: Conn,
+    events: mpsc::UnboundedSender<StreamEvent>,
+    name: String,
+    failure: PeerFailure,
+) {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        zakura_rt::task::spawn_named("peer_stream", serve_stream(send, recv, events.clone()));
+        let stream = serve_stream(send, recv, events.clone(), name.clone(), failure.clone());
+        zakura_rt::task::spawn_named("peer_stream", stream);
     }
 }
 
@@ -454,9 +487,7 @@ impl PeerTask {
 
     /// Records why the peer can't go on, as [`PeerFailure`] describes.
     fn fail(&self, why: impl std::fmt::Display) -> Ended {
-        self.failure
-            .borrow_mut()
-            .get_or_insert_with(|| format!("{}: {why}", self.name));
+        self.failure.record(format!("{}: {why}", self.name));
         Ended::Failed
     }
 
@@ -551,7 +582,13 @@ impl PeerTask {
     async fn serve(&mut self, conn: &Conn, negotiated: u64) -> Ended {
         let header_sync = negotiated & ZAKURA_CAP_HEADER_SYNC != 0;
         let (events, mut stream_events) = mpsc::unbounded_channel();
-        zakura_rt::task::spawn_named("peer_accept", accept_streams(conn.clone(), events.clone()));
+        let accept = accept_streams(
+            conn.clone(),
+            events.clone(),
+            self.name.clone(),
+            self.failure.clone(),
+        );
+        zakura_rt::task::spawn_named("peer_accept", accept);
         // The header stream the peer writes on, and whether it's settled.
         let mut header: Option<(u64, SendStream)> = None;
         let mut settled = !header_sync;
@@ -579,12 +616,6 @@ impl PeerTask {
                     StreamEvent::Header { id, send } => header = Some((id, send)),
                     StreamEvent::FirstFrame { id } => {
                         settled |= header.as_ref().is_some_and(|(current, _)| *current == id);
-                    }
-                    StreamEvent::BadVersion { id, version } => {
-                        return self.fail(format!(
-                            "the node opened header stream {id} at version {version}, not \
-                             {ZAKURA_HEADER_SYNC_STREAM_VERSION}"
-                        ));
                     }
                 },
                 Some(action) = self.commands.recv() => {

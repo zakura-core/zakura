@@ -4,7 +4,7 @@
 //! tapped. `header-sync/wire` runs the same node behind its real transport
 //! on simulated QUIC, with scripted peers (M5-C).
 
-use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{any::Any, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::{block::Height, parameters::Network};
@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     observe::StorageFact,
-    peer::{Dialer as PeerDialer, PeerControl, PeerSpec, PeerTask, NODE_ADDR},
+    peer::{Dialer as PeerDialer, PeerControl, PeerFailure, PeerSpec, PeerTask, NODE_ADDR},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict},
     storage::HEADER_SERVICE,
     Observation, RunConfig, Sim,
@@ -470,7 +470,7 @@ impl Subsystem for HeaderWire {
             scenario.net.seed,
             observer,
         );
-        let failure = Rc::new(RefCell::new(None));
+        let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) = control.add(&name, spec.script.clone());

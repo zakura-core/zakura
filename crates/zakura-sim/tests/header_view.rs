@@ -9,12 +9,19 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    rc::Rc,
+};
 
 use zakura_network::zakura::{
     v9::RegtestMessage, ZAKURA_CAP_DISCOVERY, ZAKURA_HEADER_SYNC_STREAM_VERSION,
     ZAKURA_STREAM_HEADER_SYNC,
 };
+use zakura_scheduler::{At, TaskId};
 use zakura_sim::{
     harness::{
         header_node::{
@@ -30,7 +37,7 @@ use zakura_sim::{
     property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
     table::{sender_properties, table_properties},
     Checker, MemorySink, NoChecks, Observation, ObservationLog, Plan, PlanInput, PropertyReport,
-    RunEnd, RunReport, StepCtx, Violation,
+    RunEnd, RunReport, Sim, StepCtx, TaskHold, Violation,
 };
 use zakura_sim::{
     model::is_fault_cause,
@@ -653,15 +660,72 @@ fn a_reset_reaches_the_reader_without_a_write() {
 }
 
 /// A frame the peer's reader finished is received at the read's boundary,
-/// with the frame it read, even when the peer's task handles it in a later
-/// step: its `peer-emitted` receipt holds the frame's flags and payload
-/// digest, and the stream is admitted already, so its one `peer-received`
-/// and one `node-frame` resolve in the receipt's own step, naming it. The
-/// history where the connection closes before the task handles it isn't
-/// reached by any saved Plan or script, so this covers the later handling
-/// only.
+/// with the frame it read, whether the peer's task handles it in a later
+/// step or never: its `peer-emitted` receipt holds the frame's flags and
+/// payload digest, and the stream is admitted already, so its one
+/// `peer-received` and one `node-frame` resolve in the receipt's own step,
+/// naming it. The never-handled history is the second run's (see
+/// [`HoldReceipt`]).
 #[test]
 fn a_received_frame_keeps_its_read_boundary() {
+    let mut scenario = honest(vec![PeerAction::Disconnect]);
+    scenario.peers[0]
+        .honest
+        .as_mut()
+        .expect("the peer is honest")
+        .chain = 1_200;
+    let state = Rc::new(HoldState::default());
+    let mut sim = Sim::new(HeaderWire::config(&scenario), Plan::from_fuzz(&[]));
+    let _node = HeaderWire::build(&mut sim, &scenario, HeaderWire::prepare(&scenario));
+    sim.hold_tasks(Box::new(HoldReceipt(state.clone())));
+    let report = sim.run(&mut Watch(state.clone()), &mut MemorySink::default());
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let ended = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry.obs,
+                Observation::PeerEmitted {
+                    body: EmittedBody::ConnEnded { .. },
+                    ..
+                }
+            )
+        })
+        .expect("the peer disconnects");
+    let unhandled: Vec<&Entry> = entries[..ended]
+        .iter()
+        .filter(|entry| match &entry.obs {
+            Observation::PeerEmitted {
+                body: EmittedBody::Received { seq, .. },
+                ..
+            } => !entries.iter().any(|later| {
+                matches!(later.obs, Observation::PeerEmitted {
+                    body: EmittedBody::Handled { seq: s }, ..
+                } if s == *seq)
+            }),
+            _ => false,
+        })
+        .collect();
+    let [receipt] = unhandled[..] else {
+        panic!("one frame is never handled: {unhandled:?}");
+    };
+    let resolved: Vec<&Observation> = entries
+        .iter()
+        .filter(|row| row.origin == Some(receipt.pos) && row.step == receipt.step)
+        .map(|row| &row.obs)
+        .collect();
+    assert!(
+        matches!(
+            resolved[..],
+            [
+                Observation::PeerReceived { .. },
+                Observation::NodeFrame { .. }
+            ]
+        ),
+        "the never-handled frame resolves at its read: {resolved:?}"
+    );
+
     let (report, _) = run::<HeaderWire>(&honest(Vec::new()), Plan::from_fuzz(&[]), &mut NoChecks);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     let entries = report.log.entries();
@@ -727,6 +791,74 @@ fn a_received_frame_keeps_its_read_boundary() {
         digests.values().any(|seen| seen.len() > 1),
         "two frames of one type and length have different digests"
     );
+}
+
+/// What [`HoldReceipt`] holds on, which [`Watch`] keeps up to date.
+#[derive(Default)]
+struct HoldState {
+    /// The plan has queued the peer's disconnect, and it hasn't ended yet.
+    disconnecting: Cell<bool>,
+    /// The receipts the peer's task hasn't handled, by stream and `seq`.
+    waiting: RefCell<BTreeSet<(Option<u64>, u64)>>,
+}
+
+/// Once the peer's disconnect is queued, holds its task until its reader
+/// has recorded a frame the task hasn't handled, then holds the reader at
+/// its channel send, the point right after the receipt, while the task
+/// disconnects and drops the channel. So the frame is read and never
+/// handled.
+struct HoldReceipt(Rc<HoldState>);
+
+impl TaskHold for HoldReceipt {
+    /// Holds a point of the peer module's tasks: the reader's send while a
+    /// receipt waits, and any other point until one does.
+    fn holds(&self, _: TaskId, at: &At) -> bool {
+        let peer = at
+            .site
+            .is_some_and(|site| site.file().ends_with("zakura-sim/src/peer/mod.rs"));
+        peer && self.0.disconnecting.get()
+            && (at.op.name() == "send") == !self.0.waiting.borrow().is_empty()
+    }
+}
+
+/// Keeps [`HoldState`] up to date from each step's rows.
+struct Watch(Rc<HoldState>);
+
+impl Checker for Watch {
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        if cx.pick.to_string() == "peer:peer-0:disconnect" {
+            self.0.disconnecting.set(true);
+        }
+        let mut waiting = self.0.waiting.borrow_mut();
+        for obs in cx.observations() {
+            match obs {
+                Observation::PeerEmitted {
+                    quic_stream,
+                    body: EmittedBody::Received { seq, .. },
+                    ..
+                } => {
+                    waiting.insert((*quic_stream, *seq));
+                }
+                Observation::PeerEmitted {
+                    quic_stream,
+                    body: EmittedBody::Handled { seq },
+                    ..
+                } => {
+                    waiting.remove(&(*quic_stream, *seq));
+                }
+                Observation::PeerEmitted {
+                    body: EmittedBody::ConnEnded { .. },
+                    ..
+                } => self.0.disconnecting.set(false),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
 }
 
 /// A peer that didn't negotiate header sync opens a header stream, and the

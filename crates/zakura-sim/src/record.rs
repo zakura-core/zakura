@@ -1561,7 +1561,7 @@ mod tests {
     fn peer_end_encoding_is_pinned() {
         use crate::{
             model::Label,
-            observe::{ConnEnd, Direction, EmittedBody, StreamEnd},
+            observe::{ConnEnd, Direction, EmittedBody, StreamEnd, StreamId},
         };
 
         let emitted = |quic_stream, body| Observation::PeerEmitted {
@@ -1574,9 +1574,15 @@ mod tests {
                 Some(4),
                 EmittedBody::Frame {
                     seq: 0,
-                    row: Some("status".into()),
-                    label: Label::Conformant,
-                    payload: 122,
+                    row: Some("headers".into()),
+                    rule_stream: StreamId {
+                        kind: 5,
+                        version: 9,
+                    },
+                    label: Label::OverCredit,
+                    exhausted: false,
+                    exchange: Some(1),
+                    payload: 263,
                 },
             ),
             emitted(Some(4), EmittedBody::Written { seq: 0 }),
@@ -1653,7 +1659,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 21, "{bump}");
         assert_eq!(
             serde_json::to_string(&obs).unwrap(),
-            r#"[{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"frame","seq":0,"row":"status","label":"conformant","payload":122}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"written","seq":0}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"closed"}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"received","seq":1,"message_type":1,"flags":0,"payload":122,"digest":"0011223344556677"}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"handled","seq":1}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","body":{"record":"conn-ended","reason":{"reason":"transport-error","detail":"timed out"}}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"stream-ended","direction":"send","end":{"end":"stopped","code":3}}},{"obs":"peer-conn-ended","connection":1,"quic_stream":4,"reason":{"reason":"received-close","code":0}},{"obs":"peer-conn-ended","connection":1,"reason":{"reason":"local-close"}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"reset","code":7}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"truncated","read":8}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"oversized","len":1073741824}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"finished"}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"send","end":{"end":"closed-stream"}}]"#,
+            r#"[{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"frame","seq":0,"row":"headers","rule_stream":{"kind":5,"version":9},"label":"over-credit","exhausted":false,"exchange":1,"payload":263}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"written","seq":0}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"closed"}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"received","seq":1,"message_type":1,"flags":0,"payload":122,"digest":"0011223344556677"}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"handled","seq":1}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","body":{"record":"conn-ended","reason":{"reason":"transport-error","detail":"timed out"}}},{"obs":"peer-emitted","remote":"10.1.0.1:4000","quic_stream":4,"body":{"record":"stream-ended","direction":"send","end":{"end":"stopped","code":3}}},{"obs":"peer-conn-ended","connection":1,"quic_stream":4,"reason":{"reason":"received-close","code":0}},{"obs":"peer-conn-ended","connection":1,"reason":{"reason":"local-close"}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"reset","code":7}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"truncated","read":8}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"oversized","len":1073741824}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"receive","end":{"end":"finished"}},{"obs":"peer-stream-ended","connection":1,"quic_stream":4,"direction":"send","end":{"end":"closed-stream"}}]"#,
             "{bump}"
         );
     }

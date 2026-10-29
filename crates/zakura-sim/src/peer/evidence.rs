@@ -126,13 +126,18 @@ impl PeerRecord {
             RecordBody::Frame {
                 seq,
                 row,
+                rule_stream,
                 label,
+                exhausted,
+                exchange,
                 payload,
-                ..
             } => EmittedBody::Frame {
                 seq: *seq,
                 row: row.clone(),
+                rule_stream: *rule_stream,
                 label: *label,
+                exhausted: *exhausted,
+                exchange: *exchange,
                 payload: *payload,
             },
             RecordBody::Written { seq } => EmittedBody::Written { seq: *seq },

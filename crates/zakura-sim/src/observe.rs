@@ -487,8 +487,15 @@ pub enum EmittedBody {
         /// The row whose rule its label enforces.
         #[serde(skip_serializing_if = "Option::is_none")]
         row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
         /// Its label.
         label: Label,
+        /// True if its cadence model charged it to an empty bucket.
+        exhausted: bool,
+        /// The exchange it belongs to, if its row has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
         /// Its payload's length in bytes.
         payload: u64,
     },

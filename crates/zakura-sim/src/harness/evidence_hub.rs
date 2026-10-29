@@ -580,12 +580,21 @@ mod tests {
     fn an_unresolved_peer_record_keeps_its_place_around_a_close() {
         let (mut hub, records) = hub();
         let mut log = ObservationLog::default();
-        for pos in [5, 15] {
+        let frame = RecordBody::Frame {
+            seq: 5,
+            row: Some("headers".to_owned()),
+            rule_stream: S5V9,
+            label: Label::OverCredit,
+            exhausted: true,
+            exchange: Some(7),
+            payload: 263,
+        };
+        for (pos, body) in [(5, frame), (15, RecordBody::Written { seq: 5 })] {
             records.push(PeerRecord {
                 pos: Some(pos),
                 remote: peer_addr(0, 0),
                 quic_stream: Some(4),
-                body: RecordBody::Written { seq: pos },
+                body,
             });
         }
         let registered = transport(TransportFact::Registered);
@@ -627,6 +636,20 @@ mod tests {
             .filter(|entry| matches!(entry.obs, Observation::PeerEmitted { .. }))
             .count();
         assert_eq!(emitted, 2);
+        // The frame's row keeps its whole record, since nothing else will.
+        assert!(log.entries().iter().any(|entry| matches!(
+            &entry.obs,
+            Observation::PeerEmitted {
+                body: crate::observe::EmittedBody::Frame {
+                    rule_stream: S5V9,
+                    label: Label::OverCredit,
+                    exhausted: true,
+                    exchange: Some(7),
+                    ..
+                },
+                ..
+            }
+        )));
         assert!(!log
             .entries()
             .iter()

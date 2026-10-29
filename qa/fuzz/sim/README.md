@@ -55,6 +55,35 @@ property's `Active` violation and record nothing, for `cargo fuzz tmin`. An
 abort, a stack overflow, a sanitizer report or a timeout still crashes the
 process, so `tmin`'s output is only a candidate.
 
+## Minimizing a crash
+
+`cargo xtask sim-minimize` runs `tmin` with that variable set, and keeps a
+smaller input only if fresh processes confirm it. Each budget is required:
+
+```console
+cargo xtask sim-minimize race_fixtures artifacts/race_fixtures/crash-… \
+    --property race/lost-update --out <dir> --runs 64 --wall-secs 300 --child-secs 30
+```
+
+The wrapper copies the original into `<dir>/original/` and checks its
+SHA-256 first. It builds `zakura-sim` and the target once, and pins both in
+`<dir>/bin/`. The original and each smaller candidate then pass three fresh
+processes, or the input is rejected:
+
+1. the pinned target must crash with the property's panic alone, not an
+   abort, a sanitizer report, a timeout or another panic;
+2. `zakura-sim confirm` must find the property violated alone, through its
+   trigger history, with the original's harness, generator, build,
+   assumptions and cleanup;
+3. `zakura-sim replay` must replay the recorded trace Exact.
+
+Candidates run smallest first, and the first that passes moves to
+`<dir>/minimized/` with its trace. `<dir>/report.json` gives the status
+(`minimized`, `original-kept`, `original-rejected` or `interrupted`), each
+candidate's rejection reason, the counts, the budgets, the elapsed time and
+whether `tmin` reached its fixed point. The command exits 0 only for
+`minimized`. Ctrl-C stops the run and still writes the report.
+
 Reproduce a crash input as a trace with the `zakura-sim` binary:
 
 ```console

@@ -217,7 +217,7 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
 /// decoded-byte cap, and the mirror keeps delivering 2 MB bodies. Once the
 /// cap fills, the routine hands over raw bytes, so no decoded handoff takes
 /// the queue's and applying's decoded bytes past the cap by more than one
-/// body per routine. With `no-room-check.patch`, every handoff keeps its
+/// body. With `no-room-check.patch`, every handoff keeps its
 /// decoded block, as on main, and the same input violates the property at
 /// step 122,041.
 #[test]

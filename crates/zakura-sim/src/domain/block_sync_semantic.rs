@@ -128,8 +128,8 @@ where
             id: PropertyId::new(INPUT_DECODED_BOUND),
             claim: "a body enters the sequencer input queue holding its decoded block only while \
                     the queue's decoded bytes, applying's decoded bytes and the body's fit under \
-                    BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, plus at most one body per peer \
-                    routine checking the same room at once; past it the body enters as raw bytes",
+                    BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, plus at most one body; past it \
+                    the body enters as raw bytes",
             kind: Kind::Bound {
                 unit: Unit::AttributedHeap,
             },
@@ -696,9 +696,11 @@ impl SemanticModel {
 
     /// Judges a body at `height` that entered the input queue holding
     /// `decoded` attributed bytes of its decoded block, for
-    /// [`INPUT_DECODED_BOUND`]. Every routine checking the same room at once
-    /// may add one body, so the slack is one of the largest decoded bodies
-    /// per session.
+    /// [`INPUT_DECODED_BOUND`]. A routine charges the queue before it checks
+    /// the room, so routines checking at once see each other's bodies. The
+    /// slack is one of the largest decoded bodies, for the sequencer's
+    /// snapshot, which this model reads, running ahead of the `applying`
+    /// total its view publishes.
     fn judge_decoded_handoff(&mut self, height: u32, decoded: u64) {
         self.saw_decoded_queued = true;
         self.largest_queued_decoded = self.largest_queued_decoded.max(decoded);
@@ -706,9 +708,8 @@ impl SemanticModel {
         let resident = queued
             .saturating_add(self.applying_decoded)
             .saturating_add(decoded);
-        let routines = u64::try_from(self.sessions.len()).unwrap_or(u64::MAX);
-        let bound = BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-            .saturating_add(routines.saturating_mul(self.largest_queued_decoded));
+        let bound =
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES.saturating_add(self.largest_queued_decoded);
         self.handoff_past_cap_peak = self
             .handoff_past_cap_peak
             .max(resident.saturating_sub(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES));
@@ -1642,14 +1643,15 @@ mod tests {
         assert_eq!(findings[0].step, 3);
     }
 
-    /// Decoded handoffs that pass the cap by at most one body per routine
-    /// hold.
+    /// Decoded handoffs that pass the cap by at most one body hold, however
+    /// many routines run, and every session the run ever admitted adds no
+    /// slack.
     #[test]
-    fn decoded_handoffs_within_one_body_per_routine_hold() {
+    fn decoded_handoffs_within_one_body_hold() {
         let cap = BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
         assert_eq!(decoded_handoffs(1, cap - DECODED, 1), []);
         assert_eq!(decoded_handoffs(1, cap, 1), []);
-        assert_eq!(decoded_handoffs(2, cap, 2), []);
-        assert_eq!(decoded_handoffs(2, cap, 3).len(), 1);
+        assert_eq!(decoded_handoffs(4, cap, 1), []);
+        assert_eq!(decoded_handoffs(4, cap, 2).len(), 1);
     }
 }

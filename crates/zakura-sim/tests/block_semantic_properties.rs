@@ -221,7 +221,7 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
 /// decoded block, as on main, and the same input violates the property at
 /// step 122,041.
 #[test]
-#[ignore = "a debug run takes minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_decoded_input_stall_input_holds_input_decoded_bound() {
     let ports = witnessed(
         committed(DECODED_INPUT_STALL_INPUT),
@@ -244,7 +244,7 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 /// released submission's height, and no `applying` entry holds it. The
 /// run takes 520,000 steps.
 #[test]
-#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_frontier_first_input_violates_capacity_release_wakes() {
     witnessed(
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
@@ -259,7 +259,7 @@ fn the_frontier_first_input_violates_capacity_release_wakes() {
 /// in #1523's order, so this run isn't the property's witness: the test
 /// checks the run directly. The run takes 520,000 steps.
 #[test]
-#[ignore = "a debug run takes about eight minutes; the `zakura_sim slow witnesses` job runs it with the planted profile"]
+#[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_reply_first_input_holds_capacity_release_wakes() {
     let witness = committed(CAPACITY_REPLY_FIRST_INPUT);
     let (report, ports) = run(&witness.scenario, witness.input);

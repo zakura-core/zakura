@@ -17,7 +17,8 @@ on:
       - "**/Cargo.lock"
       # Include non-Rust inputs compiled or exercised by workspace crates.
       - crates/**
-      # Planted bypass patches and their case files, which sim-planted applies.
+      # Planted bypass patches and their case files, which sim-build's coverage
+      # gate checks.
       - qa/planted/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
@@ -189,8 +190,8 @@ jobs:
           done <<< "$changed"
 
           # Broad test-relevant filter (the paths that formerly gated the whole
-          # workflow on pull_request, plus qa/planted/, whose patches sim-planted
-          # applies). Every config-relevant change also needs the build archive
+          # workflow on pull_request, plus qa/planted/, which sim-build's coverage
+          # gate checks). Every config-relevant change also needs the build archive
           # consumed by zakura-config, so `config` implies `rust` even for paths
           # outside the old workflow-level filter.
           if [[ "$config" == "true" ]] || \
@@ -528,16 +529,15 @@ jobs:
   # Each retained bypass patch under qa/planted/ must still make its
   # property fail. The runner checks out the commit once in a scratch
   # worktree under target/planted/, so the checkout stays clean, builds the
-  # unpatched simulator once, and applies each patch there in turn. A pull
-  # request runs only the cases its changes affect; main and the merge
-  # queue run every case. It runs beside sim-build, whose tests would
-  # otherwise leave it too little of one job's time limit.
+  # unpatched simulator once, and applies each patch there in turn. Each
+  # case runs a campaign of fuzz inputs, which takes minutes, so the job
+  # stays out of the blocking path: it runs every case on the nightly
+  # schedule and on manual dispatch, and test-success doesn't need it.
   sim-planted:
     name: zakura_sim planted
-    needs: changes
     # Paused for now: run the simulator suites locally. To turn the job back
     # on, restore this condition:
-    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     if: false
     permissions:
       contents: read
@@ -547,9 +547,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          # A pull request's checkout is its merge commit. Its first parent,
-          # the base branch, tells the planted runner what the PR changed.
-          fetch-depth: 2
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
@@ -557,53 +554,7 @@ jobs:
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check the planted bypass patches
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            cargo xtask planted --changed-since HEAD^1
-          else
-            cargo xtask planted
-          fi
-        env:
-          RUSTFLAGS: --cfg zakura_sim
-
-  # Some witness tests need a run of half a million simulated steps, which a
-  # debug build takes about eight minutes for. They're ignored in
-  # `sim-build`, and this job runs them beside it with the `planted` profile,
-  # which optimizes and keeps debug assertions and overflow checks on. It has
-  # its own target directory and cache key. Folding it into `sim-planted`
-  # would push that job near its 45-minute timeout.
-  sim-slow-witnesses:
-    name: zakura_sim slow witnesses
-    needs: changes
-    # Paused for now: run the simulator suites locally. To turn the job back
-    # on, restore this condition:
-    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    if: false
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      CARGO_TARGET_DIR: target/sim-slow
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
-        with:
-          toolchain: stable
-          cache-shared-key: zakura-sim-slow
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      # #1523: the frontier-first input violates capacity-release-wakes, and
-      # the reply-first input holds it. #1522: the decoded-input-stall input
-      # holds input-decoded-bound.
-      - name: Run the slow witness tests
-        run: |
-          cargo test --locked --profile planted -p zakura-sim --test block_semantic_properties -- --ignored \
-            the_frontier_first_input_violates_capacity_release_wakes \
-            the_reply_first_input_holds_capacity_release_wakes \
-            the_decoded_input_stall_input_holds_input_decoded_bound
+        run: cargo xtask planted
         env:
           RUSTFLAGS: --cfg zakura_sim
 
@@ -746,8 +697,6 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
-      - sim-planted
-      - sim-slow-witnesses
       - sim-sanitizers
       - zakura-testkit
     timeout-minutes: 30
@@ -762,11 +711,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build, sim-planted and sim-slow-witnesses skip with the same
-          # test-relevant filter as build-tests, and sim-sanitizers skips unless
+          # sim-build skips with the same test-relevant filter as
+          # build-tests, and sim-sanitizers skips unless
           # the scheduler, `zakura-rt`, or their build inputs change.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-slow-witnesses, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

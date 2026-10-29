@@ -219,7 +219,9 @@ jobs:
 
       - name: Read-only release review tests
         if: ${{ !cancelled() }}
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
+        run: |
+          python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-review.txt
+          python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

@@ -1,0 +1,51 @@
+
+### {{ 'Findings' if comment else 'Supported findings' }}
+
+{{ counts }}
+
+{% if not findings and not comment %}
+{{ 'No supported findings reported.' if complete else 'No final finding verdict is available for the unfinished review.' }}
+{% elif not findings and not complete %}
+Final findings are not available until the review finishes.
+{% endif %}
+{% for finding in findings %}
+### {{ loop.index }}. {{ finding.severity }}: {{ finding.title | plain }}
+
+[{{ finding.reference.path | plain }}:{{ finding.reference.start }}]({{ finding_urls[loop.index0] }}) · {{ finding.category }} · supported by source evidence
+
+{% for label, key in finding_fields %}
+{{ '- ' if comment else '' }}**{{ label }}:** {{ finding[key] | plain }}
+{% endfor %}
+
+{% endfor %}
+{% if excluded and not comment %}
+
+### Configured exclusions
+
+{% for entry in excluded %}
+- {{ entry.path | plain }}: matched {{ entry.exclusion_rule | plain }}
+{% endfor %}
+{% endif %}
+{% if missing %}
+
+{% if comment %}
+<details><summary>Coverage gaps ({{ missing | length }} {{ 'file' if missing | length == 1 else 'files' }})</summary>
+{% else %}
+### Coverage gaps
+{% endif %}
+
+{% for entry in (missing[:20] if comment else missing) %}
+- {{ entry.path | plain }}: {{ (entry.reason or entry.status) | plain }}
+{% endfor %}
+{% if comment and missing | length > 20 %}
+- {{ missing | length - 20 }} additional gaps are listed in the report artifact.
+{% endif %}
+{% if comment %}
+
+</details>
+{% endif %}
+{% endif %}
+{% if report.get('candidates') and not report.get('synthesis_complete') %}
+
+{{ report.candidates | length }} preliminary candidates remain unadjudicated in the JSON artifact.
+{% endif %}

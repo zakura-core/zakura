@@ -11,6 +11,7 @@ from .config import Settings
 from .contracts import ModelProvider, ModelRequest, ReviewError, parse_turn
 from .models import Spending
 from .repository import Repository, ReviewUnit
+from .state import ReviewState, update_coverage
 
 
 def review_priority(unit: ReviewUnit) -> int:
@@ -143,12 +144,12 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
            report: dict, checkpoint, *, prior_report: dict | None = None) -> dict:
     """Checkpoint coverage and candidates after each unit, including incomplete runs."""
     spending = Spending(settings)
-    report.update(status="incomplete", findings=[], candidates=[], errors=[], summaries=[],
-                  provider=settings.provider, model=settings.model,
+    report.update(asdict(ReviewState()))
+    report.update(provider=settings.provider, model=settings.model,
                   reasoning_effort=settings.reasoning_effort if settings.provider == "openai" else "provider default",
                   prompt_digest=settings.prompt_digest,
                   excluded_paths=list(settings.excluded_paths),
-                  usage=spending.report(), synthesis_complete=False)
+                  usage=spending.report())
     deadline = time.monotonic() + settings.max_seconds
     units, coverage = repo.units(settings.unit_bytes, settings.excluded_paths)
     report["coverage"] = coverage
@@ -159,10 +160,7 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
         spending, completed = restore(prior_report, report, repo, settings, units, changed)
 
     def save():
-        for entry in coverage:
-            if entry["status"] not in {"excluded", "out_of_scope"}:
-                entry["status"] = "reviewed" if all(unit in completed for unit in entry["units"]) else "pending"
-                entry["reviewed_units"] = sum(unit in completed for unit in entry["units"])
+        update_coverage(coverage, completed)
         report["usage"] = spending.report()
         checkpoint(report)
 

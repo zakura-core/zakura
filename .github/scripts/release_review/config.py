@@ -109,6 +109,20 @@ def load_settings(root: Path, provider: str, profile: str, models_json: str) -> 
     if (type(unit_bytes) is not int or not 1000 <= unit_bytes <= 48000
             or type(seconds) is not int or not 60 <= seconds <= 10800):
         raise ReviewError("invalid review work limits")
-    return Settings(provider, name, endpoint, input_price, output_price, budget,
-                    max_input, max_output, effort, unit_bytes, seconds,
-                    prompt, hashlib.sha256(prompt.encode()).hexdigest(), exclusions, cached_price)
+    return Settings(
+        provider=provider,
+        model=name,
+        endpoint=endpoint,
+        input_price=input_price,
+        output_price=output_price,
+        budget=budget,
+        max_input_bytes=max_input,
+        max_output_tokens=max_output,
+        reasoning_effort=effort,
+        unit_bytes=unit_bytes,
+        max_seconds=seconds,
+        instructions=prompt,
+        prompt_digest=hashlib.sha256(prompt.encode()).hexdigest(),
+        excluded_paths=exclusions,
+        cached_input_price=cached_price,
+    )

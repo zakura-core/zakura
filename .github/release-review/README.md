@@ -174,9 +174,10 @@ by source evidence; no reproduction is claimed.
 
 ## Validation and rollout
 
-Run the standard-library fixture suite with Python 3.11 or later:
+Install the pinned renderer dependencies and run the fixture suite with Python 3.11 or later:
 
 ```bash
+python3 -m pip install -r .github/scripts/requirements-release-review.txt
 python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
 ```
 

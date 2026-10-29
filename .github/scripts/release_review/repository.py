@@ -30,6 +30,23 @@ class ReviewUnit:
     patch: str
 
 
+def split_patch(patch: str, limit: int) -> list[str]:
+    """Split a patch on line boundaries without dropping or truncating lines."""
+    chunks, current, size = [], [], 0
+    for line in patch.splitlines(keepends=True):
+        line_size = len(line.encode())
+        if line_size > limit:
+            raise ReviewError("a single diff line exceeds the review-unit limit")
+        if current and size + line_size > limit:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += line_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 class Repository:
     def __init__(self, root: Path):
         self.root = root
@@ -180,6 +197,19 @@ class Repository:
         result = self.git(*args, allowed=(0, 1), max_bytes=80001, truncate=True).decode("utf-8", errors="replace")
         return {"revision": revision, "matches": result[:20000], "truncated": len(result) > 20000}
 
+    def patch_for_file(self, path: str) -> str:
+        """Validate both source blobs and build a text or asset patch."""
+        sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
+                   for revision in ("base", "head")}
+        if path in ASSET_PATHS:
+            patch = "".join(difflib.unified_diff(
+                sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
+                fromfile="base/" + path, tofile="head/" + path, n=12))
+        else:
+            patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                             "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
+        return patch
+
     def units(self, limit: int, excluded_paths: tuple[str, ...] = ()) -> tuple[list[ReviewUnit], list[dict]]:
         paths = self.git("diff", "--name-only", "-z", "--no-renames", self.refs["base"], self.refs["head"])
         units, coverage = [], []
@@ -197,30 +227,12 @@ class Repository:
                     entry.update(status="out_of_scope", reason="excluded by configuration",
                                  exclusion_rule=rule)
                     continue
-                sources = {revision: self.review_text(revision, path) if path in self.trees[revision] else ""
-                           for revision in ("base", "head")}
+                patch = self.patch_for_file(path)
                 if path in ASSET_PATHS:
                     entry["representation"] = "structured binary"
-                    patch = "".join(difflib.unified_diff(
-                        sources["base"].splitlines(keepends=True), sources["head"].splitlines(keepends=True),
-                        fromfile="base/" + path, tofile="head/" + path, n=12))
-                else:
-                    patch = self.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                                     "--unified=12", self.refs["base"], self.refs["head"], "--", path).decode("utf-8")
                 if len(patch.encode()) > 8_000_000:
                     raise ReviewError("file diff exceeds the eight-megabyte review limit")
-                chunks, current, size = [], [], 0
-                for line in patch.splitlines(keepends=True):
-                    line_size = len(line.encode())
-                    if line_size > limit:
-                        raise ReviewError("a single diff line exceeds the review-unit limit")
-                    if current and size + line_size > limit:
-                        chunks.append("".join(current))
-                        current, size = [], 0
-                    current.append(line)
-                    size += line_size
-                if current:
-                    chunks.append("".join(current))
+                chunks = split_patch(patch, limit)
                 for part, chunk in enumerate(chunks, 1):
                     unit = ReviewUnit(f"unit-{len(units) + 1}", path, part, chunk)
                     units.append(unit)

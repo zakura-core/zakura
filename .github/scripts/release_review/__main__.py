@@ -15,6 +15,7 @@ from .github import GitHub, fetch_head, publish, resolve_request
 from .models import AbliteratedProvider, JsonTransport, OpenAIProvider
 from .reporting import render, write_report
 from .repository import Repository
+from .state import new_report
 
 
 def prepare(args) -> int:
@@ -38,8 +39,7 @@ def prepare(args) -> int:
 
 def run_review(args) -> int:
     context = json.loads(args.context.read_text())
-    report = {key: value for key, value in context.items() if key != "pr_body"}
-    report.update(status="incomplete", findings=[], errors=[], coverage=[], synthesis_complete=False)
+    report = new_report(context)
     start = time.monotonic()
     repository = Repository(args.repo)
     try:
@@ -81,9 +81,8 @@ def publish_report(args) -> int:
         report = json.loads(report_path.read_text())
     else:
         context = json.loads(args.context.read_text())
-        report = {key: value for key, value in context.items() if key != "pr_body"}
-        report.update(status="incomplete", findings=[], coverage=[],
-                      errors=["review job stopped before producing a report"], synthesis_complete=False)
+        report = new_report(context)
+        report["errors"].append("review job stopped before producing a report")
         write_report(args.output, report)
     if report["repository"] != os.environ["GITHUB_REPOSITORY"]:
         raise ReviewError("report repository does not match this workflow")

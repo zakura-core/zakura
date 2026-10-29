@@ -84,8 +84,8 @@ type Offers = Vec<(u64, bool)>;
 /// # Panics
 ///
 /// If a stream's offers don't count from 0, or a `PeerWritten` doesn't
-/// finish its stream's latest offer, with the same `seq`, once. A write
-/// finishes before the peer offers its next frame.
+/// finish its stream's earliest unwritten offer, with the same `seq`. So
+/// writes finish in offer order, each once.
 fn peer_offers(report: &RunReport) -> BTreeMap<(u64, u64), Offers> {
     let mut sessions = BTreeMap::new();
     let mut offers: BTreeMap<(u64, u64), Offers> = BTreeMap::new();
@@ -122,14 +122,14 @@ fn peer_offers(report: &RunReport) -> BTreeMap<(u64, u64), Offers> {
                 quic_stream,
                 seq,
             } => {
-                let latest = offers
+                let next = offers
                     .get_mut(&(*connection, *quic_stream))
-                    .and_then(|offered| offered.last_mut());
-                match latest {
-                    Some((offered, written)) if offered == seq && !*written => *written = true,
+                    .and_then(|offered| offered.iter_mut().find(|(_, written)| !*written));
+                match next {
+                    Some((offered, written)) if offered == seq => *written = true,
                     _ => panic!(
                         "connection {connection}, stream {quic_stream}: PeerWritten {seq} doesn't \
-                         finish the stream's latest offer, {latest:?}"
+                         finish the stream's earliest unwritten offer, {next:?}"
                     ),
                 }
             }

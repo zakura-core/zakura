@@ -199,7 +199,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
                     ..
                 }
             ),
-            "Ops bounds that name an object wait for zakura#1643"
+            "Ops bounds that name an object wait for object creation labels"
         );
         assert!(
             !matches!(

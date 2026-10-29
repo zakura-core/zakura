@@ -43,8 +43,6 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                 None => return Ok(()),
             },
         };
-        #[cfg(any(test, zakura_sim))]
-        recv.take_tag();
         let payload_len = frame.payload.len();
         if matches!(
             frame.message_type,

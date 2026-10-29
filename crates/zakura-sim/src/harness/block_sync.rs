@@ -320,14 +320,13 @@ impl BlockScenario {
     /// its routine; and the chain resets to a fork from height 12 at 12 s of
     /// virtual time, after the 8 s request timeout.
     ///
-    /// The pause starts at height 6, not 5. From height 5, some plans leave
-    /// free only a routine that never completed a request. That routine has
-    /// no RTprop sample, so it defers the floor to the paused routines,
-    /// which still publish free slots and measured RTprops. No routine then
-    /// asks for height 7 before the reset. Main shows the same deferral on
-    /// 7 of 24 plans. From height 6, the routine that delivered height 5
-    /// stays free and measured, and all 24 plans ask for height 7 before
-    /// the timeout.
+    /// The pause starts at height 6, not 5. From height 6, the routine that
+    /// delivered height 5 stays free and measured, so its request for
+    /// height 7 has a floor rescue deadline of about 2 s and times out
+    /// before the reset. From height 5, some plans leave free only a
+    /// routine that never completed a request. That routine asks for height
+    /// 7 (#1812), but its request has no delivery measurement, so its
+    /// deadline of about 15.6 s passes the reset.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(

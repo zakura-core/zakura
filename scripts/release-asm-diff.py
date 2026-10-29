@@ -149,10 +149,10 @@ BLOCK_MARK = re.compile(r"/\*|\*/")
 
 
 def lex(text):
-    """Splits Rust source into `(kind, text)` segments: `code`, `comment`, `block` or `string`.
+    """Splits Rust source into `(kind, text)` segments: `code`, `comment`, `block`, `string` or `raw`.
 
-    A `string` segment is a string literal's body, without its quotes,
-    prefix or hashes. Char literals stay in `code`, and lifetimes too. An
+    A `string` or `raw` segment is a string or raw string literal's body,
+    without its quotes, prefix or hashes. Char literals stay in `code`, and lifetimes too. An
     unterminated literal or block comment runs to the end of the text.
     """
     segments, i, start, n = [], 0, 0, len(text)
@@ -185,7 +185,7 @@ def lex(text):
             close = '"' + mark[mark.index("r") + 1:-1]
             k = text.find(close, stop.end())
             k = n if k < 0 else k
-            segments.append(("string", text[stop.end():k]))
+            segments.append(("raw", text[stop.end():k]))
             j = min(n, k + len(close))
         else:
             body = STRING_END.match(text, stop.end())
@@ -228,6 +228,10 @@ def pad_text(text, inserts, path="<text>"):
 
 
 LINE_MACRO = re.compile(r"\bline\s*!\s*[(\[{]")
+# A `line`, `include`, `include_str` or `include_bytes` macro named in a
+# path, as `use std::line as here;` does, which could invoke it by another name.
+BUILTIN_PATH = re.compile(r"(?:\b(?:std|core)\s*::\s*(?:prelude\s*::\s*\w+\s*::\s*)?)"
+                          r"(line|include|include_str|include_bytes)\b(?!\s*!)")
 INCLUDE_MACRO = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*")
 # A string placeholder in `code_text`'s output.
 PLACEHOLDER = re.compile(r"\x01(\d+)\x02")
@@ -235,19 +239,50 @@ LITERAL_ARGUMENT = re.compile(r"\x01(\d+)\x02\s*[)\]}]")
 OUT_DIR_ARGUMENT = re.compile(r"concat\s*!\s*[(\[{]\s*env\s*!\s*[(\[{]\s*\x01(\d+)\x02")
 
 
+STRING_ESCAPE = re.compile(r"\\(?:x([0-7][0-9a-fA-F])|u\{([0-9a-fA-F_]{1,6})\}|\n\s*|(.))", re.S)
+SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", "'": "'", '"': '"'}
+
+
+def string_value(kind, body):
+    """The value of a string literal's body: a raw one as is, a plain one with its escapes decoded.
+
+    Returns None for an escape Rust doesn't accept, so a caller can refuse
+    rather than guess.
+    """
+    if kind == "raw":
+        return body
+    bad = []
+
+    def one(match):
+        """One escape's value."""
+        hex_code, unicode, simple = match.groups()
+        if hex_code:
+            return chr(int(hex_code, 16))
+        if unicode:
+            return chr(int(unicode.replace("_", ""), 16))
+        if simple is None:
+            return ""  # a line continuation
+        if simple not in SIMPLE_ESCAPES:
+            bad.append(simple)
+        return SIMPLE_ESCAPES.get(simple, "")
+
+    value = STRING_ESCAPE.sub(one, body)
+    return None if bad else value
+
+
 def code_text(text):
     """Source text with comments dropped and each string literal replaced by a numbered placeholder.
 
-    Returns the text and the strings' bodies, so token patterns can't match
-    inside a comment or a string.
+    Returns the text and the strings' values (see `string_value`), so token
+    patterns can't match inside a comment or a string.
     """
     out, strings = [], []
     for kind, part in lex(text):
         if kind == "code":
             out.append(part)
-        elif kind == "string":
+        elif kind in ("string", "raw"):
             out.append("\x01%d\x02" % len(strings))
-            strings.append(part)
+            strings.append(string_value(kind, part))
         else:
             out.append(" ")
     return "".join(out), strings
@@ -260,13 +295,19 @@ def check_line_reads(tree, files):
     for panic locations and log lines, which only label output, but `line!`
     makes a line number a value the program computes with, and a macro
     defined anywhere can expand it at a call site in a padded file. So one
-    use anywhere in the workspace refuses padding.
+    use anywhere in the workspace refuses padding, and so does a path that
+    names `line` or an include macro, such as an alias import, since it
+    could call it under another name.
     """
     for source in files:
         code, _ = code_text(source.read_bytes().decode(errors="replace"))
         found = LINE_MACRO.search(code)
         if found:
             raise PaddingError("%s uses line!, whose value padding would change" % source.relative_to(tree))
+        alias = BUILTIN_PATH.search(code)
+        if alias:
+            raise PaddingError("%s names the %s! macro in a path, which could call it under another name"
+                               % (source.relative_to(tree), alias.group(1)))
 
 
 def check_includes(tree, files, padded):
@@ -284,8 +325,11 @@ def check_includes(tree, files, padded):
         for found in INCLUDE_MACRO.finditer(code):
             literal = LITERAL_ARGUMENT.match(code, found.end())
             generated = OUT_DIR_ARGUMENT.match(code, found.end())
+            path = strings[int(literal.group(1))] if literal else None
+            if literal and path is None:
+                raise PaddingError("%s embeds a path with an escape padding can't read" % source.relative_to(tree))
             if literal:
-                target = (source.parent / strings[int(literal.group(1))]).resolve()
+                target = (source.parent / path).resolve()
                 if target in padded:
                     raise PaddingError("%s embeds %s, whose only change is blank lines"
                                        % (source.relative_to(tree), target.relative_to(tree)))
@@ -514,10 +558,12 @@ def elf_image(data):
                 index = rinfo >> 32
                 target = symbols[index] if index < len(symbols) else index
                 entries.append(b"%d %d %r %d" % (offset, rinfo & 0xFFFFFFFF, target, addend))
-            image[key] = struct.pack("<IQ", stype, flags) + b"\n".join(entries)
+            image[key] = struct.pack("<IQ", stype, flags) + name(headers[info]).encode() + b"\n" + b"\n".join(entries)
         elif keep or relocates:
             contents = b"" if stype == SHT_NOBITS else data[start:start + length]
-            image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + contents
+            # A relocation section's `sh_info` names the section it relocates.
+            applies = name(headers[info]).encode() if relocates else b""
+            image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + applies + b"\n" + contents
     return image
 
 

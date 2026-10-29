@@ -254,6 +254,18 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("section .text:", out)
 
+    def test_elf_relocations_keep_the_section_they_apply_to(self):
+        """A relocation section that moves to another target section fails, though its entries are the same."""
+
+        def build(target):
+            """An ELF executable whose `.rela.text` applies to section `target`."""
+            return elf([(".text", 1, 6, b"code", 0, 0), (".data", 1, 3, b"data", 0, 0),
+                        (".rela.text", 4, 0x40, b"r1", target, 0)])
+
+        status, out = image_status(build(1), build(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.text", out)
+
     def test_elf_program_headers_count(self):
         """An executable stack, which only a program header records, fails."""
         stack = 0x6474E551
@@ -349,7 +361,9 @@ class AlignmentTests(unittest.TestCase):
                       "fn here() -> u32 { core::line ! () }\n",
                       "fn here() -> u32 { line![] + line!{} }\n",
                       "fn here() -> u32 { let _ = \"https://x\"; line!() }\n",
-                      "macro_rules! here { () => { line!() } }\n"):
+                      "macro_rules! here { () => { line!() } }\n",
+                      "use std::line as here;\n",
+                      "pub use core::include_str as source;\n"):
             with self.assertRaises(asm_diff.PaddingError, msg=other):
                 aligned("\n".join(SOURCE), "\n".join(head), {"other.rs": other})
         _, made = aligned("\n".join(SOURCE), "\n".join(head),
@@ -359,7 +373,8 @@ class AlignmentTests(unittest.TestCase):
     def test_padding_an_embedded_file_with_only_blank_lines_is_refused(self):
         """A blank-line change to a file another embeds would pad to the same text, so it's refused."""
         blank = "\n".join(SOURCE[:2] + ["", ""] + SOURCE[2:])
-        for embed in ("include_str!(\"lib.rs\")", "include_str!(r\"lib.rs\")", "include_str! [r#\"lib.rs\"#]"):
+        for embed in ("include_str!(\"lib.rs\")", "include_str!(r\"lib.rs\")", "include_str! [r#\"lib.rs\"#]",
+                      "include_str!(\"li\\x62.rs\")", "include_str!(\"lib\\q.rs\")"):
             with self.assertRaises(asm_diff.PaddingError, msg=embed):
                 aligned("\n".join(SOURCE), blank, {"main.rs": "const S: &str = %s;\n" % embed})
         embeds = {"main.rs": "const SOURCE: &str = include_str!(\"lib.rs\");\n"}

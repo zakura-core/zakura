@@ -34,7 +34,8 @@ Set the repository variable `RELEASE_REVIEW_MODELS` to a JSON object keyed by
 
 Configure only providers you actually use. Use the highest applicable input and
 output prices for the selected model and request size; do not assume prompt-cache
-discounts. Price changes require updating this variable. The $25 ceiling is an
+discounts. Include any cache-write premium in the conservative input rate.
+Price changes require updating this variable. The $25 ceiling is an
 estimate based on these configured rates, not a provider billing guarantee.
 OpenAI requests explicitly use the standard service tier so project-level
 priority processing cannot silently change the pricing assumption.
@@ -70,7 +71,9 @@ non-ancestor baselines are rejected.
 Each rerun has its own budget. It updates the bot's existing PR summary, with
 artifacts retained per run for 14 days. Newer reviews cancel older review jobs
 for that PR. The publisher rechecks the current PR head and the existing
-comment's run identity before writing. Results for old heads remain artifacts.
+comment's run identity before writing. It reads the comment back to verify the
+bot author, content, and target PR, then saves its URL in the JSON report and
+workflow summary. Results for old heads remain artifacts.
 
 ## Interpret the result
 
@@ -93,7 +96,8 @@ does not mean no bugs, and partial coverage is never labeled clean. Preliminary
 candidates remain in the JSON artifact when synthesis cannot finish.
 
 The report contains the baseline and head commits, reviewer commit, prompt
-digest, provider/model, pricing, usage, duration, findings, and coverage. The PR
+digest, provider/model, reasoning effort, pricing, usage, duration, findings,
+and coverage. The PR
 comment links to commit-pinned source because the release PR's ordinary diff may
 contain only preparation changes. All findings in this first stage are supported
 by source evidence; no reproduction is claimed.

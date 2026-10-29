@@ -265,6 +265,15 @@ class ProviderTests(unittest.TestCase):
             with self.subTest(tier=tier), self.assertRaisesRegex(ProviderError, "standard service pricing"):
                 OpenAIProvider(settings(), "fixture", transport).complete(self.request())
 
+    def test_openai_preserves_astra_and_high_reasoning(self):
+        transport = Transport({"status": "completed", "service_tier": "default", "output": [],
+                               "usage": {"input_tokens": 20, "output_tokens": 30}})
+        config = settings(model="gpt-6-astra", reasoning_effort="high")
+        OpenAIProvider(config, "fixture", transport).complete(self.request())
+        body = transport.requests[0][1]
+        self.assertEqual(body["model"], "gpt-6-astra")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+
     def test_openai_incomplete_and_refusal_are_not_clean(self):
         for envelope in (
             {"status": "incomplete"},
@@ -395,6 +404,7 @@ class EngineTests(GitFixture):
         report, checkpoints = self.metadata(), []
         review(self.repository, provider, settings(), report, lambda value: checkpoints.append(copy.deepcopy(value)))
         self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["reasoning_effort"], "medium")
         self.assertTrue(all(item["status"] == "reviewed" for item in report["coverage"]))
         self.assertEqual(report["findings"], [candidate()])
         self.assertTrue(report["synthesis_complete"])
@@ -468,9 +478,12 @@ class GitHubFixture:
     def api(self, path, *, method="GET", body=None):
         if method != "GET":
             self.writes.append((path, method, body))
-            comment = {"id": 1, "user": {"login": "github-actions[bot]"}, "body": body["body"]}
+            comment = {"id": 1, "user": {"login": "github-actions[bot]"}, "body": body["body"],
+                       "html_url": f"https://github.com/{self.repository}/pull/12#issuecomment-1"}
             self.saved = [comment]
             return comment
+        if path == "issues/comments/1":
+            return copy.deepcopy(self.saved[0])
         if path.startswith("actions/runs/"):
             return copy.deepcopy(self.run)
         if path.startswith("pulls?"):
@@ -517,10 +530,27 @@ class GitHubTests(unittest.TestCase):
         report["run_attempt"] = 2
         self.assertEqual(publish(github, report, "rerun"), "published")
         self.assertEqual(len(github.saved), 1)
+        self.assertEqual(report["comment_url"], "https://github.com/zakura-core/zakura/pull/12#issuecomment-1")
         self.assertEqual([write[1] for write in github.writes], ["POST", "PATCH"])
         report["run_attempt"] = 1
         self.assertIn("superseded", publish(github, report, "old"))
         self.assertEqual(len(github.writes), 2)
+
+    def test_comment_publication_requires_matching_bot_body_and_pr_link(self):
+        for changes in ({"body": "wrong content"}, {"html_url": "https://github.com/other/repo/pull/12#issuecomment-1"},
+                        {"user": {"login": "someone"}}):
+            github = GitHubFixture()
+            original = github.api
+
+            def api(path, original=original, changes=changes, **kwargs):
+                result = original(path, **kwargs)
+                return result | changes if path == "issues/comments/1" and not kwargs else result
+
+            report = {"pr_number": 12, "head_sha": HEAD, "run_number": 20, "run_attempt": 1}
+            with self.subTest(changes=changes), patch.object(github, "api", side_effect=api), \
+                    self.assertRaisesRegex(ReviewError, "publication is unconfirmed"):
+                publish(github, report, "completed review")
+            self.assertNotIn("comment_url", report)
 
     def test_stale_head_never_publishes(self):
         github = GitHubFixture()
@@ -636,6 +666,8 @@ class CommandTests(GitFixture):
         self.assertIn("stopped before producing", github.saved[0]["body"])
         self.assertEqual([write[1] for write in github.writes], ["POST", "PATCH"])
         self.assertTrue((output / "report.md").is_file())
+        self.assertEqual(json.loads((output / "report.json").read_text())["comment_url"],
+                         "https://github.com/zakura-core/zakura/pull/12#issuecomment-1")
 
 
 if __name__ == "__main__":

@@ -162,7 +162,17 @@ def publish(github: GitHub, report: dict, markdown: str) -> str:
         return "stale: head changed while preparing the comment"
     body = COMMENT_MARKER + "\n<!-- release-review-run: " + json.dumps(state) + " -->\n" + markdown
     if existing:
-        github.api(f"issues/comments/{existing[0]['id']}", method="PATCH", body={"body": body})
+        written = github.api(f"issues/comments/{existing[0]['id']}", method="PATCH", body={"body": body})
     else:
-        github.api(f"issues/{number}/comments", method="POST", body={"body": body})
+        written = github.api(f"issues/{number}/comments", method="POST", body={"body": body})
+    comment_id = written.get("id") if isinstance(written, dict) else None
+    if type(comment_id) is not int or comment_id < 1:
+        raise ReviewError("GitHub did not return a comment identity; publication is unconfirmed")
+    confirmed = github.api(f"issues/comments/{comment_id}")
+    url = f"https://github.com/{github.repository}/pull/{number}#issuecomment-{comment_id}"
+    if (not isinstance(confirmed, dict) or confirmed.get("body") != body
+            or confirmed.get("html_url") != url
+            or confirmed.get("user", {}).get("login") != "github-actions[bot]"):
+        raise ReviewError("PR summary read-back did not confirm the bot comment; publication is unconfirmed")
+    report["comment_url"] = url
     return "published"

@@ -20,7 +20,8 @@ def render(report: dict, *, comment: bool = False) -> str:
              "Advisory, read-only review. No source code or tests were executed.", "",
              f"Range: `{report.get('base_tag', 'unresolved')}` (`{report.get('base_sha', 'unresolved')}`) → `{report['head_sha']}`.",
              (f"Reviewer revision: `{report.get('control_sha', 'unknown')}`. "
-              f"Provider/model: {plain(report.get('provider', 'unconfigured'))} / {plain(report.get('model', 'unconfigured'))}."),
+              f"Provider/model: {plain(report.get('provider', 'unconfigured'))} / {plain(report.get('model', 'unconfigured'))}. "
+              f"Reasoning effort: {plain(report.get('reasoning_effort', 'unavailable'))}."),
              f"Prompt digest: `{report.get('prompt_digest', 'unavailable')}`.", ""]
     coverage = report.get("coverage", [])
     reviewed = sum(item["status"] == "reviewed" for item in coverage)

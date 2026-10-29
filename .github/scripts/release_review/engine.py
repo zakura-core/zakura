@@ -138,7 +138,8 @@ def review(repo: Repository, provider: ModelProvider, settings: Settings,
     """Checkpoint coverage and candidates after each unit, including incomplete runs."""
     spending = Spending(settings)
     report.update(status="incomplete", findings=[], candidates=[], errors=[], summaries=[],
-                  provider=settings.provider, model=settings.model, prompt_digest=settings.prompt_digest,
+                  provider=settings.provider, model=settings.model, reasoning_effort=settings.reasoning_effort,
+                  prompt_digest=settings.prompt_digest,
                   usage=spending.report(), synthesis_complete=False)
     deadline = time.monotonic() + settings.max_seconds
     units, coverage = repo.units(settings.unit_bytes)

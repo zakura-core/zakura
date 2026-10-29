@@ -86,9 +86,12 @@ def publish_report(args) -> int:
         raise ReviewError("report repository does not match this workflow")
     markdown = render(report, comment=True)
     outcome = publish(GitHub(report["repository"]), report, markdown)
+    write_report(args.output, report)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
             summary.write(markdown + "\nPublication: " + outcome + "\n")
+            if report.get("comment_url"):
+                summary.write(f"\n[Verified PR summary comment]({report['comment_url']})\n")
     print(outcome)
     return 0
 

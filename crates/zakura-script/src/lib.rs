@@ -15,7 +15,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use zakura_chain::{
-    parameters::NetworkUpgrade,
+    block::Height,
+    parameters::{Network, NetworkUpgrade},
     transaction::{HashType, SigHasher},
     transparent,
 };
@@ -46,6 +47,9 @@ pub enum Error {
     },
     /// transaction is invalid according to zakura_chain (not a zcash_script error)
     TxInvalid(#[from] zakura_chain::Error),
+    /// Authenticated PQ P2SH validation rejected this input.
+    #[cfg(feature = "pq")]
+    Pq(#[from] zcash_transparent::pq::p2sh::Error),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +64,8 @@ impl fmt::Display for Error {
                 format!("{component:?} script failed: {error}")
             }
             Error::TxInvalid(e) => format!("tx is invalid: {e}"),
+            #[cfg(feature = "pq")]
+            Error::Pq(e) => format!("PQ P2SH script failed: {e}"),
         })
     }
 }
@@ -69,7 +75,12 @@ impl Error {
     ///
     /// Returns false for transaction preparation failures that prevent verification.
     pub fn is_script_failure(&self) -> bool {
-        matches!(self, Error::ScriptInvalid | Error::Interpreter { .. })
+        match self {
+            Error::ScriptInvalid | Error::Interpreter { .. } => true,
+            #[cfg(feature = "pq")]
+            Error::Pq(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -100,6 +111,9 @@ pub struct CachedFfiTransaction {
 
     /// The sighasher context to use to compute sighashes.
     sighasher: SigHasher,
+    /// Selected from trusted network/height context and transaction version, never input bytes.
+    #[cfg(feature = "pq")]
+    pq_p2sh: bool,
 }
 
 impl CachedFfiTransaction {
@@ -116,7 +130,40 @@ impl CachedFfiTransaction {
             transaction,
             all_previous_outputs,
             sighasher,
+            #[cfg(feature = "pq")]
+            pq_p2sh: false,
         })
+    }
+
+    /// Prepares input verification using the rules at this network's validation height.
+    ///
+    /// The caller must resolve every input's previous output from trusted state, in input
+    /// order. Those same outputs feed both script authentication and the transaction digest.
+    /// Only v5 transactions on explicitly configured Regtest heights can use PQ P2SH;
+    /// public networks, other versions, and builds without `pq` retain legacy rules.
+    pub fn new_for_network(
+        transaction: Arc<zakura_chain::transaction::Transaction>,
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+        network: &Network,
+        height: Height,
+    ) -> Result<Self, Error> {
+        if !transaction.is_coinbase() && all_previous_outputs.len() != transaction.inputs().len() {
+            return Err(Error::TxIndex);
+        }
+        let cached = Self::new(
+            transaction,
+            all_previous_outputs,
+            NetworkUpgrade::current(network, height),
+        )?;
+        #[cfg(feature = "pq")]
+        let cached = Self {
+            pq_p2sh: cached.transaction.version() == 5
+                && network
+                    .pq_p2sh_activation_height()
+                    .is_some_and(|activation| height >= activation),
+            ..cached
+        };
+        Ok(cached)
     }
 
     /// Returns the transparent inputs for this transaction.
@@ -148,6 +195,16 @@ impl CachedFfiTransaction {
     ///
     /// [`GetP2SHSigOpCount()`]: https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L840-L852
     pub fn p2sh_sigops(&self) -> u32 {
+        #[cfg(feature = "pq")]
+        if self.pq_p2sh && !self.transaction.is_coinbase() {
+            return self
+                .transaction
+                .inputs()
+                .iter()
+                .zip(self.all_previous_outputs.iter())
+                .map(|(input, output)| pq_p2sh_input_sigop_count(input, output))
+                .sum();
+        }
         p2sh_sigop_count(&self.transaction, &self.all_previous_outputs)
     }
 
@@ -226,12 +283,46 @@ impl CachedFfiTransaction {
             lock_time: i64::from(lock_time),
             is_final,
         };
+        #[cfg(feature = "pq")]
+        if self.pq_p2sh {
+            return match zcash_transparent::pq::p2sh::verify_spend(&script, flags, &checker) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(Error::ScriptInvalid),
+                Err(zcash_transparent::pq::p2sh::Error::Legacy(component, error)) => {
+                    Err(Error::Interpreter { component, error })
+                }
+                Err(error) => Err(Error::Pq(error)),
+            };
+        }
         match script.eval(flags, &checker) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Error::ScriptInvalid),
             Err((component, error)) => Err(Error::Interpreter { component, error }),
         }
     }
+}
+
+/// Counts committed redeem-script operations without interpreting large signature pushes.
+/// This is accounting, not authorization: the verifier still authenticates and executes the
+/// input independently. The per-input PQ verification-attempt limit remains in Common.
+#[cfg(feature = "pq")]
+fn pq_p2sh_input_sigop_count(input: &transparent::Input, output: &transparent::Output) -> u32 {
+    let legacy_count = p2sh_input_sigop_count(input, output);
+    let transparent::Input::PrevOut { unlock_script, .. } = input else {
+        return legacy_count;
+    };
+    let lock_code = script::Code(output.lock_script.as_raw_bytes().to_vec());
+    if !lock_code.is_pay_to_script_hash() {
+        return legacy_count;
+    }
+    let Ok(input) = zcash_script::pq::SpendingInput::scan(unlock_script.as_raw_bytes()) else {
+        return legacy_count;
+    };
+    let redeem = input.redeem_script();
+    if zcash_transparent::util::hash160::hash(redeem) != lock_code.0[2..22] {
+        return legacy_count;
+    }
+    script::Code(redeem.to_vec()).sig_op_count(true)
 }
 
 /// Trait for counting the number of transparent signature operations in the transparent inputs and

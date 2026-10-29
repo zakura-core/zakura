@@ -1241,6 +1241,7 @@ impl ParametersBuilder {
         } = self;
         let mut parameters = Parameters {
             network_name,
+            pq_p2sh_activation_height: None,
             network_magic,
             genesis_hash,
             activation_heights,
@@ -1380,6 +1381,10 @@ fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderE
 /// A struct of parameters for configuring Regtest in Zebra.
 #[derive(Debug, Default, Clone)]
 pub struct RegtestParameters {
+    /// Local activation of the bounded PQ P2SH rules. Disabled by default.
+    /// Requires the consuming validator's `pq` feature; this does not configure relay policy.
+    /// This is a programmatic setting, not exposed by the node's TOML configuration.
+    pub pq_p2sh_activation_height: Option<Height>,
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,
     /// Configured funding streams
@@ -1414,6 +1419,8 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 /// Network consensus parameters for test networks such as Regtest and the default Testnet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
+    /// PQ P2SH is configurable only through the Regtest constructor.
+    pq_p2sh_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -1505,6 +1512,7 @@ impl Parameters {
     /// checkpoint before Canopy activation, or if another parameter is invalid.
     pub fn new_regtest(
         RegtestParameters {
+            pq_p2sh_activation_height,
             activation_heights,
             funding_streams,
             lockbox_disbursements,
@@ -1562,6 +1570,7 @@ impl Parameters {
         let parameters = Self {
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
+            pq_p2sh_activation_height,
             ..parameters.finish()
         };
         check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
@@ -1584,6 +1593,8 @@ impl Parameters {
             network_name,
             // Already checked network magic above
             network_magic: _,
+            // A local activation height does not change Regtest's identity.
+            pq_p2sh_activation_height: _,
             genesis_hash,
             // Activation heights are configurable on Regtest
             activation_heights: _,
@@ -1748,6 +1759,17 @@ impl Parameters {
 }
 
 impl Network {
+    /// Returns the configured local PQ P2SH activation height, only on Regtest.
+    /// Public networks and ordinary configured Testnets always return `None`.
+    pub fn pq_p2sh_activation_height(&self) -> Option<Height> {
+        match self {
+            Self::Testnet(parameters) if parameters.is_regtest() => {
+                parameters.pq_p2sh_activation_height
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the parameters of this network if it is a Testnet.
     pub fn parameters(&self) -> Option<Arc<Parameters>> {
         if let Self::Testnet(parameters) = self {

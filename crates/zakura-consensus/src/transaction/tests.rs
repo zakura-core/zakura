@@ -55,6 +55,9 @@ use super::{check, Request, Verifier};
 #[cfg(test)]
 mod prop;
 
+#[cfg(feature = "pq")]
+mod pq;
+
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
 fn test_timeout() -> std::time::Duration {

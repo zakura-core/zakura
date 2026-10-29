@@ -634,9 +634,8 @@ where
                 miner_fee = Some(fee);
             }
 
-            let nu = req.upgrade(&network);
             let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+                Arc::new(CachedFfiTransaction::new_for_network(tx.clone(), Arc::new(spent_outputs), &network, req.height()).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), req.upgrade(&network)))?);
 
             tracing::trace!(?tx_id, "got state UTXOs");
 

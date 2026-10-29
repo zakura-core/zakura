@@ -3,7 +3,8 @@
 # The input resets the chain while storage holds a submission, so that
 # submission's late verdict reaches block sync as a stale completion and
 # releases the fork's submission at the same height, which storage still
-# holds.
+# holds. The late verdict is retryable: a commit would start a new body-work
+# epoch, and the release would then break `detached-submission-bounded` too.
 input = "crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin"
 # Besides sequencer.rs, which the patch changes, the rest of block sync
 # decides when the stale verdict arrives. A change there can move the input

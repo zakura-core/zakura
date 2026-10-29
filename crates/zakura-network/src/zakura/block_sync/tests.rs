@@ -12851,6 +12851,88 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     reactor_task.abort();
 }
 
+/// A late commit can move the verified tip off the selected chain to the
+/// selected tip's height, as when a fork with more work replaces the
+/// committed block's height. The body-work epoch changes, and block sync
+/// resets its floor to the replaced block. Only storage's needed-blocks
+/// answer names the common ancestor, so block sync must still ask once its
+/// floor reaches the selected tip, and then reset to the ancestor.
+#[tokio::test]
+async fn off_selected_commit_at_the_selected_height_requeries_the_anchor() {
+    let ancestor = (2, block::Hash([0x02; 32]));
+    let replaced = (3, block::Hash([0x33; 32]));
+    let fork_tip = (3, block::Hash([0x43; 32]));
+    let initial = test_committed_snapshot(1, 1, 1, (0, block::Hash([0; 32])), ancestor, fork_tip);
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let sequencer_view = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the test reactor exposes routine wiring")
+        .view
+        .clone();
+    let answer = |query_id, scope| BlockSyncEvent::ScopedNeededBlocks {
+        query_id,
+        scope,
+        body_anchor: zakura_header_chain::Frontier::new(block::Height(ancestor.0), ancestor.1),
+        blocks: vec![BlockSyncBlockMeta {
+            height: block::Height(fork_tip.0),
+            hash: fork_tip.1,
+            size: BlockSizeEstimate::Unknown,
+        }],
+    };
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup queries the needed blocks");
+    };
+    handle
+        .send(answer(query_id, scope))
+        .await
+        .expect("the startup answer queues");
+
+    // The replaced block commits after the fork took its height.
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(2, 1, 2, (0, block::Hash([0; 32])), replaced, fork_tip),
+            1,
+        )))
+        .expect("the committed snapshot receiver is live");
+    await_until(
+        "the epoch change resets the floor to the replaced block",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().verified_tip == block::Height(replaced.0),
+    )
+    .await
+    .expect("the epoch change resets block sync");
+
+    // Storage answers every query with the common ancestor.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sequencer_view.borrow().verified_tip != block::Height(ancestor.0)
+        && Instant::now() < deadline
+    {
+        if let Ok(Some(BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        })) = tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
+        {
+            handle
+                .send(answer(query_id, scope))
+                .await
+                .expect("the answer queues");
+        }
+    }
+    assert_eq!(
+        sequencer_view.borrow().verified_tip,
+        block::Height(ancestor.0),
+        "block sync resets to the common ancestor"
+    );
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn epoch_change_supersedes_stale_floor_query() {
     let blocks = mainnet_blocks_1_to_3();

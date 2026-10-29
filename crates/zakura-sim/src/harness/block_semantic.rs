@@ -105,6 +105,13 @@ impl BlockScenario {
     /// the first is submitted, every actor switches to a fork from height
     /// 2, which detaches it. Its verdict then reaches block sync as a stale
     /// completion while the fork's first submission waits in storage.
+    ///
+    /// The first verdict is retryable, so storage never commits the
+    /// replaced block. A commit would move the verified tip off the
+    /// selected chain and start a new body-work epoch. A bypass that
+    /// releases by height would then also break
+    /// `block-sync/detached-submission-bounded`, which the
+    /// `release-by-height` planted case must not.
     pub fn stale_beside_current() -> Self {
         let verdicts = vec![
             BlockAllow::Committed,
@@ -119,7 +126,7 @@ impl BlockScenario {
                     hold(
                         Select::nth(BlockKind::Apply, 1),
                         Trigger::VirtualTime(5_000),
-                        verdicts.clone(),
+                        vec![BlockAllow::Retryable],
                     ),
                     hold(
                         Select {

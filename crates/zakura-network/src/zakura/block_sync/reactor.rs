@@ -1664,7 +1664,16 @@ impl BlockSyncReactor {
         if self.empty_state_header_quiet_until.is_some() {
             return true;
         }
-        if self.request_floor >= self.state.best_header_tip {
+        // A committed verified tip off the selected chain at or above its tip
+        // leaves no selected height above the floor, yet only the state's
+        // answer names the common ancestor block sync must reset to.
+        let diverged = self.committed_view.as_ref().is_some_and(|view| {
+            let frontiers = view.frontiers;
+            frontiers.verified_best.height > frontiers.header_best.height
+                || (frontiers.verified_best.height == frontiers.header_best.height
+                    && frontiers.verified_best.hash != frontiers.header_best.hash)
+        });
+        if self.request_floor >= self.state.best_header_tip && !diverged {
             self.clear_pending_needed_query();
             return true;
         }
@@ -1678,6 +1687,7 @@ impl BlockSyncReactor {
         let Some(from) = refresh
             .map(|(_, from, _)| from)
             .or_else(|| self.next_needed_block_query_start())
+            .or_else(|| diverged.then_some(self.state.best_header_tip))
         else {
             return true;
         };

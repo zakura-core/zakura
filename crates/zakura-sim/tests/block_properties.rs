@@ -34,8 +34,8 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{BlockSyncFact, BlockSyncHolder, StorageFact, StorageRequest},
-    Checker, MemorySink, Observation, ObservationLog, Outcome, PlanInput, PropertyReport, RunEnd,
-    RunReport, StepCtx, Violation,
+    Checker, MemorySink, Observation, ObservationLog, PlanInput, PropertyReport, RunEnd, RunReport,
+    StepCtx, Violation,
 };
 
 /// Runs `scenario` under `input`, and returns the report with the ports,
@@ -584,22 +584,20 @@ fn a_stale_query_after_a_reset_is_asked_again() {
 /// replaces that height, so the sequencer detaches it and keeps it charged.
 /// Its late verdict releases the detached holder.
 ///
-/// The late verdict commits the replaced block. Some schedules still reach
-/// the fork's tip. The others end in the known stall
-/// (`lane3-issues/case3-stall.md`): the engine keeps the body-work epoch,
-/// since the commit only extends the verified chain and leaves the selected
-/// chain as it was, and the work queue retires the fork's height 3 by
-/// height as the verified tip passes it. The tip then stays at the replaced
-/// block, and nothing requests the fork's height 3 again, while the fork's
-/// heights above it are submitted or held. Every input must end in one of
-/// those two shapes, and at least one must converge. Once the planned fix
-/// lands, a verified tip that leaves the selected branch starts a new
-/// body-work epoch, and every input must converge.
+/// The late verdict commits the replaced block, which moves the verified
+/// tip off the selected chain. The engine then starts a new body-work
+/// epoch, so block sync resets to the common ancestor and requests the
+/// fork's height 3 again. Before that rule, block sync retired the fork's
+/// height 3 by height as the verified tip passed it, and most schedules
+/// stalled at the replaced block (`lane3-issues/case3-stall.md`). Every
+/// input converges on the fork's tip. Some schedules never move the
+/// verified tip to the replaced block, so the case asks only that at least
+/// one late verdict starts an epoch.
 #[test]
 #[allow(clippy::print_stdout)]
 fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {
-    let (mut converged, mut stalled) = (0, 0);
-    for input in inputs(4, 256) {
+    let (mut runs, mut invalidating) = (0, 0);
+    for input in inputs(8, 256) {
         let (report, ports) = node_run(&delayed_apply(), input);
         let (op, token, hash) = submissions(&report)
             .into_iter()
@@ -629,109 +627,34 @@ fn a_reset_detaches_a_delayed_apply_and_its_late_verdict_releases_it() {
         let released = detached(&report, token, "released").expect("the verdict releases it");
         assert!(retained < verdict && verdict <= released);
         assert_eq!(ports.live.tip().height.0, 10);
-        let tip = ports.node.view().frontiers.verified_best;
-        if tip == ports.live.tip() {
-            converged += 1;
-            let view = ports.view.borrow();
-            assert!(view.sequencer.submissions.is_empty());
-            assert_settled(&view);
-        } else {
-            stalled += 1;
-            assert_stalled_at_replaced_height(&report, &ports.view.borrow(), &hash, &fork, verdict);
+        assert_converged(&ports);
+        let view = ports.view.borrow();
+        assert!(view.sequencer.submissions.is_empty());
+        assert_settled(&view);
+        runs += 1;
+        if facts(&report).into_iter().any(|(step, fact)| {
+            step >= verdict
+                && matches!(
+                    fact,
+                    StorageFact::TransitionInstalled {
+                        invalidates_body_work: true,
+                        ..
+                    }
+                )
+        }) {
+            invalidating += 1;
         }
     }
-    println!("case 3: {converged} inputs converged, {stalled} stalled at the replaced height");
-    assert!(converged > 0, "some input converges");
+    println!("case 3: {runs} inputs converged, {invalidating} started an epoch after the verdict");
+    assert!(
+        invalidating > 0,
+        "some late verdict starts a body-work epoch"
+    );
 }
 
 /// `hash` as block storage's facts write it: hex in its byte order.
 fn storage_hash(hash: zakura_chain::block::Hash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// The known case-3 stall: the run spent its step budget with the last
-/// published verified tip at the replaced height-3 block `replaced`, and no
-/// holder or work item remains at height 3, so nothing can bring the fork's
-/// height 3 back. Sync went on above it: the node submitted, or still
-/// holds, each of the fork's heights 4 to 10 (`fork` lists the live chain
-/// by height and storage hash). No installed transition after the stale
-/// verdict, at step `verdict`, invalidated body work, so the epoch stayed.
-fn assert_stalled_at_replaced_height(
-    report: &RunReport,
-    view: &BlockSyncView,
-    replaced: &str,
-    fork: &[(u32, String)],
-    verdict: u64,
-) {
-    assert_eq!(report.end.outcome, Outcome::Budget, "{:?}", report.end);
-    let invalidated = facts(report).into_iter().find(|(step, fact)| {
-        *step >= verdict
-            && matches!(
-                fact,
-                StorageFact::TransitionInstalled {
-                    invalidates_body_work: true,
-                    ..
-                }
-            )
-    });
-    assert_eq!(invalidated, None, "the stale commit keeps the epoch");
-    let submitted: BTreeSet<&str> = submissions(report)
-        .into_iter()
-        .filter_map(|(_, request, _)| match request {
-            StorageRequest::SubmitBlock { hash, .. } => Some(hash.as_str()),
-            _ => None,
-        })
-        .collect();
-    let held = |height: u32| {
-        view.sequencer
-            .reorder
-            .iter()
-            .chain(&view.sequencer.applying)
-            .any(|body| body.height.0 == height)
-    };
-    let above: Vec<_> = fork
-        .iter()
-        .filter(|(height, _)| (4..=10).contains(height))
-        .collect();
-    assert_eq!(above.len(), 7, "the fork holds heights 4 to 10");
-    for (height, hash) in above {
-        assert!(
-            submitted.contains(hash.as_str()) || held(*height),
-            "the node submitted or holds the fork's height {height}"
-        );
-    }
-    let tip = facts(report)
-        .into_iter()
-        .rev()
-        .find_map(|(_, fact)| match fact {
-            StorageFact::ViewPublished { verified_best, .. } => Some(verified_best),
-            _ => None,
-        })
-        .expect("block storage publishes views");
-    assert_eq!(
-        tip.height, 3,
-        "the verified tip sits at the replaced height"
-    );
-    assert_eq!(tip.hash, replaced, "the replaced block commits");
-    let height = |at: &zakura_chain::block::Height| at.0 == 3;
-    assert!(
-        !view.work_queue.iter().any(|item| height(&item.height)),
-        "the work queue dropped height 3: {:?}",
-        view.work_queue
-    );
-    let sequencer = &view.sequencer;
-    assert!(
-        !sequencer
-            .reorder
-            .iter()
-            .chain(&sequencer.applying)
-            .any(|body| height(&body.height))
-            && !sequencer
-                .submissions
-                .iter()
-                .any(|submission| height(&submission.height)),
-        "the sequencer holds no height-3 body: {sequencer:?}"
-    );
 }
 
 /// Case 4: the node's first request times out before the held read is

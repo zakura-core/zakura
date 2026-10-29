@@ -266,6 +266,74 @@ pub(crate) enum BatchEntry<'a> {
     Invalid(Id<'a>),
 }
 
+/// Why a batch body couldn't be split into entries.
+enum BatchError {
+    /// The batch has more than the maximum number of entries.
+    TooManyEntries,
+    /// The body isn't a JSON array.
+    Malformed,
+}
+
+/// Splits a batch body, a JSON array, into its unparsed entries.
+///
+/// Parsing stops at the first entry over `max_entries`, so a batch over the limit costs no
+/// more to reject than one at the limit. Such a batch is rejected even if the rest of the
+/// body isn't valid JSON.
+fn parse_batch(body: &[u8], max_entries: usize) -> Result<Vec<&RawValue>, BatchError> {
+    struct BoundedEntries<'b> {
+        max_entries: usize,
+        too_many_entries: &'b std::cell::Cell<bool>,
+    }
+
+    impl<'de> de::DeserializeSeed<'de> for BoundedEntries<'_> {
+        type Value = Vec<&'de RawValue>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for BoundedEntries<'_> {
+        type Value = Vec<&'de RawValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON array")
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while let Some(entry) = seq.next_element()? {
+                if entries.len() == self.max_entries {
+                    self.too_many_entries.set(true);
+                    return Err(de::Error::custom("too many batch entries"));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    let too_many_entries = std::cell::Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let entries = de::DeserializeSeed::deserialize(
+        BoundedEntries {
+            max_entries,
+            too_many_entries: &too_many_entries,
+        },
+        &mut deserializer,
+    )
+    .and_then(|entries| deserializer.end().map(|()| entries));
+
+    match entries {
+        Ok(entries) => Ok(entries),
+        Err(_) if too_many_entries.get() => Err(BatchError::TooManyEntries),
+        Err(_) => Err(BatchError::Malformed),
+    }
+}
+
 /// A parsed request body.
 pub(crate) enum Body<'a> {
     /// A single method call.
@@ -294,21 +362,23 @@ impl<'a> Body<'a> {
                 Self::Error(MethodResponse::error(id, code.into()))
             }
         } else {
-            let Ok(entries) = serde_json::from_slice::<Vec<&RawValue>>(body) else {
-                return Self::Error(MethodResponse::error(
-                    Id::Null,
-                    ErrorCode::ParseError.into(),
-                ));
+            let entries = match parse_batch(body, max_batch_entries) {
+                Ok(entries) => entries,
+                Err(BatchError::TooManyEntries) => {
+                    return Self::Error(MethodResponse::server_error(
+                        Id::Null,
+                        TOO_BIG_BATCH_REQUEST_CODE,
+                        TOO_BIG_BATCH_REQUEST_MSG,
+                        max_batch_entries,
+                    ));
+                }
+                Err(BatchError::Malformed) => {
+                    return Self::Error(MethodResponse::error(
+                        Id::Null,
+                        ErrorCode::ParseError.into(),
+                    ));
+                }
             };
-
-            if entries.len() > max_batch_entries {
-                return Self::Error(MethodResponse::server_error(
-                    Id::Null,
-                    TOO_BIG_BATCH_REQUEST_CODE,
-                    TOO_BIG_BATCH_REQUEST_MSG,
-                    max_batch_entries,
-                ));
-            }
 
             Self::Batch(
                 entries

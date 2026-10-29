@@ -117,8 +117,10 @@ where
         Property {
             id: PropertyId::new(DETACHED_SUBMISSION_BOUNDED),
             claim: "attached and detached submissions share the submission limit and the \
-                    decoded-byte target, which only a lone body may pass, and every submission \
-                    storage held across a reset keeps an attached or detached holder",
+                    decoded-byte target, which only a lone body may pass, every submission \
+                    storage held across a reset keeps an attached or detached holder, and \
+                    the sequencer releases a submission's holders before quiescence once its \
+                    verdict reaches block sync",
             kind: Kind::Safety,
             assumes: &[],
             needs: NEEDS,
@@ -261,6 +263,9 @@ pub struct SemanticModel {
     closed: bool,
     /// Stale completions block sync received whose holders it still holds.
     stale: BTreeSet<u64>,
+    /// Tokens whose verdict reached block sync while a submission holder
+    /// still held them. The sequencer must release them before quiescence.
+    completed_held: BTreeSet<u64>,
     /// Submissions the sequencer held after the last step judged.
     in_flight_at_last_step: u64,
 
@@ -673,12 +678,16 @@ impl SemanticModel {
             }
         }
         self.judge_stale(step, &changes);
+        self.completed_held.extend(&changes.delivered);
         for token in &changes.emptied {
             if self.submissions.get(token) == Some(&(0, 0)) {
                 self.submissions.remove(token);
                 self.stale.remove(token);
             }
         }
+        let submissions = &self.submissions;
+        self.completed_held
+            .retain(|token| submissions.get(token).is_some_and(|held| *held != (0, 0)));
         self.judge_room(step, &changes);
         if changes.storage_changed {
             self.judge_detached(step);
@@ -1038,8 +1047,9 @@ fn waiting_body_moved(key: &ObligationKey, obs: &Observation) -> bool {
 
 /// Checks [`DETACHED_SUBMISSION_BOUNDED`]: the shared count limit, the
 /// shared decoded-byte target over the bodies storage holds, which only a
-/// lone body may pass, and a holder for every submission storage held across
-/// a reset.
+/// lone body may pass, a holder for every submission storage held across a
+/// reset, and, once no task can run, no holder left on a submission whose
+/// verdict reached block sync.
 fn check_detached_submission_bounded<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -1048,10 +1058,23 @@ where
     let model = caught_up(cx);
     let (findings, applicable) = {
         let mut model = model.borrow_mut();
-        (
-            std::mem::take(&mut model.detached_findings),
-            model.saw_submission,
-        )
+        let mut findings = std::mem::take(&mut model.detached_findings);
+        if cx.status != zakura_scheduler::Status::Running && !model.closed {
+            let unreleased = std::mem::take(&mut model.completed_held);
+            if !unreleased.is_empty() {
+                findings.push(Finding {
+                    step: cx.step,
+                    expected: "the sequencer releases a submission's holders before quiescence \
+                               once its verdict reaches block sync"
+                        .to_owned(),
+                    actual: format!(
+                        "no task can run, and holders still hold tokens {unreleased:?}, whose \
+                         verdicts block sync received"
+                    ),
+                });
+            }
+        }
+        (findings, model.saw_submission)
     };
     report(cx, findings).unwrap_or(if applicable {
         Verdict::Holds
@@ -1453,6 +1476,47 @@ mod tests {
             "{:?}",
             model.submissions
         );
+    }
+
+    /// A verdict that reached block sync leaves its token owed a release
+    /// until the sequencer drops the token's last holder, attached or
+    /// detached.
+    #[test]
+    fn a_delivered_verdict_owes_its_holders_a_release() {
+        let mut history = stale_beside_current();
+        history.step().verdict(1).verdict(2);
+        let model = SemanticModel::of(&history.log);
+        assert_eq!(model.completed_held, BTreeSet::from([1, 2]));
+        history.step().holder(
+            owner(1, 2, 2),
+            BlockSyncHolder::Submitted { token: 2 },
+            "released",
+        );
+        let model = SemanticModel::of(&history.log);
+        assert_eq!(model.completed_held, BTreeSet::from([1]));
+        history.step().holder(
+            owner(1, 1, 1),
+            BlockSyncHolder::Detached { token: 1 },
+            "released",
+        );
+        let model = SemanticModel::of(&history.log);
+        assert!(
+            model.completed_held.is_empty(),
+            "{:?}",
+            model.completed_held
+        );
+    }
+
+    /// A holder released in its verdict's own step owes nothing.
+    #[test]
+    fn a_release_in_the_verdicts_step_owes_nothing() {
+        let mut history = stale_beside_current();
+        history.step().verdict(2).holder(
+            owner(1, 2, 2),
+            BlockSyncHolder::Submitted { token: 2 },
+            "released",
+        );
+        assert!(SemanticModel::of(&history.log).completed_held.is_empty());
     }
 
     /// Session 1 on connection 10 asks for height 3 in epoch 1, and the

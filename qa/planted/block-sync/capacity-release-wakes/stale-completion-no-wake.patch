@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
-index a8ac759e3..79b85be97 100644
+index a296c0f15..906e99c46 100644
 --- a/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/sequencer_task.rs
-@@ -889,7 +889,7 @@ impl SequencerTask {
+@@ -989,7 +989,7 @@ impl SequencerTask {
              zakura_header_chain::BodyWorkOwner,
              zakura_header_chain::StateVersion,
          )>,
@@ -10,8 +10,8 @@ index a8ac759e3..79b85be97 100644
 +        _committed_epoch: Option<zakura_header_chain::BodyWorkEpoch>,
      ) -> (bool, bool) {
          let result = outcome.result();
-         // Frontier updates can remove applying entries before their completions.
-@@ -918,24 +918,7 @@ impl SequencerTask {
+         if matches!(result, BlockApplyResult::Rejected) {
+@@ -1021,24 +1021,7 @@ impl SequencerTask {
                  outcome.verification(),
                  zakura_header_chain::BodyVerificationOutcome::Verified(_)
              );

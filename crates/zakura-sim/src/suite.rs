@@ -134,12 +134,21 @@ pub struct SimPackage {
 }
 
 /// A package whose ordinary-build property suites run: each source file
-/// with a `proptest!` block becomes one row.
+/// with a `proptest!` block, or a call of one of `suite_macros`, becomes
+/// one row ([`is_property_suite`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PropertyPackage {
     /// The package. Its directory is `crates/<name>`.
     pub name: String,
+    /// Macros that expand to a property suite, such as
+    /// `stream_conformance_suite`. The file that defines one isn't a suite
+    /// itself.
+    #[serde(default)]
+    pub suite_macros: Vec<String>,
+    /// The package features its suites need, such as `zakura-testkit`.
+    #[serde(default)]
+    pub features: Vec<String>,
     /// The timeout of each of its rows.
     pub timeout_secs: u64,
 }
@@ -844,18 +853,19 @@ impl Builder<'_> {
                 .into_iter()
                 .filter(|file| {
                     fs::read_to_string(self.root.join(file))
-                        .is_ok_and(|source| source.contains("proptest!"))
+                        .is_ok_and(|source| is_property_suite(&source, &package.suite_macros))
                 })
                 .collect();
             if files.is_empty() {
                 self.problem(format!(
-                    "property package `{}` has no source file with a `proptest!` block",
+                    "property package `{}` has no property suite",
                     package.name
                 ));
             }
             for file in files {
                 ignored.extend(self.ignored_in(&file));
                 let module = module_path(&file, &dir);
+                let features = features(&package.features);
                 let id = self.id(format!("property-suite/{}/{module}", package.name));
                 rows.push(TestRow {
                     id,
@@ -864,7 +874,7 @@ impl Builder<'_> {
                     build: Build::Ordinary,
                     command: Build::Ordinary.command(
                         "test",
-                        &format!("--locked -p {} --lib -- {module}::", package.name),
+                        &format!("--locked -p {}{features} --lib -- {module}::", package.name),
                     ),
                     timeout_secs: package.timeout_secs,
                     file: Some(file),
@@ -986,7 +996,10 @@ impl Builder<'_> {
         }
         for package in &self.suite.property_package {
             if file.starts_with(&format!("crates/{}/src/", package.name)) {
-                return Some((format!("-p {} --lib", package.name), Build::Ordinary));
+                return Some((
+                    format!("-p {}{} --lib", package.name, features(&package.features)),
+                    Build::Ordinary,
+                ));
             }
         }
         self.problem(format!("no package row runs {file}"));
@@ -1535,6 +1548,37 @@ fn witness_test(witness: Witness) -> String {
     format!("crates/zakura-sim/{}::{}", witness.file, witness.test)
 }
 
+/// ` --features <features>`, or nothing if `features` is empty.
+fn features(features: &[String]) -> String {
+    match features.is_empty() {
+        true => String::new(),
+        false => format!(" --features {}", features.join(",")),
+    }
+}
+
+/// Whether `source` is a property suite: outside comments, it has a
+/// `proptest!` block or calls one of `macros`, and it defines none of
+/// `macros`.
+pub fn is_property_suite(source: &str, macros: &[String]) -> bool {
+    let code: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .collect();
+    let defines = code.iter().any(|line| {
+        macros
+            .iter()
+            .any(|name| line.starts_with(&format!("macro_rules! {name}")))
+    });
+    !defines
+        && code.iter().any(|line| {
+            line.contains("proptest!")
+                || macros
+                    .iter()
+                    .any(|name| line.contains(&format!("{name}!(")))
+        })
+}
+
 /// The tests in `source` that carry an `#[ignore` attribute: for each
 /// line that starts with one, the next function's name.
 pub fn ignored_tests(source: &str) -> Vec<String> {
@@ -1661,6 +1705,26 @@ mod tests {
                       /// Docs.\nfn slow() {}\n#[ignore]\n#[tokio::test]\nasync fn \
                       later() {}\nlet s = \"#[ignore]\";\n";
         assert_eq!(ignored_tests(source), ["slow", "later"]);
+    }
+
+    /// A suite is a `proptest!` block or a suite macro's call, in code.
+    #[test]
+    fn property_suites_are_code_that_calls_a_suite() {
+        let macros = ["message_suite".to_owned()];
+        assert!(is_property_suite("proptest! {\n}", &macros));
+        assert!(is_property_suite(
+            "message_suite!(family, Message);",
+            &macros
+        ));
+        assert!(!is_property_suite(
+            "//! message_suite!(family, Message);",
+            &macros
+        ));
+        assert!(!is_property_suite(
+            "macro_rules! message_suite {\n proptest! {}\n}",
+            &macros
+        ));
+        assert!(!is_property_suite("#[test]\nfn plain() {}", &macros));
     }
 
     /// File paths become module paths.

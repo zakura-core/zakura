@@ -44,9 +44,15 @@ tests = ["sim_header_sync", "sim_block_sync"]
 timeout-secs = 2700
 
 # Packages whose ordinary-build property suites run: each source file with a
-# `proptest!` block is one row, which runs that file's module.
+# `proptest!` block, or a call of a macro that expands to a property suite,
+# is one row, which runs that file's module. `stream_conformance_suite`
+# checks every session layout's properties over real QUIC; the other two
+# check each wire family's codec.
 [[property-package]]
 name = "zakura-network"
+suite-macros = ["item_suite", "message_suite", "stream_conformance_suite"]
+# Block sync's conformance suite builds only with the testkit.
+features = ["zakura-testkit"]
 timeout-secs = 1800
 
 # Every ignored test in the sources above. CI keeps them out of its

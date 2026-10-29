@@ -468,7 +468,7 @@ impl Sim {
                     by: decision.by,
                     offset: decision.offset,
                     draws,
-                    obs: Some(digest(st.log.of_step(st.step))),
+                    obs: Some(digest(st.log.entries_of_step(st.step))),
                 }));
             }
             if let Some(failure) = self.failure.take() {

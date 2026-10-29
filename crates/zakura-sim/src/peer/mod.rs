@@ -14,7 +14,7 @@
 //! the sender's rules by the [`adapter`] (M5-E2). A peer that closes its
 //! connection with a header stream open logs a `PeerClosed` (M5-F). Each record names its
 //! connection and QUIC stream from the identity map, never from draw order,
-//! so it waits in [`PeerControl`] until the node's transport has admitted
+//! so it waits in the evidence hub until the node's transport has admitted
 //! its stream.
 //!
 //! A peer with an [`AdversarySpec`] also takes [`PeerAction::Act`]s, the
@@ -66,11 +66,10 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, WireEvidence};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
-    evidence::WireEvidence,
     handshake::{Echo, Local},
     honest::{Honest, HonestChain, HonestSpec},
     limit::{RateLimit, ADVERSARY_RATE},
@@ -335,20 +334,14 @@ impl Slot {
 pub struct PeerControl {
     slots: Vec<Slot>,
     failure: PeerFailure,
-    /// What the peers' tasks recorded, until the identity map places it.
-    records: PeerRecords,
-    evidence: WireEvidence,
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`, and the peers' tasks
-    /// record into `records`.
-    pub(crate) fn new(failure: PeerFailure, records: PeerRecords) -> Self {
+    /// No peers yet. Failures land in `failure`.
+    pub(crate) fn new(failure: PeerFailure) -> Self {
         PeerControl {
             slots: Vec::new(),
             failure,
-            records,
-            evidence: WireEvidence::default(),
         }
     }
 
@@ -413,18 +406,14 @@ impl ActionSource for PeerControl {
         slot.next += 1;
     }
 
-    /// Logs the peers' records the identity map can place, and what the
-    /// node's evidence means for P3b's checks ([`WireEvidence`]), then
-    /// fails the run if a peer couldn't carry out an action. So a node frame
-    /// that stopped its peer is logged with its `NodeFrame` first. This
-    /// source is added after the transport tap, so the identity rows it
-    /// reads are logged first.
-    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        let observed = self.evidence.observe(&self.records, log);
-        if let Some(failure) = self.failure.get() {
-            return Err(format!("PeerActionFailed: {failure}"));
+    /// Fails the run if a peer couldn't carry out an action. The evidence
+    /// hub, added after this source, still logs the peers' records, so a
+    /// node frame that stopped its peer is logged with its `NodeFrame`.
+    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
+        match self.failure.get() {
+            Some(failure) => Err(format!("PeerActionFailed: {failure}")),
+            None => Ok(()),
         }
-        observed
     }
 }
 
@@ -1177,9 +1166,10 @@ impl PeerTask {
     }
 
     /// Records `body` on `remote`'s QUIC stream `quic_stream`, for
-    /// [`PeerControl`] to place.
+    /// the evidence hub to place.
     fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
-        self.records.borrow_mut().push_back(PeerRecord {
+        self.records.push(PeerRecord {
+            pos: zakura_rt::sim::next_position(),
             remote,
             quic_stream,
             body,

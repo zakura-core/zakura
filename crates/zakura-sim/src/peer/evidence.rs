@@ -1,11 +1,13 @@
 //! What scripted peers record, placed by the identity map, and what the
 //! node's evidence means for P3b's close checks (M5-D).
 //!
-//! A peer's task records each frame it sends and reads with its own address
-//! and the QUIC stream, which both ends share. [`WireEvidence`] holds each
-//! record until the transport tap has logged the connection's `registered`
-//! event and the stream's `Session` row, then logs it as a `PeerFrame`,
-//! `PeerWritten` or `PeerReceived` with that connection (M5-Q4). Records of
+//! A peer's task records each frame it sends and reads with its own address,
+//! the QUIC stream, which both ends share, and the position it happened at.
+//! The evidence hub folds each step's rows through [`WireEvidence`] in key
+//! order, and [`WireEvidence`] holds each record until the connection's
+//! `registered` event and the stream's `Session` row have passed, then
+//! places it as a `PeerFrame`, `PeerWritten` or `PeerReceived` with that
+//! connection (M5-Q4), keyed after the row that let it resolve. Records of
 //! one stream keep their order. A record whose stream can no longer be
 //! admitted, because the node refused it or its handshake, or tore its
 //! connection down, fails the run, so a peer's frames can't drop out of the
@@ -24,10 +26,10 @@
 //! response whose payload arrived before its precheck's checkpoint.
 
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
+    mem,
     net::SocketAddr,
-    rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -40,7 +42,7 @@ use super::{
 use crate::{
     model::{FrameHeader, Label},
     observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
-    Observation, ObservationLog,
+    Observation,
 };
 
 /// A frame the node's reader has the header of, by connection, QUIC stream
@@ -55,13 +57,55 @@ struct Waiting {
     payload_len: usize,
 }
 
-/// What the peers' tasks recorded and the identity map hasn't placed yet,
-/// oldest first.
-pub(crate) type PeerRecords = Rc<RefCell<VecDeque<PeerRecord>>>;
+/// What the peers' tasks record, shared with the evidence hub that drains
+/// it at each observation. The tasks that read a peer's streams record too,
+/// so it's `Send`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PeerRecords(Arc<Mutex<Queue>>);
+
+/// [`PeerRecords`]' contents.
+#[derive(Debug, Default)]
+struct Queue {
+    /// Recorded and not yet drained, oldest first.
+    recorded: Vec<PeerRecord>,
+    /// How many drained records the identity map hasn't placed yet.
+    unplaced: usize,
+}
+
+impl PeerRecords {
+    /// Locks the queue. Every change completes under the lock.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records `record`.
+    pub(crate) fn push(&self, record: PeerRecord) {
+        self.lock().recorded.push(record);
+    }
+
+    /// Every record not drained yet, oldest first.
+    pub(crate) fn take(&self) -> Vec<PeerRecord> {
+        mem::take(&mut self.lock().recorded)
+    }
+
+    /// Notes that `unplaced` drained records wait for their identity.
+    pub(crate) fn set_unplaced(&self, unplaced: usize) {
+        self.lock().unplaced = unplaced;
+    }
+
+    /// How many records aren't placed yet, drained or not.
+    pub(crate) fn unplaced(&self) -> usize {
+        let queue = self.lock();
+        queue.recorded.len() + queue.unplaced
+    }
+}
 
 /// One thing a peer did on a header stream.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerRecord {
+    /// Where the record was made, from
+    /// [`zakura_rt::sim::next_position`].
+    pub(crate) pos: Option<u64>,
     /// The peer's address on the connection, which the node sees as the
     /// remote.
     pub(crate) remote: SocketAddr,
@@ -103,8 +147,6 @@ pub(crate) enum RecordBody {
 /// The identity map as the log has it, and the labels logged so far.
 #[derive(Debug, Default)]
 pub(crate) struct WireEvidence {
-    /// How many log entries it has read.
-    seen: usize,
     /// Each registered connection, by its remote address as the log
     /// writes it. A remote gets one handshake outcome at most
     /// ([`WireEvidence::first_outcome`]).
@@ -132,106 +174,101 @@ pub(crate) struct WireEvidence {
 }
 
 impl WireEvidence {
-    /// Reads the identity rows logged since the last call, logs every record
-    /// they place, then the P3b observations the node's new evidence means.
-    pub(crate) fn observe(
-        &mut self,
-        records: &PeerRecords,
-        log: &mut ObservationLog,
-    ) -> Result<(), String> {
-        let start = self.seen;
-        for entry in &log.entries()[start..] {
-            if let Observation::Transport {
-                connection: Some(connection),
-                event,
-                ..
-            } = &entry.obs
-            {
-                self.sender.node(*connection, event);
-            }
-            match &entry.obs {
-                Observation::Transport {
-                    connection: Some(connection),
-                    remote,
-                    event: TransportFact::Registered,
-                    ..
-                } => {
-                    self.first_outcome(remote)?;
-                    self.connections.insert(remote.clone(), *connection);
-                }
-                Observation::Transport {
-                    connection: None,
-                    remote,
-                    event: TransportFact::HandshakeRefused { .. },
-                    ..
-                } => {
-                    self.first_outcome(remote)?;
-                    self.refused_handshakes.insert(remote.clone());
-                }
-                Observation::Transport {
-                    connection: Some(connection),
-                    event: TransportFact::StreamRefused { quic_stream, .. },
-                    ..
-                } => {
-                    self.refused_streams.insert((*connection, *quic_stream));
-                }
-                Observation::Transport {
-                    connection: Some(connection),
-                    event: TransportFact::TornDown,
-                    ..
-                } => {
-                    self.torn_down.insert(*connection);
-                }
-                Observation::Session {
-                    connection,
-                    quic_stream,
-                    kind,
-                    version,
-                    session_id,
-                    ..
-                } => {
-                    let stream = StreamId {
-                        kind: *kind,
-                        version: *version,
-                    };
-                    self.streams.insert((*connection, *quic_stream), stream);
-                    self.sessions.insert(*session_id, *connection);
-                }
-                _ => {}
-            }
+    /// Reads one row the hub is writing, in key order: updates the identity
+    /// map from it, and returns the P3b observations it means.
+    pub(crate) fn row(&mut self, obs: &Observation) -> Result<Vec<Observation>, String> {
+        if let Observation::Transport {
+            connection: Some(connection),
+            event,
+            ..
+        } = obs
+        {
+            self.sender.node(*connection, event);
         }
+        match obs {
+            Observation::Transport {
+                connection: Some(connection),
+                remote,
+                event: TransportFact::Registered,
+                ..
+            } => {
+                self.first_outcome(remote)?;
+                self.connections.insert(remote.clone(), *connection);
+            }
+            Observation::Transport {
+                connection: None,
+                remote,
+                event: TransportFact::HandshakeRefused { .. },
+                ..
+            } => {
+                self.first_outcome(remote)?;
+                self.refused_handshakes.insert(remote.clone());
+            }
+            Observation::Transport {
+                connection: Some(connection),
+                event: TransportFact::StreamRefused { quic_stream, .. },
+                ..
+            } => {
+                self.refused_streams.insert((*connection, *quic_stream));
+            }
+            Observation::Transport {
+                connection: Some(connection),
+                event: TransportFact::TornDown,
+                ..
+            } => {
+                self.torn_down.insert(*connection);
+            }
+            Observation::Session {
+                connection,
+                quic_stream,
+                kind,
+                version,
+                session_id,
+                ..
+            } => {
+                let stream = StreamId {
+                    kind: *kind,
+                    version: *version,
+                };
+                self.streams.insert((*connection, *quic_stream), stream);
+                self.sessions.insert(*session_id, *connection);
+            }
+            _ => {}
+        }
+        Ok(self.project(obs)?.into_iter().collect())
+    }
+
+    /// Places every record of `pending` the identity map can place now, in
+    /// order, each as its observations with the position it was recorded
+    /// at. The rest stay in `pending`. An error if the sender adapter can't
+    /// label the node's frame.
+    pub(crate) fn place(
+        &mut self,
+        pending: &mut Vec<PeerRecord>,
+    ) -> Result<Vec<(u64, Observation)>, String> {
         let mut placed = Vec::new();
         let mut failed = None;
-        records
-            .borrow_mut()
-            .retain(|record| match self.place(record) {
-                Some(Ok(obs)) => {
-                    placed.extend(obs);
-                    false
-                }
-                Some(Err(why)) => {
-                    failed.get_or_insert(why);
-                    false
-                }
-                None => true,
-            });
-        if let Some(why) = failed {
-            return Err(why);
-        }
-        if let Some(lost) = records.borrow().iter().find_map(|record| self.lost(record)) {
-            return Err(lost);
-        }
-        let mut projected = Vec::new();
-        for entry in &log.entries()[start..] {
-            if let Some(obs) = self.project(&entry.obs)? {
-                projected.push(obs);
+        pending.retain(|record| match self.place_one(record) {
+            Some(Ok(obs)) => {
+                let pos = record.pos.unwrap_or_default();
+                placed.extend(obs.into_iter().map(|obs| (pos, obs)));
+                false
             }
+            Some(Err(why)) => {
+                failed.get_or_insert(why);
+                false
+            }
+            None => true,
+        });
+        match failed {
+            Some(why) => Err(why),
+            None => Ok(placed),
         }
-        for obs in placed.into_iter().chain(projected) {
-            log.push(obs);
-        }
-        self.seen = log.entries().len();
-        Ok(())
+    }
+
+    /// Why a record of `pending` never will be placed, if one can't.
+    pub(crate) fn lost(&self, pending: &[PeerRecord]) -> Option<String> {
+        pending.iter().find_map(|record| self.lost_one(record))
     }
 
     /// Fails the run once `remote` gets a second handshake outcome,
@@ -255,7 +292,7 @@ impl WireEvidence {
     /// `record` as its observations, once its stream is admitted: one, or
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
-    fn place(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
+    fn place_one(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
         let connection = *self.connections.get(&record.remote.to_string())?;
         let stream = *self.streams.get(&(connection, record.quic_stream))?;
         let quic_stream = record.quic_stream;
@@ -325,7 +362,7 @@ impl WireEvidence {
 
     /// Why `record`, still unplaced, never will be, if the node refused its
     /// handshake or stream or tore its connection down.
-    fn lost(&self, record: &PeerRecord) -> Option<String> {
+    fn lost_one(&self, record: &PeerRecord) -> Option<String> {
         let remote = record.remote.to_string();
         let gone = match self.connections.get(&remote) {
             None => self.refused_handshakes.contains(&remote),
@@ -550,25 +587,72 @@ mod tests {
     use super::*;
     use crate::peer::peer_addr;
 
+    /// What the hub hands the identity map, in key order.
+    enum Item {
+        Row(Observation),
+        Record(PeerRecord),
+    }
+
+    /// Folds `items` through `evidence` as the hub does, with `pending` the
+    /// records drained before: each row's projections, then each placement
+    /// it allows. Returns the derived observations in order, or the first
+    /// failure, a record that can never be placed included.
+    fn fold(
+        evidence: &mut WireEvidence,
+        pending: &mut Vec<PeerRecord>,
+        items: Vec<Item>,
+    ) -> Result<Vec<Observation>, String> {
+        let mut derived = Vec::new();
+        for item in items {
+            match item {
+                Item::Row(obs) => derived.extend(evidence.row(&obs)?),
+                Item::Record(record) => pending.push(record),
+            }
+            derived.extend(evidence.place(pending)?.into_iter().map(|(_, obs)| obs));
+        }
+        match evidence.lost(pending) {
+            Some(lost) => Err(lost),
+            None => Ok(derived),
+        }
+    }
+
     /// A transport event on `connection` from peer 0's first address.
-    fn transport(seq: u64, connection: Option<u64>, event: TransportFact) -> Observation {
-        Observation::Transport {
+    fn transport(seq: u64, connection: Option<u64>, event: TransportFact) -> Item {
+        Item::Row(Observation::Transport {
             instance: 0,
             seq,
             node: "node".to_owned(),
             connection,
             remote: peer_addr(0, 0).to_string(),
             event,
+        })
+    }
+
+    /// Connection `connection`'s session row for QUIC stream 4.
+    fn session(connection: u64, session_id: u64) -> Item {
+        Item::Row(Observation::Session {
+            connection,
+            peer: "peer-0".to_owned(),
+            quic_stream: 4,
+            kind: RegtestMessage::LAYOUT[0].kind,
+            version: RegtestMessage::LAYOUT[0].version,
+            session_id,
+        })
+    }
+
+    /// Peer 0's record of `body` on QUIC stream 4.
+    fn record(body: RecordBody) -> PeerRecord {
+        PeerRecord {
+            pos: Some(1),
+            remote: peer_addr(0, 0),
+            quic_stream: 4,
+            body,
         }
     }
 
-    /// Peer 0's `PeerFrame` record for its first frame on QUIC stream 4.
-    fn status_record() -> PeerRecords {
-        Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: peer_addr(0, 0),
-            quic_stream: 4,
-            body: RecordBody::Written { seq: 0 },
-        }])))
+    /// Peer 0's `PeerWritten` record for its first frame on QUIC stream 4.
+    fn status_record() -> Item {
+        Item::Record(record(RecordBody::Written { seq: 0 }))
     }
 
     /// A node frame the peer couldn't decode, here one with a reserved flag
@@ -581,41 +665,27 @@ mod tests {
             flags: 1,
             payload: Vec::new(),
         };
-        let records = Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: peer_addr(0, 0),
-            quic_stream: 4,
-            body: RecordBody::Received {
-                seq: 0,
-                message_type: frame.message_type,
-                payload: 0,
-                credit: None,
-                frame: frame.clone(),
-                at: Duration::ZERO,
-            },
-        }])));
-        let mut log = ObservationLog::default();
-        log.push(transport(1, Some(1), TransportFact::Registered));
-        log.push(Observation::Session {
-            connection: 1,
-            peer: "peer-0".to_owned(),
-            quic_stream: 4,
-            kind: RegtestMessage::LAYOUT[0].kind,
-            version: RegtestMessage::LAYOUT[0].version,
-            session_id: 7,
+        let received = record(RecordBody::Received {
+            seq: 0,
+            message_type: frame.message_type,
+            payload: 0,
+            credit: None,
+            frame: frame.clone(),
+            at: Duration::ZERO,
         });
-        log.push(transport(
-            2,
-            Some(1),
-            TransportFact::FrameWriteStarted {
-                quic_stream: 4,
-                seq: 0,
-                message_type: frame.message_type,
-            },
-        ));
-        WireEvidence::default()
-            .observe(&records, &mut log)
+        let started = TransportFact::FrameWriteStarted {
+            quic_stream: 4,
+            seq: 0,
+            message_type: frame.message_type,
+        };
+        let items = vec![
+            transport(1, Some(1), TransportFact::Registered),
+            session(1, 7),
+            transport(2, Some(1), started),
+            Item::Record(received),
+        ];
+        let logged = fold(&mut WireEvidence::default(), &mut Vec::new(), items)
             .expect("the record is placed");
-        let logged: Vec<_> = log.entries()[3..].iter().map(|entry| &entry.obs).collect();
         assert!(
             matches!(
                 logged[..],
@@ -651,20 +721,20 @@ mod tests {
             (None, handshake),
         ];
         for (connection, ending) in cases {
-            let records = status_record();
             let mut evidence = WireEvidence::default();
-            let mut log = ObservationLog::default();
+            let mut pending = Vec::new();
+            let mut items = vec![status_record()];
             if connection.is_some() {
-                log.push(transport(1, connection, TransportFact::Registered));
+                items.push(transport(1, connection, TransportFact::Registered));
             }
-            evidence
-                .observe(&records, &mut log)
-                .expect("the stream may still be admitted");
-            assert_eq!(records.borrow().len(), 1, "it waits");
-            log.push(transport(2, connection, ending.clone()));
-            let error = evidence
-                .observe(&records, &mut log)
-                .expect_err("the record can never be placed");
+            fold(&mut evidence, &mut pending, items).expect("the stream may still be admitted");
+            assert_eq!(pending.len(), 1, "it waits");
+            let error = fold(
+                &mut evidence,
+                &mut pending,
+                vec![transport(2, connection, ending.clone())],
+            )
+            .expect_err("the record can never be placed");
             assert!(error.starts_with("UnplacedRecord"), "{ending:?}: {error}");
         }
     }
@@ -679,45 +749,41 @@ mod tests {
             kind: 5,
             version: 9,
         };
-        let records = PeerRecords::default();
-        records.borrow_mut().extend((0..4).map(|seq| PeerRecord {
-            remote: peer_addr(0, 0),
-            quic_stream: 4,
-            body: RecordBody::Frame {
-                seq,
-                row: None,
-                rule_stream: stream,
-                label: Label::Conformant,
-                exhausted: false,
-                exchange: None,
-                payload: 0,
-            },
-        }));
+        let mut items: Vec<Item> = (0..4)
+            .map(|seq| {
+                Item::Record(record(RecordBody::Frame {
+                    seq,
+                    row: None,
+                    rule_stream: stream,
+                    label: Label::Conformant,
+                    exhausted: false,
+                    exchange: None,
+                    payload: 0,
+                }))
+            })
+            .collect();
+        items.extend([
+            transport(1, Some(1), TransportFact::Registered),
+            session(1, 7),
+        ]);
         let mut evidence = WireEvidence::default();
-        let mut log = ObservationLog::default();
-        log.push(transport(1, Some(1), TransportFact::Registered));
-        log.push(Observation::Session {
-            connection: 1,
-            peer: "peer-0".to_owned(),
-            quic_stream: 4,
-            kind: 5,
-            version: 9,
-            session_id: 7,
-        });
+        let mut pending = Vec::new();
+        fold(&mut evidence, &mut pending, items).expect("the evidence is whole");
+        let mut judged = Vec::new();
         let mut event = 1;
-        let mut feed = |log: &mut ObservationLog, fact: TransportFact| {
+        let mut feed = |fact: TransportFact| {
             event += 1;
-            log.push(transport(event, Some(1), fact));
-            evidence
-                .observe(&records, log)
-                .expect("the evidence is whole");
-            log.entries()
-                .iter()
-                .filter_map(|entry| match entry.obs {
-                    Observation::FrameJudged { seq, .. } => Some(seq),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
+            let derived = fold(
+                &mut evidence,
+                &mut pending,
+                vec![transport(event, Some(1), fact)],
+            )
+            .expect("the evidence is whole");
+            judged.extend(derived.iter().filter_map(|obs| match obs {
+                Observation::FrameJudged { seq, .. } => Some(*seq),
+                _ => None,
+            }));
+            judged.clone()
         };
         let header = |seq, message_type, flags, payload_len| TransportFact::HeaderRead {
             quic_stream: 4,
@@ -737,14 +803,11 @@ mod tests {
                 outcome: crate::observe::HeaderCheckFact::AdmittedTerminal,
             },
         };
-        assert!(
-            feed(&mut log, header(0, 2, 0, 107)).is_empty(),
-            "a Grant waits"
-        );
-        assert_eq!(feed(&mut log, read(0)), [0]);
-        assert_eq!(feed(&mut log, header(1, 1, 1, 122)), [0, 1], "a flag bit");
-        assert_eq!(feed(&mut log, header(2, 3, 0, 263)), [0, 1], "a page waits");
-        assert_eq!(feed(&mut log, checked(2)), [0, 1, 2], "with nothing live");
+        assert!(feed(header(0, 2, 0, 107)).is_empty(), "a Grant waits");
+        assert_eq!(feed(read(0)), [0]);
+        assert_eq!(feed(header(1, 1, 1, 122)), [0, 1], "a flag bit");
+        assert_eq!(feed(header(2, 3, 0, 263)), [0, 1], "a page waits");
+        assert_eq!(feed(checked(2)), [0, 1, 2], "with nothing live");
         let opened = TransportFact::Regulated {
             quic_stream: 4,
             transition: TransitionFact::OpenIssued {
@@ -753,14 +816,10 @@ mod tests {
                 bytes: 263,
             },
         };
-        feed(&mut log, opened);
-        feed(&mut log, header(3, 4, 0, 41));
-        assert_eq!(
-            feed(&mut log, checked(3)),
-            [0, 1, 2],
-            "an ending for a live one"
-        );
-        assert_eq!(feed(&mut log, read(3)), [0, 1, 2, 3]);
+        feed(opened);
+        feed(header(3, 4, 0, 41));
+        assert_eq!(feed(checked(3)), [0, 1, 2], "an ending for a live one");
+        assert_eq!(feed(read(3)), [0, 1, 2, 3]);
     }
 
     /// A second handshake outcome for a remote address already mapped, as a
@@ -781,39 +840,28 @@ mod tests {
             (None, Some(2), TransportFact::Registered),
         ];
         for (first, second, outcome) in cases {
-            // A record from a refused handshake can never be placed, so only
-            // a registered first connection leaves one waiting.
-            let records = match first {
-                Some(_) => status_record(),
-                None => PeerRecords::default(),
-            };
-            let waiting = records.borrow().len();
             let mut evidence = WireEvidence::default();
-            let mut log = ObservationLog::default();
+            let mut pending = Vec::new();
             let first_outcome = match first {
                 Some(_) => TransportFact::Registered,
                 None => refused(),
             };
-            log.push(transport(1, first, first_outcome));
-            evidence
-                .observe(&records, &mut log)
-                .expect("a remote's first outcome is fine");
-            log.push(transport(2, second, outcome.clone()));
-            if let Some(connection) = second {
-                log.push(Observation::Session {
-                    connection,
-                    quic_stream: 4,
-                    kind: 5,
-                    version: 9,
-                    session_id: 1,
-                    peer: "peer-0".to_owned(),
-                });
+            let mut items = vec![transport(1, first, first_outcome)];
+            // A record from a refused handshake can never be placed, so only
+            // a registered first connection leaves one waiting.
+            if first.is_some() {
+                items.insert(0, status_record());
             }
-            let error = evidence
-                .observe(&records, &mut log)
+            fold(&mut evidence, &mut pending, items).expect("a remote's first outcome is fine");
+            let waiting = pending.len();
+            let mut items = vec![transport(2, second, outcome.clone())];
+            if let Some(connection) = second {
+                items.push(session(connection, 1));
+            }
+            let error = fold(&mut evidence, &mut pending, items)
                 .expect_err("the second outcome fails the run");
             assert!(error.starts_with("AliasedRemote"), "{outcome:?}: {error}");
-            assert_eq!(records.borrow().len(), waiting, "nothing was placed");
+            assert_eq!(pending.len(), waiting, "nothing was placed");
         }
     }
 }

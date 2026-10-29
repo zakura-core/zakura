@@ -17,7 +17,9 @@ use zakura_quic::sim::{DatagramId, DropReason, Link, NetEvent, SimNet};
 use zakura_scheduler::{hooks, SimInstant};
 
 use crate::{
-    observe::DatagramOutcome, ActionSource, Boundary, Identity, Observation, ObservationLog,
+    harness::evidence_hub::{Out, Row},
+    observe::DatagramOutcome,
+    ActionSource, Boundary, Identity, Observation, ObservationLog,
 };
 
 /// A [`SimNet`] as an action source. Clones share it, so a harness can keep
@@ -40,6 +42,8 @@ struct State {
     seen: usize,
     /// Each datagram sent and not yet gone: its length and send time.
     in_flight: BTreeMap<DatagramId, (u64, u64)>,
+    /// Where its rows go.
+    out: Out,
 }
 
 impl Net {
@@ -71,7 +75,14 @@ impl Net {
             admitted: BTreeSet::new(),
             seen: 0,
             in_flight: BTreeMap::new(),
+            out: Out::default(),
         })))
+    }
+
+    /// Hands this source's rows, and every clone's, to `out` instead of the
+    /// log.
+    pub(crate) fn write_to(&self, out: Out) {
+        self.0.borrow_mut().out = out;
     }
 
     /// The network, for binding endpoints on it.
@@ -201,14 +212,16 @@ impl ActionSource for Net {
     }
 
     /// Logs each send since the last call, stamped with the step's time, and
-    /// each delivery or drop. Sends happen only while a task runs, and time
-    /// moves only in steps that run none, so the stamp is the send's time.
+    /// each delivery or drop, each at the position the network recorded it
+    /// at. Sends happen only while a task runs, and time moves only in steps
+    /// that run none, so the stamp is the send's time.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let mut state = self.0.borrow_mut();
-        let events = state.sim.events_since(state.seen);
+        let events = state.sim.positioned_events_since(state.seen);
         state.seen += events.len();
         let now = nanos(hooks::now().expect("a run observes its sources inside the run"));
-        for event in events {
+        let mut rows = Vec::with_capacity(events.len());
+        for (event, pos) in events {
             let (id, outcome) = match event {
                 NetEvent::Sent { id, len } => {
                     // usize always fits in u64 on supported targets.
@@ -232,14 +245,18 @@ impl ActionSource for Net {
                     format!("datagram {id:?} left the network without a send the source saw")
                 })?,
             };
-            log.push(Observation::Datagram {
-                id: id.seq,
-                link: link_name(id.link),
-                len,
-                outcome,
-                sent_at,
-            });
+            rows.push(Row::at(
+                pos,
+                Observation::Datagram {
+                    id: id.seq,
+                    link: link_name(id.link),
+                    len,
+                    outcome,
+                    sent_at,
+                },
+            ));
         }
+        state.out.write(log, rows);
         Ok(())
     }
 }

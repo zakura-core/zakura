@@ -870,14 +870,14 @@ fn earlier_observation_does_not_discharge_later_trigger() {
         .expect("the request was spawned");
     let entries = report.log.entries();
     assert_eq!(
-        entries[trigger - 1],
-        zakura_sim::observe::Entry {
-            step: entries[trigger].step,
-            obs: Observation::TaskExited {
+        (entries[trigger - 1].step, &entries[trigger - 1].obs),
+        (
+            entries[trigger].step,
+            &Observation::TaskExited {
                 task: "serve-p1.1".to_owned(),
                 exit: Exit::Completed
             }
-        },
+        ),
         "the serve's exit comes first in the request's step"
     );
     assert!(

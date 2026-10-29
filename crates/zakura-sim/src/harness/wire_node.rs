@@ -46,7 +46,10 @@ use zakura_quic::{
 use zakura_rt::{sim::RunId, sync::watch};
 use zakura_scheduler::SimInstant;
 
-use super::header_node::HeaderNode;
+use super::{
+    evidence_hub::{Out, Row},
+    header_node::HeaderNode,
+};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
@@ -188,6 +191,8 @@ pub struct TransportTap {
     peers: Vec<String>,
     /// Each registered connection's remote address.
     remotes: BTreeMap<u64, SocketAddr>,
+    /// Where its rows go.
+    out: Out,
 }
 
 /// What the observer and the reader share.
@@ -207,8 +212,8 @@ struct TapState {
 struct Buffer {
     /// The last event number handed out.
     last: u64,
-    /// Each event with its number, in order.
-    events: Vec<(u64, Reported)>,
+    /// Each event with its number and emission position, in order.
+    events: Vec<(u64, Option<u64>, Reported)>,
 }
 
 /// One event in the tap's buffer: the transport's, or the wire node's own.
@@ -240,7 +245,9 @@ impl TapState {
             .checked_add(1)
             .expect("a run reports fewer than 2^64 events");
         let seq = buffer.last;
-        buffer.events.push((seq, event));
+        buffer
+            .events
+            .push((seq, zakura_rt::sim::next_position(), event));
     }
 }
 
@@ -325,8 +332,15 @@ impl TransportTap {
             net,
             peers,
             remotes: BTreeMap::new(),
+            out: Out::default(),
         };
         (observer, tap)
+    }
+
+    /// This tap, handing its rows to `out` instead of the log.
+    pub(crate) fn writing_to(mut self, out: Out) -> Self {
+        self.out = out;
+        self
     }
 
     /// The reporter the wire node's dials fail into.
@@ -638,9 +652,10 @@ impl ActionSource for TransportTap {
             return Err("ForeignRun: transport tap registered with another run".to_owned());
         }
         let events = mem::take(&mut self.state.buffer().events);
-        let last = events.last().map_or(self.delivered, |(seq, _)| *seq);
+        let last = events.last().map_or(self.delivered, |(seq, _, _)| *seq);
         let mut sent = Vec::with_capacity(events.len());
-        for (seq, event) in events {
+        let mut rows = Vec::with_capacity(events.len());
+        for (seq, pos, event) in events {
             let (connection, remote, event) = self.fact(event)?;
             let session = match (&event, connection) {
                 (
@@ -670,11 +685,16 @@ impl ActionSource for TransportTap {
                 remote: remote.to_string(),
                 event,
             };
-            log.push(obs.clone());
+            rows.push(Row::at(pos, obs.clone()));
             sent.push(obs);
             if let Some(session) = session {
                 self.net.admitted(NODE_ADDR, remote);
-                log.push(session.clone());
+                // Derived from its `admitted` event, right after it.
+                rows.push(Row {
+                    pos,
+                    sub: 1,
+                    obs: session.clone(),
+                });
                 sent.push(session);
             }
         }
@@ -682,6 +702,7 @@ impl ActionSource for TransportTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
+        self.out.write(log, rows);
         Ok(())
     }
 }

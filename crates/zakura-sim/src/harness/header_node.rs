@@ -46,6 +46,7 @@ use self::{
     policy::{Hold, LinkEffect, Predicates, Trigger},
     tap::ReactorTap,
 };
+use super::evidence_hub::{EvidenceHub, Out};
 use crate::{
     storage::{HeaderStorage, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
@@ -210,15 +211,28 @@ pub struct Effects {
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
 /// pure. With a [`ReactorTap`], it logs the node's reactor events after its
-/// storage facts, paired with them, and its predicates count both.
+/// storage facts, paired with them, and its predicates count both. Behind
+/// an [`EvidenceHub`](super::evidence_hub::EvidenceHub), the hub logs them
+/// and feeds the predicates instead, in the order they happened.
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
     port: Arc<ControlledPort>,
     base: Base,
     bound: Option<Duration>,
+    feed: Rc<RefCell<PredicateFeed>>,
+    /// Where its rows go.
+    out: Out,
+}
+
+/// What a [`PolicySource`]'s predicates count from each observed step: its
+/// storage's facts, its tap's reactor events, and the link effects.
+pub struct PredicateFeed {
     predicates: Rc<RefCell<Predicates>>,
     effects: Effects,
+    /// The storage instance and tap whose rows count.
+    storage: u64,
+    tap: Option<u64>,
     /// How many links are recorded as made.
     linked: usize,
     /// The connections recorded as closed.
@@ -227,98 +241,28 @@ pub struct PolicySource {
     grown: usize,
 }
 
-impl PolicySource {
-    /// `port`'s storage under `policy`, with its checkpoint registered with
-    /// `sim`. Its predicates count `effects` too.
-    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
-        PolicySource {
-            storage: HeaderStorage::new(sim, port.clone()),
-            tap: None,
-            port,
-            base: policy.base,
-            bound: policy.bound_ms.map(Duration::from_millis),
-            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
-            effects,
-            linked: 0,
-            closed: BTreeSet::new(),
-            grown: 0,
-        }
-    }
-
-    /// This source, draining `tap` at each observation, after storage, so
-    /// each event's storage watermark is already logged and the tap pairs
-    /// calls with that step's facts.
-    pub fn with_tap(self, tap: ReactorTap) -> Self {
-        PolicySource {
-            tap: Some(tap),
-            ..self
-        }
-    }
-
-    /// The predicates, for a [`Control`] gated by the same counts.
-    pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
-        self.predicates.clone()
-    }
-}
-
-impl ActionSource for PolicySource {
-    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
-        let pending = self.port.pending();
-        let predicates = self.predicates.borrow();
-        let mut offered = Vec::new();
-        self.storage.enabled(now, &mut offered);
-        out.extend(offered.into_iter().filter(|(_, local)| {
-            let (id, outcome) = crate::storage::decode(*local);
-            pending
-                .iter()
-                .find(|op| op.id == id)
-                .is_some_and(|op| predicates.offers(self.base, op, outcome))
-        }));
-    }
-
-    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
-        self.storage.boundaries(now, out);
-        let predicates = self.predicates.borrow();
-        for op in self.port.pending() {
-            predicates.boundaries(self.bound, &op, now, out);
-        }
-    }
-
-    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
-        self.storage.execute(local, log);
-    }
-
-    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        let before = log.entries().len();
-        let stored = self.storage.observe(log);
-        // Drained even when storage failed, so a port panic the tap holds
-        // still reaches the run's failure cell and outranks that failure.
-        let tapped = match &mut self.tap {
-            Some(tap) => {
-                // The storage source appends only its own port's facts, but
-                // a run may hold other services' storage too.
-                tap.storage_facts(log.entries()[before..].iter().filter_map(
-                    |entry| match &entry.obs {
-                        Observation::Storage {
-                            service, seq, fact, ..
-                        } if service == HEADER_SERVICE => Some((*seq, fact)),
-                        _ => None,
-                    },
-                ));
-                tap.observe(log)
-            }
-            None => Ok(()),
-        };
-        stored?;
-        tapped?;
+impl PredicateFeed {
+    /// Counts this source's storage facts and reactor events among `step`,
+    /// in order, then the link effects since the last call. An error once a
+    /// `Control` step couldn't take effect.
+    pub(crate) fn feed<'o>(
+        &mut self,
+        step: impl IntoIterator<Item = &'o Observation>,
+    ) -> Result<(), String> {
         let mut predicates = self.predicates.borrow_mut();
-        // Only this source's storage and tap append here.
-        for entry in &log.entries()[before..] {
-            match &entry.obs {
-                Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
+        for obs in step {
+            match obs {
+                Observation::Storage {
+                    service,
+                    instance,
+                    fact,
+                    ..
+                } if service == HEADER_SERVICE && *instance == self.storage => {
                     predicates.record(fact)
                 }
-                Observation::Reactor { event, .. } => predicates.record_reactor(event),
+                Observation::Reactor {
+                    instance, event, ..
+                } if Some(*instance) == self.tap => predicates.record_reactor(event),
                 _ => {}
             }
         }
@@ -342,6 +286,118 @@ impl ActionSource for PolicySource {
             Some(failure) => Err(format!("ControlFailed: {failure}")),
             None => Ok(()),
         }
+    }
+}
+
+impl PolicySource {
+    /// `port`'s storage under `policy`, with its checkpoint registered with
+    /// `sim`. Its predicates count `effects` too.
+    pub fn new(sim: &mut Sim, port: Arc<ControlledPort>, policy: Policy, effects: Effects) -> Self {
+        let storage = HeaderStorage::new(sim, port.clone());
+        let feed = PredicateFeed {
+            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
+            effects,
+            storage: storage.instance(),
+            tap: None,
+            linked: 0,
+            closed: BTreeSet::new(),
+            grown: 0,
+        };
+        PolicySource {
+            storage,
+            tap: None,
+            port,
+            base: policy.base,
+            bound: policy.bound_ms.map(Duration::from_millis),
+            feed: Rc::new(RefCell::new(feed)),
+            out: Out::default(),
+        }
+    }
+
+    /// This source, draining `tap` at each observation, after storage, so
+    /// each event's storage watermark is already logged and the tap pairs
+    /// calls with that step's facts.
+    pub fn with_tap(self, tap: ReactorTap) -> Self {
+        self.feed.borrow_mut().tap = Some(tap.instance());
+        PolicySource {
+            tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This source behind `hub`, which logs its rows and feeds its
+    /// predicates.
+    pub(crate) fn behind(self, hub: &mut EvidenceHub) -> Self {
+        hub.feed(self.feed.clone());
+        PolicySource {
+            out: hub.out(),
+            ..self
+        }
+    }
+
+    /// The predicates, for a [`Control`] gated by the same counts.
+    pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
+        self.feed.borrow().predicates.clone()
+    }
+}
+
+impl ActionSource for PolicySource {
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        let pending = self.port.pending();
+        let predicates = self.feed.borrow().predicates.clone();
+        let predicates = predicates.borrow();
+        let mut offered = Vec::new();
+        self.storage.enabled(now, &mut offered);
+        out.extend(offered.into_iter().filter(|(_, local)| {
+            let (id, outcome) = crate::storage::decode(*local);
+            pending
+                .iter()
+                .find(|op| op.id == id)
+                .is_some_and(|op| predicates.offers(self.base, op, outcome))
+        }));
+    }
+
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.storage.boundaries(now, out);
+        let predicates = self.feed.borrow().predicates.clone();
+        let predicates = predicates.borrow();
+        for op in self.port.pending() {
+            predicates.boundaries(self.bound, &op, now, out);
+        }
+    }
+
+    fn execute(&mut self, local: u64, log: &mut ObservationLog) {
+        self.storage.execute(local, log);
+    }
+
+    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let (mut rows, stored) = match self.storage.drain(log) {
+            Ok(rows) => (rows, Ok(())),
+            Err(why) => (Vec::new(), Err(why)),
+        };
+        // Drained even when storage failed, so a port panic the tap holds
+        // still reaches the run's failure cell and outranks that failure.
+        let tapped = match &mut self.tap {
+            Some(tap) => {
+                tap.storage_facts(rows.iter().filter_map(|row| match &row.obs {
+                    Observation::Storage { seq, fact, .. } => Some((*seq, fact)),
+                    _ => None,
+                }));
+                tap.drain(log).and_then(|(tapped, paired)| {
+                    rows.extend(tapped);
+                    paired
+                })
+            }
+            None => Ok(()),
+        };
+        // Behind a hub, the hub feeds the predicates once it has ordered
+        // the step.
+        let fed = match (&stored, &tapped, self.out.to_hub()) {
+            (Ok(()), Ok(()), false) => self.feed.borrow_mut().feed(rows.iter().map(|row| &row.obs)),
+            _ => Ok(()),
+        };
+        self.out.write(log, rows);
+        stored.and(tapped).and(fed)
     }
 }
 

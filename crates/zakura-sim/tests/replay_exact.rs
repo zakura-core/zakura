@@ -961,16 +961,23 @@ fn effects_replay_child() {
 fn effects_replay_in_a_fresh_process() {
     let dir = record(&EFFECTS, &[]);
     let trace = open(dir.path());
-    // Both effects of each operation, in order, in its step's digest.
+    // Both effects of each operation, in order, in its step's digest, each
+    // keyed at the next position, since nothing else in the run takes one.
+    let mut pos = 0;
     for step in &trace.steps {
-        let obs: Vec<Observation> = effects(step.step)
+        let keyed: Vec<String> = effects(step.step)
             .into_iter()
-            .map(|event| Observation::Fake {
-                source: "storage".into(),
-                event,
+            .map(|event| {
+                pos += 1;
+                let obs = serde_json::to_string(&Observation::Fake {
+                    source: "storage".into(),
+                    event,
+                })
+                .unwrap();
+                format!(r#"{{"pos":{pos},"sub":0,{}"#, &obs[1..])
             })
             .collect();
-        let json = serde_json::to_vec(&obs).unwrap();
+        let json = format!("[{}]", keyed.join(","));
         let digest: String = Sha256::digest(&json)[..8]
             .iter()
             .map(|byte| format!("{byte:02x}"))

@@ -1,7 +1,8 @@
 //! What a run observed, step by step.
 //!
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
-//! that appended it. Step 0 is setup, before the first pick.
+//! that appended it and its log key ([`Entry`]), and the log is in key
+//! order. Step 0 is setup, before the first pick.
 
 use serde::Serialize;
 
@@ -1982,13 +1983,53 @@ pub enum Exit {
     Panicked,
 }
 
-/// An observation and the step that appended it.
+/// An observation, the step that appended it, and its log key.
+///
+/// Every entry has a key `(pos, sub)`, and keys grow in the log's order. An
+/// entry a source emitted is `(pos, 0)`, where `pos` is the run-wide
+/// position it was emitted at ([`zakura_rt::sim::next_position`]), so
+/// records from separate sources order by when they happened. A row the
+/// evidence hub derives is `(pos, k)` with `k` from 1, where `pos` is the
+/// record that produced it, and it names where its evidence came from in
+/// `origin`. A row the run appends itself takes the next position when it's
+/// appended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The step, from 1. Step 0 is setup.
     pub step: u64,
+    /// The key's emission position.
+    pub pos: u64,
+    /// The key's place among the rows at `pos`, 0 for the emitted record.
+    pub sub: u32,
+    /// For a derived row, the position of the record it came from. A
+    /// resolved peer row is keyed by the record that let it resolve, so it
+    /// names its `peer-emitted` record here.
+    pub origin: Option<u64>,
     /// What happened.
     pub obs: Observation,
+}
+
+/// [`Entry`] as a step's `obs` digest encodes it.
+#[derive(Serialize)]
+pub(crate) struct Keyed<'e> {
+    pos: u64,
+    sub: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<u64>,
+    #[serde(flatten)]
+    obs: &'e Observation,
+}
+
+impl Entry {
+    /// The entry as a digest encodes it.
+    pub(crate) fn keyed(&self) -> Keyed<'_> {
+        Keyed {
+            pos: self.pos,
+            sub: self.sub,
+            origin: self.origin,
+            obs: &self.obs,
+        }
+    }
 }
 
 /// Every observation of a run, in order.
@@ -1999,18 +2040,50 @@ pub struct ObservationLog {
     frozen: bool,
     /// The run the log belongs to, 0 for one no run made.
     run: u64,
+    /// The last key appended, `(0, 0)` before any.
+    last: (u64, u32),
 }
 
 impl ObservationLog {
-    /// Appends `obs` to the current step. Does nothing once the log is
+    /// Appends `obs` to the current step, keyed at the run's next position,
+    /// or after the last key outside a run. Does nothing once the log is
     /// frozen, so cleanup at shutdown leaves no trace in it.
     pub fn push(&mut self, obs: Observation) {
-        if !self.frozen {
-            self.entries.push(Entry {
-                step: self.step,
-                obs,
-            });
+        // A position taken now is past every one handed out before it, so
+        // only a row a hub keyed outside the run's positions can be later.
+        let after = self.last.0 + 1;
+        let pos = zakura_rt::sim::next_position().map_or(after, |pos| pos.max(after));
+        let pushed = self.push_keyed((pos, 0), None, obs);
+        debug_assert!(pushed.is_ok(), "a fresh key is past the last one");
+    }
+
+    /// Appends `obs` to the current step at `key`, naming `origin`, or
+    /// refuses a key that isn't past the last one, since checks read the
+    /// log's order as the order things happened.
+    pub(crate) fn push_keyed(
+        &mut self,
+        key: (u64, u32),
+        origin: Option<u64>,
+        obs: Observation,
+    ) -> Result<(), String> {
+        if self.frozen {
+            return Ok(());
         }
+        if self.entries.last().is_some() && key <= self.last {
+            return Err(format!(
+                "OutOfOrder: a row keyed {key:?} came after {:?}: {obs:?}",
+                self.last
+            ));
+        }
+        self.last = key;
+        self.entries.push(Entry {
+            step: self.step,
+            pos: key.0,
+            sub: key.1,
+            origin,
+            obs,
+        });
+        Ok(())
     }
 
     /// Every entry, in order.
@@ -2026,6 +2099,18 @@ impl ObservationLog {
             .iter()
             .take_while(move |e| e.step == step)
             .map(|e| &e.obs)
+    }
+
+    /// The entries `step` appended, keys included.
+    pub(crate) fn entries_of_step(&self, step: u64) -> &[Entry] {
+        let start = self.entries.partition_point(|e| e.step < step);
+        let end = self.entries.partition_point(|e| e.step <= step);
+        &self.entries[start..end]
+    }
+
+    /// The last key appended, `(0, 0)` before any.
+    pub(crate) fn last_key(&self) -> (u64, u32) {
+        self.last
     }
 
     /// The step being appended to, 0 during setup.

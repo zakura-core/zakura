@@ -33,6 +33,9 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
   property ID and the trace's directory. A rerun that disagrees with the run
   panics with `nondeterministic:` instead.
 - A harness failure panics with `harness:`.
+- A task's panic violates `sim/no-task-panic`, which is `Active`. Each target
+  swaps libFuzzer's panic hook, which aborts at any panic, for the default one
+  at startup, so the task's panic reaches the scheduler.
 - Each `Known` and `Draft` violation saves one trace per property under
   `known/` or `draft/`, and the target goes on.
 - A run whose shutdown abandoned tasks retires the thread it ran on.

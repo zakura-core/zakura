@@ -27,10 +27,20 @@ macro_rules! sim_target {
     ($harness:ty) => {
         static ENTRY: zakura_sim::harness::HarnessEntry = zakura_sim::harness::entry::<$harness>();
 
-        libfuzzer_sys::fuzz_target!(|input: &[u8]| {
+        libfuzzer_sys::fuzz_target!(init: $crate::unwind_task_panics(), |input: &[u8]| {
             $crate::fuzz_one(&ENTRY, input);
         });
     };
+}
+
+/// Replaces libFuzzer's panic hook, which aborts at any panic, with the
+/// default hook. A task's panic then unwinds to the scheduler, which reports
+/// it as a `sim/no-task-panic` violation, so the target records it and
+/// `ZAKURA_SIM_EXPECT` can filter it. The target's own panics still abort
+/// the process once they unwind out of the `fuzz_target!` body. Each target
+/// calls this in its `init`.
+pub fn unwind_task_panics() {
+    drop(std::panic::take_hook());
 }
 
 thread_local! {
@@ -144,7 +154,12 @@ fn record(
 /// property is enough. A rerun that disagrees panics with
 /// `nondeterministic:`.
 fn save_once(
-    entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, property: &str, bucket: Bucket) {
+    entry: &'static HarnessEntry,
+    input: &[u8],
+    run: &ExploreRun,
+    property: &str,
+    bucket: Bucket,
+) {
     static SAVED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
     let name = match bucket {
         Bucket::Known => "known",

@@ -49,6 +49,9 @@ pub enum Bypass {
     /// planted` applies to a scratch checkout. The name is without
     /// `.patch`.
     Planted(&'static str),
+    /// No bug can violate the property yet: its check is missing what the
+    /// reason names. Only a `Draft` property names one.
+    Pending(&'static str),
 }
 
 /// A test that runs a property, and the CI job that runs the test.
@@ -72,6 +75,19 @@ const fn sim_test(file: &'static str, test: &'static str) -> Witness {
         file,
         test,
         ci: SIM_BUILD,
+    }
+}
+
+/// The job that runs the ignored `zakura-sim` witness tests whose runs
+/// take minutes, in a release build under `--cfg zakura_sim`.
+const SLOW_WITNESSES: &str = "zakura_sim slow witnesses";
+
+/// An ignored test in [`SLOW_WITNESSES`].
+const fn slow_test(file: &'static str, test: &'static str) -> Witness {
+    Witness {
+        file,
+        test,
+        ci: SLOW_WITNESSES,
     }
 }
 
@@ -338,5 +354,56 @@ pub static COVERAGE: &[Coverage] = &[
             "block_sync_teardown_returns_baseline",
         ),
         bypass: Bypass::Planted("skip-return-on-drop"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::SUBMIT_ONLY_REQUESTED,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_reset_mid_flight_input_holds_submit_only_requested",
+        ),
+        bypass: Bypass::Planted("height-only"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::STALE_COMPLETION_INERT,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_stale_beside_current_input_holds_stale_completion_inert",
+        ),
+        bypass: Bypass::Planted("release-by-height"),
+    },
+    // Both capacity tests are ignored, since each debug run takes about
+    // eight minutes. The `zakura_sim slow witnesses` job runs them. Main's
+    // sequencer is the bypass: the frontier-first input violates it (#1523).
+    Coverage {
+        property: crate::domain::block_sync_semantic::CAPACITY_RELEASE_WAKES,
+        passing: Passing::Test(slow_test(
+            "tests/block_semantic_properties.rs",
+            "the_reply_first_input_holds_capacity_release_wakes",
+        )),
+        bypass: Bypass::Test(slow_test(
+            "tests/block_semantic_properties.rs",
+            "the_frontier_first_input_violates_capacity_release_wakes",
+        )),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::DETACHED_SUBMISSION_BOUNDED,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_stalled_reset_input_holds_detached_submission_bounded",
+        ),
+        bypass: Bypass::Planted("forget-on-reset"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::INPUT_DECODED_BOUND,
+        passing: Passing::Unreachable {
+            reason: "no observation says whether a queued body is decoded",
+            witness: sim_test(
+                "tests/block_semantic_properties.rs",
+                "the_stalled_reset_input_leaves_input_decoded_bound_not_applicable",
+            ),
+        },
+        bypass: Bypass::Pending(
+            "the decoded bytes each queued body holds, which block sync doesn't observe",
+        ),
     },
 ];

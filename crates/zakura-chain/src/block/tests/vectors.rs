@@ -225,7 +225,7 @@ fn ironwood_block_accessors_preserve_pool_and_wire_order() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data: Some(orchard_shielded_data),
+                orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
                 ironwood_shielded_data: Some(ironwood_shielded_data),
             })
         };
@@ -317,7 +317,7 @@ fn ironwood_transaction_count_is_pool_specific_and_counts_bundles() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data,
+                orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 ironwood_shielded_data,
             })
         };

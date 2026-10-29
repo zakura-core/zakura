@@ -505,6 +505,7 @@ fn source_frame(entries: &[Entry], connection: u64, row: &RowAt, seq: u64) -> Op
                 connection: c,
                 stream,
                 seq: s,
+                ..
             } if (*c, *stream, *s) == (connection, row.stream, seq) => {
                 if let Some(source) = &mut source {
                     source.judged = true;
@@ -548,6 +549,7 @@ fn requests(entries: &[Entry], connection: u64, row: &RowAt, exchange: u64) -> R
                 connection: c,
                 stream,
                 seq,
+                ..
             } if *c == connection && *stream == row.stream && sent.remove(seq) => {
                 found.open += 1;
                 found.unserved += 1;

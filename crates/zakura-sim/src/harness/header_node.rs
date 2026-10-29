@@ -379,6 +379,22 @@ pub struct HeaderNode {
     /// The VCT repair state the reactor follows. `Idle` unless a scenario
     /// sets it.
     pub vct_repairs: watch::Sender<VctRootRepairStatus>,
+    /// What the reactor was started with.
+    pub startup: StartupFacts,
+}
+
+/// The settings a [`HeaderNode`]'s reactor was started with, read from the
+/// startup it was handed, so a test can check them against production's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupFacts {
+    /// The header-sync config.
+    pub config: ZakuraHeaderSyncConfig,
+    /// The reactor's request deadline.
+    pub request_timeout: Duration,
+    /// How often the reactor refreshes its `Status`.
+    pub status_refresh_interval: Duration,
+    /// The largest frame the reactor writes.
+    pub max_frame_bytes: u32,
 }
 
 impl HeaderNode {
@@ -417,6 +433,12 @@ impl HeaderNode {
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
         startup.observer.0 = observer;
+        let facts = StartupFacts {
+            config: startup.config.clone(),
+            request_timeout: startup.request_timeout,
+            status_refresh_interval: startup.status_refresh_interval,
+            max_frame_bytes: startup.max_frame_bytes,
+        };
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
         guard_dispatch(sim, actions, dispatch);
@@ -431,6 +453,7 @@ impl HeaderNode {
             handle,
             port,
             vct_repairs,
+            startup: facts,
         }
     }
 }

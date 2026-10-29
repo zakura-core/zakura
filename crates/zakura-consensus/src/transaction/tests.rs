@@ -638,7 +638,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
     };
 
     assert_eq!(
-        check::shielded_proof_size_is_canonical(&make_v5(shielded_data.clone())),
+        check::shielded_proof_size_is_canonical(&make_v5(Box::new(shielded_data.clone()))),
         Ok(())
     );
     assert_eq!(
@@ -657,7 +657,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
 
     for noncanonical in [short, padded] {
         assert_eq!(
-            check::shielded_proof_size_is_canonical(&make_v5(noncanonical.clone())),
+            check::shielded_proof_size_is_canonical(&make_v5(Box::new(noncanonical.clone()))),
             Err(TransactionError::OrchardProofSize)
         );
         assert_eq!(
@@ -687,7 +687,7 @@ fn matching_orchard_and_ironwood_nullifiers_are_not_conflicts() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data.clone()),
+        orchard_shielded_data: Some(Box::new(shielded_data.clone())),
         ironwood_shielded_data: Some(shielded_data),
     };
 
@@ -796,7 +796,7 @@ fn v6_pool_flow_transaction(
         inputs: vec![],
         outputs: transparent_outputs,
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(Box::new),
         ironwood_shielded_data,
     }
 }
@@ -883,7 +883,7 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
         inputs: vec![coinbase_input()],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        orchard_shielded_data: Some(Box::new(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS))),
         ironwood_shielded_data: None,
     };
     assert!(coinbase_with_orchard.is_coinbase());
@@ -2697,7 +2697,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 
@@ -2772,7 +2772,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
             outputs: vec![],
             lock_time: LockTime::Height(block::Height(0)),
             expiry_height: (transaction_block_height + 1).expect("expiry height is too large"),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data: Some(Box::new(joinsplit_data)),
             sapling_shielded_data: None,
         };
 

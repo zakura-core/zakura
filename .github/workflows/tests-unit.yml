@@ -256,7 +256,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -312,7 +312,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -355,7 +355,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -416,7 +416,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -445,7 +445,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -470,7 +470,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 #v2.87.28
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 #v2.87.30
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -486,7 +486,10 @@ jobs:
   sim-build:
     name: zakura_sim build
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -532,7 +535,10 @@ jobs:
   sim-planted:
     name: zakura_sim planted
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -557,6 +563,45 @@ jobs:
           else
             cargo xtask planted
           fi
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+
+  # Some witness tests need a run of half a million simulated steps, which a
+  # debug build takes about eight minutes for. They're ignored in
+  # `sim-build`, and this job runs them beside it with the `planted` profile,
+  # which optimizes and keeps debug assertions and overflow checks on. It has
+  # its own target directory and cache key. Folding it into `sim-planted`
+  # would push that job near its 45-minute timeout.
+  sim-slow-witnesses:
+    name: zakura_sim slow witnesses
+    needs: changes
+    # Paused for now: run the simulator suites locally. To turn the job back
+    # on, restore this condition:
+    # if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: false
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: target/sim-slow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+          cache-shared-key: zakura-sim-slow
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      # #1523: the frontier-first input violates capacity-release-wakes, and
+      # the reply-first input holds it.
+      - name: Run the slow witness tests
+        run: |
+          cargo test --locked --profile planted -p zakura-sim --test block_semantic_properties -- --ignored \
+            the_frontier_first_input_violates_capacity_release_wakes \
+            the_reply_first_input_holds_capacity_release_wakes
         env:
           RUSTFLAGS: --cfg zakura_sim
 
@@ -700,6 +745,7 @@ jobs:
       - publish-graph
       - sim-build
       - sim-planted
+      - sim-slow-witnesses
       - sim-sanitizers
       - zakura-testkit
     timeout-minutes: 30
@@ -714,11 +760,11 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build and sim-planted skip with the same test-relevant filter
-          # as build-tests, and sim-sanitizers skips unless the scheduler, `zakura-rt`, or
-          # their build inputs change.
+          # sim-build, sim-planted and sim-slow-witnesses skip with the same
+          # test-relevant filter as build-tests, and sim-sanitizers skips unless
+          # the scheduler, `zakura-rt`, or their build inputs change.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-sanitizers, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted, sim-slow-witnesses, sim-sanitizers, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

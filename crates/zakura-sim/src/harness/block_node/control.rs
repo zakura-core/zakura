@@ -120,6 +120,11 @@ pub enum ControlAction {
     /// through its handle, so the sequencer finishes a submission that its
     /// block service never committed.
     DispatchVerdict,
+    /// A bypass witness for an alternate submission callback: hand the
+    /// node's block service a `SubmitBlock` straight, for the body of its
+    /// oldest pending submission, under an owner that no request of the
+    /// node's names.
+    SubmitUnrequested,
 }
 
 impl ControlAction {
@@ -132,7 +137,8 @@ impl ControlAction {
             ControlAction::ProbeSend { .. } => PROBE,
             ControlAction::Teardown
             | ControlAction::InsertWork
-            | ControlAction::DispatchVerdict => "node",
+            | ControlAction::DispatchVerdict
+            | ControlAction::SubmitUnrequested => "node",
         }
     }
 
@@ -147,6 +153,7 @@ impl ControlAction {
             ControlAction::Teardown => "teardown",
             ControlAction::InsertWork => "insert-work",
             ControlAction::DispatchVerdict => "dispatch-verdict",
+            ControlAction::SubmitUnrequested => "submit-unrequested",
         }
     }
 }
@@ -396,6 +403,7 @@ impl ActionSource for Control {
                 .unwrap_or_else(|_| panic!("{full}")),
             ControlAction::InsertWork => self.topology.insert_work(),
             ControlAction::DispatchVerdict => self.topology.dispatch_verdict(),
+            ControlAction::SubmitUnrequested => self.topology.submit_unrequested(),
             action => self
                 .to_links
                 .try_send(action)

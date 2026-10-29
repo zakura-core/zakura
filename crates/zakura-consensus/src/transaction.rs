@@ -653,7 +653,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
-                    joinsplit_data,
+                    joinsplit_data.as_deref(),
                     tx_id,
                 )?,
                 Transaction::V5 {
@@ -1025,7 +1025,7 @@ where
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
@@ -1309,7 +1309,7 @@ where
 
     /// Verifies a transaction's Sprout shielded join split data.
     fn verify_sprout_shielded_data(
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         shielded_sighash: &SigHash,
     ) -> Result<AsyncChecks, TransactionError> {
         let mut checks = AsyncChecks::new();

@@ -75,6 +75,7 @@ use self::{
     limit::{RateLimit, ADVERSARY_RATE},
 };
 use crate::{
+    harness::evidence_hub::position,
     model::{
         CadenceModel, Charge, FrameHeader, FrameModel, Label, Labels, ReaderEnd, SubscriptionModel,
     },
@@ -1169,7 +1170,7 @@ impl PeerTask {
     /// the evidence hub to place.
     fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
         self.records.push(PeerRecord {
-            pos: zakura_rt::sim::next_position(),
+            pos: position(),
             remote,
             quic_stream,
             body,

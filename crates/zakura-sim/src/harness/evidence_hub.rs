@@ -28,6 +28,35 @@ use crate::{
     ActionSource, Boundary, Identity, Observation, ObservationLog,
 };
 
+/// The position a record the run's tasks emit now takes, from
+/// [`zakura_rt::sim::next_position`]. In unit tests,
+/// [`without_capture`] turns it off, with the hub, so a run can be
+/// compared with its capture paths skipped.
+pub(crate) fn position() -> Option<u64> {
+    #[cfg(test)]
+    if CAPTURE_OFF.with(std::cell::Cell::get) {
+        return None;
+    }
+    zakura_rt::sim::next_position()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set while [`without_capture`] runs its closure.
+    static CAPTURE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `run` with [`position`] and every hub built inside it turned off:
+/// sources write straight into the log, unstamped, and their task-side
+/// capture paths take no position.
+#[cfg(test)]
+pub(crate) fn without_capture<T>(run: impl FnOnce() -> T) -> T {
+    CAPTURE_OFF.with(|off| off.set(true));
+    let out = run();
+    CAPTURE_OFF.with(|off| off.set(false));
+    out
+}
+
 /// One row a source observed, with the position it was emitted at and its
 /// place among the rows at that position: 0 for the record itself, from 1
 /// for a row the source derived from it.
@@ -77,6 +106,9 @@ pub struct EvidenceHub {
     peers: Option<Peers>,
     /// The storage policy's predicates, fed each written step.
     predicates: Option<Rc<RefCell<PredicateFeed>>>,
+    /// Built under [`without_capture`], so it writes nothing.
+    #[cfg(test)]
+    off: bool,
 }
 
 /// What the hub keeps for the scripted peers.
@@ -118,11 +150,19 @@ impl Item {
 impl EvidenceHub {
     /// A hub with no sources yet.
     pub(crate) fn new() -> Self {
-        EvidenceHub::default()
+        EvidenceHub {
+            #[cfg(test)]
+            off: CAPTURE_OFF.with(std::cell::Cell::get),
+            ..EvidenceHub::default()
+        }
     }
 
     /// Where a source hands the hub its rows.
     pub(crate) fn out(&self) -> Out {
+        #[cfg(test)]
+        if self.off {
+            return Out(None);
+        }
         Out(Some(self.batch.clone()))
     }
 
@@ -303,6 +343,10 @@ impl ActionSource for EvidenceHub {
     /// predicates. Every row is written even when one fails, so a failure
     /// a source's record explains is logged with it.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        #[cfg(test)]
+        if self.off {
+            return Ok(());
+        }
         let (rows, ordered) = self.order(log);
         let start = log.entries().len();
         let mut written = Ok(());
@@ -816,6 +860,97 @@ mod tests {
                 (pair[0].pos, pair[0].sub) < (pair[1].pos, pair[1].sub),
                 "{pair:?}"
             );
+        }
+    }
+
+    /// The step choices and every task stop of the saved honest-sync Plan,
+    /// and its log, with capture on or, under [`without_capture`], off.
+    fn honest_sync(capture: bool) -> (Vec<String>, Vec<String>, crate::RunReport) {
+        use crate::harness::{
+            header_sync::HeaderWire, run_prepared, wire_plans::SavedPlan, Subsystem,
+        };
+        let fixture = format!(
+            "{}/tests/fixtures/header-wire-{}.bin",
+            env!("CARGO_MANIFEST_DIR"),
+            SavedPlan::HonestSync.name()
+        );
+        let input = std::fs::read(fixture).expect("the fixture is committed");
+        let (prefix, bytes) = input.split_at(HeaderWire::SCENARIO_BYTES);
+        let scenario = HeaderWire::draw(prefix);
+        let run = || {
+            let mut sink = MemorySink::default();
+            let report = run_prepared::<HeaderWire>(
+                &scenario,
+                HeaderWire::prepare(&scenario),
+                Plan::from_fuzz(bytes),
+                &mut sink,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            (sink, report)
+        };
+        let (sink, report) = if capture { run() } else { without_capture(run) };
+        // Each step's choices, without the `obs` digest, which the capture
+        // changes.
+        let choices = sink
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                crate::Record::Step(step) => Some(format!(
+                    "{} {} {} {:?} {:?} {:?}",
+                    step.step, step.pick, step.options, step.by, step.offset, step.draws
+                )),
+                _ => None,
+            })
+            .collect();
+        let stops = report
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| entry.obs.ran_task().is_some())
+            .map(|entry| format!("{} {:?}", entry.step, entry.obs))
+            .collect();
+        (choices, stops, report)
+    }
+
+    /// Capture takes no scheduling point: the saved honest sync makes the
+    /// same choices and stops its tasks at the same points with the hub
+    /// and its task-side positions on as with them off. The run with them
+    /// on reaches every capture path first: reactor and transport events,
+    /// peer records, datagrams and storage facts, each with a position.
+    #[test]
+    fn positions_add_no_scheduling_point() {
+        let (choices, stops, report) = honest_sync(true);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let entries = report.log.entries();
+        let reached = |pred: fn(&Observation) -> bool| {
+            entries
+                .iter()
+                .any(|entry| entry.sub == 0 && pred(&entry.obs))
+        };
+        assert!(reached(|obs| matches!(obs, Observation::Reactor { .. })));
+        assert!(reached(|obs| matches!(obs, Observation::Transport { .. })));
+        assert!(reached(|obs| matches!(obs, Observation::Datagram { .. })));
+        assert!(reached(|obs| matches!(obs, Observation::Storage { .. })));
+        assert!(
+            entries.iter().any(|entry| entry.sub > 0
+                && entry.origin != Some(entry.pos)
+                && matches!(entry.obs, Observation::PeerFrame { .. })),
+            "a peer record resolves by its own position"
+        );
+        let (choices_off, stops_off, off) = honest_sync(false);
+        assert_eq!(off.end.harness, None, "{:?}", off.end);
+        assert!(
+            !off.log.entries().iter().any(|entry| entry.sub > 0),
+            "capture was off"
+        );
+        assert_eq!(choices.len(), choices_off.len());
+        for (on, off) in choices.iter().zip(&choices_off) {
+            assert_eq!(on, off);
+        }
+        assert_eq!(stops.len(), stops_off.len());
+        for (on, off) in stops.iter().zip(&stops_off) {
+            assert_eq!(on, off);
         }
     }
 }

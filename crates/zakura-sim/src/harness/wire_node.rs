@@ -47,7 +47,7 @@ use zakura_rt::{sim::RunId, sync::watch};
 use zakura_scheduler::SimInstant;
 
 use super::{
-    evidence_hub::{Out, Row},
+    evidence_hub::{position, Out, Row},
     header_node::HeaderNode,
 };
 use crate::{
@@ -239,15 +239,15 @@ impl TapState {
             self.refused.store(true, Ordering::Relaxed);
             return;
         }
+        // Taken before the lock, which nothing else takes in between.
+        let pos = position();
         let mut buffer = self.buffer();
         buffer.last = buffer
             .last
             .checked_add(1)
             .expect("a run reports fewer than 2^64 events");
         let seq = buffer.last;
-        buffer
-            .events
-            .push((seq, zakura_rt::sim::next_position(), event));
+        buffer.events.push((seq, pos, event));
     }
 }
 

@@ -40,7 +40,7 @@ use super::pair::{PairError, Pairer};
 use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
-    harness::evidence_hub::Row,
+    harness::evidence_hub::{position, Row},
     observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
@@ -148,15 +148,15 @@ impl HeaderSyncObserver for TapObserver {
                 0
             }
         };
+        // Taken before the lock, which nothing else takes in between.
+        let pos = position();
         let mut buffer = state.buffer();
         buffer.last = buffer
             .last
             .checked_add(1)
             .expect("a run records fewer than 2^64 events");
         let seq = buffer.last;
-        buffer
-            .events
-            .push((seq, storage_seq, zakura_rt::sim::next_position(), event));
+        buffer.events.push((seq, storage_seq, pos, event));
     }
 }
 

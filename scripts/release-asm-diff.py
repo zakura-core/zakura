@@ -25,9 +25,12 @@ that only real changes differ:
     Every unchanged line then has the same number on both sides. A blank
     line changes no token, so each side still builds the same code. The
     tool refuses padding that could hide more than line numbers in panic
-    and log metadata: inside a string literal or block comment, above a
-    `line!()`, or of a blank-line-only change to a file another embeds (see
-    `align_tree`). Every padding is printed.
+    and log metadata: inside a string literal or block comment, when any
+    source in the workspace uses `line!`, or when a file another embeds
+    changes only by blank lines or an embed can't be resolved (see
+    `align_tree`). Every padding is printed. Line numbers that reach a
+    program only through panic locations, `#[track_caller]` and log macros
+    are treated as labels; that is the gate's one premise.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
@@ -48,6 +51,7 @@ padding would land inside a literal.
 """
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -76,7 +80,6 @@ MAX_PRINTED = 20
 # ---------------------------------------------------------------------------
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
-RAW_START = re.compile(r'(?:b|c)?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'\n])'")
 
 
@@ -138,6 +141,63 @@ def paddings(hunks):
     return base, head
 
 
+# Where code can stop being code: a comment, a string or raw string, or a
+# quote that may start a char literal.
+CODE_STOP = re.compile(r"//|/\*|(?<![\w])(?:b|c)?r#*\"|\"|'")
+STRING_END = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
+BLOCK_MARK = re.compile(r"/\*|\*/")
+
+
+def lex(text):
+    """Splits Rust source into `(kind, text)` segments: `code`, `comment`, `block` or `string`.
+
+    A `string` segment is a string literal's body, without its quotes,
+    prefix or hashes. Char literals stay in `code`, and lifetimes too. An
+    unterminated literal or block comment runs to the end of the text.
+    """
+    segments, i, start, n = [], 0, 0, len(text)
+    while i < n:
+        stop = CODE_STOP.search(text, i)
+        if not stop:
+            break
+        i, mark = stop.start(), stop.group()
+        if mark == "'":
+            char = CHAR_LITERAL.match(text, i)
+            i = char.end() if char else i + 1
+            continue
+        if i > start:
+            segments.append(("code", text[start:i]))
+        if mark == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            segments.append(("comment", text[i:j]))
+        elif mark == "/*":
+            depth, j = 0, i
+            for block in BLOCK_MARK.finditer(text, i):
+                depth += 1 if block.group() == "/*" else -1
+                j = block.end()
+                if depth == 0:
+                    break
+            else:
+                j = n
+            segments.append(("block", text[i:j]))
+        elif mark.endswith('"') and "r" in mark:
+            close = '"' + mark[mark.index("r") + 1:-1]
+            k = text.find(close, stop.end())
+            k = n if k < 0 else k
+            segments.append(("string", text[stop.end():k]))
+            j = min(n, k + len(close))
+        else:
+            body = STRING_END.match(text, stop.end())
+            k = body.end() - 1 if body else n
+            segments.append(("string", text[stop.end():k]))
+            j = min(n, k + 1)
+        i = start = j
+    if start < n:
+        segments.append(("code", text[start:]))
+    return segments
+
+
 def safe_boundaries(text):
     """The lines whose end lies in code or a line comment, so a blank line can follow them.
 
@@ -145,56 +205,13 @@ def safe_boundaries(text):
     that ends inside a string, raw string or block comment isn't safe, since
     a blank line there would change a token.
     """
-    safe, line, i, n = {0}, 1, 0, len(text)
-    state = None  # None for code, "line", "str", ("raw", hashes) or ("block", depth)
-    while i < n:
-        c = text[i]
-        if c == "\n":
-            if state in (None, "line"):
+    safe, line, kind = {0}, 1, "code"
+    for kind, part in lex(text):
+        for _ in range(part.count("\n")):
+            if kind in ("code", "comment"):
                 safe.add(line)
-                state = None
             line += 1
-            i += 1
-        elif state is None:
-            raw = RAW_START.match(text, i)
-            if text.startswith("//", i):
-                state, i = "line", i + 2
-            elif text.startswith("/*", i):
-                state, i = ("block", 1), i + 2
-            elif raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-                state, i = ("raw", raw.group(1)), raw.end()
-            elif c == '"':
-                state, i = "str", i + 1
-            elif c == "'":
-                char = CHAR_LITERAL.match(text, i)
-                i = char.end() if char else i + 1
-            else:
-                i += 1
-        elif state == "line":
-            i += 1
-        elif state == "str":
-            if c == "\\" and i + 1 < n:
-                if text[i + 1] == "\n":
-                    line += 1
-                i += 2
-            else:
-                state = None if c == '"' else state
-                i += 1
-        elif state[0] == "raw":
-            close = '"' + state[1]
-            if text.startswith(close, i):
-                state, i = None, i + len(close)
-            else:
-                i += 1
-        else:
-            depth = state[1]
-            if text.startswith("/*", i):
-                state, i = ("block", depth + 1), i + 2
-            elif text.startswith("*/", i):
-                state, i = (("block", depth - 1) if depth > 1 else None), i + 2
-            else:
-                i += 1
-    if state in (None, "line"):
+    if kind in ("code", "comment") or not text:
         safe.add(line)
     return safe
 
@@ -210,50 +227,88 @@ def pad_text(text, inserts, path="<text>"):
     return "\n".join(lines)
 
 
-LINE_MACRO = re.compile(r"\bline!\s*\(")
-INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?!\s*\(\s*\"([^\"]+)\"")
+LINE_MACRO = re.compile(r"\bline\s*!\s*[(\[{]")
+INCLUDE_MACRO = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*")
+# A string placeholder in `code_text`'s output.
+PLACEHOLDER = re.compile(r"\x01(\d+)\x02")
+LITERAL_ARGUMENT = re.compile(r"\x01(\d+)\x02\s*[)\]}]")
+OUT_DIR_ARGUMENT = re.compile(r"concat\s*!\s*[(\[{]\s*env\s*!\s*[(\[{]\s*\x01(\d+)\x02")
 
 
-def check_line_values(text, inserts, path):
-    """Refuses padding above a `line!()` written in the file itself.
+def code_text(text):
+    """Source text with comments dropped and each string literal replaced by a numbered placeholder.
 
-    Padding moves the line numbers below it, which is fine where they only
-    label panics and log lines, but `line!()` makes a line number a value
-    the program computes with, which the real head may not share.
+    Returns the text and the strings' bodies, so token patterns can't match
+    inside a comment or a string.
     """
-    first = min(after for after, _ in inserts)
-    for number, line in enumerate(text.split("\n"), 1):
-        if number > first and LINE_MACRO.search(line.split("//", 1)[0]):
-            raise PaddingError("padding after %s:%d would move the value of line!() at line %d" % (path, first, number))
+    out, strings = [], []
+    for kind, part in lex(text):
+        if kind == "code":
+            out.append(part)
+        elif kind == "string":
+            out.append("\x01%d\x02" % len(strings))
+            strings.append(part)
+        else:
+            out.append(" ")
+    return "".join(out), strings
 
 
-def check_includes(tree, padded):
-    """Refuses padding a file that another source file embeds, when the file's only change is blank lines.
+def check_line_reads(tree, files):
+    """Refuses padding when any of `files` writes `line!`, in any form or inside any macro.
+
+    Padding moves the line numbers below it. That's what the gate allows
+    for panic locations and log lines, which only label output, but `line!`
+    makes a line number a value the program computes with, and a macro
+    defined anywhere can expand it at a call site in a padded file. So one
+    use anywhere in the workspace refuses padding.
+    """
+    for source in files:
+        code, _ = code_text(source.read_bytes().decode(errors="replace"))
+        found = LINE_MACRO.search(code)
+        if found:
+            raise PaddingError("%s uses line!, whose value padding would change" % source.relative_to(tree))
+
+
+def check_includes(tree, files, padded):
+    """Refuses padding when an embedded file's only change is blank lines, or an embed can't be resolved.
 
     `include!`, `include_str!` and `include_bytes!` make a file's text part
     of the program. A real change to that text still differs after padding,
     so the bytes catch it, but a change of only blank lines would pad to the
-    same text on both sides.
+    same text on both sides. An argument other than a string literal, or
+    `concat!(env!("OUT_DIR"), ...)` for a generated file, could name a
+    padded file, so it refuses too.
     """
-    for source in tree.rglob("*.rs"):
-        if "target" in source.relative_to(tree).parts[:1]:
-            continue
-        text = source.read_bytes().decode(errors="replace")
-        for included in INCLUDE.findall(text):
-            target = (source.parent / included).resolve()
-            if target in padded:
-                raise PaddingError("%s embeds %s, which padding changes" % (source.relative_to(tree), included))
+    for source in files:
+        code, strings = code_text(source.read_bytes().decode(errors="replace"))
+        for found in INCLUDE_MACRO.finditer(code):
+            literal = LITERAL_ARGUMENT.match(code, found.end())
+            generated = OUT_DIR_ARGUMENT.match(code, found.end())
+            if literal:
+                target = (source.parent / strings[int(literal.group(1))]).resolve()
+                if target in padded:
+                    raise PaddingError("%s embeds %s, whose only change is blank lines"
+                                       % (source.relative_to(tree), target.relative_to(tree)))
+            elif not (generated and strings[int(generated.group(1))] == "OUT_DIR"):
+                raise PaddingError("%s embeds a file padding can't rule out: %s"
+                                   % (source.relative_to(tree), code[found.start():found.end() + 40].strip()))
+
+
+def rust_sources(tree):
+    """Every `.rs` file in `tree` outside `target`."""
+    return [path for path in sorted(tree.rglob("*.rs")) if path.relative_to(tree).parts[0] != "target"]
 
 
 def align_tree(tree, file_hunks, side):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Refuses padding inside a literal (see `pad_text`), above a `line!()`
-    (see `check_line_values`), or of a blank-line-only change in a file
-    another one embeds (see `check_includes`). Returns the
+    Refuses padding inside a literal (see `pad_text`), when the workspace
+    reads line numbers as values (see `check_line_reads`), or when it embeds
+    a file padding could make equal (see `check_includes`). Returns the
     `(path, after_line, count)` paddings it made.
     """
-    made, padded = [], set()
+    tree = Path(tree).resolve()
+    made, blank_padded = [], set()
     blank_only = getattr(file_hunks, "blank_only", set())
     for path, hunks in sorted(file_hunks.items()):
         inserts = paddings(hunks)[0 if side == "base" else 1]
@@ -261,13 +316,14 @@ def align_tree(tree, file_hunks, side):
             continue
         file = tree / path
         text = file.read_bytes().decode(errors="surrogateescape")
-        check_line_values(text, inserts, path)
         file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
         if path in blank_only:
-            padded.add(file.resolve())
-    if padded:
-        check_includes(tree, padded)
+            blank_padded.add(file.resolve())
+    if made:
+        sources = rust_sources(tree)
+        check_line_reads(tree, sources)
+        check_includes(tree, sources, blank_padded)
     return made
 
 
@@ -441,8 +497,12 @@ def elf_image(data):
                     sym = b"section " + name(headers[shndx]).encode()
                 symbols.append((sym, info, other, shndx, value, size))
             image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
+    seen = collections.Counter()
     for header in headers:
         sname, stype, flags, addr, start, length, link, info, align, _ = header
+        # ELF allows several sections with one name, such as COMDAT groups' `.text`.
+        seen[name(header)] += 1
+        key = "section %s" % name(header) + ("" if seen[name(header)] == 1 else "#%d" % seen[name(header)])
         keep = flags & SHF_ALLOC and sname and name(header) != ".note.gnu.build-id"
         relocates = stype in (SHT_RELA, SHT_REL) and 0 < info < count and headers[info][2] & SHF_ALLOC
         if relocates and obj:
@@ -454,10 +514,10 @@ def elf_image(data):
                 index = rinfo >> 32
                 target = symbols[index] if index < len(symbols) else index
                 entries.append(b"%d %d %r %d" % (offset, rinfo & 0xFFFFFFFF, target, addend))
-            image["section %s" % name(header)] = struct.pack("<IQ", stype, flags) + b"\n".join(entries)
+            image[key] = struct.pack("<IQ", stype, flags) + b"\n".join(entries)
         elif keep or relocates:
             contents = b"" if stype == SHT_NOBITS else data[start:start + length]
-            image["section %s" % name(header)] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + contents
+            image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + contents
     return image
 
 

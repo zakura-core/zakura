@@ -243,6 +243,17 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("section .rela.text", out)
 
+    def test_elf_sections_that_share_a_name_are_each_compared(self):
+        """Two `.text` sections, as COMDAT groups give, are compared one by one."""
+
+        def build(first):
+            """An ELF file with two `.text` sections."""
+            return elf([(".text", 1, 6, first, 0, 0), (".text", 1, 6, b"two", 0, 0)])
+
+        status, out = image_status(build(b"one"), build(b"One"))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .text:", out)
+
     def test_elf_program_headers_count(self):
         """An executable stack, which only a program header records, fails."""
         stack = 0x6474E551
@@ -331,19 +342,38 @@ class AlignmentTests(unittest.TestCase):
             with self.assertRaises(asm_diff.PaddingError, msg=opener):
                 aligned(base, head)
 
-    def test_padding_above_a_line_value_is_refused(self):
-        """Padding above a `line!()` would change a value the program computes with, so it's refused."""
-        base = ["fn f() {", "    let a = 1;", "}", "fn here() -> u32 {", "    line!()", "}", ""]
-        head = base[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + base[2:]
-        with self.assertRaises(asm_diff.PaddingError):
-            aligned("\n".join(base), "\n".join(head))
+    def test_padding_with_a_line_value_is_refused(self):
+        """Any `line!` in the workspace, in any form or inside a macro defined elsewhere, refuses padding."""
+        head = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+        for other in ("fn here() -> u32 { line!() }\n",
+                      "fn here() -> u32 { core::line ! () }\n",
+                      "fn here() -> u32 { line![] + line!{} }\n",
+                      "fn here() -> u32 { let _ = \"https://x\"; line!() }\n",
+                      "macro_rules! here { () => { line!() } }\n"):
+            with self.assertRaises(asm_diff.PaddingError, msg=other):
+                aligned("\n".join(SOURCE), "\n".join(head), {"other.rs": other})
+        _, made = aligned("\n".join(SOURCE), "\n".join(head),
+                          {"other.rs": "// line!()\nconst S: &str = \"line!()\";\n"})
+        self.assertEqual(made, [[("lib.rs", 2, 2)], []])
 
     def test_padding_an_embedded_file_with_only_blank_lines_is_refused(self):
         """A blank-line change to a file another embeds would pad to the same text, so it's refused."""
+        blank = "\n".join(SOURCE[:2] + ["", ""] + SOURCE[2:])
+        for embed in ("include_str!(\"lib.rs\")", "include_str!(r\"lib.rs\")", "include_str! [r#\"lib.rs\"#]"):
+            with self.assertRaises(asm_diff.PaddingError, msg=embed):
+                aligned("\n".join(SOURCE), blank, {"main.rs": "const S: &str = %s;\n" % embed})
         embeds = {"main.rs": "const SOURCE: &str = include_str!(\"lib.rs\");\n"}
-        with self.assertRaises(asm_diff.PaddingError):
-            aligned("\n".join(SOURCE), "\n".join(SOURCE[:2] + ["", ""] + SOURCE[2:]), embeds)
         _, made = aligned("\n".join(SOURCE), "\n".join(SOURCE[:2] + ["    let b = 2;"] + SOURCE[2:]), embeds)
+        self.assertEqual(made, [[("lib.rs", 2, 1)], []])
+
+    def test_padding_with_an_unresolved_embed_is_refused(self):
+        """An embed whose path isn't a literal could name a padded file, so it refuses padding."""
+        head = "\n".join(SOURCE[:2] + ["    let b = 2;"] + SOURCE[2:])
+        unresolved = {"main.rs": "const S: &str = include_str!(concat!(\"lib\", \".rs\"));\n"}
+        with self.assertRaises(asm_diff.PaddingError):
+            aligned("\n".join(SOURCE), head, unresolved)
+        generated = {"main.rs": "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n"}
+        _, made = aligned("\n".join(SOURCE), head, generated)
         self.assertEqual(made, [[("lib.rs", 2, 1)], []])
 
     def test_literals_and_lifetimes_are_told_apart(self):

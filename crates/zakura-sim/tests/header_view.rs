@@ -12,7 +12,6 @@ mod support;
 use std::{fs, path::PathBuf, rc::Rc};
 
 use zakura_network::zakura::v9::RegtestMessage;
-use zakura_sim::peer::adversary::Act;
 use zakura_sim::{
     harness::{
         header_node::{

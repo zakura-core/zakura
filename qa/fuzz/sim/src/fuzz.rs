@@ -56,7 +56,8 @@ thread_local! {
 /// - an `Active` violation saves the input under
 ///   `$ZAKURA_SIM_ARTIFACTS/inputs/active/<property-id>/`, records the run
 ///   with `record_failure`, then panics with the property ID and the trace's
-///   directory, or with `nondeterministic:` when a rerun disagrees;
+///   directory, or with `nondeterministic:` when a rerun disagrees, which
+///   moves the input to `inputs/nondeterministic/<property-id>/`;
 /// - a harness failure panics with `harness:` and the reason;
 /// - each `Known` and `Draft` violation saves a trace once per property
 ///   under its bucket, keeps each distinct input by digest, and the target

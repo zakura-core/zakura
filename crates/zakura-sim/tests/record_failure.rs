@@ -20,6 +20,7 @@ use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
+    explore::{input_path, save_failure, Bucket, ExploreRun},
     harness::{self, entry, HarnessEntry, RecordError, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
     record::{EndRecord, OutcomeKind},
@@ -445,6 +446,43 @@ fn divergence(root: &Path, evidence: &Path) -> Value {
 /// The first run's `end` record, as the evidence keeps it.
 fn first_end(evidence: &Path) -> EndRecord {
     serde_json::from_str(&std::fs::read_to_string(evidence.join(FIRST_END_FILE)).unwrap()).unwrap()
+}
+
+/// E1c: an input whose rerun disagrees moves from its failure's bucket to
+/// `inputs/nondeterministic/`, since nondeterminism isn't a property
+/// failure.
+#[test]
+fn save_failure_files_a_nondeterministic_input_once() {
+    let (ticks, scenario, first) = ticks_run(&TickScenario {
+        ticks: 5,
+        stamp: true,
+    });
+    let run = ExploreRun {
+        scenario: Some(scenario),
+        result: Ok(first),
+    };
+    let root = TempDir::new().unwrap();
+    let id = PropertyId::new(ACTIVE);
+    let saved = save_failure(ticks, &[], &run, &id, Bucket::Active, root.path()).unwrap();
+    assert!(
+        matches!(
+            saved.trace,
+            Err(RecordError::Nondeterministic {
+                evidence: Some(_),
+                ..
+            })
+        ),
+        "{:?}",
+        saved.trace
+    );
+    let nondeterministic = input_path(root.path(), Bucket::Nondeterministic, Some(&id), &[]);
+    assert_eq!(saved.input, nondeterministic);
+    assert_eq!(std::fs::read(&nondeterministic).unwrap(), b"");
+    let active = input_path(root.path(), Bucket::Active, Some(&id), &[]);
+    assert!(
+        std::fs::symlink_metadata(&active).is_err(),
+        "the input isn't also filed as an Active failure"
+    );
 }
 
 #[test]

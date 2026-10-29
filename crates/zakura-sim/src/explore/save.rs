@@ -5,7 +5,8 @@
 //! target saves the original input first, by its digest, and only then
 //! records the failure. Inputs are grouped by bucket and property, and each
 //! distinct input keeps its own file, so a property's first saved failure
-//! never stops a later input from being kept.
+//! never stops a later input from being kept. An input whose rerun disagrees
+//! moves to the `nondeterministic` bucket, so it's filed only once.
 
 use std::{
     fs::{self, OpenOptions},
@@ -104,7 +105,11 @@ pub struct SavedFailure {
 ///
 /// The input is on disk before either rerun starts, so a rerun that hangs
 /// or crashes the process can't lose it. An `Active` violation's trace goes
-/// under `root`, and a `Known` or `Draft` one's under `root/<bucket>`.
+/// under `root`, and a `Known` or `Draft` one's under `root/<bucket>`. If a
+/// rerun disagrees, the input moves to the `nondeterministic` bucket, since
+/// nondeterminism isn't a property failure. If that move fails, the input
+/// stays where it was saved.
+///
 /// Returns an error only if the input couldn't be saved, in which case
 /// nothing reran.
 pub fn save_failure(
@@ -127,8 +132,33 @@ pub fn save_failure(
         Bucket::Active => root.to_owned(),
         bucket => root.join(bucket.name()),
     };
+    let trace = record_failure(entry, scenario, input, property, report, &traces);
+    let saved = match &trace {
+        Err(RecordError::Nondeterministic { .. }) => {
+            move_input(&saved, root, Bucket::Nondeterministic, property, input).unwrap_or(saved)
+        }
+        _ => saved,
+    };
     Ok(SavedFailure {
         input: saved,
-        trace: record_failure(entry, scenario, input, property, report, &traces),
+        trace,
     })
+}
+
+/// Moves the input saved at `from` to its [`input_path`] under `bucket`,
+/// and returns the new path.
+fn move_input(
+    from: &Path,
+    root: &Path,
+    bucket: Bucket,
+    property: &PropertyId,
+    input: &[u8],
+) -> io::Result<PathBuf> {
+    let to = input_path(root, bucket, Some(property), input);
+    fs::create_dir_all(
+        to.parent()
+            .expect("input_path names a file inside a directory"),
+    )?;
+    fs::rename(from, &to)?;
+    Ok(to)
 }

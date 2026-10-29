@@ -508,6 +508,9 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
     if act == Act::OutcomeCrossing {
         crossed(&report, &frame);
     }
+    if act == Act::StatusBurst {
+        rebursts(&report);
+    }
     assert_eq!(report.end.violation, None, "{act:?}");
     Checked { report, frame }
 }
@@ -538,6 +541,54 @@ fn crossed(report: &RunReport, frame: &Sent) {
         "the peer read the ending after the Grant: {received:?}, {}",
         frame.at
     );
+}
+
+/// Requires that each `StatusBurst` picked after the bucket first ran dry
+/// stops on its own exhausted `Status`: that frame is the burst's last and
+/// its only exhausted one. A burst's frames are the `Status` frames logged
+/// at the first step after its pick that logs any, since it writes them
+/// with one call and a refresh `Status` takes a step of its own. A refill
+/// between bursts holds fewer tokens than `BURST`, so a burst that stops on
+/// an admitted frame fails. At least one burst must follow the first
+/// exhaustion.
+fn rebursts(report: &RunReport) {
+    let identity = format!("peer:peer-0:{}", Act::StatusBurst.name());
+    let picks: Vec<u64> = report
+        .picks
+        .iter()
+        .filter(|pick| pick.identity == identity)
+        .map(|pick| pick.step)
+        .collect();
+    let entries = report.log.entries();
+    let status: Vec<(u64, bool)> = sent(report)
+        .into_iter()
+        .filter(|frame| frame.row.as_deref() == Some(Row::Status.name()))
+        .map(|frame| (entries[frame.at].step, frame.exhausted))
+        .collect();
+    let dry = status
+        .iter()
+        .find(|(_, exhausted)| *exhausted)
+        .map(|(step, _)| *step)
+        .expect("check found the burst's exhausted Status");
+    let mut later = 0;
+    for &start in picks.iter().filter(|&&start| start > dry) {
+        let step = status
+            .iter()
+            .map(|(step, _)| *step)
+            .find(|step| *step >= start)
+            .unwrap_or_else(|| panic!("the burst picked at step {start} sent nothing"));
+        let burst: Vec<bool> = status
+            .iter()
+            .filter(|(at, _)| *at == step)
+            .map(|(_, exhausted)| *exhausted)
+            .collect();
+        assert!(
+            matches!(burst.split_last(), Some((true, rest)) if !rest.contains(&true)),
+            "the burst picked at step {start} stops on its own exhausted Status: {burst:?}"
+        );
+        later += 1;
+    }
+    assert!(later > 0, "a burst follows the first exhaustion: {picks:?}");
 }
 
 /// Every act of the table, one focused plan each, with `SuccessOnly`

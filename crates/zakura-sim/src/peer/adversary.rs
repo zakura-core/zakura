@@ -617,14 +617,14 @@ impl Adversary {
             }
             Act::StatusBurst => {
                 let status = RegtestMessage::Status(honest.chain.status.clone());
-                let message_type = Row::Status.rule().message_type;
                 let mut burst = Vec::new();
                 for _ in 0..BURST {
-                    let empty = honest.models.tokens(message_type) == Some(0);
                     let frame = Crafted::of(status.clone());
                     check(act, &honest.models.preview(&frame), Labels::NONE)?;
-                    burst.push(honest.send_crafted(frame));
-                    if empty {
+                    let sent = honest.send_crafted(frame);
+                    let exhausted = sent.exhausted();
+                    burst.push(sent);
+                    if exhausted {
                         break;
                     }
                 }

@@ -11,6 +11,85 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.0-rc0] - 2026-10-29
+
+### Added
+
+- Added an `indexer-rpc` cargo feature that controls whether the indexer gRPC
+  server is compiled into `zakurad`. It is enabled by default, so default and
+  release builds still serve the indexer when `rpc.indexer_listen_addr` is set.
+  A build without the feature drops the gRPC dependencies, and refuses to start
+  if `rpc.indexer_listen_addr` is configured
+  ([#1729](https://github.com/zakura-core/zakura/pull/1729)).
+- Added five block-sync byte gauges: `sync.block.applying.buffered_bytes`,
+  `sync.block.sequencer_input.queued_bytes`,
+  `sync.block.submission.in_flight_bytes`,
+  `sync.block.work.reserved_above_floor_bytes`, and
+  `sync.block.work.reserved_bytes`. The above-floor gauge reports the value the
+  latest block-request admission read; the others follow their owners' values
+  ([#1736](https://github.com/zakura-core/zakura/pull/1736)).
+
+### Changed
+
+- The Prometheus metrics endpoint is now built into `zakurad` instead of using
+  `metrics-exporter-prometheus`. Metric names and the output format are unchanged.
+  Histogram quantiles now use every sample from the last minute, within 0.1%, so some
+  values change: the previous exporter left out samples from before a histogram's first
+  scrape, and lost accuracy for samples spanning more than a factor of about 700
+  ([#1559](https://github.com/zakura-core/zakura/pull/1559)).
+- The `tracing.filter` setting now applies only `level`, `target` and
+  `target=level` directives. `zakurad` prints a warning and ignores span and
+  field directives such as `[span{field=value}]=trace`, which it previously
+  applied ([#1634](https://github.com/zakura-core/zakura/pull/1634)).
+- `zakurad` no longer forwards records from the `log` crate into its logs, so
+  internal `rustls` TLS log messages are no longer shown. TLS handshake
+  failures on the RPC listener are still logged
+  ([#1698](https://github.com/zakura-core/zakura/pull/1698)).
+- Zakura P2P trace `closed.neutral` rows now split the `ordered_read_error`
+  and `request_read_error` reasons into `ordered_read_*` and `request_read_*`
+  reasons ending in `_rejected`, `_timeout`, or `_transport`. Only the
+  `_rejected` reasons mean the peer broke the protocol. Ordered-stream
+  oversize and rate-limit closes now always report `ordered_oversize` and
+  `ordered_rate_limited`
+  ([#1707](https://github.com/zakura-core/zakura/pull/1707)).
+- `zakurad` builds its bundled RocksDB without the features it doesn't use,
+  such as SST file ingestion, remote compaction, and tracing, again, with
+  `zakura-rocksdb` 0.24.4. This leaves out more than 500 KB of code and
+  shortens clean builds. RocksDB's behavior for Zakura and the on-disk
+  database format are unchanged. The release build no longer fails to link
+  with GCC 16, which is why the trimmed build was turned off in 1.7.0
+  ([#1728](https://github.com/zakura-core/zakura/pull/1728)).
+- Building `zakurad` no longer needs libclang: the RocksDB bindings are no
+  longer generated with bindgen at build time
+  ([#1728](https://github.com/zakura-core/zakura/pull/1728)).
+- `sync.block.budget.reserved_bytes` and `sync.block.reorder.buffered_bytes`
+  now change whenever their owners change them, instead of at each block-sync
+  reactor metrics publication
+  ([#1736](https://github.com/zakura-core/zakura/pull/1736)).
+- Reduced transaction memory use by moving Sprout, Sapling, and Orchard bundles
+  out of every transaction's inline storage
+  ([#1795](https://github.com/zakura-core/zakura/pull/1795)).
+
+### Fixed
+
+- Accept compatible peers on custom testnets using the active upgrade's protocol version
+  ([#1590](https://github.com/zakura-core/zakura/pull/1590)).
+- Fixed histogram quantiles losing recent samples when concurrent writers record
+  across a metrics window boundary, and restored the metrics endpoint's `/health`
+  response to `OK`
+  ([#1655](https://github.com/zakura-core/zakura/pull/1655)).
+- Checkpoint sync now recovers retained VCT root pairs at the blocked commit boundary
+  before waiting for more headers. Missing-successor waits process header changes
+  without polling ([#1660](https://github.com/zakura-core/zakura/pull/1660)).
+- Fixed a discovery race where a node could wait out the 2 s initial-exchange
+  timeout after a peer had already answered, which closed discovery-only
+  connections as timed out
+  ([#1673](https://github.com/zakura-core/zakura/pull/1673)).
+- Fixed managed zcashd sidecar sync stalls after out-of-order block announcements by pinning zcashd v1.3.1 ([#1689](https://github.com/zakura-core/zakura/pull/1689)).
+- Fixed `z_gettreestate` on nodes in pruned storage mode, so that it returns
+  the note commitment tree state for heights below the prune height
+  ([#1725](https://github.com/zakura-core/zakura/pull/1725)).
+
 ## [1.7.0] - 2026-10-21
 
 ### Added

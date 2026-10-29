@@ -136,6 +136,10 @@ pub struct SubmissionOwnership {
     pub token: BlockApplyToken,
     /// Wire bytes.
     pub bytes: u64,
+    /// The attributed size of the decoded block the driver can retain,
+    /// measured when the sequencer submitted it. An attached submission
+    /// shares its block with its `applying` body.
+    pub decoded_attributed_memory_bytes: u64,
     /// The body left `applying` while the driver can still retain it.
     pub detached: bool,
 }
@@ -398,6 +402,9 @@ impl Sequencer {
                     bytes: applying.bytes,
                     admitted_estimate_bytes: applying.admitted_estimate_bytes,
                     allocation: applying.body.allocation(),
+                    decoded_attributed_memory_bytes: applying
+                        .body
+                        .measured_decoded_attributed_memory_bytes(),
                 })
                 .collect(),
             submissions: self
@@ -408,6 +415,7 @@ impl Sequencer {
                     owner: submission.owner,
                     token: *token,
                     bytes: submission.bytes,
+                    decoded_attributed_memory_bytes: submission.decoded_attributed_memory_bytes,
                     detached: submission.detached,
                 })
                 .collect(),
@@ -736,6 +744,17 @@ impl Sequencer {
                 resident_decoded_bytes,
                 self.submission_decode_charge(height, applying),
             )
+    }
+
+    /// Decoded bytes that submitting the unsubmitted body at `height` adds.
+    /// See [`Self::submission_decode_charge`].
+    pub(super) fn submission_decode_charge_at(&self, height: block::Height) -> u64 {
+        self.applying
+            .get(&height)
+            .filter(|applying| !applying.submitted)
+            .map_or(0, |applying| {
+                self.submission_decode_charge(height, applying)
+            })
     }
 
     /// Decoded bytes that submitting `applying` at `height` adds: none when it

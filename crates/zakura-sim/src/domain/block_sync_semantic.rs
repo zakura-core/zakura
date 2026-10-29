@@ -50,7 +50,8 @@ pub const CAPACITY_RELEASE_WAKES: &str = "block-sync/capacity-release-wakes";
 /// Reset or epoch change can't hide or multiply retained submissions.
 pub const DETACHED_SUBMISSION_BOUNDED: &str = "block-sync/detached-submission-bounded";
 
-/// The sequencer's input queue retains raw envelopes, not decoded bodies.
+/// A body enters the sequencer's input queue decoded only while the queue's
+/// and `applying`'s decoded bytes leave room for it under the decoded cap.
 pub const INPUT_DECODED_BOUND: &str = "block-sync/input-decoded-bound";
 
 /// The issue whose bug [`CAPACITY_RELEASE_WAKES`] witnesses.
@@ -67,8 +68,8 @@ pub trait SemanticView {
 
 /// The block-sync semantic properties, for a harness whose view carries the
 /// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`] and
-/// [`DETACHED_SUBMISSION_BOUNDED`], active; [`CAPACITY_RELEASE_WAKES`],
-/// known for #1523; and [`INPUT_DECODED_BOUND`], a draft.
+/// [`DETACHED_SUBMISSION_BOUNDED`] and [`INPUT_DECODED_BOUND`], active; and
+/// [`CAPACITY_RELEASE_WAKES`], known for #1523.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -130,15 +131,18 @@ where
         },
         Property {
             id: PropertyId::new(INPUT_DECODED_BOUND),
-            claim: "the sequencer input queue retains raw envelopes, not decoded block graphs",
+            claim: "a body enters the sequencer input queue holding its decoded block only while \
+                    the queue's decoded bytes, applying's decoded bytes and the body's fit under \
+                    BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, plus at most one body; past it \
+                    the body enters as raw bytes",
             kind: Kind::Bound {
                 unit: Unit::AttributedHeap,
             },
             assumes: &[],
             needs: NEEDS,
-            status: Status::Draft,
+            status: Status::Active,
             check: check_input_decoded_bound::<S>,
-            witness: Some(queued_at_idle),
+            witness: Some(any_decoded_queued),
         },
     ]
 }
@@ -253,8 +257,15 @@ pub struct SemanticModel {
     submission_heights: BTreeMap<u64, u32>,
     /// Each `applying` body's height and owner epoch, by allocation.
     applying: BTreeMap<u64, (u32, Option<u64>)>,
-    /// Bodies in the sequencer's input queue, by allocation.
-    queued: BTreeSet<u64>,
+    /// Bodies in the sequencer's input queue, by allocation: each one's
+    /// decoded attributed bytes, 0 for raw bytes.
+    queued: BTreeMap<u64, u64>,
+    /// The decoded attributed bytes the latest sequencer snapshot held in
+    /// `applying` and in detached submissions.
+    applying_decoded: u64,
+    /// The largest decoded body that entered the input queue, in
+    /// attributed bytes.
+    largest_queued_decoded: u64,
     /// The latest committed view's body work epoch.
     epoch: Option<u64>,
     /// The latest committed view's verified tip.
@@ -278,6 +289,8 @@ pub struct SemanticModel {
     stale_findings: Vec<Finding>,
     /// Findings for [`DETACHED_SUBMISSION_BOUNDED`], not yet reported.
     detached_findings: Vec<Finding>,
+    /// Findings for [`INPUT_DECODED_BOUND`], not yet reported.
+    input_findings: Vec<Finding>,
     /// Triggers of [`CAPACITY_RELEASE_WAKES`], not yet obliged.
     rooms: Vec<RoomFreed>,
 
@@ -306,8 +319,19 @@ pub struct SemanticModel {
     /// Whether it did so while the decoded bytes storage held left no room
     /// under the decoded-byte target for another body of the same size.
     pub saw_reset_at_byte_target: bool,
+    /// Whether a body entered the input queue holding its decoded block.
+    pub saw_decoded_queued: bool,
     /// Whether virtual time advanced while the input queue held a body.
     pub saw_queued_at_idle: bool,
+    /// The most decoded attributed bytes the input queue held at once.
+    pub queued_decoded_peak: u64,
+    /// The most a decoded handoff took the queue's and applying's decoded
+    /// bytes past the cap, in attributed bytes.
+    pub handoff_past_cap_peak: u64,
+    /// Bodies that entered the input queue holding raw bytes alone while
+    /// the queue's and applying's decoded bytes had no room for the largest
+    /// decoded body queued so far.
+    pub raw_queued_at_cap: u64,
 }
 
 /// What one step changed, judged once the step is folded.
@@ -606,9 +630,23 @@ impl SemanticModel {
             } => {
                 let retained = change == "retained";
                 match holder {
-                    BlockSyncHolder::Queued { allocation } => {
+                    BlockSyncHolder::Queued {
+                        allocation,
+                        decoded_attributed_memory_bytes,
+                    } => {
                         if retained {
-                            self.queued.insert(*allocation);
+                            if *decoded_attributed_memory_bytes > 0 {
+                                self.judge_decoded_handoff(
+                                    body.height,
+                                    *decoded_attributed_memory_bytes,
+                                );
+                            } else if self.decoded_resident_without_room() {
+                                self.raw_queued_at_cap += 1;
+                            }
+                            self.queued
+                                .insert(*allocation, *decoded_attributed_memory_bytes);
+                            self.queued_decoded_peak =
+                                self.queued_decoded_peak.max(self.queued_decoded());
                         } else {
                             self.queued.remove(allocation);
                         }
@@ -662,8 +700,75 @@ impl SemanticModel {
                     BlockSyncHolder::Reorder { .. } => {}
                 }
             }
+            BlockSyncFact::Sequencer {
+                applying,
+                submissions,
+                ..
+            } => {
+                let applying = applying
+                    .iter()
+                    .map(|body| body.decoded_attributed_memory_bytes);
+                // An attached submission shares its block with its
+                // `applying` body.
+                let detached = submissions
+                    .iter()
+                    .filter(|submission| submission.detached)
+                    .map(|submission| submission.decoded_attributed_memory_bytes);
+                self.applying_decoded = applying.chain(detached).fold(0, u64::saturating_add);
+            }
             BlockSyncFact::SequencerClosed => self.closed = true,
             _ => {}
+        }
+    }
+
+    /// The decoded attributed bytes the input queue holds.
+    fn queued_decoded(&self) -> u64 {
+        self.queued
+            .values()
+            .fold(0, |sum, bytes| sum.saturating_add(*bytes))
+    }
+
+    /// Whether the queue's and applying's decoded bytes have no room under
+    /// the cap for the largest decoded body queued so far.
+    fn decoded_resident_without_room(&self) -> bool {
+        self.queued_decoded()
+            .saturating_add(self.applying_decoded)
+            .saturating_add(self.largest_queued_decoded)
+            > BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+    }
+
+    /// Judges a body at `height` that entered the input queue holding
+    /// `decoded` attributed bytes of its decoded block, for
+    /// [`INPUT_DECODED_BOUND`]. A routine charges the queue before it checks
+    /// the room, so routines checking at once see each other's bodies. The
+    /// slack is one of the largest decoded bodies, for the sequencer's
+    /// snapshot, which this model reads, running ahead of the `applying`
+    /// total its view publishes.
+    fn judge_decoded_handoff(&mut self, height: u32, decoded: u64) {
+        self.saw_decoded_queued = true;
+        self.largest_queued_decoded = self.largest_queued_decoded.max(decoded);
+        let queued = self.queued_decoded();
+        let resident = queued
+            .saturating_add(self.applying_decoded)
+            .saturating_add(decoded);
+        let bound =
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES.saturating_add(self.largest_queued_decoded);
+        self.handoff_past_cap_peak = self
+            .handoff_past_cap_peak
+            .max(resident.saturating_sub(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES));
+        if resident > bound {
+            self.input_findings.push(Finding {
+                step: self.step.unwrap_or_default(),
+                expected: format!(
+                    "a decoded body enters the input queue only while the queue's and \
+                     applying's decoded bytes and its own stay within {bound} attributed bytes"
+                ),
+                actual: format!(
+                    "the height {height} body entered the queue holding {decoded} decoded \
+                     attributed bytes, beside {queued} in the queue and {} in applying",
+                    self.applying_decoded
+                ),
+            });
         }
     }
 
@@ -1092,15 +1197,33 @@ where
     })
 }
 
-/// [`INPUT_DECODED_BOUND`] is never applicable: no observation says
-/// whether a queued body is decoded, or how many bytes its graph holds.
+/// Checks [`INPUT_DECODED_BOUND`] on each decoded body that enters the
+/// input queue. A peer routine reports the queue's retain before its send,
+/// so the report covers a body in a suspended send too. The retain and the
+/// sequencer's snapshots carry the attributed size of each decoded block,
+/// measured from the block, not from the gauges the routine's check reads.
 fn check_input_decoded_bound<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
     S::View: SemanticView,
 {
-    caught_up(cx);
-    Verdict::NotApplicable
+    let model = caught_up(cx);
+    let (findings, applicable, peak, past_cap) = {
+        let mut model = model.borrow_mut();
+        (
+            std::mem::take(&mut model.input_findings),
+            model.saw_decoded_queued,
+            model.queued_decoded_peak,
+            model.handoff_past_cap_peak,
+        )
+    };
+    cx.peak("queued-decoded-attributed-bytes", peak);
+    cx.peak("handoff-past-cap-attributed-bytes", past_cap);
+    report(cx, findings).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
 }
 
 /// [`SUBMIT_ONLY_REQUESTED`]'s trigger history: storage took a submission.
@@ -1135,18 +1258,18 @@ fn reset_or_verdict_while_held(log: &ObservationLog) -> bool {
     model.saw_reset_while_held || model.saw_verdict_while_held
 }
 
-/// [`INPUT_DECODED_BOUND`]'s trigger history: virtual time advanced, which
-/// it does only once no task can run, while a body waited in the input
-/// queue.
-fn queued_at_idle(log: &ObservationLog) -> bool {
-    SemanticModel::of(log).saw_queued_at_idle
+/// [`INPUT_DECODED_BOUND`]'s trigger history: a body entered the input
+/// queue holding its decoded block, which the check judges.
+fn any_decoded_queued(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).saw_decoded_queued
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::observe::{
-        BlockSyncBody, BodyScope, StorageBranch, StoragePoint, StreamId, WorkScope,
+        BlockSyncBody, BlockSyncRetained, BodyScope, StorageBranch, StoragePoint, StreamId,
+        WorkScope,
     };
 
     /// A log built one step at a time.
@@ -1594,5 +1717,67 @@ mod tests {
             .step()
             .submit(7, 2, owner(1, 2, 2), "new-fork");
         assert_eq!(submit_findings(&history), []);
+    }
+
+    /// The decoded attributed bytes of each queued body below.
+    const DECODED: u64 = 5_000;
+
+    /// The sequencer's snapshot holds `applying` decoded attributed bytes
+    /// in `applying`. Then `bodies` bodies, each holding [`DECODED`] decoded
+    /// bytes, enter the input queue, while `sessions` routines run.
+    fn decoded_handoffs(sessions: u64, applying: u64, bodies: u64) -> Vec<Finding> {
+        let mut history = History::default();
+        history.step().view(1);
+        for session in 1..=sessions {
+            history.session(session, session);
+        }
+        history.sync(BlockSyncFact::Sequencer {
+            reorder: Vec::new(),
+            applying: vec![BlockSyncRetained {
+                body: BlockSyncBody {
+                    height: HEIGHT - 1,
+                    owner: owner(1, 1, 1),
+                    bytes: 100,
+                },
+                admitted_estimate_bytes: None,
+                allocation: 1,
+                decoded_attributed_memory_bytes: applying,
+            }],
+            submissions: Vec::new(),
+        });
+        for body in 1..=bodies {
+            history.step().holder(
+                owner(1, body + 1, 1),
+                BlockSyncHolder::Queued {
+                    allocation: body + 1,
+                    decoded_attributed_memory_bytes: DECODED,
+                },
+                "retained",
+            );
+        }
+        SemanticModel::of(&history.log).input_findings
+    }
+
+    /// A scripted history for [`INPUT_DECODED_BOUND`]: a lone routine keeps
+    /// its decoded copies although `applying` already fills the cap, so its
+    /// second body passes the cap by more than one body. The property's
+    /// bypass is `no-room-check.patch`; this test pins the check's slack.
+    #[test]
+    fn a_decoded_handoff_past_the_cap_violates_input_decoded_bound() {
+        let findings = decoded_handoffs(1, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, 2);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].step, 3);
+    }
+
+    /// Decoded handoffs that pass the cap by at most one body hold, however
+    /// many routines run, and every session the run ever admitted adds no
+    /// slack.
+    #[test]
+    fn decoded_handoffs_within_one_body_hold() {
+        let cap = BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+        assert_eq!(decoded_handoffs(1, cap - DECODED, 1), []);
+        assert_eq!(decoded_handoffs(1, cap, 1), []);
+        assert_eq!(decoded_handoffs(4, cap, 1), []);
+        assert_eq!(decoded_handoffs(4, cap, 2).len(), 1);
     }
 }

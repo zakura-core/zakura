@@ -39,10 +39,12 @@ use super::{
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
-        initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
+        charge_decoded_handoff, initial_view, SequencedBody, SequencerControlInput, SequencerTask,
+        SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
     trace::{height as trace_height, BlockTraceEvent},
+    wire::BlockSyncMessage,
     work_queue::WorkQueue,
 };
 
@@ -89,6 +91,7 @@ pub struct BenchBodyFeeder {
     body_input_bytes: Arc<AtomicU64>,
     body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     bench_peer: ZakuraPeerId,
+    view: watch::Receiver<SequencerView>,
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
 }
@@ -212,6 +215,7 @@ pub fn spawn_bench_sequencer(
             body_input_decoded_attributed_memory_bytes: body_input_decoded_attributed_memory_bytes
                 .clone(),
             bench_peer: ZakuraPeerId::new(vec![0xB1; 32]).expect("32-byte bench peer id is valid"),
+            view: view_rx.clone(),
             owner,
             source,
         },
@@ -252,8 +256,24 @@ impl BenchBodyFeeder {
         bytes: u64,
     ) -> bool {
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_decoded_block(block, None);
-        let body = SequencedBody::new_queued(
+        // Hand the body over as a peer routine does.
+        let raw_frame_payload: Arc<[u8]> = BlockSyncMessage::Block(block.clone())
+            .encode()
+            .expect("a chain block encodes within the block-sync message limits")
+            .into();
+        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        let charged = charge_decoded_handoff(
+            &self.body_input_decoded_attributed_memory_bytes,
+            &self.view,
+            decoded_attributed_memory_size_bytes,
+        );
+        let body = BufferedBlockBody::for_handoff(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+            charged,
+        );
+        let body = SequencedBody::new_handed_off(
             self.owner,
             self.source,
             height,

@@ -1338,7 +1338,7 @@ fn check_holders(events: &[BlockEvent]) -> Result<Vec<block::Height>, String> {
                 };
                 held.remove(position);
                 match holder {
-                    Holder::Queued { allocation } if !closed => dequeued.push(*allocation),
+                    Holder::Queued { allocation, .. } if !closed => dequeued.push(*allocation),
                     _ => {}
                 }
             }

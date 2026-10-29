@@ -219,7 +219,8 @@ impl AdmissionSnapshot {
 /// Serialized pools (reorder backlog, applying backlog, and outstanding
 /// reservations) cost their wire bytes while retained. Decoded pools add the
 /// decoded multiple: the sequencer input channel (bodies arrive decoded from
-/// the peer routine, bounded by the channel depth) and in-flight submissions
+/// the peer routine while the decoded cap has room, and raw past it, bounded
+/// by the channel depth) and in-flight submissions
 /// (decoded at `prepare_submit`, charged through their exact completion even
 /// after detachment, and bounded by `submitted_apply_limit`). A detached
 /// submission no longer contributes applying wire bytes, but its decoded

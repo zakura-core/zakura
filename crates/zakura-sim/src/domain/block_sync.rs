@@ -430,7 +430,7 @@ impl OwnerInput {
                 change,
             } => {
                 let holder = match holder {
-                    BlockSyncHolder::Queued { allocation } => BodyHolder::Queued(*allocation),
+                    BlockSyncHolder::Queued { allocation, .. } => BodyHolder::Queued(*allocation),
                     BlockSyncHolder::Reorder { allocation } => BodyHolder::Reorder(*allocation),
                     BlockSyncHolder::Applying { allocation } => BodyHolder::Applying(*allocation),
                     BlockSyncHolder::Submitted { token } => BodyHolder::Submitted(*token),

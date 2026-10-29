@@ -25,7 +25,10 @@ pub mod shrink;
 mod verify;
 pub mod write;
 
-pub use failure::{artifacts_root, record_failure, ARTIFACTS_VAR, TRACES_DIR};
+pub use failure::{
+    artifacts_root, record_failure, ARTIFACTS_VAR, DIVERGENCE_FILE, FIRST_END_FILE,
+    NONDETERMINISTIC_DIR, RECORDING_DIR, RERUN_DIR, TRACES_DIR,
+};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
 pub use replay::{

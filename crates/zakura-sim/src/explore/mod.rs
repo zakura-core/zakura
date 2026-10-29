@@ -10,18 +10,33 @@
 //! A [`Worker`] runs inputs one at a time on a thread of its own. After a
 //! run whose shutdown abandoned tasks, it retires that thread and starts a
 //! fresh one (#1694).
+//!
+//! A run's result has independent parts: its property reports, a harness
+//! failure and its cleanup. [`Classified`] keeps the target's action, each
+//! `Known` and `Draft` violation, and an abandoned cleanup apart, so the
+//! action never hides the rest. [`classify_process`] classifies a run in a
+//! fresh process from the trace it wrote, by the same rules, and adds how
+//! the process ended. [`save_input`] and [`save_failure`] keep a failing
+//! input on disk before anything reruns it.
 
+mod process;
+mod save;
 mod worker;
 
 use serde::Serialize;
 use serde_json::Value;
 
-pub use worker::Worker;
+pub use process::{
+    classify_process, ProcessClassified, ProcessExit, ProcessFailure, ProcessResult,
+};
+pub use save::{input_path, save_failure, save_input, SavedFailure, INPUTS_DIR};
+pub use worker::{abandon_limit, Worker, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT};
 
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport},
     harness::{run_harness, HarnessEntry, HarnessError, Subsystem},
     property::Status,
+    record::EndRecord,
     Plan, RecordSink, RunReport,
 };
 
@@ -91,8 +106,9 @@ pub fn run_bytes<S: Subsystem>(
     }
 }
 
-/// Where a failure is filed (explorer.md, Outcome handling).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// Where a failure is filed (explorer.md, Outcome handling). Each bucket
+/// means one thing, and none of them is a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Bucket {
     /// An `Active` property was violated.
@@ -103,8 +119,34 @@ pub enum Bucket {
     Draft,
     /// The simulation itself failed.
     Harness,
-    /// The process crashed without an `end` record.
+    /// The process failed: it aborted, a sanitizer reported an error, it ran
+    /// out of memory, it timed out, a signal killed it, or it exited with a
+    /// nonzero code (see [`ProcessFailure`]).
     Crash,
+    /// Shutdown abandoned the run: a task got stuck in cleanup, and the run's
+    /// tasks were leaked (#1694).
+    Abandoned,
+    /// A rerun of the input didn't do what the run before it did.
+    Nondeterministic,
+    /// The process exited with code 0 but wrote no `end` record, so the run
+    /// never finished.
+    Incomplete,
+}
+
+impl Bucket {
+    /// The bucket's directory name, such as `known`, as it serializes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Bucket::Active => "active",
+            Bucket::Known => "known",
+            Bucket::Draft => "draft",
+            Bucket::Harness => "harness",
+            Bucket::Crash => "crash",
+            Bucket::Abandoned => "abandoned",
+            Bucket::Nondeterministic => "nondeterministic",
+            Bucket::Incomplete => "incomplete",
+        }
+    }
 }
 
 /// What the fuzz target does with a run.
@@ -137,17 +179,19 @@ pub enum ExploreOutcome {
 
 impl ExploreOutcome {
     /// Where the outcome's failure is filed: `active` for a failure,
-    /// `harness` for a harness failure, and none for the rest.
+    /// `harness` for a harness failure, `abandoned` for an abandoned run,
+    /// and none for a clean one.
     pub fn bucket(&self) -> Option<Bucket> {
         match self {
             ExploreOutcome::Fail { .. } => Some(Bucket::Active),
             ExploreOutcome::HarnessFailure { .. } => Some(Bucket::Harness),
-            ExploreOutcome::Clean | ExploreOutcome::Abandoned { .. } => None,
+            ExploreOutcome::Abandoned { .. } => Some(Bucket::Abandoned),
+            ExploreOutcome::Clean => None,
         }
     }
 }
 
-/// A run's outcome and its notes.
+/// A run's outcome and the rest of its result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Classified {
     /// What the target does.
@@ -156,6 +200,28 @@ pub struct Classified {
     /// in report order, whatever the outcome. One entry per property, since
     /// a property's ID is its failure signature.
     pub notes: Vec<(String, Bucket)>,
+    /// Tasks the run's shutdown leaked, whatever the outcome. Nonzero
+    /// exactly when cleanup abandoned the run, so a run that failed and was
+    /// abandoned keeps both.
+    pub leaked: usize,
+}
+
+impl Classified {
+    /// Every bucket the run files under, without repeats, in [`Bucket`]
+    /// order: the outcome's, `abandoned` if cleanup abandoned the run, and
+    /// each note's. Empty only for a clean run.
+    pub fn buckets(&self) -> Vec<Bucket> {
+        let mut buckets: Vec<Bucket> = self
+            .outcome
+            .bucket()
+            .into_iter()
+            .chain((self.leaked > 0).then_some(Bucket::Abandoned))
+            .chain(self.notes.iter().map(|(_, bucket)| *bucket))
+            .collect();
+        buckets.sort();
+        buckets.dedup();
+        buckets
+    }
 }
 
 /// Classifies `run` of `entry`'s harness.
@@ -165,64 +231,82 @@ pub struct Classified {
 /// `Violated` report whose property is `Active`, is a failure. The second
 /// case covers an obligation that expires in `at_end`, which the step loop
 /// calls after it picks the run's end (review E-01). Then an abandoned run
-/// is its own outcome. Every other run is clean.
+/// is its own outcome. Every other run is clean. [`Classified::leaked`]
+/// keeps an abandonment whatever the outcome.
 ///
 /// `entry.status` names each property's status. A property the harness
 /// doesn't register, such as one an extra checker reported, counts as
 /// `Active`.
 pub fn classify(entry: &HarnessEntry, run: &ExploreRun) -> Classified {
-    let status = |property: &str| entry.status(property).unwrap_or(Status::Active);
-    let notes = run
-        .report()
-        .map(|report| {
-            report
-                .properties
-                .iter()
-                .filter(|report| violated(report))
-                .filter_map(|report| match status(&report.property) {
-                    Status::Active => None,
-                    Status::Known { .. } => Some((report.property.clone(), Bucket::Known)),
-                    Status::Draft => Some((report.property.clone(), Bucket::Draft)),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let outcome = match &run.result {
-        Err(error) => ExploreOutcome::HarnessFailure {
-            reason: error.to_string(),
-        },
-        // `run_harness` returns a harness end as an error, so only a report
-        // built elsewhere gets here with one.
-        Ok(report) => match &report.end.harness {
-            Some(failure) => ExploreOutcome::HarnessFailure {
-                reason: failure.to_string(),
-            },
-            None => match failed(report, status) {
-                Some(property) => ExploreOutcome::Fail { property },
-                None if report.cleanup.leaked > 0 => ExploreOutcome::Abandoned {
-                    leaked: report.cleanup.leaked,
-                },
-                None => ExploreOutcome::Clean,
-            },
-        },
-    };
-    Classified { outcome, notes }
+    match &run.result {
+        Ok(report) => classify_parts(
+            entry,
+            report.end.harness.as_ref().map(ToString::to_string),
+            report.end.violation.as_ref().map(|v| v.property.as_str()),
+            &report.properties,
+            report.cleanup.leaked,
+        ),
+        // The failure's own text, as the run's `end` record holds it, so a
+        // fresh process's trace classifies the same.
+        Err(HarnessError::Run { failure, report }) => classify_parts(
+            entry,
+            Some(failure.to_string()),
+            report.end.violation.as_ref().map(|v| v.property.as_str()),
+            &report.properties,
+            report.cleanup.leaked,
+        ),
+        Err(error) => classify_parts(entry, Some(error.to_string()), None, &[], 0),
+    }
 }
 
-/// The property `report`'s run failed: `end.violation`'s, else the first
-/// `Active` property reported `Violated`.
-fn failed(report: &RunReport, status: impl Fn(&str) -> Status) -> Option<String> {
-    let property = match &report.end.violation {
-        Some(violation) => &violation.property,
-        None => {
-            &report
-                .properties
-                .iter()
-                .find(|report| violated(report) && status(&report.property) == Status::Active)?
-                .property
-        }
+/// Classifies the run that wrote `end`, by [`classify`]'s rules, so a trace
+/// classifies as its run did.
+pub fn classify_end(entry: &HarnessEntry, end: &EndRecord) -> Classified {
+    classify_parts(
+        entry,
+        end.harness.clone(),
+        end.violation.as_ref().map(|v| v.property.as_str()),
+        &end.properties,
+        end.cleanup.leaked,
+    )
+}
+
+/// [`classify`] on a run's parts: its harness failure, its `end.violation`'s
+/// property, its property reports and the tasks its shutdown leaked.
+fn classify_parts(
+    entry: &HarnessEntry,
+    harness: Option<String>,
+    violation: Option<&str>,
+    properties: &[PropertyReport],
+    leaked: usize,
+) -> Classified {
+    let status = |property: &str| entry.status(property).unwrap_or(Status::Active);
+    let notes = properties
+        .iter()
+        .filter(|report| violated(report))
+        .filter_map(|report| match status(&report.property) {
+            Status::Active => None,
+            Status::Known { .. } => Some((report.property.clone(), Bucket::Known)),
+            Status::Draft => Some((report.property.clone(), Bucket::Draft)),
+        })
+        .collect();
+    let failed = violation.map(str::to_owned).or_else(|| {
+        properties
+            .iter()
+            .find(|report| violated(report) && status(&report.property) == Status::Active)
+            .map(|report| report.property.clone())
+    });
+    let outcome = match (harness, failed) {
+        (Some(reason), _) => ExploreOutcome::HarnessFailure { reason },
+        (None, Some(property)) => ExploreOutcome::Fail { property },
+        (None, None) if leaked > 0 => ExploreOutcome::Abandoned { leaked },
+        (None, None) => ExploreOutcome::Clean,
     };
-    Some(property.clone())
+    Classified {
+        outcome,
+        notes,
+        leaked,
+    }
 }
 
 /// True if `report` says its property was violated.

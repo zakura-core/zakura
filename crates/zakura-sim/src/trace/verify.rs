@@ -126,3 +126,34 @@ pub(crate) fn end_difference(recorded: &EndRecord, produced: &EndRecord) -> Opti
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))
 }
+
+/// The first record where trace `other` differs from `trace`: its step, 0
+/// for `init`, and field, with an `end` field at the last step `trace`
+/// holds. A step one trace lacks differs in `step`.
+pub(crate) fn trace_difference(trace: &Trace, other: &Trace) -> Option<(u64, &'static str)> {
+    if trace.init != other.init {
+        return Some((0, "init"));
+    }
+    let shared = trace.steps.len().min(other.steps.len());
+    if let Some(difference) =
+        trace
+            .steps
+            .iter()
+            .zip(&other.steps)
+            .find_map(|(recorded, produced)| {
+                step_difference(recorded, produced).map(|field| (recorded.step, field))
+            })
+    {
+        return Some(difference);
+    }
+    if trace.steps.len() != other.steps.len() {
+        // A usize always fits in a u64 on supported targets.
+        return Some((shared as u64 + 1, "step"));
+    }
+    let last = trace.steps.last().map_or(0, |step| step.step);
+    match (&trace.end, &other.end) {
+        (Some(end), Some(other)) => end_difference(end, other).map(|field| (last, field)),
+        (None, None) => None,
+        _ => Some((last, "end")),
+    }
+}

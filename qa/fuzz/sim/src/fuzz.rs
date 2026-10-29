@@ -2,18 +2,21 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
-    path::PathBuf,
+    path::Path,
     sync::{Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
 use zakura_sim::{
-    explore::{Bucket, Classified, ExploreOutcome, ExploreRun, Worker},
+    explore::{
+        input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
+        Worker, ABANDON_LIMIT_VAR,
+    },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
-    trace::{artifacts_root, record_failure, TRACES_DIR},
+    trace::{artifacts_root, TRACES_DIR},
 };
 
 /// The variable that makes a target panic only on one property's
@@ -50,38 +53,67 @@ thread_local! {
 
 /// Runs `input` on `entry`'s harness and acts on the run's class:
 ///
-/// - an `Active` violation records the run with `record_failure`, then
-///   panics with the property ID and the trace's directory, or with
-///   `nondeterministic:` when a rerun disagrees;
+/// - an `Active` violation saves the input under
+///   `$ZAKURA_SIM_ARTIFACTS/inputs/active/<property-id>/`, records the run
+///   with `record_failure`, then panics with the property ID and the trace's
+///   directory, or with `nondeterministic:` when a rerun disagrees;
 /// - a harness failure panics with `harness:` and the reason;
 /// - each `Known` and `Draft` violation saves a trace once per property
-///   under its bucket, and the target returns;
-/// - an abandoned run is logged and returns, and the worker retires its
-///   thread (#1694);
+///   under its bucket, keeps each distinct input by digest, and the target
+///   returns;
+/// - a run whose shutdown abandoned tasks saves its input under
+///   `inputs/abandoned/`, whatever its outcome, and the worker retires its
+///   thread (#1694). Once the process has abandoned
+///   `$ZAKURA_SIM_ABANDON_LIMIT` runs, by default 1, the target panics with
+///   `abandoned:`, so its supervisor restarts the process;
 /// - a clean run returns.
 ///
 /// With `ZAKURA_SIM_EXPECT=<property-id>` set, only an `Active` violation
-/// of that property panics, and nothing is recorded. An abort, a stack
-/// overflow, a sanitizer report or a timeout still crashes the process, so
-/// `cargo fuzz tmin`'s output is a candidate that triage revalidates.
+/// of that property panics, and nothing is saved or recorded. An abort, a
+/// stack overflow, a sanitizer report or a timeout still crashes the
+/// process, so `cargo fuzz tmin`'s output is a candidate that triage
+/// revalidates.
 pub fn fuzz_one(entry: &'static HarnessEntry, input: &[u8]) {
     run(entry, input, act);
 }
 
 /// Runs `input` on `entry`'s harness on this thread's worker, and calls
-/// `then` on the worker's thread with the run and its class.
+/// `then` on the worker's thread with the run and its class. Then panics
+/// with `abandoned:` if the process has reached its abandonment limit.
+///
+/// Under `ZAKURA_SIM_EXPECT` the limit doesn't apply: `tmin` must crash
+/// only on the expected property, and its own run count bounds it.
 fn run(
     entry: &'static HarnessEntry,
     input: &[u8],
     then: fn(&'static HarnessEntry, &[u8], &ExploreRun, &Classified),
 ) {
     WORKER.with(|worker| {
-        worker
-            .borrow_mut()
-            .explore(entry, input, move |input, run, classified| {
-                then(entry, input, run, classified)
-            })
+        let mut worker = worker.borrow_mut();
+        worker.explore(entry, input, move |input, run, classified| {
+            then(entry, input, run, classified)
+        });
+        let limit = abandon_limit();
+        if expected().is_none() && worker.abandoned() >= limit {
+            // The count grows only on an abandoned run, so this input is
+            // the one that reached the limit.
+            panic!(
+                "abandoned: {} runs abandoned their cleanup, and {ABANDON_LIMIT_VAR} is {limit}; \
+                 the process exits for its supervisor to restart it; input at {}",
+                worker.abandoned(),
+                input_path(&artifacts_root(), Bucket::Abandoned, None, input).display()
+            );
+        }
     });
+}
+
+/// `ZAKURA_SIM_ABANDON_LIMIT`, read once per process.
+fn abandon_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        zakura_sim::explore::abandon_limit(env::var(ABANDON_LIMIT_VAR).ok().as_deref())
+            .unwrap_or_else(|error| panic!("{error}"))
+    })
 }
 
 /// [`fuzz_one`]'s action on one classified run.
@@ -89,68 +121,95 @@ fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified:
     if met_expectation(classified) {
         return;
     }
+    if classified.leaked > 0 {
+        save_abandoned(input, classified.leaked);
+    }
     for (property, bucket) in &classified.notes {
         save_once(entry, input, run, property, *bucket);
     }
     match &classified.outcome {
         ExploreOutcome::Fail { property } => fail(entry, input, run, property),
         ExploreOutcome::HarnessFailure { reason } => panic!("harness: {reason}"),
-        ExploreOutcome::Abandoned { leaked } => abandoned(*leaked),
-        ExploreOutcome::Clean => {}
+        ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => {}
     }
 }
 
-/// Logs an abandoned run. The worker parks the run's thread for good, so a
-/// campaign that keeps abandoning runs keeps growing; the log shows why.
-fn abandoned(leaked: usize) {
-    eprintln!("abandoned: shutdown leaked {leaked} tasks; the worker retired its thread");
+/// Saves the input of a run whose shutdown leaked `leaked` tasks, and logs
+/// where. The worker parks the run's thread for good.
+fn save_abandoned(input: &[u8], leaked: usize) {
+    let saved = save_input(&artifacts_root(), Bucket::Abandoned, None, input)
+        .unwrap_or_else(|error| panic!("harness: saving an abandoned input failed: {error}"));
+    eprintln!(
+        "abandoned: shutdown leaked {leaked} tasks; the worker retired its thread; input at {}",
+        saved.display()
+    );
 }
 
-/// Records the failing run, then panics with the property and the trace's
-/// directory.
+/// `property` as an ID. The run reported it, so it fits the grammar.
+fn property_id(property: &str) -> PropertyId {
+    PropertyId::generated(property.to_owned()).unwrap_or_else(|error| panic!("harness: {error}"))
+}
+
+/// Saves the input, records the failing run, then panics with the property
+/// and the trace's directory.
 fn fail(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, property: &str) -> ! {
-    match record(entry, input, run, property, &artifacts_root()) {
-        Ok(dir) => panic!("{property}: trace at {}", dir.display()),
-        Err(error) => record_failed(property, error),
+    let saved = save_failure(
+        entry,
+        input,
+        run,
+        &property_id(property),
+        Bucket::Active,
+        &artifacts_root(),
+    )
+    .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
+    match saved.trace {
+        Ok(trace) => panic!(
+            "{property}: trace at {}; input at {}",
+            trace.dir.display(),
+            saved.input.display()
+        ),
+        Err(error) => record_failed(property, error, &saved.input),
     }
 }
 
 /// Panics for a violation of `property` that `record_failure` couldn't
-/// record: with `nondeterministic:` when a rerun disagreed with the run,
-/// else with `harness:`.
-fn record_failed(property: &str, error: RecordError) -> ! {
+/// record, whose input is at `input`: with `nondeterministic:` and the
+/// evidence's directory when a rerun disagreed with the run, else with
+/// `harness:`.
+fn record_failed(property: &str, error: RecordError, input: &Path) -> ! {
     match error {
-        RecordError::Nondeterministic { detail } => {
-            panic!("nondeterministic: {property}: {detail}")
-        }
-        error => panic!("harness: record_failure: {error}"),
+        RecordError::Nondeterministic {
+            detail,
+            evidence: Some(dir),
+        } => panic!(
+            "nondeterministic: {property}: {detail}; evidence in {}; input at {}",
+            dir.display(),
+            input.display()
+        ),
+        RecordError::Nondeterministic {
+            detail,
+            evidence: None,
+        } => panic!(
+            "nondeterministic: {property}: {detail}; input at {}",
+            input.display()
+        ),
+        error => panic!(
+            "harness: record_failure: {error}; input at {}",
+            input.display()
+        ),
     }
 }
 
-/// Records `property`'s violation in `run` under `root`, and returns the
-/// trace's directory.
-fn record(
-    entry: &'static HarnessEntry,
-    input: &[u8],
-    run: &ExploreRun,
-    property: &str,
-    root: &std::path::Path,
-) -> Result<PathBuf, RecordError> {
-    let id = PropertyId::generated(property.to_owned())
-        .unwrap_or_else(|error| panic!("harness: {error}"));
-    let scenario = run
-        .scenario
-        .as_ref()
-        .expect("run_bytes keeps the scenario of a run that reports a violation");
-    let report = run
-        .report()
-        .expect("a run that reports a violation has a report");
-    record_failure(entry, scenario, input, &id, report, root).map(|trace| trace.dir)
-}
+/// Distinct inputs one process keeps per bucket and property. Past it, the
+/// target logs once and keeps no more, so a property that fails on most
+/// inputs can't fill the disk.
+const MAX_KEPT_INPUTS: usize = 256;
 
-/// Saves a trace of the `Known` or `Draft` violation of `property` under
-/// `$ZAKURA_SIM_ARTIFACTS/<bucket>/`, unless this process or an earlier one
-/// already saved one. A property's ID is its signature, so one trace per
+/// Saves the input of the `Known` or `Draft` violation of `property` under
+/// `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by digest, up to
+/// [`MAX_KEPT_INPUTS`] per process. The first such input in a process also
+/// records a trace under `<bucket>/traces/`, unless an earlier process
+/// already saved one: a property's ID is its signature, so one trace per
 /// property is enough. A rerun that disagrees panics with
 /// `nondeterministic:`.
 fn save_once(
@@ -160,31 +219,42 @@ fn save_once(
     property: &str,
     bucket: Bucket,
 ) {
-    static SAVED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
-    let name = match bucket {
-        Bucket::Known => "known",
-        Bucket::Draft => "draft",
-        Bucket::Active | Bucket::Harness | Bucket::Crash => return,
+    static SEEN: Mutex<BTreeMap<(Bucket, String), usize>> = Mutex::new(BTreeMap::new());
+    let seen = {
+        let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = seen.entry((bucket, property.to_owned())).or_insert(0);
+        *count += 1;
+        *count
     };
-    let mut saved = SAVED.lock().unwrap_or_else(PoisonError::into_inner);
-    if !saved.insert((name.to_owned(), property.to_owned())) {
-        return;
+    let root = artifacts_root();
+    let id = property_id(property);
+    if seen == 1 && !has_trace(&root.join(bucket.name()), property) {
+        let saved = save_failure(entry, input, run, &id, bucket, &root)
+            .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
+        if let Err(error) = saved.trace {
+            record_failed(property, error, &saved.input);
+        }
+    } else if seen <= MAX_KEPT_INPUTS {
+        save_input(&root, bucket, Some(&id), input)
+            .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
+    } else if seen == MAX_KEPT_INPUTS + 1 {
+        eprintln!(
+            "{}: {property}: kept {MAX_KEPT_INPUTS} inputs in this process; later ones aren't saved",
+            bucket.name()
+        );
     }
-    let root = artifacts_root().join(name);
+}
+
+/// True if `root/traces/<property-id>/` holds a saved trace.
+fn has_trace(root: &Path, property: &str) -> bool {
     let dir = property
         .split('/')
         .fold(root.join(TRACES_DIR), |dir, segment| dir.join(segment));
-    let earlier = std::fs::read_dir(&dir).is_ok_and(|mut entries| {
+    std::fs::read_dir(&dir).is_ok_and(|mut entries| {
         entries.any(|entry| {
             entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
         })
-    });
-    if earlier {
-        return;
-    }
-    if let Err(error) = record(entry, input, run, property, &root) {
-        record_failed(property, error);
-    }
+    })
 }
 
 /// With `ZAKURA_SIM_EXPECT` set, panics on an `Active` violation of that
@@ -217,7 +287,9 @@ fn expected() -> Option<&'static str> {
 ///   time since the target started, and the target returns;
 /// - a failure of any other property panics;
 /// - once a fixture's discovery limit has passed with no `Base` find, the
-///   next input panics with `missed:`.
+///   next input panics with `missed:`;
+/// - an abandoned run saves its input, and counts toward the abandonment
+///   limit, as in [`fuzz_one`].
 ///
 /// `ZAKURA_SIM_EXPECT` works as in [`fuzz_one`], and replaces the policy.
 pub fn fuzz_fixtures(input: &[u8]) {
@@ -250,6 +322,9 @@ fn act_fixtures(
         })
     });
     let mut finds = finds.lock().unwrap_or_else(PoisonError::into_inner);
+    if classified.leaked > 0 {
+        save_abandoned(input, classified.leaked);
+    }
     match &classified.outcome {
         ExploreOutcome::HarnessFailure { reason } => panic!("harness: {reason}"),
         ExploreOutcome::Fail { property } => {
@@ -270,8 +345,7 @@ fn act_fixtures(
                 );
             }
         }
-        ExploreOutcome::Abandoned { leaked } => abandoned(*leaked),
-        ExploreOutcome::Clean => {}
+        ExploreOutcome::Abandoned { .. } | ExploreOutcome::Clean => {}
     }
     let elapsed = finds.start.elapsed();
     if let Some((property, limit)) = fixtures::EXPECTED

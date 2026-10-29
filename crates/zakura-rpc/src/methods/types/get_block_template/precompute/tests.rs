@@ -336,35 +336,26 @@ fn shielded_miner_addresses_wait_longer_for_a_template() {
         )
     };
 
-    let height = Height(template().height);
-    let transparent = miner_params(MinerAddressType::Transparent);
-    assert!(!transparent.has_shielded_component(&net, height));
-    assert_eq!(new_tip_timeout(&transparent, &net, height), NEW_TIP_TIMEOUT);
-
-    for (name, addr_type) in [
-        ("a Sapling address", MinerAddressType::Sapling),
-        ("a unified address", MinerAddressType::Unified),
-    ] {
-        let shielded = miner_params(addr_type);
-        assert!(
-            shielded.has_shielded_component(&net, height),
-            "{name} pays a shielded coinbase output"
-        );
-        assert_eq!(
-            new_tip_timeout(&shielded, &net, height),
-            SHIELDED_NEW_TIP_TIMEOUT,
-            "{name} should wait for the updater instead of proving per request"
-        );
+    let height = NetworkUpgrade::Nu6_3.activation_height(&net).unwrap();
+    for addr_type in [MinerAddressType::Transparent, MinerAddressType::Sapling] {
+        let params = miner_params(addr_type);
+        assert!(!params.has_shielded_component(&net, height));
+        assert_eq!(new_tip_timeout(&params, &net, height), NEW_TIP_TIMEOUT);
     }
+    let shielded = miner_params(MinerAddressType::Unified);
+    assert!(shielded.has_shielded_component(&net, height));
+    assert_eq!(
+        new_tip_timeout(&shielded, &net, height),
+        SHIELDED_NEW_TIP_TIMEOUT
+    );
 }
 
-/// Before NU5, the coinbase pays a unified address's Sapling or transparent receiver, never its
-/// Orchard receiver. A unified address without a Sapling receiver has no proof to wait for then.
+/// Before NU6.3, unified addresses use transparent payouts; Ironwood proofs start at NU6.3.
 #[test]
-fn orchard_receivers_are_only_shielded_from_nu5() {
+fn orchard_receivers_are_only_shielded_from_nu6_3() {
     let _init_guard = zakura_test::init();
 
-    let net = Network::Mainnet;
+    let net = Network::new_default_testnet();
     let MinerAddress::Unified {
         orchard,
         transparent,
@@ -391,19 +382,19 @@ fn orchard_receivers_are_only_shielded_from_nu5() {
         transparent,
     });
 
-    let nu5 = NetworkUpgrade::Nu5
+    let nu6_3 = NetworkUpgrade::Nu6_3
         .activation_height(&net)
-        .expect("NU5 is active on Mainnet");
-    let before_nu5 = nu5.previous().expect("NU5 activates above genesis");
+        .expect("NU6.3 is active on Testnet");
+    let before_nu6_3 = nu6_3.previous().expect("NU6.3 activates above genesis");
 
-    assert!(!miner_params.has_shielded_component(&net, before_nu5));
+    assert!(!miner_params.has_shielded_component(&net, before_nu6_3));
     assert_eq!(
-        new_tip_timeout(&miner_params, &net, before_nu5),
+        new_tip_timeout(&miner_params, &net, before_nu6_3),
         NEW_TIP_TIMEOUT
     );
-    assert!(miner_params.has_shielded_component(&net, nu5));
+    assert!(miner_params.has_shielded_component(&net, nu6_3));
     assert_eq!(
-        new_tip_timeout(&miner_params, &net, nu5),
+        new_tip_timeout(&miner_params, &net, nu6_3),
         SHIELDED_NEW_TIP_TIMEOUT
     );
 }

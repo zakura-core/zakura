@@ -619,7 +619,7 @@ fn assert_coinbase_resource_usage(
 }
 
 /// Tests that the coinbase cache reuses a previously built coinbase for the same height and fees,
-/// so a short-polling miner doesn't re-run the shielded-coinbase proof on every request.
+/// using distinct coinbase data to distinguish reuse from reconstruction without a proof.
 #[test]
 fn coinbase_cache_reuses_built_coinbase() {
     use super::CoinbaseCache;
@@ -631,24 +631,25 @@ fn coinbase_cache_reuses_built_coinbase() {
     let miner_params = MinerParams::from(
         MinerAddress::decode(
             &net,
-            default_miner_address(net.kind(), &MinerAddressType::Sapling),
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
-        .expect("hard-coded Sapling address is valid"),
+        .expect("hard-coded transparent address is valid"),
     );
     let fee = Amount::zero();
 
     let build = || {
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, fee, None)
+        let mut params = miner_params.clone();
+        params.randomize_data();
+        TransactionTemplate::new_coinbase(&net, height, &params, fee, None)
             .expect("valid coinbase tx")
     };
 
-    // A shielded coinbase carries a randomized proof, so two fresh builds differ. Identical bytes
-    // therefore prove the cache returned a reused transaction rather than rebuilding it.
+    // Distinct valid transactions make a cache hit distinguishable from reconstruction.
     let coinbase = build();
     assert_ne!(
         build(),
         coinbase,
-        "fresh shielded coinbases differ (randomized proof)"
+        "fresh coinbases differ (randomized data)"
     );
 
     let cache = CoinbaseCache::default();
@@ -696,7 +697,7 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
                 &Network::Mainnet,
                 default_miner_address(
                     zakura_chain::parameters::NetworkKind::Mainnet,
-                    &MinerAddressType::Sapling,
+                    &MinerAddressType::Transparent,
                 ),
             )
             .unwrap(),
@@ -714,7 +715,7 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
                 &Network::Mainnet,
                 default_miner_address(
                     zakura_chain::parameters::NetworkKind::Mainnet,
-                    &MinerAddressType::Sapling,
+                    &MinerAddressType::Transparent,
                 ),
             )
             .unwrap(),
@@ -749,7 +750,7 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
                 &Network::Mainnet,
                 default_miner_address(
                     zakura_chain::parameters::NetworkKind::Mainnet,
-                    &MinerAddressType::Sapling,
+                    &MinerAddressType::Transparent,
                 ),
             )
             .unwrap(),
@@ -787,7 +788,7 @@ fn coinbase_cache_preserves_zero_fee_entry_at_capacity() {
             &Network::Mainnet,
             default_miner_address(
                 zakura_chain::parameters::NetworkKind::Mainnet,
-                &MinerAddressType::Sapling,
+                &MinerAddressType::Transparent,
             ),
         )
         .unwrap(),

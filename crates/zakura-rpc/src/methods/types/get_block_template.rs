@@ -826,21 +826,12 @@ impl MinerParams {
     /// Returns `true` if the coinbase transaction that pays these parameters has a shielded
     /// output, which needs a proof that takes seconds to build.
     ///
-    /// This mirrors the receiver that `TransactionTemplate::new_coinbase()` pays at `height`: a
-    /// unified address pays its Orchard receiver only from NU5, and falls back to its transparent
-    /// receiver when it has no payable shielded receiver.
+    /// This mirrors the receiver selected by coinbase construction: unified addresses pay an
+    /// Orchard receiver through Ironwood from NU6.3, and use a transparent receiver before then.
+    /// Sapling-only payouts are unsupported and do not start proof work.
     pub(crate) fn has_shielded_component(&self, net: &Network, height: block::Height) -> bool {
-        match &self.addr {
-            MinerAddress::Unified {
-                sapling, orchard, ..
-            } => {
-                sapling.is_some()
-                    || (orchard.is_some()
-                        && NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu5)
-            }
-            MinerAddress::Sapling(_) => true,
-            _ => false,
-        }
+        matches!(&self.addr, MinerAddress::Unified { orchard: Some(_), .. }
+            if NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu6_3)
     }
 
     /// Randomizes the memo.

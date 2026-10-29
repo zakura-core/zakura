@@ -1,0 +1,8 @@
+[limits]
+budget_usd = 25
+unit_bytes = 24000
+max_rounds = 4
+max_seconds = 3300
+
+[profiles.default]
+prompts = ["prompts/reviewer.md", "prompts/focus.md"]

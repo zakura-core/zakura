@@ -1,0 +1,157 @@
+name: Release AI review
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- default-branch code only; revalidates same-repository release PR metadata; reviewed Git objects are never checked out or executed
+    workflows: [Release AI review request]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open release/v* PR number (drafts allowed)"
+        type: string
+        required: true
+      provider:
+        description: "Configured model provider"
+        type: choice
+        options: [openai, abliterated]
+        default: openai
+        required: true
+      base_tag:
+        description: "Optional release baseline override, e.g. v1.7.0-rc2"
+        type: string
+        required: false
+      prompt_profile:
+        description: "Profile from the trusted release-review configuration"
+        type: string
+        default: default
+        required: true
+
+permissions: {}
+
+env:
+  PYTHONPATH: .github/scripts
+
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      eligible: ${{ steps.resolve.outputs.eligible }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      provider: ${{ steps.resolve.outputs.provider }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve current release PR
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m release_review prepare --output "$RUNNER_TEMP/review-context"
+      - name: Save pinned request
+        if: steps.resolve.outputs.eligible == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: release-review-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-context/context.json
+          retention-days: 14
+
+  review:
+    needs: resolve
+    if: needs.resolve.outputs.eligible == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    permissions:
+      contents: read
+    concurrency:
+      group: release-ai-review-${{ needs.resolve.outputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
+        with:
+          name: release-review-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-context
+      - name: Review release Git objects with OpenAI
+        if: needs.resolve.outputs.provider == 'openai'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RELEASE_REVIEW_MODELS: ${{ vars.RELEASE_REVIEW_MODELS }}
+        run: >-
+          python3 -m release_review review
+          --context "$RUNNER_TEMP/review-context/context.json"
+          --output "$RUNNER_TEMP/review-report"
+      - name: Review release Git objects with Abliterated
+        if: needs.resolve.outputs.provider == 'abliterated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_API_KEY: ${{ secrets.ABLITERATED_API_KEY }}
+          RELEASE_REVIEW_MODELS: ${{ vars.RELEASE_REVIEW_MODELS }}
+        run: >-
+          python3 -m release_review review
+          --context "$RUNNER_TEMP/review-context/context.json"
+          --output "$RUNNER_TEMP/review-report"
+      - name: Save review evidence, including incomplete results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: release-review-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-report/
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    needs: [resolve, review]
+    if: >-
+      always() && needs.resolve.outputs.eligible == 'true' &&
+      needs.review.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: release-ai-review-publish-${{ needs.resolve.outputs.pr_number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
+        with:
+          name: release-review-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-context
+      - name: Download available evidence
+        continue-on-error: true # A failed/missing download produces an explicitly incomplete fallback report.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
+        with:
+          pattern: release-review-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-report
+          merge-multiple: true
+      - name: Update the advisory PR summary if the head is still current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -m release_review publish
+          --context "$RUNNER_TEMP/review-context/context.json"
+          --output "$RUNNER_TEMP/review-report"
+      - name: Preserve published evidence or the early-failure report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: release-review-published-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/review-report/
+          if-no-files-found: warn
+          retention-days: 14

@@ -79,10 +79,11 @@ processes, or the input is rejected:
 
 Candidates run smallest first, and the first that passes moves to
 `<dir>/minimized/` with its trace. `<dir>/report.json` gives the status
-(`minimized`, `original-kept`, `original-rejected` or `interrupted`), each
-candidate's rejection reason, the counts, the budgets, the elapsed time and
-whether `tmin` reached its fixed point. The command exits 0 only for
-`minimized`. Ctrl-C stops the run and still writes the report.
+(`minimized`, `original-kept`, `original-rejected`, `interrupted` or
+`build-failed`), each candidate's rejection reason, the counts, the budgets,
+the elapsed time and whether `tmin` reached its fixed point. The command
+exits 0 only for `minimized`. Ctrl-C stops the run and still writes the
+report.
 
 Reproduce a crash input as a trace with the `zakura-sim` binary:
 

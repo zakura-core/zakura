@@ -67,7 +67,9 @@ case "$body" in
   *timeout*) echo "==1== ERROR: libFuzzer: timeout after 2 seconds"; exit 70;;
   *nocrash*) echo "Executed $input in 1 ms"; exit 0;;
 esac
-printf "thread '<unnamed>' panicked at qa/fuzz/sim/src/fuzz.rs:198:9:\n%s\n" "$ZAKURA_SIM_EXPECT"
+printf "thread 'zakura-sim-explore' (4242) panicked at src/fuzz.rs:198:9:\n%s\n" "$ZAKURA_SIM_EXPECT"
+printf "thread '<unnamed>' (4241) panicked at library/core/src/panicking.rs:225:5:\n"
+echo "panic in a function that cannot unwind"
 echo "==1== ERROR: libFuzzer: deadly signal"
 exit 77
 "#;
@@ -562,18 +564,22 @@ fn the_original_is_copied_into_an_empty_directory() {
 #[test]
 fn crashes_are_classified_from_libfuzzer_output() {
     let property = "race/lost-update";
-    let expected = "INFO: Running\nthread '<unnamed>' panicked at qa/fuzz/sim/src/fuzz.rs:198:9:\nrace/lost-update\n==1== ERROR: libFuzzer: deadly signal\n";
+    // The thread lines as Rust 1.98 writes them, with each thread's ID. The
+    // filter's panic is followed by the abort of unwinding out of the target.
+    let expected = "Running: input.bin\n\nthread 'zakura-sim-explore' (880381) panicked at src/fuzz.rs:198:9:\nrace/lost-update\nstack backtrace:\n\nthread '<unnamed>' (880379) panicked at library/core/src/panicking.rs:225:5:\npanic in a function that cannot unwind\nthread caused non-unwinding panic. aborting.\n==1== ERROR: libFuzzer: deadly signal\n";
+    let unnamed = "thread '<unnamed>' panicked at src/fuzz.rs:198:9:\nrace/lost-update\n==1== ERROR: libFuzzer: deadly signal\n";
     let task_panic_first = "thread 'zakura-sim-run' panicked at src/x.rs:1:1:\nplanted task panic\nthread '<unnamed>' panicked at src/fuzz.rs:1:1:\nrace/lost-update\n==1== ERROR: libFuzzer: deadly signal\n";
     let other = "thread '<unnamed>' panicked at src/fuzz.rs:1:1:\nharness: boom\n==1== ERROR: libFuzzer: deadly signal\n";
     for (end, log, crash) in [
         (ChildEnd::Exited(77), expected, Crash::Expected),
+        (ChildEnd::Exited(77), unnamed, Crash::Expected),
         (ChildEnd::Exited(77), task_panic_first, Crash::Expected),
         (
             ChildEnd::Exited(77),
             other,
             Crash::OtherPanic("harness: boom".to_owned()),
         ),
-        (ChildEnd::Exited(0), expected, Crash::NoCrash),
+        (ChildEnd::Exited(0), expected, Crash::None),
         (
             ChildEnd::Exited(70),
             "==1== ERROR: libFuzzer: timeout after 5 seconds",
@@ -671,4 +677,16 @@ fn every_mapped_target_is_declared() {
     for (target, harness) in TARGETS {
         assert_eq!(resolve_target(&root, target).unwrap(), harness);
     }
+}
+
+/// SIGINT sets the interrupt flag instead of killing the wrapper.
+#[test]
+fn sigint_sets_the_interrupt_flag() {
+    install_interrupt_handler();
+    // SAFETY: `raise` has no memory-safety preconditions, and the handler
+    // only stores to an atomic.
+    unsafe {
+        libc::raise(libc::SIGINT);
+    }
+    assert!(INTERRUPTED.load(Ordering::SeqCst));
 }

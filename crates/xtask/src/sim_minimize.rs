@@ -70,6 +70,10 @@ const REPORT_FORMAT: u32 = 1;
 /// kills it, so libFuzzer's own timeout report comes first.
 const FUZZ_GRACE: Duration = Duration::from_secs(10);
 
+/// The panic Rust raises when a panic unwinds into a function that can't
+/// unwind, as the filter's panic does once it leaves the fuzz target.
+const NON_UNWINDING: &str = "panic in a function that cannot unwind";
+
 /// How often the wrapper checks a child, the deadline and the interrupt.
 const POLL: Duration = Duration::from_millis(20);
 
@@ -263,6 +267,9 @@ fn fuzz_dir(repo_root: &Path) -> PathBuf {
     repo_root.join("qa").join("fuzz").join("sim")
 }
 
+/// Builds the `tmin` command for an input and an artifact prefix directory.
+pub(super) type TminCommand = dyn Fn(&Path, &Path) -> Command;
+
 /// The pinned tools a minimization runs.
 pub(super) struct Tools {
     /// The pinned `zakura-sim` binary.
@@ -274,7 +281,7 @@ pub(super) struct Tools {
     pub(super) tmin_binary: PathBuf,
     /// The `tmin` command for an input and an artifact prefix directory,
     /// without the filter's variable.
-    pub(super) tmin: Box<dyn Fn(&Path, &Path) -> Command>,
+    pub(super) tmin: Box<TminCommand>,
     /// The checkout's provenance.
     pub(super) source: Source,
 }
@@ -298,9 +305,14 @@ fn minimize(
     let original = preserve_original(request)?;
     let logs = request.out.join(LOGS_DIR);
     fs::create_dir_all(&logs)?;
-    let built = match build_tools(repo_root, request, &logs, interrupt)? {
-        Some(tools) => tools,
-        None => {
+    let built = match build_tools(repo_root, request, &logs, interrupt) {
+        Ok(Some(tools)) => tools,
+        Err(error) => {
+            let report = Report::new(request, original, Status::BuildFailed, started)
+                .with_reason(error.to_string());
+            return write_report(request, report, started);
+        }
+        Ok(None) => {
             return write_report(
                 request,
                 interrupted_before_start(request, original, started),
@@ -544,6 +556,9 @@ pub(super) enum Status {
     /// SIGINT or SIGTERM stopped the run. The original's copy, and any
     /// candidate accepted before, are kept.
     Interrupted,
+    /// The simulator binary or the fuzz target didn't build, so no check
+    /// ran. The original's copy is kept.
+    BuildFailed,
 }
 
 impl fmt::Display for Status {
@@ -554,6 +569,7 @@ impl fmt::Display for Status {
             Status::OriginalKept => "original-kept",
             Status::OriginalRejected => "original-rejected",
             Status::Interrupted => "interrupted",
+            Status::BuildFailed => "build-failed",
         })
     }
 }
@@ -619,7 +635,7 @@ pub(super) enum Crash {
     /// It panicked with the expected property's ID.
     Expected,
     /// It ran the input to its end.
-    NoCrash,
+    None,
     /// libFuzzer reported a timeout.
     Timeout,
     /// libFuzzer reported running out of memory.
@@ -639,7 +655,7 @@ impl fmt::Display for Crash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Crash::Expected => f.write_str("the expected panic"),
-            Crash::NoCrash => f.write_str("no crash"),
+            Crash::None => f.write_str("no crash"),
             Crash::Timeout => f.write_str("a libFuzzer timeout"),
             Crash::OutOfMemory => f.write_str("libFuzzer's out-of-memory report"),
             Crash::Sanitizer => f.write_str("a sanitizer report"),
@@ -1275,13 +1291,14 @@ impl Checker<'_> {
 /// expected `property`.
 ///
 /// libFuzzer's own reports come first: a timeout, running out of memory, or
-/// a sanitizer's error. Then the last panic message: the filter panics with
-/// the property's ID alone, and the abort that follows is libFuzzer's
-/// "deadly signal". A task panic the scheduler caught prints a message
-/// too, but an expected crash's panic is always the last.
+/// a sanitizer's error. Then the last panic message, past the runtime's
+/// [`NON_UNWINDING`] abort: the filter panics with the property's ID alone,
+/// and libFuzzer reports the abort that follows as a "deadly signal". A
+/// task panic the scheduler caught prints a message too, but before the
+/// run ends, so before the filter's.
 pub(super) fn classify_crash(end: ChildEnd, log: &str, property: &str) -> Crash {
     if end == ChildEnd::Exited(0) {
-        return Crash::NoCrash;
+        return Crash::None;
     }
     if log.contains("ERROR: libFuzzer: timeout") {
         return Crash::Timeout;
@@ -1296,12 +1313,20 @@ pub(super) fn classify_crash(end: ChildEnd, log: &str, property: &str) -> Crash 
         return Crash::Sanitizer;
     }
     let mut lines = log.lines();
-    let mut last_panic = None;
+    let mut panics = Vec::new();
     while let Some(line) = lines.next() {
-        if line.starts_with("thread '") && line.contains("' panicked at ") {
-            last_panic = lines.next().map(str::to_owned);
+        // `thread '<name>' (<id>) panicked at <file>:<line>:<column>:`, then
+        // the message.
+        if line.starts_with("thread '") && line.contains(" panicked at ") {
+            panics.extend(lines.next());
         }
     }
+    // The filter's panic resumes on libFuzzer's thread, and unwinding into
+    // libFuzzer's caller panics again, which aborts.
+    while panics.last() == Some(&NON_UNWINDING) {
+        panics.pop();
+    }
+    let last_panic = panics.last().map(|message| (*message).to_owned());
     let deadly = log.contains("ERROR: libFuzzer: deadly signal");
     match last_panic {
         Some(message) if message == property && deadly => Crash::Expected,

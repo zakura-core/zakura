@@ -640,6 +640,18 @@ impl MiningRpcMethods for RpcRequestClient {
 /// Exercises actual RPC admission, template selection, and mining across local PQ activation.
 #[cfg(feature = "pq")]
 pub(crate) async fn pq_mempool_test() -> Result<()> {
+    pq_spend_test(false).await
+}
+
+/// Sends PQ authorizations over legacy P2P, then verifies the peer's mined block and RPC bytes.
+#[cfg(feature = "pq")]
+pub(crate) async fn pq_p2p_test() -> Result<()> {
+    pq_spend_test(true).await
+}
+
+/// Shares real signed fixtures and RPC checks between local admission and peer propagation.
+#[cfg(feature = "pq")]
+async fn pq_spend_test(with_peer: bool) -> Result<()> {
     use zakura_chain::{parameters::testnet::RegtestParameters, transaction::HashType};
     use zcash_script::script::Code;
     use zcash_transparent::{
@@ -719,11 +731,14 @@ pub(crate) async fn pq_mempool_test() -> Result<()> {
     config.mempool.debug_enable_at_height = Some(0);
     config.mining.miner_address = Some(miner.to_string().parse()?);
     config.consensus.checkpoint_sync = false;
+    config.network.initial_testnet_peers.clear();
+    config.network.cache_dir = false.into();
     // Writing and reading TOML is part of starting this real node.
     let mut node = testdir()?
         .with_config(&mut config)?
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let peer_address = read_listen_addr_from_logs(&mut node, "Opened Zcash protocol endpoint at")?;
     let rpc = read_listen_addr_from_logs(&mut node, OPENED_RPC_ENDPOINT_MSG)?;
     node.expect_stdout_line_matches("activating mempool")?;
     let client = RpcRequestClient::new(rpc);
@@ -818,6 +833,33 @@ pub(crate) async fn pq_mempool_test() -> Result<()> {
         client.send_raw_transaction(&spends[2]).await.is_err(),
         "unsupported execution identifier is rejected"
     );
+    // Node B starts with an empty database and learns the funding chain only from A.
+    // No funding block or spending transaction is submitted to B through RPC.
+    let mut peer = if with_peer {
+        let mut peer_config = config.clone();
+        peer_config.network.initial_testnet_peers = [peer_address.to_string()].into();
+        let mut peer_node = testdir()?
+            .with_config(&mut peer_config)?
+            .spawn_child(args!["start"])?
+            .with_timeout(EXTENDED_LAUNCH_DELAY);
+        let peer_rpc = read_listen_addr_from_logs(&mut peer_node, OPENED_RPC_ENDPOINT_MSG)?;
+        peer_node.expect_stdout_line_matches("activating mempool")?;
+        let peer_client = RpcRequestClient::new_with_timeout(peer_rpc, Duration::from_secs(10));
+        let tip: String = client
+            .json_result_from_call("getbestblockhash", "[]")
+            .await
+            .map_err(|e| eyre!(e))?;
+        wait_for_pq_tip(&peer_client, tip.parse()?).await?;
+        let mempool: Vec<String> = peer_client
+            .json_result_from_call("getrawmempool", "[]")
+            .await
+            .map_err(|e| eyre!(e))?;
+        assert!(mempool.is_empty(), "the peer starts without the PQ spends");
+        Some((peer_node, peer_client))
+    } else {
+        None
+    };
+
     for index in [0, 1, 3] {
         client.send_raw_transaction(&spends[index]).await?;
     }
@@ -834,16 +876,128 @@ pub(crate) async fn pq_mempool_test() -> Result<()> {
             .iter()
             .any(|candidate| candidate.hash() == tx.hash()));
     }
-    let mined = client.mine_proposed_block(&net).await?;
+    let mined = if let Some((_, peer_client)) = &peer {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let mempool: Vec<String> = peer_client
+                    .json_result_from_call("getrawmempool", "[]")
+                    .await
+                    .map_err(|e| eyre!(e))?;
+                if [0, 1, 3]
+                    .iter()
+                    .all(|&index| mempool.contains(&spends[index].hash().to_string()))
+                {
+                    break Ok::<_, eyre::Report>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .wrap_err("node B did not receive the spends through P2P")??;
+        let (template, _) = peer_client.block_from_template(&net).await?;
+        for index in [0, 1, 3] {
+            assert!(
+                template
+                    .transactions
+                    .iter()
+                    .any(|tx| tx.hash() == spends[index].hash()),
+                "the peer selects the relayed spend for mining"
+            );
+            assert_pq_rpc_bytes(peer_client, &spends[index]).await?;
+        }
+        let mined = peer_client.mine_proposed_block(&net).await?;
+        wait_for_pq_tip(&client, mined.hash()).await?;
+        let received = client
+            .get_block(i32::try_from(activation.0)?)
+            .await
+            .map_err(|e| eyre!(e))?
+            .expect("node A accepted the peer's block");
+        assert_eq!(
+            received.zcash_serialize_to_vec()?,
+            mined.zcash_serialize_to_vec()?,
+            "block propagation preserves authorization bytes"
+        );
+        for index in [0, 1, 3] {
+            assert_pq_rpc_bytes(&client, &spends[index]).await?;
+            assert_pq_rpc_bytes(peer_client, &spends[index]).await?;
+        }
+        for rpc in [&client, peer_client] {
+            // State commitment and the mempool's tip notification run independently.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mempool: Vec<String> = rpc
+                        .json_result_from_call("getrawmempool", "[]")
+                        .await
+                        .map_err(|e| eyre!(e))?;
+                    if mempool.is_empty() {
+                        return Ok::<_, eyre::Report>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .wrap_err("mined spends did not leave a node's mempool")??;
+        }
+        mined
+    } else {
+        client.mine_proposed_block(&net).await?
+    };
     for index in [0, 1, 3] {
         assert!(mined
             .transactions
             .iter()
             .any(|tx| tx.hash() == spends[index].hash()));
     }
+    if let Some((peer_node, _)) = peer.take() {
+        let mut peer_node = peer_node;
+        peer_node.kill(false)?;
+        peer_node
+            .wait_with_output()?
+            .assert_failure()?
+            .assert_was_killed()?;
+    }
     node.kill(false)?;
     node.wait_with_output()?
         .assert_failure()?
         .assert_was_killed()?;
+    Ok(())
+}
+
+/// Waits for an exact peer tip, including semantic block verification and state commitment.
+#[cfg(feature = "pq")]
+async fn wait_for_pq_tip(client: &RpcRequestClient, expected: block::Hash) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let tip: String = client
+                .json_result_from_call("getbestblockhash", "[]")
+                .await
+                .map_err(|e| eyre!(e))?;
+            if tip == expected.to_string() {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .wrap_err("peer did not accept the expected chain tip")?
+}
+
+/// Checks the full serialized transaction, because its v5 transaction ID excludes authorization.
+#[cfg(feature = "pq")]
+async fn assert_pq_rpc_bytes(client: &RpcRequestClient, transaction: &Transaction) -> Result<()> {
+    let raw: HexData = client
+        .json_result_from_call(
+            "getrawtransaction",
+            format!(r#"["{}", 0]"#, transaction.hash()),
+        )
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert_eq!(
+        raw.0,
+        transaction.zcash_serialize_to_vec()?,
+        "RPC preserves complete authorization bytes"
+    );
+    let decoded: Transaction = raw.0.as_slice().zcash_deserialize_into()?;
+    assert_eq!(decoded, *transaction);
     Ok(())
 }

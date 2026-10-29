@@ -4487,3 +4487,11 @@ async fn regtest_pq_mempool_and_template() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_mempool_test()).await??;
     Ok(())
 }
+
+/// PQ single-signer and multisig spends propagate between nodes and survive block/RPC transport.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_p2p_relay_and_block_acceptance() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_p2p_test()).await??;
+    Ok(())
+}

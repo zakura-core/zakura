@@ -63,3 +63,27 @@ RUSTFLAGS="--cfg zakura_sim" cargo run -p zakura-sim -- record --sim discovery/w
 
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
+
+## Seeds
+
+Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`
+with a `<name>.toml` sidecar. The sidecar records the harness, the generator
+version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
+the test or plan the seed comes from, and the property witnesses it carries.
+A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
+scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+
+`cargo xtask sim-seeds` validates every seed against the current generators.
+A required seed that fails, such as one built for an older generator or one
+whose prefix now decodes to another scenario, fails the command with the
+reason. A seed with `required = false` is quarantined instead. With `--sim`
+and `--out`, it writes one harness's admitted seeds into a corpus, each named
+by its SHA-256:
+
+```console
+cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/discovery_wait_complete
+```
+
+`cargo xtask sim-versions --sim <name>` prints the versions that fix what the
+harness's fuzz input means, as `KEY=VALUE` lines. A corpus keyed on all of
+them starts fresh when any of them changes.

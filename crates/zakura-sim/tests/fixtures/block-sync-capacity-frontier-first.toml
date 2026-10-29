@@ -6,3 +6,9 @@
 harness = "block-sync/storage"
 generator = 2
 sha256 = "530a47835d95aac55da8af47de487270668a216a6e4576ba5551736550fbf626"
+scenario_sha256 = "2600bcc1b48cc63528b37dc6c2fff869c756f9551e11e8a43e0117d5ee19157d"
+source = "crates/zakura-sim/tests/block_semantic_properties.rs"
+
+[[witness]]
+property = "block-sync/capacity-release-wakes"
+expect = "holds"

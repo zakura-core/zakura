@@ -80,8 +80,10 @@ workflow summary. Results for old heads remain artifacts.
 Every changed file is listed in the JSON coverage manifest. Text diffs are split
 into bounded units without silently discarding hunks. The model can read source
 at either pinned revision and search related unchanged files. Small units share
-bounded requests, and validation, cryptography, mining, and networking paths
-run before support files so a limited budget reaches the critical code first.
+bounded requests of at most four units, leaving room to investigate surrounding
+source. Production validation, cryptography, mining, and networking paths run
+before standalone tests, benchmarks, and support files so a limited budget
+reaches the critical code first. Existing tests remain available as context.
 Findings must cite
 an exact source quotation and identify a changed release file. A synthesis pass
 challenges candidates and examines cross-component interactions.

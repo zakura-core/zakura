@@ -362,11 +362,19 @@ class EngineTests(GitFixture):
         units = [ReviewUnit("doc", "docs/change.md", 1, "d" * 200),
                  ReviewUnit("network", "crates/zakura-network/src/lib.rs", 1, "n" * 600),
                  ReviewUnit("validation", "crates/zakura-consensus/src/lib.rs", 1, "c" * 600),
-                 ReviewUnit("chain", "crates/zakura-chain/src/lib.rs", 1, "c" * 300)]
+                 ReviewUnit("chain", "crates/zakura-chain/src/lib.rs", 1, "c" * 300),
+                 ReviewUnit("benchmark", "crates/zakura-chain/benches/check.rs", 1, "b" * 100)]
         batches = list(batch_units(units, 1000))
         self.assertEqual({item.id for item in batches[0]}, {"chain", "validation"})
-        self.assertEqual([item.id for batch in batches for item in batch], ["chain", "validation", "network", "doc"])
+        self.assertEqual([item.id for batch in batches for item in batch],
+                         ["chain", "validation", "network", "benchmark", "doc"])
         self.assertTrue(all(sum(len(item.patch.encode()) for item in batch) <= 1000 for batch in batches))
+
+    def test_small_file_batches_leave_room_for_source_investigation(self):
+        units = [ReviewUnit(str(i), f"crates/zakura-chain/src/file{i}.rs", 1, "small patch") for i in range(9)]
+        batches = list(batch_units(units, 24000))
+        self.assertEqual([len(batch) for batch in batches], [4, 4, 1])
+        self.assertEqual([unit.id for batch in batches for unit in batch], [str(i) for i in range(9)])
 
     def test_small_files_share_a_request_but_keep_individual_coverage(self):
         provider = ScriptedProvider([completed(), completed()])

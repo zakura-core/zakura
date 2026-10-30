@@ -73,8 +73,20 @@ class FixtureTests(unittest.TestCase):
                 for name in names:
                     (tree / "fixtures" / name).write_bytes(b"x")
             fixtures, missing = schedule_diff.find_fixtures(base, head, "fixtures/*.bin")
-        self.assertEqual([path.name for path in fixtures], ["a.bin", "c.bin"])
+        self.assertEqual([label for label, _ in fixtures], ["a.bin", "c.bin"])
         self.assertEqual(missing, ["fixtures/b.bin"])
+
+    def test_a_re_recorded_fixture_runs_both_inputs(self):
+        """A fixture whose bytes changed runs base's input too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base, head = Path(tmp) / "base", Path(tmp) / "head"
+            for tree, data in ((base, b"old"), (head, b"new")):
+                (tree / "fixtures").mkdir(parents=True)
+                (tree / "fixtures" / "a.bin").write_bytes(data)
+            fixtures, missing = schedule_diff.find_fixtures(base, head, "fixtures/*.bin")
+            self.assertEqual([(label, path.read_bytes()) for label, path in fixtures],
+                             [("a.bin", b"new"), ("a.bin (base's input)", b"old")])
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

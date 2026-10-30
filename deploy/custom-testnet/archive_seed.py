@@ -24,9 +24,13 @@ from urllib.request import Request, urlopen
 NU7_HEIGHT = 4465026
 
 
+class OperationCancelled(Exception):
+    """An operator cancellation, never a retryable network or filesystem error."""
+
+
 def interrupt_operation(signum, frame):
     """Turn service cancellation into an exception so ordinary cleanup runs."""
-    raise InterruptedError('archive operation was cancelled')
+    raise OperationCancelled('archive operation was cancelled')
 
 
 def command(*args, timeout=120):

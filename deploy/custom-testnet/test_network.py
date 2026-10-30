@@ -162,7 +162,7 @@ class NetworkTests(unittest.TestCase):
                 network.archive_seed.interrupt_operation(15, None)
 
         with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'command', side_effect=command) as commands:
-            with self.assertRaises(InterruptedError):
+            with self.assertRaises(network.archive_seed.OperationCancelled):
                 network.reset(self.config, 600)
         self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
         for index in (0, 1):
@@ -174,6 +174,24 @@ class NetworkTests(unittest.TestCase):
             network.cleanup_failed_reset(self.config)
         self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
         command.assert_any_call('systemctl', 'stop', 'pq-testnet-preparation.service')
+
+    def test_cancellation_is_not_retried_by_miner_readiness(self):
+        with patch.object(network, 'rpc', side_effect=network.archive_seed.OperationCancelled):
+            with self.assertRaises(network.archive_seed.OperationCancelled):
+                network.wait_for_primary(self.run)
+
+    def test_cancellation_during_validator_readiness_fails_reset(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+        def restore(archive, destination, name):
+            destination.mkdir()
+        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', side_effect=network.archive_seed.OperationCancelled), patch.object(network, 'command'):
+            with self.assertRaises(network.archive_seed.OperationCancelled):
+                network.reset(self.config, 600)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
 
     def test_reorg_withdraws_activation_and_refreshes_its_hash(self):
         controller = self.controller('active')

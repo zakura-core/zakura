@@ -59,7 +59,7 @@ class ArchiveSeedTests(unittest.TestCase):
                     archive_seed.interrupt_operation(15, None)
 
             with patch.object(archive_seed, 'public_reference', return_value={'validators': ['zakura-testnet-eu', 'zakura-testnet-as']}), patch.object(archive_seed, 'verify_archive_history', return_value={}), patch.object(archive_seed, 'command', side_effect=command):
-                with self.assertRaisesRegex(InterruptedError, 'cancelled'):
+                with self.assertRaisesRegex(archive_seed.OperationCancelled, 'cancelled'):
                     archive_seed.capture(root, root / 'snapshot.tar.zst', 'source.service', 'unused')
             self.assertIn(('systemctl', 'start', 'source.service'), calls)
             self.assertFalse((root / 'snapshot.tar.capture').exists())
@@ -76,6 +76,14 @@ class ArchiveSeedTests(unittest.TestCase):
         with patch.object(archive_seed, 'public_reference', return_value=reference), patch.object(archive_seed, 'rpc', side_effect=rpc), patch.object(archive_seed, 'verify_archive_history') as history, patch.object(archive_seed.time, 'sleep'):
             self.assertEqual(archive_seed.wait_for_sync('unused', timeout=1), reference)
         history.assert_called_once_with(18432)
+
+    def test_cancellation_is_not_retried_by_preparation_readiness(self):
+        with patch.object(archive_seed, 'rpc', side_effect=archive_seed.OperationCancelled):
+            with self.assertRaises(archive_seed.OperationCancelled):
+                archive_seed.wait_for_rpc('Testnet')
+        with patch.object(archive_seed, 'public_reference', side_effect=archive_seed.OperationCancelled):
+            with self.assertRaises(archive_seed.OperationCancelled):
+                archive_seed.wait_for_sync('unused')
 
     def test_pruned_nodes_and_missing_old_bodies_are_rejected(self):
         with patch.object(archive_seed, 'rpc', return_value={'pruned': True}):

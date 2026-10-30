@@ -60,7 +60,8 @@ use crate::{
 /// `frame-write-started`'s decoded `summary`. Version 31 added boundary
 /// reads: the hub's `component-read` rows and the reactor's
 /// `read-registered` events. Version 32 added the selected chain's
-/// `component-read` value.
+/// `component-read` value and the hub's `read-registered` rows for reads
+/// the harness registers.
 pub const FORMAT_VERSION: u32 = 32;
 
 /// What records mean: the identity grammar, the default-pick and default-draw

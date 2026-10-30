@@ -371,6 +371,117 @@ async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// A write the stream worker started and the peer never reads stays
+/// pending until a cancellation stops it. Through either token, the
+/// worker's cancellation arm records the output `unwritten-cancelled`, and
+/// the output ends once with that, though the write future was dropped
+/// mid-write (M6a-6).
+///
+/// This fails if the life is kept inside the write future, which would end
+/// it `abandoned`, or if either arm skips its update.
+#[tokio::test]
+async fn a_cancelled_write_ends_unwritten_once() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    for stream_token in [false, true] {
+        // Small windows, so one frame reaches flow control.
+        let mut link = Link::connect_with(zakura_quic::QuicConfig {
+            stream_receive_window_bytes: 64 * 1024,
+            receive_window_bytes: 128 * 1024,
+            send_window_bytes: 128 * 1024,
+            ..zakura_quic::QuicConfig::default()
+        })
+        .await?;
+        let mut context = tabled_context(None, 128);
+        // A frame far past the stream's flow-control window, so its write
+        // waits for a reader that never comes.
+        let big: u32 = 4 << 20;
+        context.limits.max_frame_bytes = big;
+        context.limits.max_message_bytes = big;
+        context.outbound_frame_cap = big;
+        let recorder = Arc::new(Recorder::default());
+        let conn = registered_tap(recorder.clone());
+        context.close_cause.observe_with(conn.clone());
+        // One whole frame from the peer opens the stream on the node's side.
+        let status = MessageRule::find(rows(), v9::message_type::STATUS)
+            .expect("the table has a status row")
+            .payload
+            .min();
+        let opening = [header(v9::message_type::STATUS, status), vec![0; status]].concat();
+        let (_peer_send, _peer_recv, send, recv) = link.open(&opening).await?;
+        let tap = Arc::new(StreamTap::new(conn, recv.id()));
+        context.precheck.observe_with(tap.clone());
+        let cancel = if stream_token {
+            context.stream_token.clone()
+        } else {
+            context.connection_token.clone()
+        };
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: ZAKURA_STREAM_HEADER_SYNC,
+            stream_version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            request_id: None,
+            max_frame_bytes: 1024,
+        };
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let outbound_tx = outbound_tx.observed(Some(tap));
+        let mut worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            persistent_stream_worker(send, recv, prelude, context, inbound_tx, outbound_rx, 1),
+        ));
+        let frame = Frame {
+            message_type: v9::message_type::HEADERS,
+            flags: 0,
+            payload: vec![7; 2_000_001],
+        };
+        timeout(TEST_TIMEOUT, outbound_tx.send(frame)).await??;
+        timeout(TEST_TIMEOUT, async {
+            while !recorder
+                .events()
+                .iter()
+                .any(|event| matches!(event, TransportEvent::FrameWriteStarted { .. }))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // Give the write time to fill the window and wait.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|event| matches!(event, TransportEvent::FrameWritten { .. })),
+            "the write is still pending when the token is cancelled"
+        );
+        cancel.cancel();
+        assert!(
+            timeout(END_WAIT, &mut worker).await.is_ok(),
+            "cancellation ends the worker"
+        );
+        let ends: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TransportEvent::OutputEnded {
+                    output, outcome, ..
+                } => Some((output, outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            [(
+                0,
+                crate::zakura::OutputOutcome::Unwritten(crate::zakura::Unwritten::Cancelled)
+            )],
+            "stream token: {stream_token}"
+        );
+        drop(outbound_tx);
+        link.close().await;
+    }
+    Ok(())
+}
+
 /// Only the first recorded cause is reported, and a cancellation after it
 /// reports nothing more. The cause-free decisions need the simulator token's
 /// hook, so `tests/sim_header_sync.rs` covers them.

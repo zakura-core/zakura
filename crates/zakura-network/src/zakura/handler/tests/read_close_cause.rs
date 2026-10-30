@@ -96,7 +96,15 @@ pub(super) struct Link {
 
 impl Link {
     pub(super) async fn connect() -> Result<Self, BoxError> {
-        let server = LocalEndpointFactory::new().endpoint(95101).await?;
+        Self::connect_with(zakura_quic::QuicConfig::default()).await
+    }
+
+    /// [`Self::connect`] with both endpoints on `quic`.
+    pub(super) async fn connect_with(quic: zakura_quic::QuicConfig) -> Result<Self, BoxError> {
+        let server = LocalEndpointFactory::new()
+            .quic_config(quic.clone())
+            .endpoint(95101)
+            .await?;
         let (connection_tx, _connections) = mpsc::channel(1);
         let (stream_tx, streams) = mpsc::channel(2);
         server.serve(CaptureConnection {
@@ -104,7 +112,10 @@ impl Link {
             connection_tx,
             stream_tx,
         })?;
-        let client = LocalEndpointFactory::new().endpoint(95102).await?;
+        let client = LocalEndpointFactory::new()
+            .quic_config(quic)
+            .endpoint(95102)
+            .await?;
         let connection = timeout(
             TEST_TIMEOUT,
             client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),

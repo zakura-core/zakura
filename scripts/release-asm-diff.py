@@ -239,11 +239,14 @@ def align_tree(tree, file_hunks, side):
     tree = Path(tree).resolve()
     made = []
     for path, hunks in sorted(file_hunks.items()):
-        inserts = paddings(hunks)[0 if side == "base" else 1]
-        if not inserts:
-            continue
         file = tree / path
         text = file.read_bytes().decode(errors="surrogateescape")
+        # Padding with no unchanged line after it aligns nothing, such as
+        # all of an empty file's, so it's left out.
+        lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+        inserts = [(after, count) for after, count in paddings(hunks)[0 if side == "base" else 1] if after < lines]
+        if not inserts:
+            continue
         file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
     return made
@@ -785,16 +788,23 @@ def run_line_checks(items):
 def run_embed_checks(items):
     """Checks that no padded file is embedded in its side's release data, returning the worst exit status.
 
-    Each item is `(title, committed files, {path: committed bytes})`.
-    `include_str!` and `include_bytes!` store a file whole, whatever name
-    they're called by, so finding a padded file's committed bytes in a data
-    section means padding changed embedded data, which the padded
-    comparison can't vouch for.
+    Each item is `(title, committed files, padded files, {path: committed
+    bytes})`. `include_str!` and `include_bytes!` store a file whole,
+    whatever name they're called by. So a padded file whose committed bytes
+    appear more often in the committed build's data sections than in the
+    padded build's is embedded, and padding changed that data, which the
+    padded comparison can't vouch for. Counting both builds keeps a short
+    file's text that happens to appear elsewhere in data from counting.
     """
+
+    def occurrences(files, text):
+        """How often `text` appears in the data sections of `files`."""
+        return sum(section.count(text) for path in files for section in data_sections(path))
+
     status = EXIT_SAME
-    for title, files, padded in items:
-        sections = [section for path in files for section in data_sections(path)]
-        found = sorted(path for path, text in padded.items() if any(text in section for section in sections))
+    for title, committed_files, padded_files, padded in items:
+        found = sorted(path for path, text in padded.items()
+                       if occurrences(committed_files, text) > occurrences(padded_files, text))
         print("%s: %s" % (title, "padded files embedded: " + ", ".join(found) if found else "no padded file embedded"))
         if found:
             status = max(status, EXIT_DIFFERS)
@@ -865,7 +875,8 @@ def main(argv=None):
                                 label = "%s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu)
                                 unpadded = built["unpadded", side, name, cgu][0]
                                 checks.append(("line check " + label, unpadded, built["padded", side, name, cgu][0]))
-                                embeds.append(("embed check " + label, unpadded, committed))
+                                embeds.append(("embed check " + label, unpadded,
+                                               built["padded", side, name, cgu][0], committed))
             padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
             status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
             return max(status, run_line_checks(checks), run_embed_checks(embeds))

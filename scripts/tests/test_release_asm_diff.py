@@ -356,6 +356,11 @@ class AlignmentTests(unittest.TestCase):
         self.assertNotEqual(where(base, SOURCE[2]), where(head, SOURCE[2]))
         self.assertEqual(where(base, "fn check(x: Option<u8>) -> u8 {"), where(head, "fn check(x: Option<u8>) -> u8 {"))
 
+    def test_an_empty_file_is_not_padded(self):
+        """A file that was empty has no unchanged line to align, so it's left as committed."""
+        _, made = aligned("", "#[cfg(test)]\nmod tests {}\n")
+        self.assertEqual(made, [[], []])
+
     def test_padding_inside_a_literal_is_refused(self):
         """A hunk that ends inside a string, raw string or block comment can't be padded."""
         for opener, closer in (('"', '"'), ('r#"', '"#'), ("/*", "*/")):
@@ -557,6 +562,22 @@ class LineCheckTests(unittest.TestCase):
         status, output = self.run_gate("data")
         self.assertEqual(status, 0, output)
         self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
+
+    def test_a_short_file_whose_text_appears_elsewhere_is_not_an_embed(self):
+        """A padded file's text that both builds' data hold, by coincidence, isn't counted as embedded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {}
+            for name, data in (("committed", b"..mod a;\n.."), ("padded", b"..mod a;\n..")):
+                path = Path(tmp) / name / "x.o"
+                path.parent.mkdir()
+                path.write_bytes(macho([("__TEXT", "__text", b"code", 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
+                files[name] = [path]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                status = asm_diff.run_embed_checks([
+                    ("embed check", files["committed"], files["padded"], {"a.rs": b"mod a;\n"})])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("no padded file embedded", out.getvalue())
 
     def test_debug_info_size_alone_passes(self):
         """A change that only resizes debug info, which moves later sections' addresses, passes."""

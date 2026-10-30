@@ -112,6 +112,11 @@ struct StateCollector {
     prepared: Vec<Prepared>,
     /// The selected tip's height, as header storage last reported it.
     selected_tip: Option<u32>,
+    /// The target of each applied header target whose common ancestor lay
+    /// below the reported selected tip. Storage applies a weaker side
+    /// branch too, so an apply is a reorg only once a locator reports its
+    /// target as the selected tip.
+    reorg_targets: Vec<StoragePoint>,
     /// Each block request's last progress step, by session and request ID.
     progress: BTreeMap<(u64, u64), RequestProgress>,
     /// The first and the newest body-work epoch block sync's work named.
@@ -605,14 +610,24 @@ impl StateCollector {
                 event: CapacityEvent::Denied,
                 class: CapacityClass::of(class),
             }),
-            StorageResult::Locator { tip, .. } => self.selected_tip = Some(tip.height),
+            StorageResult::Locator { tip, .. } => self.located(tip, hit),
             StorageResult::Applied => self.applied(key, hit),
             _ => {}
         }
     }
 
-    /// Hits the forks an applied header target shows, and moves the
-    /// selected tip to it.
+    /// Moves the selected tip to a locator's `tip`, and hits a header reorg
+    /// if `tip` is a reorg's target.
+    fn located(&mut self, tip: &StoragePoint, hit: &mut dyn FnMut(StateFeature)) {
+        self.selected_tip = Some(tip.height);
+        if let Some(at) = self.reorg_targets.iter().position(|target| target == tip) {
+            self.reorg_targets.remove(at);
+            hit(StateFeature::Fork(Fork::HeaderReorgApplied));
+        }
+    }
+
+    /// Hits the forks an applied header target shows, and keeps its target
+    /// if its common ancestor lies below the selected tip.
     fn applied(&mut self, key: OpKey, hit: &mut dyn FnMut(StateFeature)) {
         let Some(StorageRequest::ApplyHeaderTarget { owner, target, .. }) =
             self.ops.get(&key).map(|op| &op.request)
@@ -629,9 +644,8 @@ impl StateCollector {
             .selected_tip
             .is_some_and(|tip| prepared.ancestor.height < tip)
         {
-            hit(StateFeature::Fork(Fork::HeaderReorgApplied));
+            self.reorg_targets.push(prepared.target.clone());
         }
-        self.selected_tip = Some(prepared.target.height);
     }
 
     /// Hits what became of operation `key`.

@@ -459,7 +459,8 @@ vocabulary! {
         /// request for another.
         WinnerApplied = "winner-applied",
         /// Header storage applied a target whose common ancestor lies below
-        /// the selected tip it last reported: a header reorg.
+        /// the selected tip it last reported, and a later locator reported
+        /// that target as the selected tip: a header reorg.
         HeaderReorgApplied = "header-reorg-applied",
         /// Block storage reset the verified chain onto another branch.
         VerifiedReset = "verified-reset",
@@ -1425,12 +1426,20 @@ pub const REQUIRED: &[RequiredState] = &[
         "M6a and G2a",
         "no storage port acknowledges a cancellation on main",
     ),
-    waiting(
+    collected(
         Family::CompletionCancellation,
         "completion after owner retirement",
-        "G2a",
-        "no witness on main retires a header request while its storage call is \
-         pending; G2a's storage holds keep the call pending across the retirement",
+        &[HEADER_STORAGE],
+        false,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Completion {
+                    timing: Timing::AfterOwnerRetired,
+                    ..
+                }
+            )
+        },
     ),
     collected(
         Family::CompletionCancellation,

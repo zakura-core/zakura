@@ -10,6 +10,7 @@ use std::{
     thread,
 };
 
+use sha2::{Digest, Sha256};
 use zakura_network::zakura::{
     block_sync_streams, observe::HeaderRequestTerminal, v9::RegtestMessage, FrameRejection,
 };
@@ -17,8 +18,8 @@ use zakura_sim::{
     explore::{
         feedback::{Counters, Feature, Feedback, FEATURES, FEEDBACK_VERSION},
         state::{
-            collector, Coverage, Disposition, Family, FrameLabel, Operation, RetireReason, Row,
-            Service, StateFeature, Transition, REQUIRED, SPAN,
+            collector, Coverage, Disposition, Family, Fork as ForkState, FrameLabel, Operation,
+            RetireReason, Row, Service, StateFeature, Transition, REQUIRED, SPAN,
         },
     },
     harness::{
@@ -32,7 +33,8 @@ use zakura_sim::{
             policy::{
                 Allow, Hold as HeaderHold, OpKind, Select as HeaderSelect, Trigger as HeaderTrigger,
             },
-            Chain, Fork, Policy as HeaderPolicy,
+            Chain, ControlAction as HeaderAction, ControlStep as HeaderControl, Fork,
+            Policy as HeaderPolicy,
         },
         header_sync::{Dialer, HeaderWire, MirrorSpec, Storage as HeaderStorage, StorageScenario},
         run_harness,
@@ -40,8 +42,9 @@ use zakura_sim::{
         HarnessError, Subsystem,
     },
     model::Label,
+    observe::{StorageFact, StorageRequest, StorageResult},
     peer::adversary::Act,
-    Checker, MemorySink, Plan, PropertyReport, RecordSink, RunEnd, RunReport,
+    Checker, MemorySink, Observation, Plan, PropertyReport, RecordSink, RunEnd, RunReport,
 };
 
 /// Fresh counters for one run.
@@ -273,6 +276,21 @@ fn the_layout_is_pinned_to_its_version() {
         ]
     );
     assert_eq!(StateFeature::all().len(), 2_590);
+    // Swapping two values inside a vocabulary keeps every size above, and
+    // can keep every pinned index, but moves both values' indices. The
+    // digest of every feature's index pins the whole mapping.
+    let mapping: String = StateFeature::all()
+        .into_iter()
+        .map(|state| format!("{} {state:?}\n", state.feature().index()))
+        .collect();
+    let digest: String = Sha256::digest(mapping)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, "52ca141bc85c3915ae2916864d1338540a00ce5b0a045df9d61e399fbc1c7bbe",
+        "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
+    );
 }
 
 /// The families are the feature table's rows, as the C1 suite manifest's
@@ -520,6 +538,11 @@ fn witnesses() -> Vec<Witness> {
             dropped_locator(),
             plan(),
         ),
+        explicit::<HeaderStorage>(
+            "header storage apply pending at close",
+            apply_pending_at_close(),
+            plan(),
+        ),
         explicit::<HeaderWire>(
             "header wire status burst",
             act_scenario(Act::StatusBurst),
@@ -630,6 +653,64 @@ fn dropped_locator() -> StorageScenario {
     }
 }
 
+/// The node's header applies attributed to `session`.
+fn header_apply(session: u64) -> HeaderSelect {
+    HeaderSelect {
+        kind: Some(OpKind::Apply),
+        session: Some(session),
+        ..HeaderSelect::default()
+    }
+}
+
+/// The node's first apply for `mirror-0`, held until its link has closed
+/// and the relinked session's locator is submitted, then committed, as
+/// `tests/header_node_late.rs`'s `apply_pending_at_close_still_commits`
+/// runs. The close retires the applying request before its apply completes.
+fn apply_pending_at_close() -> StorageScenario {
+    let control = |action, when| HeaderControl {
+        peer: "mirror-0".to_owned(),
+        action,
+        when: Some(when),
+    };
+    StorageScenario {
+        policy: HeaderPolicy {
+            holds: vec![
+                HeaderHold {
+                    select: header_apply(1),
+                    until: HeaderTrigger::All(vec![
+                        HeaderTrigger::Closed("mirror-0".to_owned()),
+                        HeaderTrigger::Submitted(HeaderSelect::nth(OpKind::Locator, 2)),
+                    ]),
+                    then: vec![Allow::Engine],
+                    deadline_ms: Some(20_000),
+                },
+                HeaderHold {
+                    select: header_apply(2),
+                    until: HeaderTrigger::Completed(header_apply(1)),
+                    then: vec![Allow::Engine],
+                    deadline_ms: Some(25_000),
+                },
+            ],
+            ..HeaderPolicy::converging()
+        },
+        controls: vec![
+            control(
+                HeaderAction::Close,
+                HeaderTrigger::Submitted(header_apply(1)),
+            ),
+            control(
+                HeaderAction::Grow { len: 1 },
+                HeaderTrigger::Closed("mirror-0".to_owned()),
+            ),
+            control(
+                HeaderAction::Relink,
+                HeaderTrigger::Grown("mirror-0".to_owned()),
+            ),
+        ],
+        ..StorageScenario::default()
+    }
+}
+
 /// Runs `witness` without and with the collector, checks that the two
 /// record the same trace, and returns the states the collector hit.
 fn states(witness: &Witness) -> BTreeSet<StateFeature> {
@@ -719,5 +800,88 @@ fn every_collected_state_has_a_witness() {
             .filter(|(witness, _)| witness.drawn && harnesses.contains(&witness.harness))
             .any(|(_, states)| states.iter().any(shows));
         assert_eq!(drawn_shown, drawn, "{}: drawn", row.state);
+    }
+}
+
+/// [`competing_mirrors`], with `mirror-0`'s first apply held until
+/// `mirror-1`'s heavier branch has applied. Storage then applies `mirror-0`'s
+/// A5 as a weaker side branch, below the selected tip a locator reported.
+fn weaker_branch_applied_last() -> StorageScenario {
+    StorageScenario {
+        policy: HeaderPolicy {
+            holds: vec![HeaderHold {
+                select: header_apply(1),
+                until: HeaderTrigger::Completed(header_apply(2)),
+                then: vec![Allow::Engine],
+                deadline_ms: Some(20_000),
+            }],
+            ..HeaderPolicy::converging()
+        },
+        ..competing_mirrors()
+    }
+}
+
+/// Whether the node's storage applied a target below the selected tip a
+/// locator last reported: `mirror-0`'s A5 after `mirror-1`'s heavier branch,
+/// whose tip is 7.
+fn weaker_applied_below_tip(report: &RunReport) -> bool {
+    let mut prepared = Vec::new();
+    let mut applies = BTreeMap::new();
+    let mut tip = 0;
+    for entry in report.log.entries() {
+        let Observation::Storage {
+            instance: 0, fact, ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        match fact {
+            StorageFact::Submitted { request, id, .. } => match request {
+                StorageRequest::PrepareHeaderTarget { owner, target, .. } => {
+                    prepared.push((owner.clone(), target.height));
+                }
+                StorageRequest::ApplyHeaderTarget { owner, .. } => {
+                    if let Some((_, height)) = prepared.iter().rev().find(|(by, _)| by == owner) {
+                        applies.insert(*id, *height);
+                    }
+                }
+                _ => {}
+            },
+            StorageFact::Completed { id, result, .. } => match result {
+                StorageResult::Locator { tip: at, .. } => tip = at.height,
+                StorageResult::Applied if applies.get(id) == Some(&5) && tip == 7 => {
+                    return true;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Storage returns `Applied` for a weaker side branch too, so an apply
+/// below the reported tip is no reorg until a locator reports its target
+/// as the selected tip.
+#[test]
+fn a_weaker_side_branch_applied_is_no_reorg() {
+    for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
+        let witness = explicit::<HeaderStorage>(
+            &format!("header storage weaker branch applied last {index}"),
+            weaker_branch_applied_last(),
+            plan,
+        );
+        let report = (witness.run)(&mut MemorySink::default(), None);
+        assert!(
+            weaker_applied_below_tip(&report),
+            "{}: storage applied no weaker branch below the reported tip",
+            witness.name
+        );
+        let states = states(&witness);
+        assert!(
+            !states.contains(&StateFeature::Fork(ForkState::HeaderReorgApplied)),
+            "{}: {states:?}",
+            witness.name
+        );
     }
 }

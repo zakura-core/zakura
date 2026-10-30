@@ -263,9 +263,18 @@ fn difficulty_time_and_history_tree(
     // > MUST be less than or equal to the median-time-past of that block plus 90 * 60 seconds.
     //
     // We ignore the height as we are checkpointing on Canopy or higher in Mainnet and Testnet.
-    let max_time = median_time_past
-        .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
-        .expect("a valid block time plus a small constant is in-range");
+    let candidate_height = tip_height
+        .next()
+        .ok_or("candidate height exceeds the height range")?;
+    let max_time = if network.is_max_block_time_enforced(candidate_height) {
+        median_time_past
+            .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+            .expect("a valid block time plus a small constant is in-range")
+    } else {
+        // Historical custom-network seeds may resume at the current wall clock.
+        // Header validation independently enforces the absolute future-time bound.
+        DateTime32::from(u32::MAX)
+    };
 
     let cur_time = cur_time.clamp(min_time, max_time);
 
@@ -652,6 +661,42 @@ mod tests {
                     .expect("every advertised timestamp must match the template bits");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn historical_seed_templates_honor_the_configured_time_bound() {
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let activation = Height(3_000_007);
+        let network = Parameters::build()
+            .with_max_block_time_start_height(activation)
+            .to_network()
+            .unwrap();
+        let old_time = DateTime32::from(1_700_000_000);
+        let now = old_time.saturating_add(Duration32::from_seconds(30 * 24 * 3600));
+        let mut header = *block.header;
+        header.time = old_time.to_chrono();
+        for (tip, expected) in [
+            (Height(3_000_000), now),
+            (
+                Height(3_000_006),
+                old_time.saturating_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN)),
+            ),
+        ] {
+            let span = pow_adjustment_block_span_for_height(&network, tip.next().unwrap());
+            let result = difficulty_time_and_history_tree(
+                vec![Arc::new(header.clone()); span],
+                tip,
+                block.hash(),
+                &network,
+                now,
+                Arc::new(HistoryTree::default()),
+                ValueBalance::zero(),
+            )
+            .unwrap();
+            assert_eq!(result.cur_time, expected);
         }
     }
 

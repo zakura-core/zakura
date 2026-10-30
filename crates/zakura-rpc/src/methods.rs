@@ -207,6 +207,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getinfo", RpcAccess::Unauthenticated),
     ("getdeprecationinfo", RpcAccess::Unauthenticated),
     ("getblockchaininfo", RpcAccess::Unauthenticated),
+    ("getnetworkparameters", RpcAccess::Unauthenticated),
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
@@ -360,6 +361,10 @@ pub trait RpcServer {
     /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
+
+    /// Returns the running node's local activation settings for operator verification.
+    #[method(name = "getnetworkparameters")]
+    fn get_network_parameters(&self) -> Result<serde_json::Value>;
 
     /// Returns the total balance of provided `addresses` in a
     /// [`GetAddressBalanceResponse`] instance.
@@ -2089,6 +2094,14 @@ where
     }
 
     #[allow(clippy::unwrap_in_result)]
+    fn get_network_parameters(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "network": self.network.to_string(),
+            "pqP2shActivationHeight": self.network.pq_p2sh_activation_height().map(|h| h.0),
+            "nu7ActivationHeight": NetworkUpgrade::Nu7.activation_height(&self.network).map(|h| h.0),
+        }))
+    }
+
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;

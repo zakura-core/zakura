@@ -739,6 +739,8 @@ impl From<bool> for ConfiguredCheckpoints {
 /// Builder for the [`Parameters`] struct.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParametersBuilder {
+    /// Explicit local PQ activation, absent on public networks.
+    pq_p2sh_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -789,6 +791,7 @@ impl Default for ParametersBuilder {
     /// Creates a [`ParametersBuilder`] with all of the default Testnet parameters except `network_name`.
     fn default() -> Self {
         Self {
+            pq_p2sh_activation_height: None,
             network_name: "UnknownTestnet".to_string(),
             network_magic: magics::TESTNET,
             // # Correctness
@@ -1084,6 +1087,12 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets local PQ activation for a configured Testnet with an isolated identity.
+    pub fn with_pq_p2sh_activation_height(mut self, height: Height) -> Self {
+        self.pq_p2sh_activation_height = Some(height);
+        self
+    }
+
     /// Sets the local activation height for the MTP-plus-90-minutes rule.
     pub fn with_max_block_time_start_height(mut self, height: Height) -> Self {
         self.max_block_time_start_height = Some(height);
@@ -1218,6 +1227,7 @@ impl ParametersBuilder {
             .max_block_time_start_height
             .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
+            pq_p2sh_activation_height,
             network_name,
             network_magic,
             genesis_hash,
@@ -1241,7 +1251,7 @@ impl ParametersBuilder {
         } = self;
         let mut parameters = Parameters {
             network_name,
-            pq_p2sh_activation_height: None,
+            pq_p2sh_activation_height,
             network_magic,
             genesis_hash,
             activation_heights,
@@ -1323,6 +1333,7 @@ impl ParametersBuilder {
             .max_block_time_start_height
             .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
+            pq_p2sh_activation_height: _,
             network_name: _,
             network_magic,
             genesis_hash,
@@ -1348,7 +1359,8 @@ impl ParametersBuilder {
 
         // Compare the height ranges after NU7 moves the inherited ones, so an explicit copy
         // of the built-in ranges is compatible exactly when it matches them.
-        self.activation_heights == activation_heights
+        self.pq_p2sh_activation_height.is_none()
+            && self.activation_heights == activation_heights
             && self.network_magic == network_magic
             && self.genesis_hash == genesis_hash
             && self.slow_start_interval == slow_start_interval
@@ -1759,11 +1771,15 @@ impl Parameters {
 }
 
 impl Network {
-    /// Returns the configured local PQ P2SH activation height, only on Regtest.
-    /// Public networks and ordinary configured Testnets always return `None`.
+    /// Returns the explicit PQ P2SH activation on an isolated local network.
+    /// Public networks always return `None`.
     pub fn pq_p2sh_activation_height(&self) -> Option<Height> {
         match self {
-            Self::Testnet(parameters) if parameters.is_regtest() => {
+            Self::Testnet(parameters)
+                if parameters.is_regtest()
+                    || (parameters.network_magic != magics::TESTNET
+                        && parameters.network_magic != magics::MAINNET) =>
+            {
                 parameters.pq_p2sh_activation_height
             }
             _ => None,

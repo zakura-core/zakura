@@ -257,18 +257,19 @@ mod tests {
         properties: Vec<Property<Owners>>,
         sources: &Sources,
     ) -> (RunReport, Owned) {
-        run_assuming(
+        let (report, view, _) = run_assuming(
             ops,
             steps,
             properties,
             sources,
             Assumptions::none(),
             u64::MAX,
-        )
+        );
+        (report, view)
     }
 
     /// [`run`], with the scenario declaring `assumptions`, under a step
-    /// `budget`.
+    /// `budget`. Also returns the records the run emitted.
     fn run_assuming(
         ops: Vec<(u64, Op)>,
         steps: u64,
@@ -276,7 +277,7 @@ mod tests {
         sources: &Sources,
         assumptions: Assumptions<Owners>,
         budget: u64,
-    ) -> (RunReport, Owned) {
+    ) -> (RunReport, Owned, MemorySink) {
         let view: Owned = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
         let config = RunConfig {
             budget: budget.min(RunConfig::default().budget),
@@ -298,7 +299,9 @@ mod tests {
             assumptions,
             sources,
         );
-        (sim.run(&mut checker, &mut MemorySink::default()), view)
+        let mut sink = MemorySink::default();
+        let report = sim.run(&mut checker, &mut sink);
+        (report, view, sink)
     }
 
     /// The wire tier's sources, with nothing else observed.
@@ -559,7 +562,7 @@ mod tests {
             params: serde_json::Value::Null,
         }])
         .holds_when(unless_two);
-        let (run, view) = run_assuming(ops, 6, vec![assuming], &wire(), declared, u64::MAX);
+        let (run, view, _) = run_assuming(ops, 6, vec![assuming], &wire(), declared, u64::MAX);
         assert_eq!(run.end.harness, None);
         assert_eq!(view.borrow().component(BUDGET).map(Component::seq), Some(5));
         let report = report(&run, "test/require");
@@ -596,7 +599,7 @@ mod tests {
     /// property couldn't read.
     #[test]
     fn an_unfinished_run_is_never_state_unsettled() {
-        let (cut, view) = run_assuming(
+        let (cut, view, _) = run_assuming(
             Vec::new(),
             5,
             vec![requiring()],
@@ -621,7 +624,7 @@ mod tests {
             through: 2,
         }];
         let held_last = reads(current(0..=1, 1).into_iter().chain(held([2])));
-        let (cut, view) = run_assuming(
+        let (cut, view, _) = run_assuming(
             held_last,
             5,
             vec![requiring()],
@@ -643,7 +646,7 @@ mod tests {
                 .chain(held([2]))
                 .chain(current([3], 1)),
         );
-        let (cut, view) = run_assuming(
+        let (cut, view, _) = run_assuming(
             restored,
             5,
             vec![requiring_every()],
@@ -723,7 +726,7 @@ mod tests {
             (3, crate::Outcome::Budget),
         ] {
             let property = needing("test/teardown", check_teardown);
-            let (run, _) = run_assuming(
+            let (run, _, _) = run_assuming(
                 restored(),
                 if budget == u64::MAX { 3 } else { 5 },
                 vec![property],
@@ -766,5 +769,48 @@ mod tests {
             "{} bytes: {encoded:.200}",
             encoded.len()
         );
+    }
+
+    /// A run with a gap writes an end record that reads back equal to the
+    /// one a replay rebuilds, as exact replay compares them, while the run's
+    /// own report keeps the gap.
+    #[test]
+    fn a_gap_survives_the_trace_round_trip() {
+        let ops = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (run, _, sink) = run_assuming(
+            ops,
+            3,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            u64::MAX,
+        );
+        assert_eq!(
+            report(&run, "test/require").gaps.len(),
+            1,
+            "the run has a gap"
+        );
+        let Some(crate::Record::End(end)) = sink.records.last() else {
+            panic!("the run ends with an end record");
+        };
+        let line = crate::Record::End(end.clone()).to_line();
+        let read: serde_json::Value = serde_json::from_str(&line).expect("the line is JSON");
+        let read: crate::record::EndRecord =
+            serde_json::from_value(read["end"].clone()).expect("the end record reads back");
+        assert_eq!(
+            &read, end,
+            "a replay compares the record it rebuilds with this one"
+        );
+        let property = read
+            .properties
+            .iter()
+            .find(|report| report.property == "test/require")
+            .expect("the property is reported");
+        assert_eq!(property.gap_boundaries, [("Budget".to_owned(), 1)].into());
     }
 }

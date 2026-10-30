@@ -55,9 +55,10 @@ suite-macros = ["item_suite", "message_suite", "stream_conformance_suite"]
 features = ["zakura-testkit"]
 timeout-secs = 1800
 
-# Every ignored test in the sources above. CI keeps them out of its
-# blocking path because each takes a minute or more. The suite runs them
-# with `--ignored` and the `planted` profile.
+# Every ignored test in the sources above, and in the child modules a
+# property suite's filter selects. CI keeps them out of its blocking path
+# because each takes a minute or more. The suite runs them with
+# `--ignored`, and a simulator test with the `planted` profile.
 [[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"
 test = "the_decoded_input_stall_input_holds_input_decoded_bound"
@@ -105,6 +106,15 @@ file = "crates/zakura-sim/tests/block_resource_properties.rs"
 test = "lookahead_estimate_to_wire_growth"
 run = true
 timeout-secs = 3600
+
+# Header serving under every default session slot, which full-coverage CI
+# runs with `--run-ignored`. Its 40-session sibling runs in the property
+# suite's row.
+[[ignored]]
+file = "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests/load.rs"
+test = "maximum_sessions_keep_header_serving_bounded"
+run = true
+timeout-secs = 1800
 
 [[ignored]]
 file = "crates/zakura-sim/tests/discovery.rs"
@@ -191,11 +201,15 @@ smoke-secs = 60
 args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
+# RocksDB keeps process-global allocations after each temporary database
+# closes, so the exit-time leak check is off too, as header-fuzz.yml and the
+# package's README say.
 [[target]]
 package = "header-chain"
 name = "recovery_rows"
 smoke-secs = 60
 args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]
+env = ["ASAN_OPTIONS=detect_leaks=0"]
 timeout-secs = 2700
 
 [[excluded-target]]
@@ -259,6 +273,12 @@ plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f
 
 [[pending]]
 id = "header-sync/watch-observed-under-lifecycle-flood"
+kind = "property"
+owner = "P4b"
+plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
+
+[[pending]]
+id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
@@ -383,9 +403,9 @@ kind = "property"
 owner = "P8d"
 plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
 
-# The protocol-state features of campaign.md's generator coverage map. G2a
-# and G2b add the actions that reach them, and E2b collects them as fuzzer
-# feedback.
+# The protocol-state features of the G1–G3 plan's feature table, whose
+# first eight rows campaign.md's generator coverage map repeats. G2a and G2b
+# add the actions that reach them, and E2b collects them as fuzzer feedback.
 [[pending]]
 id = "feature/request-reset"
 kind = "feature"
@@ -430,6 +450,18 @@ plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd47
 
 [[pending]]
 id = "feature/reorg-stage"
+kind = "feature"
+owner = "G2b/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/recovery"
+kind = "feature"
+owner = "G2a/E2b"
+plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+[[pending]]
+id = "feature/teardown"
 kind = "feature"
 owner = "G2b/E2b"
 plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"

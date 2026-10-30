@@ -190,6 +190,59 @@ fn an_ignored_test_the_suite_doesnt_list_fails() {
 }
 
 #[test]
+fn an_ignored_test_in_a_suites_child_module_fails() {
+    let mut suite = committed();
+    remove(&mut suite.ignored, |row| {
+        row.test == "maximum_sessions_keep_header_serving_bounded"
+    });
+    assert_problem(
+        &problems(&suite),
+        "header_sync/v9/publisher/tests/load.rs::maximum_sessions_keep_header_serving_bounded is \
+         ignored",
+    );
+}
+
+#[test]
+fn library_tests_run_by_their_full_path() {
+    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+        panic!("{problems}");
+    });
+    let row = manifest
+        .tests
+        .iter()
+        .find(|row| {
+            row.id
+                .ends_with("/maximum_sessions_keep_header_serving_bounded")
+        })
+        .expect("the suite runs the load test");
+    assert_eq!(
+        row.command,
+        "CARGO_TARGET_DIR=target/suite cargo test --locked -p zakura-network --features \
+         zakura-testkit --lib -- --ignored --exact \
+         zakura::header_sync::v9::publisher::tests::load::maximum_sessions_keep_header_serving_bounded"
+    );
+}
+
+#[test]
+fn a_target_runs_with_its_environment() {
+    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+        panic!("{problems}");
+    });
+    let row = manifest
+        .targets
+        .iter()
+        .find(|row| row.name == "recovery_rows")
+        .expect("the suite runs recovery_rows");
+    assert!(
+        row.command.contains(&format!(
+            "&& ASAN_OPTIONS=detect_leaks=0 cargo +{NIGHTLY} fuzz run"
+        )),
+        "{}",
+        row.command
+    );
+}
+
+#[test]
 fn a_listed_test_that_isnt_ignored_fails() {
     let mut suite = committed();
     let mut row = suite.ignored[0].clone();
@@ -301,4 +354,32 @@ fn suite_writes_the_manifest() {
     assert!(output.status.success(), "{output:?}");
     let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
     assert_eq!(manifest["seed_report"]["seeds"], report["seeds"]);
+}
+
+#[test]
+fn the_manifest_doesnt_depend_on_the_executable() {
+    // A copy with a byte appended runs the same, and has another digest.
+    let dir = TempDir::new().unwrap();
+    let copy = dir.path().join("zakura-sim");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_zakura-sim")).unwrap();
+    bytes.push(0);
+    std::fs::write(&copy, bytes).unwrap();
+    std::fs::set_permissions(&copy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut manifests = Vec::new();
+    for (binary, name) in [
+        (
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_zakura-sim")),
+            "a.json",
+        ),
+        (copy, "b.json"),
+    ] {
+        let out = dir.path().join(name);
+        let output = Command::new(binary)
+            .args(["suite", "--out", out.to_str().unwrap()])
+            .output()
+            .expect("the binary runs");
+        assert!(output.status.success(), "{output:?}");
+        manifests.push(std::fs::read(&out).unwrap());
+    }
+    assert!(manifests[0] == manifests[1], "the two manifests differ");
 }

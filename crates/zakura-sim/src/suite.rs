@@ -32,10 +32,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{
     harness::{
@@ -203,6 +203,10 @@ pub struct Target {
     /// More libFuzzer arguments, such as `-max_len=512`.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Environment variables the run needs, as `NAME=value`, such as
+    /// `ASAN_OPTIONS=detect_leaks=0`.
+    #[serde(default)]
+    pub env: Vec<String>,
     /// The timeout of its row, build included.
     pub timeout_secs: u64,
 }
@@ -359,7 +363,7 @@ pub struct Manifest {
     pub schema: u32,
     /// The generating binary's provenance: commit, dirty flag, source and
     /// lockfile digests, compiler and flags.
-    pub build: BuildInfo,
+    pub build: ManifestBuild,
     /// The SHA-256 of `qa/suite.toml`.
     pub suite_sha256: String,
     /// The SHA-256 of each fuzz package's `Cargo.lock`, by package.
@@ -395,7 +399,51 @@ pub struct Manifest {
     /// One row per ignored test or fuzz target the suite leaves out.
     pub excluded: Vec<ExcludedRow>,
     /// `zakura-sim seeds --report`'s JSON for every committed seed.
-    pub seed_report: Value,
+    pub seed_report: seed::Report,
+}
+
+/// [`BuildInfo`] without `binary`, the generating executable's digest. That
+/// digest changes with the checkout's path and with the build that runs
+/// `suite`, so two runs at one commit would write different manifests.
+#[derive(Clone, Debug, Serialize)]
+pub struct ManifestBuild {
+    /// [`BuildInfo::git`].
+    pub git: String,
+    /// [`BuildInfo::dirty`].
+    pub dirty: bool,
+    /// [`BuildInfo::source`].
+    pub source: String,
+    /// [`BuildInfo::lockfile`].
+    pub lockfile: String,
+    /// [`BuildInfo::rustc`].
+    pub rustc: String,
+    /// [`BuildInfo::target`].
+    pub target: String,
+    /// [`BuildInfo::cfg`].
+    pub cfg: Vec<String>,
+    /// [`BuildInfo::features`].
+    pub features: Vec<String>,
+    /// [`BuildInfo::opt_level`].
+    pub opt_level: String,
+    /// [`BuildInfo::sanitizer`].
+    pub sanitizer: Option<String>,
+}
+
+impl From<BuildInfo> for ManifestBuild {
+    fn from(build: BuildInfo) -> Self {
+        ManifestBuild {
+            git: build.git,
+            dirty: build.dirty,
+            source: build.source,
+            lockfile: build.lockfile,
+            rustc: build.rustc,
+            target: build.target,
+            cfg: build.cfg,
+            features: build.features,
+            opt_level: build.opt_level,
+            sanitizer: build.sanitizer,
+        }
+    }
 }
 
 /// How many rows of each kind.
@@ -757,7 +805,7 @@ impl Builder<'_> {
         }
         Manifest {
             schema: SCHEMA,
-            build: BuildInfo::current(),
+            build: BuildInfo::current().into(),
             suite_sha256,
             fuzz_lockfiles,
             format: FORMAT_VERSION,
@@ -784,9 +832,9 @@ impl Builder<'_> {
     /// leaves out.
     fn tests(&mut self) -> (Vec<TestRow>, Vec<ExcludedRow>) {
         let mut rows = Vec::new();
-        // Every ignored test in the sources the suite runs, as
-        // (file, test).
-        let mut ignored = BTreeSet::new();
+        // Every ignored test in the sources the suite runs, as (file, test),
+        // with whether it sits at its file's top level.
+        let mut ignored = BTreeMap::new();
         for package in &self.suite.sim_package {
             let dir = format!("crates/{}", package.name);
             if !self.root.join(&dir).join("Cargo.toml").is_file() {
@@ -863,7 +911,15 @@ impl Builder<'_> {
                 ));
             }
             for file in files {
+                // The row's filter selects the file's child modules too.
+                let children = match file.strip_suffix("/mod.rs") {
+                    Some(module_dir) => module_dir.to_owned(),
+                    None => file.trim_end_matches(".rs").to_owned(),
+                };
                 ignored.extend(self.ignored_in(&file));
+                for child in self::files(self.root, &children, "rs") {
+                    ignored.extend(self.ignored_in(&child));
+                }
                 let module = module_path(&file, &dir);
                 let features = features(&package.features);
                 let id = self.id(format!("property-suite/{}/{module}", package.name));
@@ -891,15 +947,23 @@ impl Builder<'_> {
                     entry.file, entry.test
                 ));
             }
-            if !ignored.contains(&key) {
+            let Some(&top_level) = ignored.get(&key) else {
                 self.problem(format!(
                     "{SUITE_FILE} lists {}::{}, which isn't an ignored test in the suite's sources",
                     entry.file, entry.test
                 ));
                 continue;
-            }
+            };
             match (entry.run, entry.timeout_secs, &entry.reason) {
                 (true, Some(timeout_secs), None) => {
+                    if !top_level {
+                        self.problem(format!(
+                            "{SUITE_FILE} runs {}::{}, which sits inside a module of its file, \
+                             so the suite can't name its full path",
+                            entry.file, entry.test
+                        ));
+                        continue;
+                    }
                     let Some(selector) = self.test_selector(&entry.file) else {
                         continue;
                     };
@@ -916,8 +980,8 @@ impl Builder<'_> {
                         command: build.command(
                             "test",
                             &format!(
-                                "--locked {} -- --ignored --exact {}",
-                                selector.0, entry.test
+                                "--locked {} -- --ignored --exact {}{}",
+                                selector.0, selector.2, entry.test
                             ),
                         ),
                         timeout_secs,
@@ -939,7 +1003,7 @@ impl Builder<'_> {
                 )),
             }
         }
-        for (file, test) in ignored.difference(&listed) {
+        for (file, test) in ignored.keys().filter(|key| !listed.contains(*key)) {
             self.problem(format!(
                 "{file}::{test} is ignored, and {SUITE_FILE} neither runs nor excludes it"
             ));
@@ -960,12 +1024,13 @@ impl Builder<'_> {
         (rows, excluded)
     }
 
-    /// The ignored tests `file` defines, as (file, test).
-    fn ignored_in(&mut self, file: &str) -> Vec<(String, String)> {
+    /// The ignored tests `file` defines, as (file, test), each with whether
+    /// it sits at the file's top level.
+    fn ignored_in(&mut self, file: &str) -> Vec<((String, String), bool)> {
         match fs::read_to_string(self.root.join(file)) {
             Ok(source) => ignored_tests(&source)
                 .into_iter()
-                .map(|test| (file.to_owned(), test))
+                .map(|(test, top_level)| ((file.to_owned(), test), top_level))
                 .collect(),
             Err(error) => {
                 self.problem(format!("reading {file}: {error}"));
@@ -975,9 +1040,10 @@ impl Builder<'_> {
     }
 
     /// The cargo selector of the test binary or library that holds `file`,
-    /// and the build it needs: a simulator package's test binary, or a
-    /// property package's library.
-    fn test_selector(&mut self, file: &str) -> Option<(String, Build)> {
+    /// the build it needs, and the module path its top-level tests' names
+    /// start with: nothing in a simulator package's test binary, and the
+    /// file's module in a library.
+    fn test_selector(&mut self, file: &str) -> Option<(String, Build, String)> {
         for package in &self.suite.sim_package {
             let dir = format!("crates/{}/", package.name);
             let Some(rest) = file.strip_prefix(&dir) else {
@@ -988,10 +1054,20 @@ impl Builder<'_> {
                 .and_then(|name| name.strip_suffix(".rs"))
                 .filter(|name| !name.contains('/'))
             {
-                return Some((format!("-p {} --test {name}", package.name), Build::Sim));
+                return Some((
+                    format!("-p {} --test {name}", package.name),
+                    Build::Sim,
+                    String::new(),
+                ));
             }
-            if rest.starts_with("src/") {
-                return Some((format!("-p {} --lib", package.name), Build::Sim));
+            // A package whose library doesn't build in the simulator may
+            // still be a property package.
+            if rest.starts_with("src/") && package.lib {
+                return Some((
+                    format!("-p {} --lib", package.name),
+                    Build::Sim,
+                    test_prefix(file, &format!("crates/{}", package.name)),
+                ));
             }
         }
         for package in &self.suite.property_package {
@@ -999,6 +1075,7 @@ impl Builder<'_> {
                 return Some((
                     format!("-p {}{} --lib", package.name, features(&package.features)),
                     Build::Ordinary,
+                    test_prefix(file, &format!("crates/{}", package.name)),
                 ));
             }
         }
@@ -1047,13 +1124,17 @@ impl Builder<'_> {
 
     /// One seed-set row per harness, one row per witness an admitted seed
     /// carries, and the seed report. A rejected seed is a problem.
-    fn seeds(&mut self) -> (Vec<SeedSetRow>, Vec<SeedWitnessRow>, Value) {
+    fn seeds(&mut self) -> (Vec<SeedSetRow>, Vec<SeedWitnessRow>, seed::Report) {
         let fixtures = vec![self.root.join(FIXTURES_DIR)];
         let report = match seed::load(&fixtures, None) {
             Ok(report) => report,
             Err(error) => {
                 self.problem(format!("listing {FIXTURES_DIR}: {error}"));
-                return (Vec::new(), Vec::new(), Value::Null);
+                return (
+                    Vec::new(),
+                    Vec::new(),
+                    seed::SeedReport::default().rows(None, &[]),
+                );
             }
         };
         for failed in &report.rejected {
@@ -1122,8 +1203,7 @@ impl Builder<'_> {
             }
         }
         let rows = report.rows(None, &[PathBuf::from(FIXTURES_DIR)]);
-        let value = serde_json::to_value(&rows).unwrap_or(Value::Null);
-        (sets, witnesses, value)
+        (sets, witnesses, rows)
     }
 
     /// The target rows, the excluded targets' rows, and each fuzz
@@ -1204,13 +1284,16 @@ impl Builder<'_> {
                 args.push(' ');
                 args.push_str(arg);
             }
-            let fuzz = build.command(
+            let mut fuzz = build.command(
                 "fuzz",
                 &format!(
                     "run --fuzz-dir {FUZZ_DIR}/{} {} {EVIDENCE}/corpus -- {args}",
                     target.package, target.name
                 ),
             );
+            if !target.env.is_empty() {
+                fuzz = format!("{} {fuzz}", target.env.join(" "));
+            }
             rows.push(TargetRow {
                 id,
                 expect: Expect::Pass,
@@ -1503,6 +1586,48 @@ impl Builder<'_> {
     }
 }
 
+/// Why `suite --frozen` refuses the manifest of the checkout at `root`
+/// that `build` made, if it does. The build's own dirty flag covers only
+/// its source paths, and the manifest reads `qa/` and the test sources as
+/// they are on disk, so the checkout itself must be clean and at the
+/// build's commit.
+pub fn unfrozen(root: &Path, build: &ManifestBuild) -> Option<String> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+    };
+    let head = git(&["rev-parse", "HEAD"]);
+    let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+    unfrozen_by(build, head.as_deref(), status.as_deref())
+}
+
+/// [`unfrozen`], given `HEAD`'s commit and `git status --porcelain`'s
+/// output, each `None` if git couldn't say.
+pub fn unfrozen_by(
+    build: &ManifestBuild,
+    head: Option<&str>,
+    status: Option<&str>,
+) -> Option<String> {
+    if build.dirty {
+        return Some(format!("the build of {} was dirty", build.git));
+    }
+    match (head.map(str::trim), status.map(str::trim_end)) {
+        (Some(head), _) if head != build.git => Some(format!(
+            "the checkout is at {head}, and the build is of {}",
+            build.git
+        )),
+        (Some(_), Some("")) => None,
+        (Some(_), Some(status)) => Some(format!("the checkout has changes:\n{status}")),
+        _ => Some("git can't say whether the checkout is clean".to_owned()),
+    }
+}
+
 /// A fuzz package's `Cargo.toml`, as far as the manifest reads it.
 #[derive(Deserialize)]
 struct FuzzManifest {
@@ -1580,14 +1705,17 @@ pub fn is_property_suite(source: &str, macros: &[String]) -> bool {
 }
 
 /// The tests in `source` that carry an `#[ignore` attribute: for each
-/// line that starts with one, the next function's name.
-pub fn ignored_tests(source: &str) -> Vec<String> {
-    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+/// line that starts with one, the next function's name, and whether the
+/// attribute is unindented, so the test sits at the file's top level.
+pub fn ignored_tests(source: &str) -> Vec<(String, bool)> {
+    let raw: Vec<&str> = source.lines().collect();
+    let lines: Vec<&str> = raw.iter().map(|line| line.trim()).collect();
     let mut tests = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         if !line.starts_with("#[ignore") {
             continue;
         }
+        let top_level = raw[at].starts_with("#[ignore");
         let name = lines[at + 1..]
             .iter()
             .find_map(|line| {
@@ -1598,10 +1726,20 @@ pub fn ignored_tests(source: &str) -> Vec<String> {
             .and_then(|rest| rest.split(['(', '<']).next())
             .map(str::to_owned);
         if let Some(name) = name {
-            tests.push(name);
+            tests.push((name, top_level));
         }
     }
     tests
+}
+
+/// What the full name of a test at the top level of `file`, in the library
+/// at `dir`, starts with: its module path and `::`, or nothing in the
+/// crate's root.
+fn test_prefix(file: &str, dir: &str) -> String {
+    match module_path(file, dir) {
+        module if module.is_empty() => module,
+        module => format!("{module}::"),
+    }
 }
 
 /// The module path of `file` in the library at `dir`, such as
@@ -1704,7 +1842,12 @@ mod tests {
         let source = "#[test]\nfn plain() {}\n\n#[test]\n#[ignore = \"slow\"]\n\
                       /// Docs.\nfn slow() {}\n#[ignore]\n#[tokio::test]\nasync fn \
                       later() {}\nlet s = \"#[ignore]\";\n";
-        assert_eq!(ignored_tests(source), ["slow", "later"]);
+        assert_eq!(
+            ignored_tests(source),
+            [("slow".to_owned(), true), ("later".to_owned(), true)]
+        );
+        let nested = "mod tests {\n    #[test]\n    #[ignore]\n    fn inner() {}\n}\n";
+        assert_eq!(ignored_tests(nested), [("inner".to_owned(), false)]);
     }
 
     /// A suite is a `proptest!` block or a suite macro's call, in code.
@@ -1725,6 +1868,31 @@ mod tests {
             &macros
         ));
         assert!(!is_property_suite("#[test]\nfn plain() {}", &macros));
+    }
+
+    /// `--frozen` needs a clean build, and a clean checkout at its commit.
+    #[test]
+    fn frozen_needs_a_clean_checkout_at_the_builds_commit() {
+        let mut build = ManifestBuild::from(BuildInfo::current());
+        build.git = "abc".to_owned();
+        build.dirty = false;
+        assert_eq!(unfrozen_by(&build, Some("abc\n"), Some("")), None);
+        for (head, status, why) in [
+            (Some("abd"), Some(""), "the checkout is at abd"),
+            (Some("abc"), Some(" M qa/suite.toml\n"), "M qa/suite.toml"),
+            (
+                Some("abc"),
+                Some("?? qa/planted/x/y.patch\n"),
+                "?? qa/planted",
+            ),
+            (None, Some(""), "git can't say"),
+            (Some("abc"), None, "git can't say"),
+        ] {
+            let problem = unfrozen_by(&build, head, status).unwrap_or_default();
+            assert!(problem.contains(why), "{problem}");
+        }
+        build.dirty = true;
+        assert!(unfrozen_by(&build, Some("abc"), Some("")).is_some());
     }
 
     /// File paths become module paths.

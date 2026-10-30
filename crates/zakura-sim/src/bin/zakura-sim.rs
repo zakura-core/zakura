@@ -110,7 +110,8 @@ mod cli {
              registry, the coverage manifest, the planted cases, the seeds, the fuzz\n\
              targets and the test sources, and prints its counts. --out writes it as\n\
              JSON. It exits 1 and lists every problem if the manifest doesn't cover the\n\
-             suite, and with --frozen also if the build's checkout was dirty.\n\n\
+             suite, and with --frozen also if the build or the checkout is dirty, or\n\
+             the checkout isn't at the build's commit.\n\n\
              Harnesses:\n",
         );
         for entry in HARNESSES {
@@ -596,8 +597,8 @@ mod cli {
 
     /// `suite`: builds the full-suite manifest, prints its counts, and
     /// writes it where `--out` says. Fails with every problem if the
-    /// manifest doesn't cover the suite, or with `--frozen` if the checkout
-    /// the binary was built from was dirty.
+    /// manifest doesn't cover the suite, or with `--frozen` if the build or
+    /// the checkout is dirty, or the checkout isn't at the build's commit.
     #[allow(clippy::print_stdout)]
     fn suite(args: Vec<String>) -> Result<(), Error> {
         let mut out = None;
@@ -616,16 +617,19 @@ mod cli {
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             }
         }
-        let manifest = suite::manifest(&seed::repo_root()).map_err(|problems| {
+        let root = seed::repo_root();
+        let manifest = suite::manifest(&root).map_err(|problems| {
             Error::Failed(format!(
                 "{} problems keep the manifest from covering the suite:\n{problems}",
                 problems.0.len()
             ))
         })?;
-        if frozen && manifest.build.dirty {
+        if let Some(why) = frozen
+            .then(|| suite::unfrozen(&root, &manifest.build))
+            .flatten()
+        {
             return Err(Error::Failed(format!(
-                "--frozen needs a clean checkout, and the build of {} was dirty",
-                manifest.build.git
+                "--frozen needs a clean checkout at the build's commit: {why}"
             )));
         }
         let counts = serde_json::to_string_pretty(&manifest.counts)

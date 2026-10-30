@@ -381,13 +381,13 @@ impl SeedReport {
 /// [`SeedReport`] as `zakura-sim seeds --report` writes it, and as the
 /// suite manifest embeds it: one row per seed.
 #[derive(Clone, Debug, Serialize)]
-pub struct Report<'a> {
+pub struct Report {
     /// The harness the report is limited to, if any.
-    pub harness: Option<&'a str>,
+    pub harness: Option<String>,
     /// The fixture directories read.
     pub fixtures: Vec<PathBuf>,
     /// Every seed, admitted ones first.
-    pub seeds: Vec<ReportRow<'a>>,
+    pub seeds: Vec<ReportRow>,
     /// [`SeedReport::other_harnesses`].
     pub other_harnesses: usize,
 }
@@ -395,13 +395,13 @@ pub struct Report<'a> {
 /// One seed in a [`Report`]: its status, its sidecar if it parsed, and
 /// either its full input's digest or its reason.
 #[derive(Clone, Debug, Serialize)]
-pub struct ReportRow<'a> {
+pub struct ReportRow {
     /// The seed's file.
     pub file: PathBuf,
     /// `admitted`, `quarantined` or `rejected`.
     pub status: &'static str,
     /// The sidecar, if it parsed.
-    pub sidecar: Option<&'a Sidecar>,
+    pub sidecar: Option<Sidecar>,
     /// The full fuzz input's SHA-256, for an admitted seed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
@@ -414,13 +414,13 @@ impl SeedReport {
     /// The report's rows, for `harness` and the `fixtures` read. It gives
     /// paths in the repository relative to the repository's root, so it
     /// doesn't depend on where the checkout is.
-    pub fn rows<'a>(&'a self, harness: Option<&'a str>, fixtures: &[PathBuf]) -> Report<'a> {
+    pub fn rows(&self, harness: Option<&str>, fixtures: &[PathBuf]) -> Report {
         let mut seeds = Vec::new();
         for seed in &self.admitted {
             seeds.push(ReportRow {
                 file: from_root(&seed.path),
                 status: "admitted",
-                sidecar: Some(&seed.sidecar),
+                sidecar: Some(seed.sidecar.clone()),
                 input_sha256: Some(seed.input_sha256()),
                 reason: None,
             });
@@ -434,13 +434,13 @@ impl SeedReport {
             seeds.push(ReportRow {
                 file: from_root(&failed.path),
                 status,
-                sidecar: failed.sidecar.as_ref(),
+                sidecar: failed.sidecar.clone(),
                 input_sha256: None,
                 reason: Some(failed.error.to_string()),
             });
         }
         Report {
-            harness,
+            harness: harness.map(str::to_owned),
             fixtures: fixtures.iter().map(|dir| from_root(dir)).collect(),
             seeds,
             other_harnesses: self.other_harnesses,

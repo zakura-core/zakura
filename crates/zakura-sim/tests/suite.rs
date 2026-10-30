@@ -11,8 +11,8 @@ use zakura_sim::{
     harness::{coverage::COVERAGE, HARNESSES},
     seed,
     suite::{
-        self, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage, SuiteFile, Target,
-        NIGHTLY, SUITE_FILE,
+        self, ExcludedTarget, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage,
+        SuiteFile, Target, NIGHTLY, SUITE_FILE,
     },
 };
 
@@ -293,6 +293,25 @@ fn a_simulator_target_without_a_registered_harness_fails() {
 }
 
 #[test]
+fn an_excluded_simulator_target_needs_no_harness() {
+    let dir = scratch();
+    let mut suite = scratch_suite(None, &[]);
+    suite.target.retain(|target| target.name != "unmapped");
+    suite.excluded_target.push(ExcludedTarget {
+        package: "sim".to_owned(),
+        name: "unmapped".to_owned(),
+        reason: "runs no harness".to_owned(),
+    });
+    let problems = problems_at(dir.path(), &suite);
+    assert!(
+        !problems
+            .iter()
+            .any(|problem| problem.contains("`unmapped`")),
+        "{problems:?}"
+    );
+}
+
+#[test]
 fn a_target_row_cant_name_its_harness() {
     let error = toml::from_str::<SuiteFile>(
         "schema = 1\nplanted-timeout-secs = 1\nseed-timeout-secs = 1\n\n[[target]]\n\
@@ -364,6 +383,23 @@ fn an_unmapped_fuzz_target_fails() {
     assert_problem(
         &problems,
         "qa/fuzz/header-chain defines the target `header_pursuit`",
+    );
+}
+
+#[test]
+fn a_simulator_target_neither_excluded_nor_mapped_fails() {
+    let dir = scratch();
+    let mut suite = scratch_suite(None, &[]);
+    suite.target.retain(|target| target.name != "unmapped");
+    let problems = problems_at(dir.path(), &suite);
+    assert_problem(
+        &problems,
+        "qa/fuzz/sim defines the target `unmapped`, and qa/suite.toml neither maps nor excludes it",
+    );
+    assert_problem(
+        &problems,
+        "qa/fuzz/sim defines the target `unmapped`, and its \
+         `[package.metadata.zakura-sim.targets]` table maps it to no harness",
     );
 }
 

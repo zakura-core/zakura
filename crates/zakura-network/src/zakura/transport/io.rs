@@ -324,6 +324,8 @@ impl FramedSend {
                 sender,
                 #[cfg(any(test, zakura_sim))]
                 tap: self.tap.as_ref(),
+                #[cfg(any(test, zakura_sim))]
+                attempt: None,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(()) => GuardedReserveError::Full,
@@ -346,6 +348,8 @@ impl FramedSend {
                 sender,
                 #[cfg(any(test, zakura_sim))]
                 tap: self.tap.as_ref(),
+                #[cfg(any(test, zakura_sim))]
+                attempt: None,
             })
             .map_err(|_| GuardedReserveError::Closed)
     }
@@ -391,6 +395,10 @@ pub(crate) struct GuardedFrameSlot<'a> {
     /// The queue's tap, as [`FramedSend::allocate`] uses it.
     #[cfg(any(test, zakura_sim))]
     tap: Option<&'a Arc<super::StreamTap>>,
+    /// What the producer meant the frame this slot sends to be, from
+    /// [`Self::attempting`].
+    #[cfg(any(test, zakura_sim))]
+    attempt: Option<super::FrameSummary>,
 }
 
 impl GuardedFrameSlot<'_> {
@@ -404,8 +412,18 @@ impl GuardedFrameSlot<'_> {
     /// slot, with a new [`OutputLife`] if the queue is tapped.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
-        let life = self.tap.map(|tap| OutputLife::new(tap, &frame));
+        let life = self.allocate(&frame);
         self.send_with_life(frame, guard, life);
+    }
+
+    /// Records what the producer meant the frame this slot sends to be
+    /// (M6a-6). The slot reports it as the frame's `OutputAttempt`, right
+    /// after the frame's life is made. The producer calls it where it built
+    /// the frame, from its own state.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn attempting(mut self, attempt: Option<super::FrameSummary>) -> Self {
+        self.attempt = attempt;
+        self
     }
 
     /// [`Self::send`] with the `life` its caller made when it built
@@ -444,10 +462,15 @@ impl GuardedFrameSlot<'_> {
     }
 
     /// The life of `frame`, an output about to be sent through this slot, if
-    /// the queue is tapped. It reports `OutputAllocated` now.
+    /// the queue is tapped. It reports `OutputAllocated` now, then the
+    /// producer's attempt, if [`Self::attempting`] recorded one.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn allocate(&self, frame: &Frame) -> Option<OutputLife> {
-        self.tap.map(|tap| OutputLife::new(tap, frame))
+        let life = self.tap.map(|tap| OutputLife::new(tap, frame))?;
+        if let Some(attempt) = self.attempt {
+            life.attempt(attempt);
+        }
+        Some(life)
     }
 
     /// [`Self::send_request`] with the `life` its caller made before it
@@ -489,6 +512,14 @@ impl ResponseFrameSlot<'_> {
     pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
         self.slot
             .send(frame, FrameGuard::new(Arc::new((guard, self.response))));
+    }
+
+    /// Records the producer's attempt for the frame this slot sends (see
+    /// [`GuardedFrameSlot::attempting`]).
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn attempting(mut self, attempt: Option<super::FrameSummary>) -> Self {
+        self.slot = self.slot.attempting(attempt);
+        self
     }
 }
 
@@ -792,6 +823,11 @@ impl OutputLife {
     /// The output's number on its stream.
     pub(crate) fn output(&self) -> u64 {
         self.0.output
+    }
+
+    /// Reports the producer's `attempt` for this output.
+    pub(crate) fn attempt(&self, attempt: super::FrameSummary) {
+        self.0.tap.output_attempt(self.0.output, attempt);
     }
 
     /// A handle that can mark the output enqueued, and writes no terminal.

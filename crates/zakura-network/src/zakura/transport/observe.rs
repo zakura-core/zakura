@@ -159,6 +159,21 @@ pub enum TransportEvent {
         /// [`frame_fingerprint`] of the frame the writer is writing, which
         /// it computes itself.
         fingerprint: u64,
+        /// The writer's own decoded summary of that frame, on a stream whose
+        /// service installed a summarizer (M6a-6). Header sync does.
+        summary: Option<FrameSummary>,
+    },
+    /// The producer of `output` reported what it meant the frame to be,
+    /// where it built it and before it queued it (M6a-6).
+    OutputAttempt {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// What the producer meant to send, from its own state.
+        attempt: FrameSummary,
     },
     /// A producer made an output: a frame it is about to queue on the
     /// stream, before any wait (M6a-6). Outputs count from 0 per stream.
@@ -357,6 +372,67 @@ pub enum Unwritten {
     Failed,
 }
 
+/// Which producer made a header-sync frame, in a [`FrameSummary`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Producer {
+    /// The cadence's `Status`.
+    Status,
+    /// The subscriber's `Open`.
+    Open,
+    /// The subscriber's `Grant`.
+    Grant,
+    /// The subscriber's `Close`.
+    Close,
+    /// The publisher's page.
+    Page,
+    /// The publisher's terminal outcome.
+    Terminal,
+}
+
+/// What one header-sync frame says, in the fields the output ledger checks
+/// (M6a-6). A producer reports it from its own state in
+/// [`TransportEvent::OutputAttempt`], and the writer decodes it from the
+/// frame it writes, in [`TransportEvent::FrameWriteStarted`].
+///
+/// A page carries its own object count, payload bytes and last frontier,
+/// never its subscription's running totals. An update carries the credit it
+/// adds and the full cursor it acknowledges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameSummary {
+    /// Which producer's frame it is, by message type and operation.
+    pub producer: Producer,
+    /// The subscription it names, if any.
+    pub subscription: Option<u64>,
+    /// The frame's flags.
+    pub flags: u16,
+    /// A page's headers, or the header credit an update adds.
+    pub objects: u64,
+    /// A page's payload bytes, or the byte credit an update adds.
+    pub bytes: u64,
+    /// A page's last frontier, or the cursor an update acknowledges.
+    pub cursor: Option<SummaryCursor>,
+}
+
+/// A cursor or frontier in a [`FrameSummary`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SummaryCursor {
+    /// The height.
+    pub height: u32,
+    /// The block hash, in its internal byte order.
+    pub hash: [u8; 32],
+    /// The header credit an acknowledged cursor consumed. `None` for a
+    /// page's frontier.
+    pub headers: Option<u64>,
+    /// The byte credit an acknowledged cursor consumed. `None` for a page's
+    /// frontier.
+    pub bytes: Option<u64>,
+}
+
+/// Decodes a frame into its [`FrameSummary`], or `None` for one it can't
+/// decode.
+pub type Summarizer = fn(&super::Frame) -> Option<FrameSummary>;
+
 /// A fingerprint of `frame`'s message type, flags and payload: the first 8
 /// bytes of their BLAKE2b hash, little endian (M6a-6). The node computes it
 /// where it queues a frame and again where it writes it, and a simulated
@@ -492,6 +568,9 @@ pub(crate) struct StreamTap {
     /// 1 once the service takes each frame's tag. Until then the reader
     /// queues none, so a stream nobody tags never grows its queue.
     tagged: AtomicU64,
+    /// How the writer decodes each frame's summary, once the stream's service
+    /// installs it (M6a-6).
+    summarizer: OnceLock<Summarizer>,
     /// Tags of frames the reader queued for the service, oldest first.
     queued: Mutex<VecDeque<u64>>,
     /// The tag of the frame the service took last.
@@ -510,6 +589,7 @@ impl StreamTap {
             next_output: AtomicU64::new(0),
             next_order: AtomicU64::new(0),
             tagged: AtomicU64::new(0),
+            summarizer: OnceLock::new(),
             queued: Mutex::new(VecDeque::new()),
             serving: Mutex::new(None),
         }
@@ -589,15 +669,27 @@ impl StreamTap {
         *lock(&self.serving)
     }
 
+    /// Has the writer decode each frame it writes with `summarizer`. The
+    /// stream's service installs it once, before it queues a frame.
+    pub(crate) fn summarize_with(&self, summarizer: Summarizer) {
+        let _ = self.summarizer.set(summarizer);
+    }
+
     /// Reports `FrameWriteStarted` for the next write, as `output` with the
-    /// writer's own `fingerprint`, and returns its sequence number.
+    /// writer's own `fingerprint` and its summary of `encoded`, the frame's
+    /// encoded header and payload, and returns its sequence number.
     pub(crate) fn write_started(
         &self,
         message_type: u16,
         output: Option<u64>,
         fingerprint: u64,
+        encoded: &[u8],
     ) -> u64 {
         let seq = self.next_write.fetch_add(1, Ordering::AcqRel);
+        let summary = self
+            .summarizer
+            .get()
+            .and_then(|summarize| summarize(&super::Frame::decode(encoded, u32::MAX).ok()?));
         self.conn.emit(TransportEvent::FrameWriteStarted {
             conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
@@ -605,8 +697,19 @@ impl StreamTap {
             message_type,
             output,
             fingerprint,
+            summary,
         });
         seq
+    }
+
+    /// Reports `OutputAttempt` for `output` with `attempt`.
+    pub(crate) fn output_attempt(&self, output: u64, attempt: FrameSummary) {
+        self.conn.emit(TransportEvent::OutputAttempt {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            output,
+            attempt,
+        });
     }
 
     /// Reports `OutputAllocated` for the next output, `frame`, and returns

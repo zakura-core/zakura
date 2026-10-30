@@ -33,14 +33,33 @@
 //!   write, so skipped obsolete claims never shift the mapping. Its
 //!   fingerprint must equal the output's.
 //!
+//! - **Attempts.** A producer reports what it meant each frame to be, from
+//!   its own state, as the output's `output-attempt`, before the frame is
+//!   queued. Every started write of a producer-owned message type
+//!   (`Status`, `SubscribeHeaders`, `Headers`, `HeadersOutcome`) on a
+//!   header stream needs one, or it's output without an attempt. The
+//!   writer's decoded summary of the frame must equal the attempt, flags
+//!   included, and so must the summary of the frame a peer read, decoded
+//!   here. A page's summary is its own count, bytes and last frontier, so
+//!   two pages never compare by running totals.
+//!
 //! Enqueue order is a simulator contract: only there does nothing run
 //! between an insert and its `output-enqueued`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use zakura_network::zakura::{frame_fingerprint, Frame};
+use zakura_network::zakura::{
+    frame_fingerprint, v9::summary::regtest_frame_summary, Frame, ZAKURA_STREAM_HEADER_SYNC,
+};
 
-use crate::observe::{OutputEnd, TransportFact};
+use crate::{
+    harness::wire_node::summary_fact,
+    observe::{FrameSummaryFact, OutputEnd, TransportFact},
+};
+
+/// The version 9 message types a header-sync producer owns: `Status`,
+/// `SubscribeHeaders`, `Headers` and `HeadersOutcome`.
+const PRODUCER_OWNED: [u16; 4] = [1, 2, 3, 4];
 
 /// A header stream, by connection and QUIC stream.
 type StreamKey = (u64, u64);
@@ -49,6 +68,8 @@ type StreamKey = (u64, u64);
 #[derive(Debug, Default)]
 pub(crate) struct OutputLedger {
     streams: BTreeMap<StreamKey, Outputs>,
+    /// The header-sync streams, whose producer-owned frames need attempts.
+    header: BTreeSet<StreamKey>,
 }
 
 /// One stream's outputs.
@@ -74,6 +95,10 @@ struct Outputs {
 struct Output {
     /// The fingerprint of its frame as the producer queued it.
     expected: u64,
+    /// The frame's message type.
+    message_type: u16,
+    /// What its producer meant it to be.
+    attempt: Option<FrameSummaryFact>,
     enqueued: bool,
     dequeued: bool,
     /// The write `seq` its write started as.
@@ -96,11 +121,83 @@ impl OutputLedger {
                 "OutputLedger: on connection {connection}'s stream {quic_stream}, {what}"
             ))
         };
+        match event {
+            TransportFact::Admitted {
+                quic_stream, kind, ..
+            } if *kind == ZAKURA_STREAM_HEADER_SYNC => {
+                self.header.insert((connection, *quic_stream));
+            }
+            TransportFact::OutputAttempt {
+                quic_stream,
+                output,
+                attempt,
+            } => {
+                let stream = self.streams.entry((connection, *quic_stream)).or_default();
+                let life = match stream.live(*output) {
+                    Ok(life) => life,
+                    Err(why) => return fail(*quic_stream, format!("{why} reported an attempt")),
+                };
+                if life.attempt.is_some() || life.enqueued {
+                    return fail(
+                        *quic_stream,
+                        format!(
+                            "output {output} reported an attempt {}",
+                            if life.enqueued {
+                                "after it was enqueued"
+                            } else {
+                                "a second time"
+                            }
+                        ),
+                    );
+                }
+                life.attempt = Some(attempt.clone());
+            }
+            TransportFact::FrameWriteStarted {
+                quic_stream,
+                seq,
+                output: Some(output),
+                summary,
+                ..
+            } => {
+                if let Some(life) = self
+                    .streams
+                    .get(&(connection, *quic_stream))
+                    .and_then(|stream| stream.outputs.get(output))
+                {
+                    let owned = self.header.contains(&(connection, *quic_stream))
+                        && PRODUCER_OWNED.contains(&life.message_type);
+                    match (&life.attempt, summary) {
+                        (None, _) if owned => {
+                            return fail(
+                                *quic_stream,
+                                format!(
+                                    "output {output}, type {}, started write {seq} with no attempt: output \
+                                     without attempt",
+                                    life.message_type
+                                ),
+                            )
+                        }
+                        (Some(attempt), summary) if summary.as_ref() != Some(attempt) => {
+                            return fail(
+                                *quic_stream,
+                                format!(
+                                    "the writer started output {output} as write {seq} saying {summary:?}, \
+                                     and its producer attempted {attempt:?}"
+                                ),
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
         match *event {
             TransportFact::OutputAllocated {
                 quic_stream,
                 output,
                 expected,
+                message_type,
                 ..
             } => {
                 let stream = self.streams.entry((connection, quic_stream)).or_default();
@@ -118,6 +215,8 @@ impl OutputLedger {
                     output,
                     Output {
                         expected,
+                        message_type,
+                        attempt: None,
                         enqueued: false,
                         dequeued: false,
                         started: None,
@@ -325,6 +424,17 @@ impl OutputLedger {
                 life.expected
             ));
         }
+        if let Some(attempt) = &life.attempt {
+            // The header harnesses run on Regtest.
+            let read = regtest_frame_summary(frame).map(summary_fact).transpose()?;
+            if read.as_ref() != Some(attempt) {
+                return Err(format!(
+                    "OutputLedger: a peer read the node's write {seq} on connection \
+                     {connection}'s stream {quic_stream} saying {read:?}, and its output \
+                     {output}'s producer attempted {attempt:?}"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -389,6 +499,7 @@ mod tests {
             message_type: frame.message_type,
             output: Some(output),
             fingerprint: frame_fingerprint(frame),
+            summary: None,
         }
     }
 
@@ -558,5 +669,187 @@ mod tests {
         assert!(why.contains("was queued as"), "{why}");
         let why = ledger.received(CONN, STREAM, 1, &a).unwrap_err();
         assert!(why.contains("which no output started"), "{why}");
+    }
+
+    /// An admitted header stream, so its producer-owned frames need
+    /// attempts.
+    fn header_stream() -> TransportFact {
+        TransportFact::Admitted {
+            quic_stream: STREAM,
+            kind: ZAKURA_STREAM_HEADER_SYNC,
+            version: 9,
+            session_id: 7,
+            limits: crate::observe::TransportLimits {
+                max_frame_bytes: 1,
+                max_message_bytes: 1,
+                max_open_streams: 1,
+                max_inbound_queue_depth: 1,
+                idle_timeout_ms: 1,
+                prelude_timeout_ms: 1,
+                control_timeout_ms: 1,
+                stream_open_rate_per_second: 1,
+                message_rate_per_second: 1,
+            },
+            inbound_depth: 1,
+            outbound_depth: 1,
+        }
+    }
+
+    /// A Regtest `Status` frame, a producer-owned type.
+    fn status_frame() -> Frame {
+        use zakura_chain::block;
+        use zakura_network::zakura::{v9, wire_codec::encode_frame};
+        encode_frame(&v9::RegtestMessage::Status(v9::Status {
+            work_anchor_height: block::Height(0),
+            work_anchor_hash: block::Hash([1; 32]),
+            selected_tip_height: block::Height(0),
+            selected_tip_hash: block::Hash([2; 32]),
+            suffix_cumulative_work: Default::default(),
+            oldest_retained_height: block::Height(0),
+            max_headers_per_response: 1,
+            max_subscriptions: 1,
+            max_message_bytes: 1 << 20,
+            tree_aux_schema_mask: 0,
+        }))
+        .expect("the status encodes")
+    }
+
+    /// A summary fact for `producer` on `subscription`.
+    fn summary(producer: &str, subscription: Option<u64>) -> FrameSummaryFact {
+        FrameSummaryFact {
+            producer: producer.to_owned(),
+            subscription,
+            flags: 0,
+            objects: 0,
+            bytes: 0,
+            cursor: None,
+        }
+    }
+
+    fn attempt(output: u64, attempt: FrameSummaryFact) -> TransportFact {
+        TransportFact::OutputAttempt {
+            quic_stream: STREAM,
+            output,
+            attempt,
+        }
+    }
+
+    /// `started` with the writer's `summary`.
+    fn started_saying(
+        seq: u64,
+        output: u64,
+        frame: &Frame,
+        summary: Option<FrameSummaryFact>,
+    ) -> TransportFact {
+        let TransportFact::FrameWriteStarted {
+            quic_stream,
+            message_type,
+            fingerprint,
+            ..
+        } = started(seq, output, frame)
+        else {
+            unreachable!("`started` builds a write start")
+        };
+        TransportFact::FrameWriteStarted {
+            quic_stream,
+            seq,
+            message_type,
+            output: Some(output),
+            fingerprint,
+            summary,
+        }
+    }
+
+    /// A producer-owned frame on a header stream whose producer reported
+    /// no attempt is output without attempt, and the same frame with its
+    /// attempt passes.
+    ///
+    /// This fails if attempts are required only of outputs that have one.
+    #[test]
+    fn a_started_frame_needs_its_attempt() {
+        let status = status_frame();
+        let mut ledger = OutputLedger::default();
+        feed(
+            &mut ledger,
+            &[
+                header_stream(),
+                allocated(0, &status),
+                enqueued(0, 0),
+                dequeued(0),
+            ],
+        )
+        .unwrap();
+        let why = feed(
+            &mut ledger,
+            &[started_saying(0, 0, &status, Some(summary("status", None)))],
+        )
+        .unwrap_err();
+        assert!(why.contains("output without attempt"), "{why}");
+
+        let mut ledger = OutputLedger::default();
+        feed(
+            &mut ledger,
+            &[
+                header_stream(),
+                allocated(0, &status),
+                attempt(0, summary("status", None)),
+                enqueued(0, 0),
+                dequeued(0),
+                started_saying(0, 0, &status, Some(summary("status", None))),
+            ],
+        )
+        .unwrap();
+        ledger.received(CONN, STREAM, 0, &status).unwrap();
+    }
+
+    /// The writer's summary and the frame a peer read are each checked
+    /// against the attempt, fields and flags included: a write saying
+    /// subscription 2 where the producer attempted 1, a write with flags
+    /// set, and a receipt that decodes to another producer's frame.
+    ///
+    /// This fails if only the fingerprint is compared.
+    #[test]
+    fn a_wrong_frame_disagrees_with_its_attempt() {
+        let status = status_frame();
+        let lived = |attempted: FrameSummaryFact| {
+            vec![
+                header_stream(),
+                allocated(0, &status),
+                attempt(0, attempted),
+                enqueued(0, 0),
+                dequeued(0),
+            ]
+        };
+        for (attempted, said) in [
+            (summary("page", Some(1)), Some(summary("page", Some(2)))),
+            (
+                summary("status", None),
+                Some(FrameSummaryFact {
+                    flags: 1,
+                    ..summary("status", None)
+                }),
+            ),
+            (summary("status", None), None),
+        ] {
+            let mut ledger = OutputLedger::default();
+            feed(&mut ledger, &lived(attempted)).unwrap();
+            let why = feed(&mut ledger, &[started_saying(0, 0, &status, said)]).unwrap_err();
+            assert!(why.contains("its producer attempted"), "{why}");
+        }
+
+        let mut ledger = OutputLedger::default();
+        feed(&mut ledger, &lived(summary("open", Some(1)))).unwrap();
+        feed(
+            &mut ledger,
+            &[started_saying(
+                0,
+                0,
+                &status,
+                Some(summary("open", Some(1))),
+            )],
+        )
+        .unwrap();
+        let why = ledger.received(CONN, STREAM, 0, &status).unwrap_err();
+        assert!(why.contains("producer attempted"), "{why}");
     }
 }

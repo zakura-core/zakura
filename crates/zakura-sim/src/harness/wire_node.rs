@@ -33,10 +33,10 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        HeaderCheck, HeaderSyncService, OutputOutcome, Service, ServiceRegistry, Transition,
-        TransportEvent, TransportObserver, Unwritten, ZakuraConnectionLimits, ZakuraEndpoint,
-        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle,
-        ZakuraTrace,
+        FrameSummary, HeaderCheck, HeaderSyncService, OutputOutcome, Producer, Service,
+        ServiceRegistry, Transition, TransportEvent, TransportObserver, Unwritten,
+        ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
+        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
     },
     Config,
 };
@@ -54,7 +54,10 @@ use super::{
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
-    observe::{HeaderCheckFact, OutputEnd, TransitionFact, TransportFact, TransportLimits},
+    observe::{
+        FrameSummaryFact, HeaderCheckFact, OutputEnd, SummaryCursorFact, TransitionFact,
+        TransportFact, TransportLimits,
+    },
     peer::{key_index, peer_addr, peer_of, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -486,6 +489,7 @@ impl TransportTap {
                 message_type,
                 output,
                 fingerprint,
+                summary,
             } => (
                 Some(conn_id),
                 self.remote(conn_id)?,
@@ -495,6 +499,21 @@ impl TransportTap {
                     message_type,
                     output,
                     fingerprint,
+                    summary: summary.map(summary_fact).transpose()?,
+                },
+            ),
+            TransportEvent::OutputAttempt {
+                conn_id,
+                quic_stream,
+                output,
+                attempt,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::OutputAttempt {
+                    quic_stream,
+                    output,
+                    attempt: summary_fact(attempt)?,
                 },
             ),
             TransportEvent::OutputAllocated {
@@ -590,6 +609,33 @@ impl TransportTap {
             unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
         })
     }
+}
+
+/// `summary` in plain fields, or an error for a producer this build can't
+/// encode.
+pub(crate) fn summary_fact(summary: FrameSummary) -> Result<FrameSummaryFact, String> {
+    Ok(FrameSummaryFact {
+        producer: match summary.producer {
+            Producer::Status => "status",
+            Producer::Open => "open",
+            Producer::Grant => "grant",
+            Producer::Close => "close",
+            Producer::Page => "page",
+            Producer::Terminal => "terminal",
+            unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
+        }
+        .to_owned(),
+        subscription: summary.subscription,
+        flags: summary.flags,
+        objects: summary.objects,
+        bytes: summary.bytes,
+        cursor: summary.cursor.map(|cursor| SummaryCursorFact {
+            height: cursor.height,
+            hash: zakura_chain::block::Hash(cursor.hash).to_string(),
+            headers: cursor.headers,
+            bytes: cursor.bytes,
+        }),
+    })
 }
 
 /// `outcome` in plain fields, or an error for one this build can't

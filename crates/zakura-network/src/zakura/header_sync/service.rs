@@ -35,7 +35,7 @@ use crate::zakura::{
         SessionTable, WriterFence,
     },
     spawn_supervised_pipe,
-    transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
+    transport::{sim_arg, sim_chain, GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
     BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
@@ -380,7 +380,7 @@ impl PeerSession {
                     error => OrderedSendError::Encode(error.into()),
                 })?;
         let id = update.subscription_id;
-        if slot
+        if sim_chain!(slot => attempting(Some(super::v9::summary::update(&update))))
             .send_fenced(update_frame(subscriber.header_bytes(), update), &writer)
             .is_err()
         {
@@ -403,7 +403,8 @@ impl PeerSession {
         let Some(update) = subscriber.grant_due(staging) else {
             return Ok(false);
         };
-        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
+        sim_chain!(slot => attempting(Some(super::v9::summary::update(&update))))
+            .send_following(update_frame(subscriber.header_bytes(), update), &writer)
             .map_err(|_| OrderedSendError::Closed)?;
         Ok(true)
     }
@@ -420,7 +421,8 @@ impl PeerSession {
         let Ok(update) = subscriber.close() else {
             return Ok(false);
         };
-        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
+        sim_chain!(slot => attempting(Some(super::v9::summary::update(&update))))
+            .send_following(update_frame(subscriber.header_bytes(), update), &writer)
             .map_err(|_| OrderedSendError::Closed)?;
         Ok(true)
     }
@@ -725,7 +727,11 @@ impl Service for HeaderSyncService {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry((peer_id.clone(), conn_id))
-            .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+            .or_insert_with(|| {
+                Arc::new(StdMutex::new(sim_chain!(
+                    CadenceSender::new() => attempting(super::v9::summary::of_cadence)
+                )))
+            })
             .clone();
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
         // The reader checks each page and outcome header against the
@@ -742,6 +748,16 @@ impl Service for HeaderSyncService {
             subscriber,
             status,
         );
+        // The stream writer decodes each frame it writes into its summary,
+        // before the session queues its first frame (M6a-6).
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = recv.stream_tap() {
+            tap.summarize_with(if header_bytes == REGTEST_HEADER_BYTES {
+                super::v9::summary::header_frame_summary::<REGTEST_HEADER_BYTES>
+            } else {
+                super::v9::summary::header_frame_summary::<COMMON_HEADER_BYTES>
+            });
+        }
         let (publisher, publishing) = sim_arg!(spawn_publisher(
             &self.header_sync,
             header_bytes,

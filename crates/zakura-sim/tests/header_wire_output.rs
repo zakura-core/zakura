@@ -17,7 +17,10 @@ use zakura_sim::{
         HarnessError, Subsystem,
     },
     observe::{OutputEnd, TransportFact},
-    peer::{honest::HonestSpec, PeerSpec},
+    peer::{
+        honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
+        PeerSpec,
+    },
     MemorySink, NoChecks, Observation, Outcome, Plan, PlanInput, RunConfig, RunReport, Sim,
 };
 
@@ -243,4 +246,145 @@ fn a_truncated_run_leaves_queued_output_pending() {
             .any(|life| life.allocated && life.enqueued && life.ends.is_empty()),
         "a queued output is live at the freeze: {lives:?}"
     );
+}
+
+/// Over the 14 saved Plans, every frame the node started writing on a
+/// header stream has its producer's attempt, and the writer's decoded
+/// summary of it, which the output ledger checks against the attempt. The
+/// Plans first show attempts from the cadence's `Status`, the subscriber's
+/// `Open` and the publisher's pages.
+///
+/// This fails if a producer reports no attempt, since the ledger then
+/// fails the run with output without attempt.
+#[test]
+fn every_started_frame_has_its_attempt() {
+    let mut producers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut started = 0;
+    for plan in SavedPlan::ALL {
+        let (scenario, input) = saved(plan);
+        let report = run(&scenario, input);
+        assert_eq!(
+            report.end.harness,
+            None,
+            "{}: {:?}",
+            plan.name(),
+            report.end
+        );
+        let mut attempts = BTreeMap::new();
+        for entry in report.log.entries() {
+            let Observation::Transport {
+                connection: Some(connection),
+                event,
+                ..
+            } = &entry.obs
+            else {
+                continue;
+            };
+            match event {
+                TransportFact::OutputAttempt {
+                    quic_stream,
+                    output,
+                    attempt,
+                } => {
+                    *producers.entry(attempt.producer.clone()).or_default() += 1;
+                    attempts.insert((*connection, *quic_stream, *output), attempt.clone());
+                }
+                TransportFact::FrameWriteStarted {
+                    quic_stream,
+                    output: Some(output),
+                    summary,
+                    ..
+                } => {
+                    started += 1;
+                    let attempt = attempts.get(&(*connection, *quic_stream, *output));
+                    assert!(
+                        attempt.is_some(),
+                        "{}: {entry:?} has no attempt",
+                        plan.name()
+                    );
+                    assert_eq!(summary.as_ref(), attempt, "{}", plan.name());
+                }
+                _ => {}
+            }
+        }
+    }
+    for producer in ["status", "open", "page"] {
+        assert!(
+            producers.contains_key(producer),
+            "no {producer} attempt: {producers:?}"
+        );
+    }
+    assert!(started > 0);
+}
+
+/// A page's summary is the page's own. `peer-0` holds 50 headers and
+/// subscribes to the node, which holds 1,200, with two headers of credit,
+/// granted back after each page. The node serves the subscription page
+/// after page, and each page's summary names its own two headers and its
+/// own last frontier, two above the last page's, never the subscription's
+/// running total. The test first asserts at least two pages on one
+/// subscription.
+///
+/// This fails if a page's summary carries cumulative totals.
+#[test]
+fn page_summaries_are_per_page() {
+    let scenario = WireScenario {
+        node: Chain::main(1_200),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: 50,
+                subscribe: Some(SubscribeSpec {
+                    start: 50,
+                    open: CreditSpec {
+                        objects: 2,
+                        bytes: 4_096,
+                    },
+                    grants: GrantPolicy::Immediate,
+                }),
+            }),
+            ..PeerSpec::dialing()
+        }],
+        ..WireScenario::default()
+    };
+    let report = run(&scenario, Plan::from_fuzz(&[]));
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let mut pages: BTreeMap<(u64, u64, u64), Vec<(u64, u32)>> = BTreeMap::new();
+    for entry in report.log.entries() {
+        if let Observation::Transport {
+            connection: Some(connection),
+            event:
+                TransportFact::FrameWriteStarted {
+                    quic_stream,
+                    summary: Some(summary),
+                    ..
+                },
+            ..
+        } = &entry.obs
+        {
+            if summary.producer == "page" {
+                let cursor = summary.cursor.as_ref().expect("a page names its frontier");
+                pages
+                    .entry((
+                        *connection,
+                        *quic_stream,
+                        summary.subscription.expect("a page names its subscription"),
+                    ))
+                    .or_default()
+                    .push((summary.objects, cursor.height));
+            }
+        }
+    }
+    let served = pages
+        .values()
+        .max_by_key(|pages| pages.len())
+        .expect("the node served a page");
+    assert!(
+        served.len() >= 2,
+        "one subscription got two pages: {pages:?}"
+    );
+    for pair in served.windows(2) {
+        let ((_, first_height), (count, height)) = (pair[0], pair[1]);
+        assert_eq!(count, 2, "each page holds its own two headers: {served:?}");
+        assert_eq!(height, first_height + 2, "{served:?}");
+    }
 }

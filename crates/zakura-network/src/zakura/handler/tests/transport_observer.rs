@@ -353,6 +353,8 @@ async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
                 message_type: v9::message_type::STATUS,
                 output: Some(0),
                 fingerprint,
+                // This stream's service installed no summarizer.
+                summary: None,
             },
             TransportEvent::FrameWritten {
                 conn_id: CONN,

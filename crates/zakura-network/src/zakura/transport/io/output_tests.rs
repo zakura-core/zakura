@@ -37,6 +37,11 @@ impl TransportObserver for Recorder {
 }
 
 impl Recorder {
+    /// Every event recorded so far.
+    pub(crate) fn events(&self) -> Vec<TransportEvent> {
+        self.0.lock().expect("no test panics holding it").clone()
+    }
+
     /// The output events recorded so far, as `(output, what)`.
     pub(crate) fn lives(&self) -> Vec<(u64, Life)> {
         self.0

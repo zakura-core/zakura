@@ -46,9 +46,20 @@ pub(crate) enum PageStall {
 #[must_use = "dropping the terminal permit frees the subscription's slot"]
 pub(crate) struct TerminalPermit {
     _slot: SlotPermit,
+    /// What the publisher meant the outcome to be (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    attempt: Option<crate::zakura::FrameSummary>,
 }
 
 impl TerminalPermit {
+    /// Records what the publisher meant the outcome to be, which
+    /// [`Self::send`] reports as its output's attempt (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn attempting(mut self, attempt: crate::zakura::FrameSummary) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
     /// Queue the terminal outcome `frame` on `send`, holding this permit
     /// until the frame's transport write finishes. It needs no output grant
     /// and no execution slot.
@@ -78,6 +89,9 @@ impl TerminalPermit {
         frame: Frame,
     ) -> impl std::future::Future<Output = bool> + '_ {
         let life = send.allocate(&frame);
+        if let (Some(life), Some(attempt)) = (&life, self.attempt) {
+            life.attempt(attempt);
+        }
         async move {
             match send.reserve_guarded().await {
                 Ok(slot) => {
@@ -418,6 +432,8 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         });
         Some(TerminalPermit {
             _slot: published.slot,
+            #[cfg(any(test, zakura_sim))]
+            attempt: None,
         })
     }
 
@@ -541,6 +557,7 @@ mod output_tests {
     fn permit(budget: &SlotBudget) -> TerminalPermit {
         TerminalPermit {
             _slot: budget.try_reserve().expect("the budget has a slot"),
+            attempt: None,
         }
     }
 

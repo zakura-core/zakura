@@ -781,6 +781,7 @@ mod tests {
             message_type: frame.message_type,
             output: Some(0),
             fingerprint,
+            summary: None,
         };
         // The frame's output life up to its write (M6a-6).
         let life = [

@@ -5736,6 +5736,7 @@ async fn write_encoded_ordered_frame(
             message_type,
             life.map(OutputLife::output),
             encoded.fingerprint,
+            &frame,
         )
     });
     match write_policy {

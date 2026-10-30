@@ -119,6 +119,14 @@ impl PushSend<'_> {
         self.slot
             .send(frame, FrameGuard::new(Arc::new(self.grants)));
     }
+
+    /// Records what the producer meant the page to be (M6a-6, see
+    /// [`GuardedFrameSlot::attempting`](crate::zakura::transport::GuardedFrameSlot::attempting)).
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn attempting(mut self, attempt: Option<crate::zakura::FrameSummary>) -> Self {
+        self.slot = self.slot.attempting(attempt);
+        self
+    }
 }
 
 /// Await `acquire`, counting a delay if it is not ready at once.

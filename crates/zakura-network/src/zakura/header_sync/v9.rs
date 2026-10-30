@@ -8,6 +8,8 @@
 
 mod publisher;
 mod subscriber;
+#[cfg(any(test, zakura_sim))]
+pub mod summary;
 mod wire;
 
 #[cfg(test)]

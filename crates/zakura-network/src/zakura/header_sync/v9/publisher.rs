@@ -806,7 +806,8 @@ async fn publish<const HEADER_BYTES: usize>(
             if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
-            let terminal = terminal.send(&send, frame);
+            let terminal =
+                sim_chain!(terminal => attempting(super::summary::terminal(id))).send(&send, frame);
             zakura_rt::pin!(terminal);
             // A full queue must not keep a cancelled session's task alive,
             // hide a page job's panic, or stop another subscription's page.
@@ -898,7 +899,14 @@ fn settle(
         // its slot.
         Progress::Page(page, slot) => {
             if lock(shared).commit(id, &page) {
-                slot.send(page.frame);
+                sim_chain!(slot => attempting(Some(super::summary::page(
+                    id,
+                    page.count,
+                    // Widening usize to u64 is lossless on supported targets.
+                    page.frame.payload.len() as u64,
+                    &page.last,
+                ))))
+                .send(page.frame);
             }
             true
         }

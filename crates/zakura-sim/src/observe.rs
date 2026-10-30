@@ -2346,6 +2346,20 @@ pub enum TransportFact {
         /// The writer's own fingerprint of the frame it's writing, over its
         /// message type, flags and payload.
         fingerprint: u64,
+        /// The writer's own decoded summary of the frame, on a header
+        /// stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<FrameSummaryFact>,
+    },
+    /// The producer of output `output` reported what it meant the frame to
+    /// be, from its own state (M6a-6).
+    OutputAttempt {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// What the producer meant to send.
+        attempt: FrameSummaryFact,
     },
     /// A producer made output `output`, a frame it's about to queue on the
     /// stream (M6a-6). Outputs count from 0 per stream.
@@ -2404,6 +2418,44 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+}
+
+/// What a header-sync frame says, in [`TransportFact::OutputAttempt`] and
+/// [`TransportFact::FrameWriteStarted`] (M6a-6). A page carries its own
+/// object count, payload bytes and last frontier. An update carries the
+/// credit it adds and the cursor it acknowledges.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FrameSummaryFact {
+    /// Which producer's frame: `status`, `open`, `grant`, `close`, `page`
+    /// or `terminal`.
+    pub producer: String,
+    /// The subscription it names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<u64>,
+    /// The frame's flags.
+    pub flags: u16,
+    /// A page's headers, or an update's added header credit.
+    pub objects: u64,
+    /// A page's payload bytes, or an update's added byte credit.
+    pub bytes: u64,
+    /// A page's last frontier, or an update's acknowledged cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SummaryCursorFact>,
+}
+
+/// A cursor or frontier in a [`FrameSummaryFact`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SummaryCursorFact {
+    /// The height.
+    pub height: u32,
+    /// The block hash, as hex in display order.
+    pub hash: String,
+    /// The header credit an acknowledged cursor consumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<u64>,
+    /// The byte credit an acknowledged cursor consumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 /// How an output ended, in [`TransportFact::OutputEnded`] (M6a-6).

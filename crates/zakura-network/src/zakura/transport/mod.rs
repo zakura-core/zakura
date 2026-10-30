@@ -48,8 +48,8 @@ pub use message_rule::{
 };
 #[cfg(any(test, zakura_sim))]
 pub use observe::{
-    frame_fingerprint, HeaderCheck, OutputOutcome, Transition, TransportEvent, TransportObserver,
-    Unwritten,
+    frame_fingerprint, FrameSummary, HeaderCheck, OutputOutcome, Producer, Summarizer,
+    SummaryCursor, Transition, TransportEvent, TransportObserver, Unwritten,
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};

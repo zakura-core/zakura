@@ -34,6 +34,7 @@ use std::time::Duration;
 use zakura_rt::{collections::HashMap, time::Instant};
 
 use crate::zakura::{
+    transport::{sim_arg, sim_chain},
     wire_codec::{encode_frame, WireMessage},
     Cadence, Clock, FrameGuard, FramedSend, MessageRole, MessageRule, RealClock,
 };
@@ -264,7 +265,15 @@ pub(crate) enum CadenceSendError {
 pub(crate) struct CadenceSender<M, C: Clock = RealClock> {
     slots: Vec<Slot<M>>,
     clock: C,
+    /// What each frame's producer meant it to be, from the value the
+    /// sender coalesced into it (M6a-6). Its family installs it.
+    #[cfg(any(test, zakura_sim))]
+    attempter: Option<Attempter<M>>,
 }
+
+/// Summarizes a cadence row's value as the attempt of the frame it becomes.
+#[cfg(any(test, zakura_sim))]
+pub(crate) type Attempter<M> = fn(&M) -> crate::zakura::FrameSummary;
 
 impl<M: WireMessage> CadenceSender<M, RealClock> {
     /// A sender for the family's cadence rows.
@@ -287,7 +296,19 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
                 })
             })
             .collect();
-        Self { slots, clock }
+        Self {
+            slots,
+            clock,
+            #[cfg(any(test, zakura_sim))]
+            attempter: None,
+        }
+    }
+
+    /// Reports each frame's attempt with `attempter`, from the value sent.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn attempting(mut self, attempter: Attempter<M>) -> Self {
+        self.attempter = Some(attempter);
+        self
     }
 
     /// Replace the value waiting to be sent for `message`'s row.
@@ -349,7 +370,7 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
             .iter_mut()
             .find(|slot| slot.message_type == message_type)
             .ok_or(CadenceSendError::NoCadence { message_type })?;
-        send_slot(slot, now, send)
+        sim_arg!(send_slot(slot, now, send); self.attempter)
     }
 
     /// Queue every due value on `send` without waiting.
@@ -362,8 +383,10 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
     {
         let now = self.clock.now();
         let mut queued = 0;
+        #[cfg(any(test, zakura_sim))]
+        let attempter = self.attempter;
         for slot in &mut self.slots {
-            if send_slot(slot, now, send)? == RowSend::Queued {
+            if sim_arg!(send_slot(slot, now, send); attempter)? == RowSend::Queued {
                 queued += 1;
             }
         }
@@ -386,10 +409,14 @@ pub(crate) enum RowSend {
     QueueFull,
 }
 
+/// Queues `slot`'s latest value if its row is due. In test and simulator
+/// builds, the frame's attempt is `attempter`'s summary of the value it
+/// coalesced, reported once per frame.
 fn send_slot<M: WireMessage>(
     slot: &mut Slot<M>,
     now: Instant,
     send: &FramedSend,
+    #[cfg(any(test, zakura_sim))] attempter: Option<Attempter<M>>,
 ) -> Result<RowSend, CadenceSendError> {
     if slot.latest.is_none() {
         return Ok(RowSend::Idle);
@@ -418,7 +445,8 @@ fn send_slot<M: WireMessage>(
     })?;
     let written = std::sync::Arc::new(());
     slot.unwritten = zakura_rt::sync::downgrade(&written);
-    reserved.send(frame, FrameGuard::new(written));
+    sim_chain!(reserved => attempting(attempter.map(|attempt| attempt(&message))))
+        .send(frame, FrameGuard::new(written));
     slot.last_sent = Some(now);
     Ok(RowSend::Queued)
 }

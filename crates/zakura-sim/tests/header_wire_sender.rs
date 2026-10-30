@@ -363,6 +363,7 @@ impl History {
                 message_type: frame.message_type,
                 output: Some(seq),
                 fingerprint: zakura_network::zakura::frame_fingerprint(frame),
+                summary: None,
             },
         );
         self

@@ -1501,7 +1501,11 @@ where
                 "pq_p2sh_activation_height requires a node built with the pq feature",
             ));
         }
-        if height == 0 || network_name.is_none() || network_magic.is_none() {
+        if height == 0
+            || network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some([0xfa, 0x1a, 0xf9, 0xbf])
+        {
             return Err(de::Error::custom(
                 "custom Testnet PQ activation requires a positive height and explicit network_name and network_magic",
             ));
@@ -1620,7 +1624,8 @@ where
     }
 
     if let Some(height) = pq_p2sh_activation_height {
-        params_builder = params_builder.with_pq_p2sh_activation_height(Height(height));
+        params_builder =
+            params_builder.with_pq_p2sh_activation_height(zakura_chain::block::Height(height));
     }
 
     // An omitted seed and otherwise default parameters select public Testnet.

@@ -77,6 +77,16 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// when it changes. A harness with a fixed scenario sets 0.
     const SCENARIO_BYTES: usize;
 
+    /// The harnesses whose runs this harness's runs include, by name, such
+    /// as each race fixture's for `fixtures/all`. A fuzz target that runs
+    /// this harness can cover only these. None by default.
+    const COMPOSES: &'static [&'static str] = &[];
+
+    /// Whether the harness plants the bugs its `Active` properties catch,
+    /// as the race fixtures do, so its runs must violate them. `false` by
+    /// default.
+    const PLANTED: bool = false;
+
     /// Everything that varies between runs of this harness, written in full
     /// to `meta.scenario`. It must hold no floats.
     type Scenario: Serialize + DeserializeOwned + Clone;
@@ -342,6 +352,10 @@ pub struct HarnessEntry {
     pub generator: u32,
     /// [`Subsystem::SCENARIO_BYTES`].
     pub scenario_bytes: usize,
+    /// [`Subsystem::COMPOSES`].
+    pub composes: &'static [&'static str],
+    /// [`Subsystem::PLANTED`].
+    pub planted: bool,
     /// [`run_harness`] on a serialized scenario, with no extra checker.
     pub run: fn(&Value, PlanInput, &mut dyn RecordSink) -> Result<RunReport, HarnessError>,
     /// [`meta`] for a serialized scenario.
@@ -393,6 +407,8 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         name: S::NAME,
         generator: S::GENERATOR,
         scenario_bytes: S::SCENARIO_BYTES,
+        composes: S::COMPOSES,
+        planted: S::PLANTED,
         run: run_value::<S>,
         meta: meta_value::<S>,
         config: config_value::<S>,

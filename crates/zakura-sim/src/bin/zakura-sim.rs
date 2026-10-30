@@ -9,6 +9,7 @@
 //! zakura-sim versions --sim <name>
 //! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
 //!     [--quarantine <dir>] [--report <file>]
+//! zakura-sim suite [--out <file>] [--frozen]
 //! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
 //!     [--against <confirmation.json>]
 //! zakura-sim properties --sim <name>
@@ -16,8 +17,8 @@
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 //! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
-//! `cargo xtask sim-versions` and `cargo xtask sim-seeds` build and run it
-//! with that flag.
+//! `cargo xtask sim-versions`, `cargo xtask sim-seeds` and `cargo xtask
+//! sim-suite` build and run it with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -59,7 +60,8 @@ mod cli {
     use zakura_sim::{
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
-        seed::{self, Failed, SeedReport, Sidecar},
+        seed::{self, Failed, SeedReport},
+        suite,
         trace::{
             self, shrink::REPORT_FILE, ConfirmStatus, Confirmation, ReplayOptions, ShrinkBudget,
             TraceReader, CONFIRMATION_FILE, MAX_INPUT_BYTES,
@@ -87,6 +89,7 @@ mod cli {
              zakura-sim versions --sim <name>\n  \
              zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
              [--quarantine <dir>] [--report <file>]\n  \
+             zakura-sim suite [--out <file>] [--frozen]\n  \
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
              [--against <confirmation.json>]\n  \
              zakura-sim properties --sim <name>\n\n\
@@ -114,6 +117,12 @@ mod cli {
              there, named by its SHA-256. --quarantine writes each quarantined seed there\n\
              with its reason. --report writes the result as JSON. It exits 1 if any\n\
              required seed is rejected.\n\
+             `suite` builds the full-suite manifest from qa/suite.toml, the harness\n\
+             registry, the coverage manifest, the planted cases, the seeds, the fuzz\n\
+             targets and the test sources, and prints its counts. --out writes it as\n\
+             JSON. It exits 1 and lists every problem if the manifest doesn't cover the\n\
+             suite, and with --frozen also if the build or the checkout is dirty, or\n\
+             the checkout isn't at the build's commit.\n\
              `confirm` checks that a full fuzz input violates the property alone, through\n\
              its trigger history, records its trace under --out and replays it Exact. It\n\
              writes confirmation.json to --out, and exits 0 only if the input is confirmed.\n\
@@ -143,6 +152,7 @@ mod cli {
             Some("shrink") => shrink(args.collect()),
             Some("versions") => versions(args.collect()),
             Some("seeds") => seeds(args.collect()),
+            Some("suite") => suite(args.collect()),
             Some("confirm") => confirm(args.collect()),
             Some("properties") => properties(args.collect()),
             Some("-h" | "--help") => {
@@ -710,81 +720,77 @@ mod cli {
         Ok(Err(len.max(bytes.len() as u64)))
     }
 
-    /// `seeds --report`'s JSON.
-    #[derive(serde::Serialize)]
-    struct Report<'a> {
-        harness: Option<&'a str>,
-        fixtures: Vec<PathBuf>,
-        seeds: Vec<ReportRow<'a>>,
-        other_harnesses: usize,
-    }
-
-    /// One seed in [`Report`]: its status, its sidecar if it parsed, and
-    /// either its full input's digest or its reason.
-    #[derive(serde::Serialize)]
-    struct ReportRow<'a> {
-        file: PathBuf,
-        status: &'static str,
-        sidecar: Option<&'a Sidecar>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        input_sha256: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    }
-
-    /// `report` as JSON, one row per seed. It serializes structs rather than
-    /// a `Value`, so its key order doesn't depend on `serde_json`'s
-    /// `preserve_order`, and it gives paths in the repository relative to
-    /// the repository's root, so it doesn't depend on where the checkout is.
+    /// `seeds --report`'s JSON: [`SeedReport::rows`]. It serializes
+    /// structs rather than a `Value`, so its key order doesn't depend on
+    /// `serde_json`'s `preserve_order`.
     fn report_json(
         report: &SeedReport,
         sim: Option<&str>,
         fixtures: &[PathBuf],
     ) -> Result<String, Error> {
-        let mut seeds = Vec::new();
-        for seed in &report.admitted {
-            seeds.push(ReportRow {
-                file: from_root(&seed.path),
-                status: "admitted",
-                sidecar: Some(&seed.sidecar),
-                input_sha256: Some(seed.input_sha256()),
-                reason: None,
-            });
-        }
-        for (status, failed) in report
-            .quarantined
-            .iter()
-            .map(|failed| ("quarantined", failed))
-            .chain(report.rejected.iter().map(|failed| ("rejected", failed)))
-        {
-            seeds.push(ReportRow {
-                file: from_root(&failed.path),
-                status,
-                sidecar: failed.sidecar.as_ref(),
-                input_sha256: None,
-                reason: Some(failed.error.to_string()),
-            });
-        }
-        let report = Report {
-            harness: sim,
-            fixtures: fixtures.iter().map(|dir| from_root(dir)).collect(),
-            seeds,
-            other_harnesses: report.other_harnesses,
-        };
-        serde_json::to_string_pretty(&report)
+        serde_json::to_string_pretty(&report.rows(sim, fixtures))
             .map(|json| json + "\n")
             .map_err(|error| Error::Failed(format!("serializing the report: {error}")))
     }
 
-    /// `path` relative to the repository's root if it's in the repository,
-    /// and as given if not.
-    fn from_root(path: &Path) -> PathBuf {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        path.canonicalize()
-            .ok()
-            .zip(root.canonicalize().ok())
-            .and_then(|(path, root)| path.strip_prefix(root).ok().map(Path::to_owned))
-            .unwrap_or_else(|| path.to_owned())
+    /// `suite`: builds the full-suite manifest, prints its counts, and
+    /// writes it where `--out` says. Fails with every problem if the
+    /// manifest doesn't cover the suite, or with `--frozen` if the build or
+    /// the checkout is dirty, or the checkout isn't at the build's commit.
+    #[allow(clippy::print_stdout)]
+    fn suite(args: Vec<String>) -> Result<(), Error> {
+        let mut out = None;
+        let mut frozen = false;
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--frozen" if !frozen => frozen = true,
+                "--out" if out.is_none() => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| Error::Usage("--out needs a value".to_owned()))?;
+                    out = Some(PathBuf::from(value));
+                }
+                "--frozen" | "--out" => return Err(Error::Usage(format!("{flag} given twice"))),
+                _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
+            }
+        }
+        let root = seed::repo_root();
+        let dir = std::env::current_dir()
+            .map_err(|error| Error::Failed(format!("reading the working directory: {error}")))?;
+        if let Some(why) = suite::other_checkout(&root, &dir) {
+            return Err(Error::Failed(format!(
+                "{why}; build it in this checkout, or run `cargo xtask sim-suite`"
+            )));
+        }
+        let manifest = suite::manifest(&root).map_err(|problems| {
+            Error::Failed(format!(
+                "{} problems keep the manifest from covering the suite:\n{problems}",
+                problems.0.len()
+            ))
+        })?;
+        if let Some(why) = frozen
+            .then(|| suite::unfrozen(&root, &manifest.build))
+            .flatten()
+        {
+            return Err(Error::Failed(format!(
+                "--frozen needs a clean checkout at the build's commit: {why}"
+            )));
+        }
+        let counts = serde_json::to_string_pretty(&manifest.counts)
+            .map_err(|error| Error::Failed(format!("serializing the counts: {error}")))?;
+        println!(
+            "manifest of {}{}: {counts}",
+            manifest.build.git,
+            if manifest.build.dirty { " (dirty)" } else { "" }
+        );
+        if let Some(out) = out {
+            let json = serde_json::to_string_pretty(&manifest)
+                .map_err(|error| Error::Failed(format!("serializing the manifest: {error}")))?;
+            write(&out, format!("{json}\n").as_bytes())?;
+            println!("wrote {}", out.display());
+        }
+        Ok(())
     }
 
     /// Creates `dir` and its parents.

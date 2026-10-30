@@ -378,6 +378,91 @@ impl SeedReport {
     }
 }
 
+/// [`SeedReport`] as `zakura-sim seeds --report` writes it, and as the
+/// suite manifest embeds it: one row per seed.
+#[derive(Clone, Debug, Serialize)]
+pub struct Report {
+    /// The harness the report is limited to, if any.
+    pub harness: Option<String>,
+    /// The fixture directories read.
+    pub fixtures: Vec<PathBuf>,
+    /// Every seed, admitted ones first.
+    pub seeds: Vec<ReportRow>,
+    /// [`SeedReport::other_harnesses`].
+    pub other_harnesses: usize,
+}
+
+/// One seed in a [`Report`]: its status, its sidecar if it parsed, and
+/// either its full input's digest or its reason.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReportRow {
+    /// The seed's file.
+    pub file: PathBuf,
+    /// `admitted`, `quarantined` or `rejected`.
+    pub status: &'static str,
+    /// The sidecar, if it parsed.
+    pub sidecar: Option<Sidecar>,
+    /// The full fuzz input's SHA-256, for an admitted seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_sha256: Option<String>,
+    /// Why the seed failed, for a seed that did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SeedReport {
+    /// The report's rows, for `harness` and the `fixtures` read. It gives
+    /// paths in the repository relative to the repository's root, so it
+    /// doesn't depend on where the checkout is.
+    pub fn rows(&self, harness: Option<&str>, fixtures: &[PathBuf]) -> Report {
+        let mut seeds = Vec::new();
+        for seed in &self.admitted {
+            seeds.push(ReportRow {
+                file: from_root(&seed.path),
+                status: "admitted",
+                sidecar: Some(seed.sidecar.clone()),
+                input_sha256: Some(seed.input_sha256()),
+                reason: None,
+            });
+        }
+        for (status, failed) in self
+            .quarantined
+            .iter()
+            .map(|failed| ("quarantined", failed))
+            .chain(self.rejected.iter().map(|failed| ("rejected", failed)))
+        {
+            seeds.push(ReportRow {
+                file: from_root(&failed.path),
+                status,
+                sidecar: failed.sidecar.clone(),
+                input_sha256: None,
+                reason: Some(failed.error.to_string()),
+            });
+        }
+        Report {
+            harness: harness.map(str::to_owned),
+            fixtures: fixtures.iter().map(|dir| from_root(dir)).collect(),
+            seeds,
+            other_harnesses: self.other_harnesses,
+        }
+    }
+}
+
+/// The repository's root: two levels above this crate.
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// `path` relative to the repository's root if it's in the repository,
+/// and as given if not.
+pub fn from_root(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .ok()
+        .zip(repo_root().canonicalize().ok())
+        .and_then(|(path, root)| path.strip_prefix(root).ok().map(Path::to_owned))
+        .unwrap_or_else(|| path.to_owned())
+}
+
 /// The sidecar beside the seed at `path`.
 fn read_sidecar(path: &Path) -> Result<Sidecar, SeedError> {
     let sidecar = path.with_extension(SIDECAR_EXTENSION);

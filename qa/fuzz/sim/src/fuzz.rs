@@ -23,6 +23,10 @@ use zakura_sim::{
 /// violation, for `cargo fuzz tmin`.
 pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
 
+/// What the filter prints before its panic, followed by the harness's name,
+/// so `cargo xtask sim-minimize` can check which harness a target runs.
+pub const HARNESS_LINE: &str = "zakura-sim-fuzz harness: ";
+
 /// A fuzz target over harness `$harness`: `sim_target!(discovery::WaitComplete)`
 /// for a harness under `zakura_sim::harness`.
 #[macro_export]
@@ -119,7 +123,7 @@ fn abandon_limit() -> usize {
 
 /// [`fuzz_one`]'s action on one classified run.
 fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified: &Classified) {
-    if met_expectation(classified) {
+    if met_expectation(entry, classified) {
         return;
     }
     if classified.leaked > 0 {
@@ -306,14 +310,16 @@ fn has_trace(root: &Path, property: &str) -> bool {
     })
 }
 
-/// With `ZAKURA_SIM_EXPECT` set, panics on an `Active` violation of that
-/// property and returns `true` for any other run, so the caller does
-/// nothing else with it. Returns `false` when the variable is unset.
-fn met_expectation(classified: &Classified) -> bool {
+/// With `ZAKURA_SIM_EXPECT` set, prints [`HARNESS_LINE`] with `entry`'s
+/// name and panics on an `Active` violation of that property, and returns
+/// `true` for any other run, so the caller does nothing else with it.
+/// Returns `false` when the variable is unset.
+fn met_expectation(entry: &HarnessEntry, classified: &Classified) -> bool {
     let Some(want) = expected() else {
         return false;
     };
     if matches!(&classified.outcome, ExploreOutcome::Fail { property } if property == want) {
+        eprintln!("{HARNESS_LINE}{}", entry.name);
         panic!("{want}");
     }
     true
@@ -360,7 +366,7 @@ fn act_fixtures(
     run: &ExploreRun,
     classified: &Classified,
 ) {
-    if met_expectation(classified) {
+    if met_expectation(entry, classified) {
         return;
     }
     static FINDS: OnceLock<Mutex<Finds>> = OnceLock::new();

@@ -27,6 +27,10 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 
+`[package.metadata.zakura-sim.targets]` in `Cargo.toml` maps each target to
+the registered harness it runs. A new target needs both its `[[bin]]` and its
+entry there.
+
 ## What a target does with a run
 
 - An `Active` property violation saves the input under
@@ -64,9 +68,45 @@ failure of another property, panics. Once a fixture's limit in
 `missed:`.
 
 `ZAKURA_SIM_EXPECT=<property-id>` makes a target panic only on that
-property's `Active` violation and record nothing, for `cargo fuzz tmin`. An
+property's `Active` violation and record nothing, for `cargo fuzz tmin`.
+Before it panics, the target prints `zakura-sim-fuzz harness: <name>`. An
 abort, a stack overflow, a sanitizer report or a timeout still crashes the
 process, so `tmin`'s output is only a candidate.
+
+## Minimizing a crash
+
+`cargo xtask sim-minimize` runs `tmin` with that variable set, and keeps a
+smaller input only if fresh processes confirm it. Each budget is required:
+
+```console
+cargo xtask sim-minimize race_fixtures artifacts/race_fixtures/crash-… \
+    --property race/lost-update --out <dir> --runs 64 --wall-secs 300 --child-secs 30
+```
+
+The wrapper copies the original into `<dir>/original/` and checks its
+SHA-256 first. It builds `zakura-sim` and the target once, and pins both in
+`<dir>/bin/`. `zakura-sim properties` must list `--property` for the
+harness, or the run ends with `error` before any check. The original and
+each smaller candidate then pass three fresh processes, or the input is
+rejected:
+
+1. the pinned target must crash with the property's panic alone, not an
+   abort, a sanitizer report, a timeout or another panic, and must name the
+   harness the manifest maps it to;
+2. `zakura-sim confirm` must find the property violated alone, through its
+   trigger history, with the original's harness, generator, build,
+   assumptions and cleanup;
+3. `zakura-sim replay` must replay the recorded trace Exact.
+
+Candidates run smallest first, and the first that passes moves to
+`<dir>/minimized/` with its trace. `<dir>/report.json` gives the status
+(`minimized`, `original-kept`, `original-rejected`, `interrupted`,
+`build-failed` or `error`), each candidate's rejection reason, the counts,
+the budgets, the elapsed time and whether `tmin` reached its fixed point.
+`error` means the wrapper itself failed, and its reason is the error. The
+report keeps what ran before the failure. The command exits 0 only for
+`minimized`. Ctrl-C, SIGTERM and SIGHUP stop the run
+and still write the report.
 
 Reproduce a crash input as a trace with the `zakura-sim` binary:
 
@@ -76,3 +116,27 @@ RUSTFLAGS="--cfg zakura_sim" cargo run -p zakura-sim -- record --sim discovery/w
 
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
+
+## Seeds
+
+Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`
+with a `<name>.toml` sidecar. The sidecar records the harness, the generator
+version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
+the test or plan the seed comes from, and the property witnesses it carries.
+A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
+scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+
+`cargo xtask sim-seeds` validates every seed against the current generators.
+A required seed that fails, such as one built for an older generator or one
+whose prefix now decodes to another scenario, fails the command with the
+reason. A seed with `required = false` is quarantined instead. With `--sim`
+and `--out`, it writes one harness's admitted seeds into a corpus, each named
+by its SHA-256:
+
+```console
+cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/discovery_wait_complete
+```
+
+`cargo xtask sim-versions --sim <name>` prints the versions that fix what the
+harness's fuzz input means, as `KEY=VALUE` lines. A corpus keyed on all of
+them starts fresh when any of them changes.

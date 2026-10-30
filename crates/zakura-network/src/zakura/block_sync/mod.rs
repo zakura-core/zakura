@@ -4,12 +4,7 @@
 //! peer's stream-6 frames flow through the per-peer routine, the work queue, the
 //! commit pipeline, the registry, and the reactor.
 
-use std::{
-    collections::BTreeMap,
-    io,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
@@ -22,7 +17,7 @@ use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, CancellationToken, Mutex as StdMutex},
     task::JoinHandle,
-    time,
+    time::{self, Instant},
 };
 
 use super::{
@@ -30,10 +25,26 @@ use super::{
     ZakuraPeerId, ZakuraTrace,
 };
 
+/// Reports the event that `$event` builds to the observer in `$slot`, an
+/// [`ObserverSlot`](block_sync_observe::ObserverSlot), if one is installed.
+/// `$event` is evaluated only then.
+///
+/// Every call site is itself compiled only in test and simulator builds.
+#[cfg(any(test, zakura_sim))]
+macro_rules! observe {
+    ($slot:expr, $event:expr) => {
+        if let Some(observer) = &$slot.0 {
+            observer.observe($event)
+        }
+    };
+}
+
 mod admission;
 mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
+#[cfg(any(test, zakura_sim))]
+pub mod block_sync_observe;
 mod config;
 mod error;
 mod events;
@@ -67,28 +78,56 @@ pub use bench::{
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
-pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::{BlockSyncStartError, BlockSyncWireError};
 pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
     BlockSyncEvent, BlockSyncMisbehavior,
 };
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
 #[cfg(test)]
-pub(crate) use service::block_sync_streams;
-pub use service::BlockSyncPeerSession;
-pub(crate) use service::BlockSyncService;
-#[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+#[cfg(any(test, zakura_sim))]
+pub use service::{block_sync_serving_limit, block_sync_streams};
+pub use service::{BlockSyncPeerSession, BlockSyncService};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use state::DetachedHandleEvents;
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+pub use wire::decode_block_payload_for_test;
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
     ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     ZAKURA_STREAM_BLOCK_SYNC,
 };
+
+/// The current UTC time as chrono's type. Reads `zakura_rt::time::utc_now`,
+/// so a simulated run sees the scenario clock.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    time::utc_now().into()
+}
+
+/// A header-chain [`Clock`](zakura_header_chain::Clock) that reads [`utc_now`], so
+/// body-retry deadlines and their conversion to `Instant`s share one clock.
+#[derive(Copy, Clone, Debug, Default)]
+struct BlockSyncClock;
+
+impl zakura_header_chain::Clock for BlockSyncClock {
+    /// Returns [`utc_now`].
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        utc_now()
+    }
+}
 
 #[cfg(test)]
 fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {

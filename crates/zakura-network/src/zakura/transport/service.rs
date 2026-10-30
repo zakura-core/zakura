@@ -202,6 +202,20 @@ impl ServiceStream {
     }
 }
 
+/// Reads the first cause recorded for a connection's close, such as
+/// `service_protocol_reject`.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+pub struct CloseCauseReader(CloseCause);
+
+#[cfg(any(test, zakura_sim))]
+impl CloseCauseReader {
+    /// The first recorded cause, or `None` while no path recorded one.
+    pub fn get(&self) -> Option<&'static str> {
+        self.0.get()
+    }
+}
+
 /// Per-peer transport state handed to a service when a peer connects.
 #[derive(Debug)]
 pub struct Peer {
@@ -258,6 +272,52 @@ impl Peer {
             direction,
             streams,
             cancel_token,
+        )
+    }
+
+    /// Build a peer that carries one persistent stream of kind `stream_kind`
+    /// at `version`, in service session `session_id`, as the transport hands
+    /// it to a service after admitting that session.
+    ///
+    /// [`Peer::new`] and [`Peer::new_with_direction`] leave every stream at
+    /// version 0, which a service that checks its stream version refuses.
+    /// This is the in-memory way to open a versioned session, such as a
+    /// simulator linking two nodes with [`framed_channel`](super::framed_channel)s.
+    ///
+    /// The peer has no remote IP and a fresh close cause. Its stream's
+    /// cancellation token is a child of `cancel_token`, so cancelling
+    /// `cancel_token` closes the connection and the session with it.
+    ///
+    /// A session that replaces another needs a `conn_id` greater than the
+    /// current connection's for that peer, since [`ZakuraConnId`]s only
+    /// increase and header sync refuses a session from an older connection.
+    /// It also needs a new token and a `session_id` never used before for
+    /// the same peer. Header sync matches a session's teardown by peer and
+    /// session ID alone, so a reused ID would let the replaced session's
+    /// late teardown remove its replacement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_versioned(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        stream_kind: u16,
+        version: u16,
+        session_id: u64,
+        (recv, send): (FramedRecv, FramedSend),
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let stream =
+            ServiceStream::new(session_id, version, recv, send, cancel_token.child_token());
+        Self::new_with_service_streams(
+            conn_id,
+            id,
+            None,
+            negotiated,
+            direction,
+            HashMap::from([(stream_kind, stream)]),
+            cancel_token,
+            CloseCause::new(),
         )
     }
 
@@ -415,6 +475,22 @@ impl Peer {
     /// Return the shared first-cause connection close recorder.
     pub(crate) fn close_cause(&self) -> CloseCause {
         self.close_cause.clone()
+    }
+
+    /// Makes `reader` the reader of this peer's stream: a frame it refuses
+    /// records its close cause on this connection and closes it.
+    #[cfg(any(test, zakura_sim))]
+    pub fn read_through(&self, reader: &super::StreamReader) {
+        reader.bind(self.close_cause.clone(), self.cancel_token.clone());
+    }
+
+    /// Return a reader for the cause of this peer's connection close.
+    ///
+    /// A service takes the peer by value, so the simulator keeps this reader
+    /// from before [`Service::add_peer`] to see why the connection closed.
+    #[cfg(any(test, zakura_sim))]
+    pub fn close_cause_reader(&self) -> CloseCauseReader {
+        CloseCauseReader(self.close_cause.clone())
     }
 
     /// Split this peer into fields so the registry can fan streams out by owner.

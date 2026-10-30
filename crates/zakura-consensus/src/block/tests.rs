@@ -1575,7 +1575,7 @@ fn failing_librustzcash_v5_transaction(
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     }
 }
 
@@ -2962,7 +2962,7 @@ mod zip218_shielded_action_limits {
             outputs: Vec::new(),
             lock_time: LockTime::unlocked(),
             expiry_height: Height(100),
-            joinsplit_data,
+            joinsplit_data: joinsplit_data.map(Box::new),
             sapling_shielded_data: None,
         })
     }

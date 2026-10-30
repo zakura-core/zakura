@@ -1991,6 +1991,167 @@ class ReleaseStateConditionTests(unittest.TestCase):
         self.assertEqual(cond, "unreadable")
 
 
+class ReleaseStateAlertTests(unittest.TestCase):
+    """Transient fetch failures wait, while invalid bundles still alert immediately."""
+
+    def setUp(self):
+        """Create an isolated release-state lane with captured notifications."""
+        self.target = make_release_state()
+        self.lane = watchdog.Watchdog([], make_args())
+        self.posted = []
+        self.lane.notify = lambda text, args: (self.posted.append(text), True)[1]
+        self.state = {"version": watchdog.STATE_VERSION}
+        self.now = ReleaseStateConditionTests.NOW
+        self.pointer = {
+            "height": 3457371,
+            "meta_url": "https://example.invalid/release-state/v1/3457371/meta.json",
+            "generated_at": watchdog.datetime.datetime.fromtimestamp(
+                self.now, watchdog.datetime.timezone.utc
+            ).isoformat(),
+        }
+        self.healthy = [self.pointer, {"files": ALL_FILES}]
+
+    def poll(self, elapsed, responses):
+        """Feed pointer/metadata responses through the production alert handler."""
+        with patch.object(watchdog, "fetch_json", side_effect=responses):
+            self.lane.handle_release_state(
+                self.state, self.target, self.now + elapsed, False,
+            )
+
+    def http_error(self, code):
+        """Create an HTTP failure and close its response when the test finishes."""
+        error = watchdog.urllib.error.HTTPError(self.target.url, code, "error", {}, None)
+        self.addCleanup(error.close)
+        return error
+
+    def test_transient_errors_at_either_url_wait_three_minutes(self):
+        """The deadline applies to direct/wrapped timeouts and the full 5xx range."""
+        errors = [
+            TimeoutError("read timed out"),
+            watchdog.urllib.error.URLError(TimeoutError("connect timed out")),
+            *[self.http_error(code) for code in (500, 502, 503, 504, 599)],
+        ]
+        for error in errors:
+            for metadata in (False, True):
+                with self.subTest(error=str(error), metadata=metadata):
+                    self.state = {}
+                    self.posted.clear()
+                    for elapsed in (0, 60, 179, 180, 240):
+                        responses = [self.pointer, error] if metadata else error
+                        self.poll(elapsed, responses)
+                        self.assertEqual(len(self.posted), int(elapsed >= 180))
+                    self.assertIn("unreachable", self.posted[0])
+                    self.poll(300, self.healthy)
+                    self.assertEqual(len(self.posted), 2)
+                    self.assertIn("recovered from unreachable", self.posted[1])
+                    self.poll(360, self.healthy)
+                    self.assertEqual(len(self.posted), 2)
+
+    def test_brief_failure_has_no_recovery_and_resets_the_timer(self):
+        """A healthy poll clears an unannounced failure without sending recovery."""
+        self.poll(0, TimeoutError())
+        self.poll(64, self.healthy)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.state["release_state"]["mainnet"]["condition"], "ok")
+        self.poll(120, TimeoutError())
+        self.poll(299, TimeoutError())
+        self.assertEqual(self.posted, [])
+        self.poll(300, TimeoutError())
+        self.assertEqual(len(self.posted), 1)
+
+    def test_mixed_transient_errors_keep_the_timer_across_restart(self):
+        """A saved timeout followed by 5xx failures remains one continuous incident."""
+        self.poll(0, TimeoutError())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            watchdog.save_state(path, self.state)
+            self.state = watchdog.load_state(path)
+        self.lane = watchdog.Watchdog([], make_args())
+        self.lane.notify = lambda text, args: (self.posted.append(text), True)[1]
+        for elapsed in (60, 179, 180):
+            self.poll(elapsed, self.http_error(503))
+            self.assertEqual(len(self.posted), int(elapsed >= 180))
+
+    def test_other_fetch_errors_alert_during_the_grace_period(self):
+        """Non-transient errors escalate immediately, including during a pending timeout."""
+        errors = [
+            self.http_error(code) for code in (403, 404, 429, 600)
+        ] + [
+            watchdog.urllib.error.URLError("name resolution failed"),
+            json.JSONDecodeError("invalid JSON", "", 0),
+        ]
+        for error in errors:
+            for after_timeout in (False, True):
+                with self.subTest(error=str(error), after_timeout=after_timeout):
+                    self.state = {}
+                    self.posted.clear()
+                    if after_timeout:
+                        self.poll(0, TimeoutError())
+                    self.poll(60, error)
+                    self.assertEqual(len(self.posted), 1)
+                    self.assertIn("unreachable", self.posted[0])
+
+    def test_invalid_and_stale_bundles_alert_immediately(self):
+        """Successful reads never defer malformed, incomplete, or stale bundle alerts."""
+        cases = [
+            ([{}, {"files": ALL_FILES}], "unreachable"),
+            ([self.pointer, {}], "unreadable"),
+            ([{**self.pointer, "generated_at": "invalid"}, {"files": ALL_FILES}], "unreadable"),
+            ([self.pointer, {"files": {}}], "incomplete"),
+            ([{**self.pointer, "generated_at": "2000-01-01T00:00:00Z"}, {"files": ALL_FILES}], "stale"),
+        ]
+        for responses, condition in cases:
+            with self.subTest(condition=condition, responses=responses):
+                self.state = {}
+                self.posted.clear()
+                self.poll(0, TimeoutError())
+                self.poll(60, responses)
+                self.assertEqual(len(self.posted), 1)
+                self.assertIn(f"release state* {condition}", self.posted[0])
+
+    def test_active_bundle_alert_survives_transient_errors_until_recovery(self):
+        """Transient reads cannot erase an alert or duplicate it when the bad bundle returns."""
+        cases = [
+            ([self.pointer, {}], "unreadable"),
+            ([self.pointer, {"files": {}}], "incomplete"),
+            ([{**self.pointer, "generated_at": "2000-01-01T00:00:00Z"}, {"files": ALL_FILES}], "stale"),
+        ]
+        for invalid, condition in cases:
+            with self.subTest(condition=condition):
+                self.state = {"version": watchdog.STATE_VERSION}
+                self.posted.clear()
+                self.poll(0, invalid)
+                self.assertEqual(len(self.posted), 1)
+                for elapsed, responses in (
+                    (60, TimeoutError()),
+                    (120, invalid),
+                    (180, [self.pointer, self.http_error(503)]),
+                    (360, TimeoutError()),
+                ):
+                    self.poll(elapsed, responses)
+                    self.assertEqual(len(self.posted), 1)
+                    entry = self.state["release_state"]["mainnet"]
+                    self.assertTrue(entry["alerting"])
+                    self.assertEqual(entry["condition"], condition)
+
+                # Persist the incident as the main loop does, then restart the lane.
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "state.json"
+                    watchdog.save_state(path, self.state)
+                    self.state = watchdog.load_state(path)
+                self.lane = watchdog.Watchdog([], make_args())
+                self.lane.notify = lambda text, args: (self.posted.append(text), True)[1]
+                with patch.object(self.lane, "notify", return_value=False):
+                    self.poll(420, self.healthy)
+                self.assertTrue(self.state["release_state"]["mainnet"]["alerting"])
+                self.poll(480, self.healthy)
+                self.assertEqual(len(self.posted), 2)
+                self.assertIn(f"recovered from {condition}", self.posted[1])
+                self.assertFalse(self.state["release_state"]["mainnet"]["alerting"])
+                self.poll(540, self.healthy)
+                self.assertEqual(len(self.posted), 2)
+
+
 class ReleaseStateConfigTests(unittest.TestCase):
     def load(self, body):
         import tempfile

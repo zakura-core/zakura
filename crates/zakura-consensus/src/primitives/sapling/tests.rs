@@ -731,7 +731,7 @@ async fn cache_miss_propagates_an_inner_readiness_failure() {
 
 /// The real verification stack, behind a cache private to one test.
 ///
-/// The production [`VERIFIER`](super::VERIFIER) is a process-wide `Lazy`, so its cache carries
+/// The production [`VERIFIER`](super::VERIFIER) is a process-wide `LazyLock`, so its cache carries
 /// whatever every other test in this binary has already verified. This builds the same batch and
 /// fallback stack behind a fresh cache, so a test can prove what a cold cache does with real
 /// Sapling verification underneath.

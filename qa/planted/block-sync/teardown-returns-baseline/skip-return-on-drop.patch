@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+index c101954cd..ad4b1a5d3 100644
+--- a/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
++++ b/crates/zakura-network/src/zakura/block_sync/peer_routine.rs
+@@ -2936,7 +2936,6 @@ impl Drop for PeerRoutine {
+     fn drop(&mut self) {
+         // A routine dropped inside its handoff no longer blocks on it.
+         self.handoff_blocked.store(false, Ordering::Relaxed);
+-        self.return_unreceived_requests("peer_routine_drop");
+         // The routine's last snapshot, after it returned its work.
+         #[cfg(any(test, zakura_sim))]
+         self.observe_owners(true);

@@ -121,6 +121,33 @@ pub(in crate::zakura::block_sync) struct WorkQueueState {
 }
 
 impl WorkQueueState {
+    /// Read each item's ownership and charge from the maps, not the tallies.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn ownership(&self) -> Vec<super::WorkItemOwnership> {
+        let pending = self
+            .pending
+            .iter()
+            .map(|(height, item)| (height, item, super::WorkItemPlace::Pending));
+        let in_flight = self.in_flight.iter().map(|(height, item)| {
+            let place = if item.provisional {
+                super::WorkItemPlace::Provisional
+            } else {
+                super::WorkItemPlace::InFlight
+            };
+            (height, item, place)
+        });
+        pending
+            .chain(in_flight)
+            .map(|(height, item, place)| super::WorkItemOwnership {
+                height: *height,
+                owner: item.owner,
+                place,
+                estimated_bytes: item.estimated_bytes,
+                reserved_bytes: item.budget.reserved_charge(),
+            })
+            .collect()
+    }
+
     pub(in crate::zakura::block_sync) fn new(floor: block::Height) -> Self {
         Self {
             pending: BTreeMap::new(),

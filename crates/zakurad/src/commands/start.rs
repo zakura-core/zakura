@@ -794,8 +794,9 @@ impl StartCmd {
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
-        let indexer_rpc_task_handle = {
-            if let Some(indexer_listen_addr) = config.rpc.indexer_listen_addr {
+        let indexer_rpc_task_handle = match config.rpc.indexer_listen_addr {
+            #[cfg(feature = "indexer-rpc")]
+            Some(indexer_listen_addr) => {
                 info!("spawning indexer RPC server");
                 let (indexer_rpc_task_handle, _listen_addr) =
                     zakura_rpc::node::start_indexer_server(
@@ -809,9 +810,20 @@ impl StartCmd {
                     .map_err(|err| eyre!(err))?;
 
                 indexer_rpc_task_handle
-            } else {
+            }
+            #[cfg(not(feature = "indexer-rpc"))]
+            Some(_) => {
+                return Err(eyre!(
+                    "rpc.indexer_listen_addr is configured, but this zakurad was built \
+                     without the `indexer-rpc` feature"
+                ));
+            }
+            None => {
+                #[cfg(feature = "indexer-rpc")]
                 warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                spawn_erased(std::future::pending().in_current_span())
+                spawn_erased(
+                    std::future::pending::<Result<(), tower::BoxError>>().in_current_span(),
+                )
             }
         };
         node_tasks.track(&indexer_rpc_task_handle);

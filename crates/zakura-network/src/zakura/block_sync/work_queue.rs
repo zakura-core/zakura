@@ -39,6 +39,8 @@ use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 mod request_write;
 pub(super) mod state;
 
+#[cfg(any(test, zakura_sim))]
+pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
 pub(super) use request_write::{RequestWrite, RequestWriteStatus};
 use state::{WorkQueueState, WorkWake};
@@ -70,6 +72,44 @@ pub(super) struct WorkItem {
     /// Another attempt's body ended this owner's reservation. The owner's request
     /// still claims the height, so dropping or moving the item is a revocation.
     answered_elsewhere: bool,
+}
+
+/// Where a queued item sits in its download lifecycle.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WorkItemPlace {
+    /// Waiting for a request.
+    Pending,
+    /// Taken by a request that has not yet published its reservation here.
+    Provisional,
+    /// Taken by a published request.
+    InFlight,
+}
+
+/// One queued item's owner and byte quantities.
+#[cfg(any(test, zakura_sim))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct WorkItemOwnership {
+    /// The item's height.
+    pub height: block::Height,
+    /// The request that took the item, if one did.
+    pub owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Where the item sits.
+    pub place: WorkItemPlace,
+    /// The size estimate a request for this item reserves.
+    pub estimated_bytes: u64,
+    /// The estimate bytes this item currently charges to the queue's tally.
+    pub reserved_bytes: u64,
+}
+
+/// A request reservation that a received body ended.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct EndedReservation {
+    /// The height's own charge: the estimate its request reserved for it.
+    pub(super) charge: u64,
+    /// Every byte released: the charge, plus the unsent heights of a queued
+    /// request the release retired.
+    pub(super) released: u64,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -113,6 +153,36 @@ struct WorkQueueInner {
     request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
 }
 
+/// Publishes a changed reservation gauge before releasing the queue lock.
+struct WorkQueueGuard<'a> {
+    inner: MutexGuard<'a, WorkQueueInner>,
+    reserved_bytes: u64,
+}
+
+impl std::ops::Deref for WorkQueueGuard<'_> {
+    type Target = WorkQueueInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for WorkQueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for WorkQueueGuard<'_> {
+    fn drop(&mut self) {
+        let bytes = self.inner.state.reserved_bytes();
+        if bytes != self.reserved_bytes {
+            // This lossy cast affects diagnostics only; the state keeps an integer.
+            metrics::gauge!("sync.block.work.reserved_bytes").set(bytes as f64);
+        }
+    }
+}
+
 /// The shared download work source. See the module docs for the invariants.
 #[derive(Debug)]
 pub(super) struct WorkQueue {
@@ -122,6 +192,10 @@ pub(super) struct WorkQueue {
     /// owner's routine retiring the request. Routines rescan their requests for
     /// lost ownership only after this changes.
     revocations: AtomicU64,
+    /// Receives request write steps and queue snapshots, in test and simulator
+    /// builds.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl WorkQueue {
@@ -133,7 +207,34 @@ impl WorkQueue {
             }),
             available: Notify::new(),
             revocations: AtomicU64::new(0),
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
+    }
+
+    /// This queue, reporting to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(
+        mut self,
+        observer: super::block_sync_observe::ObserverSlot,
+    ) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Reports the queue's items to the observer, if one is installed. A task
+    /// that changes the queue calls this after it handled an input.
+    ///
+    /// It reports under the queue's lock. Releasing the lock is a preemption
+    /// point under the simulator, so a snapshot read before it could land
+    /// after a newer one.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn observe_items(&self) {
+        let inner = self.lock();
+        observe!(
+            self.observer,
+            super::block_sync_observe::BlockEvent::WorkQueue(Self::ownership(&inner))
+        );
     }
 
     /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
@@ -177,10 +278,16 @@ impl WorkQueue {
         self.lock().state.set_estimate_floor(floor);
     }
 
-    fn lock(&self) -> MutexGuard<'_, WorkQueueInner> {
-        self.inner
+    fn lock(&self) -> WorkQueueGuard<'_> {
+        let inner = self
+            .inner
             .lock()
-            .expect("work queue mutex is never poisoned")
+            .expect("work queue mutex is never poisoned");
+        let reserved_bytes = inner.state.reserved_bytes();
+        WorkQueueGuard {
+            inner,
+            reserved_bytes,
+        }
     }
 
     /// Add scoped `(height, hash, size)` items to `pending`.
@@ -322,6 +429,7 @@ impl WorkQueue {
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
         self.release_active_reserved_height_matching(None, height, false)
+            .map(|ended| ended.released)
     }
 
     /// End the receipt reservation and retire any queued request it invalidates.
@@ -332,15 +440,17 @@ impl WorkQueue {
         height: block::Height,
     ) -> Option<u64> {
         self.release_active_reserved_height_matching(Some(owner), height, false)
+            .map(|ended| ended.released)
     }
 
     /// Like [`Self::release_active_reserved_height_for_owner`], for a body that
-    /// another attempt received.
+    /// another attempt received. Returns the height's own charge with the
+    /// released total, both read under the lock that checks `owner`.
     pub(super) fn release_answered_elsewhere(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> Option<u64> {
+    ) -> Option<EndedReservation> {
         self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
@@ -349,8 +459,8 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
         answered_elsewhere: bool,
-    ) -> Option<u64> {
-        let (released, claim) = {
+    ) -> Option<EndedReservation> {
+        let (ended, claim) = {
             let mut inner = self.lock();
             let ended =
                 inner
@@ -358,12 +468,15 @@ impl WorkQueue {
                     .end_reservation_at_receipt(owner, height, answered_elsewhere)?;
             let (outcome, claim) = self.return_items_locked(&mut inner, ended.owner, []);
             (
-                ended.released_bytes.saturating_add(outcome.released_bytes),
+                EndedReservation {
+                    charge: ended.released_bytes,
+                    released: ended.released_bytes.saturating_add(outcome.released_bytes),
+                },
                 claim,
             )
         };
         drop(claim);
-        Some(released)
+        Some(ended)
     }
 
     /// Claim a received height and end any request reservation it owned.
@@ -525,6 +638,7 @@ impl WorkQueue {
         let (mut outcome, wake) = inner.state.return_owned(owner, heights);
         outcome.request_was_unwritten = request_was_unwritten;
         self.wake(wake);
+
         (outcome, claim)
     }
 
@@ -560,6 +674,7 @@ impl WorkQueue {
             inner.request_writes.remove(&claim.owner());
         }
         let delta = inner.state.reset_above(floor);
+
         drop(inner);
         drop(claims);
         self.wake(delta.wake);
@@ -605,6 +720,19 @@ impl WorkQueue {
     #[cfg(test)]
     pub(super) fn reserved_bytes_scanned(&self) -> u64 {
         self.lock().state.reserved_bytes_scanned()
+    }
+
+    /// Every queued item with its owner and byte quantities, read from the
+    /// queue maps rather than from the maintained tallies.
+    #[cfg(test)]
+    pub(super) fn ownership_snapshot(&self) -> Vec<WorkItemOwnership> {
+        Self::ownership(&self.lock())
+    }
+
+    /// The items of `inner`, as [`Self::ownership_snapshot`] reads them.
+    #[cfg(any(test, zakura_sim))]
+    fn ownership(inner: &WorkQueueInner) -> Vec<WorkItemOwnership> {
+        inner.state.ownership()
     }
 
     /// Number of contiguous runs across `pending` (one queued range per maximal

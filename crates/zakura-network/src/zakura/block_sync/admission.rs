@@ -1,6 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zakura_chain::block;
+use zakura_rt::time::Instant;
 
 use super::{
     config::{ZakuraBlockSyncConfig, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
@@ -27,8 +28,9 @@ const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// [`estimated_resident_pipeline_bytes`].
 ///
 // The factor is a calibration from the measured ~3.3–4x wire→resident ratio of real
-// blocks. It is an average, not a bound: a consensus-valid block can decode at about
-// 26x. Admission charges the measured decoded heap whenever it exceeds this estimate.
+// blocks before legacy bundles were boxed. It is an average, not a bound: small
+// transparent transactions can still exceed it. Admission charges the measured
+// decoded heap whenever it exceeds this estimate.
 pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 
 /// Pure inputs for deciding whether a block request may consume budget.
@@ -217,7 +219,8 @@ impl AdmissionSnapshot {
 /// Serialized pools (reorder backlog, applying backlog, and outstanding
 /// reservations) cost their wire bytes while retained. Decoded pools add the
 /// decoded multiple: the sequencer input channel (bodies arrive decoded from
-/// the peer routine, bounded by the channel depth) and in-flight submissions
+/// the peer routine while the decoded cap has room, and raw past it, bounded
+/// by the channel depth) and in-flight submissions
 /// (decoded at `prepare_submit`, charged through their exact completion even
 /// after detachment, and bounded by `submitted_apply_limit`). A detached
 /// submission no longer contributes applying wire bytes, but its decoded

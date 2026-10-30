@@ -5,12 +5,11 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 
 use futures::{future::BoxFuture, FutureExt};
-use once_cell::sync::Lazy;
 use orchard::{
     bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
@@ -101,35 +100,33 @@ fn build_verifying_key(version: OrchardCircuitVersion) -> ItemVerifyingKey {
     vk
 }
 
-lazy_static::lazy_static! {
-    /// The Orchard Action verifying key for the **pre-NU6.2** (insecure) circuit.
-    ///
-    /// Reconstructs the verifying key of the original (NU5..NU6.2) Orchard Action circuit.
-    /// Bundles mined before NU6.2 committed to this circuit and only verify under this key, so it
-    /// MUST be retained to re-verify pre-NU6.2 history on resync. It must never be used to verify
-    /// post-NU6.2 bundles.
-    pub static ref VERIFYING_KEY_PRE_NU6_2: ItemVerifyingKey =
-        build_verifying_key(OrchardCircuitVersion::InsecurePreNu6_2);
+/// The Orchard Action verifying key for the **pre-NU6.2** (insecure) circuit.
+///
+/// Reconstructs the verifying key of the original (NU5..NU6.2) Orchard Action circuit.
+/// Bundles mined before NU6.2 committed to this circuit and only verify under this key, so it
+/// MUST be retained to re-verify pre-NU6.2 history on resync. It must never be used to verify
+/// post-NU6.2 bundles.
+pub static VERIFYING_KEY_PRE_NU6_2: LazyLock<ItemVerifyingKey> =
+    LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::InsecurePreNu6_2));
 
-    /// The Orchard Action verifying key for the **NU6.2-until-NU6.3** (fixed) circuit.
-    ///
-    /// Built from the fixed variable-base scalar-multiplication Orchard Action circuit shipped in
-    /// NU6.2. Orchard bundles mined from the NU6.2 activation height until NU6.3 commit to this
-    /// circuit and only verify under this key. At NU6.3 the Orchard pool moves to
-    /// [`VERIFYING_KEY_NU6_3_ONWARD`]. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
-    pub static ref VERIFYING_KEY_NU6_2: ItemVerifyingKey =
-        build_verifying_key(OrchardCircuitVersion::FixedPostNu6_2);
+/// The Orchard Action verifying key for the **NU6.2-until-NU6.3** (fixed) circuit.
+///
+/// Built from the fixed variable-base scalar-multiplication Orchard Action circuit shipped in
+/// NU6.2. Orchard bundles mined from the NU6.2 activation height until NU6.3 commit to this
+/// circuit and only verify under this key. At NU6.3 the Orchard pool moves to
+/// [`VERIFYING_KEY_NU6_3_ONWARD`]. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
+pub static VERIFYING_KEY_NU6_2: LazyLock<ItemVerifyingKey> =
+    LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::FixedPostNu6_2));
 
-    /// The Orchard Action verifying key for the **NU6.3-onward** circuit.
-    ///
-    /// The NU6.3 circuit extends the fixed circuit with the `disableCrossAddress` constraint. Every
-    /// Orchard Action mined from NU6.3 onward proves under it: v5 Orchard bundles at NU6.3, v6
-    /// Orchard bundles, and Ironwood bundles. They must not be verified with the NU6.2 fixed key,
-    /// which leaves `disableCrossAddress` unconstrained and so cannot enforce the cross-address
-    /// restriction.
-    pub static ref VERIFYING_KEY_NU6_3_ONWARD: ItemVerifyingKey =
-        build_verifying_key(OrchardCircuitVersion::PostNu6_3);
-}
+/// The Orchard Action verifying key for the **NU6.3-onward** circuit.
+///
+/// The NU6.3 circuit extends the fixed circuit with the `disableCrossAddress` constraint. Every
+/// Orchard Action mined from NU6.3 onward proves under it: v5 Orchard bundles at NU6.3, v6
+/// Orchard bundles, and Ironwood bundles. They must not be verified with the NU6.2 fixed key,
+/// which leaves `disableCrossAddress` unconstrained and so cannot enforce the cross-address
+/// restriction.
+pub static VERIFYING_KEY_NU6_3_ONWARD: LazyLock<ItemVerifyingKey> =
+    LazyLock::new(|| build_verifying_key(OrchardCircuitVersion::PostNu6_3));
 
 /// A Halo2 verification item, used as the request type of the service.
 ///
@@ -354,8 +351,8 @@ fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackServic
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
+pub static VERIFIER_PRE_NU6_2: LazyLock<VerifierService> =
+    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
 
 /// Global batch verification context for **NU6.2-until-NU6.3** Halo2 Action proofs.
 ///
@@ -365,8 +362,8 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
+pub static VERIFIER_NU6_2: LazyLock<VerifierService> =
+    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
 
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
@@ -378,14 +375,14 @@ pub static VERIFIER_NU6_2: Lazy<VerifierService> =
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
+pub static VERIFIER_NU6_3_ONWARD: LazyLock<VerifierService> =
+    LazyLock::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
 
 /// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
 ///
 /// Keeping selection separate from initialization lets tests verify every
 /// routing branch without building the expensive Orchard verifying keys.
-fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierService> {
+fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static LazyLock<VerifierService> {
     use NetworkUpgrade::*;
 
     match network_upgrade {

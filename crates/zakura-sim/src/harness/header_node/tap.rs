@@ -84,6 +84,10 @@ struct TapState {
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
+    /// Set when the observer recorded an event whose number wasn't the
+    /// slot's count as it arrived, so the observer repeated an event or lost
+    /// an earlier one. Equal totals alone would let a repeat hide a loss.
+    out_of_step: AtomicBool,
     buffer: Mutex<Buffer>,
 }
 
@@ -122,11 +126,17 @@ impl LiveEvidence for TapState {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is.
+    /// `PortGone` once an event found the node's port dropped, `Unobserved`
+    /// once the observer recorded an event out of step with the slot's
+    /// count, and `ReactorGone` once the observer is gone.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
+        } else if self.out_of_step.load(Ordering::Relaxed) {
+            Some(
+                "Unobserved: the tapped reactor's observer recorded an event out of step with \
+                 its slot's count, repeating it or after losing one",
+            )
         } else if self.observer.strong_count() == 0 {
             Some("ReactorGone: the tapped reactor dropped its observer during the run")
         } else {
@@ -169,6 +179,14 @@ impl HeaderSyncObserver for TapObserver {
             .checked_add(1)
             .expect("a run records fewer than 2^64 events");
         let seq = buffer.last;
+        // The slot counts an event before the observer sees it.
+        if seq
+            != state
+                .emitted
+                .load(zakura_rt::sync::counter::Ordering::Relaxed)
+        {
+            state.out_of_step.store(true, Ordering::Relaxed);
+        }
         buffer.events.push((seq, storage_seq, pos, event));
     }
 }
@@ -199,6 +217,7 @@ impl ReactorTap {
                 emitted: Arc::clone(&emitted),
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
+                out_of_step: AtomicBool::new(false),
                 buffer: Mutex::default(),
             }))
         });

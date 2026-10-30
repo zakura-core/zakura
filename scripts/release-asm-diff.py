@@ -716,12 +716,18 @@ def run_comparisons(items, explain=False):
 def run_line_checks(items):
     """Checks that padding a side changed none of its instructions, returning the worst exit status.
 
-    Each item is `(title, unpadded files, padded files)`. The gate's contract
-    is "identical apart from source line numbers": a line number may move
-    where it only labels a panic or a log line, which lives in data. If one
-    reaches an instruction, by any route, such as `line!` forwarded through
-    a macro, padding changed what the program computes, and the padded
-    comparison can't vouch for it.
+    Each item is `(title, unpadded files, padded files)`. A line number may
+    move where it only labels a panic or a log line, which lives in data
+    (see the module docs' contract). If one reaches an instruction, by any
+    route, such as `line!` forwarded through a macro, padding changed what
+    the program computes, and the padded comparison can't vouch for it.
+
+    Padding that changes the size of data also changes the code, since
+    instructions and relocations address data by offset. An embedded
+    padded file does that (the embed check names it), and so, rarely, does
+    a `tracing` event whose line crosses a power of ten, since its name
+    holds the line as text. That fails closed; moving the hook a line
+    avoids it.
     """
     status = EXIT_SAME
     for title, unpadded, padded in items:
@@ -730,7 +736,8 @@ def run_line_checks(items):
             status = max(status, EXIT_EMPTY)
             continue
         differences = compare_files(unpadded, padded, code_only=True)
-        print("%s: %s" % (title, "line numbers reach code" if differences else "code unchanged by padding"))
+        print("%s: %s" % (title, "code changed by padding (a line number reaches code, or padded data changed size)"
+                              if differences else "code unchanged by padding"))
         for line in differences[:MAX_PRINTED]:
             print("  " + line)
         if differences:

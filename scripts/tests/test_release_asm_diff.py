@@ -521,7 +521,7 @@ class LineCheckTests(unittest.TestCase):
         status, output = self.run_gate("code")
         self.assertEqual(status, 1, output)
         self.assertIn("x codegen-units=4: 1 files: identical", output)
-        self.assertIn("line check base x codegen-units=4: line numbers reach code", output)
+        self.assertIn("line check base x codegen-units=4: code changed by padding", output)
         self.assertIn("section __TEXT,__text", output)
 
     def test_a_line_number_that_reaches_only_data_passes(self):

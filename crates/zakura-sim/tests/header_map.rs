@@ -14,7 +14,11 @@ use zakura_network::zakura::{
 };
 use zakura_sim::{
     harness::{
-        header_node::{reads::without_reads, Chain, Policy},
+        header_node::{
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            reads::without_reads,
+            Chain, Policy,
+        },
         header_sync::{wire_config, HeaderWire, WireScenario},
         run_prepared,
         wire_node::TransportTap,
@@ -56,6 +60,35 @@ fn honest() -> WireScenario {
             ..PeerSpec::dialing()
         }],
         policy: Policy::converging(),
+        ..WireScenario::default()
+    }
+}
+
+/// The node at 50 dials `peer-0`, which holds the 1,200-header tree and
+/// finishes its side of the header stream once every subscription has
+/// ended, so the stream's session tears down and a new one reopens on the
+/// same connection (`header_wire_view.rs`'s reopen).
+fn reopen() -> WireScenario {
+    let mut peer = PeerSpec {
+        honest: Some(HonestSpec {
+            chain: 1_200,
+            subscribe: None,
+        }),
+        ..PeerSpec::listening()
+    };
+    peer.script = vec![PeerAction::FinishHeader];
+    WireScenario {
+        node: Chain::main(50),
+        peers: vec![peer],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 2),
+                until: Trigger::VirtualTime(5_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
         ..WireScenario::default()
     }
 }
@@ -246,22 +279,33 @@ fn map_reads_add_no_scheduling_point() {
     }
 }
 
-/// Each registry record carries the services the registry reached: every
-/// fanout's mask is within the mask its peer carried, a connection's
-/// fanout reaches header sync exactly when its header stream was admitted
-/// before it, and each `registry-removed` names the union of its
-/// connection's fanout masks, the services its cleanup guard removes. The
-/// runs first show a fanout that reaches header sync and a removal, on the
-/// honest sync and on both connections of the replacement history.
+/// Each registry record carries the services the registry reached, one
+/// record per fanout call: every fanout's mask is within the mask its peer
+/// carried, a connection's fanout reaches header sync exactly when its
+/// header stream was admitted since its last fanout, every header
+/// admission is followed by such a fanout, so each connection has as many
+/// header fanouts as header admissions and none is left over, and each
+/// `registry-removed` names the union of its connection's fanout masks,
+/// the services its cleanup guard removes. The runs first show a fanout
+/// that reaches header sync on the honest sync, a removal on the
+/// replacement history's first connection, and, on the reopen history,
+/// one connection fanning out header sync's mask twice.
 ///
-/// This fails if a record names services the call didn't reach.
+/// This fails if a record names services the call didn't reach, or a call
+/// makes no record, even one whose mask an earlier record already named.
 #[test]
 fn registry_records_carry_their_masks() {
-    for scenario in [honest(), replacement()] {
+    for (name, scenario) in [
+        ("honest", honest()),
+        ("replacement", replacement()),
+        ("reopen", reopen()),
+    ] {
         let report = run(&scenario, Plan::from_fuzz(&[]));
-        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        assert_eq!(report.end.harness, None, "{name}: {:?}", report.end);
         let mut admitted: BTreeMap<u64, bool> = BTreeMap::new();
         let mut reached: BTreeMap<u64, u64> = BTreeMap::new();
+        // Each connection's header admissions and header fanouts.
+        let mut counts: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
         let (mut header_fanouts, mut removals) = (0, 0);
         for entry in report.log.entries() {
             let Observation::Transport {
@@ -274,7 +318,11 @@ fn registry_records_carry_their_masks() {
             };
             match event {
                 TransportFact::Admitted { kind, .. } if *kind == ZAKURA_STREAM_HEADER_SYNC => {
-                    admitted.insert(*connection, true);
+                    assert!(
+                        admitted.insert(*connection, true).is_none(),
+                        "{name}: {connection}: an admission before the last one's fanout"
+                    );
+                    counts.entry(*connection).or_default().0 += 1;
                 }
                 TransportFact::RegistryFanout {
                     negotiated,
@@ -292,6 +340,7 @@ fn registry_records_carry_their_masks() {
                         "{connection}: the fanout reaches header sync after its stream"
                     );
                     header_fanouts += usize::from(header);
+                    counts.entry(*connection).or_default().1 += usize::from(header);
                     *reached.entry(*connection).or_default() |= admitted_mask;
                 }
                 TransportFact::RegistryRemoved { admitted_mask } => {
@@ -305,8 +354,27 @@ fn registry_records_carry_their_masks() {
                 _ => {}
             }
         }
-        assert!(header_fanouts > 0, "a fanout reaches header sync");
-        assert!(removals > 0 || scenario.peers[0].script.is_empty());
+        assert!(header_fanouts > 0, "{name}: a fanout reaches header sync");
+        assert!(
+            removals > 0 || name != "replacement",
+            "{name}: the first connection's services are removed"
+        );
+        assert!(
+            admitted.is_empty(),
+            "{name}: admissions with no fanout after them: {admitted:?}"
+        );
+        for (connection, (admissions, fanouts)) in &counts {
+            assert_eq!(
+                admissions, fanouts,
+                "{name}: {connection}: one header fanout per header admission"
+            );
+        }
+        if name == "reopen" {
+            assert!(
+                counts.values().any(|(_, fanouts)| *fanouts >= 2),
+                "{name}: a connection fans out header sync's mask twice: {counts:?}"
+            );
+        }
     }
 }
 

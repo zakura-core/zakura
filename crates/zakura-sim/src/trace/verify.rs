@@ -8,7 +8,8 @@ use crate::{
 };
 
 /// Compares a replay's `init` and step records with a trace's, and keeps the
-/// replay's `end` record for [`end_difference`].
+/// replay's `end` record for [`end_difference`]. It can also keep a copy of
+/// every record, for evidence.
 ///
 /// The decider has already checked each pick and draw, and echoes the
 /// recorded `by` and offset, so a differing record in practice differs in its
@@ -25,11 +26,16 @@ pub(crate) struct VerifySink<'t> {
     pub(crate) steps_seen: usize,
     /// The replay's `end` record, once emitted.
     pub(crate) end: Option<EndRecord>,
+    /// Whether to keep a copy of every record.
+    keep: bool,
+    /// Every record received, in order, if `keep` is set.
+    pub(crate) kept: Vec<Record>,
 }
 
 impl<'t> VerifySink<'t> {
-    /// A sink that checks records against `trace`.
-    pub(crate) fn new(trace: &'t Trace) -> Self {
+    /// A sink that checks records against `trace`, and keeps a copy of
+    /// each if `keep` is set.
+    pub(crate) fn new(trace: &'t Trace, keep: bool) -> Self {
         VerifySink {
             init: trace.init.as_ref(),
             steps: &trace.steps,
@@ -37,6 +43,8 @@ impl<'t> VerifySink<'t> {
             first: None,
             steps_seen: 0,
             end: None,
+            keep,
+            kept: Vec::new(),
         }
     }
 
@@ -49,6 +57,9 @@ impl<'t> VerifySink<'t> {
 
 impl RecordSink for VerifySink<'_> {
     fn record(&mut self, record: Record) {
+        if self.keep {
+            self.kept.push(record.clone());
+        }
         match record {
             Record::Init(init) => {
                 if self.init != Some(&init) {

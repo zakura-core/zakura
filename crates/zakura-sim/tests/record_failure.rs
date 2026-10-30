@@ -26,7 +26,7 @@ use zakura_sim::{
     record::{EndRecord, OutcomeKind},
     trace::{
         record_failure, Trace, TraceReader, DIVERGENCE_FILE, FIRST_END_FILE, INPUT_FILE,
-        NONDETERMINISTIC_DIR, RECORDING_DIR, RERUN_DIR, TRACES_DIR,
+        NONDETERMINISTIC_DIR, PROPERTIES_FILE, RECORDING_DIR, REPLAY_DIR, TRACES_DIR,
     },
     ActionSource, Identity, MemorySink, NullSink, Observation, ObservationLog, Plan,
     PropertyOutcome, Record, RecordSink, RunConfig, RunReport, Sim,
@@ -194,7 +194,13 @@ struct TickScenario {
     /// Whether tick 2's observation reads the host clock: a planted
     /// nondeterminism that changes an observation and nothing else.
     stamp: bool,
+    /// Whether tick 2's observation says if [`PARITY_RUNS`] was even: a
+    /// planted nondeterminism that only every other run shows.
+    parity: bool,
 }
+
+/// Runs that observed tick 2 of a `parity` scenario.
+static PARITY_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A source that offers `ticks` ticks, one per step, and observes each.
 struct Clock {
@@ -217,6 +223,10 @@ impl ActionSource for Clock {
         self.next.set(n + 1);
         let event = match n {
             2 if self.scenario.stamp => format!("tick 2 at {}", host_nanos()),
+            2 if self.scenario.parity => {
+                let runs = PARITY_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("tick 2 after {} runs", runs % 2)
+            }
             _ => format!("tick {n}"),
         };
         log.push(Observation::Fake {
@@ -320,6 +330,7 @@ impl Subsystem for Ticks {
         TickScenario {
             ticks: 5,
             stamp: false,
+            parity: false,
         }
     }
 }
@@ -339,6 +350,7 @@ fn record_failure_catches_a_planted_nondeterminism() {
     let (ticks, scenario, first) = ticks_run(&TickScenario {
         ticks: 5,
         stamp: true,
+        parity: false,
     });
     assert_eq!(first.end.violation.as_ref().unwrap().property, ACTIVE);
     assert_eq!(first_violation(&first, ACTIVE), 4);
@@ -361,9 +373,9 @@ fn record_failure_catches_a_planted_nondeterminism() {
             let evidence = evidence.expect("record_failure keeps the evidence");
             let divergence = divergence(root.path(), &evidence);
             assert_eq!(divergence["check"], "replay");
-            // The second recording stamps another time at the same step.
+            // The replay stamps another time at the same step.
             assert_eq!(
-                divergence["rerun_difference"],
+                divergence["replay_difference"],
                 json!({ "step": 3, "field": "obs" })
             );
             // The first run and the recording end alike.
@@ -390,10 +402,12 @@ fn record_failure_keeps_a_recording_that_disagrees() {
     let (ticks, _, first) = ticks_run(&TickScenario {
         ticks: 5,
         stamp: false,
+        parity: false,
     });
     let three = serde_json::to_value(TickScenario {
         ticks: 3,
         stamp: false,
+        parity: false,
     })
     .unwrap();
     let root = TempDir::new().unwrap();
@@ -414,16 +428,89 @@ fn record_failure_keeps_a_recording_that_disagrees() {
     let divergence = divergence(root.path(), &evidence);
     assert_eq!(divergence["check"], "recording");
     assert_eq!(divergence["end_difference"], "end.outcome");
-    // Both reruns ran three ticks alike.
-    assert_eq!(divergence["rerun_difference"], Value::Null);
+    // No replay ran.
+    assert_eq!(divergence["replay_difference"], Value::Null);
     let recording = TraceReader::open(&evidence.join(RECORDING_DIR)).unwrap();
     assert_eq!(recording.end.unwrap().violation, None);
     assert!(first_end(&evidence).violation.is_some());
+    let properties = properties(&evidence);
+    assert_eq!(violation_step(&properties["first"]), Some(4));
+    assert_eq!(violation_step(&properties["recording"]), None);
+    assert_eq!(properties["replay"], Value::Null);
+}
+
+/// The evidence holds the records and property reports of the replay that
+/// disagreed with the recording. A third run would hide this
+/// nondeterminism: it shows only in every other run, so a fresh recording
+/// after the replay matches the first recording.
+#[test]
+fn record_failure_keeps_the_replay_that_diverged() {
+    let (ticks, scenario, first) = ticks_run(&TickScenario {
+        ticks: 5,
+        stamp: false,
+        parity: true,
+    });
+    let root = TempDir::new().unwrap();
+    let evidence = match record_failure(
+        ticks,
+        &scenario,
+        &[],
+        &PropertyId::new(ACTIVE),
+        &first,
+        root.path(),
+    ) {
+        Err(RecordError::Nondeterministic { detail, evidence }) => {
+            assert!(
+                detail.contains("step 3 recorded a different obs"),
+                "{detail}"
+            );
+            evidence.expect("record_failure keeps the evidence")
+        }
+        other => panic!("expected Nondeterministic, got {other:?}"),
+    };
+    let divergence = divergence(root.path(), &evidence);
+    assert_eq!(divergence["check"], "replay");
+    assert_eq!(
+        divergence["replay_difference"],
+        json!({ "step": 3, "field": "obs" })
+    );
+    assert_eq!(divergence["replay_error"], Value::Null);
+    let recording = TraceReader::open(&evidence.join(RECORDING_DIR)).unwrap();
+    let replay = TraceReader::open(&evidence.join(REPLAY_DIR)).unwrap();
+    assert_eq!(replay.meta, recording.meta);
+    assert_eq!(replay.steps.len(), recording.steps.len());
+    // The replay took the recording's picks, and only step 3's `obs`
+    // differs.
+    for (recorded, replayed) in recording.steps.iter().zip(&replay.steps) {
+        assert_eq!(recorded.pick, replayed.pick);
+        assert_eq!(recorded.obs == replayed.obs, recorded.step != 3);
+    }
+    let properties = properties(&evidence);
+    for run in ["first", "recording", "replay"] {
+        assert_eq!(violation_step(&properties[run]), Some(4), "{run}");
+    }
+}
+
+/// The step of ACTIVE's first violation in `reports`, a run's property
+/// reports as `properties.json` holds them.
+fn violation_step(reports: &Value) -> Option<u64> {
+    let reports = reports.as_array();
+    assert!(reports.is_some(), "a run's property reports");
+    reports?
+        .iter()
+        .find(|report| report["property"] == ACTIVE)
+        .and_then(|report| report["violations"][0]["step"].as_u64())
+}
+
+/// `properties.json` in `evidence`.
+fn properties(evidence: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(evidence.join(PROPERTIES_FILE)).unwrap()).unwrap()
 }
 
 /// `divergence.json` in `evidence`, a nondeterminism evidence directory
 /// under `root`, once its layout checks out: it sits under ACTIVE's
-/// directory, and both recordings read back complete.
+/// directory, it holds the replay's records only for a failed replay check,
+/// and each trace reads back complete.
 fn divergence(root: &Path, evidence: &Path) -> Value {
     assert_eq!(
         evidence.parent().unwrap(),
@@ -432,15 +519,24 @@ fn divergence(root: &Path, evidence: &Path) -> Value {
             .fold(root.join(NONDETERMINISTIC_DIR), |dir, segment| dir
                 .join(segment))
     );
-    assert_eq!(
-        entries(evidence),
-        [DIVERGENCE_FILE, FIRST_END_FILE, RECORDING_DIR, RERUN_DIR]
-    );
-    for dir in [RECORDING_DIR, RERUN_DIR] {
+    let divergence: Value =
+        serde_json::from_str(&std::fs::read_to_string(evidence.join(DIVERGENCE_FILE)).unwrap())
+            .unwrap();
+    let mut expected = vec![
+        DIVERGENCE_FILE,
+        FIRST_END_FILE,
+        PROPERTIES_FILE,
+        RECORDING_DIR,
+    ];
+    if divergence["check"] == "replay" {
+        expected.push(REPLAY_DIR);
+    }
+    assert_eq!(entries(evidence), expected);
+    for dir in &expected[3..] {
         let trace = TraceReader::open(&evidence.join(dir)).unwrap();
         assert!(trace.is_complete(), "{dir}");
     }
-    serde_json::from_str(&std::fs::read_to_string(evidence.join(DIVERGENCE_FILE)).unwrap()).unwrap()
+    divergence
 }
 
 /// The first run's `end` record, as the evidence keeps it.
@@ -456,6 +552,7 @@ fn save_failure_files_a_nondeterministic_input_once() {
     let (ticks, scenario, first) = ticks_run(&TickScenario {
         ticks: 5,
         stamp: true,
+        parity: false,
     });
     let run = ExploreRun {
         scenario: Some(scenario),
@@ -490,6 +587,7 @@ fn record_failure_records_a_known_violation() {
     let (ticks, scenario, first) = ticks_run(&TickScenario {
         ticks: 3,
         stamp: false,
+        parity: false,
     });
     // The Known violation didn't end the run.
     assert_eq!(first.end.violation, None);

@@ -31,7 +31,9 @@ python3 scripts/fuzz-campaign.py --campaign qa/fuzz/sim/campaigns/full-suite-202
 the source and lockfile digests, `qa/suite.toml`'s digest, every target,
 harness, property, witness and pending row, and the seed report. Its
 target rows hold each target's 60-second smoke command over its seeds. Run
-them before the calibration segment.
+them before the calibration segment. Run each row's generated command
+unchanged. A direct binary smoke over an empty corpus does not execute the
+admitted seeds and does not satisfy C3.
 
 ## Run a segment
 
@@ -62,6 +64,21 @@ writes `run.log`, `exit-status`, libFuzzer's artifacts and
 shard's directory also holds `segment.json`, `suite.json`, and the start
 and finish times. Every segment of a target grows the same corpus,
 `$CAMPAIGN_ROOT/corpus/<package>/<target>/`.
+
+### Block-storage calibration limit
+
+The campaign host exposed a target-design limit during calibration. The
+committed `block-sync-above-window` seed takes about 430 seconds without
+AddressSanitizer and more than 900 seconds with AddressSanitizer. The
+`block-sync-stuck-floor` seed has a 1.5-million-step budget and did not
+finish during 28 minutes of a non-sanitized corpus initialization.
+LibFuzzer's per-input timeout also did not fire in that non-sanitized run.
+
+Keep these inputs in C2's retained witness suite and full admitted corpus.
+Do not report `block_sync_storage` as C3-complete until a bounded search
+harness or equivalent target separates continuous search scenarios from
+the retained long witnesses. A search over a separate bounded corpus may
+continue as explicitly incomplete campaign evidence.
 
 A segment's script refuses to reuse a segment's directory. To continue an
 interrupted segment, run its next attempt with `--attempt 2` (then 3, and

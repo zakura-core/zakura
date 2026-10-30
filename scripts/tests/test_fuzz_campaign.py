@@ -39,7 +39,7 @@ def campaign():
         "name": "test",
         "cpus": 4,
         "integration": {"base": "b" * 40},
-        "toolchain": {"fuzz": "nightly-2026-07-15"},
+        "toolchain": {"rust": "1.98.0", "fuzz": "nightly-2026-07-15"},
         "formats": {"trace": 21, "contract": 1},
         "segment": [{"name": "pilot", "budget-secs": 3600}],
         "target": [
@@ -150,7 +150,7 @@ class ScriptTest(unittest.TestCase):
         script = self.script("sim")
         self.assertIn(
             "test -d /c/corpus/sim/discovery_wait_complete || { mkdir -p /c/corpus/sim/discovery_wait_complete "
-            "&& cargo xtask sim-seeds --sim discovery/wait-complete --out /c/corpus/sim/discovery_wait_complete; }",
+            "&& cargo +1.98.0 xtask sim-seeds --sim discovery/wait-complete --out /c/corpus/sim/discovery_wait_complete; }",
             script,
         )
         self.assertIn("'RUSTFLAGS=--cfg zakura_sim' "

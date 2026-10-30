@@ -2,7 +2,8 @@
 # `zakura-sim suite`, defines the suite's targets. This file adds only what
 # the campaign decides: the integration it runs, each target's workers,
 # shard and per-input timeout, and each segment's search budget.
-# `../launch.py` refuses a target set that differs from C1's manifest.
+# `scripts/fuzz-campaign.py` refuses a target set that differs from C1's
+# manifest.
 
 schema = 2
 name = "full-suite-20261029"
@@ -12,8 +13,8 @@ artifacts_root = "/srv/zakura-fuzz/campaigns/full-suite-20261029"
 # The campaign host's vCPUs. No shard's workers may exceed them.
 cpus = 8
 
-# The PR heads merged into the campaign branch. `launch.py` checks that each
-# is an ancestor of the checkout.
+# The PR heads merged into the campaign branch. `scripts/fuzz-campaign.py`
+# checks that each is an ancestor of the checkout.
 [integration]
 base = "4eab091b605ff7adab9f37515195d58f1362633c"
 pull_1824 = "476415833998f2c17a5cb83558674306a52bc8d6"
@@ -25,8 +26,8 @@ pull_1832 = "1d84808bcba8d398dd90db57a80e093c6aed91fa"
 pull_1833 = "f3a60bb1c0e33021ea94a50b37242c531c908551"
 pull_1837 = "0dfcf619efb0dbd08ccbacd50bdc512446b1d718"
 
-# `launch.py` checks `fuzz`, `trace` and `contract` against the frozen suite
-# manifest.
+# `scripts/fuzz-campaign.py` checks `fuzz`, `trace` and `contract` against
+# the frozen suite manifest, and seeds corpora with `rust`'s cargo.
 [toolchain]
 rust = "1.98.0"
 fuzz = "nightly-2026-07-15"

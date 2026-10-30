@@ -21,8 +21,8 @@ Run these commands from a clean checkout of the campaign commit. Set
 ```console
 export CAMPAIGN_ROOT=/srv/zakura-fuzz/campaigns/full-suite-20261029
 mkdir -p "$CAMPAIGN_ROOT"
-RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --locked
-cargo xtask sim-suite --frozen --out "$CAMPAIGN_ROOT/suite.json"
+RUSTFLAGS="--cfg zakura_sim" cargo +1.98.0 test -p zakura-sim --locked
+cargo +1.98.0 xtask sim-suite --frozen --out "$CAMPAIGN_ROOT/suite.json"
 python3 scripts/fuzz-campaign.py --campaign qa/fuzz/sim/campaigns/full-suite-20261029 \
   --suite-manifest "$CAMPAIGN_ROOT/suite.json" --check
 ```

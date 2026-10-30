@@ -211,7 +211,10 @@ def segment_script(campaign, rows, suite_manifest, segment, shard, attempt, only
             f"{rustflags}cargo +{toolchain} fuzz build --fuzz-dir {q(str(repo / 'qa/fuzz' / package))} {q(name)}"
         )
         harness = row.get("harness")
-        seed = f" && cargo xtask sim-seeds --sim {q(harness)} --out {q(str(corpus))}" if harness else ""
+        seed = (
+            f" && cargo +{campaign['toolchain']['rust']} xtask sim-seeds --sim {q(harness)} --out {q(str(corpus))}"
+            if harness else ""
+        )
         lines.append(f"test -d {q(str(corpus))} || {{ mkdir -p {q(str(corpus))}{seed}; }}")
     for target in targets:
         row = rows[target["id"]]

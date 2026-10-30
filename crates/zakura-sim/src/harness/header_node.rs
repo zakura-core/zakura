@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_header_chain::{Frontier, VctRootRepairStatus};
 use zakura_network::zakura::{
-    framed_channel, observe::HeaderSyncObserver, spawn_header_sync_reactor, FullStateFrontiers,
+    framed_channel, observe::ObserverSlot, spawn_header_sync_reactor, FullStateFrontiers,
     HeaderSyncHandle, HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
@@ -470,7 +470,7 @@ impl HeaderNode {
         fixture: &HeaderFixture,
         tip: Frontier,
         dispatch: DispatchFlag,
-        observer: Option<Arc<dyn HeaderSyncObserver>>,
+        observer: Option<ObserverSlot>,
     ) -> Self {
         let anchor = fixture.anchor();
         let mut startup = HeaderSyncStartup::new(
@@ -489,7 +489,9 @@ impl HeaderNode {
         startup.committed_snapshots = Some(port.selected_chain());
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
-        startup.observer.0 = observer;
+        if let Some(observer) = observer {
+            startup.observer = observer;
+        }
         let facts = StartupFacts {
             config: startup.config.clone(),
             request_timeout: startup.request_timeout,

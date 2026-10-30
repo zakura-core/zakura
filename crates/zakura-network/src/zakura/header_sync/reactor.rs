@@ -49,8 +49,8 @@ use super::observe::{self, ReactorEvent};
 #[cfg(any(test, zakura_sim))]
 macro_rules! observe {
     ($reactor:expr, $event:expr) => {
-        if let Some(observer) = &$reactor.startup.observer.0 {
-            observer.observe($event)
+        if $reactor.startup.observer.is_installed() {
+            $reactor.startup.observer.emit($event)
         }
     };
 }
@@ -4589,9 +4589,9 @@ impl HeaderSyncReactor {
         let dispatched = self
             .startup
             .observer
-            .0
-            .as_ref()
-            .and_then(|_| observe::PortCall::of(action));
+            .is_installed()
+            .then(|| observe::PortCall::of(action))
+            .flatten();
         let is_port_call = !matches!(
             action,
             HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. }

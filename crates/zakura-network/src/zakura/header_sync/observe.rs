@@ -7,6 +7,8 @@
 
 use std::{any::Any, fmt, panic::AssertUnwindSafe, sync::Arc};
 
+use zakura_rt::sync::counter;
+
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
 
@@ -18,25 +20,97 @@ use crate::zakura::ZakuraPeerId;
 
 /// Receives reactor events as they happen.
 ///
-/// Called synchronously on the reactor task, never while the reactor holds a
-/// lock. An implementation must not block, yield, take a `zakura_rt` lock, or
-/// call into the reactor. A panic in `observe` unwinds the reactor task, even
-/// when it is called inside a port future.
+/// Every event reaches it through its slot's counted delivery path,
+/// [`ObserverSlot::emit`], which counts it first, so a reader can tell an
+/// event the observer dropped from one never sent.
+///
+/// An implementation must never block, never reach a scheduling point, and
+/// never call back into an observed owner. It may take only diagnostic
+/// locks, such as a std mutex around its own buffer, and never hold one
+/// across a scheduling point. Today the reactor calls it on its own task,
+/// with no lock held, but later owners will call it from any task and
+/// under their own locks, so it mustn't rely on either. A panic in
+/// `observe` unwinds the caller, even when it's called inside a port
+/// future.
 pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: ReactorEvent);
 }
 
-/// The optional observer installed on a reactor's startup.
+/// The optional observer installed on a reactor's startup, with its
+/// delivery count.
+///
+/// The count is shared by every clone, and a reader that holds it, such as
+/// a simulator tap, keeps it after the reactor and its observer are gone.
 #[derive(Clone, Default)]
-pub struct ObserverSlot(pub Option<Arc<dyn HeaderSyncObserver>>);
+pub struct ObserverSlot {
+    observer: Option<Arc<dyn HeaderSyncObserver>>,
+    /// Events [`emit`](Self::emit) handed to the observer, counted before
+    /// each call.
+    emitted: Arc<counter::AtomicU64>,
+}
 
 impl fmt::Debug for ObserverSlot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_tuple("ObserverSlot")
-            .field(&self.0.is_some())
+            .debug_struct("ObserverSlot")
+            .field("installed", &self.observer.is_some())
+            .field("emitted", &self.emitted())
             .finish()
+    }
+}
+
+impl ObserverSlot {
+    /// A slot that delivers to `observer`, with nothing emitted yet.
+    pub fn new(observer: Arc<dyn HeaderSyncObserver>) -> Self {
+        Self::counting(observer, Arc::default())
+    }
+
+    /// A slot that delivers to `observer` and counts into `emitted`, which
+    /// the caller keeps, so it can read the count after the reactor and its
+    /// observer are gone.
+    pub fn counting(
+        observer: Arc<dyn HeaderSyncObserver>,
+        emitted: Arc<counter::AtomicU64>,
+    ) -> Self {
+        ObserverSlot {
+            observer: Some(observer),
+            emitted,
+        }
+    }
+
+    /// A slot that delivers to what `wrap` makes of this slot's observer and
+    /// shares this slot's count, so a reader of the count also sees what the
+    /// wrapper drops. A slot with no observer stays empty.
+    pub fn wrapped(
+        &self,
+        wrap: impl FnOnce(Arc<dyn HeaderSyncObserver>) -> Arc<dyn HeaderSyncObserver>,
+    ) -> Self {
+        ObserverSlot {
+            observer: self.observer.clone().map(wrap),
+            emitted: self.emitted.clone(),
+        }
+    }
+
+    /// Whether an observer is installed.
+    pub fn is_installed(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// The events emitted so far, through any clone.
+    pub fn emitted(&self) -> u64 {
+        self.emitted.load(counter::Ordering::Relaxed)
+    }
+
+    /// Delivers `event` to the observer, if one is installed, counting it
+    /// first. The count is a plain std atomic, so this adds no scheduling
+    /// point. Every reactor event goes through here (rule 7 of the M6a
+    /// observation contract).
+    pub fn emit(&self, event: ReactorEvent) {
+        if let Some(observer) = &self.observer {
+            self.emitted.fetch_add(1, counter::Ordering::Relaxed);
+            observer.observe(event);
+        }
     }
 }
 
@@ -275,20 +349,20 @@ impl RequestRef {
     }
 }
 
-/// The observer and call number a port future reports its end through.
+/// The observer slot and call number a port future reports its end through.
 #[derive(Clone, Debug)]
 pub(crate) struct PortTap {
     /// The call's number, or 0 for an action that calls no port.
     pub(crate) call: u64,
-    observer: Option<Arc<dyn HeaderSyncObserver>>,
+    slot: ObserverSlot,
 }
 
 impl PortTap {
-    /// A tap for `call` that reports to `slot`'s observer, if one is installed.
+    /// A tap for `call` that reports through `slot`.
     pub(crate) fn new(call: u64, slot: &ObserverSlot) -> Self {
         Self {
             call,
-            observer: slot.0.clone(),
+            slot: slot.clone(),
         }
     }
 
@@ -309,12 +383,10 @@ impl PortTap {
     /// Reports that the call ended with `end`, from outside the port future's
     /// panic catch, where an observer panic already unwinds the reactor.
     pub(crate) fn end_after_catch(&self, end: CallEnd) {
-        if let Some(observer) = &self.observer {
-            observer.observe(ReactorEvent::CallEnded {
-                call: self.call,
-                end,
-            });
-        }
+        self.slot.emit(ReactorEvent::CallEnded {
+            call: self.call,
+            end,
+        });
     }
 }
 

@@ -34,7 +34,7 @@ fn registration_and_runtime_run_ids_can_differ() {
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let emitter = observer.clone();
     sim.scheduler().spawn_root("reactor", async move {
-        emitter.observe(ReactorEvent::Handled {
+        emitter.emit(ReactorEvent::Handled {
             call: 1,
             panicked: false,
         });

@@ -195,7 +195,9 @@ fn observed_reactor(
     startup.header_chain_port = port;
     startup.use_direct_port();
     startup.trace = trace;
-    startup.observer = ObserverSlot(recorder.map(|recorder| recorder as _));
+    startup.observer = recorder.map_or_else(ObserverSlot::default, |recorder| {
+        ObserverSlot::new(recorder)
+    });
     let (_, _, reactor) = build_header_sync_reactor(startup).expect("the observed reactor builds");
     (reactor, snapshot)
 }
@@ -537,6 +539,68 @@ async fn handled_follows_the_callbacks_effects() {
     );
 }
 
+/// Forwards every event to its recorder except a port future's
+/// `CallEnded`, which it drops, as a buggy observer might.
+#[derive(Debug, Default)]
+struct DropsCallEnds {
+    recorder: Recorder,
+}
+
+impl HeaderSyncObserver for DropsCallEnds {
+    fn observe(&self, event: ReactorEvent) {
+        if !matches!(event, ReactorEvent::CallEnded { .. }) {
+            self.recorder.observe(event);
+        }
+    }
+}
+
+/// The slot counts each event before the observer sees it, from the
+/// reactor's own events and from inside a port future alike, so an event
+/// the observer drops still shows in the count, and the count outlives the
+/// reactor.
+///
+/// This fails if a port future's `CallEnded` skips the counted path.
+#[tokio::test]
+async fn the_slot_counts_events_the_observer_drops() {
+    let observer = Arc::new(DropsCallEnds::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        None,
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let slot = ObserverSlot::new(observer.clone());
+    reactor.startup.observer = slot.clone();
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let before = slot.emitted();
+    observer.recorder.take();
+
+    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    complete_next(&mut reactor).await;
+
+    let recorded = observer.recorder.take();
+    assert!(
+        matches!(
+            recorded.first(),
+            Some(ReactorEvent::Dispatched { call: 1, .. })
+        ) && matches!(recorded.last(), Some(ReactorEvent::Handled { call: 1, .. })),
+        "the call was dispatched and handled: {recorded:?}"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::CallEnded { .. })),
+        "the observer dropped the call's end"
+    );
+    drop(reactor);
+    assert_eq!(
+        slot.emitted() - before,
+        recorded.len() as u64 + 1, // a test's handful of events fits u64
+        "the count has the dropped `CallEnded` too"
+    );
+}
+
 /// The events strictly between `CallEnded { call }` and `Handled { call }`.
 fn bracket(events: &[ReactorEvent], call: u64) -> &[ReactorEvent] {
     let ended = events
@@ -846,7 +910,7 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
         None,
         crate::zakura::ZakuraTrace::noop(),
     );
-    reactor.startup.observer = ObserverSlot(Some(observer.clone()));
+    reactor.startup.observer = ObserverSlot::new(observer.clone());
     let peer = peer();
     let _outbound = connect(&mut reactor, &peer, 7);
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
@@ -895,7 +959,7 @@ async fn observer_panic_unwinds_with_its_own_payload() {
             None,
             crate::zakura::ZakuraTrace::noop(),
         );
-        reactor.startup.observer = ObserverSlot(Some(observer.clone()));
+        reactor.startup.observer = ObserverSlot::new(observer.clone());
         let peer = peer();
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
@@ -1201,7 +1265,7 @@ fn no_observer_evaluates_nothing() {
     assert_eq!(evaluated.get(), 0);
 
     let recorder = Arc::new(Recorder::default());
-    reactor.startup.observer = ObserverSlot(Some(recorder.clone()));
+    reactor.startup.observer = ObserverSlot::new(recorder.clone());
     observe!(reactor, event());
     assert_eq!(evaluated.get(), 1);
     assert_eq!(

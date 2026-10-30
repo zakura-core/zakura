@@ -525,7 +525,7 @@ fn observer_panic_run(input: PlanInput) -> RunReport {
                     &fixture,
                     Chain::default().tip(&fixture),
                     dispatch.clone(),
-                    Some(Arc::new(PanicsOnReply(observer))),
+                    Some(observer.wrapped(|inner| Arc::new(PanicsOnReply(inner)))),
                 ),
                 HeaderNode::spawn(
                     sim,

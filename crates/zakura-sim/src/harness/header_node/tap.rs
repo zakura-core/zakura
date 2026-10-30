@@ -14,6 +14,10 @@
 //! A call caught panicking ends the run with
 //! [`HarnessFailure::ReactorPortPanicked`] once its drain is logged.
 //!
+//! The tap builds the reactor's [`ObserverSlot`] and keeps its delivery
+//! count, so an event the slot sent that the observer never recorded fails
+//! the run as `Unobserved`.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -27,8 +31,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, PortCall, ReactorEvent, RequestRef,
-        WaitCause,
+        CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, PortCall, ReactorEvent,
+        RequestRef, WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
@@ -72,6 +76,10 @@ struct TapState {
     /// The observer, which only the reactor holds, so it's gone once the
     /// reactor is.
     observer: Weak<TapObserver>,
+    /// The reactor's delivery count, from its observer slot. It outlives the
+    /// reactor, so an event the slot sent but the observer never recorded
+    /// still counts.
+    emitted: Arc<zakura_rt::sync::counter::AtomicU64>,
     /// Set when something recorded an event outside `run`.
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
@@ -99,9 +107,14 @@ impl TapState {
 
 /// A tap publishes reactor events.
 impl LiveEvidence for TapState {
-    /// The last event recorded.
+    /// The last event the reactor emitted or the observer recorded,
+    /// whichever is later. An event the slot counted that the observer
+    /// didn't record is one the log never got.
     fn last_seq(&self) -> u64 {
-        self.buffer().last
+        let emitted = self
+            .emitted
+            .load(zakura_rt::sync::counter::Ordering::Relaxed);
+        self.buffer().last.max(emitted)
     }
 
     /// Whether an event was recorded outside the tap's run.
@@ -162,10 +175,11 @@ impl HeaderSyncObserver for TapObserver {
 
 impl ReactorTap {
     /// A tap on the reactor of the node named `node`, whose storage is
-    /// `port`. Returns the observer, for the reactor's startup and nothing
-    /// else, and the reader. Its checkpoint is registered with `sim` now, so
-    /// the run fails unless the reader observes every boundary, however
-    /// it's later wrapped or added.
+    /// `port`. Returns the observer's slot, for the reactor's startup and
+    /// nothing else, and the reader, which keeps the slot's delivery count.
+    /// Its checkpoint is registered with `sim` now, so the run fails unless
+    /// the reader observes every boundary, however it's later wrapped or
+    /// added.
     ///
     /// # Panics
     ///
@@ -174,13 +188,15 @@ impl ReactorTap {
         sim: &mut Sim,
         port: &Arc<ControlledPort>,
         node: &str,
-    ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
+    ) -> (ObserverSlot, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
+        let emitted: Arc<zakura_rt::sync::counter::AtomicU64> = Arc::default();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
                 port: Arc::downgrade(port),
                 observer: observer.clone(),
+                emitted: Arc::clone(&emitted),
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
                 buffer: Mutex::default(),
@@ -204,7 +220,7 @@ impl ReactorTap {
             pairer: Pairer::default(),
             failure: sim.failure(),
         };
-        (observer, tap)
+        (ObserverSlot::counting(observer, emitted), tap)
     }
 
     /// The tap's registration index among the run's taps.

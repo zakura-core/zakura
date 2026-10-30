@@ -907,9 +907,9 @@ mod tests {
         sim.scheduler().spawn_root("t", async move {
             // A spawn reaches a point first, so the rest runs in one step.
             drop(zakura_rt::task::spawn_named("later", async {}));
-            task_observer.observe(waiting(1));
+            task_observer.emit(waiting(1));
             send(&from, b, 10);
-            task_observer.observe(waiting(2));
+            task_observer.emit(waiting(2));
         });
         let report = sim.run(&mut NoChecks, &mut MemorySink::default());
         drop((observer, to, port));

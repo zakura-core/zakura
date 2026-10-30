@@ -9,7 +9,7 @@ mod support;
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use support::{config, inputs, run};
-use zakura_network::zakura::observe::{HeaderSyncObserver, ReactorEvent};
+use zakura_network::zakura::observe::{HeaderSyncObserver, ObserverSlot, ReactorEvent};
 use zakura_node_services::header_chain::Port;
 use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
@@ -53,6 +53,9 @@ struct Twist {
     /// Drop the port's last strong handle at setup, so the tap finds it
     /// gone.
     drop_port: bool,
+    /// Have the observer drop this call's `Handled`, though its slot counts
+    /// it, as a buggy observer would.
+    lose_call: Option<u64>,
 }
 
 /// A run in which a task reads membership through a controlled port, as
@@ -79,7 +82,11 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
             } else {
                 drop(port);
             }
-            observer.observe(handled(1));
+            let observer = match twist.lose_call {
+                Some(call) => observer.wrapped(|inner| Arc::new(Loses { inner, call })),
+                None => observer,
+            };
+            observer.emit(handled(1));
             if !twist.drop_observer {
                 kept = Some(observer.clone());
             }
@@ -94,11 +101,11 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
 
 /// Spawns `reactor`, which emits two events at each of three steps and then
 /// exits, dropping its `observer`.
-fn spawn_emitter(sim: &mut Sim, observer: Arc<dyn HeaderSyncObserver>) {
+fn spawn_emitter(sim: &mut Sim, observer: ObserverSlot) {
     sim.scheduler().spawn_root("reactor", async move {
         for call in 2..=4 {
-            observer.observe(handled(call));
-            observer.observe(handled(call + 100));
+            observer.emit(handled(call));
+            observer.emit(handled(call + 100));
             zakura_rt::task::yield_now().await;
         }
     });
@@ -452,7 +459,7 @@ fn two_tap_run(divert: Option<u64>) -> RunReport {
             for (instance, node) in [(0, "node"), (1, "mirror-0")] {
                 let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
                 let (observer, tap) = ReactorTap::new(sim, &port, node);
-                observer.observe(handled(1));
+                observer.emit(handled(1));
                 kept.push((port, observer));
                 if divert == Some(instance) {
                     sim.add_source(Box::new(Divert {
@@ -526,6 +533,61 @@ fn a_tap_dropped_during_the_run_fails_it() {
     }
 }
 
+/// An observer that forwards every event to `inner` except `call`'s
+/// `Handled`.
+#[derive(Debug)]
+struct Loses {
+    inner: Arc<dyn HeaderSyncObserver>,
+    call: u64,
+}
+
+impl HeaderSyncObserver for Loses {
+    /// Forwards `event` unless it's the lost call's `Handled`.
+    fn observe(&self, event: ReactorEvent) {
+        if event != handled(self.call) {
+            self.inner.observe(event);
+        }
+    }
+}
+
+/// An event the slot counted but the observer dropped fails the run with
+/// `Unobserved` at the step that emitted it: the first, a middle one, and
+/// the run's last. The emitter's events are counted and recorded alike
+/// otherwise, so a faithful observer passes.
+///
+/// This fails if the tap checks only what its observer recorded.
+#[test]
+fn an_event_the_observer_drops_fails_unobserved() {
+    let whole = plain_run();
+    assert_eq!(whole.end.harness, None, "{:?}", whole.end);
+    let step_of = |call: u64| {
+        whole
+            .log
+            .entries()
+            .iter()
+            .find(|entry| {
+                matches!(&entry.obs, Observation::Reactor {
+                    event: ReactorFact::Handled { call: c, .. }, ..
+                } if *c == call)
+            })
+            .expect("the plain run logs the call")
+            .step
+    };
+    for call in [1, 3, 104] {
+        let report = tap_run(
+            Twist {
+                lose_call: Some(call),
+                ..Twist::default()
+            },
+            |tap| Box::new(tap),
+        );
+        let (source, detail) = evidence_failure(&report);
+        assert_eq!(source, "reactor:node#0");
+        assert!(detail.starts_with("Unobserved"), "losing {call}: {detail}");
+        assert_eq!(report.end.steps, step_of(call), "losing {call}");
+    }
+}
+
 /// A reader shared with a checker.
 type Shared = Rc<RefCell<Option<ReactorTap>>>;
 
@@ -565,7 +627,7 @@ enum Late {
 /// A checker that acts on the tap in `at_end`, after the last observation.
 struct AtEnd {
     shared: Shared,
-    observer: Arc<dyn HeaderSyncObserver>,
+    observer: ObserverSlot,
     late: Late,
 }
 
@@ -582,7 +644,7 @@ impl zakura_sim::Checker for AtEnd {
         match self.late {
             Late::Nothing => {}
             Late::DropReader => drop(self.shared.borrow_mut().take()),
-            Late::Emit => self.observer.observe(handled(50)),
+            Late::Emit => self.observer.emit(handled(50)),
             Late::EmitOutside => emit_outside_the_run(&self.observer),
         }
         Vec::new()
@@ -590,10 +652,10 @@ impl zakura_sim::Checker for AtEnd {
 }
 
 /// Emits an event from a thread with no run, which the tap refuses.
-fn emit_outside_the_run(observer: &Arc<dyn HeaderSyncObserver>) {
+fn emit_outside_the_run(observer: &ObserverSlot) {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| observer.observe(handled(60)))
+            .spawn(|| observer.emit(handled(60)))
             .join()
             .expect("a refused emission doesn't panic");
     });
@@ -605,7 +667,7 @@ fn late_run(late: Late) -> RunReport {
     let mut sim = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
-    observer.observe(handled(1));
+    observer.emit(handled(1));
     spawn_emitter(&mut sim, observer.clone());
     let shared: Shared = Rc::new(RefCell::new(Some(tap)));
     sim.add_source(Box::new(SharedSource(shared.clone())));
@@ -649,7 +711,7 @@ fn the_tap_is_checked_live_after_the_last_observation() {
 /// before observing.
 struct RefuseBefore<S> {
     inner: S,
-    observer: Arc<dyn HeaderSyncObserver>,
+    observer: ObserverSlot,
     at: u64,
 }
 

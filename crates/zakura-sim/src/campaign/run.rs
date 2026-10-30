@@ -2,12 +2,13 @@
 //! run gets exactly once.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Read, Write},
     os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -66,6 +67,18 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// How long the supervisor waits for a killed process group to go.
 const GROUP_EXIT: Duration = Duration::from_secs(10);
+
+/// How many bytes of a process's output its log keeps from the start. The
+/// feedback line comes at the start.
+const LOG_HEAD: usize = 1 << 20;
+
+/// How many bytes of a process's output its log keeps from the end, where
+/// libFuzzer and the sanitizers print their reports.
+const LOG_TAIL: usize = 1 << 20;
+
+/// How long the supervisor waits for a process's output to end once the
+/// process has exited.
+const OUTPUT_DRAIN: Duration = Duration::from_secs(10);
 
 /// How a run ended. Each status means one thing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +596,10 @@ pub(super) fn fuzzer_command(
 /// calls `spawned` with its process ID, and waits for it, killing it at
 /// `deadline` if one is given. Returns how it ended and the log.
 ///
+/// The log keeps the output's first [`LOG_HEAD`] and last [`LOG_TAIL`]
+/// bytes, with a line that counts the bytes dropped between them, so a
+/// process that writes without bound fills neither the disk nor memory.
+///
 /// With `group`, text that each of the command's processes has in its
 /// command line, the command runs in its own process group. At the
 /// deadline, and again once the command exits, the whole group is killed,
@@ -597,9 +614,10 @@ pub(super) fn run_logged(
     spawned: impl FnOnce(u32),
 ) -> Result<(ProcessExit, Vec<u8>), CampaignError> {
     let io = |what: &str| CampaignError::io(format!("{what} {}", log.display()));
-    let file = File::create(log).map_err(io("creating"))?;
-    let stderr = file.try_clone().map_err(io("opening"))?;
-    command.stdin(Stdio::null()).stdout(file).stderr(stderr);
+    let mut file = File::create(log).map_err(io("creating"))?;
+    let (output, stdout) = io::pipe().map_err(io("making the pipe for"))?;
+    let stderr = stdout.try_clone().map_err(io("making the pipe for"))?;
+    command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
     if group.is_some() {
         command.process_group(0);
     }
@@ -607,6 +625,14 @@ pub(super) fn run_logged(
     let mut child = command
         .spawn()
         .map_err(CampaignError::io(format!("starting {shown}")))?;
+    // The command holds the pipe's write ends, and the output ends only
+    // once every holder closes them.
+    drop(command);
+    let (send, captured) = mpsc::channel();
+    thread::spawn(move || {
+        // The receiver is gone only if the wait below failed.
+        let _ = send.send(capture(output, &mut file));
+    });
     spawned(child.id());
     let waited = CampaignError::io(format!("waiting for {shown}"));
     let exit = match deadline {
@@ -635,8 +661,52 @@ pub(super) fn run_logged(
     if let Some(marker) = group {
         end_group(child.id(), marker)?;
     }
-    let output = fs::read(log).map_err(io("reading"))?;
+    let output = captured
+        .recv_timeout(OUTPUT_DRAIN)
+        .map_err(|_| {
+            CampaignError::Refused(format!(
+                "{shown} exited, and a process it started still holds its output after {} s",
+                OUTPUT_DRAIN.as_secs()
+            ))
+        })?
+        .map_err(io("writing"))?;
     Ok((exit, output))
+}
+
+/// Copies `output` to `log` until it ends, keeping its first [`LOG_HEAD`]
+/// and last [`LOG_TAIL`] bytes, and returns what it kept. The head goes to
+/// `log` as it arrives, and the tail once the output ends, after a line
+/// that counts the bytes dropped between them.
+fn capture(mut output: impl Read, log: &mut File) -> io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut dropped = 0u64;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = match output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let (head, rest) = buffer[..read].split_at(read.min(LOG_HEAD - kept.len()));
+        log.write_all(head)?;
+        kept.extend_from_slice(head);
+        tail.extend(rest);
+        let excess = tail.len().saturating_sub(LOG_TAIL);
+        tail.drain(..excess);
+        // A usize always fits in a u64 on supported targets.
+        dropped += excess as u64;
+    }
+    let head = kept.len();
+    if dropped > 0 {
+        kept.extend_from_slice(
+            format!("\n[zakura-sim campaign: dropped {dropped} bytes of output]\n").as_bytes(),
+        );
+    }
+    kept.extend(tail);
+    log.write_all(&kept[head..])?;
+    Ok(kept)
 }
 
 /// Sends SIGKILL to every process in process group `group`, by running

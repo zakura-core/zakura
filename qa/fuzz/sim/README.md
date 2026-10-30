@@ -127,7 +127,8 @@ main.
   initial snapshot, which holds the harness's curated seeds. Each worker runs
   libFuzzer on its own corpus directory plus the initial snapshot, and
   restarts a process that ends early, such as at a crash or the abandonment
-  limit, up to `--max-restarts` times. When every worker stops, the run saves
+  limit, up to `--max-restarts` times. Each process's log keeps the first and
+  last MiB of its output. When every worker stops, the run saves
   the union of the initial snapshot and the workers' corpora as a new
   snapshot, compacts it with libFuzzer's merge if `--compact-secs` is set,
   and writes the end record.

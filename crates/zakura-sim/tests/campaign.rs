@@ -7,7 +7,7 @@
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
 //! say: crash once or always, end at the abandonment limit, exit 0 early,
-//! log a feedback line, hang in a merge, or leave a merge process behind
+//! log 8 MiB, log a feedback line, hang in a merge, or leave a merge process behind
 //! that writes a crash file later. It exits when its parent does, as a real
 //! fuzzer does when a terminal's interrupt reaches its process group.
 #![cfg(zakura_sim)]
@@ -87,6 +87,9 @@ if [ "$merge" = 1 ]; then
     done
   done
   exit 0
+fi
+if [ -e "$control/chatty" ]; then
+  yes 'a chatty target line' | head -c 8388608 >&2
 fi
 out=${dirs[0]}
 end=$(( $(date +%s%N) + time * 1000000000 ))
@@ -679,6 +682,27 @@ fn interrupted_compaction_keeps_every_snapshot() {
             .initial_snapshot,
         snapshot
     );
+}
+
+/// A fuzzer's log keeps the start and the end of its output, and drops the
+/// middle, so a target that logs without bound fills neither the disk nor
+/// the supervisor's memory. The run goes on as usual.
+#[test]
+fn a_fuzzers_log_keeps_the_start_and_end_of_its_output() {
+    let fixture = Fixture::new();
+    fixture.set("chatty");
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let log = fs::read(fixture.store.run_dir(&run).join("workers/0/log-0.txt")).unwrap();
+    assert!(
+        log.len() <= (2 << 20) + 4096,
+        "the log holds {} bytes",
+        log.len()
+    );
+    let log = String::from_utf8_lossy(&log);
+    assert!(log.starts_with("asan="), "the start is kept");
+    assert!(log.contains("bytes of output]"), "the drop is counted");
+    assert!(log.trim_end().ends_with("second(s)"), "the end is kept");
 }
 
 /// No merge process writes after the end record: the supervisor kills the

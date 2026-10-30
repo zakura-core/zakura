@@ -56,6 +56,9 @@ struct Twist {
     /// Have the observer drop this call's `Handled`, though its slot counts
     /// it, as a buggy observer would.
     lose_call: Option<u64>,
+    /// Have the observer record the first call's `Handled` twice and drop
+    /// the second call's, so its total matches the slot's.
+    repeat_then_lose: Option<(u64, u64)>,
 }
 
 /// A run in which a task reads membership through a controlled port, as
@@ -82,9 +85,16 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
             } else {
                 drop(port);
             }
-            let observer = match twist.lose_call {
-                Some(call) => observer.wrapped(|inner| Arc::new(Loses { inner, call })),
-                None => observer,
+            let observer = match (twist.lose_call, twist.repeat_then_lose) {
+                (Some(call), _) => observer.wrapped(|inner| Arc::new(Loses { inner, call })),
+                (None, Some((repeat, lose))) => observer.wrapped(|inner| {
+                    Arc::new(Substitutes {
+                        inner,
+                        repeat,
+                        lose,
+                    })
+                }),
+                (None, None) => observer,
             };
             observer.emit(handled(1));
             if !twist.drop_observer {
@@ -586,6 +596,78 @@ fn an_event_the_observer_drops_fails_unobserved() {
         assert!(detail.starts_with("Unobserved"), "losing {call}: {detail}");
         assert_eq!(report.end.steps, step_of(call), "losing {call}");
     }
+}
+
+/// An observer that forwards `repeat`'s `Handled` twice, drops `lose`'s, and
+/// forwards everything else once.
+#[derive(Debug)]
+struct Substitutes {
+    inner: Arc<dyn HeaderSyncObserver>,
+    repeat: u64,
+    lose: u64,
+}
+
+impl HeaderSyncObserver for Substitutes {
+    /// Forwards `event` twice, not at all, or once.
+    fn observe(&self, event: ReactorEvent) {
+        if event == handled(self.repeat) {
+            self.inner.observe(event.clone());
+            self.inner.observe(event);
+        } else if event != handled(self.lose) {
+            self.inner.observe(event);
+        }
+    }
+}
+
+/// An observer that records one event twice and drops a later one keeps
+/// its total level with the slot's, yet the run fails `Unobserved` at the
+/// step of the repeat, since that event arrived out of step with the
+/// slot's count.
+///
+/// This fails if the tap compares only its total with the slot's.
+#[test]
+fn a_repeated_event_never_hides_a_lost_one() {
+    let whole = plain_run();
+    let step_of = |call: u64| {
+        whole
+            .log
+            .entries()
+            .iter()
+            .find(|entry| {
+                matches!(&entry.obs, Observation::Reactor {
+                    event: ReactorFact::Handled { call: c, .. }, ..
+                } if *c == call)
+            })
+            .expect("the plain run logs the call")
+            .step
+    };
+    assert!(step_of(2) < step_of(3), "the lost event comes a step later");
+    let report = tap_run(
+        Twist {
+            repeat_then_lose: Some((2, 3)),
+            ..Twist::default()
+        },
+        |tap| Box::new(tap),
+    );
+    let repeats = report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Reactor {
+                    event: ReactorFact::Handled { call: 2, .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(repeats, 2, "the observer recorded the event twice");
+    let (source, detail) = evidence_failure(&report);
+    assert_eq!(source, "reactor:node#0");
+    assert!(detail.starts_with("Unobserved"), "{detail}");
+    assert_eq!(report.end.steps, step_of(2));
 }
 
 /// A reader shared with a checker.

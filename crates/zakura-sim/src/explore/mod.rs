@@ -20,7 +20,11 @@
 //! ended. [`save_input`] and [`save_failure`] keep a failing input on disk
 //! before anything reruns it. [`triage::triage`] confirms a saved input's
 //! failure in fresh processes and archives it with its evidence.
+//!
+//! [`feedback`] turns abstract protocol states into features libFuzzer
+//! reads beside its code edges (E2a).
 
+pub mod feedback;
 mod process;
 mod save;
 pub mod triage;

@@ -1,6 +1,6 @@
 //! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
-//! `cargo xtask sim-versions`, `cargo xtask sim-seeds`, `cargo xtask sim-triage`
-//! and `cargo xtask sim-verify-archive`: run the
+//! `cargo xtask sim-versions`, `cargo xtask sim-seeds`, `cargo xtask sim-suite`,
+//! `cargo xtask sim-triage` and `cargo xtask sim-verify-archive`: run the
 //! `zakura-sim` binary in the simulator build.
 //!
 //! xtask is a normal build, so it can't link `zakura-sim`, which only exists

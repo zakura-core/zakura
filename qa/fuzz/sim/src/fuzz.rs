@@ -11,6 +11,7 @@ use std::{
 
 use zakura_sim::{
     explore::{
+        feedback::{Feedback, NewCollector},
         input_path, save_failure, save_input, traces_root, Bucket, Classified, ExploreOutcome,
         ExploreRun, Worker, ABANDON_LIMIT_VAR,
     },
@@ -28,7 +29,9 @@ pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
 pub const HARNESS_LINE: &str = "zakura-sim-fuzz harness: ";
 
 /// A fuzz target over harness `$harness`: `sim_target!(discovery::WaitComplete)`
-/// for a harness under `zakura_sim::harness`.
+/// for a harness under `zakura_sim::harness`. With a second argument,
+/// `$collector` makes each input's collector, whose features libFuzzer reads
+/// beside its code edges: `sim_target!(feedback::Probe, feedback::probe_collector)`.
 #[macro_export]
 macro_rules! sim_target {
     ($harness:ty) => {
@@ -37,6 +40,19 @@ macro_rules! sim_target {
         libfuzzer_sys::fuzz_target!(init: $crate::unwind_task_panics(), |input: &[u8]| {
             $crate::fuzz_one(&ENTRY, input);
         });
+    };
+    ($harness:ty, $collector:path) => {
+        static ENTRY: zakura_sim::harness::HarnessEntry = zakura_sim::harness::entry::<$harness>();
+
+        libfuzzer_sys::fuzz_target!(
+            init: {
+                $crate::unwind_task_panics();
+                $crate::init_feedback();
+            },
+            |input: &[u8]| {
+                $crate::fuzz_one_with(&ENTRY, $collector, input);
+            }
+        );
     };
 }
 
@@ -79,23 +95,31 @@ thread_local! {
 /// process, so `cargo fuzz tmin`'s output is a candidate that triage
 /// revalidates.
 pub fn fuzz_one(entry: &'static HarnessEntry, input: &[u8]) {
-    run(entry, input, act);
+    run(entry, input, None, act);
 }
 
-/// Runs `input` on `entry`'s harness on this thread's worker, and calls
-/// `then` on the worker's thread with the run and its class. Then panics
-/// with `abandoned:` if the process has reached its abandonment limit.
+/// [`fuzz_one`], with `collector`'s features in the counters
+/// `ZAKURA_SIM_FEEDBACK` picks ([`crate::feedback`]).
+pub fn fuzz_one_with(entry: &'static HarnessEntry, collector: NewCollector, input: &[u8]) {
+    run(entry, input, Some(crate::feedback(collector)), act);
+}
+
+/// Runs `input` on `entry`'s harness on this thread's worker, with
+/// `feedback`'s collector if there is one, and calls `then` on the worker's
+/// thread with the run and its class. Then panics with `abandoned:` if the
+/// process has reached its abandonment limit.
 ///
 /// Under `ZAKURA_SIM_EXPECT` the limit doesn't apply: `tmin` must crash
 /// only on the expected property, and its own run count bounds it.
 fn run(
     entry: &'static HarnessEntry,
     input: &[u8],
+    feedback: Option<Feedback>,
     then: fn(&'static HarnessEntry, &[u8], &ExploreRun, &Classified),
 ) {
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
-        worker.explore(entry, input, move |input, run, classified| {
+        worker.explore_with(entry, input, feedback, move |input, run, classified| {
             then(entry, input, run, classified)
         });
         let limit = abandon_limit();
@@ -349,7 +373,7 @@ fn expected() -> Option<&'static str> {
 /// `ZAKURA_SIM_EXPECT` works as in [`fuzz_one`], and replaces the policy.
 pub fn fuzz_fixtures(input: &[u8]) {
     static ENTRY: HarnessEntry = zakura_sim::harness::entry::<fixtures::All>();
-    run(&ENTRY, input, act_fixtures);
+    run(&ENTRY, input, None, act_fixtures);
 }
 
 /// When the target first ran, and each fixture whose `Base` variant it

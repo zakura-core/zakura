@@ -518,52 +518,51 @@ impl Topology {
     /// Extends the selected chain of the node named `peer` by `len` fixture
     /// headers from its tip, through its own port, as if it had mined them.
     /// It records the growth only once the mirror's published tip is the
-    /// new one. Anything else, such as a resource stall that leaves the
-    /// target unadmitted, is recorded as a failure instead. The node must
-    /// be a mirror, on an engine port, that isn't applying anything else.
+    /// new one. The mirror's own sync may move its tip while the growth
+    /// waits at a scheduling point, which leaves the growth stale. Then it
+    /// grows the new tip instead. Anything else, such as a resource stall
+    /// that leaves the target unadmitted while the tip stays put, is
+    /// recorded as a failure. The node must be a mirror, on an engine port.
     async fn grow(&self, peer: &str, fixture: &HeaderFixture, len: u32) {
         let node = self
             .nodes
             .iter()
             .find(|node| node.name == peer)
             .unwrap_or_else(|| panic!("the scenario has a `{peer}`"));
-        let published = || {
-            node.port
-                .selected_chain()
-                .borrow()
-                .as_ref()
-                .map(|snapshot| snapshot.frontiers.header_best)
-        };
-        let snapshot = node
-            .port
-            .selected_chain()
-            .borrow()
-            .clone()
-            .expect("an engine port publishes its snapshot from the start");
-        let tip = snapshot.frontiers.header_best;
-        let headers = fixture.extend(tip, len, 0);
-        let target = Frontier::new(
-            block::Height(
-                tip.height
-                    .0
-                    .checked_add(len)
-                    .expect("fixture heights stay small"),
-            ),
-            headers.last().expect("a growth has headers").hash(),
-        );
-        let request = fixture.target_request(&snapshot, tip, &headers, 1);
-        let applied = match node.port.prepare_header_target(request).await {
-            Ok(prepared) => node.port.apply_header_target(prepared).await,
-            Err(error) => Err(error),
-        };
-        match (applied, published()) {
-            (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
-                self.effects.grown.borrow_mut().push(peer.to_owned());
-            }
-            (applied, now) => {
-                *self.effects.failure.borrow_mut() = Some(format!(
-                    "growing {peer} to {target:?} gave {applied:?}, with its tip at {now:?}"
-                ));
+        let published = || node.port.selected_chain().borrow().clone();
+        loop {
+            let snapshot =
+                published().expect("an engine port publishes its snapshot until shutdown");
+            let tip = snapshot.frontiers.header_best;
+            let headers = fixture.extend(tip, len, 0);
+            let target = Frontier::new(
+                block::Height(
+                    tip.height
+                        .0
+                        .checked_add(len)
+                        .expect("fixture heights stay small"),
+                ),
+                headers.last().expect("a growth has headers").hash(),
+            );
+            let request = fixture.target_request(&snapshot, tip, &headers, 1);
+            let applied = match node.port.prepare_header_target(request).await {
+                Ok(prepared) => node.port.apply_header_target(prepared).await,
+                Err(error) => Err(error),
+            };
+            let now = published().map(|snapshot| snapshot.frontiers.header_best);
+            match (applied, now) {
+                (Ok(ApplyHeaderTargetOutcome::Applied), Some(now)) if now == target => {
+                    self.effects.grown.borrow_mut().push(peer.to_owned());
+                    return;
+                }
+                // The mirror moved its tip during the growth.
+                (_, Some(now)) if now != tip => continue,
+                (applied, now) => {
+                    *self.effects.failure.borrow_mut() = Some(format!(
+                        "growing {peer} to {target:?} gave {applied:?}, with its tip at {now:?}"
+                    ));
+                    return;
+                }
             }
         }
     }

@@ -241,24 +241,39 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
 }
 
 /// The harness `target` runs, from the fuzz package's [`fuzz_targets`].
+/// Fails when the package declares no such `[[bin]]`, or when
+/// [`TARGETS_TABLE`] maps it to no harness.
 fn resolve_target(repo_root: &Path, target: &str) -> Result<String, BoxError> {
     let mut targets = fuzz_targets(repo_root)?;
-    targets.remove(target).ok_or_else(|| {
-        let known: Vec<_> = targets.keys().map(String::as_str).collect();
-        format!(
-            "unknown simulation fuzz target `{target}`; expected one of {}",
-            known.join(", ")
+    match targets.remove(target) {
+        Some(Some(harness)) => Ok(harness),
+        Some(None) => Err(format!(
+            "{} declares fuzz target `{target}` but maps it to no harness in {TARGETS_TABLE}",
+            fuzz_dir(repo_root).join("Cargo.toml").display()
         )
-        .into()
-    })
+        .into()),
+        None => {
+            let known: Vec<_> = targets
+                .iter()
+                .filter(|(_, harness)| harness.is_some())
+                .map(|(target, _)| target.as_str())
+                .collect();
+            Err(format!(
+                "unknown simulation fuzz target `{target}`; expected one of {}",
+                known.join(", ")
+            )
+            .into())
+        }
+    }
 }
 
-/// Each fuzz target and the harness it runs, as `cargo metadata` reads them
-/// from the fuzz package's manifest: every `[[bin]]` needs an entry in
-/// [`TARGETS_TABLE`], and every entry a `[[bin]]`. `zakura-sim confirm`
-/// checks that the harness is registered, and [`ran_harness`] that the
-/// target runs it.
-fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, String>, BoxError> {
+/// Each fuzz target and the harness [`TARGETS_TABLE`] maps it to, as `cargo
+/// metadata` reads them from the fuzz package's manifest. Every entry in the
+/// table needs a `[[bin]]`. A `[[bin]]` without an entry, such as a probe
+/// that runs no registered harness, maps to `None`, and only minimizing that
+/// target fails. `zakura-sim confirm` checks that the harness is registered,
+/// and [`ran_harness`] that the target runs it.
+fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, Option<String>>, BoxError> {
     let manifest = fuzz_dir(repo_root).join("Cargo.toml");
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let output = Command::new(cargo)
@@ -291,28 +306,22 @@ fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, String>, BoxError> 
     let mapped = package["metadata"]["zakura-sim"]["targets"]
         .as_object()
         .unwrap_or(&empty);
-    let mut targets = BTreeMap::new();
-    for bin in &bins {
-        let harness = mapped.get(*bin).ok_or_else(|| {
+    let mut targets: BTreeMap<String, Option<String>> =
+        bins.iter().map(|bin| ((*bin).to_owned(), None)).collect();
+    for (name, harness) in mapped {
+        let slot = targets.get_mut(name).ok_or_else(|| {
             format!(
-                "{} declares fuzz target `{bin}` but maps it to no harness in {TARGETS_TABLE}",
+                "{} maps `{name}` to a harness in {TARGETS_TABLE} but declares no such [[bin]]",
                 manifest.display()
             )
         })?;
         let harness = harness.as_str().ok_or_else(|| {
             format!(
-                "{} maps `{bin}` to {harness}, not to a harness's name",
+                "{} maps `{name}` to {harness}, not to a harness's name",
                 manifest.display()
             )
         })?;
-        targets.insert((*bin).to_owned(), harness.to_owned());
-    }
-    if let Some(name) = mapped.keys().find(|name| !bins.contains(&name.as_str())) {
-        return Err(format!(
-            "{} maps `{name}` to a harness in {TARGETS_TABLE} but declares no such [[bin]]",
-            manifest.display()
-        )
-        .into());
+        *slot = Some(harness.to_owned());
     }
     Ok(targets)
 }

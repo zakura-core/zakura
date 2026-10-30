@@ -32,6 +32,7 @@ pub mod seed;
 mod sender;
 pub mod sim;
 pub mod storage;
+pub mod suite;
 pub mod table;
 pub mod trace;
 pub mod witness;

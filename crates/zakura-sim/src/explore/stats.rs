@@ -29,6 +29,7 @@ use super::{
 };
 use crate::{
     check::PropertyOutcome,
+    end::Outcome,
     harness::HarnessEntry,
     property::{Inconclusive, Status},
     record::OutcomeKind,
@@ -178,41 +179,49 @@ impl Counts {
             ExploreOutcome::HarnessFailure { .. } => "harness-failure",
             ExploreOutcome::Abandoned { .. } => "abandoned",
         };
-        *self.outcomes.entry(outcome.to_owned()).or_default() += 1;
+        bump(&mut self.outcomes, outcome);
         for feature in features {
             *self.features.entry(feature.index()).or_default() += 1;
         }
         let Some(report) = run.report() else {
-            *self.ends.entry(NOT_RUN.to_owned()).or_default() += 1;
+            bump(&mut self.ends, NOT_RUN);
             return;
         };
-        let end = report.end_record();
-        let name = match (end.outcome, end.status) {
-            (OutcomeKind::Idle, Some(status)) => format!("idle/{}", serialized_name(&status)),
-            (outcome, _) => serialized_name(&outcome),
+        // The `end` record's names, read from the report itself, since the
+        // record clones every property report.
+        let name = match report.end.outcome {
+            Outcome::Violation => serialized_name(&OutcomeKind::Violation),
+            Outcome::Budget => serialized_name(&OutcomeKind::Budget),
+            Outcome::Idle { status } => format!("idle/{}", serialized_name(&status)),
+            Outcome::Harness => serialized_name(&OutcomeKind::Harness),
         };
-        *self.ends.entry(name).or_default() += 1;
-        self.drains_exhausted += u64::from(end.drain.is_some_and(|drain| drain.exhausted));
-        let cleanup = &mut self.cleanup;
-        cleanup.abandoned += u64::from(end.cleanup.leaked > 0);
-        cleanup.leaked_tasks += count(end.cleanup.leaked);
-        cleanup.unwound += u64::from(end.cleanup.unwound > 0);
-        cleanup.panicked += u64::from(end.cleanup.panicked > 0);
-        cleanup.unwind_failures += u64::from(end.cleanup.unwind_failures > 0);
+        bump(&mut self.ends, &name);
+        self.drains_exhausted += u64::from(report.end.drain.is_some_and(|drain| drain.exhausted));
+        let (cleanup, report_cleanup) = (&mut self.cleanup, &report.cleanup);
+        cleanup.abandoned += u64::from(report_cleanup.leaked > 0);
+        cleanup.leaked_tasks += count(report_cleanup.leaked);
+        cleanup.unwound += u64::from(report_cleanup.unwound > 0);
+        cleanup.panicked += u64::from(report_cleanup.panicked > 0);
+        cleanup.unwind_failures += u64::from(report_cleanup.unwind_failures > 0);
         for property in &report.properties {
+            // A lookup first, so a known property costs no allocation.
+            if !self.properties.contains_key(&property.property) {
+                self.properties.insert(
+                    property.property.clone(),
+                    PropertyCounts::new(Status::Active),
+                );
+            }
             let counts = self
                 .properties
-                .entry(property.property.clone())
-                .or_insert_with(|| PropertyCounts::new(Status::Active));
+                .get_mut(&property.property)
+                .expect("the property was just inserted");
             match &property.outcome {
                 PropertyOutcome::Held { applicable } => {
                     counts.held += 1;
                     counts.evaluations += u64::from(*applicable);
                 }
                 PropertyOutcome::NotApplicable => counts.not_applicable += 1,
-                PropertyOutcome::Inconclusive { reason } => {
-                    *counts.inconclusive.entry(reason.clone()).or_default() += 1;
-                }
+                PropertyOutcome::Inconclusive { reason } => bump(&mut counts.inconclusive, reason),
                 PropertyOutcome::Violated { .. } => counts.violated += 1,
             }
         }
@@ -397,6 +406,16 @@ impl Recorder {
         fs::rename(&partial, &self.path)?;
         self.written = Instant::now();
         Ok(())
+    }
+}
+
+/// Adds 1 to `key`'s count, allocating its key only the first time.
+fn bump(map: &mut BTreeMap<String, u64>, key: &str) {
+    match map.get_mut(key) {
+        Some(count) => *count += 1,
+        None => {
+            map.insert(key.to_owned(), 1);
+        }
     }
 }
 

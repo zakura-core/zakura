@@ -336,16 +336,19 @@ there with `exit` between runs and the target's `atexit` handler runs. An
 or a kill leaves the counts of the last write, and the file stays incomplete.
 The compaction's merge writes no stats.
 
-`evidence` matches each worker's files to its attempts log by process ID. It
-reports each worker's outcome, its processes by how they ended, and its
-counts; the run's totals; the totals of complete files alone; each
-property's assumption losses (`assumptions-never-held` and
-`assumption-lost`); the features reached, by family; and the properties, the
-harness's and any file's, that no complete file saw apply. It lists every gap: a worker that didn't spend its
-budget, a process that left no file, a file whose process didn't exit
-cleanly, a file the attempts log doesn't list, and a file that can't be read
-or that another harness wrote. Feature counts come only from a target with
-a collector.
+`evidence` matches each file to the attempt in the worker's attempts log
+whose process has the file's process ID and started while the attempt ran.
+It reports each worker's outcome, its processes by how they ended, and its
+counts; the run's totals; the totals of the complete files that logged
+processes wrote; each property's assumption losses
+(`assumptions-never-held` and `assumption-lost`); the features reached, by
+family; and the properties, the harness's and any file's, that none of
+those complete files saw apply. It lists every gap: a worker that didn't
+spend its budget, a process that left no file, a file whose process didn't
+exit cleanly, a file no logged process wrote (a reused process ID or a
+stale copy among them), and a file that can't be read, that another
+harness wrote, or that isn't named `stats-<pid>.json`. Feature counts come
+only from a target with a collector.
 
 `cargo xtask sim-minimize` minimizes a saved failure, as
 [Minimizing a crash](#minimizing-a-crash) describes, and

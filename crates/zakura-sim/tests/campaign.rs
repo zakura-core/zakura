@@ -67,7 +67,8 @@ alive() { kill -0 "$parent" 2>/dev/null; }
 stats() {
   if [ -n "$ZAKURA_SIM_STATS" ] && [ -e "$control/stats" ]; then
     mkdir -p "$ZAKURA_SIM_STATS"
-    sed -e "s/@PID@/$$/" -e "s/@COMPLETE@/$1/" "$control/stats" > "$ZAKURA_SIM_STATS/.partial-$$"
+    sed -e "s/@PID@/$$/" -e "s/@COMPLETE@/$1/" -e "s/@STARTED@/$started/" "$control/stats" \
+      > "$ZAKURA_SIM_STATS/.partial-$$"
     mv "$ZAKURA_SIM_STATS/.partial-$$" "$ZAKURA_SIM_STATS/stats-$$.json"
   fi
 }
@@ -106,6 +107,7 @@ fi
 if [ -e "$control/chatty" ]; then
   yes 'a chatty target line' | head -c 8388608 >&2
 fi
+started=$(date +%s)
 stats false
 out=${dirs[0]}
 end=$(( $(date +%s%N) + time * 1000000000 ))
@@ -1316,8 +1318,8 @@ fn template_counts() -> Counts {
     }
 }
 
-/// [`template_counts`] as a stats file of `harness`, whose process ID and
-/// completeness the stand-in fills in.
+/// [`template_counts`] as a stats file of `harness`, whose process ID,
+/// start and completeness the stand-in fills in.
 fn stats_template(harness: &str) -> String {
     let stats = ProcessStats {
         version: STATS_VERSION,
@@ -1330,6 +1332,7 @@ fn stats_template(harness: &str) -> String {
     };
     let text = serde_json::to_string(&stats).unwrap();
     text.replace("\"pid\":0", "\"pid\":@PID@")
+        .replace("\"started_unix\":0", "\"started_unix\":@STARTED@")
         .replace("\"complete\":false", "\"complete\":@COMPLETE@")
 }
 
@@ -1346,6 +1349,33 @@ fn unapplied(applied: bool) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// Worker `worker`'s attempts log in run `run`.
+fn attempts_log(store: &Store, run: &Digest, worker: usize) -> PathBuf {
+    store
+        .run_dir(run)
+        .join("workers")
+        .join(worker.to_string())
+        .join(ATTEMPTS_FILE)
+}
+
+/// Worker `worker`'s logged attempts in run `run`.
+fn read_attempts(store: &Store, run: &Digest, worker: usize) -> Vec<campaign::Attempt> {
+    fs::read_to_string(attempts_log(store, run, worker))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Rewrites worker `worker`'s attempts log in run `run` with `attempts`.
+fn write_attempts(store: &Store, run: &Digest, worker: usize, attempts: &[campaign::Attempt]) {
+    let text: String = attempts
+        .iter()
+        .map(|attempt| serde_json::to_string(attempt).unwrap() + "\n")
+        .collect();
+    fs::write(attempts_log(store, run, worker), text).unwrap();
 }
 
 /// `counts` added up `n` times.
@@ -1483,17 +1513,7 @@ fn evidence_lists_incomplete_processes() {
     fixture.set("crash");
     let (run, end) = start(&fixture.store, fixture.options(1, 2));
     assert_eq!(end.status, Status::Complete, "{end:?}");
-    let attempts: Vec<campaign::Attempt> = fs::read_to_string(
-        fixture
-            .store
-            .run_dir(&run)
-            .join("workers/0")
-            .join(ATTEMPTS_FILE),
-    )
-    .unwrap()
-    .lines()
-    .map(|line| serde_json::from_str(line).unwrap())
-    .collect();
+    let attempts = read_attempts(&fixture.store, &run, 0);
     assert_eq!(attempts.len(), 2, "{attempts:?}");
     assert_eq!(attempts[0].end, AttemptEnd::Failure);
     let crashed = attempts[0].pid.unwrap();
@@ -1523,6 +1543,7 @@ fn evidence_lists_incomplete_processes() {
         stats.join(format!("stats-{stray}.json")),
         stats_template(SIM)
             .replace("@PID@", &stray.to_string())
+            .replace("@STARTED@", "0")
             .replace("@COMPLETE@", "true"),
     )
     .unwrap();
@@ -1531,6 +1552,7 @@ fn evidence_lists_incomplete_processes() {
         stats.join("stats-8.json"),
         stats_template("other/harness")
             .replace("@PID@", "8")
+            .replace("@STARTED@", "0")
             .replace("@COMPLETE@", "true"),
     )
     .unwrap();
@@ -1542,7 +1564,7 @@ fn evidence_lists_incomplete_processes() {
         Some(&Incomplete::MissingStats {
             worker: 0,
             attempt: 1,
-            pid: finished
+            pid: Some(finished)
         })
     );
     assert_eq!(
@@ -1572,25 +1594,130 @@ fn evidence_lists_incomplete_processes() {
     assert_eq!(reasons.next(), None);
     assert_eq!(evidence.totals, times(&template, 2));
     assert_eq!(
-        evidence.complete_totals, template,
-        "the stray file is complete"
+        evidence.complete_totals,
+        Counts::default(),
+        "the stray file is complete, but no logged process wrote it"
     );
-
-    // Without a complete file, no property applied.
-    fs::remove_file(stats.join(format!("stats-{stray}.json"))).unwrap();
-    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
-    assert_eq!(evidence.complete_totals, Counts::default());
+    // Without a complete file a logged process wrote, no property applied.
     assert_eq!(evidence.unapplied, unapplied(false));
 }
 
-/// E4b-min: a run whose processes wrote no stats files lists every attempt
-/// as missing its stats, and leaves every one of the harness's properties
+/// E4b-min: a stats file counts only for the logged process that wrote
+/// it. A process ID an earlier attempt also had, and a stale copy from
+/// before the attempt started, leave that attempt's file missing and the
+/// file unlogged. A file named like a stats file, but not as a process
+/// writes one, is unreadable rather than a second file for the same
+/// process.
+#[test]
+fn evidence_matches_each_file_to_the_process_that_wrote_it() {
+    let fixture = Fixture::new();
+    fixture.write_stats();
+    fixture.set("crash");
+    let (run, end) = start(&fixture.store, fixture.options(1, 2));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    let stats = fixture.store.run_dir(&run).join("workers/0/stats");
+    let (crashed, finished) = (attempts[0].pid.unwrap(), attempts[1].pid.unwrap());
+    let template = template_counts();
+
+    // The finished process reused the crashed one's ID, and overwrote its
+    // file.
+    fs::rename(
+        stats.join(format!("stats-{finished}.json")),
+        stats.join(format!("stats-{crashed}.json")),
+    )
+    .unwrap();
+    let text = fs::read_to_string(stats.join(format!("stats-{crashed}.json"))).unwrap();
+    fs::write(
+        stats.join(format!("stats-{crashed}.json")),
+        text.replace(
+            &format!("\"pid\":{finished}"),
+            &format!("\"pid\":{crashed}"),
+        ),
+    )
+    .unwrap();
+    attempts[1].pid = Some(crashed);
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [Incomplete::MissingStats {
+            worker: 0,
+            attempt: 0,
+            pid: Some(crashed)
+        }]
+    );
+    assert_eq!(evidence.workers[0].processes, 1);
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, template);
+
+    // A stale copy: its process started before either attempt did.
+    for attempt in &mut attempts {
+        attempt.started_unix += 3600;
+    }
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [
+            Incomplete::MissingStats {
+                worker: 0,
+                attempt: 0,
+                pid: Some(crashed)
+            },
+            Incomplete::MissingStats {
+                worker: 0,
+                attempt: 1,
+                pid: Some(crashed)
+            },
+            Incomplete::UnloggedProcess {
+                worker: 0,
+                pid: crashed
+            },
+        ]
+    );
+    assert_eq!(evidence.totals, template);
+    assert_eq!(evidence.complete_totals, Counts::default());
+    assert_eq!(evidence.unapplied, unapplied(false));
+
+    // A second name for the same process.
+    for attempt in &mut attempts {
+        attempt.started_unix -= 3600;
+    }
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    fs::copy(
+        stats.join(format!("stats-{crashed}.json")),
+        stats.join(format!("stats-0{crashed}.json")),
+    )
+    .unwrap();
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    let Some(Incomplete::UnreadableStats { file, error, .. }) = evidence.incomplete.last() else {
+        panic!("{:?}", evidence.incomplete);
+    };
+    assert_eq!(file, &format!("stats-0{crashed}.json"));
+    assert!(error.contains("stats-<pid>.json"), "{error}");
+    assert_eq!(evidence.incomplete.len(), 2, "{:?}", evidence.incomplete);
+    assert_eq!(evidence.totals, template);
+}
+
+/// E4b-min: a run whose processes wrote no stats files, and an attempts
+/// log written before attempts recorded process IDs, list every attempt as
+/// missing its stats, and leave every one of the harness's properties
 /// unapplied.
 #[test]
 fn evidence_without_stats_files_leaves_every_property_unapplied() {
     let fixture = Fixture::new();
     let (run, end) = start(&fixture.store, fixture.options(1, 1));
     assert_eq!(end.status, Status::Complete, "{end:?}");
+    let mut attempts = read_attempts(&fixture.store, &run, 0);
+    let pid = attempts[0].pid;
+    assert!(pid.is_some());
+    let missing = [Incomplete::MissingStats {
+        worker: 0,
+        attempt: 0,
+        pid,
+    }];
     let entry = harness::find(SIM).unwrap();
     let mut harness_ids: Vec<String> = (entry.properties)()
         .into_iter()
@@ -1599,19 +1726,25 @@ fn evidence_without_stats_files_leaves_every_property_unapplied() {
     harness_ids.sort();
     assert!(!harness_ids.is_empty());
     let evidence = campaign::evidence(&fixture.store, &run).unwrap();
-    assert!(
-        matches!(
-            evidence.incomplete.as_slice(),
-            [Incomplete::MissingStats {
-                worker: 0,
-                attempt: 0,
-                ..
-            }]
-        ),
-        "{:?}",
-        evidence.incomplete
-    );
+    assert_eq!(evidence.incomplete, missing);
     assert_eq!(evidence.totals, Counts::default());
+    assert_eq!(evidence.unapplied, harness_ids);
+
+    attempts[0].pid = None;
+    write_attempts(&fixture.store, &run, 0, &attempts);
+    let line = fs::read_to_string(attempts_log(&fixture.store, &run, 0)).unwrap();
+    let line = line.replace(",\"pid\":null", "");
+    assert!(!line.contains("pid"), "{line}");
+    fs::write(attempts_log(&fixture.store, &run, 0), line).unwrap();
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert_eq!(
+        evidence.incomplete,
+        [Incomplete::MissingStats {
+            worker: 0,
+            attempt: 0,
+            pid: None
+        }]
+    );
     assert_eq!(evidence.unapplied, harness_ids);
 }
 

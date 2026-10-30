@@ -301,12 +301,12 @@ impl ProcessStats {
         dir.join(format!("stats-{pid}.json"))
     }
 
-    /// The process ID a stats file's name holds, if it's one.
+    /// The process ID a stats file's name holds, if it's one, exactly as
+    /// [`ProcessStats::path`] writes it.
     pub fn pid_of(name: &str) -> Option<u32> {
-        name.strip_prefix("stats-")?
-            .strip_suffix(".json")?
-            .parse()
-            .ok()
+        let digits = name.strip_prefix("stats-")?.strip_suffix(".json")?;
+        let pid: u32 = digits.parse().ok()?;
+        (pid.to_string() == digits).then_some(pid)
     }
 
     /// Reads the stats file at `path`, at [`STATS_VERSION`].

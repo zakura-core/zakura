@@ -3,12 +3,15 @@
 //! (explorer implementation plan, E4b-min).
 //!
 //! Each worker's processes write their stats files to the worker's
-//! `stats/` directory ([`crate::explore::stats`]). The evidence matches the
-//! files to the worker's attempts log by process ID, and lists each gap as
-//! an [`Incomplete`]: a worker that didn't spend its budget, a process that
-//! left no file, a file whose process didn't exit cleanly, and a file the
-//! log doesn't list. Only complete files count toward
-//! [`Evidence::complete_totals`], and so toward [`Evidence::unapplied`].
+//! `stats/` directory ([`crate::explore::stats`]). The evidence matches
+//! each file to the attempt in the worker's attempts log whose process has
+//! its process ID and started while the attempt ran, so a reused process ID
+//! or a stale copy matches no attempt. It lists each gap as an
+//! [`Incomplete`]: a worker that didn't spend its budget, a process that
+//! left no file, a file whose process didn't exit cleanly, and a file no
+//! logged process wrote. Only complete files that a logged process wrote
+//! count toward [`Evidence::complete_totals`], and so toward
+//! [`Evidence::unapplied`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -20,7 +23,8 @@ use serde::Serialize;
 
 use super::{
     run::{
-        read_attempts, read_end, worker_dir, AttemptEnd, WorkerOutcome, OUTCOME_FILE, STATS_DIR,
+        read_attempts, read_end, worker_dir, Attempt, AttemptEnd, WorkerOutcome, OUTCOME_FILE,
+        STATS_DIR,
     },
     store::{read_record, CampaignError, Digest, RunState, Store},
     Status, WorkerEnd,
@@ -40,11 +44,12 @@ pub struct Evidence {
     pub workers: Vec<WorkerEvidence>,
     /// Every stats file's counts, summed.
     pub totals: Counts,
-    /// The complete stats files' counts, summed.
+    /// The counts of the complete stats files that logged processes wrote,
+    /// summed.
     pub complete_totals: Counts,
-    /// The properties, of the harness's and of any stats file, that no
-    /// complete stats file saw apply: none of their runs held with an
-    /// applicable evaluation or violated them.
+    /// The properties, of the harness's and of any stats file, that no file
+    /// in [`Evidence::complete_totals`] saw apply: none of their runs held
+    /// with an applicable evaluation or violated them.
     pub unapplied: Vec<String>,
     /// Every way the counts fall short, by worker.
     pub incomplete: Vec<Incomplete>,
@@ -81,14 +86,15 @@ pub enum Incomplete {
         /// The worker.
         worker: usize,
     },
-    /// A process the attempts log lists left no stats file.
+    /// A process the attempts log lists left no stats file, or the log,
+    /// written before attempts recorded it, doesn't name its process.
     MissingStats {
         /// The worker.
         worker: usize,
         /// The attempt.
         attempt: u32,
-        /// Its process ID.
-        pid: u32,
+        /// Its process ID, if the log names it.
+        pid: Option<u32>,
     },
     /// A process didn't exit cleanly, or still runs: its stats file lacks
     /// the runs since its last checkpoint.
@@ -98,16 +104,18 @@ pub enum Incomplete {
         /// Its process ID.
         pid: u32,
     },
-    /// A stats file whose process the attempts log doesn't list: the
-    /// supervisor stopped while the process ran.
+    /// A stats file no process in the attempts log wrote: the supervisor
+    /// stopped while the process ran, or the file is a stale copy or from
+    /// an earlier process with the same ID. Its counts stay out of the
+    /// complete totals.
     UnloggedProcess {
         /// The worker.
         worker: usize,
         /// Its process ID.
         pid: u32,
     },
-    /// A stats file that can't be read, or that another harness wrote. Its
-    /// counts are left out.
+    /// A stats file that can't be read, that another harness wrote, or
+    /// whose name isn't `stats-<pid>.json`. Its counts are left out.
     UnreadableStats {
         /// The worker.
         worker: usize,
@@ -164,35 +172,45 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
             &mut evidence.incomplete,
         )?;
         let mut ends = BTreeMap::new();
-        for attempt in &attempts {
+        // The latest attempt claims a file first, so a file whose process
+        // ID an earlier attempt also had counts once.
+        let mut logged = BTreeSet::new();
+        for attempt in attempts.iter().rev() {
             *ends.entry(attempt.end).or_default() += 1;
-            let Some(pid) = attempt.pid else {
-                continue;
-            };
-            if !stats.contains_key(&pid) {
-                evidence.incomplete.push(Incomplete::MissingStats {
+            let wrote = attempt.pid.filter(|pid| {
+                !logged.contains(pid)
+                    && stats
+                        .get(pid)
+                        .is_some_and(|process| started_during(process, attempt))
+            });
+            match wrote {
+                Some(pid) => {
+                    logged.insert(pid);
+                }
+                None => evidence.incomplete.push(Incomplete::MissingStats {
                     worker: plan.index,
                     attempt: attempt.attempt,
-                    pid,
-                });
+                    pid: attempt.pid,
+                }),
             }
         }
         let mut counts = Counts::default();
         let processes = stats.len();
         for (pid, process) in &stats {
-            if !attempts.iter().any(|attempt| attempt.pid == Some(*pid)) {
+            let logged = logged.contains(pid);
+            if !logged {
                 evidence.incomplete.push(Incomplete::UnloggedProcess {
                     worker: plan.index,
                     pid: *pid,
                 });
             }
-            if process.complete {
-                evidence.complete_totals.add(&process.counts);
-            } else {
+            if !process.complete {
                 evidence.incomplete.push(Incomplete::PartialStats {
                     worker: plan.index,
                     pid: *pid,
                 });
+            } else if logged {
+                evidence.complete_totals.add(&process.counts);
             }
             counts.add(&process.counts);
         }
@@ -224,6 +242,16 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
     Ok(evidence)
 }
 
+/// True if `process` started while `attempt` ran. Both times are whole
+/// seconds, and the process starts after the supervisor logs its attempt's
+/// start.
+fn started_during(process: &ProcessStats, attempt: &Attempt) -> bool {
+    let ended = attempt
+        .started_unix
+        .saturating_add(attempt.millis.div_ceil(1000));
+    (attempt.started_unix..=ended).contains(&process.started_unix)
+}
+
 /// Worker directory `dir`'s outcome record, if it wrote one.
 fn outcome_record(dir: &Path) -> Result<Option<WorkerEnd>, CampaignError> {
     let path = dir.join(OUTCOME_FILE);
@@ -234,7 +262,9 @@ fn outcome_record(dir: &Path) -> Result<Option<WorkerEnd>, CampaignError> {
 }
 
 /// Every stats file of `harness` in `dir`, by process ID. A file that can't
-/// be read, or that another harness wrote, joins `incomplete` instead.
+/// be read, that another harness wrote, or that is named like a stats file
+/// but not as a process writes one, such as `stats-07.json`, joins
+/// `incomplete` instead.
 fn read_stats(
     dir: &Path,
     worker: usize,
@@ -255,23 +285,26 @@ fn read_stats(
     for entry in entries {
         let entry = entry.map_err(CampaignError::io(format!("listing {}", dir.display())))?;
         let file = entry.file_name().to_string_lossy().into_owned();
-        let Some(pid) = ProcessStats::pid_of(&file) else {
+        if !(file.starts_with("stats-") && file.ends_with(".json")) {
             continue;
-        };
-        let read = ProcessStats::read(&entry.path()).and_then(|process| {
-            if process.harness != harness {
-                Err(format!(
-                    "it holds harness {}'s counts, not {harness}'s",
-                    process.harness
-                ))
-            } else if process.pid != pid {
-                Err(format!("it holds process {}'s counts", process.pid))
-            } else {
-                Ok(process)
-            }
-        });
+        }
+        let read = ProcessStats::pid_of(&file)
+            .ok_or_else(|| "it isn't named stats-<pid>.json".to_owned())
+            .and_then(|pid| Ok((pid, ProcessStats::read(&entry.path())?)))
+            .and_then(|(pid, process)| {
+                if process.harness != harness {
+                    Err(format!(
+                        "it holds harness {}'s counts, not {harness}'s",
+                        process.harness
+                    ))
+                } else if process.pid != pid {
+                    Err(format!("it holds process {}'s counts", process.pid))
+                } else {
+                    Ok((pid, process))
+                }
+            });
         match read {
-            Ok(process) => {
+            Ok((pid, process)) => {
                 stats.insert(pid, process);
             }
             Err(error) => incomplete.push(Incomplete::UnreadableStats {

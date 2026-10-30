@@ -190,7 +190,9 @@ pub enum ReactorEvent {
     /// its state, so `snapshot` holds until the next `Resumed`. Reported
     /// once at build with turn 0, before each of the loop's waits, and,
     /// with `last` set, after the loop retires its work on the way out.
-    /// The final one is reported even when nothing changed.
+    /// The final one is reported even when nothing changed. The build's
+    /// own effects, such as a startup repair's `Dispatched`, come before
+    /// its turn 0 `Settled`.
     Settled {
         /// The turn that ends here: 0 at build, then the turn of the
         /// `Resumed` it follows.

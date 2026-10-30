@@ -144,6 +144,7 @@ impl ReactorLife {
                 ));
             }
         }
+        let reported = !facts.is_empty();
         let mut started = false;
         let mut settled_last_in_step = false;
         for fact in facts {
@@ -158,7 +159,7 @@ impl ReactorLife {
                         None if *turn == 0 && !*last => self.register()?,
                         None => {
                             return Err(format!(
-                                "NoInitialSnapshot: the reactor's first report, at step {step}, \
+                                "NoInitialSnapshot: the reactor's first marker, at step {step}, \
                                  is Settled{{turn: {turn}}}"
                             ))
                         }
@@ -189,7 +190,7 @@ impl ReactorLife {
                             if !self.finished && *turn == settled + 1 => {}
                         None => {
                             return Err(format!(
-                                "NoInitialSnapshot: the reactor's first report, at step {step}, \
+                                "NoInitialSnapshot: the reactor's first marker, at step {step}, \
                                  is Resumed{{turn: {turn}}}"
                             ))
                         }
@@ -215,12 +216,9 @@ impl ReactorLife {
                     }
                     self.marker = Some(Marker::Resumed(*turn));
                 }
-                _ if self.marker.is_none() => {
-                    return Err(format!(
-                        "NoInitialSnapshot: the reactor reported {fact:?} at step {step} before \
-                         its initial snapshot"
-                    ))
-                }
+                // The build's own effects, such as a startup repair's
+                // dispatch, come before its snapshot.
+                _ if self.marker.is_none() => {}
                 _ if self.finished => {
                     return Err(format!(
                         "AfterFinal: the reactor reported {fact:?} at step {step} after its \
@@ -247,8 +245,21 @@ impl ReactorLife {
             },
             _ => None,
         };
-        if let Some(Stop::Exited(exit)) = stop {
+        if let Some(Stop::Exited(_)) = stop {
             self.exited = true;
+        }
+        if let Some(detail) = self.link.take_unpaired() {
+            match (&stop, reported) {
+                // Teardown drops pending calls' futures, whose receipts no
+                // call end follows.
+                _ if self.finished || self.exited => {}
+                // The reactor carries on, so it lost the call's end.
+                (Some(Stop::Waiting), _) | (_, true) => return Err(detail),
+                // Mid-teardown, or not yet run: its next report decides.
+                _ => self.link.defer_unpaired(detail),
+            }
+        }
+        if let Some(Stop::Exited(exit)) = stop {
             if !self.finished {
                 return self.unfinished_exit(step, exit);
             }
@@ -864,5 +875,157 @@ mod tests {
             transitions += usize::from(after[0] == "in-transition" && ran == node_task);
         }
         assert!(transitions > 0, "the node stops mid-turn");
+    }
+
+    /// How [`repairing_run`] stops the reactor.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Stopping {
+        /// Cancels its shutdown token, so it settles a last time.
+        Shutdown,
+        /// Aborts its task, while the test keeps another clone of its
+        /// observer.
+        Abort,
+    }
+
+    /// The real reactor, tapped and audited, starting at A5 with the VCT
+    /// root at height 1 unavailable, so its build dispatches a context
+    /// read, which storage holds. A task stops it as `stopping` says.
+    fn repairing_run(stopping: Stopping) -> (RunReport, Rc<RefCell<ReactorLife>>) {
+        use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+
+        use crate::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
+
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let header = HeaderFixture::regtest();
+        crate::harness::header_node::preload(fixture.port.engine(), &header, &Chain::main(5));
+        let held = Policy {
+            bound_ms: None,
+            holds: vec![Hold {
+                select: Select {
+                    kind: Some(OpKind::VctContext),
+                    ..Select::default()
+                },
+                // Never: the run makes no locator read.
+                until: Trigger::Submitted(Select::nth(OpKind::Locator, 1)),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        };
+        let storage = PolicySource::new(
+            &mut fixture.sim,
+            fixture.port.clone(),
+            held,
+            Effects::default(),
+        );
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let port: Arc<dyn Port> = fixture.port.clone();
+        let (mut startup, _) = startup(&port, &header, Chain::main(5).tip(&header));
+        let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
+            state: VctRootRepairState::Unavailable {
+                height: zakura_chain::block::Height(1),
+            },
+            generation: 7,
+        });
+        startup.vct_root_repairs = Some(repairs_rx);
+        let shutdown = startup.shutdown.clone();
+        let kept = (stopping == Stopping::Abort).then(|| slot.clone());
+        startup.observer = slot;
+        let (handle, actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+        fixture.sim.scheduler().spawn_root("stopper", async move {
+            for _ in 0..8 {
+                zakura_rt::task::yield_now().await;
+            }
+            match stopping {
+                Stopping::Shutdown => shutdown.cancel(),
+                Stopping::Abort => reactor.abort(),
+            }
+        });
+        let (report, life) = fixture.run(&mut States::default());
+        drop((handle, actions, repairs, kept));
+        (report, life)
+    }
+
+    /// The facts of `report`'s node reactor, with their steps.
+    fn reactor_facts(report: &RunReport) -> Vec<(u64, &ReactorFact)> {
+        report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Reactor { event, .. } => Some((entry.step, event)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A reactor that starts with a VCT repair dispatches its context read
+    /// while it's built, before its turn 0 snapshot, which lists the call.
+    /// That's a valid start, and the reactor starts and ends as usual.
+    ///
+    /// This fails if every report before the initial snapshot fails it.
+    #[test]
+    fn a_startup_repair_reports_before_the_first_snapshot() {
+        let (report, life) = repairing_run(Stopping::Shutdown);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(
+                facts[..2],
+                [
+                    (0, ReactorFact::Dispatched { call: 1, port: crate::observe::ReactorCall::VctContext { .. } }),
+                    (0, ReactorFact::Settled { turn: 0, snapshot: Some(ref snapshot), .. }),
+                ] if snapshot.unhandled_calls == [1]
+            ),
+            "the build dispatches, then settles with the call: {:?}",
+            &facts[..2]
+        );
+        assert!(life.borrow().task().is_some(), "the reactor starts");
+        assert_eq!(name(life.borrow().component().state()), "ended-seen");
+    }
+
+    /// A reactor stopped with a call still pending drops the call's future,
+    /// so storage records `CallerDropped` with no call end. That's its
+    /// teardown, not a lost event: shut down, it ends seen, and aborted
+    /// with its observer kept elsewhere, it ends unsettled, and neither run
+    /// fails.
+    ///
+    /// This fails if the tap fails a teardown receipt before the reactor's
+    /// lifecycle explains it.
+    #[test]
+    fn a_stop_with_a_pending_call_ends_clean() {
+        for (stopping, ended) in [
+            (Stopping::Shutdown, "ended-seen"),
+            (Stopping::Abort, "ended-unsettled"),
+        ] {
+            let (report, life) = repairing_run(stopping);
+            assert_eq!(report.end.harness, None, "{stopping:?}: {:?}", report.end);
+            let dropped = report.log.entries().iter().any(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::Storage {
+                        fact: crate::observe::StorageFact::CallerDropped { .. },
+                        ..
+                    }
+                )
+            });
+            assert!(
+                dropped,
+                "{stopping:?}: the pending call's future is dropped"
+            );
+            assert!(
+                !reactor_facts(&report)
+                    .iter()
+                    .any(|(_, fact)| matches!(fact, ReactorFact::CallEnded { .. })),
+                "{stopping:?}: no call end follows"
+            );
+            assert_eq!(
+                name(life.borrow().component().state()),
+                ended,
+                "{stopping:?}"
+            );
+        }
     }
 }

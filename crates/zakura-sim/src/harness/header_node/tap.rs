@@ -101,6 +101,9 @@ struct TapState {
     /// explains an observer dropped without a final `Settled` by its task's
     /// outcome (M6a-3).
     audited: AtomicBool,
+    /// A drain's pairing failure that the hub's audit decides, the first
+    /// one not yet decided. See [`ReactorLink::take_unpaired`].
+    unpaired: Mutex<Option<String>>,
     buffer: Mutex<Buffer>,
 }
 
@@ -234,6 +237,7 @@ impl ReactorTap {
                 port_gone: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
                 audited: AtomicBool::new(false),
+                unpaired: Mutex::default(),
                 buffer: Mutex::default(),
             }))
         });
@@ -300,6 +304,26 @@ impl ReactorLink {
     /// Whether the reactor dropped its observer with no final `Settled`.
     pub(crate) fn unfinished_drop(&self) -> bool {
         self.state.unfinished_drop()
+    }
+
+    /// Takes the drain pairing failure the tap left to the hub, if any: a
+    /// storage receipt no call end paired with, which is a failure unless
+    /// the reactor is tearing down.
+    pub(crate) fn take_unpaired(&self) -> Option<String> {
+        self.state
+            .unpaired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Leaves `detail` undecided for a later boundary.
+    pub(crate) fn defer_unpaired(&self, detail: String) {
+        self.state
+            .unpaired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(detail);
     }
 }
 
@@ -659,6 +683,17 @@ impl ReactorTap {
             Err(PairError::Evidence(_))
                 if self.state.health().is_some() || self.state.unfinished_drop() =>
             {
+                Ok(())
+            }
+            // A receipt with no call end is also what a reactor's teardown
+            // leaves, when it drops a pending call's future. Once a hub
+            // audits the reactor, it decides by the reactor's lifecycle.
+            Err(PairError::Evidence(detail)) if self.state.audited.load(Ordering::Relaxed) => {
+                self.state
+                    .unpaired
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_or_insert(detail);
                 Ok(())
             }
             Err(PairError::Evidence(detail)) => Err(detail),

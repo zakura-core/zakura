@@ -11,6 +11,14 @@ import network
 
 
 class ArchiveSeedTests(unittest.TestCase):
+    def test_existing_archive_cannot_be_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / 'seed.tar.zst'
+            archive.write_bytes(b'preserved first capture')
+            with self.assertRaisesRegex(ValueError, 'immutable'):
+                archive_seed.pack_state(Path(temporary), archive)
+            self.assertEqual(archive.read_bytes(), b'preserved first capture')
+
     def document(self):
         return {'selectedProfile': 'public-testnet', 'generatedAt': 100,
                 'status': {'network': {'name': 'Testnet', 'activationHeight': 4465026},

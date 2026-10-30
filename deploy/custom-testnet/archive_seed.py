@@ -51,6 +51,8 @@ def state_bytes(cache):
 def pack_state(cache, archive):
     """Write an atomic compressed snapshot of a stopped node's state."""
     cache, archive = Path(cache), Path(archive)
+    if archive.exists():
+        raise ValueError('refusing to replace an immutable archive')
     temporary = archive.with_suffix('.partial')
     names = [name for name in ('state', 'non_finalized_state') if (cache / name).is_dir()]
     if 'state' not in names:
@@ -264,10 +266,12 @@ def refresh_seed(config, restore_archive):
         finalized = info['header_chain']['finalized']
         command('systemctl', 'stop', service)
         size = state_bytes(preparation / 'cache')
-        if shutil.disk_usage(root).free < size * 3 + 2 * 1024**3:
+        # Preparation is removed before restoring the two validators. Reserving
+        # twice its size covers both the compressed seed and those final copies.
+        if shutil.disk_usage(root).free < size * 2 + 2 * 1024**3:
             raise ValueError('insufficient space for the preserved seed and two archive validators')
         stage('preserving', public_tip=reference, seed_height=info['blocks'])
-        destination = archive.parent / f'archive-seed-{info["blocks"]}-{info["bestblockhash"][:12]}.tar.zst'
+        destination = archive.parent / f'archive-seed-{info["blocks"]}-{name.lower()}.tar.zst'
         digest = pack_state(preparation / 'cache', destination)
         updated = dict(config, seed_archive=str(destination), seed_sha256=digest,
                        seed_height=info['blocks'], seed_hash=info['bestblockhash'],

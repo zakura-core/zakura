@@ -274,6 +274,7 @@ class Controller:
         with self.lock:
             run = json.loads((self.root / 'run.json').read_text())
             result = dict(run, observed_at=int(time.time()), nodes=[])
+            result.pop('activation_hash', None)
             try:
                 if run['phase'] not in ('preparing', 'failed'):
                     result['nodes'] = verify_nodes(self.config, run)

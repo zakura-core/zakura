@@ -13,8 +13,12 @@
 compile_error!("qa/fuzz/sim needs RUSTFLAGS=\"--cfg zakura_sim\"");
 
 #[cfg(zakura_sim)]
+mod feedback;
+#[cfg(zakura_sim)]
 mod fuzz;
 
+#[cfg(zakura_sim)]
+pub use feedback::*;
 #[cfg(zakura_sim)]
 pub use fuzz::*;
 

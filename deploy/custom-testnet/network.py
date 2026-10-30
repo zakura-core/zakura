@@ -52,8 +52,8 @@ def load_config(path):
         raise ValueError('revision must identify the deployed source commit')
     if config['seed_height'] >= 4465026 or config['seed_height'] < 4134000:
         raise ValueError('seed must be after NU6.3 and before public Testnet NU7')
-    if not 0 < config['seed_finalized_height'] <= config['seed_height']:
-        raise ValueError('finalized checkpoint must not exceed the full seed tip')
+    if not 0 < config['seed_finalized_height'] < config['seed_height']:
+        raise ValueError('finalized checkpoint must precede the full seed tip so its last block is replayed')
     for field in ('seed_hash', 'seed_finalized_hash', 'seed_sha256', 'binary_sha256'):
         if not re.fullmatch(r'[0-9a-f]{64}', config[field]):
             raise ValueError('seed and binary hashes must be full lowercase hex values')

@@ -34,8 +34,8 @@ neither necessary nor a five-minute schedule.
 
 `/etc/zakura-custom-testnet.json` pins the deployment root, service prefix, binary,
 source revision, miner receiving address, public peer, and seed URL provenance,
-full and finalized tip heights/hashes, checksum, and original network directory. It contains no signing
-keys. Preserve the seed archive outside the disposable node directories.
+full and finalized tip heights/hashes, checksum, and original network directory.
+It contains no signing keys. Preserve the seed archive outside the disposable node directories.
 
 `install.py` installs the controller, the two node units, Caddy configuration,
 and the operator command from a checked-out source revision. It requires an
@@ -63,7 +63,8 @@ Use `/v1/network` and `/v1/config` from the dashboard origin together. Build the
 manifest's revision with the `pq` feature, download and checksum the seed,
 extract into the participant cache directory, and rename its network directory
 under `state/v*/` and directly under `non_finalized_state/` to the new
-lowercase network name. Keep JSON-RPC on localhost. A participant must refresh its configuration
+lowercase network name. Keep JSON-RPC on localhost. A participant must refresh
+its configuration
 and state after every operator reset.
 
 `/v1/status` reports the current generation, node heights/hashes and agreement,

@@ -16,6 +16,7 @@
 //! own ancestors are followed, and on Windows a path can change between the
 //! check and the open.
 
+pub mod confirm;
 pub mod explain;
 pub mod failure;
 pub mod meta;
@@ -25,6 +26,7 @@ pub mod shrink;
 mod verify;
 pub mod write;
 
+pub use confirm::{confirm, ConfirmStatus, Confirmation, CONFIRMATION_FILE};
 pub use failure::{artifacts_root, record_failure, ARTIFACTS_VAR, TRACES_DIR};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};

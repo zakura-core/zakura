@@ -52,7 +52,7 @@ impl Recorder {
 
 /// Whether `event` reports a work identity: a reservation's placement or
 /// binding, a call's captured leases, or a transfer's start or end
-/// (M6a-4).
+/// (M6a-4), or a page's staging (M6a-5a).
 fn is_identity(event: &ReactorEvent) -> bool {
     matches!(
         event,
@@ -61,6 +61,7 @@ fn is_identity(event: &ReactorEvent) -> bool {
             | ReactorEvent::LeasesCaptured { .. }
             | ReactorEvent::EntriesTaken { .. }
             | ReactorEvent::TransferEnded { .. }
+            | ReactorEvent::Staged { .. }
     )
 }
 
@@ -363,7 +364,7 @@ fn prepare_operation(
             &mut 0,
             &reactor.startup.observer,
             active.incarnation,
-            entries.len(),
+            &entries,
         ),
         entries,
     }
@@ -1280,10 +1281,16 @@ async fn observer_does_not_change_behaviour() {
                     call: 1,
                     panicked: false
                 },
+                ReactorEvent::Staged {
+                    incarnation: 1,
+                    count: 1,
+                    ..
+                },
                 ReactorEvent::EntriesTaken {
                     incarnation: 1,
                     transfer: 1,
-                    count: 1
+                    count: 1,
+                    ..
                 },
                 ReactorEvent::Dispatched {
                     call: 2,
@@ -1624,6 +1631,7 @@ fn the_snapshot_lists_awaiting_and_active_work() {
                     purpose: HeaderTargetPurpose::Normal,
                     phase: HeaderTargetPhase::Applying,
                     held: 1,
+                    held_digest: observe::HeldDigest::of(&seeded.entries),
                     cursor: None,
                 },
             },
@@ -2396,10 +2404,21 @@ async fn every_transfer_ends_once() {
         (Dropped, Ends::Dropped),
     ] {
         let history = transfer_history(case).await;
+        // The transfer took the one staged header, with that header's
+        // digest.
+        let chain = history
+            .iter()
+            .find_map(|event| match event {
+                ReactorEvent::EntriesTaken { chain, .. } => Some(*chain),
+                _ => None,
+            })
+            .expect("the page's prepare took its header");
+        assert_eq!(chain.len, 1, "{case:?}");
         let taken = ReactorEvent::EntriesTaken {
             incarnation: 1,
             transfer: 1,
             count: 1,
+            chain,
         };
         let ended = ReactorEvent::TransferEnded {
             transfer: 1,
@@ -2421,4 +2440,95 @@ async fn every_transfer_ends_once() {
             "only the handoff dispatches its apply, as call 2: {case:?}"
         );
     }
+}
+
+/// The active work's held count and digest in `snapshot`, for `peer`.
+fn held_by(
+    snapshot: &observe::ReactorSnapshot,
+    peer: &ZakuraPeerId,
+) -> Option<(usize, observe::HeldDigest)> {
+    snapshot.work.iter().find_map(|work| match &work.phase {
+        observe::WorkPhase::Active {
+            held, held_digest, ..
+        } if work.peer == *peer => Some((*held, *held_digest)),
+        _ => None,
+    })
+}
+
+/// A prepare takes the staged headers whose digest the page reported, so
+/// its `EntriesTaken` chain is the last `Staged` digest, and the work then
+/// holds the empty digest: at a settled boundary with the prepare held,
+/// and at one after the prepare hands off to an apply that hasn't
+/// completed. An expected digest that restarts empty after the take
+/// matches both, so neither is unframed work (M6a-5a).
+///
+/// This fails if the take leaves the taken entries' digest held.
+#[tokio::test]
+async fn a_held_prepare_and_a_handoff_are_not_unframed() {
+    let recorder = Arc::new(Recorder::default());
+    let peer = peer();
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let port = Arc::new(ScriptedPort {
+        gate: Some(gate.clone()),
+        ..ScriptedPort::default()
+    });
+    let (mut reactor, snapshot) = observed_reactor(
+        port.clone(),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (_, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let target = prepared_for(&mut reactor, &peer, owner);
+    *port.prepared.lock().expect("unpoisoned") = Some(target);
+    recorder.take_all();
+
+    prepare_through_a_page(&mut reactor, &snapshot, &peer);
+    let events = recorder.take_all();
+    let staged = events.iter().find_map(|event| match event {
+        ReactorEvent::Staged { after, count, .. } => Some((*count, *after)),
+        _ => None,
+    });
+    let chain = events.iter().find_map(|event| match event {
+        ReactorEvent::EntriesTaken { chain, .. } => Some(*chain),
+        _ => None,
+    });
+    let (count, after) = staged.expect("the page staged its header");
+    assert_eq!((count, after.len), (1, 1));
+    assert_eq!(chain, Some(after), "the take carries the staged digest");
+    assert_eq!(
+        held_by(&settle(&reactor, &recorder), &peer),
+        Some((0, observe::HeldDigest::default())),
+        "the held prepare left the work holding nothing"
+    );
+
+    // The prepare answers and hands off to the apply, which the gate holds.
+    gate.add_permits(1);
+    complete_next(&mut reactor).await;
+    let events = recorder.take_all();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ReactorEvent::TransferEnded {
+                disposition: observe::TransferDisposition::HandedToApply { .. },
+                ..
+            }
+        )),
+        "the prepare handed its headers to the apply: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ReactorEvent::Dispatched {
+                op: PortCall::Apply { .. },
+                ..
+            }
+        )),
+        "the apply is pending: {events:#?}"
+    );
+    assert_eq!(
+        held_by(&settle(&reactor, &recorder), &peer),
+        Some((0, observe::HeldDigest::default())),
+        "the handoff left the work holding nothing"
+    );
 }

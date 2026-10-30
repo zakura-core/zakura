@@ -430,6 +430,11 @@ impl StreamTap {
         });
     }
 
+    /// The QUIC stream it taps (M6a-5a).
+    pub(crate) fn quic_stream(&self) -> u64 {
+        self.quic_stream
+    }
+
     /// The sequence number of the header the reader has now.
     pub(crate) fn reading(&self) -> u64 {
         self.reading.load(Ordering::Acquire)

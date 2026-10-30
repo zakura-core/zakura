@@ -21,7 +21,7 @@ use observe::{HeaderSyncObserver, ObserverSlot};
 
 /// Records every event in order.
 #[derive(Debug, Default)]
-struct Recorder(StdMutex<Vec<ReactorEvent>>);
+pub(super) struct Recorder(StdMutex<Vec<ReactorEvent>>);
 
 impl HeaderSyncObserver for Recorder {
     fn observe(&self, event: ReactorEvent) {
@@ -34,14 +34,14 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call.
-    fn take(&self) -> Vec<ReactorEvent> {
+    pub(super) fn take(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
 }
 
 /// A reactor with an external port and `snapshot` committed, observed by
 /// `recorder`. Its port actions arrive on the returned channel.
-fn observed(
+pub(super) fn observed(
     snapshot: &zakura_header_chain::EngineSnapshot,
     recorder: &Arc<Recorder>,
     direct: bool,
@@ -61,7 +61,7 @@ fn observed(
 }
 
 /// The genesis snapshot the test reactors commit.
-fn genesis() -> zakura_header_chain::EngineSnapshot {
+pub(super) fn genesis() -> zakura_header_chain::EngineSnapshot {
     let startup = startup(CancellationToken::new());
     committed_snapshot(zakura_header_chain::Frontier::new(
         startup.anchor.0,
@@ -71,7 +71,10 @@ fn genesis() -> zakura_header_chain::EngineSnapshot {
 
 /// Connects the peer `byte`, keeping a sender into its outbound queue, and
 /// drops its initial status.
-fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedSend, FramedRecv) {
+pub(super) fn connect(
+    reactor: &mut HeaderSyncReactor,
+    byte: u8,
+) -> (ZakuraPeerId, FramedSend, FramedRecv) {
     let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length");
     let (send, mut outbound) = framed_channel(8);
     reactor.handle_peer_connected(PeerSession::from_parts(
@@ -84,7 +87,7 @@ fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedSe
 }
 
 /// `count` headers that extend `parent`, one second apart.
-fn headers(parent: zakura_header_chain::Frontier, count: u32) -> Vec<HeaderEntry> {
+pub(super) fn headers(parent: zakura_header_chain::Frontier, count: u32) -> Vec<HeaderEntry> {
     let mut parent = parent.hash;
     (1..=count)
         .map(|second| {
@@ -102,7 +105,7 @@ fn headers(parent: zakura_header_chain::Frontier, count: u32) -> Vec<HeaderEntry
 }
 
 /// The reactor's state, settled now, as its observer receives it.
-fn settle(reactor: &HeaderSyncReactor, recorder: &Recorder) -> observe::ReactorSnapshot {
+pub(super) fn settle(reactor: &HeaderSyncReactor, recorder: &Recorder) -> observe::ReactorSnapshot {
     recorder.take();
     reactor.settled(false);
     match recorder.take().as_slice() {

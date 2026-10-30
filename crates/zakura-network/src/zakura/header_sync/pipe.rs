@@ -43,6 +43,12 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                 None => return Ok(()),
             },
         };
+        // The frame's stream and read seq, taken as the reader hands it
+        // over (M6a-5a). An in-memory link has no stream tap.
+        #[cfg(any(test, zakura_sim))]
+        let read = recv
+            .stream_tap()
+            .and_then(|tap| tap.serving().map(|seq| (tap.quic_stream(), seq)));
         let payload_len = frame.payload.len();
         if matches!(
             frame.message_type,
@@ -55,6 +61,17 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
         }
         let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
             .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
+        // Digests the decoded entries before any other code sees them.
+        #[cfg(any(test, zakura_sim))]
+        let frame_tag = read.map(|(quic_stream, seq)| super::observe::FrameTag {
+            quic_stream,
+            seq,
+            payload_len,
+            received: match &message {
+                Message::Headers(page) => super::observe::HeldDigest::of(&page.entries),
+                _ => super::observe::HeldDigest::default(),
+            },
+        });
         let event = match message {
             Message::Status(status) => {
                 session.subscriber().observe(&status);
@@ -83,6 +100,8 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                     session_id,
                     page,
                     admitted,
+                    #[cfg(any(test, zakura_sim))]
+                    frame: frame_tag,
                 }
             }
             Message::HeadersOutcome(outcome) => {

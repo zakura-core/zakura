@@ -358,7 +358,7 @@ impl VctLocalFixture {
                     selected_target: self.context.target,
                     episode: self.context.episode,
                 },
-                transfer: unobserved_transfer(active.entries.len()),
+                transfer: unobserved_transfer(&active.entries),
                 entries: active.entries.clone(),
             },
             HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
@@ -785,7 +785,7 @@ fn normal_header_operations_have_no_vct_fatal_deadline() {
             common_ancestor: snapshot.frontiers.finalized,
         },
         entries: active.entries.clone(),
-        transfer: unobserved_transfer(active.entries.len()),
+        transfer: unobserved_transfer(&active.entries),
     };
 
     assert!(reactor.dispatch_action(action));
@@ -2470,7 +2470,7 @@ async fn disconnected_preparation_retains_capacity_until_completion() {
         completion: zakura_header_chain::TargetCompletion::TargetPrefix {
             common_ancestor: snapshot.frontiers.finalized,
         },
-        transfer: unobserved_transfer(active.entries.len()),
+        transfer: unobserved_transfer(&active.entries),
         entries: std::mem::take(&mut active.entries),
     };
     assert!(reactor.dispatch_action(operation));

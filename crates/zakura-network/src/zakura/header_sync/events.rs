@@ -332,6 +332,9 @@ pub enum Event {
         page: Headers,
         /// Where the page leaves its subscription.
         admitted: Admitted,
+        /// The frame it came in (M6a-5a).
+        #[cfg(any(test, zakura_sim))]
+        frame: Option<super::observe::FrameTag>,
     },
     /// A terminal outcome that the session's subscriber admitted.
     Outcome {

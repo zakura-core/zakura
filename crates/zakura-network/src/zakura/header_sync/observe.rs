@@ -276,6 +276,9 @@ pub enum ReactorEvent {
         transfer: TransferId,
         /// How many headers it took.
         count: usize,
+        /// The digest of the headers it took, as the incarnation held them
+        /// (M6a-5a).
+        chain: HeldDigest,
     },
     /// A transfer's last handle dropped, ending it (M6a-4). Reported once
     /// per transfer, by its tag's `Drop`, from whichever task dropped it.
@@ -285,6 +288,123 @@ pub enum ReactorEvent {
         /// How it ended.
         disposition: TransferDisposition,
     },
+    /// The reactor appended a page's headers to an incarnation's staged
+    /// entries (M6a-5a). Reported right after the append, so `after` is
+    /// the digest of every entry the incarnation then holds.
+    Staged {
+        /// The incarnation that holds them.
+        incarnation: IncarnationId,
+        /// The frame the page came in, or `None` on a link with no stream
+        /// tap.
+        frame: Option<FrameTag>,
+        /// How many headers it appended.
+        count: usize,
+        /// The digest of the entries the incarnation holds after the
+        /// append.
+        after: HeldDigest,
+    },
+}
+
+/// Which frame a page came in, read where the session reader takes it
+/// (M6a-5a). A cfg-only field of `Event::Page`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FrameTag {
+    /// The frame's QUIC stream.
+    pub quic_stream: u64,
+    /// The frame's read sequence number on that stream, as the transport
+    /// observer numbers it.
+    pub seq: u64,
+    /// The frame's payload length in bytes.
+    pub payload_len: usize,
+    /// The digest of the entries the reader decoded from it, taken before
+    /// any other code sees them.
+    pub received: HeldDigest,
+}
+
+/// A composable digest of a sequence of header entries (M6a-5a).
+///
+/// Each entry hashes to `h`, over its header's hash, its `body_size` and
+/// its `tree_aux` record, so every field of a [`HeaderEntry`]. A sequence
+/// `e_1..e_n` digests to the polynomial `h_1·B^(n-1) + ... + h_n` modulo
+/// 2^64, with its length. So `D(A then P) = D(A)·B^|P| + D(P)`, and a
+/// reader can extend an expected digest by a page's digest and length
+/// alone, with [`then`](Self::then).
+///
+/// [`HeaderEntry`]: super::wire::HeaderEntry
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct HeldDigest {
+    /// The polynomial's value.
+    pub value: u64,
+    /// The entries it covers.
+    pub len: u64,
+}
+
+impl HeldDigest {
+    /// The polynomial's base, an odd 64-bit constant.
+    const BASE: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// The digest of `entries`, in order.
+    pub fn of(entries: &[super::wire::HeaderEntry]) -> Self {
+        entries.iter().fold(Self::default(), |digest, entry| {
+            digest.then(Self::entry(entry))
+        })
+    }
+
+    /// The one-entry digest of `entry`.
+    pub fn entry(entry: &super::wire::HeaderEntry) -> Self {
+        use super::wire::TreeAuxWire;
+
+        let mut state = blake2b_simd::Params::new()
+            .hash_length(8)
+            .personal(b"ZakuraSimHeldEnt")
+            .to_state();
+        state.update(&entry.header.hash().0);
+        state.update(&entry.body_size.to_le_bytes());
+        match &entry.tree_aux {
+            None => {
+                state.update(&[0]);
+            }
+            Some(record) => {
+                let mut bytes = vec![1];
+                record
+                    .encode_to(&mut bytes)
+                    .expect("writing a record to a vector can't fail");
+                state.update(&bytes);
+            }
+        }
+        let hash = state.finalize();
+        let value = u64::from_le_bytes(
+            hash.as_bytes()
+                .try_into()
+                .expect("the hash is 8 bytes long"),
+        );
+        Self { value, len: 1 }
+    }
+
+    /// The digest of this sequence followed by `next`'s.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        Self {
+            value: self
+                .value
+                .wrapping_mul(Self::power(next.len))
+                .wrapping_add(next.value),
+            len: self.len.saturating_add(next.len),
+        }
+    }
+
+    /// `BASE^exponent` modulo 2^64, by squaring.
+    fn power(mut exponent: u64) -> u64 {
+        let (mut result, mut base) = (1u64, Self::BASE);
+        while exponent != 0 {
+            if exponent & 1 == 1 {
+                result = result.wrapping_mul(base);
+            }
+            base = base.wrapping_mul(base);
+            exponent >>= 1;
+        }
+        result
+    }
 }
 
 impl ReactorEvent {
@@ -495,22 +615,23 @@ struct TransferTag {
 }
 
 impl TransferHandle {
-    /// A new transfer of `count` headers out of `incarnation`, numbered
-    /// one past `last`, which it advances. Reports `EntriesTaken` through
-    /// `slot`, which its end reports through too. It starts
-    /// `NotDispatched`.
+    /// A new transfer of the `taken` headers out of `incarnation`,
+    /// numbered one past `last`, which it advances. Reports `EntriesTaken`,
+    /// with their count and digest, through `slot`, which its end reports
+    /// through too. It starts `NotDispatched`.
     pub(crate) fn taken(
         last: &mut TransferId,
         slot: &ObserverSlot,
         incarnation: IncarnationId,
-        count: usize,
+        taken: &[super::wire::HeaderEntry],
     ) -> Self {
         *last += 1;
         let transfer = *last;
         slot.emit(ReactorEvent::EntriesTaken {
             incarnation,
             transfer,
-            count,
+            count: taken.len(),
+            chain: HeldDigest::of(taken),
         });
         Self(Arc::new(TransferTag {
             transfer,
@@ -614,6 +735,8 @@ pub enum WorkPhase {
         phase: HeaderTargetPhase,
         /// How many staged headers it holds.
         held: usize,
+        /// The digest of the staged headers it holds (M6a-5a).
+        held_digest: HeldDigest,
         /// The cursor of its last staged page.
         cursor: Option<Cursor>,
     },

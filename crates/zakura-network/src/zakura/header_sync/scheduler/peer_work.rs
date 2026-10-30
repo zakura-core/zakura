@@ -1034,6 +1034,9 @@ impl PeerWorkQueue {
                         purpose: request.purpose.clone(),
                         phase: request.phase,
                         held: request.entries.len(),
+                        held_digest: crate::zakura::header_sync::observe::HeldDigest::of(
+                            &request.entries,
+                        ),
                         cursor: request.cursor,
                     },
                 },

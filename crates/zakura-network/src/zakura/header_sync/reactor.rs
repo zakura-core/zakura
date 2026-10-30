@@ -1227,7 +1227,9 @@ impl HeaderSyncReactor {
                 session_id,
                 page,
                 admitted,
-            } => self.handle_page(peer, session_id, page, admitted),
+                #[cfg(any(test, zakura_sim))]
+                frame,
+            } => sim_arg!(self.handle_page(peer, session_id, page, admitted); frame),
             Event::Outcome {
                 peer,
                 session_id,
@@ -1887,6 +1889,7 @@ impl HeaderSyncReactor {
         session_id: u64,
         response: Headers,
         admitted: Admitted,
+        #[cfg(any(test, zakura_sim))] frame: Option<observe::FrameTag>,
     ) {
         let Some(active) = self.peer_work_queue.active(&peer) else {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
@@ -2016,7 +2019,18 @@ impl HeaderSyncReactor {
             .active_mut(&peer)
             .expect("the matching active request was just cloned");
         active.common_ancestor.get_or_insert(returned_ancestor);
+        #[cfg(any(test, zakura_sim))]
+        let count = response.entries.len();
         active.entries.extend(response.entries);
+        observe!(
+            self,
+            ReactorEvent::Staged {
+                incarnation: active.incarnation,
+                frame,
+                count,
+                after: observe::HeldDigest::of(&active.entries),
+            }
+        );
         active.cursor = Some(admitted.cursor);
         let staged_entry_count = active.entries.len();
         let target_tip_height = active.target.status.selected_tip_height;
@@ -2123,7 +2137,7 @@ impl HeaderSyncReactor {
                 &mut self.last_transfer,
                 &self.startup.observer,
                 active.incarnation,
-                active.entries.len(),
+                &active.entries,
             );
             let action = HeaderPortOperation::PrepareHeaderTarget {
                 purpose: active.purpose.clone(),

@@ -7,6 +7,7 @@ mod identities;
 mod observer;
 mod peer_faults;
 mod port_panics;
+mod staging;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;
@@ -24,9 +25,9 @@ use crate::zakura::{
     Frame, LOCAL_MAX_MESSAGE_BYTES,
 };
 
-/// An unobserved transfer for a test-built prepare of `count` headers.
-fn unobserved_transfer(count: usize) -> observe::TransferHandle {
-    observe::TransferHandle::taken(&mut 0, &observe::ObserverSlot::default(), 0, count)
+/// An unobserved transfer for a test-built prepare of `entries`.
+fn unobserved_transfer(entries: &[HeaderEntry]) -> observe::TransferHandle {
+    observe::TransferHandle::taken(&mut 0, &observe::ObserverSlot::default(), 0, entries)
 }
 
 fn peer() -> ZakuraPeerId {
@@ -118,7 +119,7 @@ impl HeaderSyncReactor {
     /// admitted it. See [`admit_page`].
     fn deliver_page(&mut self, peer: ZakuraPeerId, session_id: u64, page: Headers) {
         let admitted = admit_page(self, &peer, &page);
-        self.handle_page(peer, session_id, page, admitted);
+        self.handle_page(peer, session_id, page, admitted, None);
     }
 
     /// Deliver `outcome` from `peer`'s session `session_id` as its subscriber
@@ -178,6 +179,7 @@ fn page_event(session: &PeerSession, page: Headers) -> Event {
         session_id: session.session_id(),
         page,
         admitted,
+        frame: None,
     }
 }
 

@@ -245,6 +245,38 @@ fn call_of(entries: &[Entry], op: u64) -> Option<(u64, u64, usize, Option<usize>
     Some((call, session, ended, handled))
 }
 
+/// The scenario of [`replacement_while_storage_is_pending`].
+fn replacement() -> WireScenario {
+    let handled = Trigger::Handled(Select::nth(OpKind::Prepare, 1));
+    let hold = |select, until, deadline_ms| Hold {
+        select,
+        until,
+        then: vec![Allow::Engine],
+        deadline_ms: Some(deadline_ms),
+    };
+    WireScenario {
+        node: Chain::main(PRELOAD),
+        peers: vec![honest(
+            PeerSpec::dialing(),
+            120,
+            vec![PeerAction::Close, PeerAction::Redial],
+        )],
+        policy: Policy {
+            holds: vec![
+                hold(
+                    Select::nth(OpKind::Prepare, 1),
+                    Trigger::Submitted(Select::nth(OpKind::Prepare, 2)),
+                    20_000,
+                ),
+                hold(Select::nth(OpKind::Prepare, 2), handled.clone(), 25_000),
+                hold(Select::nth(OpKind::Apply, 1), handled, 5_000),
+            ],
+            ..Policy::converging()
+        },
+        ..WireScenario::default()
+    }
+}
+
 /// M4's replacement while a prepare is pending (`header_node_late.rs`,
 /// `prepare_completed_after_replacement_is_inert`), over real connections,
 /// with every session ID read back from the node's `admitted` events.
@@ -274,34 +306,7 @@ fn call_of(entries: &[Entry], op: u64) -> Option<(u64, u64, usize, Option<usize>
 /// of the history that isn't reached fails the test.
 #[test]
 fn replacement_while_storage_is_pending() {
-    let handled = Trigger::Handled(Select::nth(OpKind::Prepare, 1));
-    let hold = |select, until, deadline_ms| Hold {
-        select,
-        until,
-        then: vec![Allow::Engine],
-        deadline_ms: Some(deadline_ms),
-    };
-    let scenario = WireScenario {
-        node: Chain::main(PRELOAD),
-        peers: vec![honest(
-            PeerSpec::dialing(),
-            120,
-            vec![PeerAction::Close, PeerAction::Redial],
-        )],
-        policy: Policy {
-            holds: vec![
-                hold(
-                    Select::nth(OpKind::Prepare, 1),
-                    Trigger::Submitted(Select::nth(OpKind::Prepare, 2)),
-                    20_000,
-                ),
-                hold(Select::nth(OpKind::Prepare, 2), handled.clone(), 25_000),
-                hold(Select::nth(OpKind::Apply, 1), handled, 5_000),
-            ],
-            ..Policy::converging()
-        },
-        ..WireScenario::default()
-    };
+    let scenario = replacement();
     for plan in plans() {
         let (report, _, ports) = run_with(&scenario, plan, &mut NoChecks);
         assert_eq!(report.end.harness, None, "{:?}", report.end);
@@ -905,5 +910,58 @@ fn regenerate_saved_plans() {
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
         fs::write(base.with_extension("end.json"), format!("{end}\n"))
             .expect("the fixture directory exists");
+    }
+}
+
+/// In the replacement history, session 1's late prepare finds session 2's
+/// preparing work, so its transfer ends `stale`, once, and session 2's
+/// transfer ends handed to its apply.
+///
+/// This fails if the completion doesn't hand its transfer to the handler,
+/// which leaves it `dropped`.
+#[test]
+fn the_replacement_history_ends_its_transfer() {
+    let scenario = replacement();
+    for plan in plans() {
+        let (report, _, _) = run_with(&scenario, plan, &mut NoChecks);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let mut prepares = Vec::new();
+        let mut ended: Vec<(u64, String)> = Vec::new();
+        for entry in report.log.entries() {
+            match &entry.obs {
+                Observation::Reactor {
+                    event:
+                        ReactorFact::Dispatched {
+                            port: ReactorCall::Prepare { transfer, .. },
+                            ..
+                        },
+                    ..
+                } => prepares.push(*transfer),
+                Observation::Reactor {
+                    event:
+                        ReactorFact::TransferEnded {
+                            transfer,
+                            disposition,
+                            ..
+                        },
+                    ..
+                } => ended.push((*transfer, disposition.clone())),
+                _ => {}
+            }
+        }
+        assert_eq!(prepares.len(), 2, "one prepare per session: {prepares:?}");
+        let ends = |transfer| -> Vec<&str> {
+            ended
+                .iter()
+                .filter(|(t, _)| *t == transfer)
+                .map(|(_, disposition)| disposition.as_str())
+                .collect()
+        };
+        assert_eq!(ends(prepares[0]), ["stale"], "session 1's late prepare");
+        assert_eq!(
+            ends(prepares[1]),
+            ["handed-to-apply"],
+            "session 2's prepare"
+        );
     }
 }

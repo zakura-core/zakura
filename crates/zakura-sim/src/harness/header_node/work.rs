@@ -6,14 +6,17 @@
 //! request it was reserved for starts. A request's `Started` and
 //! `Retired` name their incarnation, and each prepare or apply call's
 //! `LeasesCaptured` joins the call to the incarnation and the lease IDs it
-//! holds. [`WorkLedger`] folds those records in log order and checks them
+//! holds. A prepare takes its incarnation's staged headers as a transfer,
+//! `EntriesTaken`, which ends once, `TransferEnded`, when its last handle
+//! drops. [`WorkLedger`] folds those records in log order and checks them
 //! against each settled snapshot, whose holdings it reads from the queue's
-//! own maps. Any break is a structural failure of the tap's evidence.
+//! own maps. Any break is a structural failure of the tap's evidence. A
+//! transfer still live when the log freezes is pending, not a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::observe::{
-    ReactorFact, ReactorPlacement, ReactorRequest, ReactorSnapshot, ReactorWorkState,
+    ReactorCall, ReactorFact, ReactorPlacement, ReactorRequest, ReactorSnapshot, ReactorWorkState,
 };
 
 /// One placed reservation.
@@ -44,12 +47,26 @@ pub struct Incarnation {
     pub calls: Vec<u64>,
 }
 
-/// A tapped reactor's placements, bindings and captures, folded in log
-/// order.
+/// One transfer of staged headers into a prepare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transfer {
+    /// The incarnation the headers left.
+    pub incarnation: u64,
+    /// How many headers it took.
+    pub count: u64,
+    /// The prepare call that carries it, once dispatched.
+    pub call: Option<u64>,
+    /// How it ended, once it did, with its apply call for a handoff.
+    pub ended: Option<(String, Option<u64>)>,
+}
+
+/// A tapped reactor's placements, bindings, captures and transfers, folded
+/// in log order.
 #[derive(Debug, Default)]
 pub struct WorkLedger {
     reservations: BTreeMap<u64, Reservation>,
     incarnations: BTreeMap<u64, Incarnation>,
+    transfers: BTreeMap<u64, Transfer>,
     /// Calls the reactor dispatched.
     calls: BTreeSet<u64>,
     /// Calls whose leases were captured.
@@ -72,6 +89,20 @@ impl WorkLedger {
     /// Every incarnation, by ID.
     pub fn incarnations(&self) -> &BTreeMap<u64, Incarnation> {
         &self.incarnations
+    }
+
+    /// Every transfer, by ID.
+    pub fn transfers(&self) -> &BTreeMap<u64, Transfer> {
+        &self.transfers
+    }
+
+    /// The headers every transfer took out of `incarnation`, live or ended.
+    pub fn taken(&self, incarnation: u64) -> u64 {
+        self.transfers
+            .values()
+            .filter(|transfer| transfer.incarnation == incarnation)
+            .map(|transfer| transfer.count)
+            .sum()
     }
 
     /// Folds `fact`, failing with a detail if it breaks the identities
@@ -165,8 +196,75 @@ impl WorkLedger {
                 }
                 work.retired = true;
             }
-            ReactorFact::Dispatched { call, .. } => {
+            ReactorFact::Dispatched { call, port } => {
                 self.calls.insert(*call);
+                if let ReactorCall::Prepare { transfer, .. } = port {
+                    match self.transfers.get_mut(transfer) {
+                        Some(taken) if taken.ended.is_none() && taken.call.is_none() => {
+                            taken.call = Some(*call)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "UnknownTransfer: prepare call {call} carries transfer \
+                                 {transfer}, which isn't live and undispatched"
+                            ))
+                        }
+                    }
+                }
+            }
+            ReactorFact::EntriesTaken {
+                incarnation,
+                transfer,
+                count,
+            } => {
+                if !self
+                    .incarnations
+                    .get(incarnation)
+                    .is_some_and(|work| work.started.is_some())
+                {
+                    return Err(format!(
+                        "UnknownIncarnation: transfer {transfer} took headers from incarnation \
+                         {incarnation}, which never started"
+                    ));
+                }
+                let taken = Transfer {
+                    incarnation: *incarnation,
+                    count: *count,
+                    call: None,
+                    ended: None,
+                };
+                if self.transfers.insert(*transfer, taken).is_some() {
+                    return Err(format!(
+                        "DuplicateTransfer: transfer {transfer} was taken twice"
+                    ));
+                }
+            }
+            ReactorFact::TransferEnded {
+                transfer,
+                disposition,
+                apply,
+            } => {
+                let Some(taken) = self.transfers.get_mut(transfer) else {
+                    return Err(format!(
+                        "UnknownTransfer: transfer {transfer} ended {disposition} before it \
+                         was taken"
+                    ));
+                };
+                if let Some((first, _)) = &taken.ended {
+                    return Err(format!(
+                        "TransferEndedTwice: transfer {transfer} ended {first}, then \
+                         {disposition}"
+                    ));
+                }
+                if let Some(call) = apply {
+                    if !self.calls.contains(call) {
+                        return Err(format!(
+                            "UncalledHandoff: transfer {transfer} went to apply call {call} \
+                             before its dispatch"
+                        ));
+                    }
+                }
+                taken.ended = Some((disposition.clone(), *apply));
             }
             ReactorFact::LeasesCaptured {
                 call, incarnation, ..
@@ -199,13 +297,18 @@ impl WorkLedger {
     }
 
     /// Checks `snapshot`, a settled one, against the identities folded so
-    /// far: each active request is a started incarnation of its peer, and
-    /// each reservation the queue holds was placed for its peer and, when
-    /// the peer's work is active, bound to that work's incarnation.
+    /// far: each active request is a started incarnation of its peer whose
+    /// staged leases cover exactly the headers it holds and every transfer
+    /// took from it, live or ended, and each reservation the queue holds was
+    /// placed for its peer and, when the peer's work is active, bound to
+    /// that work's incarnation.
     pub(crate) fn settled(&self, snapshot: &ReactorSnapshot) -> Result<(), String> {
         let mut active = BTreeMap::new();
         for work in &snapshot.work {
-            let ReactorWorkState::Active { incarnation, .. } = work.state else {
+            let ReactorWorkState::Active {
+                incarnation, held, ..
+            } = work.state
+            else {
                 continue;
             };
             match self.incarnations.get(&incarnation) {
@@ -217,6 +320,20 @@ impl WorkLedger {
                         work.peer
                     ))
                 }
+            }
+            let staged: u64 = snapshot
+                .holdings
+                .iter()
+                .filter(|holding| holding.peer == work.peer)
+                .flat_map(|holding| &holding.leases)
+                .map(|lease| lease.count)
+                .sum();
+            let taken = self.taken(incarnation);
+            if staged != held + taken {
+                return Err(format!(
+                    "Unaccounted: incarnation {incarnation}'s leases own {staged} headers, but \
+                     it holds {held} and its transfers took {taken}"
+                ));
             }
             active.insert(work.peer.as_str(), incarnation);
         }
@@ -480,5 +597,107 @@ mod tests {
             named(misbound.settled(&snapshot("01", 1, 2))).as_deref(),
             Some("MisboundReservation")
         );
+    }
+
+    fn taken(incarnation: u64, transfer: u64, count: u64) -> ReactorFact {
+        ReactorFact::EntriesTaken {
+            incarnation,
+            transfer,
+            count,
+        }
+    }
+
+    fn ended(transfer: u64, disposition: &str, apply: Option<u64>) -> ReactorFact {
+        ReactorFact::TransferEnded {
+            transfer,
+            disposition: disposition.into(),
+            apply,
+        }
+    }
+
+    /// A transfer taken, carried by its prepare, and handed once to a
+    /// dispatched apply folds cleanly, and its count stays accounted after
+    /// it ends. Each kind of break fails with its own name.
+    ///
+    /// This fails if a check is dropped.
+    #[test]
+    fn the_ledger_refuses_each_broken_transfer() {
+        let prepare = |call: u64, transfer: u64| ReactorFact::Dispatched {
+            call,
+            port: ReactorCall::Prepare {
+                peer: "01".into(),
+                source: "01".into(),
+                owner: request("01", 1).owner,
+                transfer,
+            },
+        };
+        let apply = ReactorFact::Dispatched {
+            call: 2,
+            port: ReactorCall::Apply {
+                peer: "01".into(),
+                source: "01".into(),
+                owner: request("01", 1).owner,
+            },
+        };
+        let start = [placed(1, "01"), bound(1, 1), started("01", 1)];
+        let mut ledger = WorkLedger::default();
+        let good: Vec<ReactorFact> = start
+            .iter()
+            .cloned()
+            .chain([
+                taken(1, 1, 2),
+                prepare(1, 1),
+                apply.clone(),
+                ended(1, "handed-to-apply", Some(2)),
+            ])
+            .collect();
+        assert_eq!(fold(&mut ledger, &good), None);
+        let mut accounted = snapshot("01", 1, 1);
+        accounted.holdings[0].leases = vec![crate::observe::ReactorLease { lease: 2, count: 2 }];
+        assert_eq!(ledger.settled(&accounted), Ok(()));
+        assert_eq!(ledger.taken(1), 2);
+
+        let named = |result: Result<(), String>| {
+            result
+                .err()
+                .map(|detail| detail.split(':').next().unwrap_or_default().to_owned())
+        };
+        let mut short = accounted.clone();
+        short.holdings[0].leases[0].count = 1;
+        assert_eq!(
+            named(ledger.settled(&short)).as_deref(),
+            Some("Unaccounted")
+        );
+
+        let broken: [(Vec<ReactorFact>, &str); 6] = [
+            (vec![taken(1, 1, 2)], "UnknownIncarnation"),
+            (vec![taken(1, 1, 2), taken(1, 1, 2)], "DuplicateTransfer"),
+            (vec![ended(1, "stale", None)], "UnknownTransfer"),
+            (vec![prepare(1, 1)], "UnknownTransfer"),
+            (
+                vec![
+                    taken(1, 1, 2),
+                    ended(1, "stale", None),
+                    ended(1, "dropped", None),
+                ],
+                "TransferEndedTwice",
+            ),
+            (
+                vec![taken(1, 1, 2), ended(1, "handed-to-apply", Some(2))],
+                "UncalledHandoff",
+            ),
+        ];
+        for (facts, name) in broken {
+            let facts: Vec<ReactorFact> = if name == "UnknownIncarnation" {
+                facts
+            } else {
+                start.iter().cloned().chain(facts).collect()
+            };
+            assert_eq!(
+                fold(&mut WorkLedger::default(), &facts).as_deref(),
+                Some(name),
+                "{facts:?}"
+            );
+        }
     }
 }

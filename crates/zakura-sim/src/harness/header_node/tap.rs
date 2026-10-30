@@ -36,7 +36,8 @@ use std::{
 use zakura_network::zakura::{
     observe::{
         CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement, PortCall,
-        ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm, WaitCause, WorkPhase,
+        ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm, TransferDisposition,
+        WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
@@ -338,10 +339,12 @@ fn call(call: PortCall) -> ReactorCall {
             peer: supplier,
             source,
             owner,
+            transfer,
         } => ReactorCall::Prepare {
             peer: peer(&supplier),
             source: hex(&source.digest()),
             owner: work_owner(owner),
+            transfer,
         },
         PortCall::Apply {
             peer: supplier,
@@ -364,6 +367,23 @@ fn end(end: CallEnd) -> &'static str {
         CallEnd::NotSubmitted => "not-submitted",
         CallEnd::PortPanicked => "port-panicked",
         CallEnd::Dropped => "dropped",
+    }
+}
+
+/// `ended`'s name, with its apply call for a handoff.
+fn disposition(ended: TransferDisposition) -> (&'static str, Option<u64>) {
+    match ended {
+        TransferDisposition::NotDispatched => ("not-dispatched", None),
+        TransferDisposition::Dropped => ("dropped", None),
+        TransferDisposition::External => ("external", None),
+        TransferDisposition::Panicked => ("panicked", None),
+        TransferDisposition::Stale => ("stale", None),
+        TransferDisposition::NoAuthority => ("no-authority", None),
+        TransferDisposition::OwnerMismatch => ("owner-mismatch", None),
+        TransferDisposition::RepairInvalid => ("repair-invalid", None),
+        TransferDisposition::HandedToApply { call } => ("handed-to-apply", Some(call)),
+        TransferDisposition::ApplyRefused => ("apply-refused", None),
+        TransferDisposition::PrepareFailed => ("prepare-failed", None),
     }
 }
 
@@ -594,6 +614,27 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             incarnation,
             leases,
         },
+        ReactorEvent::EntriesTaken {
+            incarnation,
+            transfer,
+            count,
+        } => ReactorFact::EntriesTaken {
+            incarnation,
+            transfer,
+            // A transfer holds at most a few thousand headers.
+            count: count as u64,
+        },
+        ReactorEvent::TransferEnded {
+            transfer,
+            disposition: ended,
+        } => {
+            let (disposition, apply) = disposition(ended);
+            ReactorFact::TransferEnded {
+                transfer,
+                disposition: disposition.to_owned(),
+                apply,
+            }
+        }
         // The enum is non-exhaustive, and an event the log can't hold would
         // leave the evidence silently incomplete.
         unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),

@@ -20,7 +20,7 @@ use zakura_sim::{
         },
         header_sync::storage_config,
     },
-    observe::ReactorFact,
+    observe::{ReactorCall, ReactorFact},
     storage::HeaderStorage,
     ActionSource, Boundary, HarnessFailure, Identity, IdleStatus, MemorySink, Observation,
     ObservationLog, Outcome, PlanInput, RunConfig, RunReport, Sim, Violation,
@@ -1002,6 +1002,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Placed { .. } => "placed",
                 ReactorFact::Bound { .. } => "bound",
                 ReactorFact::LeasesCaptured { .. } => "leases-captured",
+                ReactorFact::EntriesTaken { .. } => "entries-taken",
+                ReactorFact::TransferEnded { .. } => "transfer-ended",
             }),
             _ => None,
         })
@@ -1011,8 +1013,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
 /// Tapping the node's reactor adds no scheduling point: under every plan, the
 /// run with the tap makes the same picks and logs the same storage entries
 /// as the run without it, and the node's dispatches, call ends, completions,
-/// starts, retirements, settled markers, placements, bindings and captured
-/// leases all reach the log, in sequence.
+/// starts, retirements, settled markers, placements, bindings, captured
+/// leases and transfers all reach the log, in sequence.
 #[test]
 fn tap_adds_no_scheduling_point() {
     for input in inputs(16, 256) {
@@ -1034,7 +1036,9 @@ fn tap_adds_no_scheduling_point() {
                 "resumed",
                 "placed",
                 "bound",
-                "leases-captured"
+                "leases-captured",
+                "entries-taken",
+                "transfer-ended"
             ])
         );
         let seqs: Vec<u64> = tapped
@@ -1119,6 +1123,55 @@ fn work_identities_add_no_scheduling_point() {
         assert!(
             reserved && leased,
             "a settled snapshot holds a reservation and a lease"
+        );
+        assert_eq!(tapped.end, bare.end);
+        assert_eq!(support::picks(&tapped), support::picks(&bare));
+        assert_eq!(stops(&tapped), stops(&bare));
+    }
+}
+
+/// Transfers add no scheduling point (M6a-4): under every plan, the tapped
+/// run makes the same picks and stops every task at the same point, object
+/// and site as the bare run, and the tapped run takes a transfer into a
+/// prepare call that names it and ends it once, handed to its apply.
+///
+/// This fails if a transfer's capture path reads anything through the
+/// simulator's primitives, such as a prepare's call naming its transfer.
+#[test]
+fn transfer_events_add_no_scheduling_point() {
+    for input in inputs(8, 256) {
+        let bare = node_run(input.clone(), false);
+        let tapped = node_run(input, true);
+        let facts: Vec<&ReactorFact> = tapped
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Reactor { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        let handed = facts.iter().find_map(|fact| match fact {
+            ReactorFact::TransferEnded {
+                transfer,
+                disposition,
+                apply: Some(_),
+            } if disposition == "handed-to-apply" => Some(*transfer),
+            _ => None,
+        });
+        let Some(handed) = handed else {
+            panic!("a transfer goes to its apply");
+        };
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                ReactorFact::EntriesTaken { transfer, count, .. } if *transfer == handed && *count > 0
+            )) && facts.iter().any(|fact| matches!(
+                fact,
+                ReactorFact::Dispatched { port: ReactorCall::Prepare { transfer, .. }, .. }
+                    if *transfer == handed
+            )),
+            "the handed transfer was taken and its prepare names it"
         );
         assert_eq!(tapped.end, bare.end);
         assert_eq!(support::picks(&tapped), support::picks(&bare));

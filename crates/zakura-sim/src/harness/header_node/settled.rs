@@ -19,7 +19,7 @@
 //! also reports its own teardown, `Dropping`, from its `Drop`, so it ends
 //! there unsettled if no `Settled{last}` came first: cancelled, or aborted
 //! before its task's first poll. After `Dropping`, only its pending calls'
-//! `dropped` call ends may follow. A task that completes with no
+//! `dropped` call ends, and their transfers' `dropped` ends, may follow. A task that completes with no
 //! `Settled{last}` fails the run as `NoFinalSnapshot`, and one that panics,
 //! which reports no teardown, ends unsettled at its exit.
 //!
@@ -168,8 +168,13 @@ impl ReactorLife {
         let mut settled_last_in_step = false;
         for fact in facts {
             settled_last_in_step = false;
-            let dropped_call =
-                matches!(fact, ReactorFact::CallEnded { end, .. } if end == "dropped");
+            // A teardown drops each pending call, which ends it, and ends
+            // the transfer a held prepare carries.
+            let dropped_call = matches!(fact, ReactorFact::CallEnded { end, .. } if end == "dropped")
+                || matches!(
+                    fact,
+                    ReactorFact::TransferEnded { disposition, .. } if disposition == "dropped"
+                );
             if self.dropping && !dropped_call {
                 return Err(format!(
                     "AfterDropping: the reactor reported {fact:?} at step {step} after its \

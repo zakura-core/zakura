@@ -1052,3 +1052,186 @@ fn a_truncated_run_is_pending() {
         seen.last()
     );
 }
+
+/// Each transfer's facts in `report`'s log: its incarnation and count, the
+/// prepare call that carries it, and how it ended, with the apply call.
+#[derive(Debug, Default)]
+struct TransferFacts {
+    taken: Option<(u64, u64)>,
+    call: Option<u64>,
+    ended: Vec<(String, Option<u64>)>,
+}
+
+/// Every transfer in `report`'s log, by ID.
+fn transfer_facts(report: &RunReport) -> std::collections::BTreeMap<u64, TransferFacts> {
+    let mut transfers = std::collections::BTreeMap::<u64, TransferFacts>::new();
+    for entry in report.log.entries() {
+        let Observation::Reactor { event, .. } = &entry.obs else {
+            continue;
+        };
+        match event {
+            ReactorFact::EntriesTaken {
+                incarnation,
+                transfer,
+                count,
+            } => transfers.entry(*transfer).or_default().taken = Some((*incarnation, *count)),
+            ReactorFact::Dispatched {
+                call,
+                port: ReactorCall::Prepare { transfer, .. },
+            } => transfers.entry(*transfer).or_default().call = Some(*call),
+            ReactorFact::TransferEnded {
+                transfer,
+                disposition,
+                apply,
+            } => transfers
+                .entry(*transfer)
+                .or_default()
+                .ended
+                .push((disposition.clone(), *apply)),
+            _ => {}
+        }
+    }
+    transfers
+}
+
+/// A settled boundary after a successful handoff to apply, and before the
+/// apply's call ends, still accounts for every staged header: the
+/// incarnation holds none, its leases own exactly what its ended transfer
+/// took, and the fold, which checks that at every settled boundary, finds
+/// no gap. Storage holds the first apply for 1 s of virtual time, so it
+/// can't commit inside the reactor's turn that dispatched it.
+///
+/// This fails if the fold counts only live transfers.
+#[test]
+fn a_handoff_keeps_the_accounting() {
+    let mut scenario = honest(Vec::new());
+    scenario.peers[0]
+        .honest
+        .as_mut()
+        .expect("the peer is honest")
+        .chain = 1_200;
+    scenario.policy = Policy {
+        holds: vec![hold(
+            Select::nth(OpKind::Apply, 1),
+            Trigger::VirtualTime(1_000),
+            5_000,
+        )],
+        ..Policy::converging()
+    };
+    let (report, _) = reactor_run(&scenario, HeaderWire::config(&scenario));
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let transfers = transfer_facts(&report);
+    let mut checked = 0;
+    for facts in transfers.values() {
+        let (Some((incarnation, count)), [(ended, Some(apply))]) = (facts.taken, &facts.ended[..])
+        else {
+            continue;
+        };
+        if ended != "handed-to-apply" {
+            continue;
+        }
+        // The first settled snapshot after the handoff and before the
+        // apply's call ends.
+        let mut after_handoff = false;
+        for entry in report.log.entries() {
+            let Observation::Reactor { event, .. } = &entry.obs else {
+                continue;
+            };
+            match event {
+                ReactorFact::TransferEnded { apply: Some(c), .. } if c == apply => {
+                    after_handoff = true
+                }
+                ReactorFact::CallEnded { call, .. } if call == apply => break,
+                ReactorFact::Settled {
+                    snapshot: Some(snapshot),
+                    ..
+                } if after_handoff => {
+                    let Some(work) = snapshot.work.iter().find(|work| {
+                        matches!(
+                            work.state,
+                            zakura_sim::observe::ReactorWorkState::Active { incarnation: i, .. }
+                                if i == incarnation
+                        )
+                    }) else {
+                        break;
+                    };
+                    let zakura_sim::observe::ReactorWorkState::Active { held, .. } = work.state
+                    else {
+                        unreachable!("matched above");
+                    };
+                    let leased: u64 = snapshot
+                        .holdings
+                        .iter()
+                        .filter(|holding| holding.peer == work.peer)
+                        .flat_map(|holding| &holding.leases)
+                        .map(|lease| lease.count)
+                        .sum();
+                    assert_eq!((held, leased), (0, count), "incarnation {incarnation}");
+                    checked += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "a settled boundary falls between a handoff and its apply's end: {transfers:?}"
+    );
+}
+
+/// A run cut off by its budget while a prepare is held leaves its transfer
+/// taken and unended, with no harness failure.
+///
+/// This fails if the run requires every transfer to end by the freeze.
+#[test]
+fn a_truncated_run_leaves_its_transfer_pending() {
+    let mut scenario = honest(Vec::new());
+    scenario.peers[0]
+        .honest
+        .as_mut()
+        .expect("the peer is honest")
+        .chain = 1_200;
+    let full = HeaderWire::config(&scenario);
+    let (report, _) = reactor_run(&scenario, full);
+    // The step of the first prepare's dispatch: its transfer is live until
+    // the call is handled, at least a step later.
+    let dispatched = report
+        .log
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Reactor {
+                    event: ReactorFact::Dispatched {
+                        port: ReactorCall::Prepare { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("the run prepares a target")
+        .step;
+    let config = zakura_sim::RunConfig {
+        budget: dispatched + 1,
+        drain_bound: 0,
+        ..full
+    };
+    let (report, _) = reactor_run(&scenario, config);
+    assert_eq!(
+        report.end.outcome,
+        zakura_sim::Outcome::Budget,
+        "{:?}",
+        report.end
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let transfers = transfer_facts(&report);
+    assert!(
+        transfers
+            .values()
+            .any(|facts| facts.taken.is_some() && facts.call.is_some() && facts.ended.is_empty()),
+        "a dispatched transfer is still live at the freeze: {transfers:?}"
+    );
+}

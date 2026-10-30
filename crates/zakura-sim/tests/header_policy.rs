@@ -330,6 +330,7 @@ fn dispatched(call: u64, kind: OpKind, session: u64) -> ReactorFact {
             peer: "aa".to_owned(),
             source: "aa".to_owned(),
             owner: owner(session),
+            transfer: call,
         },
         OpKind::Apply => ReactorCall::Apply {
             peer: "aa".to_owned(),

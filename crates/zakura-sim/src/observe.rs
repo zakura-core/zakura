@@ -1439,6 +1439,29 @@ pub enum ReactorFact {
         /// The leases' IDs.
         leases: Vec<u64>,
     },
+    /// The reactor moved an incarnation's staged headers into a prepare
+    /// (M6a-4).
+    EntriesTaken {
+        /// The incarnation the headers left.
+        incarnation: u64,
+        /// The transfer's number, from 1 per reactor.
+        transfer: u64,
+        /// How many headers it took.
+        count: u64,
+    },
+    /// A transfer's last handle dropped, ending it (M6a-4).
+    TransferEnded {
+        /// The transfer's number.
+        transfer: u64,
+        /// How it ended: `not-dispatched`, `dropped`, `external`,
+        /// `panicked`, `stale`, `no-authority`, `owner-mismatch`,
+        /// `repair-invalid`, `handed-to-apply`, `apply-refused` or
+        /// `prepare-failed`.
+        disposition: String,
+        /// The apply call it went to, for `handed-to-apply`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        apply: Option<u64>,
+    },
 }
 
 /// The work a reservation was placed for (M6a-4).
@@ -1598,6 +1621,8 @@ pub enum ReactorCall {
         source: String,
         /// The request that owns the target.
         owner: WorkOwner,
+        /// The transfer that carries its staged headers (M6a-4).
+        transfer: u64,
     },
     /// A prepared target's application.
     Apply {

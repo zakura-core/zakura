@@ -62,7 +62,11 @@ budget-secs = 43200
 id = "target/sim/block_sync_storage"
 shard = "sim"
 workers = 3
-input-timeout-secs = 600
+# The committed above-window witness takes about 430 seconds without ASan
+# and more than 900 seconds with ASan on the campaign host. The target uses
+# the volume lane after its ASan build and short-input smoke passed.
+sanitizer = "none"
+input-timeout-secs = 840
 
 [[target]]
 id = "target/sim/header_sync_wire"

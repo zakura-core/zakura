@@ -31,7 +31,9 @@ python3 scripts/fuzz-campaign.py --campaign qa/fuzz/sim/campaigns/full-suite-202
 the source and lockfile digests, `qa/suite.toml`'s digest, every target,
 harness, property, witness and pending row, and the seed report. Its
 target rows hold each target's 60-second smoke command over its seeds. Run
-them before the calibration segment.
+them before the calibration segment. Run each row's generated command
+unchanged. A direct binary smoke over an empty corpus does not execute the
+admitted seeds and does not satisfy C3.
 
 ## Run a segment
 
@@ -62,6 +64,13 @@ writes `run.log`, `exit-status`, libFuzzer's artifacts and
 shard's directory also holds `segment.json`, `suite.json`, and the start
 and finish times. Every segment of a target grows the same corpus,
 `$CAMPAIGN_ROOT/corpus/<package>/<target>/`.
+
+A target may set `sanitizer = "none"` in `manifest.toml` after its ASan
+smoke passes. The launcher records that choice in the generated command.
+For simulator targets, it also disables the sanitizer-only scheduler
+feature. The block-storage target uses this volume lane because its finite
+300,000-step above-window witness takes about 430 seconds without ASan and
+more than 900 seconds with ASan on the campaign host.
 
 A segment's script refuses to reuse a segment's directory. To continue an
 interrupted segment, run its next attempt with `--attempt 2` (then 3, and

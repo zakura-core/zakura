@@ -39,7 +39,11 @@ def campaign():
         "name": "test",
         "cpus": 4,
         "integration": {"base": "b" * 40},
-        "toolchain": {"rust": "1.98.0", "fuzz": "nightly-2026-07-15"},
+        "toolchain": {
+            "rust": "1.98.0",
+            "fuzz": "nightly-2026-07-15",
+            "sanitizer": "address",
+        },
         "formats": {"trace": 21, "contract": 1},
         "segment": [{"name": "pilot", "budget-secs": 3600}],
         "target": [
@@ -123,6 +127,17 @@ class CheckTest(unittest.TestCase):
         bad["target"][1]["workers"] = 5
         self.assertEqual(problems(bad, manifest()), ["the shard `header-chain` has 5 workers on 4 vCPUs"])
 
+    def test_a_sanitizer_must_be_supported(self):
+        bad = campaign()
+        bad["target"][0]["sanitizer"] = "thread"
+        self.assertEqual(
+            problems(bad, manifest()),
+            [
+                "`target/sim/discovery_wait_complete`'s sanitizer is thread, "
+                "not `address` or `none`"
+            ],
+        )
+
 
 class ScriptTest(unittest.TestCase):
     def script(self, shard, attempt=1):
@@ -138,7 +153,8 @@ class ScriptTest(unittest.TestCase):
         script = self.script("header-chain")
         self.assertIn(
             "env ASAN_OPTIONS=detect_leaks=0 timeout --kill-after=300 4200 cargo +nightly-2026-07-15 fuzz run "
-            "--fuzz-dir /r/qa/fuzz/header-chain recovery_rows /c/corpus/header-chain/recovery_rows -- "
+            "--fuzz-dir /r/qa/fuzz/header-chain -s address recovery_rows "
+            "/c/corpus/header-chain/recovery_rows -- "
             "-max_total_time=3600 -timeout=300 -jobs=2 -workers=2 -max_len=256 "
             "-artifact_prefix=/c/segments/pilot/header-chain/header-chain/recovery_rows/artifacts/",
             script,
@@ -155,6 +171,29 @@ class ScriptTest(unittest.TestCase):
         )
         self.assertIn("'RUSTFLAGS=--cfg zakura_sim' "
                       "ZAKURA_SIM_ARTIFACTS=/c/segments/pilot/sim/sim/discovery_wait_complete/sim", script)
+
+    def test_a_sim_target_can_disable_the_sanitizer(self):
+        selected = campaign()
+        selected["target"][0]["sanitizer"] = "none"
+        rows = fuzz_campaign.suite_targets(
+            fuzz_campaign.tomllib.loads(SUITE_TEXT.decode()), manifest()
+        )
+        with tempfile.TemporaryDirectory() as dir:
+            suite = Path(dir) / "suite.json"
+            suite.write_text(json.dumps(manifest()))
+            script = fuzz_campaign.segment_script(
+                selected, rows, suite, "pilot", "sim", 1, set(), Path("/c"), HEAD, Path("/r")
+            )
+        self.assertIn(
+            "fuzz build --fuzz-dir /r/qa/fuzz/sim -s none --no-default-features "
+            "discovery_wait_complete",
+            script,
+        )
+        self.assertIn(
+            "fuzz run --fuzz-dir /r/qa/fuzz/sim -s none --no-default-features "
+            "discovery_wait_complete",
+            script,
+        )
 
     def test_a_resume_needs_its_parent_and_writes_its_own_directory(self):
         script = self.script("sim", attempt=2)

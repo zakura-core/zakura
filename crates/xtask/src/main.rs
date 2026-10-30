@@ -134,6 +134,7 @@ fn try_main() -> Result<(), BoxError> {
             }
             sim_feedback::run(&repo_root()?)
         }
+        Some("sim-suite") => sim::run(&repo_root()?, "suite", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -360,6 +361,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         "  cargo xtask sim-seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>] [--quarantine <dir>] [--report <file>]"
     )?;
     writeln!(output, "  cargo xtask sim-feedback")?;
+    writeln!(output, "  cargo xtask sim-suite [--out <file>] [--frozen]")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -445,5 +447,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "checks that libFuzzer keeps an input for a semantic feature alone."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Builds the zakura-sim full-suite manifest from qa/suite.toml, and fails with every"
+    )?;
+    writeln!(
+        output,
+        "harness, property, target, ignored test or seed the manifest doesn't cover."
     )
 }

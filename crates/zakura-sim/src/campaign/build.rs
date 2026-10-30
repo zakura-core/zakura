@@ -438,19 +438,23 @@ mod tests {
         );
     }
 
-    /// The fuzz package maps each of its targets to a registered harness.
+    /// Each fuzz target the package maps runs a registered harness. The
+    /// suite check requires every other target to be excluded in
+    /// `qa/suite.toml`, as `feedback_probe` is.
     #[test]
-    fn every_fuzz_target_runs_a_registered_harness() {
+    fn every_mapped_fuzz_target_runs_a_registered_harness() {
         let text = include_str!("../../../../qa/fuzz/sim/Cargo.toml");
         let manifest: toml::Value = toml::from_str(text).unwrap();
         let targets = manifest["bin"].as_array().unwrap();
-        assert!(!targets.is_empty());
+        let mut mapped = 0;
         for target in targets {
             let name = target["name"].as_str().unwrap();
-            let harness = target_harness(text, name)
-                .unwrap_or_else(|| panic!("fuzz target {name} maps no harness"));
-            crate::harness::find(&harness).unwrap();
+            if let Some(harness) = target_harness(text, name) {
+                crate::harness::find(&harness).unwrap();
+                mapped += 1;
+            }
         }
+        assert!(mapped > 0);
         assert_eq!(target_harness(text, "no_such_target"), None);
     }
 }

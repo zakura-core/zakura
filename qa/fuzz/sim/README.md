@@ -120,7 +120,8 @@ main.
   the `zakura-sim` binary that wrote it, the harness's versions, properties
   and simulator limits, the feedback line the target logs at startup (none
   for a target without a collector), the suite manifest's digest, each
-  worker's libFuzzer seed and CPUs, the budget and libFuzzer flags, and the
+  worker's libFuzzer seed and CPUs, the budget, libFuzzer flags and sanitizer
+  variables such as `ASAN_OPTIONS`, and the
   initial snapshot, which holds the harness's curated seeds. Each worker runs
   libFuzzer on its own corpus directory plus the initial snapshot, and
   restarts a process that ends early, such as at a crash or the abandonment

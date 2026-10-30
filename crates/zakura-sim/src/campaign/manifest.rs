@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     build::FuzzBuild,
-    run::{close, fuzzer_command, read_end, run_logged, verify_files},
+    run::{close, fuzzer_command, read_end, run_logged, verify_files, Prepared},
     snapshot::Source,
     store::{
         now_unix, partial_path, read_record, record_bytes, write_once, CampaignError, Digest,
@@ -36,6 +36,16 @@ pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
 /// The start of the line a fuzz target with semantic feedback logs at
 /// startup, followed by `key=value` pairs.
 pub const FEEDBACK_LINE: &str = "zakura-sim feedback: ";
+
+/// The sanitizer variables a run's fuzzer processes get from its
+/// manifest, and from nowhere else.
+pub const SANITIZER_VARS: &[&str] = &[
+    "ASAN_OPTIONS",
+    "LSAN_OPTIONS",
+    "MSAN_OPTIONS",
+    "TSAN_OPTIONS",
+    "UBSAN_OPTIONS",
+];
 
 /// How long the startup probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -235,6 +245,9 @@ pub struct Budget {
     pub abandon_limit: usize,
     /// `ZAKURA_SIM_FEEDBACK`, if set: `on` or `off`.
     pub feedback_mode: Option<String>,
+    /// The sanitizer variables, from [`SANITIZER_VARS`], that the fuzzer
+    /// processes run with. The others are unset.
+    pub sanitizer_options: BTreeMap<String, String>,
     /// If set, the time limit in seconds for compacting the run's snapshot
     /// with libFuzzer's merge after the workers stop.
     pub compact_secs: Option<u64>,
@@ -243,9 +256,20 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Checks the budget: a nonzero time, a known feedback mode, and extra
-    /// flags that are flags and aren't reserved.
+    /// Checks the budget: a nonzero time, a known feedback mode, known
+    /// sanitizer variables, and extra flags that are flags and aren't
+    /// reserved.
     fn check(&self) -> Result<(), CampaignError> {
+        if let Some(name) = self
+            .sanitizer_options
+            .keys()
+            .find(|name| !SANITIZER_VARS.contains(&name.as_str()))
+        {
+            return Err(CampaignError::Refused(format!(
+                "`{name}` isn't a sanitizer variable: {}",
+                SANITIZER_VARS.join(", ")
+            )));
+        }
         if self.seconds == 0 {
             return Err(CampaignError::Refused(
                 "a worker's budget must be at least 1 second".to_owned(),
@@ -447,15 +471,15 @@ impl Store {
     }
 }
 
-/// Writes the manifest of a campaign segment's first run, and returns its
-/// digest. [`super::run`] then runs it.
+/// Writes the manifest of a campaign segment's first run, and returns the
+/// run locked for [`Prepared::run`].
 ///
 /// The run's initial snapshot holds `options.harness`'s curated seeds from
 /// `options.fixtures`, which must all validate, and with
 /// [`Migration::Carry`] the previous segment's last snapshot too. A store
 /// with a run must name it as `options.parent`, since a store holds one
 /// campaign.
-pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Digest, CampaignError> {
+pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, CampaignError> {
     options.budget.check()?;
     if options.workers.is_empty() {
         return Err(CampaignError::Refused(
@@ -560,11 +584,12 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Digest, Cam
         },
         artifacts: options.artifacts,
     };
-    store.write_manifest(&manifest)
+    let digest = store.write_manifest(&manifest)?;
+    Prepared::lock(store, digest)
 }
 
-/// Writes the manifest of a run that resumes another, and returns its
-/// digest. [`super::run`] then runs it.
+/// Writes the manifest of a run that resumes another, and returns the run
+/// locked for [`Prepared::run`].
 ///
 /// An open parent is ended first, by [`close`]. The new run starts from the
 /// parent's end snapshot, after checking that snapshot's inputs and every
@@ -572,7 +597,7 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Digest, Cam
 /// fuzzer build has the parent's identity, the runner comes from the
 /// build's commit, and the harness and feedback match the parent's: a run
 /// that differs in any of them starts a new segment instead.
-pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Digest, CampaignError> {
+pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared, CampaignError> {
     let _lock = store.lock_store()?;
     let parent_digest = match options.parent {
         Some(parent) => parent,
@@ -641,7 +666,8 @@ pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Digest, C
         initial_snapshot: head,
         ..parent
     };
-    store.write_manifest(&manifest)
+    let digest = store.write_manifest(&manifest)?;
+    Prepared::lock(store, digest)
 }
 
 /// The libFuzzer seed of worker `index` in a run that resumes `parent`: the
@@ -740,6 +766,7 @@ mod tests {
             rss_limit_mb: 4096,
             abandon_limit: 1,
             feedback_mode: None,
+            sanitizer_options: BTreeMap::new(),
             compact_secs: None,
             libfuzzer_args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         };

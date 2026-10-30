@@ -8,7 +8,8 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,12 @@ const LOCK_FILE: &str = "lock";
 /// The file `start` and `resume` lock while they pick a parent and write a
 /// manifest, so two of them can't both continue one run.
 const STORE_LOCK_FILE: &str = "store.lock";
+
+/// How long [`lock`] waits for a lock that another process holds.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+
+/// How often [`lock`] retries.
+const LOCK_RETRY: Duration = Duration::from_millis(10);
 
 /// The temporary file's number within this process.
 static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
@@ -230,9 +237,9 @@ impl Store {
         if !dir.exists() {
             return Ok(RunState::Open);
         }
-        match lock(&dir.join(LOCK_FILE))? {
-            Some(_lock) => Ok(RunState::Open),
-            None => Ok(RunState::Running),
+        match probe(&dir.join(LOCK_FILE))? {
+            true => Ok(RunState::Open),
+            false => Ok(RunState::Running),
         }
     }
 
@@ -266,22 +273,47 @@ impl Store {
 }
 
 /// Takes the exclusive lock on the file at `path`, creating it. `None` if
-/// another open file holds it.
+/// another process holds it for longer than [`LOCK_WAIT`], since a
+/// [`probe`] holds it only for a moment.
 fn lock(path: &Path) -> Result<Option<File>, CampaignError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .map_err(CampaignError::io(format!("opening {}", path.display())))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
+    let file = open_lock(path)?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(LOCK_RETRY),
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(error)) => {
+                return Err(CampaignError::Io {
+                    context: format!("locking {}", path.display()),
+                    error,
+                })
+            }
+        }
+    }
+}
+
+/// True if no process holds the exclusive lock on the file at `path`. It
+/// takes a shared lock for a moment, which [`lock`] waits out.
+fn probe(path: &Path) -> Result<bool, CampaignError> {
+    match open_lock(path)?.try_lock_shared() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
         Err(TryLockError::Error(error)) => Err(CampaignError::Io {
             context: format!("locking {}", path.display()),
             error,
         }),
     }
+}
+
+/// The lock file at `path`, created if it doesn't exist.
+fn open_lock(path: &Path) -> Result<File, CampaignError> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(CampaignError::io(format!("opening {}", path.display())))
 }
 
 /// A fresh temporary name in `dir`. Every reader skips names that start

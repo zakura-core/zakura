@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! <store>/
+//!   store.lock                     held while `start` or `resume` writes a manifest
 //!   builds/<binary sha256>/        a fuzzer binary and its build record
 //!     fuzzer
 //!     build.json
@@ -27,10 +28,11 @@
 //!
 //! Every file under a digest is written to a temporary name, synced, and
 //! then linked or renamed into place, so an interrupted write never leaves
-//! a partial file under a final name. Nothing in the store is changed or
-//! deleted once written: a run reads its initial snapshot and writes a new
-//! one, and a failed or interrupted write leaves every earlier snapshot
-//! intact.
+//! a partial file under a final name. No build, snapshot, manifest or end
+//! record changes once written, and nothing deletes a worker's files: a run
+//! reads its initial snapshot and writes a new one, so a failed or
+//! interrupted run, merge or compaction leaves every earlier snapshot and
+//! every failure intact.
 //!
 //! A run is one manifest. Its supervisor runs each worker's fuzzer
 //! processes until the worker's budget is spent, restarting a process that
@@ -67,9 +69,10 @@ pub use build::{build_fuzzer, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
 pub use manifest::{
     prepare_resume, prepare_start, Budget, FeedbackRecord, HarnessRecord, LimitsRecord, Manifest,
     Migration, ResumeOptions, SeedsRecord, StartOptions, WorkerPlan, FEEDBACK_LINE, FEEDBACK_VAR,
+    SANITIZER_VARS,
 };
 pub use run::{
-    close, read_end, run, Attempt, AttemptEnd, Compaction, End, FileRecord, Recorder, Status,
+    close, read_end, Attempt, AttemptEnd, Compaction, End, FileRecord, Prepared, Recorder, Status,
     WorkerEnd, WorkerOutcome, ATTEMPTS_FILE, OUTCOME_FILE,
 };
 pub use snapshot::{Snapshot, SnapshotEntry, SnapshotIndex, Source};

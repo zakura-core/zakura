@@ -52,6 +52,7 @@ for arg in "$@"; do
   esac
 done
 parent=$PPID
+echo "asan=$ASAN_OPTIONS" >&2
 alive() { kill -0 "$parent" 2>/dev/null; }
 if [ -e "$control/feedback" ]; then
   echo "zakura-sim feedback: backend=stub version=7 features=1 mode=on" >&2
@@ -166,6 +167,7 @@ impl Fixture {
                 rss_limit_mb: 2048,
                 abandon_limit: 1,
                 feedback_mode: None,
+                sanitizer_options: Default::default(),
                 compact_secs: None,
                 libfuzzer_args: Vec::new(),
             },
@@ -293,6 +295,14 @@ fn inputs(store: &Store, snapshot: &Digest) -> BTreeSet<Digest> {
         .into_iter()
         .map(|entry| entry.sha256)
         .collect()
+}
+
+/// Starts a campaign in `store` with `options`, runs it, and returns the
+/// run and its end.
+fn start(store: &Store, options: StartOptions) -> (Digest, End) {
+    let prepared = campaign::prepare_start(store, options).unwrap();
+    let run = prepared.manifest().clone();
+    (run, prepared.run(store).unwrap())
 }
 
 /// The only run that no run continues.
@@ -473,8 +483,14 @@ fn resumed_runs_keep_corpus_additions_and_failures() {
 fn workers_restart_failed_fuzzers_up_to_their_limit() {
     let fixture = Fixture::new();
     fixture.set("abandon");
-    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 2)).unwrap();
-    let end = campaign::run(&fixture.store, &run).unwrap();
+    let mut options = fixture.options(1, 2);
+    options
+        .budget
+        .sanitizer_options
+        .insert("ASAN_OPTIONS".to_owned(), "detect_leaks=0".to_owned());
+    let (run, end) = start(&fixture.store, options);
+    let log = fs::read_to_string(fixture.store.run_dir(&run).join("workers/0/log-0.txt")).unwrap();
+    assert!(log.contains("asan=detect_leaks=0\n"), "{log}");
     assert_eq!(end.status, Status::Complete, "{end:?}");
     assert_eq!(end.workers[0].attempts, 2);
     let log = fs::read_to_string(
@@ -495,8 +511,7 @@ fn workers_restart_failed_fuzzers_up_to_their_limit() {
 
     let fixture = Fixture::new();
     fixture.set("always-crash");
-    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 30)).unwrap();
-    let end = campaign::run(&fixture.store, &run).unwrap();
+    let (_, end) = start(&fixture.store, fixture.options(1, 30));
     assert_eq!(end.status, Status::WorkerStopped);
     assert_eq!(end.workers[0].outcome, WorkerOutcome::RestartLimit);
     assert_eq!(
@@ -519,8 +534,7 @@ fn interrupted_compaction_keeps_every_snapshot() {
     fixture.set("merge-hangs");
     let mut options = fixture.options(1, 1);
     options.budget.compact_secs = Some(1);
-    let run = campaign::prepare_start(&fixture.store, options).unwrap();
-    let end = campaign::run(&fixture.store, &run).unwrap();
+    let (run, end) = start(&fixture.store, options);
     assert_eq!(end.status, Status::Complete);
     assert_eq!(
         end.compaction,
@@ -594,7 +608,8 @@ fn interrupted_compaction_keeps_every_snapshot() {
 fn incompatible_runs_start_a_new_segment() {
     let fixture = Fixture::new();
     fixture.set("feedback");
-    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap();
+    let prepared = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap();
+    let run = prepared.manifest().clone();
     let manifest = fixture.store.read_manifest(&run).unwrap();
     let feedback = manifest.feedback.as_ref().expect("the stand-in logs it");
     assert_eq!(
@@ -605,7 +620,7 @@ fn incompatible_runs_start_a_new_segment() {
         ),
         ("stub", "7", "on")
     );
-    let end = campaign::run(&fixture.store, &run).unwrap();
+    let end = prepared.run(&fixture.store).unwrap();
 
     let other = fixture.dir.path().join("other-stub");
     fs::copy(fixture.store.fuzzer_path(&fixture.build), &other).unwrap();
@@ -649,7 +664,8 @@ fn incompatible_runs_start_a_new_segment() {
     let mut options = fixture.options(1, 1);
     options.build = other_build.clone();
     options.parent = Some((run.clone(), Migration::Seeds));
-    let fresh = campaign::prepare_start(&fixture.store, options).unwrap();
+    let fresh_prepared = campaign::prepare_start(&fixture.store, options).unwrap();
+    let fresh = fresh_prepared.manifest().clone();
     let fresh_manifest = fixture.store.read_manifest(&fresh).unwrap();
     assert_eq!(fresh_manifest.segment, 2);
     assert_eq!(fresh_manifest.previous_segment.as_ref(), Some(&run));
@@ -672,12 +688,12 @@ fn incompatible_runs_start_a_new_segment() {
         refused.to_string().contains("already continued"),
         "{refused}"
     );
-    let fresh_end = campaign::run(&fixture.store, &fresh).unwrap();
+    let fresh_end = fresh_prepared.run(&fixture.store).unwrap();
 
     let mut options = fixture.options(1, 1);
     options.parent = Some((fresh.clone(), Migration::Carry));
     let carried = campaign::prepare_start(&fixture.store, options).unwrap();
-    let carried_manifest = fixture.store.read_manifest(&carried).unwrap();
+    let carried_manifest = fixture.store.read_manifest(carried.manifest()).unwrap();
     assert_eq!(carried_manifest.segment, 3);
     assert_eq!(
         carried_manifest.initial_snapshot, fresh_end.snapshot,
@@ -738,7 +754,10 @@ fn snapshots_and_manifests_verify_against_their_digests() {
     .unwrap();
     assert!(fixture.store.verify_snapshot(&extra.digest).is_err());
 
-    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap();
+    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 1))
+        .unwrap()
+        .manifest()
+        .clone();
     let path = fixture.store.manifest_path(&run);
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, text.replace("\"test\"", "\"tset\"")).unwrap();

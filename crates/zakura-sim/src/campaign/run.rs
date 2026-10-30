@@ -14,7 +14,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    manifest::{Budget, Manifest, WorkerPlan, FEEDBACK_VAR},
+    manifest::{Budget, Manifest, WorkerPlan, FEEDBACK_VAR, SANITIZER_VARS},
     snapshot::Source,
     store::{
         now_unix, partial_path, read_record, record_bytes, replace, write_once, CampaignError,
@@ -221,16 +221,48 @@ impl End {
     }
 }
 
-/// Runs manifest `digest`: supervises its workers until each one stops,
-/// then saves the run's snapshot, compacts it if the budget asks, and
-/// writes the end record.
-///
-/// Refuses a run that another process runs or that has an end record.
-/// Fails without an end record if the store can't be read or written; the
-/// run then stays open, and `close` or `resume` ends it later.
-pub fn run(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
+/// A run whose manifest `start` or `resume` wrote, and whose lock this
+/// process took before it let go of the store's, so no other process can
+/// close the run before it starts.
+#[derive(Debug)]
+pub struct Prepared {
+    /// The run's manifest.
+    manifest: Digest,
+    /// The run's lock.
+    lock: File,
+}
+
+impl Prepared {
+    /// Locks the run of manifest `digest`.
+    pub(super) fn lock(store: &Store, manifest: Digest) -> Result<Prepared, CampaignError> {
+        Ok(Prepared {
+            lock: store.lock_run(&manifest)?,
+            manifest,
+        })
+    }
+
+    /// The run's manifest.
+    pub fn manifest(&self) -> &Digest {
+        &self.manifest
+    }
+
+    /// Runs the run: supervises its workers until each one stops, then
+    /// saves the run's snapshot, compacts it if the budget asks, and writes
+    /// the end record.
+    ///
+    /// Fails without an end record if the store can't be read or written;
+    /// the run then stays open, and `close` or `resume` ends it later.
+    pub fn run(self, store: &Store) -> Result<End, CampaignError> {
+        let Prepared { manifest, lock } = self;
+        let ended = supervise(store, &manifest);
+        drop(lock);
+        ended
+    }
+}
+
+/// [`Prepared::run`] for manifest `digest`, whose lock the caller holds.
+fn supervise(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
     let manifest = store.read_manifest(digest)?;
-    let _lock = store.lock_run(digest)?;
     let dir = store.run_dir(digest);
     if dir.join(END_FILE).exists() {
         return Err(already_ended(digest));
@@ -486,8 +518,8 @@ impl Worker<'_> {
 
 /// The fuzzer command for `budget`, before its corpus and per-process
 /// flags: the binary, under `taskset -c <cpus>` if `cpus` is set, with the
-/// budget's libFuzzer flags and the target's variables. The target saves
-/// its inputs and traces under `sim`.
+/// budget's libFuzzer flags, its sanitizer variables and the target's
+/// variables. The target saves its inputs and traces under `sim`.
 pub(super) fn fuzzer_command(
     fuzzer: &Path,
     cpus: Option<&str>,
@@ -513,6 +545,12 @@ pub(super) fn fuzzer_command(
         Some(mode) => command.env(FEEDBACK_VAR, mode),
         None => command.env_remove(FEEDBACK_VAR),
     };
+    for name in SANITIZER_VARS {
+        match budget.sanitizer_options.get(*name) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
     command
 }
 

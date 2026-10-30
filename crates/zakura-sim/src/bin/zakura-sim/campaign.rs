@@ -9,8 +9,9 @@ use std::{
 
 use zakura_sim::{
     campaign::{
-        self, build_fuzzer, Budget, CampaignError, Digest, End, Migration, ResumeOptions, RunState,
-        StartOptions, Status, Store, WorkerPlan, FUZZ_PACKAGE,
+        self, build_fuzzer, Budget, CampaignError, Compaction, Digest, End, Migration, Prepared,
+        ResumeOptions, RunState, StartOptions, Status, Store, WorkerPlan, FUZZ_PACKAGE,
+        SANITIZER_VARS,
     },
     explore::DEFAULT_ABANDON_LIMIT,
     harness,
@@ -184,6 +185,10 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
                 .number("--abandon-limit")?
                 .unwrap_or(DEFAULT_ABANDON_LIMIT),
             feedback_mode: flags.one("--feedback")?.map(str::to_owned),
+            sanitizer_options: SANITIZER_VARS
+                .iter()
+                .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
+                .collect(),
             compact_secs: flags.number("--compact-secs")?,
             libfuzzer_args: flags
                 .many("--libfuzzer-arg")
@@ -196,8 +201,8 @@ fn start(store: &Store, flags: &Flags) -> Result<(), Error> {
         artifacts: flags.one("--artifacts")?.map(str::to_owned),
         parent,
     };
-    let manifest = campaign::prepare_start(store, options).map_err(failed)?;
-    run_manifest(store, &manifest)
+    let prepared = campaign::prepare_start(store, options).map_err(failed)?;
+    run_prepared(store, prepared)
 }
 
 /// `resume`: writes a manifest that resumes the last run, and runs it.
@@ -209,20 +214,21 @@ fn resume(store: &Store, flags: &Flags) -> Result<(), Error> {
         seconds: flags.number("--seconds")?,
         workers: flags.number("--workers")?,
     };
-    let manifest = campaign::prepare_resume(store, options).map_err(failed)?;
-    run_manifest(store, &manifest)
+    let prepared = campaign::prepare_resume(store, options).map_err(failed)?;
+    run_prepared(store, prepared)
 }
 
 /// Prints the manifest, runs it, and prints its end. Fails unless the run
 /// is complete.
 #[allow(clippy::print_stdout)]
-fn run_manifest(store: &Store, manifest: &Digest) -> Result<(), Error> {
+fn run_prepared(store: &Store, prepared: Prepared) -> Result<(), Error> {
+    let manifest = prepared.manifest().clone();
     println!(
         "manifest {manifest} in {}",
-        store.manifest_path(manifest).display()
+        store.manifest_path(&manifest).display()
     );
-    let end = campaign::run(store, manifest).map_err(failed)?;
-    print_end(manifest, &end);
+    let end = prepared.run(store).map_err(failed)?;
+    print_end(&manifest, &end);
     match end.status {
         Status::Complete => Ok(()),
         status => Err(Error::Failed(format!(
@@ -269,14 +275,7 @@ fn status(store: &Store, flags: &Flags) -> Result<(), Error> {
             RunState::Open => "open: its supervisor stopped; close or resume it".to_owned(),
             RunState::Ended => {
                 let end = campaign::read_end(store, digest).map_err(failed)?;
-                format!(
-                    "{}; snapshot {} holds {} inputs, {} added; {} failure files",
-                    status_name(end.status),
-                    end.head(),
-                    end.inputs,
-                    end.added,
-                    end.failures.len()
-                )
+                format!("{}; {}", status_name(end.status), summary(&end))
             }
         };
         println!(
@@ -316,22 +315,36 @@ fn verify(store: &Store, flags: &Flags) -> Result<(), Error> {
 #[allow(clippy::print_stdout)]
 fn print_end(manifest: &Digest, end: &End) {
     println!(
-        "run {manifest} ended {}: snapshot {} holds {} inputs, {} added; {} failure files",
+        "run {manifest} ended {}: {}",
         status_name(end.status),
-        end.snapshot,
-        end.inputs,
-        end.added,
-        end.failures.len()
+        summary(end)
     );
-    if let Some(compaction) = &end.compaction {
-        println!("compaction: {compaction:?}");
-    }
     for worker in &end.workers {
         println!(
             "worker {}: {:?} after {} processes, {} ms",
             worker.index, worker.outcome, worker.attempts, worker.millis
         );
     }
+}
+
+/// The end record's snapshot, compaction and failures, in words.
+fn summary(end: &End) -> String {
+    let compaction = match &end.compaction {
+        None => String::new(),
+        Some(Compaction::Compacted { snapshot, inputs }) => {
+            format!(", compacted to snapshot {snapshot} of {inputs} inputs")
+        }
+        Some(Compaction::Failed { failure }) => {
+            format!(", whose compaction failed ({failure:?})")
+        }
+    };
+    format!(
+        "snapshot {} holds {} inputs, {} added{compaction}; {} failure files",
+        end.snapshot,
+        end.inputs,
+        end.added,
+        end.failures.len()
+    )
 }
 
 /// `status`'s name in records.

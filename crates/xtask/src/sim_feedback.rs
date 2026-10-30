@@ -25,6 +25,9 @@
 //!   counters. The merge must add the input, with exactly one new feature:
 //!   its state's.
 //!
+//! In both modes the merge must report no new coverage edges. Otherwise the new
+//! feature could be a code edge rather than the state's.
+//!
 //! The target logs its feature count, and libFuzzer logs how many extra
 //! counters it found. The two must agree, or the counters didn't reach
 //! libFuzzer. Every mismatch fails the check with its reason.
@@ -77,6 +80,8 @@ struct MergeLog {
     added: usize,
     /// The features they added.
     new_features: usize,
+    /// The coverage edges they added.
+    new_edges: usize,
 }
 
 pub(super) fn run(repo_root: &Path) -> Result<(), BoxError> {
@@ -103,12 +108,13 @@ pub(super) fn run(repo_root: &Path) -> Result<(), BoxError> {
         let verdict = judge(case, &log);
         writeln!(
             report,
-            "mode={} kept={} offered={} added={} new_features={} extra_counters={}: {}",
+            "mode={} kept={} offered={} added={} new_features={} new_edges={} extra_counters={}: {}",
             case.mode,
             case.kept.0,
             case.offered.0,
             log.added,
             log.new_features,
+            log.new_edges,
             log.extra_counters,
             verdict.as_deref().unwrap_or("ok"),
         )?;
@@ -201,6 +207,12 @@ fn judge(case: Case, log: &MergeLog) -> Option<String> {
             log.extra_counters, log.features
         ));
     }
+    if log.new_edges != 0 {
+        return Some(format!(
+            "{what}: the merge added {} new coverage edges, expected 0",
+            log.new_edges
+        ));
+    }
     let added = case.expected_added();
     if log.added != added || log.new_features != added {
         return Some(format!(
@@ -236,23 +248,33 @@ fn parse(log: &str) -> Result<MergeLog, &'static str> {
         })
         .ok_or("`INFO: <n> Extra Counters` line")?;
     // `MERGE-OUTER: 1 new files with 1 new features added; 0 new coverage edges`
-    let (added, new_features) = log
+    let (added, new_features, new_edges) = log
         .lines()
         .find_map(|line| {
             let rest = line.strip_prefix("MERGE-OUTER: ")?;
             let (added, rest) = rest.split_once(" new files with ")?;
-            let (new_features, _) = rest.split_once(" new features added")?;
-            Some((added.parse().ok()?, new_features.parse().ok()?))
+            let (new_features, rest) = rest.split_once(" new features added; ")?;
+            let new_edges = rest.strip_suffix(" new coverage edges")?;
+            Some((
+                added.parse().ok()?,
+                new_features.parse().ok()?,
+                new_edges.parse().ok()?,
+            ))
         })
-        .ok_or("`MERGE-OUTER: <n> new files with <n> new features added` line")?;
+        .ok_or(MERGE_SUMMARY)?;
     Ok(MergeLog {
         mode,
         features,
         extra_counters,
         added,
         new_features,
+        new_edges,
     })
 }
+
+/// The merge summary line `parse` requires.
+const MERGE_SUMMARY: &str =
+    "`MERGE-OUTER: <n> new files with <n> new features added; <n> new coverage edges` line";
 
 #[cfg(test)]
 mod tests {
@@ -283,6 +305,7 @@ MERGE-OUTER: 1 new files with 1 new features added; 0 new coverage edges
                 extra_counters: 65536,
                 added: 1,
                 new_features: 1,
+                new_edges: 0,
             })
         );
     }
@@ -303,9 +326,11 @@ MERGE-OUTER: 1 new files with 1 new features added; 0 new coverage edges
             parse(&without("INFO")),
             Err("`INFO: <n> Extra Counters` line")
         );
+        assert_eq!(parse(&without("MERGE-OUTER: 1")), Err(MERGE_SUMMARY));
         assert_eq!(
-            parse(&without("MERGE-OUTER: 1")),
-            Err("`MERGE-OUTER: <n> new files with <n> new features added` line")
+            parse(&LOG.replace("; 0 new coverage edges", "")),
+            Err(MERGE_SUMMARY),
+            "the coverage-edge field is required"
         );
     }
 
@@ -333,5 +358,22 @@ MERGE-OUTER: 1 new files with 1 new features added; 0 new coverage edges
             ..parse(LOG).unwrap()
         };
         assert!(judge(case("on"), &edge).is_some(), "an edge came with it");
+    }
+
+    #[test]
+    fn rejects_a_new_coverage_edge() {
+        let log = LOG.replace("0 new coverage edges", "1 new coverage edges");
+        let verdict = judge(case("on"), &parse(&log).unwrap());
+        assert!(verdict.unwrap().contains("1 new coverage edges"));
+        let hidden = MergeLog {
+            mode: "off".to_owned(),
+            added: 0,
+            new_features: 0,
+            new_edges: 1,
+            ..parse(LOG).unwrap()
+        };
+        assert!(judge(case("off"), &hidden)
+            .unwrap()
+            .contains("1 new coverage edges"));
     }
 }

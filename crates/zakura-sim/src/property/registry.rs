@@ -304,6 +304,8 @@ struct PropertyState {
     inconclusive: Option<Inconclusive>,
     /// Why the latest evaluation couldn't judge its fired trigger, if so.
     unsettled: Option<Inconclusive>,
+    /// The sticky reason an evaluation recorded, `Unobserved`, if any.
+    sticky: Option<Inconclusive>,
     /// Each quantity's largest value, as the check measured it.
     peaks: BTreeMap<String, u64>,
     /// The runs of evaluations the check couldn't read a component at.
@@ -565,7 +567,7 @@ fn step_property<S: HasView>(
     violations.extend(parts.recorded);
     state.unsettled = parts.unsettled;
     if let Some(sticky) = parts.sticky {
-        state.inconclusive.get_or_insert(sticky);
+        state.sticky.get_or_insert(sticky);
     }
     record_gaps(state, parts.gaps, cx.step);
     for (quantity, value) in parts.peaks {
@@ -753,6 +755,9 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
         state
             .inconclusive
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
+            // A run that ends with an obligation open is unfinished, which
+            // the state reasons never mean, so they come after it.
+            .or(state.sticky)
             .or(state.unsettled)
     };
     match reason {

@@ -123,12 +123,14 @@ pub enum Inconclusive {
     HarnessFailed,
     /// Every peer left, but the run ended before teardown settled.
     TeardownOpen,
-    /// The latest evaluation needed a component that was initializing or in
-    /// transition at its boundary ([`require`](super::require)).
+    /// The latest evaluation needed a component that existed and was
+    /// mid-change at its boundary: in transition, or ended in transition
+    /// ([`require`](super::require)). Never an unfinished run's reason.
     Unsettled,
-    /// An every-boundary claim couldn't read a component at some boundary
+    /// An every-boundary claim couldn't read a component that existed and
+    /// was mid-change at some boundary
     /// ([`require_every`](super::require_every)). Sticky: a later current
-    /// boundary doesn't clear it.
+    /// boundary doesn't clear it. An open obligation at run end outranks it.
     Unobserved,
 }
 

@@ -143,8 +143,8 @@ mod tests {
         },
         property::{
             require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind,
-            Property, PropertyId, Registry, RegistryChecker, Source, Sources, State, Status,
-            Verdict,
+            LivenessBound, ObligationKey, Property, PropertyId, Registry, RegistryChecker, Source,
+            Sources, State, Status, Subject, Verdict,
         },
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NullSink, ObservationLog,
         Plan, RunConfig, RunReport, Sim,
@@ -257,19 +257,32 @@ mod tests {
         properties: Vec<Property<Owners>>,
         sources: &Sources,
     ) -> (RunReport, Owned) {
-        run_assuming(ops, steps, properties, sources, Assumptions::none())
+        run_assuming(
+            ops,
+            steps,
+            properties,
+            sources,
+            Assumptions::none(),
+            u64::MAX,
+        )
     }
 
-    /// [`run`], with the scenario declaring `assumptions`.
+    /// [`run`], with the scenario declaring `assumptions`, under a step
+    /// `budget`.
     fn run_assuming(
         ops: Vec<(u64, Op)>,
         steps: u64,
         properties: Vec<Property<Owners>>,
         sources: &Sources,
         assumptions: Assumptions<Owners>,
+        budget: u64,
     ) -> (RunReport, Owned) {
         let view: Owned = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
-        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        let config = RunConfig {
+            budget: budget.min(RunConfig::default().budget),
+            ..RunConfig::default()
+        };
+        let mut sim = Sim::new(config, Plan::from_fuzz(&[]));
         let mut hub = EvidenceHub::new();
         hub.owners(view.clone());
         sim.add_source(Box::new(Script {
@@ -435,8 +448,9 @@ mod tests {
     }
 
     /// With no existence evidence, a component stays `Initializing`
-    /// through the run's end, which leaves its property inconclusive, not
-    /// failed. Evidence with no registered read fails the run.
+    /// through the run's end, which leaves its property `NotApplicable`, as
+    /// a property whose source never appears, not failed and not
+    /// `state-unsettled`. Evidence with no registered read fails the run.
     #[test]
     fn evidence_before_registration_fails_and_none_is_pending() {
         let (none, view) = run(Vec::new(), 3, vec![requiring()], &wire());
@@ -448,10 +462,9 @@ mod tests {
         assert_eq!(none.end.harness, None);
         assert_eq!(none.end.steps, 3);
         assert_eq!(view.borrow().captured(), Capture::AfterStep(3));
-        assert_eq!(
-            report(&none, "test/require").outcome,
-            inconclusive("state-unsettled")
-        );
+        let report = report(&none, "test/require");
+        assert_eq!(report.outcome, PropertyOutcome::NotApplicable);
+        assert_eq!(report.gaps, []);
         let (early, _) = run(vec![(2, Op::Exists)], 3, vec![requiring()], &wire());
         assert!(
             matches!(&early.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
@@ -546,7 +559,7 @@ mod tests {
             params: serde_json::Value::Null,
         }])
         .holds_when(unless_two);
-        let (run, view) = run_assuming(ops, 6, vec![assuming], &wire(), declared);
+        let (run, view) = run_assuming(ops, 6, vec![assuming], &wire(), declared, u64::MAX);
         assert_eq!(run.end.harness, None);
         assert_eq!(view.borrow().component(BUDGET).map(Component::seq), Some(5));
         let report = report(&run, "test/require");
@@ -557,5 +570,70 @@ mod tests {
             through: at,
         };
         assert_eq!(report.gaps, [gap(3), gap(5)]);
+    }
+
+    /// Never discharged.
+    fn never(_: &ObligationKey, _: &crate::Observation) -> bool {
+        false
+    }
+
+    /// Opens one obligation at step 1 that nothing discharges, then needs
+    /// [`BUDGET`] at every boundary.
+    fn check_obliged(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        if cx.step == 1 {
+            let obligation = cx.obligation(None, Subject::Owner("budget".to_owned()), never);
+            cx.oblige(obligation);
+        }
+        check_every(cx)
+    }
+
+    /// An unfinished run never ends `state-unsettled` or `state-unobserved`.
+    /// A run cut by its budget before the component exists leaves its
+    /// property `NotApplicable`. A run that ends with an obligation open
+    /// is `obligation-open`, even after a boundary the property couldn't
+    /// read.
+    #[test]
+    fn an_unfinished_run_is_never_state_unsettled() {
+        let (cut, view) = run_assuming(
+            Vec::new(),
+            5,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            2,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::Initializing)
+        );
+        assert_eq!(
+            report(&cut, "test/require").outcome,
+            PropertyOutcome::NotApplicable
+        );
+
+        let mut obliged = needing("test/obliged", check_obliged);
+        obliged.kind = Kind::Liveness {
+            bound: LivenessBound::VirtualTime(std::time::Duration::from_secs(3_600)),
+        };
+        let ops = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (open, _) = run(ops, 3, vec![obliged], &wire());
+        assert_eq!(open.end.harness, None);
+        let report = report(&open, "test/obliged");
+        assert_eq!(
+            report.gaps,
+            [Gap {
+                component: "Budget".to_owned(),
+                from: 2,
+                through: 2
+            }],
+            "the check missed step 2"
+        );
+        assert_eq!(report.outcome, inconclusive("obligation-open"));
     }
 }

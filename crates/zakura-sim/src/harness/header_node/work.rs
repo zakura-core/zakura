@@ -10,8 +10,9 @@
 //! `EntriesTaken`, which ends once, `TransferEnded`, when its last handle
 //! drops. A page's `Staged` names a live round (M6a-5a). [`WorkLedger`]
 //! folds those records in log order and checks them against each settled
-//! snapshot, whose holdings it reads from the queue's own maps. Any break is a structural failure of the tap's evidence. A
-//! transfer still live when the log freezes is pending, not a failure.
+//! snapshot, whose holdings it reads from the queue's own maps. Any break
+//! is a structural failure of the tap's evidence. A transfer still live
+//! when the log freezes is pending, not a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 

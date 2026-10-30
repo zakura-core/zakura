@@ -1875,3 +1875,45 @@ fn a_direct_wake_inside_a_read_panics() {
     let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
     assert_eq!(status, Status::Quiescent);
 }
+
+/// Inside a boundary read, dropping an already-polled `Sleep`, which would
+/// cancel its timer, and drawing from the run's RNG both panic before the
+/// scheduler's timers or draws change.
+///
+/// This fails if executor calls that reach no preemption point skip the
+/// mark.
+#[test]
+fn a_read_that_moves_a_timer_or_draws_panics() {
+    use std::future::Future;
+
+    use rand_10::RngExt;
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let draws = shared(Cell::new(0));
+    let counted = draws.clone();
+    s.set_draws(move |_| {
+        counted.set(counted.get() + 1);
+        0
+    });
+    let mut sleep = Box::pin(time::sleep(Duration::from_secs(10)));
+    let waker = std::task::Waker::noop();
+    assert!(sleep
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(waker))
+        .is_pending());
+    let deadline = s.next_deadline().expect("the sleep registered its timer");
+    let refused = |read: &mut dyn FnMut()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim::boundary_read(read))).is_err()
+    };
+    let mut sleep = Some(sleep);
+    assert!(refused(&mut || drop(sleep.take())));
+    assert_eq!(
+        s.next_deadline(),
+        Some(deadline),
+        "the timer is still there"
+    );
+    assert!(refused(&mut || {
+        let _: u64 = zakura_rt::rand::rng().random();
+    }));
+    assert_eq!(draws.get(), 0, "no draw was taken");
+}

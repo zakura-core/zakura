@@ -630,8 +630,8 @@ fn peeks_outside_a_run_behave_like_std() {
     assert_eq!(Semaphore::new(2).peek_available(), 2);
 }
 
-/// Inside a boundary read, a point, a `Mutex` lock and a guard's release
-/// panic, and the mark clears when the read unwinds, so the task's own
+/// Inside a boundary read, a point, a `Mutex` lock, any use of the
+/// executor and a guard's release panic, and the mark clears when the read unwinds, so the task's own
 /// points work again. A peek inside one is fine.
 ///
 /// This fails if the runtime doesn't check the mark.
@@ -648,6 +648,9 @@ fn a_read_that_reaches_the_runtime_panics() {
             atomic.load(Ordering::SeqCst);
         }));
         assert!(refused(&|| drop(lock.lock())));
+        assert!(refused(&|| {
+            let _ = sim::executor();
+        }));
         let guard = std::cell::Cell::new(Some(lock.lock().unwrap()));
         assert!(refused(&|| drop(guard.take())));
         assert!(!sim::in_boundary_read(), "an unwound read clears its mark");

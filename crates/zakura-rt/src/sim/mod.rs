@@ -169,8 +169,17 @@ impl fmt::Display for RunId {
 }
 
 /// The executor of the run on this thread, or `None` outside a run.
+///
+/// # Panics
+///
+/// Inside a [`boundary_read`], since every executor call is a step toward
+/// changing the schedule: a timer, a draw, a spawn, a new object.
+#[track_caller]
 pub fn executor() -> Option<&'static dyn Executor> {
-    current().map(|run| run.executor)
+    current().map(|run| {
+        refuse_in_boundary_read("the executor");
+        run.executor
+    })
 }
 
 /// The run on this thread, or `None` outside a run.
@@ -182,10 +191,18 @@ pub fn run_id() -> Option<RunId> {
 /// thread. A handle from an earlier run then acts as if its task or timer
 /// ended with the run, instead of reaching a later run's task or timer with
 /// the same id.
+///
+/// # Panics
+///
+/// Inside a [`boundary_read`], as [`executor`] does.
+#[track_caller]
 pub fn executor_for(run: RunId) -> Option<&'static dyn Executor> {
     current()
         .filter(|current| current.id == run)
-        .map(|current| current.executor)
+        .map(|current| {
+            refuse_in_boundary_read("the executor");
+            current.executor
+        })
 }
 
 /// The next emission position of the run on this thread, from 1, or `None`
@@ -210,8 +227,10 @@ pub fn next_position() -> Option<u64> {
 /// Runs `read` as a boundary read: harness code that looks at owners'
 /// state between steps, while every task is stopped. A read must not reach
 /// the runtime, since that would change the schedule it observes, so inside
-/// `read` a preemption point, a park, an unpark and a simulated task's
-/// waker all panic. Use the peeks ([`Peek`]) to read runtime objects.
+/// `read` any use of the executor ([`executor`], [`executor_for`]), and so
+/// every preemption point, park, unpark, timer change and draw, panics, and
+/// so does a simulated task's waker. Use the peeks ([`Peek`]) to read
+/// runtime objects.
 pub fn boundary_read<R>(read: impl FnOnce() -> R) -> R {
     /// Clears the mark when the read returns or unwinds.
     struct Reading(bool);

@@ -54,6 +54,7 @@ impl TerminalPermit {
     /// and no execution slot.
     ///
     /// Returns false if the stream is closed.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) async fn send(self, send: &FramedSend, frame: Frame) -> bool {
         match send.reserve_guarded().await {
             Ok(slot) => {
@@ -61,6 +62,30 @@ impl TerminalPermit {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    /// Queue the terminal outcome `frame` on `send`, as the release build
+    /// does. In test and simulator builds it makes the frame's output life
+    /// before it returns the future, so a terminal cancelled before its
+    /// first poll, or while it waits for queue space, still ends one.
+    ///
+    /// Returns false if the stream is closed.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send(
+        self,
+        send: &FramedSend,
+        frame: Frame,
+    ) -> impl std::future::Future<Output = bool> + '_ {
+        let life = send.allocate(&frame);
+        async move {
+            match send.reserve_guarded().await {
+                Ok(slot) => {
+                    slot.send_with_life(frame, FrameGuard::new(Arc::new(self)), life);
+                    true
+                }
+                Err(_) => false,
+            }
         }
     }
 }

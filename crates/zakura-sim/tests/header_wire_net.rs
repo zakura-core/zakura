@@ -605,6 +605,7 @@ impl Crossing {
                             quic_stream,
                             seq,
                             message_type,
+                            ..
                         },
                     ..
                 } if Some(*c) == crossing.connection => {

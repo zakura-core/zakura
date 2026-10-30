@@ -50,6 +50,8 @@ use super::peer_memory::{
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
+#[cfg(any(test, zakura_sim))]
+use super::transport::OutputLife;
 use super::transport::{
     sim_arg, sim_chain, transport_observe, worker_framed_channel, FramedWorkerRecv,
     OrderedStreamFailure, OrderedStreamFailureCause, SessionLayout,
@@ -5142,22 +5144,41 @@ async fn persistent_stream_worker_with_policy(
             } => {
                 match outbound {
                     Some(queued_frame) => {
+                        // The frame's output life leaves the frame here, so it
+                        // outlives the cancellable write below (M6a-6).
+                        #[cfg(any(test, zakura_sim))]
+                        let (queued_frame, life) = {
+                            let mut queued_frame = queued_frame;
+                            let life = queued_frame.take_life();
+                            if let Some(life) = &life {
+                                life.dequeued();
+                            }
+                            (queued_frame, life)
+                        };
                         // Cancellation resets the stream before a replacement can write.
                         let result = zakura_rt::select! {
                             biased;
-                            _ = context.connection_token.cancelled() => break,
-                            _ = context.stream_token.cancelled() => break,
+                            _ = context.connection_token.cancelled() => {
+                                #[cfg(any(test, zakura_sim))]
+                                OutputLife::cancelled(life.as_ref());
+                                break
+                            }
+                            _ = context.stream_token.cancelled() => {
+                                #[cfg(any(test, zakura_sim))]
+                                OutputLife::cancelled(life.as_ref());
+                                break
+                            }
                             // Encode before the request claim, so a frame that
                             // doesn't fit starts no exchange and its session can
                             // retire without closing the connection.
-                            result = queued_frame.encode_and_write_with(
+                            result = sim_arg!(queued_frame.encode_and_write_with(
                                 |frame| encode_ordered_frame(
                                     frame, context.limits, context.outbound_frame_cap,
                                 ),
                                 |encoded| async {
                                 let result = sim_arg!(write_encoded_ordered_frame(
                                     &mut send, encoded, context.write_policy,
-                                ); context.precheck.tap()).await;
+                                ); (context.precheck.tap(), life.as_ref())).await;
                                 // A failed request claim can cancel the session on
                                 // drop. Record the cause while it is still alive.
                                 if !context.stream_token.is_cancelled() {
@@ -5170,7 +5191,7 @@ async fn persistent_stream_worker_with_policy(
                                     }
                                 }
                                 result
-                            }) => result,
+                            }); life.as_ref()) => result,
                         };
                         if let Err(error) = result {
                             if error.is::<OrderedFrameWriteTimeout>() {
@@ -5638,7 +5659,7 @@ async fn write_ordered_frame(
         send,
         encoded,
         StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
-        None,
+        (None, None),
     )
     .await
 }
@@ -5648,6 +5669,10 @@ struct EncodedOrderedFrame {
     bytes: Vec<u8>,
     #[cfg(any(test, zakura_sim))]
     message_type: u16,
+    /// The frame's fingerprint, which the writer reports with its write
+    /// (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    fingerprint: u64,
 }
 
 /// Encodes one ordered-stream frame, or refuses it with
@@ -5680,22 +5705,38 @@ fn encode_ordered_frame(
         bytes,
         #[cfg(any(test, zakura_sim))]
         message_type: frame.message_type,
+        #[cfg(any(test, zakura_sim))]
+        fingerprint: super::frame_fingerprint(&frame),
     })
 }
 
 /// Writes one encoded ordered-stream frame under `write_policy`. In test and
-/// simulator builds, `tap` reports when its write starts and finishes.
+/// simulator builds, `tap` reports when its write starts and finishes, the
+/// start naming the frame's output `life` and its fingerprint (M6a-6).
 async fn write_encoded_ordered_frame(
     send: &mut SendStream,
     encoded: EncodedOrderedFrame,
     write_policy: StreamWritePolicy,
-    #[cfg(any(test, zakura_sim))] tap: Option<&Arc<super::StreamTap>>,
+    #[cfg(any(test, zakura_sim))] (tap, life): (
+        Option<&Arc<super::StreamTap>>,
+        Option<&OutputLife>,
+    ),
 ) -> Result<(), BoxError> {
     #[cfg(any(test, zakura_sim))]
     let message_type = encoded.message_type;
     let frame = encoded.bytes;
     #[cfg(any(test, zakura_sim))]
-    let seq = tap.map(|tap| tap.write_started(message_type));
+    if let Some(life) = life {
+        life.started();
+    }
+    #[cfg(any(test, zakura_sim))]
+    let seq = tap.map(|tap| {
+        tap.write_started(
+            message_type,
+            life.map(OutputLife::output),
+            encoded.fingerprint,
+        )
+    });
     match write_policy {
         StreamWritePolicy::UntilCancelled => send.write_chunk(Bytes::from(frame)).await?,
         StreamWritePolicy::Timeout(duration) => {

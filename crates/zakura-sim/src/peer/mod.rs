@@ -35,6 +35,7 @@ mod evidence;
 pub(crate) mod handshake;
 pub mod honest;
 pub mod limit;
+mod output;
 mod stage;
 
 use std::{

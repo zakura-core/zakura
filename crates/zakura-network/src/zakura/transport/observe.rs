@@ -153,6 +153,60 @@ pub enum TransportEvent {
         seq: u64,
         /// The frame's message type.
         message_type: u16,
+        /// The output the frame is, or `None` for a frame queued with no
+        /// output life (M6a-6).
+        output: Option<u64>,
+        /// [`frame_fingerprint`] of the frame the writer is writing, which
+        /// it computes itself.
+        fingerprint: u64,
+    },
+    /// A producer made an output: a frame it is about to queue on the
+    /// stream, before any wait (M6a-6). Outputs count from 0 per stream.
+    OutputAllocated {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// The frame's message type.
+        message_type: u16,
+        /// The frame's payload length.
+        payload_len: u32,
+        /// [`frame_fingerprint`] of the frame as the producer queues it.
+        expected: u64,
+    },
+    /// The output's frame is in the stream's queue. It's reported right
+    /// after the insert, with no preemption point in between.
+    OutputEnqueued {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// Its place in the stream's queue, from 0.
+        order: u64,
+    },
+    /// The stream's writer took the output's frame from the queue.
+    OutputDequeued {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+    },
+    /// The output's life ended. Only its life's `Drop` reports this, once.
+    OutputEnded {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// How it ended.
+        outcome: OutputOutcome,
     },
     /// The writer finished writing a frame.
     FrameWritten {
@@ -271,6 +325,56 @@ pub enum Transition {
     },
 }
 
+/// How an output ended, from the phase its life reached (M6a-6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OutputOutcome {
+    /// Its frame never reached the queue: the send was refused, cancelled
+    /// before the insert, or found the stream closed.
+    NotQueued,
+    /// Its frame was queued and dropped with the queue, never dequeued.
+    Dropped,
+    /// The writer wrote the whole frame.
+    Written,
+    /// The writer dequeued the frame and didn't write it all.
+    Unwritten(Unwritten),
+    /// The writer dequeued the frame, and its life dropped with no outcome
+    /// recorded, as when the writer's future is dropped mid-write.
+    Abandoned,
+}
+
+/// Why a dequeued frame wasn't written, in [`OutputOutcome::Unwritten`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Unwritten {
+    /// Its request claim was obsolete, so the writer skipped it.
+    Obsolete,
+    /// It didn't fit the stream's frame or message cap.
+    Encode,
+    /// The stream or connection was cancelled before the write finished.
+    Cancelled,
+    /// The stream's write failed.
+    Failed,
+}
+
+/// A fingerprint of `frame`'s message type, flags and payload: the first 8
+/// bytes of their BLAKE2b hash, little endian (M6a-6). The node computes it
+/// where it queues a frame and again where it writes it, and a simulated
+/// peer computes it over the frame it read.
+pub fn frame_fingerprint(frame: &super::Frame) -> u64 {
+    let hash = blake2b_simd::Params::new()
+        .hash_length(8)
+        .personal(b"zakura-output-fp")
+        .to_state()
+        .update(&frame.message_type.to_le_bytes())
+        .update(&frame.flags.to_le_bytes())
+        .update(&frame.payload)
+        .finalize();
+    let mut bytes = [0; 8];
+    bytes.copy_from_slice(hash.as_bytes());
+    u64::from_le_bytes(bytes)
+}
+
 /// The subscriber precheck's verdict on a response header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderCheck {
@@ -381,6 +485,10 @@ pub(crate) struct StreamTap {
     reading: AtomicU64,
     /// The next write's sequence number.
     next_write: AtomicU64,
+    /// The next output's number (M6a-6).
+    next_output: AtomicU64,
+    /// The next enqueued output's place in the queue.
+    next_order: AtomicU64,
     /// 1 once the service takes each frame's tag. Until then the reader
     /// queues none, so a stream nobody tags never grows its queue.
     tagged: AtomicU64,
@@ -399,6 +507,8 @@ impl StreamTap {
             next_read: AtomicU64::new(0),
             reading: AtomicU64::new(0),
             next_write: AtomicU64::new(0),
+            next_output: AtomicU64::new(0),
+            next_order: AtomicU64::new(0),
             tagged: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
             serving: Mutex::new(None),
@@ -479,17 +589,70 @@ impl StreamTap {
         *lock(&self.serving)
     }
 
-    /// Reports `FrameWriteStarted` for the next write and returns its
-    /// sequence number.
-    pub(crate) fn write_started(&self, message_type: u16) -> u64 {
+    /// Reports `FrameWriteStarted` for the next write, as `output` with the
+    /// writer's own `fingerprint`, and returns its sequence number.
+    pub(crate) fn write_started(
+        &self,
+        message_type: u16,
+        output: Option<u64>,
+        fingerprint: u64,
+    ) -> u64 {
         let seq = self.next_write.fetch_add(1, Ordering::AcqRel);
         self.conn.emit(TransportEvent::FrameWriteStarted {
             conn_id: self.conn.conn_id(),
             quic_stream: self.quic_stream,
             seq,
             message_type,
+            output,
+            fingerprint,
         });
         seq
+    }
+
+    /// Reports `OutputAllocated` for the next output, `frame`, and returns
+    /// its number.
+    pub(crate) fn output_allocated(&self, frame: &super::Frame) -> u64 {
+        let output = self.next_output.fetch_add(1, Ordering::AcqRel);
+        self.conn.emit(TransportEvent::OutputAllocated {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            output,
+            message_type: frame.message_type,
+            // The frame cap bounds every payload far below u32::MAX.
+            payload_len: u32::try_from(frame.payload.len()).unwrap_or(u32::MAX),
+            expected: frame_fingerprint(frame),
+        });
+        output
+    }
+
+    /// Reports `OutputEnqueued` for `output`, at the queue's next place.
+    pub(crate) fn output_enqueued(&self, output: u64) {
+        let order = self.next_order.fetch_add(1, Ordering::AcqRel);
+        self.conn.emit(TransportEvent::OutputEnqueued {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            output,
+            order,
+        });
+    }
+
+    /// Reports `OutputDequeued` for `output`.
+    pub(crate) fn output_dequeued(&self, output: u64) {
+        self.conn.emit(TransportEvent::OutputDequeued {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            output,
+        });
+    }
+
+    /// Reports `OutputEnded` for `output` with `outcome`.
+    pub(crate) fn output_ended(&self, output: u64, outcome: OutputOutcome) {
+        self.conn.emit(TransportEvent::OutputEnded {
+            conn_id: self.conn.conn_id(),
+            quic_stream: self.quic_stream,
+            output,
+            outcome,
+        });
     }
 
     /// Reports `FrameWritten` for the write numbered `seq`.

@@ -145,6 +145,9 @@ async fn run_worker(
     };
     let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
     let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+    // As `spawn_service_session` taps it, so the service's frames are
+    // outputs (M6a-6).
+    let outbound_tx = outbound_tx.observed(Some(tap.clone()));
     let cancel = context.connection_token.clone();
     let mut worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
         persistent_stream_worker(send, recv, prelude, context, inbound_tx, outbound_rx, 1),
@@ -269,7 +272,10 @@ async fn oversize_header_is_read_then_closed() -> Result<(), BoxError> {
 }
 
 /// A whole frame gets both read stages, and a service frame gets both write
-/// events, each numbered from 0 on its own direction of the stream.
+/// events, each numbered from 0 on its own direction of the stream. The
+/// service frame is output 0 through its whole life: allocated, enqueued,
+/// dequeued, started with the writer's own fingerprint of it, and ended
+/// `Written` once (M6a-6).
 #[tokio::test]
 async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
@@ -283,15 +289,21 @@ async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
         flags: 0,
         payload: vec![0; status],
     };
-    let run = run_worker(&bytes, false, Some(outbound)).await?;
+    let run = run_worker(&bytes, false, Some(outbound.clone())).await?;
     let quic_stream = run.quic_stream;
     assert!(run.ended, "cancellation ends the worker");
     // The reader and the writer run independently, so only each direction's
     // own order is fixed.
+    let fingerprint = crate::zakura::frame_fingerprint(&outbound);
     let (writes, reads): (Vec<_>, Vec<_>) = run.events.into_iter().partition(|event| {
         matches!(
             event,
-            TransportEvent::FrameWriteStarted { .. } | TransportEvent::FrameWritten { .. }
+            TransportEvent::FrameWriteStarted { .. }
+                | TransportEvent::FrameWritten { .. }
+                | TransportEvent::OutputAllocated { .. }
+                | TransportEvent::OutputEnqueued { .. }
+                | TransportEvent::OutputDequeued { .. }
+                | TransportEvent::OutputEnded { .. }
         )
     });
     assert_eq!(
@@ -315,17 +327,44 @@ async fn worker_reports_each_frame_stage() -> Result<(), BoxError> {
     assert_eq!(
         writes,
         vec![
+            TransportEvent::OutputAllocated {
+                conn_id: CONN,
+                quic_stream,
+                output: 0,
+                message_type: v9::message_type::STATUS,
+                payload_len: u32::try_from(status)?,
+                expected: fingerprint,
+            },
+            TransportEvent::OutputEnqueued {
+                conn_id: CONN,
+                quic_stream,
+                output: 0,
+                order: 0,
+            },
+            TransportEvent::OutputDequeued {
+                conn_id: CONN,
+                quic_stream,
+                output: 0,
+            },
             TransportEvent::FrameWriteStarted {
                 conn_id: CONN,
                 quic_stream,
                 seq: 0,
                 message_type: v9::message_type::STATUS,
+                output: Some(0),
+                fingerprint,
             },
             TransportEvent::FrameWritten {
                 conn_id: CONN,
                 quic_stream,
                 seq: 0,
                 message_type: v9::message_type::STATUS,
+            },
+            TransportEvent::OutputEnded {
+                conn_id: CONN,
+                quic_stream,
+                output: 0,
+                outcome: crate::zakura::OutputOutcome::Written,
             },
         ]
     );

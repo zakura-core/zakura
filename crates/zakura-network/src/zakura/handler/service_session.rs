@@ -257,6 +257,10 @@ pub(super) fn spawn_service_session(
         }
         #[cfg(any(test, zakura_sim))]
         prepared.observe_admission(admitted.session_id, inbound_depth, outbound_depth);
+        // Frames the service queues get output lives on the stream's tap
+        // (M6a-6).
+        #[cfg(any(test, zakura_sim))]
+        let sender = sender.observed(prepared.context.precheck.tap().cloned());
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,

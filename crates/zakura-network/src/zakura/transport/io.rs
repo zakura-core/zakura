@@ -186,6 +186,10 @@ pub struct FramedSend {
     sender: FramedSender,
     response_slots: Option<SlotBudget>,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
+    /// The stream's tap, which gives each frame queued here an
+    /// [`OutputLife`]. Only a transport worker's queue has one.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<Arc<super::StreamTap>>,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +205,8 @@ impl FramedSend {
             sender: FramedSender::Plain(sender),
             response_slots: None,
             session_resources: None,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
         }
     }
 
@@ -211,6 +217,8 @@ impl FramedSend {
             response_slots: Some(response_slots),
             sender: FramedSender::Queued(sender),
             session_resources: None,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
         }
     }
 
@@ -224,6 +232,7 @@ impl FramedSend {
     }
 
     /// Queue a frame for transport-owned encoding and writing.
+    #[cfg(not(any(test, zakura_sim)))]
     pub async fn send(&self, frame: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
         match &self.sender {
             FramedSender::Plain(sender) => sender.send(frame).await,
@@ -234,7 +243,35 @@ impl FramedSend {
         }
     }
 
+    /// Queue a frame for transport-owned encoding and writing.
+    ///
+    /// In test and simulator builds it makes the frame's [`OutputLife`]
+    /// before it returns the future, so a future dropped before its first
+    /// poll still ends one.
+    #[cfg(any(test, zakura_sim))]
+    pub fn send(
+        &self,
+        frame: Frame,
+    ) -> impl std::future::Future<Output = Result<(), mpsc::error::SendError<Frame>>> + '_ {
+        let life = self.allocate(&frame);
+        async move {
+            match &self.sender {
+                FramedSender::Plain(sender) => sender.send(frame).await,
+                FramedSender::Queued(sender) => {
+                    let queued = QueuedFrame::plain(frame).with_life(life);
+                    let handle = queued.handle();
+                    let sent = sender.send(queued).await;
+                    if sent.is_ok() {
+                        OutputHandle::enqueued(handle.as_ref());
+                    }
+                    sent.map_err(|error| mpsc::error::SendError(error.0.into_parts().0))
+                }
+            }
+        }
+    }
+
     /// Try to queue a frame without waiting for capacity.
+    #[cfg(not(any(test, zakura_sim)))]
     pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
         match &self.sender {
             FramedSender::Plain(sender) => sender.try_send(frame),
@@ -244,6 +281,37 @@ impl FramedSend {
         }
     }
 
+    /// Try to queue a frame without waiting for capacity. A refused frame's
+    /// [`OutputLife`] ends with the frame's return.
+    #[cfg(any(test, zakura_sim))]
+    pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
+        match &self.sender {
+            FramedSender::Plain(sender) => sender.try_send(frame),
+            FramedSender::Queued(sender) => {
+                let life = self.allocate(&frame);
+                let queued = QueuedFrame::plain(frame).with_life(life);
+                let handle = queued.handle();
+                sender.try_send(queued).map_err(map_queued_try_send_error)?;
+                OutputHandle::enqueued(handle.as_ref());
+                Ok(())
+            }
+        }
+    }
+
+    /// Gives frames queued here an [`OutputLife`] on `tap`'s stream.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed(mut self, tap: Option<Arc<super::StreamTap>>) -> Self {
+        self.tap = tap;
+        self
+    }
+
+    /// The life of `frame`, an output about to be queued here, if this
+    /// queue is tapped. It reports `OutputAllocated` now.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn allocate(&self, frame: &Frame) -> Option<OutputLife> {
+        self.tap.as_ref().map(|tap| OutputLife::new(tap, frame))
+    }
+
     /// Reserve queue space before encoding a response or sharing its ownership.
     pub(crate) fn try_reserve_guarded(&self) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
         let FramedSender::Queued(sender) = &self.sender else {
@@ -251,7 +319,12 @@ impl FramedSend {
         };
         sender
             .try_reserve()
-            .map(|permit| GuardedFrameSlot { permit, sender })
+            .map(|permit| GuardedFrameSlot {
+                permit,
+                sender,
+                #[cfg(any(test, zakura_sim))]
+                tap: self.tap.as_ref(),
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(()) => GuardedReserveError::Full,
                 mpsc::error::TrySendError::Closed(()) => GuardedReserveError::Closed,
@@ -268,7 +341,12 @@ impl FramedSend {
         sender
             .reserve()
             .await
-            .map(|permit| GuardedFrameSlot { permit, sender })
+            .map(|permit| GuardedFrameSlot {
+                permit,
+                sender,
+                #[cfg(any(test, zakura_sim))]
+                tap: self.tap.as_ref(),
+            })
             .map_err(|_| GuardedReserveError::Closed)
     }
 
@@ -310,17 +388,40 @@ impl FramedSend {
 pub(crate) struct GuardedFrameSlot<'a> {
     permit: mpsc::Permit<'a, QueuedFrame>,
     sender: &'a mpsc::Sender<QueuedFrame>,
+    /// The queue's tap, as [`FramedSend::allocate`] uses it.
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<&'a Arc<super::StreamTap>>,
 }
 
 impl GuardedFrameSlot<'_> {
     /// Transfer a validated frame and its ownership to the reserved queue slot.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
         self.permit.send(QueuedFrame::guarded(frame, guard));
+    }
+
+    /// Transfer a validated frame and its ownership to the reserved queue
+    /// slot, with a new [`OutputLife`] if the queue is tapped.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+        let life = self.tap.map(|tap| OutputLife::new(tap, &frame));
+        self.send_with_life(frame, guard, life);
+    }
+
+    /// [`Self::send`] with the `life` its caller made when it built
+    /// `frame`.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_with_life(self, frame: Frame, guard: FrameGuard, life: Option<OutputLife>) {
+        let queued = QueuedFrame::guarded(frame, guard).with_life(life);
+        let handle = queued.handle();
+        self.permit.send(queued);
+        OutputHandle::enqueued(handle.as_ref());
     }
 
     /// Publish a request whose ownership must be claimed before its first byte.
     /// A false result requires explicit settlement after publication unlocks:
     /// Tokio can retain a send made through a permit after its receiver drops.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn send_request(self, frame: Frame, claim: Arc<dyn FrameWriteClaim>) -> bool {
         if self.sender.is_closed() {
             return false;
@@ -330,6 +431,28 @@ impl GuardedFrameSlot<'_> {
             guard: None,
             claim: Some(claim),
         });
+        !self.sender.is_closed()
+    }
+
+    /// Publish a request whose ownership must be claimed before its first
+    /// byte, as the release build does, with a new [`OutputLife`] if the
+    /// queue is tapped. The life is `Enqueued` right after the insert, so a
+    /// false result after a real enqueue still ends it from that phase.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_request(self, frame: Frame, claim: Arc<dyn FrameWriteClaim>) -> bool {
+        let life = self.tap.map(|tap| OutputLife::new(tap, &frame));
+        if self.sender.is_closed() {
+            return false;
+        }
+        let queued = QueuedFrame {
+            frame,
+            guard: None,
+            claim: Some(claim),
+            life,
+        };
+        let handle = queued.handle();
+        self.permit.send(queued);
+        OutputHandle::enqueued(handle.as_ref());
         !self.sender.is_closed()
     }
 }
@@ -390,6 +513,10 @@ pub(crate) struct QueuedFrame {
     frame: Frame,
     guard: Option<FrameGuard>,
     claim: Option<Arc<dyn FrameWriteClaim>>,
+    /// The frame's output life, on a tapped queue. It moves with the frame
+    /// until the writer takes it out at dequeue.
+    #[cfg(any(test, zakura_sim))]
+    life: Option<OutputLife>,
 }
 
 impl QueuedFrame {
@@ -409,6 +536,8 @@ impl QueuedFrame {
             frame,
             guard: None,
             claim: None,
+            #[cfg(any(test, zakura_sim))]
+            life: None,
         }
     }
 
@@ -417,7 +546,30 @@ impl QueuedFrame {
             frame,
             guard: Some(guard),
             claim: None,
+            #[cfg(any(test, zakura_sim))]
+            life: None,
         }
+    }
+
+    /// This frame with output life `life`.
+    #[cfg(any(test, zakura_sim))]
+    fn with_life(mut self, life: Option<OutputLife>) -> Self {
+        self.life = life;
+        self
+    }
+
+    /// A handle on this frame's life, for its producer to mark it enqueued
+    /// once the insert returns.
+    #[cfg(any(test, zakura_sim))]
+    fn handle(&self) -> Option<OutputHandle> {
+        self.life.as_ref().map(OutputLife::handle)
+    }
+
+    /// Takes the frame's output life out, for the writer at dequeue, so it
+    /// outlives the cancellable write.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn take_life(&mut self) -> Option<OutputLife> {
+        self.life.take()
     }
 
     /// Split the frame from its guard while retaining both in the caller.
@@ -432,7 +584,7 @@ impl QueuedFrame {
         F: FnOnce(Frame) -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
-        self.encode_and_write_with(Ok, write).await
+        self.encode_and_write_with(Ok, write, None).await
     }
 
     /// Encode the frame, then claim it and run the transport write while
@@ -441,6 +593,7 @@ impl QueuedFrame {
     /// `encode` runs before the claim, so a frame that fails to encode starts
     /// nothing: its exchange stays unstarted, and retiring its session leaves
     /// the connection up.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) async fn encode_and_write_with<P, E, Enc, F, Fut>(
         self,
         encode: Enc,
@@ -465,6 +618,203 @@ impl QueuedFrame {
             claim.written();
         }
         Ok(())
+    }
+
+    /// [`Self::encode_and_write_with`] as the release build runs it, setting
+    /// the phase of `life`, the frame's output life the writer took out at
+    /// dequeue, at each outcome. `write` marks the write started.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) async fn encode_and_write_with<P, E, Enc, F, Fut>(
+        self,
+        encode: Enc,
+        write: F,
+        life: Option<&OutputLife>,
+    ) -> Result<(), E>
+    where
+        Enc: FnOnce(Frame) -> Result<P, E>,
+        F: FnOnce(P) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        let Self {
+            frame,
+            guard: _guard,
+            claim,
+            life: unowned,
+        } = self;
+        debug_assert!(unowned.is_none(), "the writer takes the life out first");
+        drop(unowned);
+        let set = |phase| {
+            if let Some(life) = life {
+                life.set(phase);
+            }
+        };
+        let encoded = match encode(frame) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                set(Phase::ENCODE);
+                return Err(error);
+            }
+        };
+        if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
+            set(Phase::OBSOLETE);
+            return Ok(());
+        }
+        if let Err(error) = write(encoded).await {
+            set(Phase::FAILED);
+            return Err(error);
+        }
+        if let Some(claim) = &claim {
+            claim.written();
+        }
+        set(Phase::WRITTEN);
+        Ok(())
+    }
+}
+
+/// One output's phase, shared by its [`OutputLife`] and its producer's
+/// [`OutputHandle`] (M6a-6).
+///
+/// Phases only move forward, through `fetch_max`, so a writer that dequeued
+/// a frame before its producer marked it enqueued keeps its later phase.
+/// Each writer path sets at most one terminal phase, from `WRITTEN` on. The
+/// atomic is a `counter` atomic, so setting it is never a preemption point.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct Phase(zakura_rt::sync::counter::AtomicU64);
+
+#[cfg(any(test, zakura_sim))]
+impl Phase {
+    const ALLOCATED: u64 = 0;
+    const ENQUEUED: u64 = 1;
+    const DEQUEUED: u64 = 2;
+    const STARTED: u64 = 3;
+    /// The first terminal phase. Every phase from here on is final.
+    const WRITTEN: u64 = 4;
+    const OBSOLETE: u64 = 5;
+    const ENCODE: u64 = 6;
+    const CANCELLED: u64 = 7;
+    const FAILED: u64 = 8;
+
+    /// Moves to `phase` unless the output is already there or past it.
+    fn set(&self, phase: u64) {
+        self.0
+            .fetch_max(phase, zakura_rt::sync::counter::Ordering::AcqRel);
+    }
+
+    /// The outcome a life that drops in this phase ends with.
+    fn outcome(&self) -> super::OutputOutcome {
+        use super::{OutputOutcome, Unwritten};
+        use zakura_rt::sync::counter::Ordering;
+        match self.0.load(Ordering::Acquire) {
+            Self::ALLOCATED => OutputOutcome::NotQueued,
+            Self::ENQUEUED => OutputOutcome::Dropped,
+            Self::DEQUEUED | Self::STARTED => OutputOutcome::Abandoned,
+            Self::WRITTEN => OutputOutcome::Written,
+            Self::OBSOLETE => OutputOutcome::Unwritten(Unwritten::Obsolete),
+            Self::ENCODE => OutputOutcome::Unwritten(Unwritten::Encode),
+            Self::CANCELLED => OutputOutcome::Unwritten(Unwritten::Cancelled),
+            Self::FAILED => OutputOutcome::Unwritten(Unwritten::Failed),
+            phase => unreachable!("`set` only stores the phases above, not {phase}"),
+        }
+    }
+}
+
+/// What an output's life and its producer's handle share.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct OutputShared {
+    tap: Arc<super::StreamTap>,
+    output: u64,
+    phase: Phase,
+}
+
+/// One output: a frame a producer queues on a tapped stream, from before
+/// any wait until its frame is written, refused or dropped (M6a-6).
+///
+/// It's made synchronously in each queueing call, moves into the queued
+/// frame, and the writer takes it out at dequeue, so it outlives the
+/// cancellable write. Code paths only advance its phase. Its `Drop` is the
+/// only writer of the output's terminal `OutputEnded`, from the phase it
+/// reached, so every path ends an output exactly once.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+pub(crate) struct OutputLife(Arc<OutputShared>);
+
+#[cfg(any(test, zakura_sim))]
+impl OutputLife {
+    /// The life of `frame`, the next output on `tap`'s stream. Reports
+    /// `OutputAllocated`.
+    fn new(tap: &Arc<super::StreamTap>, frame: &Frame) -> Self {
+        let output = tap.output_allocated(frame);
+        Self(Arc::new(OutputShared {
+            tap: tap.clone(),
+            output,
+            phase: Phase(zakura_rt::sync::counter::AtomicU64::new(Phase::ALLOCATED)),
+        }))
+    }
+
+    /// The output's number on its stream.
+    pub(crate) fn output(&self) -> u64 {
+        self.0.output
+    }
+
+    /// A handle that can mark the output enqueued, and writes no terminal.
+    fn handle(&self) -> OutputHandle {
+        OutputHandle(self.0.clone())
+    }
+
+    /// Moves the output to `phase` (see [`Phase::set`]).
+    fn set(&self, phase: u64) {
+        self.0.phase.set(phase);
+    }
+
+    /// The writer took the frame from the queue. Reports `OutputDequeued`.
+    pub(crate) fn dequeued(&self) {
+        self.set(Phase::DEQUEUED);
+        self.0.tap.output_dequeued(self.0.output);
+    }
+
+    /// The writer is about to hand the frame's first bytes to the stream.
+    pub(crate) fn started(&self) {
+        self.set(Phase::STARTED);
+    }
+
+    /// The stream or connection was cancelled before the write finished.
+    /// The writer's cancellation arms call it before they break.
+    pub(crate) fn cancelled(life: Option<&Self>) {
+        if let Some(life) = life {
+            life.set(Phase::CANCELLED);
+        }
+    }
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Drop for OutputLife {
+    /// Reports `OutputEnded` with the outcome of the phase the output
+    /// reached. Nothing else reports it.
+    fn drop(&mut self) {
+        self.0
+            .tap
+            .output_ended(self.0.output, self.0.phase.outcome());
+    }
+}
+
+/// A producer's handle on the life it moved into the queue, to mark it
+/// enqueued once the insert returns. It writes no terminal record.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+pub(crate) struct OutputHandle(Arc<OutputShared>);
+
+#[cfg(any(test, zakura_sim))]
+impl OutputHandle {
+    /// The insert returned: moves the output to `Enqueued` and reports
+    /// `OutputEnqueued` with its place in the queue. The caller calls it
+    /// right after the insert, with no preemption point in between.
+    fn enqueued(handle: Option<&Self>) {
+        if let Some(handle) = handle {
+            handle.0.phase.set(Phase::ENQUEUED);
+            handle.0.tap.output_enqueued(handle.0.output);
+        }
     }
 }
 
@@ -505,6 +855,9 @@ fn map_queued_try_send_error(
         }
     }
 }
+
+#[cfg(test)]
+mod output_tests;
 
 #[cfg(test)]
 mod tests {

@@ -33,9 +33,10 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        HeaderCheck, HeaderSyncService, Service, ServiceRegistry, Transition, TransportEvent,
-        TransportObserver, ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
+        HeaderCheck, HeaderSyncService, OutputOutcome, Service, ServiceRegistry, Transition,
+        TransportEvent, TransportObserver, Unwritten, ZakuraConnectionLimits, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle,
+        ZakuraTrace,
     },
     Config,
 };
@@ -53,7 +54,7 @@ use super::{
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
-    observe::{HeaderCheckFact, TransitionFact, TransportFact, TransportLimits},
+    observe::{HeaderCheckFact, OutputEnd, TransitionFact, TransportFact, TransportLimits},
     peer::{key_index, peer_addr, peer_of, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -483,6 +484,8 @@ impl TransportTap {
                 quic_stream,
                 seq,
                 message_type,
+                output,
+                fingerprint,
             } => (
                 Some(conn_id),
                 self.remote(conn_id)?,
@@ -490,6 +493,66 @@ impl TransportTap {
                     quic_stream,
                     seq,
                     message_type,
+                    output,
+                    fingerprint,
+                },
+            ),
+            TransportEvent::OutputAllocated {
+                conn_id,
+                quic_stream,
+                output,
+                message_type,
+                payload_len,
+                expected,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::OutputAllocated {
+                    quic_stream,
+                    output,
+                    message_type,
+                    payload_len,
+                    expected,
+                },
+            ),
+            TransportEvent::OutputEnqueued {
+                conn_id,
+                quic_stream,
+                output,
+                order,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::OutputEnqueued {
+                    quic_stream,
+                    output,
+                    order,
+                },
+            ),
+            TransportEvent::OutputDequeued {
+                conn_id,
+                quic_stream,
+                output,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::OutputDequeued {
+                    quic_stream,
+                    output,
+                },
+            ),
+            TransportEvent::OutputEnded {
+                conn_id,
+                quic_stream,
+                output,
+                outcome,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::OutputEnded {
+                    quic_stream,
+                    output,
+                    outcome: output_end(outcome)?,
                 },
             ),
             TransportEvent::FrameWritten {
@@ -527,6 +590,22 @@ impl TransportTap {
             unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
         })
     }
+}
+
+/// `outcome` in plain fields, or an error for one this build can't
+/// encode.
+fn output_end(outcome: OutputOutcome) -> Result<OutputEnd, String> {
+    Ok(match outcome {
+        OutputOutcome::NotQueued => OutputEnd::NotQueued,
+        OutputOutcome::Dropped => OutputEnd::Dropped,
+        OutputOutcome::Written => OutputEnd::Written,
+        OutputOutcome::Unwritten(Unwritten::Obsolete) => OutputEnd::UnwrittenObsolete,
+        OutputOutcome::Unwritten(Unwritten::Encode) => OutputEnd::UnwrittenEncode,
+        OutputOutcome::Unwritten(Unwritten::Cancelled) => OutputEnd::UnwrittenCancelled,
+        OutputOutcome::Unwritten(Unwritten::Failed) => OutputEnd::UnwrittenFailed,
+        OutputOutcome::Abandoned => OutputEnd::Abandoned,
+        unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
+    })
 }
 
 /// `limits` in plain fields.

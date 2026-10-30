@@ -83,6 +83,7 @@ impl SenderAdapter {
                 quic_stream,
                 seq,
                 message_type,
+                ..
             } => (
                 *quic_stream,
                 Pending::Started {

@@ -2339,6 +2339,53 @@ pub enum TransportFact {
         seq: u64,
         /// The frame's message type.
         message_type: u16,
+        /// The output the frame is (M6a-6), or `None` for a frame queued
+        /// with no output life.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<u64>,
+        /// The writer's own fingerprint of the frame it's writing, over its
+        /// message type, flags and payload.
+        fingerprint: u64,
+    },
+    /// A producer made output `output`, a frame it's about to queue on the
+    /// stream (M6a-6). Outputs count from 0 per stream.
+    OutputAllocated {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// The frame's message type.
+        message_type: u16,
+        /// The frame's payload length.
+        payload_len: u32,
+        /// The fingerprint of the frame as the producer queued it.
+        expected: u64,
+    },
+    /// The output's frame is in the stream's queue at place `order`, from
+    /// 0, reported right after the insert.
+    OutputEnqueued {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// Its place in the queue.
+        order: u64,
+    },
+    /// The stream's writer took the output's frame from the queue.
+    OutputDequeued {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+    },
+    /// The output's life ended, reported once by its `Drop`.
+    OutputEnded {
+        /// The QUIC stream.
+        quic_stream: u64,
+        /// The output.
+        output: u64,
+        /// How it ended.
+        outcome: OutputEnd,
     },
     /// The writer finished writing a frame.
     FrameWritten {
@@ -2357,6 +2404,28 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+}
+
+/// How an output ended, in [`TransportFact::OutputEnded`] (M6a-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputEnd {
+    /// Its frame never reached the queue.
+    NotQueued,
+    /// Its frame was queued and dropped with the queue, never dequeued.
+    Dropped,
+    /// The writer wrote the whole frame.
+    Written,
+    /// The writer skipped it as an obsolete request claim.
+    UnwrittenObsolete,
+    /// It didn't fit the stream's caps.
+    UnwrittenEncode,
+    /// A cancellation stopped the writer before the write finished.
+    UnwrittenCancelled,
+    /// The stream's write failed.
+    UnwrittenFailed,
+    /// The writer dequeued it and its life dropped with no outcome.
+    Abandoned,
 }
 
 /// The credit one subscription update adds, in

@@ -28,6 +28,8 @@ pub(crate) use guard::BudgetObserver;
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 #[cfg(any(test, zakura_sim))]
 pub use guard::{BudgetChange, BudgetChangeKind};
+#[cfg(any(test, zakura_sim))]
+pub(crate) use io::OutputLife;
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
@@ -43,9 +45,12 @@ pub use message_rule::{
     PayloadLen,
 };
 #[cfg(any(test, zakura_sim))]
-pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
+pub use observe::{
+    frame_fingerprint, HeaderCheck, OutputOutcome, Transition, TransportEvent, TransportObserver,
+    Unwritten,
+};
 #[cfg(any(test, zakura_sim))]
-pub use observe::{HeaderCheck, Transition, TransportEvent, TransportObserver};
+pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
 #[cfg(feature = "internal-bench")]
 pub use pipe::supervised_spawn_bench;
 pub(crate) use pipe::{

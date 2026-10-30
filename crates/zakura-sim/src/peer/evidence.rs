@@ -16,6 +16,8 @@
 //! Each `PeerReceived` is followed by the frame's `NodeFrame`, which the
 //! [`SenderAdapter`] labels under the sender's rules against the peer
 //! updates the node had applied when it started writing the frame (M5-E2).
+//! The [`OutputLedger`] checks the node's output lives and each frame a
+//! peer read against the output its write started (M6a-6).
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
@@ -38,6 +40,7 @@ use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule
 
 use super::{
     adapter::SenderAdapter,
+    output::OutputLedger,
     stage::{header_stage, NodeView, Stage},
 };
 use crate::{
@@ -242,6 +245,8 @@ pub(crate) struct WireEvidence {
     waiting: BTreeMap<FrameKey, Waiting>,
     /// Labels the node's frames.
     sender: SenderAdapter,
+    /// Checks the node's outputs and the frames the peers read (M6a-6).
+    outputs: OutputLedger,
 }
 
 impl WireEvidence {
@@ -255,6 +260,7 @@ impl WireEvidence {
         } = obs
         {
             self.sender.node(*connection, event);
+            self.outputs.node(*connection, event)?;
         }
         match obs {
             Observation::Transport {
@@ -437,6 +443,9 @@ impl WireEvidence {
                         Ok(node_frame) => node_frame,
                         Err(why) => return Some(Err(why)),
                     };
+                if let Err(why) = self.outputs.received(connection, quic_stream, seq, &frame) {
+                    return Some(Err(why));
+                }
                 return Some(Ok(vec![
                     Observation::PeerReceived {
                         connection,
@@ -765,17 +774,39 @@ mod tests {
             frame: frame.clone(),
             at: Duration::ZERO,
         });
+        let fingerprint = zakura_network::zakura::frame_fingerprint(&frame);
         let started = TransportFact::FrameWriteStarted {
             quic_stream: 4,
             seq: 0,
             message_type: frame.message_type,
+            output: Some(0),
+            fingerprint,
         };
-        let items = vec![
+        // The frame's output life up to its write (M6a-6).
+        let life = [
+            TransportFact::OutputAllocated {
+                quic_stream: 4,
+                output: 0,
+                message_type: frame.message_type,
+                payload_len: 0,
+                expected: fingerprint,
+            },
+            TransportFact::OutputEnqueued {
+                quic_stream: 4,
+                output: 0,
+                order: 0,
+            },
+            TransportFact::OutputDequeued {
+                quic_stream: 4,
+                output: 0,
+            },
+        ];
+        let mut items = vec![
             transport(1, Some(1), TransportFact::Registered),
             session(1, 7),
-            transport(2, Some(1), started),
-            Item::Record(received),
         ];
+        items.extend(life.into_iter().map(|fact| transport(2, Some(1), fact)));
+        items.extend([transport(2, Some(1), started), Item::Record(received)]);
         let logged = fold(&mut WireEvidence::default(), &mut Vec::new(), items)
             .expect("the record is placed");
         assert!(

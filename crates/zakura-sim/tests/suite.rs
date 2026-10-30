@@ -11,8 +11,8 @@ use zakura_sim::{
     harness::{coverage::COVERAGE, HARNESSES},
     seed,
     suite::{
-        self, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage, SuiteFile, Target,
-        NIGHTLY, SUITE_FILE,
+        self, ExcludedTarget, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage,
+        SuiteFile, Target, NIGHTLY, SUITE_FILE,
     },
 };
 
@@ -230,11 +230,11 @@ fn the_committed_suite_covers_the_registry() {
 fn a_harness_without_a_target_fails() {
     let mut suite = committed();
     remove(&mut suite.missing_target, |row| {
-        row.harness == "header-sync/wire"
+        row.harness == "header-sync/smoke"
     });
     assert_problem(
         &problems(&suite),
-        "no target runs the harness `header-sync/wire`",
+        "no target runs the harness `header-sync/smoke`",
     );
 }
 
@@ -255,7 +255,10 @@ fn a_simulator_target_takes_its_harness_from_its_cargo_toml() {
         panic!("{problems}");
     });
     for (name, harness) in [
+        ("block_sync_storage", "block-sync/storage"),
         ("discovery_wait_complete", "discovery/wait-complete"),
+        ("header_sync_storage", "header-sync/storage"),
+        ("header_sync_wire", "header-sync/wire"),
         ("race_fixtures", "fixtures/all"),
     ] {
         let row = manifest
@@ -289,6 +292,25 @@ fn a_simulator_target_without_a_registered_harness_fails() {
     assert_problem(
         &problems,
         "qa/fuzz/sim/Cargo.toml maps `stale` to a harness, and defines no such target",
+    );
+}
+
+#[test]
+fn an_excluded_simulator_target_needs_no_harness() {
+    let dir = scratch();
+    let mut suite = scratch_suite(None, &[]);
+    suite.target.retain(|target| target.name != "unmapped");
+    suite.excluded_target.push(ExcludedTarget {
+        package: "sim".to_owned(),
+        name: "unmapped".to_owned(),
+        reason: "runs no harness".to_owned(),
+    });
+    let problems = problems_at(dir.path(), &suite);
+    assert!(
+        !problems
+            .iter()
+            .any(|problem| problem.contains("`unmapped`")),
+        "{problems:?}"
     );
 }
 
@@ -497,14 +519,14 @@ fn a_registered_pending_row_fails() {
 fn every_problem_is_reported_at_once() {
     let mut suite = committed();
     remove(&mut suite.missing_target, |row| {
-        row.harness == "block-sync/storage"
+        row.harness == "header-sync/smoke"
     });
     remove(&mut suite.ignored, |row| {
         row.test == "regenerate_wait_complete_input"
     });
     remove(&mut suite.target, |row| row.name == "race_fixtures");
     let problems = problems(&suite);
-    assert_problem(&problems, "no target runs the harness `block-sync/storage`");
+    assert_problem(&problems, "no target runs the harness `header-sync/smoke`");
     assert_problem(&problems, "regenerate_wait_complete_input is ignored");
     assert_problem(&problems, "defines the target `race_fixtures`");
     assert_problem(&problems, "no target runs the harness `race/ab-ba`");

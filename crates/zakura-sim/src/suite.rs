@@ -1335,7 +1335,7 @@ impl Builder<'_> {
 
     /// The target rows, the excluded targets' rows, and each fuzz
     /// package's lockfile digest. Every binary target of every fuzz
-    /// package must be mapped or excluded, and each one of
+    /// package must be mapped or excluded, and each mapped one of
     /// [`SIM_FUZZ_PACKAGE`] must have a harness in its package's
     /// `[package.metadata.zakura-sim.targets]` table.
     fn targets(&mut self) -> (Vec<TargetRow>, Vec<ExcludedRow>, BTreeMap<String, String>) {
@@ -1379,8 +1379,15 @@ impl Builder<'_> {
                 ));
             }
         }
+        let excluded: BTreeSet<(String, String)> = self
+            .suite
+            .excluded_target
+            .iter()
+            .map(|target| (target.package.clone(), target.name.clone()))
+            .collect();
         for key in &bins {
-            if key.0 == SIM_FUZZ_PACKAGE && !harnesses.contains_key(key) {
+            if key.0 == SIM_FUZZ_PACKAGE && !harnesses.contains_key(key) && !excluded.contains(key)
+            {
                 self.problem(format!(
                     "{FUZZ_DIR}/{} defines the target `{}`, and its \
                      `[package.metadata.zakura-sim.targets]` table maps it to no harness",

@@ -10,7 +10,10 @@ cargo-fuzz = true
 # The registered harness each target runs. `cargo xtask sim-minimize`, the C1
 # suite manifest and campaign tooling read the mapping from here.
 [package.metadata.zakura-sim.targets]
+block_sync_storage = "block-sync/storage"
 discovery_wait_complete = "discovery/wait-complete"
+header_sync_storage = "header-sync/storage"
+header_sync_wire = "header-sync/wire"
 race_fixtures = "fixtures/all"
 
 [features]

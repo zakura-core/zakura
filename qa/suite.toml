@@ -180,6 +180,29 @@ covers = [
 smoke-secs = 60
 timeout-secs = 1800
 
+# The storage and wire harnesses' inputs carry a scenario prefix sized for
+# 4096-byte inputs, as qa/fuzz/sim/README.md says.
+[[target]]
+package = "sim"
+name = "block_sync_storage"
+smoke-secs = 60
+args = ["-max_len=4096", "-rss_limit_mb=4096"]
+timeout-secs = 2700
+
+[[target]]
+package = "sim"
+name = "header_sync_storage"
+smoke-secs = 60
+args = ["-max_len=4096", "-rss_limit_mb=4096"]
+timeout-secs = 2700
+
+[[target]]
+package = "sim"
+name = "header_sync_wire"
+smoke-secs = 60
+args = ["-max_len=4096", "-rss_limit_mb=4096"]
+timeout-secs = 2700
+
 # The header-chain targets, with header-fuzz.yml's limits.
 [[target]]
 package = "header-chain"
@@ -218,26 +241,16 @@ package = "rpc"
 name = "json_rpc_request"
 reason = "JSON-RPC parsing isn't a P2P DoS property; rpc-fuzz.yml keeps fuzzing it nightly"
 
+[[excluded-target]]
+package = "sim"
+name = "feedback_probe"
+reason = "a transport check with no property: `cargo xtask sim-feedback` builds and runs it"
+
 # Harnesses no target runs yet. Each stays in the report as unimplemented.
 [[missing-target]]
 harness = "header-sync/smoke"
 owner = "E5a"
 reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
-
-[[missing-target]]
-harness = "header-sync/storage"
-owner = "E5a"
-reason = "the target waits for G1's action grammar (#1830) and E5a's readiness contract"
-
-[[missing-target]]
-harness = "block-sync/storage"
-owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
-
-[[missing-target]]
-harness = "header-sync/wire"
-owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and

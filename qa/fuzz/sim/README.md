@@ -87,7 +87,7 @@ child starts, and never changes the input itself. It then records the input
 twice, each time in a fresh `zakura-sim record` process that it kills after
 `--child-secs`, and classifies each recording from its exit, its standard
 error and its trace. It compares the two traces if either wrote its `end`
-record. If both recordings filed the input alike, their traces match, and both
+record, and counts a trace that doesn't read as a difference. If both recordings filed the input alike, their traces match, and both
 ended without failing, a third process replays the first trace Exact. Each
 input gets one status:
 
@@ -97,7 +97,7 @@ input gets one status:
   first one Exact.
 - `nondeterministic`: the two recordings filed the input differently, or
   their traces differ. `triage.json` names the first record where they
-  differ.
+  differ, or the recording whose trace doesn't read.
 - `replay-failed`: the recordings agreed, but the replay didn't match the
   first one Exact.
 
@@ -113,7 +113,10 @@ under `runs/`, `triage.json` and `SHA256SUMS`. `triage.json` names the
 harness, the generator, the provenance hash and the build. Triage writes the
 bundle under `.staging/` and renames it into place, and never changes it
 after that. A later triage of the same input on the same harness, generator
-and build files it in the same place, and keeps the bundle that's there.
+and build files it in the same place. It keeps the bundle that's there if that
+bundle matches its `SHA256SUMS` and its `triage.json` names the same result.
+Otherwise, as with a stale or misplaced copy, it keeps both, and names its own
+bundle `<input sha256>-<n>/` with the first free `n`.
 `sim-verify-archive` checks every bundle against its `SHA256SUMS`, and counts
 the bundles under each harness, provenance and signature.
 

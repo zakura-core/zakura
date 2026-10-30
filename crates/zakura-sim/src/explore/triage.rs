@@ -10,7 +10,8 @@
 //!    time limit, and classifies each child's run with [`classify_process`].
 //!    A child that outlives its limit is killed, and its run classifies with
 //!    [`ProcessExit::TimedOut`];
-//! 3. compares the two runs' traces, if either wrote its `end` record;
+//! 3. compares the two runs' traces, if either wrote its `end` record. A
+//!    trace that doesn't read counts as a difference;
 //! 4. if both runs filed the input alike, their traces match, and they
 //!    ended without failing, replays the first run's trace Exact in a third
 //!    fresh child;
@@ -18,9 +19,12 @@
 //!    into place.
 //!
 //! A bundle never changes after its rename. A later triage that files the
-//! same input in the same place keeps the bundle that's there. The input is
-//! only read, so a triage killed at any point leaves it whole, and leaves
-//! its copy in the staging bundle.
+//! same input in the same place keeps the bundle that's there if that bundle
+//! matches its checksums and its [`TRIAGE_FILE`] names the same result.
+//! Otherwise, as with a stale or misplaced copy, triage keeps both, and
+//! names its own bundle `<input sha256>-<n>` with the first free `n`. The
+//! input is only read, so a triage killed at any point leaves it whole, and
+//! leaves its copy in the staging bundle.
 //!
 //! Bundles go under `<out>/<harness>/<provenance>/`, where `<harness>` is
 //! the harness's name and `<provenance>` is [`provenance_hash`] of its
@@ -55,7 +59,7 @@ use crate::{
     harness::HarnessEntry,
     trace::{
         meta::{hex, BuildInfo, UNKNOWN},
-        trace_difference, TraceReader, MAX_INPUT_BYTES,
+        trace_difference, Invalid, ReadError, Trace, TraceReader, MAX_INPUT_BYTES,
     },
 };
 
@@ -161,8 +165,8 @@ pub enum TriageStatus {
     /// Both fresh recordings ran clean, their traces match, and a fresh
     /// replay of the first one's trace matched it Exact.
     NotReproduced,
-    /// The two fresh recordings filed the input differently, or their traces
-    /// differ.
+    /// The two fresh recordings filed the input differently, their traces
+    /// differ, or a trace doesn't read, so triage can't compare them.
     Nondeterministic,
     /// Both fresh recordings filed the input alike and their traces match,
     /// but a fresh replay of the first one's trace didn't match it Exact.
@@ -222,8 +226,8 @@ pub struct Triaged {
     pub replay: Option<ProcessExit>,
     /// The bundle's directory.
     pub bundle: PathBuf,
-    /// False if a bundle for the same input was already in that place, so
-    /// this triage kept it and archived nothing.
+    /// False if a bundle that holds the same result was already in that
+    /// place, so this triage kept it and archived nothing.
     pub archived: bool,
 }
 
@@ -441,10 +445,13 @@ pub fn triage(
             record_json(RECORD_DIRS[0], &first, &signatures[0]),
             record_json(RECORD_DIRS[1], &second, &signatures[1]),
         ],
-        "difference": difference.map(|(step, field)| json!({
-            "step": step,
-            "field": field,
-        })),
+        "difference": difference.map(|difference| match difference {
+            Difference::Record { step, field } => json!({ "step": step, "field": field }),
+            Difference::Unread { run, error } => json!({
+                "run": format!("{RUNS_DIR}/{run}"),
+                "unread": error,
+            }),
+        }),
         "replay": replay.map(|exit| json!({
             "dir": format!("{RUNS_DIR}/{REPLAY_DIR}"),
             "exit": exit,
@@ -472,7 +479,7 @@ pub fn triage(
             .join(&digest),
         _ => root.join(status.name()).join(&digest),
     };
-    let archived = place(&staging, &bundle)?;
+    let (bundle, archived) = place(&staging, &bundle, &report)?;
     Ok(Triaged {
         status,
         bucket,
@@ -484,20 +491,52 @@ pub fn triage(
     })
 }
 
-/// The first record where the two recordings' traces in `staging` differ:
-/// its step and field, as [`trace_difference`] names them. `None` if they
-/// match, if neither wrote its `end` record, or if either doesn't read as a
-/// trace. A failed child's trace may stop at any step, so two traces without
-/// their `end` record aren't compared.
-fn recordings_difference(staging: &Path) -> Option<(u64, &'static str)> {
-    let read = |name: &str| {
-        TraceReader::open_prefix(&staging.join(RUNS_DIR).join(name).join(RUN_TRACE_DIR)).ok()
+/// How the two recordings' traces differ.
+enum Difference {
+    /// The first record where they differ, as [`trace_difference`] names
+    /// it.
+    Record { step: u64, field: &'static str },
+    /// The recording in this run directory wrote a trace that doesn't read,
+    /// or wrote none while the other wrote its `end` record, so triage can't
+    /// compare them.
+    Unread { run: &'static str, error: String },
+}
+
+/// How the two recordings' traces in `staging` differ. `None` if they
+/// match, or if neither wrote its `end` record. A failed child's trace may
+/// stop at any step, even before its first record, so two traces without
+/// their `end` record aren't compared. A trace that doesn't read is a
+/// difference, never a match.
+fn recordings_difference(staging: &Path) -> Option<Difference> {
+    let read = |run: &'static str| {
+        let dir = staging.join(RUNS_DIR).join(run).join(RUN_TRACE_DIR);
+        match TraceReader::open_prefix(&dir) {
+            Ok(trace) => Ok(Some(trace)),
+            // The child stopped before it wrote its first record.
+            Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(ReadError::Invalid(Invalid::MissingMeta)) => Ok(None),
+            Err(error) => Err(Difference::Unread {
+                run,
+                error: error.to_string(),
+            }),
+        }
     };
-    let (first, second) = (read(RECORD_DIRS[0])?, read(RECORD_DIRS[1])?);
-    if first.end.is_none() && second.end.is_none() {
+    let traces = match (read(RECORD_DIRS[0]), read(RECORD_DIRS[1])) {
+        (Err(difference), _) | (_, Err(difference)) => return Some(difference),
+        (Ok(first), Ok(second)) => [first, second],
+    };
+    let ended = |trace: &Option<Trace>| trace.as_ref().is_some_and(|trace| trace.end.is_some());
+    if !traces.iter().any(ended) {
         return None;
     }
-    trace_difference(&first, &second)
+    match traces {
+        [Some(first), Some(second)] => trace_difference(&first, &second)
+            .map(|(step, field)| Difference::Record { step, field }),
+        [first, _] => Some(Difference::Unread {
+            run: RECORD_DIRS[usize::from(first.is_some())],
+            error: "it wrote no trace, and the other recording wrote its end record".to_owned(),
+        }),
+    }
 }
 
 /// The scenario the input's prefix draws, serialized, or `None` if the
@@ -552,30 +591,86 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Moves the bundle at `staging` to `bundle`, unless a bundle is already
-/// there. Returns true if it moved it. If one is there, it removes the
-/// staging bundle and keeps the one that's there.
-fn place(staging: &Path, bundle: &Path) -> io::Result<bool> {
+/// The [`TRIAGE_FILE`] fields that name a bundle's result. Two triages of
+/// one input that agree on these filed it alike.
+const RESULT_FIELDS: [&str; 8] = [
+    "format",
+    "status",
+    "bucket",
+    "signature",
+    "harness",
+    "generator",
+    "provenance",
+    "input",
+];
+
+/// Moves the bundle at `staging`, whose [`TRIAGE_FILE`] holds `report`, to
+/// `bundle`, or beside it. Returns where the bundle is, and true if it moved
+/// the staging bundle there.
+///
+/// It tries `bundle`, then `<bundle>-1`, `<bundle>-2` and so on. At the
+/// first name that's free, it moves the staging bundle there. At a name
+/// that holds a bundle with the same result (see [`holds_result`]), it
+/// removes the staging bundle and keeps that one. It never changes a bundle
+/// that's there.
+fn place(staging: &Path, bundle: &Path, report: &Value) -> io::Result<(PathBuf, bool)> {
     fs::create_dir_all(
         bundle
             .parent()
             .expect("a bundle's path names a directory inside the archive"),
     )?;
-    if fs::symlink_metadata(bundle).is_ok() {
-        fs::remove_dir_all(staging)?;
-        return Ok(false);
-    }
-    match fs::rename(staging, bundle) {
-        Ok(()) => Ok(true),
-        // Another triage placed the same bundle first. Renaming a
-        // directory onto a directory that isn't empty fails, so the first
-        // rename wins.
-        Err(_) if fs::symlink_metadata(bundle).is_ok() => {
-            fs::remove_dir_all(staging)?;
-            Ok(false)
+    let name = bundle
+        .file_name()
+        .expect("a bundle's path ends in its input's SHA-256")
+        .to_string_lossy();
+    let mut n = 0u64;
+    loop {
+        let candidate = match n {
+            0 => bundle.to_owned(),
+            n => bundle.with_file_name(format!("{name}-{n}")),
+        };
+        if fs::symlink_metadata(&candidate).is_err() {
+            match fs::rename(staging, &candidate) {
+                Ok(()) => return Ok((candidate, true)),
+                // Another triage placed a bundle there first. Renaming a
+                // directory onto a directory that isn't empty fails, so the
+                // first rename wins, and this triage checks that bundle as
+                // it would any other.
+                Err(_) if fs::symlink_metadata(&candidate).is_ok() => {}
+                Err(error) => return Err(error),
+            }
         }
-        Err(error) => Err(error),
+        if holds_result(&candidate, report) {
+            fs::remove_dir_all(staging)?;
+            return Ok((candidate, false));
+        }
+        n += 1;
     }
+}
+
+/// True if `dir` is a directory whose bundle matches its
+/// [`CHECKSUMS_FILE`], whose [`TRIAGE_FILE`] agrees with `report` on every
+/// one of [`RESULT_FIELDS`], and whose input's SHA-256 is the one `report`
+/// names. False if any of that fails to read.
+fn holds_result(dir: &Path, report: &Value) -> bool {
+    let is_dir = fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir());
+    let verified = || verify_bundle(dir).is_ok_and(|problems| problems.is_empty());
+    let same_report = || {
+        fs::read(dir.join(TRIAGE_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|found| {
+                RESULT_FIELDS
+                    .iter()
+                    .all(|field| found[field] == report[field])
+            })
+    };
+    let same_input = || {
+        fs::read(dir.join(BUNDLE_INPUT_FILE)).is_ok_and(|input| {
+            report["input"]["sha256"].as_str() == Some(hex(&Sha256::digest(input)).as_str())
+        })
+    };
+    is_dir && verified() && same_report() && same_input()
 }
 
 /// [`CHECKSUMS_FILE`]'s text for the bundle in `dir`: one line per regular
@@ -658,17 +753,20 @@ pub fn verify_bundle(dir: &Path) -> io::Result<Vec<String>> {
 
 /// Every bundle under the archive root `out`, sorted: each directory outside
 /// [`STAGING_DIR`] that holds a [`TRIAGE_FILE`] or is named by an input's
-/// SHA-256, as every bundle is. A bundle that lost its [`TRIAGE_FILE`] is
-/// still found, so [`verify_bundle`] reports it.
+/// SHA-256, alone or followed by `-<n>`, as every bundle is. A bundle that
+/// lost its [`TRIAGE_FILE`] is still found, so [`verify_bundle`] reports it.
 pub fn bundles(out: &Path) -> io::Result<Vec<PathBuf>> {
     let digest_named = |dir: &Path| {
         dir.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                name.len() == 64
-                    && name
+                let (digest, n) = name.split_once('-').unwrap_or((name, "0"));
+                digest.len() == 64
+                    && digest
                         .bytes()
                         .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                    && !n.is_empty()
+                    && n.bytes().all(|byte| byte.is_ascii_digit())
             })
     };
     let mut found = Vec::new();

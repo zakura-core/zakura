@@ -7,6 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -28,7 +29,7 @@ use zakura_sim::{
     },
     harness::{entry, record, HarnessEntry, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    trace::{meta::BuildInfo, replay_with, ReplayOptions, TraceReader},
+    trace::{meta::BuildInfo, replay_with, ReplayOptions, TraceReader, INPUT_FILE},
     HarnessFailure, NullSink, RunConfig, Sim,
 };
 
@@ -62,13 +63,17 @@ const ABANDON_CASE: u8 = 9;
 /// [`ACTIVE`] is violated in every process, but its evidence differs in
 /// the second process that runs the input.
 const SECOND_DIFFERS_CASE: u8 = 10;
+/// The task aborts the process at its second step, as in [`ABORT_CASE`].
+/// The second process that runs the input deletes its trace's `input.bin`
+/// first, so that trace doesn't read.
+const SECOND_UNREADABLE_CASE: u8 = 11;
 
 const ACTIVE: &str = "test/triage/active";
 const KNOWN: &str = "test/triage/known";
 
 /// The variable that names the file counting the processes that ran
-/// [`FIRST_ONLY_CASE`], [`RECORDS_ONLY_CASE`] or [`SECOND_DIFFERS_CASE`]:
-/// one byte per process.
+/// [`FIRST_ONLY_CASE`], [`RECORDS_ONLY_CASE`], [`SECOND_DIFFERS_CASE`] or
+/// [`SECOND_UNREADABLE_CASE`]: one byte per process.
 const COUNTER: &str = "ZAKURA_SIM_TRIAGE_COUNTER";
 
 /// A one-task harness whose first scenario byte picks a case.
@@ -169,12 +174,19 @@ impl Subsystem for Triage {
             FIRST_ONLY_CASE => (count_process() == 0, false),
             RECORDS_ONLY_CASE => (count_process() < 2, false),
             SECOND_DIFFERS_CASE => (true, count_process() == 1),
+            SECOND_UNREADABLE_CASE => {
+                if count_process() == 1 {
+                    let trace = RECORD_DIR.get().expect("the case runs in a recording");
+                    fs::remove_file(trace.join(INPUT_FILE)).unwrap();
+                }
+                (false, false)
+            }
             _ => (false, false),
         };
         let scheduler = sim.scheduler();
         match case {
             HARNESS_CASE => scheduler.spawn_root("bad:name", async {}),
-            ABORT_CASE => scheduler.spawn_root("tick", async {
+            ABORT_CASE | SECOND_UNREADABLE_CASE => scheduler.spawn_root("tick", async {
                 yield_now().await;
                 std::process::abort();
             }),
@@ -229,6 +241,9 @@ static NEXT_GENERATOR: HarnessEntry = HarnessEntry {
 /// The variable that makes [`triage_child`] record or replay.
 const CHILD: &str = "ZAKURA_SIM_TRIAGE_CHILD";
 
+/// The trace directory [`triage_child`] records to.
+static RECORD_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 /// Records or replays when run as a child, and does nothing otherwise.
 ///
 /// - `record:<input>:<dir>` records the input in the file `<input>` to
@@ -244,6 +259,7 @@ fn triage_child() {
     match parts[..] {
         ["record", input, dir] => {
             let input = fs::read(input).unwrap();
+            RECORD_DIR.set(PathBuf::from(dir)).unwrap();
             record(&TRIAGE, RecordInput::Input(&input), Path::new(dir)).unwrap();
         }
         ["replay", dir] => {
@@ -772,6 +788,87 @@ fn recordings_whose_traces_differ_are_nondeterministic() {
     );
     let difference = &report(&triaged.bundle)["difference"];
     assert!(difference["field"].as_str().is_some(), "{difference}");
+}
+
+/// A recording whose trace doesn't read can't be compared, so its input is
+/// `nondeterministic`, even though both recordings crashed alike. The
+/// report names the recording.
+#[test]
+fn an_unreadable_recording_is_not_confirmed() {
+    let scratch = Scratch::new();
+    let input = [SECOND_UNREADABLE_CASE];
+    let triaged = scratch.triage("second-unreadable", &input, TIMEOUT);
+    assert!(signature(&triaged.records[0].classified).is_some());
+    assert_eq!(
+        signature(&triaged.records[0].classified),
+        signature(&triaged.records[1].classified)
+    );
+    assert_eq!(
+        triaged.status,
+        TriageStatus::Nondeterministic,
+        "{triaged:?}"
+    );
+    let difference = &report(&triaged.bundle)["difference"];
+    assert_eq!(difference["run"], "runs/record-2", "{difference}");
+    assert!(difference["unread"].as_str().is_some(), "{difference}");
+}
+
+/// `bundle`'s name followed by `-<n>`, beside it.
+fn beside(bundle: &Path, n: u32) -> PathBuf {
+    let name = bundle.file_name().unwrap().to_str().unwrap();
+    bundle.with_file_name(format!("{name}-{n}"))
+}
+
+/// Copies the directory `from` to `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for item in fs::read_dir(from).unwrap() {
+        let item = item.unwrap();
+        let target = to.join(item.file_name());
+        if item.file_type().unwrap().is_dir() {
+            copy_dir(&item.path(), &target);
+        } else {
+            fs::copy(item.path(), target).unwrap();
+        }
+    }
+}
+
+/// A bundle in a triage's place that fails its checksums, or that names
+/// another result, as a stale or misplaced copy does, doesn't stop the
+/// triage from archiving. The new bundle goes beside it as
+/// `<input sha256>-1`, the bundle that was there stays as it was, and a
+/// later triage keeps the new one.
+#[test]
+fn a_bundle_that_fails_or_differs_keeps_the_new_one_beside_it() {
+    let scratch = Scratch::new();
+    let first = scratch.triage("active", &[ACTIVE_CASE], TIMEOUT);
+    fs::write(first.bundle.join(SCENARIO_FILE), b"{}\n").unwrap();
+    let damaged = verify_bundle(&first.bundle).unwrap();
+    assert!(!damaged.is_empty());
+    let fresh = scratch.triage("active-fresh", &[ACTIVE_CASE], TIMEOUT);
+    assert_eq!(fresh.status, TriageStatus::Confirmed);
+    assert!(fresh.archived, "{fresh:?}");
+    assert_eq!(fresh.bundle, beside(&first.bundle, 1));
+    assert_eq!(verify_bundle(&fresh.bundle).unwrap(), Vec::<String>::new());
+    assert_eq!(verify_bundle(&first.bundle).unwrap(), damaged);
+    let again = scratch.triage("active-again", &[ACTIVE_CASE], TIMEOUT);
+    assert!(!again.archived, "{again:?}");
+    assert_eq!(again.bundle, fresh.bundle);
+
+    // The confirmed bundle, copied to where `[CLEAN]` goes, matches its
+    // checksums but names another status and input.
+    let misplaced = scratch.root().join("not-reproduced").join(sha256(&[CLEAN]));
+    copy_dir(&fresh.bundle, &misplaced);
+    assert_eq!(verify_bundle(&misplaced).unwrap(), Vec::<String>::new());
+    let clean = scratch.triage("clean", &[CLEAN], TIMEOUT);
+    assert_eq!(clean.status, TriageStatus::NotReproduced);
+    assert!(clean.archived, "{clean:?}");
+    assert_eq!(clean.bundle, beside(&misplaced, 1));
+    assert_eq!(report(&clean.bundle)["input"]["sha256"], sha256(&[CLEAN]));
+
+    let mut all = vec![first.bundle, fresh.bundle, misplaced, clean.bundle];
+    all.sort();
+    assert_eq!(bundles(&scratch.out()).unwrap(), all);
 }
 
 /// A staging bundle that a killed triage left, under a staging name this

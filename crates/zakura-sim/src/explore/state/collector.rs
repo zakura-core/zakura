@@ -239,6 +239,17 @@ fn block_epoch(request: &StorageRequest) -> Option<(EpochWork, u64)> {
     }
 }
 
+/// Whether `service` delivers `request`'s reply to a waiting caller, so a
+/// completion that isn't delivered found none. Block storage sends an
+/// action's reply to block sync's handle, which `HandleClosed` shows, and
+/// a record's reply to nobody. Only its range read has a caller.
+fn replies_to_caller(service: Service, request: &StorageRequest) -> bool {
+    match service {
+        Service::Header => true,
+        Service::Block => matches!(request, StorageRequest::ReadRange { .. }),
+    }
+}
+
 /// The work owner a header operation names.
 fn header_owner(request: &StorageRequest) -> Option<&WorkOwner> {
     match request {
@@ -563,7 +574,7 @@ impl StateCollector {
                 timing,
             });
         }
-        if !delivered {
+        if !delivered && replies_to_caller(service, &op.request) {
             hit(StateFeature::Disposition {
                 service,
                 op: kind,

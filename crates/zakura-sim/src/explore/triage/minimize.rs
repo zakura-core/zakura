@@ -127,7 +127,8 @@ pub enum Minimization {
     NotKept {
         /// Why.
         reason: String,
-        /// The staging directory that keeps the minimizer's output.
+        /// The staging directory that keeps the minimizer's output,
+        /// without its pinned binaries.
         staging: PathBuf,
     },
 }
@@ -173,7 +174,13 @@ pub(super) fn minimize(
                 let _ = fs::remove_dir_all(&staging);
                 Minimization::Kept { bundle, archived }
             }
-            Err(reason) => Minimization::NotKept { reason, staging },
+            Err(reason) => {
+                // The pinned binaries take hundreds of megabytes, and each
+                // triage that keeps nothing would leave its own copy. Its
+                // report keeps their SHA-256.
+                let _ = fs::remove_dir_all(output.join(PINNED_DIR));
+                Minimization::NotKept { reason, staging }
+            }
         },
     )
 }

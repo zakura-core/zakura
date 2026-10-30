@@ -223,7 +223,8 @@ triage: its own budgets bound `tmin` and each check. If its report says
 - a fresh `zakura-sim replay` must replay the candidate's trace Exact.
 
 If any of that fails, or the minimizer kept no candidate, triage prints why
-and leaves the minimizer's output under `.staging/`. Otherwise the new
+and leaves the minimizer's output under `.staging/`, without the pinned
+binaries, whose SHA-256 its report keeps. Otherwise the new
 bundle goes beside the failure's bundle as `<bundle name>.minimized/`, or
 `<bundle name>.minimized-<n>/` with the first free `n`. It holds the
 candidate as `input.bin`, the minimizer's output under `minimizer/`, the

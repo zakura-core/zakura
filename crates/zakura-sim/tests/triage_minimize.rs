@@ -748,6 +748,10 @@ fn minimizer_output_that_doesnt_hold_is_not_kept() {
             staging.join("output").is_dir() || mode == Mode::Abort,
             "{mode:?}"
         );
+        assert!(
+            !staging.join("output").join("bin").exists(),
+            "{mode:?}: the staging directory keeps no pinned binary"
+        );
         assert_eq!(
             bundles(&scratch.out()).unwrap(),
             std::slice::from_ref(&triaged.bundle),

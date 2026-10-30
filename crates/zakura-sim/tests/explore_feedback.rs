@@ -12,6 +12,7 @@ use zakura_sim::{
             probe_collector, probe_feature, Collect, Counters, Feature, FeatureMap, Feedback,
             NewCollector, Probe,
         },
+        state::{self, StateFeature},
         Worker,
     },
     harness::{self, entry, HarnessEntry, HARNESSES},
@@ -133,12 +134,27 @@ fn collector_leaves_every_trace_unchanged() {
         runs.push((entry, (0..scenario + 32).map(|i| (i * 37) as u8).collect()));
     }
     let counters = counters();
+    let state_features: Vec<Feature> = StateFeature::all()
+        .into_iter()
+        .map(StateFeature::feature)
+        .collect();
     for (entry, input) in runs {
         let what = format!("{} on {input:?}", entry.name);
         let without = recorded(entry, &input, None, counters);
         let with = recorded(entry, &input, Some(everything), counters);
         assert!(!counters.hits().is_empty(), "{what}: the collector ran");
         assert_eq!(with, without, "{what}");
+        // A harness may reach no protocol state, so the state collector
+        // can hit nothing.
+        let with_state = recorded(entry, &input, Some(state::collector), counters);
+        assert!(
+            counters
+                .hits()
+                .iter()
+                .all(|hit| state_features.contains(hit)),
+            "{what}: the state collector hits only state features"
+        );
+        assert_eq!(with_state, without, "{what}: the state collector");
     }
     let without = recorded(&PROBE, &[7], None, counters);
     let with = recorded(&PROBE, &[7], Some(probe_collector), counters);

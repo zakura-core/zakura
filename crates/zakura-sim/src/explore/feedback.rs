@@ -47,8 +47,12 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 
 /// The feedback version, for campaign manifests. Bump it when a feature's
 /// index changes meaning, since a corpus kept for one feature would then
-/// count for another.
-pub const FEEDBACK_VERSION: u32 = 1;
+/// count for another, or when the feature set changes.
+///
+/// - 1: [`Probe`]'s features (E2a).
+/// - 2: adds the protocol-state features at [`super::state`]'s index layout
+///   (E2b).
+pub const FEEDBACK_VERSION: u32 = 2;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;

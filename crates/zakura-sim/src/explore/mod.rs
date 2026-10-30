@@ -22,11 +22,13 @@
 //! failure in fresh processes and archives it with its evidence.
 //!
 //! [`feedback`] turns abstract protocol states into features libFuzzer
-//! reads beside its code edges (E2a).
+//! reads beside its code edges (E2a), and [`state`] collects the protocol
+//! states of the feature table as those features (E2b).
 
 pub mod feedback;
 mod process;
 mod save;
+pub mod state;
 pub mod triage;
 mod worker;
 

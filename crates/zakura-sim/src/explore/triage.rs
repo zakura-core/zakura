@@ -10,9 +10,11 @@
 //!    time limit, and classifies each child's run with [`classify_process`].
 //!    A child that outlives its limit is killed, and its run classifies with
 //!    [`ProcessExit::TimedOut`];
-//! 3. if both runs filed the input alike and wrote their `end` record,
-//!    replays the first run's trace Exact in a third fresh child;
-//! 4. writes [`TRIAGE_FILE`] and [`CHECKSUMS_FILE`], and renames the bundle
+//! 3. compares the two runs' traces, if either wrote its `end` record;
+//! 4. if both runs filed the input alike, their traces match, and they
+//!    ended without failing, replays the first run's trace Exact in a third
+//!    fresh child;
+//! 5. writes [`TRIAGE_FILE`] and [`CHECKSUMS_FILE`], and renames the bundle
 //!    into place.
 //!
 //! A bundle never changes after its rename. A later triage that files the
@@ -50,7 +52,7 @@ use crate::{
     harness::HarnessEntry,
     trace::{
         meta::{hex, BuildInfo},
-        MAX_INPUT_BYTES,
+        trace_difference, TraceReader, MAX_INPUT_BYTES,
     },
 };
 
@@ -149,16 +151,18 @@ impl Children for SimChildren {
 #[serde(rename_all = "kebab-case")]
 pub enum TriageStatus {
     /// Both fresh recordings filed the input under the same buckets and
-    /// signature, and that is a failure. If they wrote their `end` record, a
-    /// fresh replay of the first one's trace matched it Exact.
+    /// signature, their traces match, and that is a failure. If both ended
+    /// without failing, a fresh replay of the first one's trace matched it
+    /// Exact.
     Confirmed,
-    /// Both fresh recordings ran clean, and a fresh replay of the first one's
-    /// trace matched it Exact.
+    /// Both fresh recordings ran clean, their traces match, and a fresh
+    /// replay of the first one's trace matched it Exact.
     NotReproduced,
-    /// The two fresh recordings filed the input differently.
+    /// The two fresh recordings filed the input differently, or their traces
+    /// differ.
     Nondeterministic,
-    /// Both fresh recordings filed the input alike, but a fresh replay of the
-    /// first one's trace didn't match it Exact.
+    /// Both fresh recordings filed the input alike and their traces match,
+    /// but a fresh replay of the first one's trace didn't match it Exact.
     ReplayFailed,
 }
 
@@ -314,12 +318,21 @@ pub fn triage(
         ));
     }
     let digest = hex(&Sha256::digest(&input));
-    let staging = out.join(STAGING_DIR).join(format!(
-        "{}-{}",
-        process::id(),
-        NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&staging)?;
+    let staging_root = out.join(STAGING_DIR);
+    fs::create_dir_all(&staging_root)?;
+    let staging = loop {
+        let dir = staging_root.join(format!(
+            "{}-{}",
+            process::id(),
+            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            // A killed triage whose process had this ID left it.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
     let staged_input = staging.join(BUNDLE_INPUT_FILE);
     write_synced(&staged_input, &input)?;
     if let Some(scenario) = draw(entry, &input) {
@@ -352,8 +365,10 @@ pub fn triage(
     let second = record(RECORD_DIRS[1])?;
 
     let signatures = [signature(&first.classified), signature(&second.classified)];
-    let alike =
-        signatures[0] == signatures[1] && first.classified.buckets() == second.classified.buckets();
+    let difference = recordings_difference(&staging);
+    let alike = signatures[0] == signatures[1]
+        && first.classified.buckets() == second.classified.buckets()
+        && difference.is_none();
     let replay = if alike && matches!(first.classified.result, ProcessResult::Ended(_)) {
         let trace = staging
             .join(RUNS_DIR)
@@ -403,6 +418,10 @@ pub fn triage(
             record_json(RECORD_DIRS[0], &first, &signatures[0]),
             record_json(RECORD_DIRS[1], &second, &signatures[1]),
         ],
+        "difference": difference.map(|(step, field)| json!({
+            "step": step,
+            "field": field,
+        })),
         "replay": replay.map(|exit| json!({
             "dir": format!("{RUNS_DIR}/{REPLAY_DIR}"),
             "exit": exit,
@@ -435,6 +454,22 @@ pub fn triage(
         bundle,
         archived,
     })
+}
+
+/// The first record where the two recordings' traces in `staging` differ:
+/// its step and field, as [`trace_difference`] names them. `None` if they
+/// match, if neither wrote its `end` record, or if either doesn't read as a
+/// trace. A failed child's trace may stop at any step, so two traces without
+/// their `end` record aren't compared.
+fn recordings_difference(staging: &Path) -> Option<(u64, &'static str)> {
+    let read = |name: &str| {
+        TraceReader::open_prefix(&staging.join(RUNS_DIR).join(name).join(RUN_TRACE_DIR)).ok()
+    };
+    let (first, second) = (read(RECORD_DIRS[0])?, read(RECORD_DIRS[1])?);
+    if first.end.is_none() && second.end.is_none() {
+        return None;
+    }
+    trace_difference(&first, &second)
 }
 
 /// The scenario the input's prefix draws, serialized, or `None` if the
@@ -564,7 +599,13 @@ fn file_digests(dir: &Path) -> io::Result<BTreeMap<String, String>> {
 /// What [`verify_bundle`] found wrong with a bundle, one entry per file.
 /// Empty for a bundle whose files match its [`CHECKSUMS_FILE`].
 pub fn verify_bundle(dir: &Path) -> io::Result<Vec<String>> {
-    let listed = fs::read_to_string(dir.join(CHECKSUMS_FILE))?;
+    let listed = match fs::read_to_string(dir.join(CHECKSUMS_FILE)) {
+        Ok(listed) => listed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(vec![format!("{CHECKSUMS_FILE} is missing")]);
+        }
+        Err(error) => return Err(error),
+    };
     let mut actual = file_digests(dir)?;
     actual.remove(CHECKSUMS_FILE);
     let mut problems = Vec::new();
@@ -587,13 +628,25 @@ pub fn verify_bundle(dir: &Path) -> io::Result<Vec<String>> {
     Ok(problems)
 }
 
-/// Every bundle under the archive root `out`, sorted: each directory that
-/// holds a [`TRIAGE_FILE`], outside [`STAGING_DIR`].
+/// Every bundle under the archive root `out`, sorted: each directory outside
+/// [`STAGING_DIR`] that holds a [`TRIAGE_FILE`] or is named by an input's
+/// SHA-256, as every bundle is. A bundle that lost its [`TRIAGE_FILE`] is
+/// still found, so [`verify_bundle`] reports it.
 pub fn bundles(out: &Path) -> io::Result<Vec<PathBuf>> {
+    let digest_named = |dir: &Path| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    };
     let mut found = Vec::new();
     let mut pending = vec![out.to_owned()];
     while let Some(dir) = pending.pop() {
-        if fs::symlink_metadata(dir.join(TRIAGE_FILE)).is_ok() {
+        if digest_named(&dir) || fs::symlink_metadata(dir.join(TRIAGE_FILE)).is_ok() {
             found.push(dir);
             continue;
         }

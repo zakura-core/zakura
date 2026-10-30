@@ -59,12 +59,16 @@ const RECORDS_ONLY_CASE: u8 = 7;
 const EXIT_CASE: u8 = 8;
 /// A task spins in cleanup, so shutdown abandons the run.
 const ABANDON_CASE: u8 = 9;
+/// [`ACTIVE`] is violated in every process, but its evidence differs in
+/// the second process that runs the input.
+const SECOND_DIFFERS_CASE: u8 = 10;
 
 const ACTIVE: &str = "test/triage/active";
 const KNOWN: &str = "test/triage/known";
 
 /// The variable that names the file counting the processes that ran
-/// [`FIRST_ONLY_CASE`] or [`RECORDS_ONLY_CASE`]: one byte per process.
+/// [`FIRST_ONLY_CASE`], [`RECORDS_ONLY_CASE`] or [`SECOND_DIFFERS_CASE`]:
+/// one byte per process.
 const COUNTER: &str = "ZAKURA_SIM_TRIAGE_COUNTER";
 
 /// A one-task harness whose first scenario byte picks a case.
@@ -72,27 +76,31 @@ struct Triage {
     case: u8,
     /// True if [`ACTIVE`] is violated in this run.
     active: bool,
+    /// True if this is the second process that ran [`SECOND_DIFFERS_CASE`].
+    second: bool,
 }
 
 impl HasView for Triage {
-    type View = (u8, bool);
+    type View = (u8, bool, bool);
 
-    /// The case, and whether [`ACTIVE`] is violated.
-    fn view(&self) -> (u8, bool) {
-        (self.case, self.active)
+    /// The case, whether [`ACTIVE`] is violated, and whether this is the
+    /// second process that ran [`SECOND_DIFFERS_CASE`].
+    fn view(&self) -> (u8, bool, bool) {
+        (self.case, self.active, self.second)
     }
 }
 
 fn active_check(cx: &mut CheckCtx<'_, Triage>) -> Verdict {
     match cx.view() {
-        (case, true) => cx.violated("no run", format!("case {case}")),
+        (case, true, false) => cx.violated("no run", format!("case {case}")),
+        (case, true, true) => cx.violated("no run", format!("case {case}, second process")),
         _ => Verdict::Holds,
     }
 }
 
 fn known_check(cx: &mut CheckCtx<'_, Triage>) -> Verdict {
     match cx.view() {
-        (KNOWN_CASE, _) => cx.violated("no run", "the known case".to_owned()),
+        (KNOWN_CASE, _, _) => cx.violated("no run", "the known case".to_owned()),
         _ => Verdict::Holds,
     }
 }
@@ -156,11 +164,12 @@ impl Subsystem for Triage {
     /// Spawns the case's task.
     fn build(sim: &mut Sim, scenario: &Case, (): ()) -> Self {
         let case = scenario.case;
-        let active = match case {
-            ACTIVE_CASE => true,
-            FIRST_ONLY_CASE => count_process() == 0,
-            RECORDS_ONLY_CASE => count_process() < 2,
-            _ => false,
+        let (active, second) = match case {
+            ACTIVE_CASE => (true, false),
+            FIRST_ONLY_CASE => (count_process() == 0, false),
+            RECORDS_ONLY_CASE => (count_process() < 2, false),
+            SECOND_DIFFERS_CASE => (true, count_process() == 1),
+            _ => (false, false),
         };
         let scheduler = sim.scheduler();
         match case {
@@ -188,7 +197,11 @@ impl Subsystem for Triage {
                 }
             }),
         };
-        Triage { case, active }
+        Triage {
+            case,
+            active,
+            second,
+        }
     }
 
     /// One `Active` and one `Known` property.
@@ -621,6 +634,72 @@ fn verify_bundle_finds_changed_missing_and_added_files() {
             format!("{BUNDLE_INPUT_FILE} changed"),
             format!("{SCENARIO_FILE} is missing"),
         ]
+    );
+}
+
+/// Two recordings that file the input alike but whose traces differ are
+/// `nondeterministic`, even when the replay matches the first. The report
+/// names the first record where they differ.
+#[test]
+fn recordings_whose_traces_differ_are_nondeterministic() {
+    let scratch = Scratch::new();
+    let input = [SECOND_DIFFERS_CASE];
+    let triaged = scratch.triage("second-differs", &input, TIMEOUT);
+    assert_eq!(
+        signature(&triaged.records[0].classified),
+        signature(&triaged.records[1].classified)
+    );
+    assert_eq!(
+        triaged.status,
+        TriageStatus::Nondeterministic,
+        "{triaged:?}"
+    );
+    assert_eq!(
+        triaged.bundle,
+        scratch.out().join("nondeterministic").join(sha256(&input))
+    );
+    let difference = &report(&triaged.bundle)["difference"];
+    assert!(difference["field"].as_str().is_some(), "{difference}");
+}
+
+/// A staging bundle that a killed triage left, under a staging name this
+/// process would pick, doesn't stop a later triage from archiving.
+#[test]
+fn staging_leftovers_dont_block_triage() {
+    let scratch = Scratch::new();
+    for n in 0..256 {
+        let leftover = scratch
+            .out()
+            .join(STAGING_DIR)
+            .join(format!("{}-{n}", std::process::id()));
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join(BUNDLE_INPUT_FILE), [n as u8]).unwrap();
+    }
+    let triaged = scratch.triage("crash", &[ACTIVE_CASE], TIMEOUT);
+    assert_eq!(triaged.status, TriageStatus::Confirmed);
+    assert!(triaged.archived);
+    assert_eq!(bundles(&scratch.out()).unwrap(), [triaged.bundle]);
+}
+
+/// A bundle that lost its `triage.json` or its checksums is still a bundle,
+/// and its check names what's missing.
+#[test]
+fn verify_finds_bundles_without_their_report_or_checksums() {
+    let scratch = Scratch::new();
+    let report_lost = scratch.triage("known", &[KNOWN_CASE], TIMEOUT).bundle;
+    let sums_lost = scratch.triage("clean", &[CLEAN], TIMEOUT).bundle;
+    fs::remove_file(report_lost.join(TRIAGE_FILE)).unwrap();
+    fs::remove_file(sums_lost.join(CHECKSUMS_FILE)).unwrap();
+    let mut both = vec![report_lost.clone(), sums_lost.clone()];
+    both.sort();
+    assert_eq!(bundles(&scratch.out()).unwrap(), both);
+    assert_eq!(
+        verify_bundle(&report_lost).unwrap(),
+        [format!("{TRIAGE_FILE} is missing")]
+    );
+    assert_eq!(
+        verify_bundle(&sums_lost).unwrap(),
+        [format!("{CHECKSUMS_FILE} is missing")]
     );
 }
 

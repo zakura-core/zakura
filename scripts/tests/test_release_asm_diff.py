@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import io
 import os
 import struct
@@ -363,20 +364,11 @@ class AlignmentTests(unittest.TestCase):
             with self.assertRaises(asm_diff.PaddingError, msg=opener):
                 aligned(base, head)
 
-    def test_padding_with_a_line_value_is_refused(self):
-        """Any `line!` in the workspace, in any form or inside a macro defined elsewhere, refuses padding."""
+    def test_a_forwarded_line_macro_is_left_to_the_line_check(self):
+        """Padding doesn't scan for `line!`; a line number that reaches code fails the build-level line check."""
         head = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
-        for other in ("fn here() -> u32 { line!() }\n",
-                      "fn here() -> u32 { core::line ! () }\n",
-                      "fn here() -> u32 { line![] + line!{} }\n",
-                      "fn here() -> u32 { let _ = \"https://x\"; line!() }\n",
-                      "macro_rules! here { () => { line!() } }\n",
-                      "use std::line as here;\n",
-                      "pub use core::include_str as source;\n"):
-            with self.assertRaises(asm_diff.PaddingError, msg=other):
-                aligned("\n".join(SOURCE), "\n".join(head), {"other.rs": other})
-        _, made = aligned("\n".join(SOURCE), "\n".join(head),
-                          {"other.rs": "// line!()\nconst S: &str = \"line!()\";\n"})
+        other = {"other.rs": "macro_rules! forward { ($m:ident) => { $m!() } }\nfn here() -> u32 { forward!(line) }\n"}
+        _, made = aligned("\n".join(SOURCE), "\n".join(head), other)
         self.assertEqual(made, [[("lib.rs", 2, 2)], []])
 
     def test_padding_an_embedded_file_with_only_blank_lines_is_refused(self):
@@ -483,6 +475,68 @@ echo "$(git rev-parse HEAD) $(git describe --always --tags --match 'v*.*.*') $SO
 [ "$(wc -l < "$FAKE_CARGO_LOG")" -le "${FAKE_CARGO_PASSES:-0}" ] && exit 0
 exit 7
 """
+
+
+# A fake `cargo` that "builds" crate `x` as a Mach-O file holding the line
+# count of `crates/x/lib.rs`, in an instruction section when
+# `FAKE_LINES_IN` is `code` and in a data section when it's `data`, the way
+# a line number reaches code or only data.
+FAKE_OBJECT_CARGO = """#!/usr/bin/env python3
+import json, os, struct, sys
+from pathlib import Path
+%s
+if sys.argv[1] == "metadata":
+    print(json.dumps({"packages": [{"name": "x", "targets": [{"name": "x", "kind": ["lib"]}]}]}))
+    sys.exit(0)
+lines = struct.pack("<I", Path("crates/x/lib.rs").read_text().count("\\n"))
+code, data = (lines, b"same") if os.environ["FAKE_LINES_IN"] == "code" else (b"same", lines)
+deps = Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "deps"
+deps.mkdir(parents=True, exist_ok=True)
+(deps / "x-0.o").write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
+""" % inspect.getsource(macho)
+
+
+class LineCheckTests(unittest.TestCase):
+    def run_gate(self, lines_in):
+        """Runs the gate on a cfg-only hook above `crates/x/lib.rs` code, with the fake object cargo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "crates" / "x").mkdir(parents=True)
+            git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run(git + ["init", "-q"], check=True)
+            hook = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+            for lines in (SOURCE, hook):
+                (repo / "crates" / "x" / "lib.rs").write_text("\n".join(lines))
+                subprocess.run(git + ["add", "."], check=True)
+                subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+            cargo = Path(tmp) / "cargo"
+            cargo.write_text(FAKE_OBJECT_CARGO)
+            os.chmod(cargo, 0o755)
+            out, err = io.StringIO(), io.StringIO()
+            os.environ["FAKE_LINES_IN"] = lines_in
+            try:
+                with redirect_stdout(out), redirect_stderr(err):
+                    status = asm_diff.main([
+                        "--repo", str(repo), "--base", "HEAD~1", "--head", "HEAD", "--cargo", str(cargo),
+                        "--package", "x", "--cgu", "4", "--no-binary", "--work-dir", str(Path(tmp) / "work"),
+                    ])
+            finally:
+                del os.environ["FAKE_LINES_IN"]
+        return status, out.getvalue() + err.getvalue()
+
+    def test_a_line_number_that_reaches_code_fails(self):
+        """A line number that padding moves into an instruction, as a forwarded `line!` would, exits 1."""
+        status, output = self.run_gate("code")
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("line check base x codegen-units=4: line numbers reach code", output)
+        self.assertIn("section __TEXT,__text", output)
+
+    def test_a_line_number_that_reaches_only_data_passes(self):
+        """A line number in data only, as a panic location's is, is outside the contract."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("line check base x codegen-units=4: code unchanged by padding", output)
 
 
 class CommandTests(unittest.TestCase):

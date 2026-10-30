@@ -15,22 +15,26 @@ when the two sides' objects and binaries match byte for byte:
     fixups or rebase and bind data, its exports and its dylibs on macOS, or
     every allocated section, relocations included, on Linux.
 
-Nothing is masked. Two things are made the same on both sides first, so
-that only real changes differ:
+The contract is "identical apart from source line numbers". Nothing is
+masked. Two things are made the same on both sides first, so that only
+real changes differ:
 
   * Line numbers. A line added or removed in a `.rs` file moves every line
     below it, and line numbers live in release data, in panic locations and
     `tracing` callsites. So for each hunk of `git diff base head`, the
     shorter side is padded with blank lines to the longer side's length.
     Every unchanged line then has the same number on both sides. A blank
-    line changes no token, so each side still builds the same code. The
-    tool refuses padding that could hide more than line numbers in panic
-    and log metadata: inside a string literal or block comment, when any
-    source in the workspace uses `line!`, or when a file another embeds
-    changes only by blank lines or an embed can't be resolved (see
-    `align_tree`). Every padding is printed. Line numbers that reach a
-    program only through panic locations, `#[track_caller]` and log macros
-    are treated as labels; that is the gate's one premise.
+    line changes no token, so each side still builds the same code. Every
+    padding is printed. Padding is refused inside a string literal or block
+    comment, and when a file another embeds changes only by blank lines or
+    an embed can't be resolved (see `align_tree`).
+
+    A padded side is also built as committed, and its instruction sections
+    must match the padded build byte for byte (see `run_line_checks`). So a
+    line number that reaches code, by any route, such as `line!` forwarded
+    through a macro, fails. A line number that reaches only data, such as a
+    panic location, a `tracing` callsite, or a `Location::caller().line()`
+    read at run time, is outside the contract.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
@@ -46,8 +50,8 @@ Usage:
       [--no-binary] [--explain] [--work-dir <dir>] [--cargo <cargo>]
 
 Exit status: 0 when everything matches; 1 when anything differs or is on
-one side only; 2 when a side built no objects; 3 when a command fails or
-padding would land inside a literal.
+one side only, or a line number reaches code; 2 when a side built no
+objects; 3 when a command fails or padding is refused.
 """
 
 import argparse
@@ -227,11 +231,6 @@ def pad_text(text, inserts, path="<text>"):
     return "\n".join(lines)
 
 
-LINE_MACRO = re.compile(r"\bline\s*!\s*[(\[{]")
-# A `line`, `include`, `include_str` or `include_bytes` macro named in a
-# path, as `use std::line as here;` does, which could invoke it by another name.
-BUILTIN_PATH = re.compile(r"(?:\b(?:std|core)\s*::\s*(?:prelude\s*::\s*\w+\s*::\s*)?)"
-                          r"(line|include|include_str|include_bytes)\b(?!\s*!)")
 INCLUDE_MACRO = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*")
 # A string placeholder in `code_text`'s output.
 PLACEHOLDER = re.compile(r"\x01(\d+)\x02")
@@ -288,28 +287,6 @@ def code_text(text):
     return "".join(out), strings
 
 
-def check_line_reads(tree, files):
-    """Refuses padding when any of `files` writes `line!`, in any form or inside any macro.
-
-    Padding moves the line numbers below it. That's what the gate allows
-    for panic locations and log lines, which only label output, but `line!`
-    makes a line number a value the program computes with, and a macro
-    defined anywhere can expand it at a call site in a padded file. So one
-    use anywhere in the workspace refuses padding, and so does a path that
-    names `line` or an include macro, such as an alias import, since it
-    could call it under another name.
-    """
-    for source in files:
-        code, _ = code_text(source.read_bytes().decode(errors="replace"))
-        found = LINE_MACRO.search(code)
-        if found:
-            raise PaddingError("%s uses line!, whose value padding would change" % source.relative_to(tree))
-        alias = BUILTIN_PATH.search(code)
-        if alias:
-            raise PaddingError("%s names the %s! macro in a path, which could call it under another name"
-                               % (source.relative_to(tree), alias.group(1)))
-
-
 def check_includes(tree, files, padded):
     """Refuses padding when an embedded file's only change is blank lines, or an embed can't be resolved.
 
@@ -346,10 +323,10 @@ def rust_sources(tree):
 def align_tree(tree, file_hunks, side):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Refuses padding inside a literal (see `pad_text`), when the workspace
-    reads line numbers as values (see `check_line_reads`), or when it embeds
-    a file padding could make equal (see `check_includes`). Returns the
-    `(path, after_line, count)` paddings it made.
+    Refuses padding inside a literal (see `pad_text`), or when the
+    workspace embeds a file padding could make equal (see
+    `check_includes`). Returns the `(path, after_line, count)` paddings it
+    made.
     """
     tree = Path(tree).resolve()
     made, blank_padded = [], set()
@@ -365,9 +342,7 @@ def align_tree(tree, file_hunks, side):
         if path in blank_only:
             blank_padded.add(file.resolve())
     if made:
-        sources = rust_sources(tree)
-        check_line_reads(tree, sources)
-        check_includes(tree, sources, blank_padded)
+        check_includes(tree, rust_sources(tree), blank_padded)
     return made
 
 
@@ -435,7 +410,11 @@ def macho_relocations(data, reloff, nreloc, symbols, cputype):
     return b"\n".join(out)
 
 
-def macho_image(data):
+S_ATTR_INSTRUCTIONS = 0x80000400
+SHF_EXECINSTR = 0x4
+
+
+def macho_image(data, code_only=False):
     """The runtime parts of a 64-bit little-endian Mach-O file, as `{name: bytes}`.
 
     Skips `__DWARF` debug info, `__LLVM` embedded bitcode, `__LINKEDIT`
@@ -444,7 +423,8 @@ def macho_image(data):
     and export data, the linkedit blobs above, every other load command as
     is, and, in an object file, its non-debug symbols. In an object file,
     relocations name their symbols, and symbol names drop LLVM's promotion
-    suffix (see `LLVM_SUFFIX`).
+    suffix (see `LLVM_SUFFIX`). With `code_only`, keeps only the sections
+    that hold instructions, with their relocations.
     """
     image = {}
     cputype = struct.unpack_from("<I", data, 4)[0]
@@ -460,7 +440,7 @@ def macho_image(data):
         if cmd == LC_SEGMENT_64:
             segname = body[8:24].rstrip(b"\0").decode()
             nsects = struct.unpack_from("<I", body, 64)[0]
-            if segname != "__LINKEDIT":
+            if segname != "__LINKEDIT" and not code_only:
                 image["segment %s" % segname] = body[8:24] + body[24:40] + body[56:72]
             for j in range(nsects):
                 sect = body[72 + 80 * j:152 + 80 * j]
@@ -469,6 +449,8 @@ def macho_image(data):
                     continue
                 addr, length = struct.unpack_from("<QQ", sect, 32)
                 start, align, reloff, nreloc, flags = struct.unpack_from("<IIIII", sect, 48)
+                if code_only and not flags & S_ATTR_INSTRUCTIONS:
+                    continue
                 header = struct.pack("<QQIII", addr, length, align, flags, nreloc) + sect[68:80]
                 contents = b"" if flags & 0xFF in S_ZEROFILL else data[start:start + length]
                 image["section %s" % names] = header + contents
@@ -476,6 +458,8 @@ def macho_image(data):
                     image["relocations %s" % names] = (
                         data[reloff:reloff + 8 * nreloc] if executable
                         else macho_relocations(data, reloff, nreloc, symbols, cputype))
+        elif code_only:
+            continue
         elif cmd in LC_LINKEDIT_DATA:
             start, length = struct.unpack_from("<II", body, 8)
             image["linkedit 0x%x" % cmd] = data[start:start + length]
@@ -490,7 +474,8 @@ def macho_image(data):
                     b"%s %d %d %d %d" % symbol for symbol in symbols if not symbol[1] & 0xE0))
         elif cmd not in (LC_DYSYMTAB, LC_UUID, LC_CODE_SIGNATURE):
             image["load command %d (0x%x)" % (index, cmd)] = body
-    image["header"] = data[4:16] + data[24:32]
+    if not code_only:
+        image["header"] = data[4:16] + data[24:32]
     return image
 
 
@@ -501,7 +486,7 @@ ET_REL = 1
 STT_SECTION = 3
 
 
-def elf_image(data):
+def elf_image(data, code_only=False):
     """The runtime parts of a 64-bit little-endian ELF file, as `{name: bytes}`.
 
     Keeps every program header, every allocated section's header and
@@ -510,9 +495,10 @@ def elf_image(data):
     section and value, a section symbol by its section, and the symbols are
     kept with their names without LLVM's promotion suffix (see
     `LLVM_SUFFIX`). Debug and other unallocated sections, embedded bitcode
-    among them, are skipped.
+    among them, are skipped. With `code_only`, keeps only executable
+    sections and the relocations that apply to them.
     """
-    image = {"header": data[16:24] + data[24:32]}
+    image = {} if code_only else {"header": data[16:24] + data[24:32]}
     obj = struct.unpack_from("<H", data, 16)[0] == ET_REL
     shoff = struct.unpack_from("<Q", data, 0x28)[0]
     entsize, count, strndx = struct.unpack_from("<HHH", data, 0x3A)
@@ -526,7 +512,7 @@ def elf_image(data):
 
     phoff = struct.unpack_from("<Q", data, 0x20)[0]
     phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
-    for k in range(phnum):
+    for k in range(0 if code_only else phnum):
         # Every program header: type, permissions, mapping and alignment.
         image["program header %d" % k] = data[phoff + k * phentsize:phoff + (k + 1) * phentsize]
     symbols = []
@@ -540,7 +526,8 @@ def elf_image(data):
                     # A section symbol has no name of its own.
                     sym = b"section " + name(headers[shndx]).encode()
                 symbols.append((sym, info, other, shndx, value, size))
-            image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
+            if not code_only:
+                image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
     # ELF allows several sections with one name, such as COMDAT groups'
     # `.text`, so each is known by its name and occurrence.
     seen, labels = collections.Counter(), []
@@ -552,6 +539,8 @@ def elf_image(data):
         key = "section " + label
         keep = flags & SHF_ALLOC and sname and name(header) != ".note.gnu.build-id"
         relocates = stype in (SHT_RELA, SHT_REL) and 0 < info < count and headers[info][2] & SHF_ALLOC
+        if code_only and not (flags & SHF_EXECINSTR or relocates and headers[info][2] & SHF_EXECINSTR):
+            continue
         if relocates and obj:
             width = 24 if stype == SHT_RELA else 16
             entries = []
@@ -570,13 +559,13 @@ def elf_image(data):
     return image
 
 
-def runtime_image(path):
+def runtime_image(path, code_only=False):
     """The runtime parts of a Mach-O or ELF object or binary at `path` (see `macho_image`, `elf_image`)."""
     data = Path(path).read_bytes()
     if data[:4] == MACHO_MAGIC:
-        return macho_image(data)
+        return macho_image(data, code_only)
     if data[:6] == ELF_MAGIC:
-        return elf_image(data)
+        return elf_image(data, code_only)
     raise ValueError("%s isn't a 64-bit little-endian Mach-O or ELF file" % path)
 
 
@@ -595,16 +584,19 @@ def compare_images(base, head):
     return out
 
 
-def compare_files(bfiles, hfiles):
-    """How two sides' sets of object files or binaries differ, matched by file name."""
+def compare_files(bfiles, hfiles, code_only=False):
+    """How two sides' sets of object files or binaries differ, matched by file name.
+
+    With `code_only`, compares only the sections that hold instructions.
+    """
     bnames, hnames = {path.name: path for path in bfiles}, {path.name: path for path in hfiles}
     out = []
     for file in sorted(set(bnames) | set(hnames)):
         if file not in hnames or file not in bnames:
             out.append("%s: only in %s" % (file, "base" if file in bnames else "head"))
             continue
-        out.extend("%s %s" % (file, line) for line in compare_images(runtime_image(bnames[file]),
-                                                                     runtime_image(hnames[file])))
+        out.extend("%s %s" % (file, line) for line in compare_images(runtime_image(bnames[file], code_only),
+                                                                     runtime_image(hnames[file], code_only)))
     return out
 
 
@@ -786,6 +778,31 @@ def run_comparisons(items, explain=False):
     return status
 
 
+def run_line_checks(items):
+    """Checks that padding a side changed none of its instructions, returning the worst exit status.
+
+    Each item is `(title, unpadded files, padded files)`. The gate's contract
+    is "identical apart from source line numbers": a line number may move
+    where it only labels a panic or a log line, which lives in data. If one
+    reaches an instruction, by any route, such as `line!` forwarded through
+    a macro, padding changed what the program computes, and the padded
+    comparison can't vouch for it.
+    """
+    status = EXIT_SAME
+    for title, unpadded, padded in items:
+        if not unpadded or not padded:
+            print("%s: nothing built (unpadded %d files, padded %d)" % (title, len(unpadded), len(padded)))
+            status = max(status, EXIT_EMPTY)
+            continue
+        differences = compare_files(unpadded, padded, code_only=True)
+        print("%s: %s" % (title, "line numbers reach code" if differences else "code unchanged by padding"))
+        for line in differences[:MAX_PRINTED]:
+            print("  " + line)
+        if differences:
+            status = max(status, EXIT_DIFFERS)
+    return status
+
+
 def parse_args(argv):
     """Parses the command line."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -816,25 +833,38 @@ def main(argv=None):
         file_hunks = rust_hunks(repo, base, head)
         with rw.work_dir(args.work_dir) as work:
             inputs = metadata_env(work, repo, base)
-            built = {}
+            built, checks = {}, []
+            names = list(packages) + ([] if args.no_binary else [BINARY])
             for side, rev in (("base", base), ("head", head)):
                 with rw.worktree(repo, rev, work / "src") as tree:
-                    for path, after, count in align_tree(tree, file_hunks, side):
+                    padded = align_tree(tree, file_hunks, side)
+                    for path, after, count in padded:
                         print("padded %s: %d blank lines after %s:%d" % (side, count, path, after))
                     crates = lib_crates(read_metadata(args.cargo, tree))
                     with side_target(work, side) as target:
-                        for package in packages:
-                            crate = crates.get(package, package.replace("-", "_"))
-                            for cgu in cgus:
-                                out = work / "out" / side / ("%s-cgu%d" % (package, cgu))
-                                built[side, package, cgu] = emit_lib(
-                                    args.cargo, tree, target, inputs, package, crate, cgu, out, args.explain)
-                        if not args.no_binary:
-                            for cgu in cgus:
-                                out = work / "out" / side / ("%s-cgu%d" % (BINARY, cgu))
-                                built[side, BINARY, cgu] = emit_binary(
-                                    args.cargo, tree, target, inputs, cgu, out, args.explain)
-            return run_comparisons(comparisons(built, packages, cgus, not args.no_binary), args.explain)
+                        # The padded tree first, then, when this side was
+                        # padded, the tree as committed, for the line check.
+                        for variant in (("padded", "unpadded") if padded else ("padded",)):
+                            if variant == "unpadded":
+                                rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
+                            for name in names:
+                                for cgu in cgus:
+                                    out = work / "out" / variant / side / ("%s-cgu%d" % (name, cgu))
+                                    asm = args.explain and variant == "padded"
+                                    if name == BINARY:
+                                        result = emit_binary(args.cargo, tree, target, inputs, cgu, out, asm)
+                                    else:
+                                        crate = crates.get(name, name.replace("-", "_"))
+                                        result = emit_lib(args.cargo, tree, target, inputs, name, crate, cgu, out, asm)
+                                    built[variant, side, name, cgu] = result
+                    if padded:
+                        checks.extend(
+                            ("line check %s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu),
+                             built["unpadded", side, name, cgu][0], built["padded", side, name, cgu][0])
+                            for name in names for cgu in cgus)
+            padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
+            status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
+            return max(status, run_line_checks(checks))
     except PaddingError as error:
         print("error: %s" % error, file=sys.stderr)
         return rw.EXIT_COMMAND_FAILED

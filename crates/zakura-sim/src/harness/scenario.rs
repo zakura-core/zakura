@@ -7,9 +7,11 @@
 //! padding, so an inserted, deleted or changed action never moves the Plan
 //! bytes that follow the prefix.
 //!
-//! [`Layout::read`] rejects a prefix written for another version, so a
-//! generator bump never reinterprets an old input. Each harness maps that
-//! rejection to one documented scenario. Every other prefix decodes.
+//! [`Layout::read`] rejects a prefix written for another grammar version, so
+//! a later generator never reinterprets an input written under this one. An
+//! input from before the harness had a grammar has no version byte, so its
+//! first byte may still match. Each harness maps a version rejection to one
+//! documented scenario. Every other prefix decodes.
 
 use std::fmt;
 

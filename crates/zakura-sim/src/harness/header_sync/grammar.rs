@@ -37,8 +37,9 @@
 //! `local-resource` and `rejected`, in that order. A selection is 3 bytes:
 //! bit 7 for `held`, then the low 7 bits mod 9 pick no kind or one of the 8
 //! [`OpKind`]s in declaration order; `nth` (n mod 65, 0 for none); and the
-//! session (n mod 37, 0 for none). A run has at most 36 sessions: one per
-//! mirror at setup, and one per relink.
+//! session (n mod 37, 0 for none). Only a hold's trigger reads the `held`
+//! bit. Elsewhere `held` matches nothing, so the bit is ignored there. A run
+//! has at most 36 sessions: one per mirror at setup, and one per relink.
 //!
 //! A trigger is 5 bytes: its kind, a count, then operands.
 //!
@@ -225,7 +226,7 @@ pub fn decode(prefix: &[u8]) -> Result<StorageScenario, Rejection> {
                 };
                 let when = match trigger[0] {
                     NONE => None,
-                    _ => match decode_trigger(trigger, mirrors) {
+                    _ => match decode_trigger(trigger, mirrors, false) {
                         Some(when) => Some(when),
                         None => continue,
                     },
@@ -239,13 +240,13 @@ pub fn decode(prefix: &[u8]) -> Result<StorageScenario, Rejection> {
             HOLD => {
                 let until = match trigger[0] {
                     NONE => Trigger::VirtualTime(0),
-                    _ => match decode_trigger(trigger, mirrors) {
+                    _ => match decode_trigger(trigger, mirrors, true) {
                         Some(until) => until,
                         None => continue,
                     },
                 };
                 scenario.policy.holds.push(Hold {
-                    select: decode_select(&slot[1..4]),
+                    select: decode_select(&slot[1..4], false),
                     until,
                     then: (0..ALLOWS.len())
                         .filter(|bit| slot[4] >> bit & 1 == 1)
@@ -299,7 +300,7 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
             return Err(Unencodable("a hold has a deadline".to_owned()));
         }
         slot[0] = HOLD;
-        encode_select(&hold.select, &mut slot[1..4])?;
+        encode_select(&hold.select, &mut slot[1..4], false)?;
         let mut mask = 0u8;
         let mut last = None;
         for allow in &hold.then {
@@ -317,7 +318,7 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
             mask |= 1 << bit;
         }
         slot[4] = mask;
-        encode_trigger(&hold.until, mirrors, &mut slot[TRIGGER..])?;
+        encode_trigger(&hold.until, mirrors, true, &mut slot[TRIGGER..])?;
     }
     for step in &scenario.controls {
         let slot = writer.slot()?;
@@ -332,7 +333,7 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         };
         slot[1] = mirror_index(&step.peer, mirrors)?;
         if let Some(when) = &step.when {
-            encode_trigger(when, mirrors, &mut slot[TRIGGER..])?;
+            encode_trigger(when, mirrors, false, &mut slot[TRIGGER..])?;
         }
     }
     Ok(writer.finish())
@@ -393,8 +394,9 @@ fn mirror_index(peer: &str, mirrors: usize) -> Result<u8, Unencodable> {
         .ok_or_else(|| Unencodable(format!("`{peer}` isn't one of its {mirrors} mirrors")))
 }
 
-/// The selection 3 bytes encode.
-fn decode_select(bytes: &[u8]) -> Select {
+/// The selection 3 bytes encode. Its `held` bit counts only where `held`
+/// can match: in a hold's trigger.
+fn decode_select(bytes: &[u8], held: bool) -> Select {
     let kind = usize::from(bytes[0] & !HELD) % (OP_KINDS.len() + 1);
     let nth = u32::from(bytes[1]) % (MAX_NTH + 1);
     let session = u64::from(bytes[2]) % (MAX_SESSION + 1);
@@ -402,12 +404,18 @@ fn decode_select(bytes: &[u8]) -> Select {
         kind: kind.checked_sub(1).map(|kind| OP_KINDS[kind]),
         nth: (nth > 0).then_some(nth),
         session: (session > 0).then_some(session),
-        held: bytes[0] & HELD != 0,
+        held: held && bytes[0] & HELD != 0,
     }
 }
 
-/// Writes `select` to `out`'s 3 bytes.
-fn encode_select(select: &Select, out: &mut [u8]) -> Result<(), Unencodable> {
+/// Writes `select` to `out`'s 3 bytes. Fails for a `held` selection
+/// unless `held` says it can match, in a hold's trigger.
+fn encode_select(select: &Select, out: &mut [u8], held: bool) -> Result<(), Unencodable> {
+    if select.held && !held {
+        return Err(Unencodable(
+            "a `held` selection outside a hold's trigger matches nothing".to_owned(),
+        ));
+    }
     let kind = select.kind.map_or(0, |kind| {
         1 + OP_KINDS
             .iter()
@@ -427,14 +435,15 @@ fn encode_select(select: &Select, out: &mut [u8]) -> Result<(), Unencodable> {
 }
 
 /// The trigger of kind 1 to 9 that `bytes` encode, or `None` for an
-/// unlisted kind.
-fn decode_trigger(bytes: &[u8], mirrors: usize) -> Option<Trigger> {
+/// unlisted kind. `held` says whether it's a hold's trigger.
+fn decode_trigger(bytes: &[u8], mirrors: usize, held: bool) -> Option<Trigger> {
+    let select = || decode_select(&bytes[2..5], held);
     let event = match bytes[0] {
-        SUBMITTED => Trigger::Submitted(decode_select(&bytes[2..5])),
-        CALLER_DROPPED => Trigger::CallerDropped(decode_select(&bytes[2..5])),
-        COMPLETED => Trigger::Completed(decode_select(&bytes[2..5])),
-        REPLY_TAKEN => Trigger::ReplyTaken(decode_select(&bytes[2..5])),
-        HANDLED => Trigger::Handled(decode_select(&bytes[2..5])),
+        SUBMITTED => Trigger::Submitted(select()),
+        CALLER_DROPPED => Trigger::CallerDropped(select()),
+        COMPLETED => Trigger::Completed(select()),
+        REPLY_TAKEN => Trigger::ReplyTaken(select()),
+        HANDLED => Trigger::Handled(select()),
         CLOSED => Trigger::Closed(mirror(bytes[2], mirrors)),
         LINKED => Trigger::Linked(mirror(bytes[2], mirrors)),
         GROWN => Trigger::Grown(mirror(bytes[2], mirrors)),
@@ -450,8 +459,14 @@ fn decode_trigger(bytes: &[u8], mirrors: usize) -> Option<Trigger> {
     })
 }
 
-/// Writes `trigger` to `out`'s 5 bytes.
-fn encode_trigger(trigger: &Trigger, mirrors: usize, out: &mut [u8]) -> Result<(), Unencodable> {
+/// Writes `trigger` to `out`'s 5 bytes. `held` says whether it's a hold's
+/// trigger.
+fn encode_trigger(
+    trigger: &Trigger,
+    mirrors: usize,
+    held: bool,
+    out: &mut [u8],
+) -> Result<(), Unencodable> {
     let event = match trigger {
         Trigger::VirtualTime(ms) => {
             let units = units(*ms, TIME_UNIT_MS, 0, u16::MAX, "a virtual time")?;
@@ -487,7 +502,7 @@ fn encode_trigger(trigger: &Trigger, mirrors: usize, out: &mut [u8]) -> Result<(
         }
     };
     out[0] = kind;
-    encode_select(select, &mut out[2..5])
+    encode_select(select, &mut out[2..5], held)
 }
 
 /// `value` in `unit`s, checked to be a whole number from `min` to `max`.

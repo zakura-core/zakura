@@ -406,8 +406,10 @@ fn each_opcode_has_a_decoder_case() {
             ),
         ),
         (
-            // Held Apply (kind 7), nth 3, session 2, offering engine,
-            // unavailable and rejected, opening at once.
+            // Apply (kind 7), nth 3, session 2, offering engine,
+            // unavailable and rejected, opening at once. A hold's own
+            // selection ignores the held bit, since `held` matches nothing
+            // there.
             slot(HOLD, [0x87, 3, 2, 0b1_0101], none),
             expected(
                 vec![Hold {
@@ -415,7 +417,7 @@ fn each_opcode_has_a_decoder_case() {
                         kind: Some(OpKind::Apply),
                         nth: Some(3),
                         session: Some(2),
-                        held: true,
+                        held: false,
                     },
                     until: Trigger::VirtualTime(0),
                     then: vec![Allow::Engine, Allow::Unavailable, Allow::Rejected],
@@ -498,6 +500,66 @@ fn each_trigger_kind_has_a_decoder_case() {
         );
         assert_eq!(decode(&prefix(&[hold])), scenario, "{trigger:?}");
         assert_bounded_and_canonical(&scenario);
+    }
+}
+
+/// Only a hold's trigger reads a selection's held bit. A hold's own
+/// selection and a control step's trigger ignore it, since `held` matches
+/// nothing there, and the encoder refuses a `held` selection in either.
+#[test]
+fn the_held_bit_counts_only_in_a_hold_trigger() {
+    // Submitted, with the held bit on the second Locator.
+    let trigger = [1, 0, 0x81, 2, 0];
+    let locators = Select::nth(OpKind::Locator, 2);
+    let held = Select {
+        held: true,
+        ..locators.clone()
+    };
+    let scenario = decode(&prefix(&[
+        slot(HOLD, [0x81, 2, 0, 1], trigger),
+        slot(CLOSE, [0; 4], trigger),
+    ]));
+    assert_eq!(
+        scenario,
+        expected(
+            vec![Hold {
+                select: locators.clone(),
+                until: Trigger::Submitted(held.clone()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::Submitted(locators.clone()))
+            )],
+        )
+    );
+    assert_bounded_and_canonical(&scenario);
+
+    let held_select = StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: held.clone(),
+                until: Trigger::VirtualTime(0),
+                then: vec![],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    };
+    let held_control = StorageScenario {
+        controls: vec![step(
+            "mirror-0",
+            ControlAction::Close,
+            Some(Trigger::Count(2, Box::new(Trigger::Completed(held)))),
+        )],
+        ..StorageScenario::default()
+    };
+    for scenario in [held_select, held_control] {
+        let error = grammar::encode(&scenario).expect_err("held").to_string();
+        assert!(error.contains("matches nothing"), "{error}");
     }
 }
 
@@ -606,6 +668,14 @@ fn generator_changes_isolate_corpora() {
             Err(Rejection::Length { found: len })
         );
     }
+}
+
+/// `draw` takes exactly the harness's prefix, as `run_bytes` cuts it, so
+/// a prefix of another length is a caller's bug, not the default scenario.
+#[test]
+#[should_panic(expected = "exactly SCENARIO_BYTES")]
+fn draw_refuses_a_prefix_of_another_length() {
+    Storage::draw(&[2; 343]);
 }
 
 /// Empty and truncated inputs draw defined scenarios, as `run_bytes`

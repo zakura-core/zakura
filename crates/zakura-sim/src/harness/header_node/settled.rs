@@ -961,13 +961,47 @@ mod tests {
     /// root at height 1 unavailable, so its build dispatches a context
     /// read, which storage holds. A task stops it as `stopping` says.
     fn repairing_run(stopping: Stopping) -> (RunReport, Rc<RefCell<ReactorLife>>) {
-        use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = repairing_storage(&mut fixture.sim, &fixture.port);
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let kept = (stopping == Stopping::Abort).then(|| slot.clone());
+        let held = spawn_repairing(&mut fixture.sim, &fixture.port, slot, stopping);
+        let (report, life) = fixture.run(&mut States::default());
+        drop((held, kept));
+        (report, life)
+    }
 
+    /// [`repairing_run`]'s shutdown with no observer, tap or audit, under
+    /// the same choices.
+    fn unobserved_repairing_run() -> RunReport {
+        let mut sim = Sim::new(
+            RunConfig {
+                budget: 1_000,
+                drain_bound: 0,
+                ..RunConfig::default()
+            },
+            Plan::from_fuzz(&[]),
+        );
+        let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+        let storage = repairing_storage(&mut sim, &port);
+        sim.add_source(Box::new(storage));
+        let held = spawn_repairing(&mut sim, &port, ObserverSlot::default(), Stopping::Shutdown);
+        let report = sim.run(&mut crate::NoChecks, &mut MemorySink::default());
+        drop((held, port));
+        report
+    }
+
+    /// Storage for [`repairing_run`], preloaded at A5, holding the VCT
+    /// context read.
+    fn repairing_storage(sim: &mut Sim, port: &Arc<ControlledPort>) -> PolicySource {
         use crate::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
 
-        let (mut fixture, slot) = Fixture::new(1_000);
-        let header = HeaderFixture::regtest();
-        crate::harness::header_node::preload(fixture.port.engine(), &header, &Chain::main(5));
+        crate::harness::header_node::preload(
+            port.engine(),
+            &HeaderFixture::regtest(),
+            &Chain::main(5),
+        );
         let held = Policy {
             bound_ms: None,
             holds: vec![Hold {
@@ -982,15 +1016,22 @@ mod tests {
             }],
             ..Policy::converging()
         };
-        let storage = PolicySource::new(
-            &mut fixture.sim,
-            fixture.port.clone(),
-            held,
-            Effects::default(),
-        );
-        let tap = fixture.tap.take().expect("the fixture has its tap");
-        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
-        let port: Arc<dyn Port> = fixture.port.clone();
+        PolicySource::new(sim, port.clone(), held, Effects::default())
+    }
+
+    /// Spawns [`repairing_run`]'s reactor on `port`, reporting through
+    /// `slot`, and its stopper. Returns what the run must keep until it
+    /// ends.
+    fn spawn_repairing(
+        sim: &mut Sim,
+        port: &Arc<ControlledPort>,
+        slot: ObserverSlot,
+        stopping: Stopping,
+    ) -> Box<dyn std::any::Any> {
+        use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+
+        let header = HeaderFixture::regtest();
+        let port: Arc<dyn Port> = port.clone();
         let (mut startup, _) = startup(&port, &header, Chain::main(5).tip(&header));
         let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
             state: VctRootRepairState::Unavailable {
@@ -1000,11 +1041,10 @@ mod tests {
         });
         startup.vct_root_repairs = Some(repairs_rx);
         let shutdown = startup.shutdown.clone();
-        let kept = (stopping == Stopping::Abort).then(|| slot.clone());
         startup.observer = slot;
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
-        fixture.sim.scheduler().spawn_root("stopper", async move {
+        sim.scheduler().spawn_root("stopper", async move {
             for _ in 0..8 {
                 zakura_rt::task::yield_now().await;
             }
@@ -1013,9 +1053,61 @@ mod tests {
                 Stopping::Abort => reactor.abort(),
             }
         });
-        let (report, life) = fixture.run(&mut States::default());
-        drop((handle, actions, repairs, kept));
-        (report, life)
+        Box::new((handle, actions, repairs))
+    }
+
+    /// Each step's pick, each task stop the log records, and the run's
+    /// choices.
+    fn schedule(report: &RunReport) -> (Vec<String>, Vec<String>, Plan) {
+        let picks = report
+            .picks
+            .iter()
+            .map(|pick| format!("{} {}", pick.step, pick.identity))
+            .collect();
+        let stops = report
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::TaskSpawned { .. }
+                        | Observation::TaskReached { .. }
+                        | Observation::TaskWaiting { .. }
+                        | Observation::TaskParked { .. }
+                        | Observation::TaskExited { .. }
+                )
+            })
+            .map(|entry| format!("{} {:?}", entry.step, entry.obs))
+            .collect();
+        (picks, stops, report.resolved.clone())
+    }
+
+    /// Reporting a pending call dropped at teardown adds no scheduling
+    /// point: the reactor's startup read, still held at shutdown, ends
+    /// dropped in the observed and audited run, which takes the same
+    /// picks, task stops and choices as the same run unobserved.
+    ///
+    /// This fails if the dropped call's report reaches a scheduling point.
+    #[test]
+    fn a_dropped_call_adds_no_scheduling_point() {
+        let (observed, _) = repairing_run(Stopping::Shutdown);
+        assert_eq!(observed.end.harness, None, "{:?}", observed.end);
+        assert!(
+            reactor_facts(&observed)
+                .iter()
+                .any(|(_, fact)| matches!(fact,
+                ReactorFact::CallEnded { end, op: Some(_), .. } if end == "dropped")),
+            "the held read ends dropped"
+        );
+        let unobserved = unobserved_repairing_run();
+        assert_eq!(unobserved.end.harness, None, "{:?}", unobserved.end);
+        let (picks, stops, choices) = schedule(&observed);
+        assert!(
+            stops.iter().any(|stop| stop.contains("TaskReached")),
+            "the run records where tasks stopped"
+        );
+        assert_eq!((picks, stops, choices), schedule(&unobserved));
     }
 
     /// The facts of `report`'s node reactor, with their steps.

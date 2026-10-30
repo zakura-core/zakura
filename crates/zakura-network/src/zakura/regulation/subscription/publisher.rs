@@ -527,3 +527,51 @@ fn acknowledge<C>(published: &mut Published<C>, through: Option<usize>) {
             .expect("the drained range ends at a found index");
     }
 }
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use crate::zakura::{
+        regulation::SlotBudget,
+        transport::output_tests::{frame, poll_once, tapped, Life},
+        OutputOutcome,
+    };
+
+    /// A terminal permit holding one slot of `budget`.
+    fn permit(budget: &SlotBudget) -> TerminalPermit {
+        TerminalPermit {
+            _slot: budget.try_reserve().expect("the budget has a slot"),
+        }
+    }
+
+    /// A terminal send makes its output's life before it returns the
+    /// future, so one dropped before its first poll, and one cancelled while
+    /// it waits for queue space, each end `not-queued` (M6a-6).
+    ///
+    /// This fails if the life is made inside the async body.
+    #[test]
+    fn a_terminal_cancelled_before_its_first_poll_ends_not_queued() {
+        let budget = SlotBudget::new(2).expect("two slots");
+        let (send, _recv, recorder) = tapped(1);
+        drop(permit(&budget).send(&send, frame(1)));
+        send.try_send(frame(2)).expect("the queue has a slot");
+        {
+            let mut waiting = std::pin::pin!(permit(&budget).send(&send, frame(3)));
+            assert!(
+                poll_once(waiting.as_mut()).is_pending(),
+                "the queue is full"
+            );
+        }
+        assert_eq!(
+            recorder.lives(),
+            [
+                (0, Life::Allocated),
+                (0, Life::Ended(OutputOutcome::NotQueued)),
+                (1, Life::Allocated),
+                (1, Life::Enqueued(0)),
+                (2, Life::Allocated),
+                (2, Life::Ended(OutputOutcome::NotQueued)),
+            ]
+        );
+    }
+}

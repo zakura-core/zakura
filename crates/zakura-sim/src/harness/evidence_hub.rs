@@ -1396,6 +1396,7 @@ mod tests {
                     ReactorFact::Bound {
                         reservation: 1,
                         incarnation: 1,
+                        via: "start".into(),
                     },
                 ];
                 let rows = [started(), staged(0, page, page), settled(1, extra, leased)];

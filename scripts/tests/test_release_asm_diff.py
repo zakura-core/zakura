@@ -313,6 +313,8 @@ def aligned(base_text, head_text, extra=None):
         repo = Path(tmp)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
+        # A user setting that drops the a/ and b/ prefixes mustn't matter.
+        subprocess.run(git + ["config", "diff.noprefix", "true"], check=True)
         for name, text in (extra or {}).items():
             (repo / name).write_text(text)
         revs = []
@@ -575,9 +577,16 @@ class LineCheckTests(unittest.TestCase):
             out = io.StringIO()
             with redirect_stdout(out):
                 status = asm_diff.run_embed_checks([
-                    ("embed check", files["committed"], files["padded"], {"a.rs": b"mod a;\n"})])
+                    ("embed check", files["committed"], files["padded"], {"a.rs": (b"mod a;\n", b"\nmod a;\n")})])
         self.assertEqual(status, 0, out.getvalue())
         self.assertIn("no padded file embedded", out.getvalue())
+
+    def test_an_embed_padded_at_its_start_fails(self):
+        """A padded file whose committed text survives inside its padded text is still found embedded."""
+        status, output = self.run_gate("embed", head=[""] + SOURCE)
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("embed check base x codegen-units=4: padded files embedded: crates/x/lib.rs", output)
 
     def test_debug_info_size_alone_passes(self):
         """A change that only resizes debug info, which moves later sections' addresses, passes."""

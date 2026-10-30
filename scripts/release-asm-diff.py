@@ -254,8 +254,10 @@ def align_tree(tree, file_hunks, side):
 
 def rust_hunks(repo, base, head):
     """The `-U0` diff hunks of every `.rs` file that both revisions have."""
+    # Explicit prefixes, so a `diff.noprefix` or `diff.mnemonicPrefix`
+    # setting can't change the headers `parse_file_hunks` reads.
     diff = rw.run(["git", "-C", repo, "diff", "-U0", "--no-ext-diff", "--no-color", "--no-renames",
-                   base, head, "--", "*.rs"], capture=True)
+                   "--src-prefix=a/", "--dst-prefix=b/", base, head, "--", "*.rs"], capture=True)
     return parse_file_hunks(diff)
 
 
@@ -788,13 +790,17 @@ def run_line_checks(items):
 def run_embed_checks(items):
     """Checks that no padded file is embedded in its side's release data, returning the worst exit status.
 
-    Each item is `(title, committed files, padded files, {path: committed
-    bytes})`. `include_str!` and `include_bytes!` store a file whole,
-    whatever name they're called by. So a padded file whose committed bytes
-    appear more often in the committed build's data sections than in the
-    padded build's is embedded, and padding changed that data, which the
-    padded comparison can't vouch for. Counting both builds keeps a short
-    file's text that happens to appear elsewhere in data from counting.
+    Each item is `(title, committed files, padded files, {path: (committed
+    bytes, padded bytes)})`. `include_str!` and `include_bytes!` store a
+    file whole, whatever name they're called by. So a padded file is
+    embedded when its committed bytes appear more often in the committed
+    build's data sections than in the padded build's, or its padded bytes
+    appear more often in the padded build's than in the committed build's.
+    Either way padding changed that data, which the padded comparison
+    can't vouch for. Checking both texts catches padding at a file's start
+    or end, where one text holds the other, and counting both builds keeps
+    a short file's text that happens to appear elsewhere in data from
+    counting.
     """
 
     def occurrences(files, text):
@@ -803,8 +809,9 @@ def run_embed_checks(items):
 
     status = EXIT_SAME
     for title, committed_files, padded_files, padded in items:
-        found = sorted(path for path, text in padded.items()
-                       if occurrences(committed_files, text) > occurrences(padded_files, text))
+        found = sorted(path for path, (committed, text) in padded.items()
+                       if occurrences(committed_files, committed) > occurrences(padded_files, committed)
+                       or occurrences(padded_files, text) > occurrences(committed_files, text))
         print("%s: %s" % (title, "padded files embedded: " + ", ".join(found) if found else "no padded file embedded"))
         if found:
             status = max(status, EXIT_DIFFERS)
@@ -848,6 +855,7 @@ def main(argv=None):
                     padded = align_tree(tree, file_hunks, side)
                     for path, after, count in padded:
                         print("padded %s: %d blank lines after %s:%d" % (side, count, path, after))
+                    padded_texts = {path: (tree / path).read_bytes() for path, _, _ in padded}
                     crates = lib_crates(read_metadata(args.cargo, tree))
                     with side_target(work, side) as target:
                         # The padded tree first, then, when this side was
@@ -855,7 +863,7 @@ def main(argv=None):
                         for variant in (("padded", "unpadded") if padded else ("padded",)):
                             if variant == "unpadded":
                                 rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
-                                committed = {path: (tree / path).read_bytes() for path, _, _ in padded}
+                                texts = {path: ((tree / path).read_bytes(), padded_texts[path]) for path in padded_texts}
                                 # Every crate rebuilds, so each emits its objects again.
                                 for source in rust_sources(tree):
                                     os.utime(source)
@@ -876,7 +884,7 @@ def main(argv=None):
                                 unpadded = built["unpadded", side, name, cgu][0]
                                 checks.append(("line check " + label, unpadded, built["padded", side, name, cgu][0]))
                                 embeds.append(("embed check " + label, unpadded,
-                                               built["padded", side, name, cgu][0], committed))
+                                               built["padded", side, name, cgu][0], texts))
             padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
             status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
             return max(status, run_line_checks(checks), run_embed_checks(embeds))

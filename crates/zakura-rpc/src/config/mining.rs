@@ -253,11 +253,6 @@ mod tests {
         assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
         assert!(toml::from_str::<Config>("miner_address = 42").is_err());
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn internal_miner_thread_configuration_is_positive_and_defaults_to_one() {
@@ -265,6 +260,14 @@ mod tests {
         assert_eq!(defaults.internal_miner_threads.get(), 1);
         let configured: Config = serde_json::from_str(r#"{"internal_miner_threads":6}"#).unwrap();
         assert_eq!(configured.internal_miner_threads.get(), 6);
+        assert_eq!(
+            toml::from_str::<Config>("internal_miner_threads = 6")
+                .unwrap()
+                .internal_miner_threads
+                .get(),
+            6
+        );
+        assert!(toml::from_str::<Config>("internal_miner_threads = 0").is_err());
         let restored: Config =
             serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
         assert_eq!(restored, configured);

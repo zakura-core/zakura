@@ -2035,3 +2035,74 @@ async fn teardown_reports_each_pending_call_dropped() {
         ]
     );
 }
+
+/// One shared log of what a [`PendingCall`](observe::PendingCall) reports
+/// and what its future holds drops, in order.
+#[derive(Debug, Default)]
+struct DropOrder(StdMutex<Vec<String>>);
+
+impl HeaderSyncObserver for DropOrder {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(format!("{event:?}"));
+    }
+}
+
+/// Something a guarded future holds, which logs its own drop, as a
+/// permit's or a lease's release would reach a scheduling point.
+struct Held(Arc<DropOrder>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .lock()
+            .expect("no test panics while holding it")
+            .push("held dropped".to_owned());
+    }
+}
+
+/// A guarded call dropped unfinished reports its dropped end before
+/// anything its future holds drops, and a call whose future finished
+/// reports nothing more.
+///
+/// This fails if the guard drops the future before it reports.
+#[tokio::test]
+async fn a_dropped_call_reports_before_its_future_drops() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot::new(order.clone());
+    let held = Held(order.clone());
+    let pending = observe::PendingCall::new(
+        Box::pin(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        }),
+        observe::PortTap::new(1, &slot),
+    );
+    drop(pending);
+    assert_eq!(
+        *order.0.lock().expect("unpoisoned"),
+        [
+            format!(
+                "{:?}",
+                ReactorEvent::CallEnded {
+                    call: 1,
+                    end: CallEnd::Dropped
+                }
+            ),
+            "held dropped".to_owned(),
+        ]
+    );
+
+    let finished = Arc::new(DropOrder::default());
+    let slot = ObserverSlot::new(finished.clone());
+    let mut done = observe::PendingCall::new(Box::pin(async {}), observe::PortTap::new(2, &slot));
+    (&mut done).await;
+    drop(done);
+    assert!(
+        finished.0.lock().expect("unpoisoned").is_empty(),
+        "a finished call reports no dropped end"
+    );
+}

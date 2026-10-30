@@ -460,13 +460,18 @@ mod tests {
     impl Fixture {
         /// A run of at most `budget` steps, and the reactor's slot.
         fn new(budget: u64) -> (Self, ObserverSlot) {
+            Self::planned(budget, &[])
+        }
+
+        /// [`new`](Self::new), picking under the fuzz Plan `plan`.
+        fn planned(budget: u64, plan: &[u8]) -> (Self, ObserverSlot) {
             let mut sim = Sim::new(
                 RunConfig {
                     budget,
                     drain_bound: 0,
                     ..RunConfig::default()
                 },
-                Plan::from_fuzz(&[]),
+                Plan::from_fuzz(plan),
             );
             let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
             let (slot, tap) = ReactorTap::new(&mut sim, &port, "node");
@@ -1052,8 +1057,8 @@ mod tests {
     }
 
     /// A reactor stopped with a call still pending drops the call's future,
-    /// so storage records `CallerDropped`, and the call's guard reports
-    /// `CallEnded{dropped}` right after it, which pairs with that receipt.
+    /// and the call's guard reports `CallEnded{dropped}` right before it,
+    /// so the `CallerDropped` the drop leaves pairs with that end.
     /// Shut down, the reactor ends seen, and aborted with its observer kept
     /// elsewhere, it ends unsettled, and neither run fails.
     ///
@@ -1087,8 +1092,12 @@ mod tests {
                 })
                 .collect();
             assert!(
-                matches!(ends[..], [(1, "dropped", Some(_))]),
-                "{stopping:?}: the dropped call's end pairs with its receipt: {ends:?}"
+                matches!(ends[..], [(1, "dropped", None)]),
+                "{stopping:?}: the call ends dropped: {ends:?}"
+            );
+            assert!(
+                end_precedes_receipt(&report, 1),
+                "{stopping:?}: its end comes before its receipt"
             );
             assert_eq!(
                 name(life.borrow().component().state()),
@@ -1506,14 +1515,14 @@ mod tests {
         report
     }
 
-    /// A reactor shut down with a prepare held in storage drops the
-    /// prepare's future, which leaves `CallerDropped`, and then the staged
-    /// headers' capacity, whose release reaches scheduling points. Its
-    /// `CallEnded{dropped}` comes right after the receipt, in the same
-    /// step, so it pairs, and the run is clean.
+    /// A reactor shut down with a prepare held in storage reports the
+    /// prepare's `CallEnded{dropped}`, then drops its future, which leaves
+    /// `CallerDropped`, and the staged headers' capacity, whose release
+    /// reaches scheduling points. The receipt pairs with the end before it,
+    /// whatever stops come between, and the run is clean.
     ///
-    /// This fails if the guard reports the end only after the captured
-    /// capacity drops.
+    /// This fails if the guard reports the end only after it drops the
+    /// future.
     #[test]
     fn a_dropped_prepare_pairs_before_its_capacity_releases() {
         let report = held_prepare_shutdown();
@@ -1547,14 +1556,41 @@ mod tests {
             })
             .expect("the prepare's call ends");
         assert!(
-            matches!(&ended, (_, end, Some(_)) if end == "dropped"),
-            "its dropped end pairs: {ended:?}"
+            matches!(&ended, (_, end, None) if end == "dropped"),
+            "it ends dropped: {ended:?}"
         );
-        assert_eq!(
-            receipt_step(&report, true),
-            ended.0,
-            "the receipt and end share a step"
+        assert!(
+            end_precedes_receipt(&report, prepare),
+            "its end comes before its receipt"
         );
+    }
+
+    /// Whether call `call` ended `dropped` before storage published a drop
+    /// receipt: the end's storage watermark is below the receipt's
+    /// sequence number.
+    fn end_precedes_receipt(report: &RunReport, call: u64) -> bool {
+        let entries = report.log.entries();
+        let Some(watermark) = entries.iter().find_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                storage_seq,
+                event: ReactorFact::CallEnded { call: c, end, .. },
+                ..
+            } if *c == call && end == "dropped" => Some(*storage_seq),
+            _ => None,
+        }) else {
+            return false;
+        };
+        entries.iter().any(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Storage {
+                    seq,
+                    fact: crate::observe::StorageFact::CallerDropped { .. }
+                        | crate::observe::StorageFact::ReplyDropped { .. },
+                    ..
+                } if seq > watermark
+            )
+        })
     }
 
     /// A reactor torn down with no initial snapshot before it, as a build
@@ -1576,5 +1612,185 @@ mod tests {
             report.end
         );
         assert_eq!(name(life.borrow().component().state()), "initializing");
+    }
+
+    /// Forwards every event to `inner`, and sets `dispatched` once a call
+    /// of the kind `wanted` names is dispatched.
+    #[derive(Debug)]
+    struct Dispatches {
+        inner: Arc<dyn zakura_network::zakura::observe::HeaderSyncObserver>,
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+        wanted: fn(&zakura_network::zakura::observe::PortCall) -> bool,
+    }
+
+    impl zakura_network::zakura::observe::HeaderSyncObserver for Dispatches {
+        /// Forwards `event`, noting a wanted dispatch.
+        fn observe(&self, event: ReactorEvent) {
+            if let ReactorEvent::Dispatched { op, .. } = &event {
+                if (self.wanted)(op) {
+                    self.dispatched
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            self.inner.observe(event);
+        }
+    }
+
+    /// The node at genesis syncing from `mirror-0` at A5 under the
+    /// converging policy and the fuzz Plan `plan`, shut down as soon as
+    /// storage answers its first locator read.
+    fn locator_shutdown(plan: &[u8]) -> RunReport {
+        let (mut fixture, slot) = Fixture::planned(5_000, plan);
+        let header = HeaderFixture::regtest();
+        let storage = PolicySource::new(
+            &mut fixture.sim,
+            fixture.port.clone(),
+            Policy::converging(),
+            Effects::default(),
+        );
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let mirror_port = Arc::new(zakura_storage::header::adapter::EnginePort::new(&header));
+        crate::harness::header_node::preload(&mirror_port, &header, &Chain::main(5));
+        let port: Arc<dyn Port> = fixture.port.clone();
+        let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
+        let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        startup.observer = slot.wrapped(|inner| {
+            Arc::new(Dispatches {
+                inner,
+                dispatched: dispatched.clone(),
+                wanted: |op| {
+                    matches!(
+                        op,
+                        zakura_network::zakura::observe::PortCall::Locator { .. }
+                    )
+                },
+            })
+        });
+        let shutdown = startup.shutdown.clone();
+        let dispatch = DispatchFlag::default();
+        let node = HeaderNode::from_startup(
+            &mut fixture.sim,
+            "node",
+            1,
+            port,
+            startup,
+            repairs,
+            dispatch.clone(),
+        );
+        let mirror = HeaderNode::spawn(
+            &mut fixture.sim,
+            "mirror-0",
+            2,
+            mirror_port,
+            &header,
+            Chain::main(5).tip(&header),
+            dispatch,
+            None,
+        );
+        let topology = Rc::new(Topology::new(vec![node, mirror], Effects::default()));
+        topology.link(1, 0);
+        let watched = fixture.port.clone();
+        fixture.sim.scheduler().spawn_root("stopper", async move {
+            let mut base = None;
+            for _ in 0..5_000 {
+                let seq = watched.last_seq();
+                match base {
+                    None if dispatched.load(std::sync::atomic::Ordering::Relaxed) => {
+                        base = Some(seq)
+                    }
+                    // The read takes and drops its permit, is submitted and
+                    // completes: four facts.
+                    Some(base) if seq >= base + 4 => break,
+                    _ => {}
+                }
+                zakura_rt::task::yield_now().await;
+            }
+            shutdown.cancel();
+        });
+        let (report, _) = fixture.run(&mut States::default());
+        drop(topology);
+        report
+    }
+
+    /// A reactor shut down while storage has answered its locator read and
+    /// its reply waits untaken drops the call's future, which leaves
+    /// `ReplyDropped`, then releases the read's last locator permit, which
+    /// reaches a scheduling point. Its `CallEnded{dropped}` comes before
+    /// both, so the receipt pairs with it and every run is clean. Some
+    /// Plan must reach that history.
+    ///
+    /// This fails if the guard reports the end only after it drops the
+    /// future.
+    #[test]
+    fn a_ready_locator_dropped_at_shutdown_pairs_with_its_end() {
+        let mut reached = false;
+        for seed in 0_u8..32 {
+            let report = locator_shutdown(&[seed; 64]);
+            assert_eq!(report.end.harness, None, "seed {seed}: {:?}", report.end);
+            let ready = report.log.entries().iter().any(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::Storage {
+                        fact: crate::observe::StorageFact::ReplyDropped { .. },
+                        ..
+                    }
+                )
+            });
+            if ready {
+                let call = reactor_facts(&report)
+                    .iter()
+                    .find_map(|(_, fact)| match fact {
+                        ReactorFact::CallEnded { call, end, .. } if end == "dropped" => Some(*call),
+                        _ => None,
+                    })
+                    .expect("the locator ends dropped");
+                assert!(end_precedes_receipt(&report, call), "seed {seed}");
+                reached = true;
+            }
+        }
+        assert!(
+            reached,
+            "some Plan leaves the locator's reply ready and untaken"
+        );
+    }
+
+    /// A `dropped` end waits only for the drop receipt of an operation
+    /// storage held when the end came. Call 1 ends dropped while its
+    /// operation is pending and never gets a receipt. Call 2, submitted
+    /// after, is dropped with no end, and its `CallerDropped` fails the
+    /// run at its own step, though call 1 is still waiting.
+    ///
+    /// This fails if a waiting dropped call takes any later receipt of its
+    /// kind.
+    #[test]
+    fn a_dropped_call_without_its_receipt_hides_no_later_receipt() {
+        let report = scripted_calls(|port, slot| {
+            Box::pin(async move {
+                let mut turn = 2;
+                let waiting = locator(&port, &slot, 1);
+                slot.emit(ReactorEvent::CallEnded {
+                    call: 1,
+                    end: zakura_network::zakura::observe::CallEnd::Dropped,
+                });
+                wait(&slot, &mut turn).await;
+                drop(locator(&port, &slot, 2));
+                point();
+                wait(&slot, &mut turn).await;
+                drop(waiting);
+                turn
+            })
+        });
+        let detail = unpaired(&report);
+        assert!(
+            detail.starts_with("Unpaired: operation 2's CallerDropped"),
+            "{detail}"
+        );
+        assert!(
+            !reactor_facts(&report)
+                .iter()
+                .any(|(_, fact)| matches!(fact, ReactorFact::Settled { last: true, .. })),
+            "the run fails before the reactor's teardown"
+        );
     }
 }

@@ -4702,8 +4702,6 @@ impl HeaderSyncReactor {
                     }) as HeaderSyncPortCompletion
                 }),
             };
-        #[cfg(any(test, zakura_sim))]
-        let operation = Box::pin(observe::PendingCall::new(operation, pending_tap));
         let operation = AssertUnwindSafe(operation)
             .catch_unwind()
             .map(move |result| {
@@ -4738,6 +4736,8 @@ impl HeaderSyncReactor {
         if let Some(op) = dispatched {
             observe!(self, ReactorEvent::Dispatched { call, op });
         }
+        #[cfg(any(test, zakura_sim))]
+        let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         true
     }

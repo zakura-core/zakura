@@ -466,7 +466,8 @@ pub enum CallEnd {
     /// The future panicked, and the reactor caught it.
     PortPanicked,
     /// The future was dropped unfinished, as the reactor's teardown drops
-    /// its pending calls.
+    /// its pending calls. Reported right before the drop, so any storage
+    /// receipt the drop leaves comes after it.
     Dropped,
 }
 
@@ -553,12 +554,14 @@ impl PortTap {
     }
 }
 
-/// A port call's storage future, guarded so that dropping it unfinished,
-/// as the reactor's teardown drops its pending calls, reports
-/// `CallEnded{end: Dropped}` through the call's tap. It wraps only the
-/// storage future, inside the panic catch and the completion that holds
-/// the call's captured capacity, so the storage receipt its drop leaves
-/// and the end come with no scheduling point between them.
+/// A port call's whole future, guarded so that dropping it unfinished, as
+/// the reactor's teardown drops its pending calls, reports
+/// `CallEnded{end: Dropped}` through the call's tap. It reports first,
+/// then drops the future: the storage call, whose drop may leave a
+/// `CallerDropped` or `ReplyDropped` receipt, and everything else it
+/// holds, permits and capacity leases included, whose release can reach
+/// scheduling points. So for a dropped call alone, the end comes before
+/// its receipt, one to one.
 pub(crate) struct PendingCall<F> {
     future: Option<F>,
     tap: PortTap,
@@ -607,15 +610,15 @@ impl<F: std::future::Future + Unpin> std::future::Future for PendingCall<F> {
 }
 
 impl<F> Drop for PendingCall<F> {
-    /// Drops the future, then reports the call dropped unless a poll
-    /// finished or its end was already reported, or the thread is
-    /// unwinding (see [`ReactorEvent::Dropping`]).
+    /// Reports the call dropped unless a poll finished or its end was
+    /// already reported, or the thread is unwinding (see
+    /// [`ReactorEvent::Dropping`]), then drops the future.
     fn drop(&mut self) {
-        drop(self.future.take());
         let reported = self.done || self.tap.ended.load(counter::Ordering::Relaxed) != 0;
         if self.tap.call != 0 && !reported && !std::thread::panicking() {
             self.tap.end_after_catch(CallEnd::Dropped);
         }
+        drop(self.future.take());
     }
 }
 

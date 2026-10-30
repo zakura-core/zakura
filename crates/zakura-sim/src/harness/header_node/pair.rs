@@ -7,10 +7,17 @@
 //! a locator or VCT context that `timed-out`. [`Pairer`] checks that the
 //! receipt's operation is the call's own work, pairs the two one to one, and
 //! records the operation in the event. A `not-submitted` or
-//! `port-panicked` call pairs with nothing. A call whose future the
-//! reactor's teardown dropped ends `dropped` right after the future's drop,
-//! so it pairs with the drop receipt at its watermark if storage had taken
-//! the call, and with nothing otherwise.
+//! `port-panicked` call pairs with nothing.
+//!
+//! A call whose future the reactor's teardown dropped is the one exception
+//! to that order: for dropped calls only, the end precedes its receipt, one
+//! to one. Its guard reports `dropped` before it drops the future, whose
+//! drop, and the release of whatever else it holds, can reach scheduling
+//! points. So a `dropped` end names no operation. It waits for the drop
+//! receipt of one of the operations it could be: its own work, submitted by
+//! its watermark, with no receipt by then. The first such `CallerDropped`
+//! or `ReplyDropped`, in its drain or a later one, pairs with it. A drop
+//! receipt that no waiting call could be is unpaired at its own step.
 //!
 //! Since the receipt and its `CallEnded` share a step, every receipt a
 //! reactor call must have taken pairs in its own drain: every locator's,
@@ -113,6 +120,13 @@ pub(crate) struct Pairer {
     paired: BTreeSet<u64>,
     /// The receipts the current drain's facts hold, by sequence number.
     fresh: Vec<u64>,
+    /// Each operation's submission, by sequence number.
+    submitted_at: BTreeMap<u64, u64>,
+    /// Each operation's first receipt, by sequence number.
+    receipt_at: BTreeMap<u64, u64>,
+    /// Each `dropped` call still waiting for its drop receipt, with the
+    /// operations it could be.
+    waiting: Vec<(u64, BTreeSet<u64>)>,
 }
 
 impl Pairer {
@@ -123,6 +137,7 @@ impl Pairer {
             let (receipt, id) = match fact {
                 StorageFact::Submitted { id, request, .. } => {
                     self.ops.insert(*id, Work::of_request(request));
+                    self.submitted_at.insert(*id, seq);
                     continue;
                 }
                 StorageFact::ReplyTaken { id } => (Receipt::ReplyTaken, *id),
@@ -131,6 +146,7 @@ impl Pairer {
                 _ => continue,
             };
             self.receipts.insert(seq, (receipt, id));
+            self.receipt_at.entry(id).or_insert(seq);
             self.fresh.push(seq);
         }
     }
@@ -167,7 +183,10 @@ impl Pairer {
         }
         let fresh = std::mem::take(&mut self.fresh);
         if failure.is_none() {
-            failure = fresh.into_iter().find_map(|seq| self.unpaired(seq));
+            failure = fresh.into_iter().find_map(|seq| {
+                let detail = self.unpaired(seq)?;
+                (!self.pair_dropped(seq)).then_some(detail)
+            });
         }
         match (panicked, failure) {
             (Some(call), _) => Err(PairError::PortPanicked { call }),
@@ -199,16 +218,27 @@ impl Pairer {
                 ))
             }
             "not-submitted" | "port-panicked" => return Ok(None),
-            // The teardown dropped the future: it pairs with the drop
-            // receipt that leaves, if storage had taken the call.
-            "dropped" => match self.receipts.get(&storage_seq) {
-                Some(&(Receipt::CallerDropped | Receipt::ReplyDropped, id))
-                    if self.ops.get(&id) == Some(work) && !self.paired.contains(&id) =>
-                {
-                    &[Receipt::CallerDropped, Receipt::ReplyDropped]
+            // Its receipt, if storage took the call, comes after it.
+            "dropped" => {
+                let candidates: BTreeSet<u64> = self
+                    .ops
+                    .iter()
+                    .filter(|(id, op)| {
+                        *op == work
+                            && !self.paired.contains(id)
+                            && self
+                                .submitted_at
+                                .get(id)
+                                .is_some_and(|at| *at <= storage_seq)
+                            && self.receipt_at.get(id).is_none_or(|at| *at > storage_seq)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                if !candidates.is_empty() {
+                    self.waiting.push((call, candidates));
                 }
-                _ => return Ok(None),
-            },
+                return Ok(None);
+            }
             other => return Err(format!("Mispaired: call {call} ended `{other}`")),
         };
         let Some(&(receipt, id)) = self.receipts.get(&storage_seq) else {
@@ -236,6 +266,27 @@ impl Pairer {
             ));
         }
         Ok(Some(id))
+    }
+
+    /// Pairs the drop receipt at `seq` with a `dropped` call waiting for
+    /// it, if one could be its operation, and says whether it did.
+    fn pair_dropped(&mut self, seq: u64) -> bool {
+        let (receipt, id) = self.receipts[&seq];
+        if receipt == Receipt::ReplyTaken {
+            return false;
+        }
+        let Some(index) = self
+            .waiting
+            .iter()
+            .position(|(_, candidates)| candidates.contains(&id))
+        else {
+            return false;
+        };
+        self.waiting.swap_remove(index);
+        for (_, candidates) in &mut self.waiting {
+            candidates.remove(&id);
+        }
+        self.paired.insert(id)
     }
 
     /// The failure for the receipt at `seq`, if a call must have taken it

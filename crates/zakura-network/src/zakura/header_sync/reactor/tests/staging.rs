@@ -296,6 +296,73 @@ fn a_second_writer_changes_the_held_digest() {
     );
 }
 
+/// An entry of the page being delivered changes after its frame tag was
+/// taken, on a first page and on a later one. Each `Staged.after` digests
+/// the entries the incarnation then holds, the changed one included, so it
+/// differs from what the frames' tags compose to.
+///
+/// This fails if `after` takes the new page's digest from its frame tag.
+#[test]
+fn an_entry_changed_after_its_tag_shows_in_after() {
+    for changed_page in [0, 1] {
+        let snapshot = genesis();
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, mut actions) = observed(&snapshot, &recorder, false);
+        let (peer, _send, mut outbound) = connect(&mut reactor, 0x71);
+        let target = block::Hash([0x53; 32]);
+        let mut status = pruned_status(&snapshot, target);
+        status.work_anchor_height = snapshot.frontiers.finalized.height;
+        status.selected_tip_height = block::Height(100);
+        status.max_headers_per_response = 2;
+        reactor.handle_status(peer.clone(), 0, status);
+        reactor.schedule_cached_statuses();
+        let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+        recorder.take();
+
+        let entries = headers(snapshot.frontiers.header_best, 4);
+        let mut pages = [
+            page(&snapshot, &open, target, entries[..2].to_vec()),
+            page(&snapshot, &open, target, entries[2..].to_vec()),
+        ];
+        pages[1].common_ancestor_height = block::Height(2);
+        pages[1].common_ancestor_hash = entries[1].header.hash();
+        let tags = [tag(&pages[0], 0), tag(&pages[1], 1)];
+        let mut tagged = HeldDigest::default();
+        for (at, mut delivered) in pages.into_iter().enumerate() {
+            let frame = tags[at];
+            tagged = tagged.then(frame.received);
+            if at == changed_page {
+                // A second writer changes the page between its tag and the
+                // append, keeping its count and frame.
+                delivered.entries[1].body_size += 1;
+            }
+            let admitted = admit_page(&reactor, &peer, &delivered);
+            reactor.handle_page(peer.clone(), 0, delivered, admitted, Some(frame));
+            reactor.schedule_cached_statuses();
+            let held_now = HeldDigest::of(
+                &reactor
+                    .peer_work_queue
+                    .active(&peer)
+                    .expect("the round is active")
+                    .entries,
+            );
+            let [(1, Some(reported), 2, after)] = staged(&recorder.take())[..] else {
+                panic!("page {at} staged");
+            };
+            assert_eq!(reported, frame, "page {at}");
+            assert_eq!(
+                after, held_now,
+                "page {at}: `after` digests the entries held"
+            );
+            if at >= changed_page {
+                assert_ne!(after, tagged, "page {at}: the change shows in `after`");
+            } else {
+                assert_eq!(after, tagged, "page {at}");
+            }
+        }
+    }
+}
+
 /// Capacity a page's response consumes, with nothing appended, reports no
 /// `Staged`: only the append does, so the simulator never admits work from
 /// the budget alone. The snapshot shows the lease and nothing held.

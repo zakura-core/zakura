@@ -52,6 +52,7 @@ for arg in "$@"; do
   esac
 done
 parent=$PPID
+touch "$control/ran"
 echo "asan=$ASAN_OPTIONS" >&2
 echo "expect=$ZAKURA_SIM_EXPECT" >&2
 alive() { kill -0 "$parent" 2>/dev/null; }
@@ -725,8 +726,9 @@ fn a_merge_that_crashes_on_an_input_still_compacts() {
     assert_store_verifies(&fixture.store);
 }
 
-/// Resume refuses another build identity or another feedback, and a new
-/// segment starts from the seeds alone or carries the corpus.
+/// Resume refuses another build identity, without running the build, or
+/// another feedback, and a new segment starts from the seeds alone or
+/// carries the corpus.
 #[test]
 fn incompatible_runs_start_a_new_segment() {
     let fixture = Fixture::new();
@@ -755,6 +757,7 @@ fn incompatible_runs_start_a_new_segment() {
     let mut changed = identity();
     changed.cargo_args = vec!["--sanitizer".to_owned(), "none".to_owned()];
     let other_build = fixture.store.save_build(&other, changed).unwrap().binary;
+    fixture.unset("ran");
     let refused = campaign::prepare_resume(
         &fixture.store,
         ResumeOptions {
@@ -766,6 +769,10 @@ fn incompatible_runs_start_a_new_segment() {
     assert!(
         refused.to_string().contains("build cargo_args"),
         "{refused}"
+    );
+    assert!(
+        !fixture.control.join("ran").exists(),
+        "resume refuses the build without running it"
     );
 
     fixture.unset("feedback");

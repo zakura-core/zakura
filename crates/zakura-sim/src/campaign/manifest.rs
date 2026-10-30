@@ -637,6 +637,18 @@ pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared,
     if harness != parent.harness {
         differences.push("harness".to_owned());
     }
+    let refuse = |differences: &[String]| {
+        if differences.is_empty() {
+            return Ok(());
+        }
+        Err(CampaignError::Refused(format!(
+            "run {parent_digest} can't be resumed with this build: {} differ. Start a new \
+             segment with `campaign start --parent {parent_digest} --corpus carry|seeds`",
+            differences.join(", ")
+        )))
+    };
+    // The probe runs the fuzzer, so only a build that may resume gets that far.
+    refuse(&differences)?;
     let budget = Budget {
         seconds: options.seconds.unwrap_or(parent.budget.seconds),
         ..parent.budget.clone()
@@ -646,13 +658,7 @@ pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared,
     if feedback != parent.feedback {
         differences.push("feedback".to_owned());
     }
-    if !differences.is_empty() {
-        return Err(CampaignError::Refused(format!(
-            "run {parent_digest} can't be resumed with this build: {} differ. Start a new \
-             segment with `campaign start --parent {parent_digest} --corpus carry|seeds`",
-            differences.join(", ")
-        )));
-    }
+    refuse(&differences)?;
     let count = options.workers.unwrap_or(parent.workers.len());
     if count == 0 {
         return Err(CampaignError::Refused(

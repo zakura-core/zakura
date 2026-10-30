@@ -98,8 +98,17 @@ pub struct PropertyReport {
     /// The boundaries a check couldn't read a component it needed, as runs
     /// of consecutive evaluations, in the order they opened. A property can
     /// end `Held` with gaps (M6a, rule 8).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// The trace's `end` record leaves them out, as it does `violations`:
+    /// a component that keeps changing can open a run every other step.
+    /// It keeps `gap_boundaries` instead, and a replay finds every run
+    /// again.
+    #[serde(skip)]
     pub gaps: Vec<Gap>,
+    /// How many boundaries `gaps` covers, by component. One entry per
+    /// component, so its size doesn't grow with the run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gap_boundaries: BTreeMap<String, u64>,
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
@@ -123,6 +132,7 @@ impl PropertyReport {
             excluded: None,
             peaks: BTreeMap::new(),
             gaps: Vec::new(),
+            gap_boundaries: BTreeMap::new(),
             violations: Vec::new(),
         }
     }

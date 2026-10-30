@@ -35,8 +35,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, PortCall, ReactorEvent,
-        ReactorSnapshot as Snapshot, RequestRef, ResumeArm, WaitCause, WorkPhase,
+        CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement, PortCall,
+        ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm, WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
@@ -50,8 +50,9 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     harness::evidence_hub::{position, Row},
     observe::{
-        ReactorAdopted, ReactorCall, ReactorCursor, ReactorFact, ReactorPurpose, ReactorRequest,
-        ReactorSession, ReactorSnapshot, ReactorWork, ReactorWorkState, StorageFact,
+        ReactorAdopted, ReactorCall, ReactorCursor, ReactorFact, ReactorHolding, ReactorLease,
+        ReactorPlacement, ReactorPurpose, ReactorRequest, ReactorSession, ReactorSnapshot,
+        ReactorWork, ReactorWorkState, StorageFact,
     },
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
@@ -286,6 +287,7 @@ fn request(request: RequestRef) -> ReactorRequest {
         peer: peer(&request.peer),
         session_id: request.session_id,
         request_id: request.request_id,
+        incarnation: request.incarnation,
         owner: work_owner(request.owner),
         target: hash(request.target_tip_hash),
     }
@@ -442,6 +444,7 @@ fn snapshot(settled: Snapshot) -> ReactorSnapshot {
                         }
                     }
                     WorkPhase::Active {
+                        incarnation,
                         request_id,
                         owner,
                         purpose: why,
@@ -449,8 +452,9 @@ fn snapshot(settled: Snapshot) -> ReactorSnapshot {
                         held,
                         cursor,
                     } => ReactorWorkState::Active {
+                        incarnation,
                         request_id,
-                        owner: work_owner(owner),
+                        owner: Box::new(work_owner(owner)),
                         purpose: purpose(why),
                         target_phase: phase(at).to_owned(),
                         // A queue holds at most a few thousand headers.
@@ -465,6 +469,32 @@ fn snapshot(settled: Snapshot) -> ReactorSnapshot {
                 },
             })
             .collect(),
+        holdings: settled
+            .holdings
+            .into_iter()
+            .map(|holding| ReactorHolding {
+                peer: peer(&holding.peer),
+                reservation: holding.reservation,
+                leases: holding
+                    .leases
+                    .into_iter()
+                    .map(|lease| ReactorLease {
+                        lease: lease.lease,
+                        // A lease owns at most a few thousand headers.
+                        count: lease.count as u64,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// `placement` in plain fields.
+fn placement(placement: Placement) -> ReactorPlacement {
+    ReactorPlacement {
+        session_id: placement.session_id,
+        scope: scope(placement.scope),
+        target: hash(placement.target_tip_hash),
     }
 }
 
@@ -535,6 +565,34 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
         ReactorEvent::Resumed { turn, arm: at } => ReactorFact::Resumed {
             turn,
             arm: arm(at).to_owned(),
+        },
+        ReactorEvent::Placed {
+            reservation,
+            peer: owner,
+            count,
+            placement: placed,
+        } => ReactorFact::Placed {
+            reservation,
+            peer: peer(&owner),
+            // A reservation holds at most a few thousand headers.
+            count: count as u64,
+            placement: placed.map(placement),
+        },
+        ReactorEvent::Bound {
+            reservation,
+            incarnation,
+        } => ReactorFact::Bound {
+            reservation,
+            incarnation,
+        },
+        ReactorEvent::LeasesCaptured {
+            call,
+            incarnation,
+            leases,
+        } => ReactorFact::LeasesCaptured {
+            call,
+            incarnation,
+            leases,
         },
         // The enum is non-exhaustive, and an event the log can't hold would
         // leave the evidence silently incomplete.

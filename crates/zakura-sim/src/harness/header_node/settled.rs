@@ -26,12 +26,16 @@
 //! The reactor is bound to the task that ran when it reported
 //! `Resumed{arm: start}`, by that task's scheduler name, which is unique
 //! in a run. Until then it's `Initializing`.
+//!
+//! The fold also keeps the reactor's work identities (M6a-4) in a
+//! [`WorkLedger`], checked against each settled snapshot.
 
 use std::{cell::RefCell, rc::Rc};
 
 use super::{
     tap::ReactorLink,
     view::{HeaderSyncView, Reading},
+    work::WorkLedger,
 };
 use crate::{
     observe::{Exit, ReactorFact, ReactorSnapshot},
@@ -79,6 +83,8 @@ pub struct ReactorLife {
     dropping: bool,
     /// Whether its last read was in transition.
     in_transition: bool,
+    /// Its work identities.
+    work: WorkLedger,
 }
 
 impl ReactorLife {
@@ -96,7 +102,13 @@ impl ReactorLife {
             exited: false,
             dropping: false,
             in_transition: false,
+            work: WorkLedger::default(),
         }
+    }
+
+    /// The reactor's work identities, as of the last boundary.
+    pub fn work(&self) -> &WorkLedger {
+        &self.work
     }
 
     /// The reactor's component, as of the last boundary.
@@ -164,6 +176,9 @@ impl ReactorLife {
                      Dropping"
                 ));
             }
+            self.work
+                .fold(fact)
+                .map_err(|detail| format!("{detail}, at step {step}"))?;
             match fact {
                 ReactorFact::Settled {
                     turn,
@@ -194,6 +209,11 @@ impl ReactorLife {
                                  repeats a snapshot never logged"
                             ))
                         }
+                    }
+                    if let Some(snapshot) = &self.snapshot {
+                        self.work
+                            .settled(snapshot)
+                            .map_err(|detail| format!("{detail}, at step {step}"))?;
                     }
                     self.marker = Some(Marker::Settled(*turn));
                     self.finished |= *last;

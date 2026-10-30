@@ -15,6 +15,7 @@ pub mod policy;
 pub mod settled;
 pub mod tap;
 pub mod view;
+pub mod work;
 
 use std::{
     cell::{Cell, RefCell},

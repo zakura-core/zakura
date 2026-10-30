@@ -999,6 +999,9 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Settled { .. } => "settled",
                 ReactorFact::Resumed { .. } => "resumed",
                 ReactorFact::Dropping { .. } => "dropping",
+                ReactorFact::Placed { .. } => "placed",
+                ReactorFact::Bound { .. } => "bound",
+                ReactorFact::LeasesCaptured { .. } => "leases-captured",
             }),
             _ => None,
         })
@@ -1008,7 +1011,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
 /// Tapping the node's reactor adds no scheduling point: under every plan, the
 /// run with the tap makes the same picks and logs the same storage entries
 /// as the run without it, and the node's dispatches, call ends, completions,
-/// starts, retirements and settled markers all reach the log, in sequence.
+/// starts, retirements, settled markers, placements, bindings and captured
+/// leases all reach the log, in sequence.
 #[test]
 fn tap_adds_no_scheduling_point() {
     for input in inputs(16, 256) {
@@ -1027,7 +1031,10 @@ fn tap_adds_no_scheduling_point() {
                 "started",
                 "retired",
                 "settled",
-                "resumed"
+                "resumed",
+                "placed",
+                "bound",
+                "leases-captured"
             ])
         );
         let seqs: Vec<u64> = tapped
@@ -1040,5 +1047,81 @@ fn tap_adds_no_scheduling_point() {
             })
             .collect();
         assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    }
+}
+
+/// Each task stop in `report`'s log, with its step, as the log records it:
+/// where the task reached a point, with the point's object and site, or
+/// how it waited, parked or exited.
+fn stops(report: &RunReport) -> Vec<(u64, String)> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| entry.obs.ran_task().is_some())
+        .map(|entry| (entry.step, format!("{:?}", entry.obs)))
+        .collect()
+}
+
+/// The work identities add no scheduling point (M6a-4): under every plan,
+/// the tapped run makes the same picks and stops every task at the same
+/// point, object and site as the bare run, and the tapped run reaches each
+/// capture path: a placement for staged work, its binding and start, a
+/// call's captured leases, and a settled snapshot holding a reservation and
+/// a lease.
+///
+/// This fails if a capture path reads anything through the simulator's
+/// primitives, such as a reservation's rest.
+#[test]
+fn work_identities_add_no_scheduling_point() {
+    for input in inputs(8, 256) {
+        let bare = node_run(input.clone(), false);
+        let tapped = node_run(input, true);
+        let facts: Vec<&ReactorFact> = tapped
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Reactor { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                ReactorFact::Placed {
+                    placement: Some(_),
+                    ..
+                }
+            )) && facts
+                .iter()
+                .any(|fact| matches!(fact, ReactorFact::Bound { .. }))
+                && facts.iter().any(
+                    |fact| matches!(fact, ReactorFact::Started { request, .. } if request.incarnation > 0)
+                )
+                && facts.iter().any(
+                    |fact| matches!(fact, ReactorFact::LeasesCaptured { leases, .. } if !leases.is_empty())
+                ),
+            "the run places, binds, starts and captures leases"
+        );
+        let holdings = facts.iter().filter_map(|fact| match fact {
+            ReactorFact::Settled {
+                snapshot: Some(snapshot),
+                ..
+            } => Some(&snapshot.holdings),
+            _ => None,
+        });
+        let (mut reserved, mut leased) = (false, false);
+        for holding in holdings.flatten() {
+            reserved |= holding.reservation.is_some();
+            leased |= !holding.leases.is_empty();
+        }
+        assert!(
+            reserved && leased,
+            "a settled snapshot holds a reservation and a lease"
+        );
+        assert_eq!(tapped.end, bare.end);
+        assert_eq!(support::picks(&tapped), support::picks(&bare));
+        assert_eq!(stops(&tapped), stops(&bare));
     }
 }

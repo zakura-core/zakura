@@ -1409,6 +1409,67 @@ pub enum ReactorFact {
         /// Where: `start`, `fatal-wait`, or the loop arm, such as `event`.
         arm: String,
     },
+    /// The work queue reserved header capacity for a peer's work (M6a-4).
+    Placed {
+        /// The reservation's ID, from 1 per chunk budget, shared with
+        /// leases.
+        reservation: u64,
+        /// The peer whose work it's for.
+        peer: String,
+        /// The headers it reserves.
+        count: u64,
+        /// The work the queue held for the peer then, if any. A repair
+        /// reserves before it stages its work, so it has none.
+        placement: Option<ReactorPlacement>,
+    },
+    /// A placed reservation now belongs to a work incarnation (M6a-4).
+    Bound {
+        /// The reservation's ID.
+        reservation: u64,
+        /// The incarnation, from 1 per work queue.
+        incarnation: u64,
+    },
+    /// A prepare or apply call captured its peer's staged capacity leases
+    /// (M6a-4). It follows the call's `dispatched`.
+    LeasesCaptured {
+        /// The call.
+        call: u64,
+        /// The incarnation of the peer's active work then, if any.
+        incarnation: Option<u64>,
+        /// The leases' IDs.
+        leases: Vec<u64>,
+    },
+}
+
+/// The work a reservation was placed for (M6a-4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorPlacement {
+    /// The session that offered it.
+    pub session_id: u64,
+    /// The header authority it runs under.
+    pub scope: WorkScope,
+    /// The advertised target it pursues.
+    pub target: String,
+}
+
+/// The header capacity the reactor's work queue holds for one peer (M6a-4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorHolding {
+    /// The peer.
+    pub peer: String,
+    /// Its reservation for pages still to come, if any.
+    pub reservation: Option<u64>,
+    /// Its staged pages' leases, in staging order.
+    pub leases: Vec<ReactorLease>,
+}
+
+/// One staged page's capacity lease (M6a-4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorLease {
+    /// Its ID.
+    pub lease: u64,
+    /// The headers it owns.
+    pub count: u64,
 }
 
 /// The header-sync reactor's settled state in plain fields (M6a-3). Every
@@ -1427,6 +1488,8 @@ pub struct ReactorSnapshot {
     pub unhandled_calls: Vec<u64>,
     /// Each peer's queued work.
     pub work: Vec<ReactorWork>,
+    /// The reservation and leases the queue holds for each peer (M6a-4).
+    pub holdings: Vec<ReactorHolding>,
 }
 
 /// The committed snapshot fields the reactor schedules from.
@@ -1475,10 +1538,12 @@ pub enum ReactorWorkState {
     },
     /// An active request.
     Active {
+        /// Its work incarnation (M6a-4).
+        incarnation: u64,
         /// Its correlation ID.
         request_id: u64,
-        /// Its work owner.
-        owner: WorkOwner,
+        /// Its work owner, boxed to keep the enum small.
+        owner: Box<WorkOwner>,
         /// Why it started.
         purpose: ReactorPurpose,
         /// `receiving`, `preparing` or `applying`.
@@ -1554,6 +1619,8 @@ pub struct ReactorRequest {
     pub session_id: u64,
     /// Its correlation ID.
     pub request_id: u64,
+    /// Its work incarnation (M6a-4).
+    pub incarnation: u64,
     /// Its work owner.
     pub owner: WorkOwner,
     /// The advertised target it pursues.

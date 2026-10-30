@@ -1314,7 +1314,28 @@ fn a_connection_is_observed_from_handshake_to_admission() {
         },
     );
     wire.run_until(Duration::from_secs(5));
-    let events = wire.events();
+    let all = wire.events();
+    assert_eq!(
+        all.first(),
+        Some(&TransportEvent::ReadRegistered {
+            key: zakura_network::zakura::diag::ReadKey::SupervisorMap,
+        }),
+        "the handler registers its map's read before any connection"
+    );
+    // The connection's own lifecycle, without the M6a-7b registry and
+    // boundary-read records.
+    let events: Vec<TransportEvent> = all
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TransportEvent::Negotiated { .. }
+                    | TransportEvent::Registered { .. }
+                    | TransportEvent::StreamRefused { .. }
+                    | TransportEvent::Admitted { .. }
+            )
+        })
+        .collect();
     let (conn_id, quic_stream) = header_stream(&events);
     let limits = ZakuraLocalLimits::from_config(&regtest_config());
     let TransportEvent::StreamRefused {

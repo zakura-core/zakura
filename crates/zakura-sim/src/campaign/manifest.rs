@@ -123,8 +123,8 @@ pub struct Manifest {
 #[serde(rename_all = "kebab-case")]
 pub enum Migration {
     /// The previous segment's last snapshot, plus the curated seeds. Only
-    /// when the harness's versions didn't change, so every input keeps its
-    /// meaning.
+    /// when the harness's versions didn't change and both segments' fuzzer
+    /// builds are clean, so every input keeps its meaning.
     Carry,
     /// The curated seeds alone. The previous segment's snapshots stay in
     /// the store.
@@ -476,9 +476,9 @@ impl Store {
 ///
 /// The run's initial snapshot holds `options.harness`'s curated seeds from
 /// `options.fixtures`, which must all validate, and with
-/// [`Migration::Carry`] the previous segment's last snapshot too. A store
-/// with a run must name it as `options.parent`, since a store holds one
-/// campaign.
+/// [`Migration::Carry`] the previous segment's last snapshot too, which
+/// needs clean fuzzer builds in both segments. A store with a run must name
+/// it as `options.parent`, since a store holds one campaign.
 pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, CampaignError> {
     options.budget.check()?;
     if options.workers.is_empty() {
@@ -509,6 +509,9 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
                 return Err(CampaignError::Refused(format!(
                     "run {parent} is already continued; a new segment follows the last run"
                 )));
+            }
+            if *migration == Migration::Carry {
+                check_carry(&manifest.build, &build)?;
             }
             let head = store.ended_head(parent)?;
             if *migration == Migration::Carry && manifest.harness.versions != harness.versions {
@@ -712,6 +715,25 @@ fn check_runner(runner: &BuildInfo, build: &FuzzBuild) -> Result<(), CampaignErr
              from one checkout",
             runner.git, build.binary, build.identity.git
         )));
+    }
+    Ok(())
+}
+
+/// Refuses to carry a corpus from the fuzzer `previous` to the fuzzer
+/// `next` unless both builds are [clean](super::BuildIdentity::clean).
+/// Carry trusts the harness's versions, from the runner's registry, to say
+/// whether an input keeps its meaning. A dirty fuzzer can run a generator
+/// change that no version records.
+fn check_carry(previous: &FuzzBuild, next: &FuzzBuild) -> Result<(), CampaignError> {
+    for build in [previous, next] {
+        if !build.identity.clean() {
+            return Err(CampaignError::Refused(format!(
+                "fuzzer {} is dirty or of unknown provenance, so the harness's versions may \
+                 not say what its generator does; carry a corpus only between clean builds, \
+                 or migrate with --corpus seeds",
+                build.binary
+            )));
+        }
     }
     Ok(())
 }

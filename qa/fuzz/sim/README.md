@@ -167,7 +167,9 @@ compaction loses nothing that a snapshot already held.
 
 A new commit, generator, format, contract or feedback version starts a new
 campaign segment. `start --parent <run> --corpus carry` carries the last
-snapshot over when the harness's versions didn't change.
+snapshot over when the harness's versions didn't change and both segments'
+fuzzer builds are clean, since a dirty build can change the generator without
+changing a version.
 `--corpus seeds` starts from the curated seeds alone. Either way the previous
 segment's manifests and snapshots stay in the store.
 

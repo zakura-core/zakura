@@ -1015,6 +1015,63 @@ fn dirty_builds_resume_only_on_their_own_binary() {
     assert!(refused.to_string().contains("unknown commit"), "{refused}");
 }
 
+/// A new segment carries a corpus only between clean builds, since a dirty
+/// build can change the generator without changing the harness's versions.
+/// It still starts from the seeds.
+#[test]
+fn dirty_builds_never_carry_a_corpus() {
+    let fixture = Fixture::new();
+    let mut dirty = identity();
+    dirty.dirty = true;
+    let dirty = fixture
+        .store
+        .save_build(&fs::read(fixture.variant("dirty")).unwrap(), dirty)
+        .unwrap()
+        .binary;
+    let carry = |parent: &Digest, build: &Digest| {
+        let mut options = fixture.options(1, 1);
+        options.build = build.clone();
+        options.parent = Some((parent.clone(), Migration::Carry));
+        campaign::prepare_start(&fixture.store, options)
+    };
+    let mut options = fixture.options(1, 1);
+    options.build = dirty.clone();
+    let (dirty_run, _) = start(&fixture.store, options);
+
+    // From a dirty build to a clean one.
+    let refused = carry(&dirty_run, &fixture.build).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("fuzzer {dirty} is dirty")),
+        "{refused}"
+    );
+    assert_eq!(
+        fixture.store.manifests().unwrap().len(),
+        1,
+        "nothing written"
+    );
+
+    let mut options = fixture.options(1, 1);
+    options.parent = Some((dirty_run, Migration::Seeds));
+    let (clean_run, _) = start(&fixture.store, options);
+
+    // From a clean build to a dirty one.
+    let refused = carry(&clean_run, &dirty).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("fuzzer {dirty} is dirty")),
+        "{refused}"
+    );
+    assert_eq!(
+        fixture.store.manifests().unwrap().len(),
+        2,
+        "nothing written"
+    );
+    carry(&clean_run, &fixture.build).unwrap();
+}
+
 /// A snapshot is named by its index's digest, the same inputs share a
 /// name, and a changed, missing, extra or resized input fails
 /// verification. So does a changed manifest.

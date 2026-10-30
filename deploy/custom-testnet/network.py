@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import shutil
 import statistics
 import subprocess
@@ -199,6 +200,7 @@ def new_run(config):
             'storage_mode': 'archive',
             'network': {'name': 'PqNu7' + identity, 'magic': bytes(magic).hex()},
             'revision': config['revision'], 'seed_height': config['seed_height'],
+            'binary_revision': config.get('binary_source_revision', config['revision']),
             'seed_hash': config['seed_hash']}
 
 
@@ -317,6 +319,21 @@ def wait_for_primary(run):
         if parameters['network'] != run['network']['name'] or parameters['pqP2shActivationHeight'] != run['activation_height'] or parameters['nu7ActivationHeight'] != archive_seed.NU7_HEIGHT:
             raise ValueError('restarted mining node does not match this run')
         return
+
+
+def cleanup_failed_reset(config):
+    """Systemd failure cleanup also runs after a forced reset-process termination."""
+    if os.environ.get('SERVICE_RESULT') == 'success':
+        return
+    root = Path(config['root'])
+    with (root / 'reset.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run = json.loads((root / 'run.json').read_text())
+        run.update(phase='failed', error='reset service ended without completing')
+        atomic_json(root / 'run.json', run)
+        for suffix in ('preparation', 'node0', 'node1'):
+            command('systemctl', 'stop', f'{config["service_prefix"]}-{suffix}.service')
+        command('systemctl', 'restart', f'{config["service_prefix"]}-controller.service')
 
 
 class Controller:
@@ -477,9 +494,11 @@ def main(argv=None):
     reset_parser.add_argument('--activation-delay', type=activation_delay, default=600)
     commands.add_parser('serve')
     commands.add_parser('status')
+    commands.add_parser('cleanup-reset')
     gate = commands.add_parser('check-node')
     gate.add_argument('--index', type=int, choices=(0, 1), required=True)
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, archive_seed.interrupt_operation)
     config = load_config(args.config)
     root = Path(config['root'])
     root.mkdir(parents=True, exist_ok=True)
@@ -487,6 +506,8 @@ def main(argv=None):
         serve(config)
     elif args.action == 'check-node':
         check_node(config, args.index)
+    elif args.action == 'cleanup-reset':
+        cleanup_failed_reset(config)
     elif args.action == 'status':
         print(json.dumps(Controller(config).sample(), indent=2))
     else:

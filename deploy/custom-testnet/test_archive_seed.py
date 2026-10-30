@@ -56,10 +56,10 @@ class ArchiveSeedTests(unittest.TestCase):
             def command(*args, **kwargs):
                 calls.append(args)
                 if args[0] == 'cp':
-                    raise RuntimeError('copy failed')
+                    archive_seed.interrupt_operation(15, None)
 
             with patch.object(archive_seed, 'public_reference', return_value={'validators': ['zakura-testnet-eu', 'zakura-testnet-as']}), patch.object(archive_seed, 'verify_archive_history', return_value={}), patch.object(archive_seed, 'command', side_effect=command):
-                with self.assertRaisesRegex(RuntimeError, 'copy failed'):
+                with self.assertRaisesRegex(InterruptedError, 'cancelled'):
                     archive_seed.capture(root, root / 'snapshot.tar.zst', 'source.service', 'unused')
             self.assertIn(('systemctl', 'start', 'source.service'), calls)
             self.assertFalse((root / 'snapshot.tar.capture').exists())
@@ -105,7 +105,7 @@ class ArchiveSeedTests(unittest.TestCase):
     def test_post_nu7_archive_configuration_is_accepted_and_pruned_seed_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'config.json'
-            config = dict(root=temporary, service_prefix='pq-testnet', revision='a' * 40,
+            config = dict(root=str(Path(temporary) / 'deployment'), service_prefix='pq-testnet', revision='a' * 40,
                           seed_height=4559785, seed_finalized_height=4558785, seed_storage_mode='archive',
                           seed_hash='b' * 64, seed_finalized_hash='c' * 64,
                           seed_sha256='d' * 64, binary_sha256='e' * 64)

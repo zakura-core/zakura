@@ -66,6 +66,7 @@ RequiresMountsFor={root}
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/zakura-testnet reset --activation-delay 10m
+ExecStopPost=/usr/local/bin/zakura-testnet cleanup-reset
 TimeoutStartSec=3600
 TimeoutStopSec=120
 ''')

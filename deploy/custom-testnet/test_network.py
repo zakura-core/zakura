@@ -146,6 +146,35 @@ class NetworkTests(unittest.TestCase):
             command.assert_any_call('systemctl', 'stop', f'pq-testnet-node{index}.service')
         self.assertFalse(any(call.args[:2] == ('systemctl', 'restart') for call in command.call_args_list))
 
+    def test_cancelled_reset_with_saved_countdown_stops_both_nodes(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+
+        def restore(archive, destination, name):
+            destination.mkdir()
+
+        def command(*args):
+            if args == ('systemctl', 'restart', 'pq-testnet-controller.service'):
+                self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'countdown')
+                network.archive_seed.interrupt_operation(15, None)
+
+        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'command', side_effect=command) as commands:
+            with self.assertRaises(InterruptedError):
+                network.reset(self.config, 600)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
+        for index in (0, 1):
+            self.assertIn(unittest.mock.call('systemctl', 'stop', f'pq-testnet-node{index}.service'), commands.call_args_list)
+
+    def test_service_failure_cleanup_withdraws_countdown_and_stops_preparation(self):
+        self.controller()
+        with patch.dict(network.os.environ, {'SERVICE_RESULT': 'signal'}), patch.object(network, 'command') as command:
+            network.cleanup_failed_reset(self.config)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
+        command.assert_any_call('systemctl', 'stop', 'pq-testnet-preparation.service')
+
     def test_reorg_withdraws_activation_and_refreshes_its_hash(self):
         controller = self.controller('active')
         self.run['activation_hash'] = 'old hash'

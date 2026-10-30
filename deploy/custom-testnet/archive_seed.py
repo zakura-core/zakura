@@ -14,6 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import secrets
+import signal
 import shutil
 import subprocess
 import time
@@ -21,6 +22,11 @@ from urllib.request import Request, urlopen
 
 
 NU7_HEIGHT = 4465026
+
+
+def interrupt_operation(signum, frame):
+    """Turn service cancellation into an exception so ordinary cleanup runs."""
+    raise InterruptedError('archive operation was cancelled')
 
 
 def command(*args, timeout=120):
@@ -295,6 +301,7 @@ def main(argv=None):
     parser.add_argument('--service', default='zakurad.service')
     parser.add_argument('--reference-url', default='https://api.nu7.valargroup.dev/v1/dashboard')
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, interrupt_operation)
     print(json.dumps(capture(args.cache_dir, args.output, args.service, args.reference_url), indent=2))
 
 

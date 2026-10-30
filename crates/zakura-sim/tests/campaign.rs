@@ -1087,6 +1087,39 @@ fn snapshots_and_manifests_verify_against_their_digests() {
     ));
 }
 
+/// `close` reads a worker's attempts log line by line, and a garbled line,
+/// such as one with bytes that aren't UTF-8, costs only that line.
+#[test]
+fn close_reads_past_a_garbled_attempts_line() {
+    let fixture = Fixture::new();
+    let child = spawn(fixture.store.root(), &fixture.start_args("60"));
+    let run = running(&fixture.store);
+    kill(&fixture.store, child, &run);
+    let attempt = campaign::Attempt {
+        attempt: 0,
+        seed: 1,
+        max_total_time: 60,
+        started_unix: 0,
+        millis: 5,
+        code: Some(1),
+        signal: None,
+        killed: false,
+        end: AttemptEnd::Failure,
+        failure: Some(ProcessFailure::Exit { code: 1 }),
+        artifacts: Vec::new(),
+    };
+    let line = serde_json::to_string(&attempt).unwrap();
+    let worker = fixture.store.run_dir(&run).join("workers/0");
+    fs::create_dir_all(&worker).unwrap();
+    let mut log = format!("{line}\n").into_bytes();
+    log.extend_from_slice(b"{\"attempt\": \xff\xfe}\n");
+    log.extend_from_slice(format!("{line}\n{{\"attempt\": 2, \"se").as_bytes());
+    fs::write(worker.join(ATTEMPTS_FILE), log).unwrap();
+    let end = campaign::close(&fixture.store, &run).unwrap();
+    assert_eq!(end.workers[0].attempts, 2, "{end:?}");
+    assert_eq!(end.workers[0].millis, 10);
+}
+
 /// A run that a supervisor holds can't be closed or resumed, and `status`
 /// says it runs.
 #[test]

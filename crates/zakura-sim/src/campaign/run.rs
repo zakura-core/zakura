@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -79,6 +79,11 @@ const LOG_TAIL: usize = 1 << 20;
 /// How long the supervisor waits for a process's output to end once the
 /// process has exited.
 const OUTPUT_DRAIN: Duration = Duration::from_secs(10);
+
+/// The longest line of an attempts log that `close` reads as an attempt.
+/// The longest line the supervisor writes holds one line of a process's
+/// log, at most [`LOG_HEAD`] + [`LOG_TAIL`] bytes, escaped as JSON.
+const MAX_ATTEMPT_LINE: u64 = 64 << 20;
 
 /// How a run ended. Each status means one thing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,25 +913,43 @@ fn stopped_worker(plan: &WorkerPlan, dir: &Path) -> Result<WorkerEnd, CampaignEr
         return read_record(&outcome, None);
     }
     let log = dir.join(ATTEMPTS_FILE);
-    let text = match fs::read_to_string(&log) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(CampaignError::Io {
-                context: format!("reading {}", log.display()),
-                error,
-            })
-        }
-    };
+    let io = || CampaignError::io(format!("reading {}", log.display()));
     let mut attempts = 0;
     let mut millis = 0u64;
-    // A line cut off when the supervisor stopped isn't an attempt.
-    for attempt in text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Attempt>(line).ok())
-    {
-        attempts += 1;
-        millis = millis.saturating_add(attempt.millis);
+    let mut reader = match File::open(&log) {
+        Ok(file) => BufReader::new(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkerEnd {
+                index: plan.index,
+                outcome: WorkerOutcome::Unfinished,
+                attempts,
+                millis,
+            })
+        }
+        Err(error) => return Err(io()(error)),
+    };
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_ATTEMPT_LINE)
+            .read_until(b'\n', &mut line)
+            .map_err(io())?;
+        if read == 0 {
+            break;
+        }
+        // A usize always fits in a u64 on supported targets.
+        if !line.ends_with(b"\n") && read as u64 == MAX_ATTEMPT_LINE {
+            // Longer than any attempt the supervisor writes.
+            reader.skip_until(b'\n').map_err(io())?;
+            continue;
+        }
+        // A line cut off when the supervisor stopped, or garbled on disk,
+        // isn't an attempt.
+        if let Ok(attempt) = serde_json::from_slice::<Attempt>(&line) {
+            attempts += 1;
+            millis = millis.saturating_add(attempt.millis);
+        }
     }
     Ok(WorkerEnd {
         index: plan.index,

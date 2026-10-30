@@ -1738,6 +1738,34 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// The supervisor map's boundary read (M6a-7b): each registered
+    /// connection's `conn_id`, peer and remote IP, by `conn_id`, through a
+    /// std `Weak`, so it reads `Gone` once the last handle to the state
+    /// drops. It's `Held` while a task holds the state's lock.
+    #[cfg(any(test, zakura_sim))]
+    fn read(&self) -> crate::zakura::diag::ComponentRead {
+        use crate::zakura::diag::{self, MapEntry, OwnerState};
+
+        let state = diag::weak(&self.inner);
+        Box::new(move || {
+            diag::upgrade(&state, |state| {
+                diag::peek_async(state, |state| {
+                    let mut entries: Vec<MapEntry> = state
+                        .active_by_peer
+                        .iter()
+                        .map(|(peer, entry)| MapEntry {
+                            conn_id: entry.conn_id,
+                            peer: peer.clone(),
+                            remote_ip: entry.remote_ip,
+                        })
+                        .collect();
+                    entries.sort_unstable_by_key(|entry| entry.conn_id);
+                    OwnerState::SupervisorMap(entries)
+                })
+            })
+        })
+    }
+
     fn forget_retained_native_metadata(&self, peer_id: &ZakuraPeerId) {
         if let Some(peer_registry) = &self.peer_registry {
             peer_registry.forget_retained_native_metadata(peer_id);
@@ -1796,6 +1824,9 @@ struct RegisteredPeerCleanupGuard {
     disconnect_token: CancellationToken,
     admitted_capabilities: u64,
     armed: bool,
+    /// Where `RegistryRemoved` goes (M6a-7b).
+    #[cfg(any(test, zakura_sim))]
+    tap: Option<Arc<super::ConnTap>>,
 }
 
 impl RegisteredPeerCleanupGuard {
@@ -1814,7 +1845,15 @@ impl RegisteredPeerCleanupGuard {
             disconnect_token,
             admitted_capabilities: 0,
             armed: true,
+            #[cfg(any(test, zakura_sim))]
+            tap: None,
         }
+    }
+
+    /// Reports each `remove_peer` fanout through `tap`, the connection's.
+    #[cfg(any(test, zakura_sim))]
+    fn observe_with(&mut self, tap: Option<&Arc<super::ConnTap>>) {
+        self.tap = tap.cloned();
     }
 
     fn add_admitted_capabilities(&mut self, capabilities: u64) {
@@ -1825,6 +1864,13 @@ impl RegisteredPeerCleanupGuard {
         if self.admitted_capabilities != 0 {
             self.registry
                 .remove_peer(&self.peer_id, self.conn_id, self.admitted_capabilities);
+            #[cfg(any(test, zakura_sim))]
+            if let Some(tap) = &self.tap {
+                tap.emit(super::TransportEvent::RegistryRemoved {
+                    conn_id: self.conn_id,
+                    admitted_mask: self.admitted_capabilities,
+                });
+            }
             self.admitted_capabilities = 0;
         }
     }
@@ -1856,6 +1902,25 @@ impl Drop for RegisteredPeerCleanupGuard {
         let _task = zakura_rt::task::try_spawn(erased(async move {
             supervisor.deregister(&peer_id, conn_id).await;
         }));
+    }
+}
+
+/// Reports a registry fanout for `conn_id` through its connection's tap,
+/// right after `add_escalated_peer` returned `admitted_mask` for a `Peer`
+/// that carried `negotiated` (M6a-7b).
+#[cfg(any(test, zakura_sim))]
+fn observe_fanout(
+    close_cause: &CloseCause,
+    conn_id: ZakuraConnId,
+    negotiated: u64,
+    admitted_mask: u64,
+) {
+    if let Some(tap) = close_cause.tap() {
+        tap.emit(super::TransportEvent::RegistryFanout {
+            conn_id,
+            negotiated,
+            admitted_mask,
+        });
     }
 }
 
@@ -2472,8 +2537,14 @@ impl ZakuraProtocolHandler {
 
     /// Report every connection's transport events to `observer`. Install it
     /// before serving or dialing any connection.
+    ///
+    /// The observer takes the supervisor map's boundary read now, then
+    /// gets its `ReadRegistered` (M6a-7b).
     #[cfg(any(test, zakura_sim))]
     pub fn with_transport_observer(mut self, observer: Arc<dyn super::TransportObserver>) -> Self {
+        let key = crate::zakura::diag::ReadKey::SupervisorMap;
+        observer.register_read(key.clone(), self.supervisor.read());
+        observer.observe(super::TransportEvent::ReadRegistered { key });
         self.transport_observer = Some(observer);
         self
     }
@@ -2823,6 +2894,8 @@ impl ZakuraProtocolHandler {
         let conn_id = context.conn_id;
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
+        #[cfg(any(test, zakura_sim))]
+        cleanup_guard.observe_with(close_cause.tap());
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
@@ -3009,6 +3082,13 @@ impl ZakuraProtocolHandler {
                             connection_token.clone(),
                             close_cause.clone(),
                         ));
+                #[cfg(any(test, zakura_sim))]
+                observe_fanout(
+                    &close_cause,
+                    conn_id,
+                    opened_capabilities,
+                    admitted_capabilities,
+                );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
@@ -3148,6 +3228,13 @@ impl ZakuraProtocolHandler {
                                     connection_token.clone(),
                                     close_cause.clone(),
                                 ),
+                            );
+                            #[cfg(any(test, zakura_sim))]
+                            observe_fanout(
+                                &close_cause,
+                                conn_id,
+                                accepted_capabilities,
+                                admitted_capabilities,
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
@@ -3310,6 +3397,13 @@ impl ZakuraProtocolHandler {
                                 connection_token.clone(),
                                 close_cause.clone(),
                             ),
+                        );
+                        #[cfg(any(test, zakura_sim))]
+                        observe_fanout(
+                            &close_cause,
+                            conn_id,
+                            accepted_capabilities,
+                            admitted_capabilities,
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                     }
@@ -6860,6 +6954,7 @@ mod tests {
     pub(super) mod connection;
     mod quic_progress;
     mod read_close_cause;
+    mod supervisor_map;
     mod transport_observer;
     use super::*;
     use crate::zakura::P2P_V2_ALPN;

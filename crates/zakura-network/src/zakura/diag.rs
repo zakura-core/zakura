@@ -14,10 +14,13 @@
 
 use std::{
     collections::BTreeMap,
+    net::IpAddr,
     sync::{Arc, Mutex, Weak},
 };
 
 use zakura_rt::sync::PoisonError;
+
+use crate::zakura::{ZakuraConnId, ZakuraPeerId};
 
 /// One boundary read's result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +54,19 @@ impl<S> Read<S> {
 pub enum OwnerState {
     /// The header chunk budget's counters.
     Budget(BudgetCounters),
+    /// The supervisor's map of registered connections, by `conn_id`.
+    SupervisorMap(Vec<MapEntry>),
+}
+
+/// One registered connection in the supervisor's map (M6a-7b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    /// The connection's registration ID.
+    pub conn_id: ZakuraConnId,
+    /// The peer it's registered for.
+    pub peer: ZakuraPeerId,
+    /// The remote IP it was admitted from, if the transport knew it.
+    pub remote_ip: Option<IpAddr>,
 }
 
 /// The header chunk budget's counters, read under its lock.
@@ -70,6 +86,8 @@ pub struct BudgetCounters {
 pub enum ReadKey {
     /// A reactor's header chunk budget.
     Budget,
+    /// A handler's supervisor map.
+    SupervisorMap,
 }
 
 /// A registered boundary read. It must take no scheduling point, never wait

@@ -266,6 +266,34 @@ pub enum TransportEvent {
         /// The connection.
         conn_id: ZakuraConnId,
     },
+    /// The handler registered the boundary read of a shared component it
+    /// owns, as it built it (M6a-7b): its supervisor map, from
+    /// `with_transport_observer`. Reported right after the observer took
+    /// the read through [`TransportObserver::register_read`].
+    ReadRegistered {
+        /// The component.
+        key: crate::zakura::diag::ReadKey,
+    },
+    /// `ServiceRegistry::add_escalated_peer` returned for the connection
+    /// (M6a-7b). Every service it reached ran `add_peer` inside the call,
+    /// so their install records come before this one.
+    RegistryFanout {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The capability mask the fanout's `Peer` carried.
+        negotiated: u64,
+        /// The capability mask of the services that got streams, as the
+        /// registry returned it.
+        admitted_mask: u64,
+    },
+    /// `ServiceRegistry::remove_peer` returned for the connection, for the
+    /// services in `admitted_mask` (M6a-7b).
+    RegistryRemoved {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The services' capability mask.
+        admitted_mask: u64,
+    },
 }
 
 /// A regulation table's state change.

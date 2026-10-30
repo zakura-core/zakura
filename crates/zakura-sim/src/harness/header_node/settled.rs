@@ -234,7 +234,12 @@ impl ReactorLife {
                 ReactorFact::Dropping { turn, .. } => {
                     let current = match self.marker {
                         Some(Marker::Settled(turn) | Marker::Resumed(turn)) => turn,
-                        None => 0,
+                        None => {
+                            return Err(format!(
+                                "NoInitialSnapshot: the reactor reported Dropping at step \
+                                 {step} before its initial snapshot"
+                            ))
+                        }
                     };
                     if *turn != current {
                         return Err(format!(
@@ -1550,5 +1555,26 @@ mod tests {
             ended.0,
             "the receipt and end share a step"
         );
+    }
+
+    /// A reactor torn down with no initial snapshot before it, as a build
+    /// that skipped its `Settled{turn: 0}` and an abort before the first
+    /// poll would leave it, fails the run.
+    ///
+    /// This fails if `Dropping` stands in for the missing snapshot.
+    #[test]
+    fn a_teardown_with_no_initial_snapshot_fails() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            slot.emit(dropping(0));
+        });
+        let (report, life) = fixture.run(&mut States::default());
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { source, detail })
+                if source == TAP && detail.starts_with("NoInitialSnapshot")),
+            "{:?}",
+            report.end
+        );
+        assert_eq!(name(life.borrow().component().state()), "initializing");
     }
 }

@@ -1695,7 +1695,7 @@ fn pq_activation_config_requires_an_isolated_network_and_support() {
 fn custom_testnet_pq_configuration_round_trips() {
     let source = r#"
 initial_testnet_peers = ["127.0.0.1:18333"]
-network = { network_name = "PqFork", network_magic = [80, 81, 84, 49], pq_p2sh_activation_height = 4420649 }
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], pq_p2sh_activation_height = 4420649 }
 "#;
     let parsed = toml::from_str::<Config>(source);
     if cfg!(feature = "pq") {

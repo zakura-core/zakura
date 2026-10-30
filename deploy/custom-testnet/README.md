@@ -50,8 +50,8 @@ remain enforced. This is a custom-network consensus parameter shared by every
 participant; it does not change public Testnet or Mainnet.
 
 The seed database format may be upgraded only by the node's supported upgrade
-path. Do not edit its version file or rewind a pruned post-NU7 snapshot to fake a
-pre-NU7 seed. Snapshot restoration and node startup must pass before mining.
+path. Do not edit its version file or rewind a pruned post-NU7 snapshot to
+fake a pre-NU7 seed. Snapshot restoration and node startup must pass before mining.
 
 ## Join a run
 

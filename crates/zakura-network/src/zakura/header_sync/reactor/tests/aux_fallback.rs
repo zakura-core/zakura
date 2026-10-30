@@ -400,6 +400,7 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
             reached: false,
             accepted: open.acknowledged,
         },
+        None,
     );
     assert!(reactor
         .pruned_peers

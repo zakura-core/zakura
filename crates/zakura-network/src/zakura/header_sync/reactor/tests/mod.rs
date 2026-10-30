@@ -145,7 +145,7 @@ impl HeaderSyncReactor {
                 bytes: 0,
             },
         });
-        self.handle_outcome(peer, session_id, ended);
+        self.handle_outcome(peer, session_id, ended, None);
     }
 }
 
@@ -194,6 +194,7 @@ fn outcome_event(session: &PeerSession, outcome: HeadersOutcome) -> Event {
         peer: session.peer_id().clone(),
         session_id: session.session_id(),
         ended,
+        frame: None,
     }
 }
 

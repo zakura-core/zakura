@@ -1,6 +1,6 @@
 //! Staged work (M6a-5a): each page's `Staged` with the digest of the
-//! entries the incarnation then holds, and the settled snapshot's held
-//! digest.
+//! entries the incarnation then holds, the settled snapshot's held digest,
+//! and each outcome's `Outcome` with what the reactor did with it.
 //!
 //! The simulator's fold compares these digests with what the frames
 //! delivered. These tests show the reactor's half: its digests cover the
@@ -10,9 +10,11 @@
 use super::{
     aux_fallback::{answer_locator, pruned_status},
     identities::{connect, genesis, headers, observed, settle, Recorder},
+    timeouts::seed_vct_active_request,
     *,
 };
-use observe::{FrameTag, HeldDigest};
+use crate::zakura::CloseCause;
+use observe::{FrameTag, HeldDigest, OutcomeDisposition};
 
 /// A page of `entries` that extends the committed tip on `open`'s
 /// subscription.
@@ -251,5 +253,127 @@ fn a_second_writer_changes_the_held_digest() {
             .active_mut(&peer)
             .expect("the round is active")
             .entries[1] = kept;
+    }
+}
+
+/// The `Outcome` events in `events`.
+fn outcomes(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    events
+        .into_iter()
+        .filter(|event| matches!(event, ReactorEvent::Outcome { .. }))
+        .collect()
+}
+
+/// A reactor with `peer` connected on session 7, observed by `recorder`.
+fn outcome_reactor(
+    recorder: &Arc<Recorder>,
+    peer: &ZakuraPeerId,
+) -> (HeaderSyncReactor, zakura_header_chain::EngineSnapshot) {
+    let snapshot = genesis();
+    let (mut reactor, _actions) = observed(&snapshot, recorder, true);
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        CloseCause::new(),
+    ));
+    (reactor, snapshot)
+}
+
+/// Each exit of the outcome handler reports what it did: no active work,
+/// another request's work, a matching request that already holds its
+/// pages, an ordinary request it retires, and a repair it retries. Only
+/// the last two name a change to their incarnation's work.
+///
+/// This fails if a request past receiving is reported as retired.
+#[test]
+fn outcomes_report_their_disposition() {
+    let peer = ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length");
+    let outcome = |subscription_id| HeadersOutcome {
+        subscription_id,
+        initial_target_tip_hash: block::Hash([0x53; 32]),
+        outcome: HeadersOutcomeCode::TargetNotSelected,
+    };
+    let expect = |subscription, disposition| ReactorEvent::Outcome {
+        session_id: 7,
+        subscription,
+        frame: None,
+        disposition,
+    };
+    let cases: [(
+        &str,
+        Option<HeaderTargetPhase>,
+        bool,
+        u64,
+        OutcomeDisposition,
+    ); 5] = [
+        ("no work", None, false, 9, OutcomeDisposition::NoActive),
+        (
+            "another request",
+            Some(HeaderTargetPhase::Applying),
+            false,
+            10,
+            OutcomeDisposition::OtherRequest,
+        ),
+        (
+            "past receiving",
+            Some(HeaderTargetPhase::Applying),
+            false,
+            9,
+            OutcomeDisposition::NotReceiving { incarnation: 1 },
+        ),
+        (
+            "receiving",
+            Some(HeaderTargetPhase::Receiving),
+            false,
+            9,
+            OutcomeDisposition::Retired { incarnation: 1 },
+        ),
+        (
+            "receiving repair",
+            Some(HeaderTargetPhase::Receiving),
+            true,
+            9,
+            OutcomeDisposition::Retried { incarnation: 1 },
+        ),
+    ];
+    for (case, phase, repair, subscription, disposition) in cases {
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, snapshot) = outcome_reactor(&recorder, &peer);
+        match (phase, repair) {
+            (None, _) => {}
+            (Some(phase), false) => {
+                seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+                reactor
+                    .peer_work_queue
+                    .active_mut(&peer)
+                    .expect("just seeded")
+                    .phase = phase;
+            }
+            (Some(phase), true) => {
+                seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
+            }
+        }
+        recorder.take();
+        reactor.deliver_outcome(peer.clone(), 7, outcome(subscription));
+        assert_eq!(
+            outcomes(recorder.take()),
+            [expect(subscription, disposition)],
+            "{case}"
+        );
+        let active = reactor.peer_work_queue.active(&peer).is_some();
+        assert_eq!(
+            active,
+            !matches!(
+                disposition,
+                OutcomeDisposition::NoActive
+                    | OutcomeDisposition::Retired { .. }
+                    | OutcomeDisposition::Retried { .. }
+            ),
+            "{case}: only a retirement or a retry ends the work"
+        );
     }
 }

@@ -52,7 +52,7 @@ impl Recorder {
 
 /// Whether `event` reports a work identity: a reservation's placement or
 /// binding, a call's captured leases, or a transfer's start or end
-/// (M6a-4), or a page's staging (M6a-5a).
+/// (M6a-4), or a page's staging or an outcome's handling (M6a-5a).
 fn is_identity(event: &ReactorEvent) -> bool {
     matches!(
         event,
@@ -62,6 +62,7 @@ fn is_identity(event: &ReactorEvent) -> bool {
             | ReactorEvent::EntriesTaken { .. }
             | ReactorEvent::TransferEnded { .. }
             | ReactorEvent::Staged { .. }
+            | ReactorEvent::Outcome { .. }
     )
 }
 

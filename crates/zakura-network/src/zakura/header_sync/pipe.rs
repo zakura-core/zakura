@@ -113,6 +113,8 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                     peer: peer.clone(),
                     session_id,
                     ended,
+                    #[cfg(any(test, zakura_sim))]
+                    frame: frame_tag,
                 }
             }
         };

@@ -1234,7 +1234,9 @@ impl HeaderSyncReactor {
                 peer,
                 session_id,
                 ended,
-            } => self.handle_outcome(peer, session_id, ended),
+                #[cfg(any(test, zakura_sim))]
+                frame,
+            } => sim_arg!(self.handle_outcome(peer, session_id, ended); frame),
             #[cfg(any(test, feature = "zakura-testkit"))]
             Event::HeaderLocatorReady {
                 peer,
@@ -2250,7 +2252,23 @@ impl HeaderSyncReactor {
     /// End `peer`'s receiving work when its subscription's terminal outcome
     /// arrives. An outcome for work that already holds its pages, or for a
     /// subscription this node closed, changes nothing.
-    fn handle_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, ended: Ended) {
+    ///
+    /// In test and simulator builds, `frame` is the frame it came in, and
+    /// each exit reports an `Outcome` with what it did.
+    fn handle_outcome(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        ended: Ended,
+        #[cfg(any(test, zakura_sim))] frame: Option<observe::FrameTag>,
+    ) {
+        #[cfg(any(test, zakura_sim))]
+        let outcome = |disposition| ReactorEvent::Outcome {
+            session_id,
+            subscription: ended.id,
+            frame,
+            disposition,
+        };
         // A terminal outcome lets the session open again, which an offer held
         // by `Self::subscription_ready` waits for.
         self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
@@ -2264,9 +2282,11 @@ impl HeaderSyncReactor {
             self.close_deadlines.remove(&peer);
         }
         let Some(active) = self.peer_work_queue.active(&peer) else {
+            observe!(self, outcome(observe::OutcomeDisposition::NoActive));
             return;
         };
         if active.request_id.get() != ended.id || active.owner.session_id() != session_id {
+            observe!(self, outcome(observe::OutcomeDisposition::OtherRequest));
             return;
         }
         // Remember a pruned publisher even when the round already holds its
@@ -2278,9 +2298,16 @@ impl HeaderSyncReactor {
             self.note_history_pruned(&peer, schema);
         }
         let Some(active) = self.peer_work_queue.active(&peer) else {
+            observe!(self, outcome(observe::OutcomeDisposition::NoActive));
             return;
         };
+        #[cfg(any(test, zakura_sim))]
+        let incarnation = active.incarnation;
         if active.phase != HeaderTargetPhase::Receiving {
+            observe!(
+                self,
+                outcome(observe::OutcomeDisposition::NotReceiving { incarnation })
+            );
             return;
         }
         let is_repair = matches!(
@@ -2301,6 +2328,10 @@ impl HeaderSyncReactor {
                 "outcome" => format!("{:?}", ended.outcome)
             )
             .increment(1);
+            observe!(
+                self,
+                outcome(observe::OutcomeDisposition::Retried { incarnation })
+            );
         } else {
             self.retire_peer_work(&peer, terminal_outcome);
             metrics::counter!(
@@ -2308,6 +2339,10 @@ impl HeaderSyncReactor {
                 "outcome" => format!("{:?}", ended.outcome)
             )
             .increment(1);
+            observe!(
+                self,
+                outcome(observe::OutcomeDisposition::Retired { incarnation })
+            );
         }
     }
 

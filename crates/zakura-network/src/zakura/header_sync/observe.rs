@@ -303,10 +303,47 @@ pub enum ReactorEvent {
         /// append.
         after: HeldDigest,
     },
+    /// The reactor handled a subscription's terminal outcome (M6a-5a).
+    /// Reported on each of `handle_outcome`'s exits.
+    Outcome {
+        /// The session it came on.
+        session_id: u64,
+        /// The subscription it ended.
+        subscription: u64,
+        /// The frame it came in, or `None` on a link with no stream tap.
+        frame: Option<FrameTag>,
+        /// What the reactor did with it.
+        disposition: OutcomeDisposition,
+    },
 }
 
-/// Which frame a page came in, read where the session reader takes it
-/// (M6a-5a). A cfg-only field of `Event::Page`.
+/// What the reactor did with a subscription's terminal outcome (M6a-5a).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OutcomeDisposition {
+    /// No request was active for the peer.
+    NoActive,
+    /// The peer's active request is another session's or subscription's.
+    OtherRequest,
+    /// The matching request already holds its pages, so nothing changed.
+    NotReceiving {
+        /// The matching request's incarnation.
+        incarnation: IncarnationId,
+    },
+    /// The outcome retired the matching request.
+    Retired {
+        /// The retired request's incarnation.
+        incarnation: IncarnationId,
+    },
+    /// The outcome retried the matching repair with another supplier.
+    Retried {
+        /// The retried repair's incarnation.
+        incarnation: IncarnationId,
+    },
+}
+
+/// Which frame a page or outcome came in, read where the session reader
+/// takes it (M6a-5a). A cfg-only field of `Event::Page` and
+/// `Event::Outcome`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct FrameTag {
     /// The frame's QUIC stream.
@@ -317,7 +354,7 @@ pub struct FrameTag {
     /// The frame's payload length in bytes.
     pub payload_len: usize,
     /// The digest of the entries the reader decoded from it, taken before
-    /// any other code sees them.
+    /// any other code sees them. Empty for an outcome.
     pub received: HeldDigest,
 }
 

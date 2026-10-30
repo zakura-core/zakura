@@ -344,6 +344,9 @@ pub enum Event {
         session_id: u64,
         /// The subscription the outcome ended.
         ended: Ended,
+        /// The frame it came in (M6a-5a).
+        #[cfg(any(test, zakura_sim))]
+        frame: Option<super::observe::FrameTag>,
     },
     /// State returned the selected-path locator for an advertised target.
     #[cfg(any(test, feature = "zakura-testkit"))]

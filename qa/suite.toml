@@ -16,8 +16,10 @@ seed-timeout-secs = 1800
 
 # Packages whose tests the simulator build runs, as CI's `zakura_sim build`
 # job does: the library's unit tests and every test binary.
+# zakura-rt's library has no unit tests, so only its test binaries run.
 [[sim-package]]
 name = "zakura-rt"
+lib = false
 timeout-secs = 1800
 
 [[sim-package]]

@@ -51,7 +51,8 @@ fn pending(id: &str, kind: PendingKind) -> Pending {
 /// A checkout in a temporary directory, with a workspace and a simulator
 /// fuzz package:
 ///
-/// - the package `demo` has the test targets `tests/flat.rs` and
+/// - the package `demo` has a library with one unit test, and the test
+///   targets `tests/flat.rs` and
 ///   `tests/nested/main.rs`. `nested` builds only in the simulator, and has
 ///   an ignored test at its top level and one in its child module
 ///   `helpers`;
@@ -69,7 +70,10 @@ fn scratch() -> TempDir {
             "crates/demo/Cargo.toml",
             "[package]\nname = \"demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
         ),
-        ("crates/demo/src/lib.rs", ""),
+        (
+            "crates/demo/src/lib.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() {}\n}\n",
+        ),
         ("crates/demo/tests/flat.rs", "#[test]\nfn flat() {}\n"),
         (
             "crates/demo/tests/nested/main.rs",
@@ -250,23 +254,87 @@ fn a_harness_both_run_and_missing_fails() {
 }
 
 #[test]
-fn a_target_covering_a_harness_its_harness_doesnt_check_fails() {
-    // `fixtures/all` checks the race fixtures' properties, and none of
-    // `header-sync/wire`'s.
+fn a_target_covering_a_harness_its_harness_doesnt_compose_fails() {
+    // `header-sync/smoke` reports no property, so no property check rejects
+    // it, and `fixtures/all` checks none of `header-sync/wire`'s.
     let mut suite = committed();
-    remove(&mut suite.missing_target, |row| {
-        row.harness == "header-sync/wire"
-    });
-    for target in &mut suite.target {
-        if target.name == "race_fixtures" {
-            target.covers.push("header-sync/wire".to_owned());
+    for harness in ["header-sync/smoke", "header-sync/wire"] {
+        remove(&mut suite.missing_target, |row| row.harness == harness);
+        for target in &mut suite.target {
+            if target.name == "race_fixtures" {
+                target.covers.push(harness.to_owned());
+            }
         }
     }
-    assert_problem(
-        &problems(&suite),
-        "the target `race_fixtures` covers the harness `header-sync/wire`, and its harness \
-         `fixtures/all` doesn't check `header-sync/wire`'s properties",
+    let problems = problems(&suite);
+    for harness in ["header-sync/smoke", "header-sync/wire"] {
+        assert_problem(
+            &problems,
+            &format!(
+                "the target `race_fixtures` covers the harness `{harness}`, and its harness \
+                 `fixtures/all` doesn't compose `{harness}`"
+            ),
+        );
+    }
+}
+
+#[test]
+fn planted_fixture_properties_expect_a_violation() {
+    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+        panic!("{problems}");
+    });
+    let expect = |id: &str| {
+        manifest
+            .properties
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| panic!("no row {id}"))
+            .expect
+    };
+    // The race harnesses and `fixtures/all` plant each race, and
+    // `fixtures/fixed` only fixes it.
+    for harness in ["race/lost-update", "fixtures/all"] {
+        assert_eq!(
+            expect(&format!("property/{harness}/race/lost-update")),
+            Expect::Violated,
+            "{harness}"
+        );
+    }
+    assert_eq!(
+        expect("property/fixtures/fixed/race/lost-update"),
+        Expect::Holds
     );
+    assert_eq!(
+        expect("property/discovery/wait-complete/discovery/wait-complete-wakes"),
+        Expect::Holds
+    );
+}
+
+#[test]
+fn an_ignore_the_scan_cant_classify_fails() {
+    let dir = scratch();
+    fs::write(
+        dir.path().join("crates/demo/tests/flat.rs"),
+        "#[test]\n#[cfg_attr(zakura_sim, ignore)]\nfn flat() {}\n",
+    )
+    .unwrap();
+    assert_problem(
+        &problems_at(dir.path(), &scratch_suite(None, &[])),
+        "crates/demo/tests/flat.rs:2: the suite can't tell which test \
+         `#[cfg_attr(zakura_sim, ignore)]` ignores",
+    );
+}
+
+#[test]
+fn a_sim_library_without_unit_tests_fails() {
+    let dir = scratch();
+    let suite = scratch_suite(None, &[]);
+    let problem = "sim package `demo`'s library has no unit tests";
+    assert!(!problems_at(dir.path(), &suite)
+        .iter()
+        .any(|found| found.contains(problem)),);
+    fs::write(dir.path().join("crates/demo/src/lib.rs"), "").unwrap();
+    assert_problem(&problems_at(dir.path(), &suite), problem);
 }
 
 #[test]

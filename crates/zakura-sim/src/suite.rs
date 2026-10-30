@@ -16,7 +16,11 @@
 //! - a fuzz target that `qa/suite.toml` neither maps nor excludes;
 //! - a simulator fuzz target that its package's table maps to no harness;
 //! - a simulator-only test target that a package's `tests` list leaves out;
-//! - an ignored test that `qa/suite.toml` doesn't list;
+//! - a simulator package whose library row runs and has no unit tests;
+//! - an ignored test that `qa/suite.toml` doesn't list, or an attribute
+//!   that may ignore a test in a form the scan can't classify, such as
+//!   `#[cfg_attr(zakura_sim, ignore)]`;
+//! - a target that covers a harness its own harness doesn't compose;
 //! - a reported property without a coverage row, or an on-demand witness
 //!   that the suite doesn't run;
 //! - a planted case whose property no harness reports;
@@ -203,8 +207,9 @@ pub struct Target {
     /// The target's `[[bin]]` name.
     pub name: String,
     /// Harnesses whose runs it covers through its harness, such as the race
-    /// fixtures through `fixtures/all`. Its harness must check each covered
-    /// harness's properties, and its report must account for each.
+    /// fixtures through `fixtures/all`. Its harness must compose each
+    /// covered harness ([`HarnessEntry::composes`]) and check its
+    /// properties, and its report must account for each.
     #[serde(default)]
     pub covers: Vec<String>,
     /// The smoke run's length.
@@ -351,6 +356,11 @@ pub enum Expect {
     /// No run in the suite violates the `Active` property, and each of its
     /// witness rows passes.
     Holds,
+    /// The harness plants a bug that breaks the `Active` property
+    /// ([`HarnessEntry::planted`]), so some run in the suite violates it,
+    /// and each of its witness rows passes. A suite with no violation
+    /// missed the planted bug.
+    Violated,
     /// The suite archives and reports each violation of the `Known` or
     /// `Draft` property without failing, and each of its witness rows
     /// passes.
@@ -510,7 +520,9 @@ pub struct HarnessRow {
 pub struct PropertyRow {
     /// `property/<harness>/<property>`.
     pub id: String,
-    /// [`Expect::Holds`] if `Active`, [`Expect::Reported`] if not.
+    /// [`Expect::Holds`] if `Active`, [`Expect::Violated`] if `Active` in a
+    /// harness that plants its bugs, and [`Expect::Reported`] if not
+    /// `Active`.
     pub expect: Expect,
     /// The harness.
     pub harness: String,
@@ -1012,16 +1024,31 @@ impl Builder<'_> {
     /// The ignored tests `file` defines, as (file, test), each with whether
     /// it sits at the file's top level.
     fn ignored_in(&mut self, file: &str) -> Vec<((String, String), bool)> {
-        match fs::read_to_string(self.root.join(file)) {
-            Ok(source) => ignored_tests(&source)
-                .into_iter()
-                .map(|(test, top_level)| ((file.to_owned(), test), top_level))
-                .collect(),
+        self.scan(file)
+            .ignored
+            .into_iter()
+            .map(|(test, top_level)| ((file.to_owned(), test), top_level))
+            .collect()
+    }
+
+    /// [`scan_tests`] on `file`. A failed read, and each attribute the scan
+    /// can't classify, is a problem.
+    fn scan(&mut self, file: &str) -> TestScan {
+        let source = match fs::read_to_string(self.root.join(file)) {
+            Ok(source) => source,
             Err(error) => {
                 self.problem(format!("reading {file}: {error}"));
-                Vec::new()
+                return TestScan::default();
             }
+        };
+        let scan = scan_tests(&source);
+        for (line, attribute) in &scan.unclassified {
+            self.problem(format!(
+                "{file}:{line}: the suite can't tell which test `{attribute}` ignores, or when. \
+                 Put a plain `#[ignore]` or `#[ignore = \"...\"]` on the test itself"
+            ));
         }
+        scan
     }
 
     /// The rows of the simulator package `package`: its library's unit
@@ -1058,8 +1085,15 @@ impl Builder<'_> {
                         file: None,
                     });
                     let src = self.cargo_path(lib.src_path.parent().unwrap_or(Path::new("")));
+                    let mut tests = 0;
                     for file in files(self.root, &src, "rs") {
-                        ignored.extend(self.ignored_in(&file));
+                        let scan = self.scan(&file);
+                        tests += scan.tests;
+                        ignored.extend(
+                            scan.ignored
+                                .into_iter()
+                                .map(|(test, top_level)| ((file.clone(), test), top_level)),
+                        );
                         self.own(
                             file.clone(),
                             Owner {
@@ -1068,6 +1102,15 @@ impl Builder<'_> {
                                 prefix: test_prefix(&file, &dir),
                             },
                         );
+                    }
+                    // `--lib` with no unit test runs nothing, so its row can't
+                    // pass.
+                    if tests == 0 {
+                        self.problem(format!(
+                            "sim package `{}`'s library has no unit tests, so its `--lib` row \
+                             can't pass: set `lib = false`",
+                            package.name
+                        ));
                     }
                 }
                 None => self.problem(format!("sim package `{}` has no library", package.name)),
@@ -1505,9 +1548,12 @@ impl Builder<'_> {
         (rows, excluded, lockfiles)
     }
 
-    /// Records a problem for each harness in `covers` with properties that
-    /// `runs`, the harness of the target `target`, doesn't check. The
-    /// target's runs can decide only the properties its harness checks.
+    /// Records a problem for each harness in `covers` that `runs`, the
+    /// harness of the target `target`, doesn't compose, or whose properties
+    /// it doesn't check. A shared property ID doesn't make one harness's
+    /// runs another's, so the code-owned [`HarnessEntry::composes`] decides
+    /// what the target's runs include. Its runs can decide only the
+    /// properties its harness checks.
     fn covered_by(&mut self, target: &str, runs: &HarnessEntry, covers: &[String]) {
         let checks: BTreeSet<String> = (runs.properties)()
             .into_iter()
@@ -1517,6 +1563,14 @@ impl Builder<'_> {
             let Some(covered) = HARNESSES.iter().find(|entry| entry.name == name) else {
                 continue;
             };
+            if !runs.composes.contains(&covered.name) {
+                self.problem(format!(
+                    "the target `{target}` covers the harness `{name}`, and its harness `{}` \
+                     doesn't compose `{name}`",
+                    runs.name
+                ));
+                continue;
+            }
             let unchecked: Vec<String> = (covered.properties)()
                 .into_iter()
                 .filter(|property| !checks.contains(&property.id))
@@ -1753,6 +1807,7 @@ impl Builder<'_> {
                 properties.push(PropertyRow {
                     id,
                     expect: match property.status {
+                        Status::Active if entry.planted => Expect::Violated,
                         Status::Active => Expect::Holds,
                         Status::Known { .. } | Status::Draft => Expect::Reported,
                     },
@@ -1969,32 +2024,249 @@ pub fn is_property_suite(source: &str, macros: &[String]) -> bool {
         })
 }
 
-/// The tests in `source` that carry an `#[ignore` attribute: for each
-/// line that starts with one, the next function's name, and whether the
-/// attribute is unindented, so the test sits at the file's top level.
-pub fn ignored_tests(source: &str) -> Vec<(String, bool)> {
-    let raw: Vec<&str> = source.lines().collect();
-    let lines: Vec<&str> = raw.iter().map(|line| line.trim()).collect();
-    let mut tests = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        if !line.starts_with("#[ignore") {
+/// What [`scan_tests`] finds in a source file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestScan {
+    /// How many outer attributes mark a test, such as `#[test]` or
+    /// `#[tokio::test]`.
+    pub tests: usize,
+    /// Each test a plain `#[ignore]` or `#[ignore = "..."]` marks, with
+    /// whether the attribute's line is unindented, so the test sits at the
+    /// file's top level.
+    pub ignored: Vec<(String, bool)>,
+    /// Each attribute that may ignore a test in a form the scan can't
+    /// classify, with its line, from 1: an `ignore` inside another
+    /// attribute, such as `#[cfg_attr(zakura_sim, ignore)]`, or an
+    /// `#[ignore]` that no function follows.
+    pub unclassified: Vec<(usize, String)>,
+}
+
+/// What an outer attribute is, to [`scan_tests`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attribute {
+    /// A path ending in `test`, such as `test` or `tokio::test`.
+    Test,
+    /// `ignore`, or `ignore = "..."`.
+    Ignore,
+    /// Any other attribute that names `ignore`.
+    Unclassified,
+    /// An attribute that names no `ignore`.
+    Other,
+}
+
+/// The tests and ignored tests in `source`, from its outer attributes
+/// outside comments and literals. The scan doesn't evaluate `cfg`: a test
+/// that a build leaves out still counts, and its on-demand row then runs
+/// no test and fails [`Expect::Pass`].
+pub fn scan_tests(source: &str) -> TestScan {
+    let code = mask(source);
+    let bytes = code.as_bytes();
+    let mut scan = TestScan::default();
+    let mut at = 0;
+    while let Some(offset) = code[at..].find('#') {
+        let hash = at + offset;
+        // `#!` is an inner attribute, and `r#` a raw identifier.
+        let open = hash + 1 + leading_whitespace(&code[hash + 1..]);
+        if bytes.get(open) != Some(&b'[') {
+            at = hash + 1;
             continue;
         }
-        let top_level = raw[at].starts_with("#[ignore");
-        let name = lines[at + 1..]
-            .iter()
-            .find_map(|line| {
-                ["fn ", "async fn ", "pub fn ", "pub async fn "]
-                    .iter()
-                    .find_map(|prefix| line.strip_prefix(prefix))
-            })
-            .and_then(|rest| rest.split(['(', '<']).next())
-            .map(str::to_owned);
-        if let Some(name) = name {
-            tests.push((name, top_level));
+        let Some(close) = closing_bracket(bytes, open) else {
+            break;
+        };
+        let line = code[..hash].matches('\n').count() + 1;
+        let attribute = || source[hash..=close].to_owned();
+        match classify(&code[open + 1..close]) {
+            Attribute::Test => scan.tests += 1,
+            Attribute::Ignore => {
+                let line_start = code[..hash].rfind('\n').map_or(0, |at| at + 1);
+                let top_level = !matches!(bytes[line_start], b' ' | b'\t');
+                match test_name(&code[close + 1..]) {
+                    Some(name) => scan.ignored.push((name, top_level)),
+                    None => scan.unclassified.push((line, attribute())),
+                }
+            }
+            Attribute::Unclassified => scan.unclassified.push((line, attribute())),
+            Attribute::Other => {}
+        }
+        at = close + 1;
+    }
+    scan
+}
+
+/// What the attribute with `content` between its brackets is.
+fn classify(content: &str) -> Attribute {
+    let content = content.trim();
+    let path_end = content
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(content.len());
+    let (path, rest) = content.split_at(path_end);
+    let rest = rest.trim_start();
+    let names_ignore = content
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| word == "ignore");
+    match path {
+        "ignore" if rest.is_empty() || rest.starts_with('=') => Attribute::Ignore,
+        _ if names_ignore => Attribute::Unclassified,
+        _ if path.rsplit("::").next() == Some("test") => Attribute::Test,
+        _ => Attribute::Other,
+    }
+}
+
+/// The name of the function that `code`, the masked text after an
+/// attribute, starts with, past further attributes. `None` if no function
+/// follows.
+fn test_name(mut code: &str) -> Option<String> {
+    loop {
+        code = code.trim_start();
+        let Some(rest) = code.strip_prefix('#') else {
+            break;
+        };
+        let rest = rest.trim_start();
+        let close = closing_bracket(rest.as_bytes(), 0)?;
+        code = &rest[close + 1..];
+    }
+    let mut words = code
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty());
+    for word in words.by_ref() {
+        match word {
+            "fn" => return words.next().map(str::to_owned),
+            "pub" | "crate" | "super" | "self" | "in" | "const" | "async" | "unsafe" | "extern" => {
+            }
+            _ => return None,
         }
     }
-    tests
+    None
+}
+
+/// The length of `text`'s leading whitespace, in bytes.
+fn leading_whitespace(text: &str) -> usize {
+    text.len() - text.trim_start().len()
+}
+
+/// The index of the `]` that closes the `[` at `open` in `bytes`, if
+/// `bytes` has one there.
+fn closing_bracket(bytes: &[u8], open: usize) -> Option<usize> {
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (at, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `source` with its comments and the contents of its string, byte string,
+/// raw string and character literals replaced by spaces, newlines kept, so
+/// each byte keeps its offset.
+fn mask(source: &str) -> String {
+    let src = source.as_bytes();
+    let mut out = src.to_vec();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        let to = to.min(out.len());
+        for byte in out.iter_mut().take(to).skip(from) {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut at = 0;
+    while at < src.len() {
+        let rest = &src[at..];
+        if rest.starts_with(b"//") {
+            let end = rest
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(src.len(), |end| at + end);
+            blank(&mut out, at, end);
+            at = end;
+        } else if rest.starts_with(b"/*") {
+            let mut depth = 0usize;
+            let mut end = at;
+            while end < src.len() {
+                if src[end..].starts_with(b"/*") {
+                    depth += 1;
+                    end += 2;
+                } else if src[end..].starts_with(b"*/") {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+        } else if src[at] == b'r'
+            && (at == 0
+                || !ident(src[at - 1])
+                || (matches!(src[at - 1], b'b' | b'c') && (at < 2 || !ident(src[at - 2]))))
+            && {
+                let hashes = rest[1..].iter().take_while(|&&byte| byte == b'#').count();
+                rest.get(1 + hashes) == Some(&b'"')
+            }
+        {
+            let hashes = rest[1..].iter().take_while(|&&byte| byte == b'#').count();
+            let body = at + 2 + hashes;
+            let mut closing = vec![b'"'];
+            closing.extend(std::iter::repeat_n(b'#', hashes));
+            let end = src[body..]
+                .windows(closing.len())
+                .position(|window| window == closing.as_slice())
+                .map_or(src.len(), |end| body + end);
+            blank(&mut out, body, end);
+            at = end + closing.len();
+        } else if src[at] == b'"' {
+            let mut end = at + 1;
+            while end < src.len() && src[end] != b'"' {
+                if src[end] == b'\\' {
+                    end += 1;
+                }
+                end += 1;
+            }
+            blank(&mut out, at + 1, end);
+            at = end + 1;
+        } else if src[at] == b'\'' {
+            // A character literal, or else a lifetime or a label.
+            let end = match rest.get(1) {
+                Some(b'\\') => rest
+                    .iter()
+                    .skip(3)
+                    .position(|&byte| byte == b'\'')
+                    .map(|end| at + 3 + end),
+                Some(_) => source[at + 1..]
+                    .chars()
+                    .next()
+                    .map(|c| at + 1 + c.len_utf8())
+                    .filter(|&end| src.get(end) == Some(&b'\'')),
+                None => None,
+            };
+            match end {
+                Some(end) => {
+                    blank(&mut out, at + 1, end);
+                    at = end + 1;
+                }
+                None => at += 1,
+            }
+        } else {
+            at += 1;
+        }
+    }
+    String::from_utf8(out).expect("masking replaces whole characters with ASCII spaces")
 }
 
 /// What the full name of a test at the top level of `file`, in the library
@@ -2186,12 +2458,81 @@ mod tests {
         let source = "#[test]\nfn plain() {}\n\n#[test]\n#[ignore = \"slow\"]\n\
                       /// Docs.\nfn slow() {}\n#[ignore]\n#[tokio::test]\nasync fn \
                       later() {}\nlet s = \"#[ignore]\";\n";
+        let scan = scan_tests(source);
         assert_eq!(
-            ignored_tests(source),
+            scan.ignored,
             [("slow".to_owned(), true), ("later".to_owned(), true)]
         );
+        assert_eq!(scan.tests, 3);
+        assert!(scan.unclassified.is_empty());
         let nested = "mod tests {\n    #[test]\n    #[ignore]\n    fn inner() {}\n}\n";
-        assert_eq!(ignored_tests(nested), [("inner".to_owned(), false)]);
+        assert_eq!(scan_tests(nested).ignored, [("inner".to_owned(), false)]);
+    }
+
+    /// Every form of `ignore` either marks the next test or fails the
+    /// scan, and literals and comments never do either.
+    #[test]
+    fn ignore_attributes_the_scan_cant_classify_fail() {
+        let source = "#[test] #[ignore]\nfn same_line() {}\n\
+                      #[cfg(feature = \"slow\")]\n#[test]\n#[ignore = \"a ] in the reason\"]\n\
+                      pub(crate) async fn gated() {}\n\
+                      #[cfg_attr(zakura_sim, ignore)]\n#[test]\nfn sim_only() {}\n\
+                      #[test]\n#[cfg_attr(\n    not(zakura_sim),\n    ignore = \"slow\"\n)]\n\
+                      fn split() {}\n\
+                      #[ignore]\nstruct NotATest;\n\
+                      /* #[cfg_attr(x, ignore)] /* nested */ */\n\
+                      const C: char = '\"';\nconst Q: char = '\\'';\n\
+                      fn f<'a>(s: &'a str) {}\n\
+                      const R: &str = r#\"#[cfg_attr(x, ignore)]\"#;\n\
+                      #[allow(clippy::ignored_unit_patterns)]\nfn g() {}\n";
+        let scan = scan_tests(source);
+        assert_eq!(
+            scan.ignored,
+            [("same_line".to_owned(), true), ("gated".to_owned(), true)]
+        );
+        assert_eq!(scan.tests, 4);
+        assert_eq!(
+            scan.unclassified,
+            [
+                (7, "#[cfg_attr(zakura_sim, ignore)]".to_owned()),
+                (
+                    11,
+                    "#[cfg_attr(\n    not(zakura_sim),\n    ignore = \"slow\"\n)]".to_owned()
+                ),
+                (16, "#[ignore]".to_owned()),
+            ]
+        );
+    }
+
+    /// A target can cover only a harness its harness composes, and only if
+    /// its harness checks the covered harness's properties.
+    #[test]
+    fn a_composed_harness_must_be_checked() {
+        use crate::harness::{entry, fixtures::All};
+        let suite: SuiteFile =
+            toml::from_str("schema = 1\nplanted-timeout-secs = 1\nseed-timeout-secs = 1\n")
+                .unwrap();
+        let mut builder = Builder {
+            root: Path::new("."),
+            canonical_root: PathBuf::from("."),
+            suite: &suite,
+            problems: Vec::new(),
+            ids: BTreeSet::new(),
+            owners: BTreeMap::new(),
+        };
+        // A wrong code-owned list: `fixtures/all` checks none of
+        // `header-sync/wire`'s properties.
+        let runs = HarnessEntry {
+            composes: &["header-sync/wire"],
+            ..entry::<All>()
+        };
+        builder.covered_by("t", &runs, &["header-sync/wire".to_owned()]);
+        assert_eq!(builder.problems.len(), 1);
+        assert!(
+            builder.problems[0].contains("doesn't check `header-sync/wire`'s properties"),
+            "{:?}",
+            builder.problems
+        );
     }
 
     /// A suite is a `proptest!` block or a suite macro's call, in code.

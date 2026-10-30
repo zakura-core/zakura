@@ -311,6 +311,7 @@ pub(crate) fn read_key(key: &ReadKey) -> Result<String, String> {
     match key {
         ReadKey::Budget => Ok("budget".to_owned()),
         ReadKey::SupervisorMap => Ok("supervisor-map".to_owned()),
+        ReadKey::HeaderSessions { service } => Ok(format!("header-sessions/{service}")),
         unknown => Err(format!(
             "UnknownEvent: the tap can't encode the read key {unknown:?}"
         )),

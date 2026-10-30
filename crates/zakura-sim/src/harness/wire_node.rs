@@ -34,10 +34,10 @@ use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
         diag::{ComponentRead, ReadKey},
-        FrameSummary, HeaderCheck, HeaderSyncService, OutputOutcome, Producer, Service,
-        ServiceRegistry, Transition, TransportEvent, TransportObserver, TransportSlot, Unwritten,
-        ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
-        ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
+        FrameSummary, HeaderCheck, HeaderSyncService, OutputOutcome, Producer, RemoveCause,
+        Service, ServiceRegistry, Transition, TransportEvent, TransportObserver, TransportSlot,
+        Unwritten, ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig,
+        ZakuraLocalLimits, ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
     },
     Config,
 };
@@ -84,6 +84,9 @@ pub struct WireNode {
     endpoint: watch::Receiver<Bound>,
     /// Where its failed dials go.
     dials: DialReporter,
+    /// The allocation ID of the header-sync service its registry holds,
+    /// whose session table the wire view reads (M6a-7b).
+    pub service: u64,
 }
 
 impl WireNode {
@@ -102,7 +105,9 @@ impl WireNode {
         dials: DialReporter,
     ) -> Self {
         let (bound, endpoint) = watch::channel(None);
-        let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
+        let header_service = HeaderSyncService::new(header.handle.clone());
+        let service_id = header_service.diag_id();
+        let service: Arc<dyn Service> = Arc::new(header_service);
         let config = config(network);
         sim.scheduler().spawn_root("wire-node", async move {
             let limits = ZakuraLocalLimits::from_config(&config);
@@ -135,6 +140,7 @@ impl WireNode {
             seed,
             endpoint,
             dials,
+            service: service_id,
         }
     }
 
@@ -699,6 +705,60 @@ impl TransportTap {
                 self.remote(conn_id)?,
                 TransportFact::RegistryRemoved { admitted_mask },
             ),
+            TransportEvent::Installed {
+                service,
+                conn_id,
+                session_id,
+                quic_stream,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::Installed {
+                    service,
+                    session_id,
+                    quic_stream,
+                },
+            ),
+            TransportEvent::InstallRefused {
+                service,
+                conn_id,
+                reason,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::InstallRefused {
+                    service,
+                    reason: reason.to_owned(),
+                },
+            ),
+            TransportEvent::Removed {
+                service,
+                conn_id,
+                session_id,
+                cause,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::Removed {
+                    service,
+                    session_id,
+                    cause: remove_cause(cause)?,
+                },
+            ),
+            TransportEvent::RemoveIgnored {
+                service,
+                conn_id,
+                session_id,
+                cause,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::RemoveIgnored {
+                    service,
+                    session_id,
+                    cause: remove_cause(cause)?,
+                },
+            ),
             // The enum is non-exhaustive, and an event the log can't hold would
             // leave the evidence silently incomplete.
             unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
@@ -731,6 +791,18 @@ pub(crate) fn summary_fact(summary: FrameSummary) -> Result<FrameSummaryFact, St
             bytes: cursor.bytes,
         }),
     })
+}
+
+/// `cause` as the log names it, or an error for one this build can't
+/// encode.
+fn remove_cause(cause: RemoveCause) -> Result<String, String> {
+    Ok(match cause {
+        RemoveCause::Replaced => "replaced",
+        RemoveCause::Teardown => "teardown",
+        RemoveCause::RemovePeer => "remove-peer",
+        unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
+    }
+    .to_owned())
 }
 
 /// `outcome` in plain fields, or an error for one this build can't

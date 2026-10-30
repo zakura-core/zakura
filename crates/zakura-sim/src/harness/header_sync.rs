@@ -640,7 +640,7 @@ impl Subsystem for HeaderWire {
             observer,
             dials,
         );
-        hub.transport_reads(reads);
+        hub.transport_reads(reads, node.service);
         let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone());
         hub.place_peers(ports.records.clone());

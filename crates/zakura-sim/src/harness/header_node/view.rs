@@ -4,8 +4,8 @@
 //!
 //! The reactor reports its own state (M6a-3), folded from its settled
 //! snapshots. The budget's counters and the selected chain come from their
-//! boundary reads (M6a-7a), and the supervisor map from its own (M6a-7b,
-//! see [`super::reads`]). Each later component
+//! boundary reads (M6a-7a), and the supervisor map and the header sessions
+//! from theirs (M6a-7b, see [`super::reads`]). Each later component
 //! registers its read, gives [`Reading`] its state, and wires its
 //! existence evidence. Until then the
 //! others stay `Initializing`, so a property that needs one never ends
@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use zakura_network::zakura::diag::{BudgetCounters, MapEntry};
+use zakura_network::zakura::diag::{BudgetCounters, MapEntry, SessionEntry};
 use zakura_storage::header::adapter::SelectedChain;
 
 use crate::{
@@ -34,6 +34,14 @@ pub enum Reading {
     SelectedChain(SelectedChain),
     /// The supervisor's registered connections, by `conn_id`.
     SupervisorMap(Vec<MapEntry>),
+    /// The session table of the header-sync service the registry holds,
+    /// by connection and session ID.
+    HeaderSessions {
+        /// The service's allocation ID.
+        service: u64,
+        /// Each peer's current session.
+        sessions: Vec<SessionEntry>,
+    },
 }
 
 impl Tagged for Reading {
@@ -43,7 +51,8 @@ impl Tagged for Reading {
             Reading::Reactor(_)
             | Reading::Budget(_)
             | Reading::SelectedChain(_)
-            | Reading::SupervisorMap(_) => None,
+            | Reading::SupervisorMap(_)
+            | Reading::HeaderSessions { .. } => None,
         }
     }
 }

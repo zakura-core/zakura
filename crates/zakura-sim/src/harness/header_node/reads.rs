@@ -20,7 +20,15 @@
 //!
 //! On `header-sync/wire` the handler registers the supervisor map's read
 //! through the transport observer (M6a-7b), and the map exists from the
-//! first `Registered`.
+//! first `Registered`. Each header-sync service registers its session
+//! table's read through the reactor's observer, under its allocation ID.
+//! The wire harness builds two services on one reactor handle, one kept by
+//! its `HeaderNode` and one in the handler's registry, so the harness names
+//! the registry's, and the hub runs that one's read only. The table exists
+//! from the first header stream's `Admitted`. Every install and removal
+//! record must name that service, and each registry fanout that reached
+//! header sync must follow exactly one install or refusal for its
+//! connection since the connection's previous fanout (see [`Installs`]).
 
 use std::{
     cell::{Cell, RefCell},
@@ -29,7 +37,10 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use zakura_network::zakura::diag::{self, ComponentRead, OwnerState, ReadKey};
+use zakura_network::zakura::{
+    diag::{self, ComponentRead, OwnerState, ReadKey},
+    ServicePeerDirection, ZAKURA_CAP_HEADER_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+};
 use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
@@ -37,7 +48,10 @@ use super::{
     view::{HeaderSyncView, Reading},
 };
 use crate::{
-    observe::{ComponentReading, ComponentValue, MapRow, ReactorFact, TransportFact},
+    observe::{
+        ComponentReading, ComponentValue, InstallRow, MapRow, ReactorFact, SessionRow,
+        TransportFact,
+    },
     property::{ComponentKind, Read},
     storage::{hex, point},
     Observation, ObservationLog,
@@ -115,7 +129,12 @@ pub(crate) struct BoundaryReads {
     /// The node transport tap's reads and its instance, on a tier with a
     /// transport.
     transport: Option<(ReadSink, u64)>,
+    /// The allocation ID of the header-sync service the registry holds,
+    /// whose session table the view reads.
+    header_service: Option<u64>,
     map_exists: bool,
+    sessions_exist: bool,
+    installs: Installs,
     /// Built under [`without_reads`].
     off: bool,
 }
@@ -138,7 +157,10 @@ impl BoundaryReads {
             generations: BTreeMap::new(),
             budget_exists: false,
             transport: None,
+            header_service: None,
             map_exists: false,
+            sessions_exist: false,
+            installs: Installs::default(),
             off: off || READS_OFF.with(Cell::get),
         }
     }
@@ -149,14 +171,26 @@ impl BoundaryReads {
         self.transport = Some((sink, instance));
     }
 
-    /// Starts running `read`, registered under `key`.
+    /// Reads the session table of header-sync service `service`, the one
+    /// the node's registry holds.
+    pub(crate) fn header_sessions(&mut self, service: u64) {
+        self.header_service = Some(service);
+    }
+
+    /// Starts running `read`, registered under `key`, if the view reads
+    /// its component. Another service's session table isn't one.
     fn adopt(
         &mut self,
         view: &mut HeaderSyncView,
         key: ReadKey,
         read: ComponentRead,
     ) -> Result<(), String> {
-        let kind = kind(&key)?;
+        let kind = match &key {
+            ReadKey::HeaderSessions { service } if Some(*service) != self.header_service => {
+                return Ok(());
+            }
+            key => kind(key)?,
+        };
         let generation = self.generations.entry(key.clone()).or_default();
         *generation += 1;
         view.register(kind);
@@ -212,20 +246,36 @@ impl BoundaryReads {
                     _ => {}
                 },
                 Observation::Transport {
-                    instance, event, ..
-                } if Some(*instance) == transport => match event {
-                    TransportFact::ReadRegistered { key: name, .. } => {
-                        let (key, read) = handed_transport
-                            .next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
-                            .ok_or_else(|| unhanded(name, step))?;
-                        self.adopt(&mut view, key, read)?;
+                    instance,
+                    connection,
+                    event,
+                    ..
+                } if Some(*instance) == transport => {
+                    match event {
+                        TransportFact::ReadRegistered { key: name, .. } => {
+                            let (key, read) = handed_transport
+                                .next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
+                                .ok_or_else(|| unhanded(name, step))?;
+                            self.adopt(&mut view, key, read)?;
+                        }
+                        TransportFact::Registered if !self.map_exists => {
+                            self.map_exists = true;
+                            view.exists(ComponentKind::SupervisorMap, step);
+                        }
+                        TransportFact::Admitted { kind, .. }
+                            if *kind == ZAKURA_STREAM_HEADER_SYNC && !self.sessions_exist =>
+                        {
+                            self.sessions_exist = true;
+                            view.exists(ComponentKind::HeaderSessions, step);
+                        }
+                        _ => {}
                     }
-                    TransportFact::Registered if !self.map_exists => {
-                        self.map_exists = true;
-                        view.exists(ComponentKind::SupervisorMap, step);
+                    if let Some(connection) = connection {
+                        self.installs
+                            .row(*connection, event, self.header_service)
+                            .map_err(|why| format!("{why} at step {step}"))?;
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -320,6 +370,15 @@ fn unhanded(name: &str, step: u64) -> String {
     format!("UnhandedRead: {name}'s read-registered row at step {step} came with no read")
 }
 
+/// `direction` as the log names it.
+fn direction(direction: ServicePeerDirection) -> String {
+    match direction {
+        ServicePeerDirection::Inbound => "inbound",
+        ServicePeerDirection::Outbound => "outbound",
+    }
+    .to_owned()
+}
+
 /// A panic's message, if it has one.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
@@ -334,6 +393,7 @@ fn kind(key: &ReadKey) -> Result<ComponentKind, String> {
     match key {
         ReadKey::Budget => Ok(ComponentKind::Budget),
         ReadKey::SupervisorMap => Ok(ComponentKind::SupervisorMap),
+        ReadKey::HeaderSessions { .. } => Ok(ComponentKind::HeaderSessions),
         unknown => Err(format!("UnknownRead: no component reads {unknown:?}")),
     }
 }
@@ -347,6 +407,13 @@ fn reading(key: &ReadKey, read: diag::Read<OwnerState>) -> Result<Read<Reading>,
         (ReadKey::SupervisorMap, diag::Read::Current(OwnerState::SupervisorMap(entries))) => {
             Read::Current(Reading::SupervisorMap(entries))
         }
+        (
+            ReadKey::HeaderSessions { service },
+            diag::Read::Current(OwnerState::HeaderSessions(sessions)),
+        ) => Read::Current(Reading::HeaderSessions {
+            service: *service,
+            sessions,
+        }),
         (key, diag::Read::Current(unknown)) => {
             return Err(format!(
                 "UnknownRead: {key:?}'s read holds {unknown:?}, which no component reads"
@@ -355,6 +422,59 @@ fn reading(key: &ReadKey, read: diag::Read<OwnerState>) -> Result<Read<Reading>,
         (_, diag::Read::Held { holder }) => Read::Held { holder },
         (_, diag::Read::Gone) => Read::Gone,
     })
+}
+
+/// Each connection's header-sync install records since its last registry
+/// fanout (M6a-7b). The header service installs or refuses inside the
+/// registry's `add_peer` call, so each fanout that reached header sync
+/// follows exactly one install record of its connection, and one that
+/// didn't follows none. An `Installed` stands as an effect even if the
+/// table changes again before a boundary.
+#[derive(Default)]
+struct Installs {
+    /// Install records seen since each connection's last fanout.
+    pending: BTreeMap<u64, u64>,
+}
+
+impl Installs {
+    /// Folds `event`, a transport row of `connection`, where `service` is
+    /// the header-sync service the registry holds.
+    fn row(
+        &mut self,
+        connection: u64,
+        event: &TransportFact,
+        service: Option<u64>,
+    ) -> Result<(), String> {
+        let named = match event {
+            TransportFact::Installed { service, .. }
+            | TransportFact::InstallRefused { service, .. } => {
+                *self.pending.entry(connection).or_default() += 1;
+                *service
+            }
+            TransportFact::Removed { service, .. }
+            | TransportFact::RemoveIgnored { service, .. } => *service,
+            TransportFact::RegistryFanout { admitted_mask, .. } => {
+                let installs = self.pending.remove(&connection).unwrap_or(0);
+                let expected = u64::from(admitted_mask & ZAKURA_CAP_HEADER_SYNC != 0);
+                if installs != expected {
+                    return Err(format!(
+                        "FanoutInstalls: connection {connection}'s fanout with mask \
+                         {admitted_mask:#x} follows {installs} header-sync install records \
+                         since its last, not {expected}"
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if Some(named) != service {
+            return Err(format!(
+                "ForeignService: connection {connection}'s session record names header-sync \
+                 service {named}, but the registry holds {service:?}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `read` as the log holds it.
@@ -384,6 +504,26 @@ fn record(read: &Read<Reading>) -> ComponentReading {
                         connection: entry.conn_id,
                         peer: hex(&entry.peer.digest()),
                         remote_ip: entry.remote_ip.map(|ip| ip.to_string()),
+                    })
+                    .collect(),
+            })
+        }
+        Read::Current(Reading::HeaderSessions { service, sessions }) => {
+            ComponentReading::Current(ComponentValue::HeaderSessions {
+                service: *service,
+                sessions: sessions
+                    .iter()
+                    .map(|session| SessionRow {
+                        peer: hex(&session.peer.digest()),
+                        connection: session.conn_id,
+                        session_id: session.session_id,
+                        direction: direction(session.direction),
+                        installed: session.installed.map(|facts| InstallRow {
+                            negotiated: facts.negotiated,
+                            stream_version: facts.stream_version,
+                            quic_stream: facts.quic_stream,
+                            direction: direction(facts.direction),
+                        }),
                     })
                     .collect(),
             })

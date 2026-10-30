@@ -569,6 +569,15 @@ pub enum ComponentValue {
         /// Each registered connection, by connection.
         entries: Vec<MapRow>,
     },
+    /// The session table of the header-sync service the registry reaches
+    /// (M6a-7b).
+    HeaderSessions {
+        /// The service's allocation ID, which its install and removal
+        /// records carry.
+        service: u64,
+        /// Each peer's current session, by connection and session ID.
+        sessions: Vec<SessionRow>,
+    },
 }
 
 /// One registered connection in [`ComponentValue::SupervisorMap`].
@@ -581,6 +590,39 @@ pub struct MapRow {
     /// The remote IP it was admitted from, if the transport knew it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_ip: Option<String>,
+}
+
+/// One peer's current session in [`ComponentValue::HeaderSessions`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SessionRow {
+    /// The peer's ID, as hex.
+    pub peer: String,
+    /// The session's connection.
+    pub connection: u64,
+    /// The service session's ID, as `Admitted` and `Session` name it.
+    pub session_id: u64,
+    /// The connection's direction as the table holds it: `inbound` or
+    /// `outbound`.
+    pub direction: String,
+    /// What the service installed it from, or `None` for an entry put in
+    /// the table some other way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<InstallRow>,
+}
+
+/// What a header-sync service installed a session from, in a
+/// [`SessionRow`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InstallRow {
+    /// The capability mask the connection negotiated.
+    pub negotiated: u64,
+    /// The header stream's version.
+    pub stream_version: u16,
+    /// The header stream's QUIC stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quic_stream: Option<u64>,
+    /// The connection's direction, from the `Peer`.
+    pub direction: String,
 }
 
 impl Observation {
@@ -2522,6 +2564,45 @@ pub enum TransportFact {
     RegistryRemoved {
         /// The services' capability mask.
         admitted_mask: u64,
+    },
+    /// A header-sync service put the connection's session in its table,
+    /// reported under the table's lock at the insert (M6a-7b).
+    Installed {
+        /// The service's allocation ID.
+        service: u64,
+        /// The service session's ID.
+        session_id: u64,
+        /// The header stream's QUIC stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
+    },
+    /// A header-sync service's `add_peer` installed nothing for the
+    /// connection (M6a-7b).
+    InstallRefused {
+        /// The service's allocation ID.
+        service: u64,
+        /// Why, such as `regulation_contract`.
+        reason: String,
+    },
+    /// A session of the connection left a header-sync service's table,
+    /// reported under the table's lock (M6a-7b).
+    Removed {
+        /// The service's allocation ID.
+        service: u64,
+        /// The removed session's ID.
+        session_id: u64,
+        /// What removed it: `replaced`, `teardown` or `remove-peer`.
+        cause: String,
+    },
+    /// A session's teardown removed nothing, since the table held a newer
+    /// session (M6a-7b).
+    RemoveIgnored {
+        /// The service's allocation ID.
+        service: u64,
+        /// The stale session's ID.
+        session_id: u64,
+        /// What tried to remove it.
+        cause: String,
     },
 }
 

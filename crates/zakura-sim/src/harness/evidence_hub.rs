@@ -242,7 +242,9 @@ impl EvidenceHub {
     }
 
     /// Runs the boundary reads the node's transport tap keeps in `sink`,
-    /// whose rows, as tap `instance`, report their registration (M6a-7b).
+    /// whose rows, as tap `instance`, report their registration, and reads
+    /// the session table of header-sync service `service`, the one the
+    /// node's registry holds (M6a-7b).
     ///
     /// # Panics
     ///
@@ -250,11 +252,14 @@ impl EvidenceHub {
     pub(crate) fn transport_reads(
         &mut self,
         (sink, instance): (super::header_node::reads::ReadSink, u64),
+        service: u64,
     ) {
-        self.reads
+        let reads = self
+            .reads
             .as_mut()
-            .expect("the node's reactor gives the hub its view first")
-            .transport(sink, instance);
+            .expect("the node's reactor gives the hub its view first");
+        reads.transport(sink, instance);
+        reads.header_sessions(service);
     }
 
     /// Reads the node's selected chain from `port` at each boundary.

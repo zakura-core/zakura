@@ -38,6 +38,8 @@ pub struct Incarnation {
     pub reservations: Vec<u64>,
     /// Its request, once it started.
     pub started: Option<ReactorRequest>,
+    /// Whether its request was retired.
+    pub retired: bool,
     /// The prepare and apply calls that captured its leases, in call order.
     pub calls: Vec<u64>,
 }
@@ -52,6 +54,8 @@ pub struct WorkLedger {
     calls: BTreeSet<u64>,
     /// Calls whose leases were captured.
     captured: BTreeSet<u64>,
+    /// Each peer's most recently started incarnation.
+    latest: BTreeMap<String, u64>,
 }
 
 impl WorkLedger {
@@ -116,8 +120,20 @@ impl WorkLedger {
                         peer: placed.peer.clone(),
                         reservations: Vec::new(),
                         started: None,
+                        retired: false,
                         calls: Vec::new(),
                     });
+                // A continuation binds to work that already started, which
+                // must be its peer's current round.
+                if work.started.is_some()
+                    && (work.retired || self.latest.get(&placed.peer) != Some(incarnation))
+                {
+                    return Err(format!(
+                        "StaleBinding: reservation {reservation} was bound to {}'s incarnation \
+                         {incarnation}, which isn't its current round",
+                        placed.peer
+                    ));
+                }
                 if work.peer != placed.peer {
                     return Err(format!(
                         "ForeignBinding: reservation {reservation}, placed for {}, was bound to \
@@ -136,14 +152,18 @@ impl WorkLedger {
                     ));
                 }
                 work.started = Some(request.clone());
+                self.latest
+                    .insert(request.peer.clone(), request.incarnation);
             }
             ReactorFact::Retired { request, .. } => {
-                if self.known(request)?.started.is_none() {
+                let work = self.known(request)?;
+                if work.started.is_none() || work.retired {
                     return Err(format!(
-                        "UnknownIncarnation: incarnation {} retired before it started",
+                        "UnknownIncarnation: incarnation {} retired before it started, or twice",
                         request.incarnation
                     ));
                 }
+                work.retired = true;
             }
             ReactorFact::Dispatched { call, .. } => {
                 self.calls.insert(*call);
@@ -361,7 +381,13 @@ mod tests {
         assert_eq!(ledger.settled(&snapshot("01", 1, 2)), Ok(()));
         assert_eq!(ledger.incarnation(1).unwrap().reservations, [1, 2]);
 
-        let broken: [(&[ReactorFact], &str); 6] = [
+        let retired = ReactorFact::Retired {
+            request: request("01", 1),
+            phase: "receiving".into(),
+            purpose: ReactorPurpose::Normal,
+            reason: "local_error".into(),
+        };
+        let broken: [(&[ReactorFact], &str); 8] = [
             (&[placed(1, "01"), placed(1, "01")], "DuplicateResource"),
             (&[bound(1, 1)], "UnplacedBinding"),
             (
@@ -381,6 +407,30 @@ mod tests {
                     started("01", 1),
                 ],
                 "DuplicateIncarnation",
+            ),
+            (
+                &[
+                    placed(1, "01"),
+                    bound(1, 1),
+                    started("01", 1),
+                    retired.clone(),
+                    placed(2, "01"),
+                    bound(2, 1),
+                ],
+                "StaleBinding",
+            ),
+            (
+                &[
+                    placed(1, "01"),
+                    bound(1, 1),
+                    started("01", 1),
+                    placed(2, "01"),
+                    bound(2, 2),
+                    started("01", 2),
+                    placed(3, "01"),
+                    bound(3, 1),
+                ],
+                "StaleBinding",
             ),
         ];
         for (facts, name) in broken {

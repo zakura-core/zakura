@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     build::FuzzBuild,
-    run::{close, fuzzer_command, read_end, run_logged, verify_files, Prepared},
+    run::{close, fuzzer_command, read_end, run_logged, verify_end, Prepared},
     snapshot::Source,
     store::{
         now_unix, partial_path, read_record, record_bytes, write_once, CampaignError, Digest,
@@ -451,7 +451,7 @@ impl Store {
 
     /// Ends `parent` if it's open, by [`close`], and returns its end
     /// record's snapshot to start from, after checking that snapshot and
-    /// every failure file the record lists.
+    /// the record against the run's files.
     fn ended_head(&self, parent: &Digest) -> Result<Digest, CampaignError> {
         match self.run_state(parent)? {
             RunState::Running => {
@@ -465,8 +465,8 @@ impl Store {
             RunState::Ended => {}
         }
         let end = read_end(self, parent)?;
+        verify_end(self, parent, &self.read_manifest(parent)?, &end)?;
         self.verify_snapshot(end.head())?;
-        verify_files(self, &end.failures)?;
         Ok(end.head().clone())
     }
 }

@@ -382,8 +382,71 @@ pub fn read_end(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
     Ok(end)
 }
 
+/// Checks run `digest`'s end record against the run's own files: every
+/// failure file it lists is in the store with its digest, every file in the
+/// run's failure directories is listed, and its snapshot holds the initial
+/// snapshot's inputs and every input in the workers' corpora. So a record
+/// left by a stale or mixed copy of the store can't name an older snapshot
+/// or leave a failure out. The snapshots' own inputs are
+/// [`Store::verify_snapshot`]'s to check.
+pub(super) fn verify_end(
+    store: &Store,
+    digest: &Digest,
+    manifest: &Manifest,
+    end: &End,
+) -> Result<(), CampaignError> {
+    verify_files(store, &end.failures)?;
+    let listed: BTreeSet<&str> = end.failures.iter().map(|file| file.path.as_str()).collect();
+    let dir = store.run_dir(digest);
+    for failure_dir in failure_dirs(&dir, manifest) {
+        for path in files_under(&failure_dir)? {
+            if !listed.contains(store_path(store, &path)?.as_str()) {
+                return Err(CampaignError::corrupt(
+                    &path,
+                    format!("it's a failure file of run {digest}, and its end record omits it"),
+                ));
+            }
+        }
+    }
+    let held: BTreeSet<Digest> = store
+        .read_index(&end.snapshot)?
+        .inputs
+        .into_iter()
+        .map(|entry| entry.sha256)
+        .collect();
+    let snapshot = store.snapshot_dir(&end.snapshot);
+    for entry in store.read_index(&manifest.initial_snapshot)?.inputs {
+        if !held.contains(&entry.sha256) {
+            return Err(CampaignError::corrupt(
+                &snapshot,
+                format!(
+                    "run {digest} ended with it, and it lacks input {} of the run's initial \
+                     snapshot",
+                    entry.sha256
+                ),
+            ));
+        }
+    }
+    for plan in &manifest.workers {
+        for path in files_under(&worker_dir(&dir, plan.index).join(CORPUS_DIR))? {
+            let input = Digest::of_file(&path)
+                .map_err(CampaignError::io(format!("reading {}", path.display())))?;
+            if !held.contains(&input) {
+                return Err(CampaignError::corrupt(
+                    &snapshot,
+                    format!(
+                        "run {digest} ended with it, and it lacks the worker input {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks that each of `files` is in the store with its digest.
-pub(super) fn verify_files(store: &Store, files: &[FileRecord]) -> Result<(), CampaignError> {
+fn verify_files(store: &Store, files: &[FileRecord]) -> Result<(), CampaignError> {
     for file in files {
         let relative = Path::new(&file.path);
         if !relative
@@ -799,15 +862,7 @@ fn finish(
         _ => None,
     };
     let mut failures = Vec::new();
-    let failure_dirs = manifest
-        .workers
-        .iter()
-        .flat_map(|plan| {
-            let worker = worker_dir(&dir, plan.index);
-            [worker.join(ARTIFACTS_DIR), worker.join(SIM_DIR)]
-        })
-        .chain([dir.join(COMPACT_ARTIFACTS_DIR), dir.join(COMPACT_SIM_DIR)]);
-    for failure_dir in failure_dirs {
+    for failure_dir in failure_dirs(&dir, manifest) {
         for path in files_under(&failure_dir)? {
             failures.push(file_record(store, &path)?);
         }
@@ -971,6 +1026,20 @@ fn live_fuzzer(worker: &Path, fuzzer: &Path) -> Option<u32> {
     (fs::canonicalize(fuzzer).ok()? == exe).then_some(pid)
 }
 
+/// The directories of run `dir` whose files are failures: each worker's
+/// libFuzzer artifacts and saved inputs, and the compaction's.
+fn failure_dirs(dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
+    manifest
+        .workers
+        .iter()
+        .flat_map(|plan| {
+            let worker = worker_dir(dir, plan.index);
+            [worker.join(ARTIFACTS_DIR), worker.join(SIM_DIR)]
+        })
+        .chain([dir.join(COMPACT_ARTIFACTS_DIR), dir.join(COMPACT_SIM_DIR)])
+        .collect()
+}
+
 /// Run `dir`'s worker `index`'s directory.
 fn worker_dir(dir: &Path, index: usize) -> PathBuf {
     dir.join(WORKERS_DIR).join(index.to_string())
@@ -983,6 +1052,16 @@ fn already_ended(digest: &Digest) -> CampaignError {
 
 /// The file at `path`, which is under the store's root, as a record.
 fn file_record(store: &Store, path: &Path) -> Result<FileRecord, CampaignError> {
+    Ok(FileRecord {
+        path: store_path(store, path)?,
+        sha256: Digest::of_file(path)
+            .map_err(CampaignError::io(format!("reading {}", path.display())))?,
+    })
+}
+
+/// `path`, which is under the store's root, relative to the root with `/`
+/// separators, as a [`FileRecord`] holds it.
+fn store_path(store: &Store, path: &Path) -> Result<String, CampaignError> {
     let relative = path.strip_prefix(store.root()).map_err(|_| {
         CampaignError::Refused(format!(
             "{} isn't under the store's root {}",
@@ -990,15 +1069,11 @@ fn file_record(store: &Store, path: &Path) -> Result<FileRecord, CampaignError> 
             store.root().display()
         ))
     })?;
-    Ok(FileRecord {
-        path: relative
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/"),
-        sha256: Digest::of_file(path)
-            .map_err(CampaignError::io(format!("reading {}", path.display())))?,
-    })
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 /// `value` as one line of JSON.

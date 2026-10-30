@@ -233,18 +233,17 @@ impl Store {
     }
 
     /// Whether the run of manifest `digest` is going, and whether it ended.
+    /// A run whose lock a supervisor holds is running, whatever files its
+    /// directory holds.
     pub fn run_state(&self, digest: &Digest) -> Result<RunState, CampaignError> {
         let dir = self.run_dir(digest);
+        if dir.exists() && !probe(&dir.join(LOCK_FILE))? {
+            return Ok(RunState::Running);
+        }
         if dir.join(super::run::END_FILE).exists() {
             return Ok(RunState::Ended);
         }
-        if !dir.exists() {
-            return Ok(RunState::Open);
-        }
-        match probe(&dir.join(LOCK_FILE))? {
-            true => Ok(RunState::Open),
-            false => Ok(RunState::Running),
-        }
+        Ok(RunState::Open)
     }
 
     /// Locks the run of manifest `digest` for this process. Refuses if

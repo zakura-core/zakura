@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, fs};
 
 use super::{
-    run::{read_end, verify_files, Compaction},
+    run::{read_end, verify_end, Compaction},
     store::{CampaignError, Digest, RunState, Store},
 };
 
@@ -28,9 +28,10 @@ pub struct Verified {
 }
 
 /// Checks every record in `store`: each manifest, snapshot index, input,
-/// fuzzer binary and listed failure file matches its digest, each run an
-/// end record names is in the store, and each manifest's parent and build
-/// are too. Returns the first problem it finds.
+/// fuzzer binary and listed failure file matches its digest, each end
+/// record matches its run's files, each run an end record names is in the
+/// store, and each manifest's parent and build are too. Returns the first
+/// problem it finds.
 pub fn verify(store: &Store) -> Result<Verified, CampaignError> {
     let mut verified = Verified::default();
     let manifests = store.manifests()?;
@@ -61,7 +62,7 @@ pub fn verify(store: &Store) -> Result<Verified, CampaignError> {
                 if let Some(Compaction::Compacted { snapshot, .. }) = &end.compaction {
                     named.insert(snapshot.clone());
                 }
-                verify_files(store, &end.failures)?;
+                verify_end(store, digest, manifest, &end)?;
                 verified.failures += end.failures.len();
             }
         }

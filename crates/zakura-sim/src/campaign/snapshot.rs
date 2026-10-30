@@ -148,6 +148,23 @@ impl Store {
         Ok(Snapshot { digest, index })
     }
 
+    /// Reads snapshot `digest`'s index, and checks its digest and version,
+    /// but not its inputs.
+    pub(super) fn read_index(&self, digest: &Digest) -> Result<SnapshotIndex, CampaignError> {
+        let path = self.snapshot_dir(digest).join(INDEX_FILE);
+        let index: SnapshotIndex = read_record(&path, Some(digest))?;
+        if index.version != STORE_VERSION {
+            return Err(CampaignError::corrupt(
+                &path,
+                format!(
+                    "it's at version {}, and this build reads {STORE_VERSION}",
+                    index.version
+                ),
+            ));
+        }
+        Ok(index)
+    }
+
     /// Reads snapshot `digest` and checks it: the index's digest is the
     /// snapshot's name, the index is in digest order with each input once,
     /// every input file is there with the index's digest and length, and no
@@ -155,16 +172,7 @@ impl Store {
     pub fn verify_snapshot(&self, digest: &Digest) -> Result<Snapshot, CampaignError> {
         let dir = self.snapshot_dir(digest);
         let index_path = dir.join(INDEX_FILE);
-        let index: SnapshotIndex = read_record(&index_path, Some(digest))?;
-        if index.version != STORE_VERSION {
-            return Err(CampaignError::corrupt(
-                &index_path,
-                format!(
-                    "it's at version {}, and this build reads {STORE_VERSION}",
-                    index.version
-                ),
-            ));
-        }
+        let index = self.read_index(digest)?;
         if !index
             .inputs
             .windows(2)

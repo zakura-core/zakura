@@ -378,13 +378,25 @@ fn running(store: &Store) -> Digest {
 }
 
 /// Kills `child`, a supervisor of `run`, and waits for the run's lock to
-/// free.
+/// free and for its workers' stand-in fuzzers, which see their parent die,
+/// to exit.
 fn kill(store: &Store, mut child: Child, run: &Digest) {
     child.kill().unwrap();
     child.wait().unwrap();
     wait_for("the run's lock to free", || {
         store.run_state(run).unwrap() == RunState::Open
     });
+    wait_for("the run's workers' fuzzers to exit", || !runs_a_worker(run));
+}
+
+/// True if a process's command line names one of `run`'s worker
+/// directories, as each worker fuzzer's corpus directory does.
+fn runs_a_worker(run: &Digest) -> bool {
+    let workers = format!("{run}/workers/");
+    fs::read_dir("/proc").unwrap().any(|entry| {
+        let cmdline = fs::read(entry.unwrap().path().join("cmdline")).unwrap_or_default();
+        String::from_utf8_lossy(&cmdline).contains(&workers)
+    })
 }
 
 /// Starts the CLI command `args` and kills it once both workers of the run
@@ -1118,6 +1130,57 @@ fn close_reads_past_a_garbled_attempts_line() {
     let end = campaign::close(&fixture.store, &run).unwrap();
     assert_eq!(end.workers[0].attempts, 2, "{end:?}");
     assert_eq!(end.workers[0].millis, 10);
+}
+
+/// `verify` and `resume` check an end record against its run's files: a
+/// record that omits a failure file or names an older snapshot is refused.
+/// A run whose lock a supervisor holds is running, even beside an end
+/// record.
+#[test]
+fn end_records_match_their_runs() {
+    let fixture = Fixture::new();
+    fixture.set("crash");
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert!(!end.failures.is_empty() && end.added > 0, "{end:?}");
+    let manifest = fixture.store.read_manifest(&run).unwrap();
+    let path = fixture.store.run_dir(&run).join("end.json");
+    let original = fs::read(&path).unwrap();
+    let rewrite = |change: &dyn Fn(&mut End)| {
+        let mut changed = end.clone();
+        change(&mut changed);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    };
+    let refused = |what: &str| {
+        let verified = campaign::verify(&fixture.store);
+        assert!(
+            matches!(verified, Err(CampaignError::Corrupt { .. })),
+            "{what}: {verified:?}"
+        );
+        let resumed = campaign::prepare_resume(&fixture.store, ResumeOptions::default());
+        assert!(
+            matches!(resumed, Err(CampaignError::Corrupt { .. })),
+            "{what}: {resumed:?}"
+        );
+    };
+    rewrite(&|end| end.failures.clear());
+    refused("a record without its failures");
+    rewrite(&|end| {
+        end.snapshot = manifest.initial_snapshot.clone();
+        end.added = 0;
+    });
+    refused("a record with the initial snapshot");
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, &original).unwrap();
+    campaign::verify(&fixture.store).unwrap();
+
+    let prepared = campaign::prepare_resume(&fixture.store, ResumeOptions::default()).unwrap();
+    let next = fixture.store.run_dir(prepared.manifest()).join("end.json");
+    fs::write(&next, &original).unwrap();
+    assert_eq!(
+        fixture.store.run_state(prepared.manifest()).unwrap(),
+        RunState::Running
+    );
 }
 
 /// A run that a supervisor holds can't be closed or resumed, and `status`

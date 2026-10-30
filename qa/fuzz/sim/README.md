@@ -134,7 +134,9 @@ main.
   and writes the end record.
 - `resume` continues the last run. If that run has no end record, because
   its supervisor or host stopped, `resume` first closes it. It checks the
-  run's snapshot and failure files against their digests, then runs a new
+  run's snapshot and failure files against their digests, and checks that
+  the end record lists every failure file in the run's directory and that
+  its snapshot holds every input the workers added, then runs a new
   manifest from that snapshot, with `resume_parent` naming the run. It
   refuses a build with another identity, another harness version, or other
   feedback.
@@ -144,7 +146,8 @@ main.
   runs in its own process group, which the supervisor kills at the
   compaction's time limit. A supervisor killed first leaves the merge
   running; stop it with `kill -- -<pid>`.
-- `status` lists the runs, and `verify` checks every record in the store.
+- `status` lists the runs, and `verify` checks every record in the store,
+  and each end record against its run's files as `resume` does.
 
 Every run ends with exactly one end record, `runs/<manifest>/end.json`, with
 one of three statuses:

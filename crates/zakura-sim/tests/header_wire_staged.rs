@@ -10,14 +10,13 @@ mod support;
 
 use std::rc::Rc;
 
-use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Policy,
         },
-        header_sync::{HeaderWire, WireScenario, FAMILY},
+        header_sync::{staged_work_properties, HeaderWire, WireScenario, FAMILY},
         run_prepared,
         wire_plans::SavedPlan,
         HarnessError, Subsystem,
@@ -25,7 +24,6 @@ use zakura_sim::{
     observe::{ReactorCall, ReactorFact, ReactorWorkState},
     peer::{honest::HonestSpec, PeerSpec},
     property::{Assumptions, HasView, Registry, RegistryChecker},
-    table::{downstream_properties, Effect},
     Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -38,17 +36,12 @@ impl HasView for Nothing {
     fn view(&self) {}
 }
 
-/// The header family's `receiver-work-authorized` properties, one per
-/// response row. The other downstream templates need peer-side credit rows
-/// that `header-sync/wire` doesn't log yet.
+/// The header family's `receiver-work-authorized` properties on the wire
+/// tier's sources. The other downstream templates need peer-side credit
+/// rows that `header-sync/wire` doesn't log yet.
 fn work_checker() -> RegistryChecker<Nothing> {
-    let properties =
-        downstream_properties::<Nothing>(FAMILY, &RegtestMessage::LAYOUT, &[Effect::Work])
-            .into_iter()
-            .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
-            .collect();
     RegistryChecker::new(
-        Registry::new(properties).expect("one per row"),
+        Registry::new(staged_work_properties()).expect("one per row"),
         Rc::new(Nothing),
         Assumptions::none(),
         &HeaderWire::sources(),

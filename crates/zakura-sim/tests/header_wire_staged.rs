@@ -291,3 +291,58 @@ fn saved_plans_have_no_unframed_work() {
     }
     assert!(admitted > 0, "the saved Plans stage pages");
 }
+
+/// Each outcome the node handles names the frame it came in: the peer's
+/// outcome frame on the session's connection and QUIC stream, by its read
+/// seq. Today's honest runs handle only outcomes for work already gone,
+/// which is enough to follow the tag from the session reader.
+///
+/// This fails if the reader drops an outcome's frame tag.
+#[test]
+fn a_handled_outcome_names_its_frame() {
+    let report = run(&honest(1_200), Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let mut named = 0;
+    for (at, entry) in entries.iter().enumerate() {
+        let Observation::Reactor {
+            event: ReactorFact::Outcome {
+                session_id, frame, ..
+            },
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        let frame = frame.expect("a wire outcome names its frame");
+        let (connection, quic_stream) = entries[..at]
+            .iter()
+            .find_map(|before| match &before.obs {
+                Observation::Session {
+                    connection,
+                    quic_stream,
+                    session_id: s,
+                    ..
+                } if s == session_id => Some((*connection, *quic_stream)),
+                _ => None,
+            })
+            .expect("the outcome's session was admitted");
+        assert_eq!(frame.quic_stream, quic_stream);
+        assert!(
+            entries[..at].iter().any(|before| matches!(
+                &before.obs,
+                Observation::PeerFrame {
+                    connection: c,
+                    quic_stream: Some(q),
+                    seq,
+                    row: Some(row),
+                    ..
+                } if *c == connection && *q == quic_stream && *seq == frame.seq
+                    && row == "headers-outcome"
+            )),
+            "outcome frame {frame:?} is a peer outcome frame"
+        );
+        named += 1;
+    }
+    assert!(named > 0, "the node handled an outcome");
+}

@@ -277,6 +277,22 @@ def reset(config, delay):
     return run
 
 
+def wait_for_primary(run):
+    """Wait for the restarted miner to expose this run before reconnecting its peer."""
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            parameters = rpc(18232, 'getnetworkparameters')
+        except (OSError, RuntimeError):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('mining node did not become ready after restart')
+            time.sleep(1)
+            continue
+        if parameters['network'] != run['network']['name'] or parameters['pqP2shActivationHeight'] != run['activation_height'] or parameters['nu7ActivationHeight'] != run['activation_height']:
+            raise ValueError('restarted mining node does not match this run')
+        return
+
+
 class Controller:
     def __init__(self, config):
         self.config = config
@@ -310,6 +326,9 @@ class Controller:
                     # Repeating this step after a crash only restarts the same named service.
                     atomic_text(self.root / 'node0.toml', node_config(self.config, run, 0, mining=True))
                     command('systemctl', 'restart', f'{self.config["service_prefix"]}-node0.service')
+                    wait_for_primary(run)
+                    # A fresh initial-peer dial avoids retaining the closed pre-mining connection.
+                    command('systemctl', 'restart', f'{self.config["service_prefix"]}-node1.service')
                     run['phase'] = 'mining'
                     atomic_json(self.root / 'run.json', run)
                 if result['nodes'] and run['phase'] in ('mining', 'active'):

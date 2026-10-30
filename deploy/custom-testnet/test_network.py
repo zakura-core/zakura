@@ -63,11 +63,12 @@ class NetworkTests(unittest.TestCase):
         with patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command, patch.object(network.time, 'time', return_value=299):
             controller.sample(advance=True)
             command.assert_not_called()
-        with patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command, patch.object(network.time, 'time', return_value=300):
+        with patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command, patch.object(network.time, 'time', return_value=300), patch.object(network, 'wait_for_primary'):
             controller = network.Controller(self.config)
             controller.sample(advance=True)
             controller.sample(advance=True)
-            command.assert_called_once_with('systemctl', 'restart', 'pq-testnet-node0.service')
+            self.assertEqual(command.call_count, 2)
+            command.assert_has_calls([unittest.mock.call('systemctl', 'restart', 'pq-testnet-node0.service'), unittest.mock.call('systemctl', 'restart', 'pq-testnet-node1.service')])
         self.assertIn('internal_miner = true', (self.root / 'node0.toml').read_text())
         self.assertFalse((self.root / 'node1.toml').exists())
 
@@ -204,6 +205,15 @@ class NetworkTests(unittest.TestCase):
             blocks, interval = controller.recent_blocks({'height': 4420650, 'hash': 'tip'}, 4420649)
         self.assertEqual(len(blocks), 6)
         self.assertEqual(interval, 451)
+
+    def test_miner_readiness_requires_matching_activation_parameters(self):
+        params = dict(network=self.run['network']['name'], pqP2shActivationHeight=4420649, nu7ActivationHeight=4420649)
+        with patch.object(network, 'rpc', return_value=params):
+            network.wait_for_primary(self.run)
+        params['nu7ActivationHeight'] = 4465026
+        with patch.object(network, 'rpc', return_value=params):
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                network.wait_for_primary(self.run)
 
     def test_activation_delay_is_bounded(self):
         self.assertEqual(network.activation_delay('5m'), 300)

@@ -23,7 +23,9 @@ directories, and restores the preserved archive. It creates a new name, network
 magic, node identity, participant configuration, and run identifier each time.
 The countdown starts after both nodes agree with the recorded seed hash. A
 controller restart resumes the recorded countdown; status queries never enable
-mining. Concurrent resets are refused. A failed reset leaves mining stopped.
+mining. At the deadline, the controller waits for the restarted miner to become
+ready, then restarts its observer to reconnect through the initial peer.
+Concurrent resets are refused. A failed reset leaves mining stopped.
 Previous fork balances and transactions do not carry into the new run.
 
 The five-minute countdown is deliberate: the historical seed can immediately

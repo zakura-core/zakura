@@ -554,6 +554,38 @@ mod tests {
         ledger.received(CONN, STREAM, 0, &a).unwrap();
     }
 
+    /// An obsolete claim skipped on dequeue starts no write, so the next
+    /// output's frame is the stream's write 0: output 0 is skipped, output
+    /// 1 is written as write 0, and a peer's read of write 0 maps to output
+    /// 1, not output 0.
+    ///
+    /// This fails if a receipt is mapped by output number instead of write
+    /// `seq`.
+    #[test]
+    fn an_obsolete_skip_keeps_the_receipt_mapping() {
+        let (skipped, written) = (frame(1), frame(2));
+        let mut ledger = OutputLedger::default();
+        feed(
+            &mut ledger,
+            &[
+                allocated(0, &skipped),
+                allocated(1, &written),
+                enqueued(0, 0),
+                enqueued(1, 1),
+                dequeued(0),
+                ended(0, OutputEnd::UnwrittenObsolete),
+                dequeued(1),
+                started(0, 1, &written),
+                self::written(0),
+                ended(1, OutputEnd::Written),
+            ],
+        )
+        .unwrap();
+        ledger.received(CONN, STREAM, 0, &written).unwrap();
+        let why = ledger.received(CONN, STREAM, 0, &skipped).unwrap_err();
+        assert!(why.contains("its output 1 was queued as"), "{why}");
+    }
+
     /// Fails if a second end passes, as a terminal reported from a
     /// cancellation arm as well as from `Drop` would be.
     #[test]

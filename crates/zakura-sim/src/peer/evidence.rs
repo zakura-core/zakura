@@ -824,6 +824,85 @@ mod tests {
         );
     }
 
+    /// A frame a peer read is checked against its output when it's placed,
+    /// whether or not the peer's task ever handles it: a read of the node's
+    /// write 0 whose bytes differ from output 0's fails the fold, though no
+    /// `Handled` record follows (M6a-6).
+    ///
+    /// This fails if receipts aren't checked against the output ledger, or
+    /// only once the peer handles them.
+    #[test]
+    fn a_receipt_never_handled_is_still_checked() {
+        let written = Frame {
+            message_type: RegtestMessage::ROWS[0].message_type,
+            flags: 0,
+            payload: vec![1; 4],
+        };
+        let read = Frame {
+            payload: vec![2; 4],
+            ..written.clone()
+        };
+        let fingerprint = zakura_network::zakura::frame_fingerprint(&written);
+        let lived = || {
+            let mut items = vec![
+                transport(1, Some(1), TransportFact::Registered),
+                session(1, 7),
+            ];
+            items.extend(
+                [
+                    TransportFact::OutputAllocated {
+                        quic_stream: 4,
+                        output: 0,
+                        message_type: written.message_type,
+                        payload_len: 4,
+                        expected: fingerprint,
+                    },
+                    TransportFact::OutputEnqueued {
+                        quic_stream: 4,
+                        output: 0,
+                        order: 0,
+                    },
+                    TransportFact::OutputDequeued {
+                        quic_stream: 4,
+                        output: 0,
+                    },
+                    TransportFact::FrameWriteStarted {
+                        quic_stream: 4,
+                        seq: 0,
+                        message_type: written.message_type,
+                        output: Some(0),
+                        fingerprint,
+                    },
+                ]
+                .into_iter()
+                .map(|fact| transport(2, Some(1), fact)),
+            );
+            items
+        };
+        let received = |frame: &Frame| {
+            Item::Record(record(RecordBody::Received {
+                seq: 0,
+                message_type: frame.message_type,
+                payload: 4,
+                credit: None,
+                frame: frame.clone(),
+                at: Duration::ZERO,
+            }))
+        };
+        let mut good = lived();
+        good.push(received(&written));
+        fold(&mut WireEvidence::default(), &mut Vec::new(), good)
+            .expect("the frame the peer read is output 0's");
+        let mut bad = lived();
+        bad.push(received(&read));
+        let why = fold(&mut WireEvidence::default(), &mut Vec::new(), bad)
+            .expect_err("the frame the peer read isn't output 0's");
+        assert!(
+            why.starts_with("OutputLedger: a peer read the node's write 0"),
+            "{why}"
+        );
+    }
+
     /// A record waits while its stream may still be admitted, and is
     /// forgotten once the node refuses the stream or the handshake, or tears
     /// the connection down first. Its `peer-emitted` row already holds it,

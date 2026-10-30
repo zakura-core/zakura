@@ -19,9 +19,7 @@ use super::store::{
 #[path = "../../build/provenance.rs"]
 mod provenance;
 
-/// The nightly toolchain that builds the simulator fuzz targets, as
-/// `header-fuzz.yml` and `tests-unit.yml` pin it.
-pub const NIGHTLY: &str = "nightly-2026-07-15";
+pub use crate::suite::NIGHTLY;
 
 /// The simulator fuzz package, relative to the repository's root.
 pub const FUZZ_PACKAGE: &str = "qa/fuzz/sim";

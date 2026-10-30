@@ -201,3 +201,33 @@ fn counters_saturate_and_clear() {
     counters.clear();
     assert!(counters.hits().is_empty());
 }
+
+/// Each feature keeps its own count, whichever byte of a word it shares
+/// with its neighbors, and a saturated count leaves the neighbors alone.
+#[test]
+fn counters_count_each_feature_apart() {
+    let counters = counters();
+    let map = FeatureMap::new(counters);
+    let features = [0, 1, 7, 8, 9, 15, 4096, 65534, 65535].map(Feature::new);
+    for (hits, feature) in features.iter().enumerate() {
+        for _ in 0..=hits {
+            map.hit(*feature);
+        }
+    }
+    for _ in 0..300 {
+        map.hit(Feature::new(8));
+    }
+    for (hits, feature) in features.iter().enumerate() {
+        let expected = if feature.index() == 8 {
+            u8::MAX
+        } else {
+            u8::try_from(hits + 1).unwrap()
+        };
+        assert_eq!(counters.get(*feature), expected, "{feature:?}");
+    }
+    assert_eq!(counters.get(Feature::new(2)), 0);
+    assert_eq!(counters.get(Feature::new(16)), 0);
+    assert_eq!(counters.hits(), features);
+    counters.clear();
+    assert!(counters.hits().is_empty());
+}

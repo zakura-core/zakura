@@ -60,6 +60,10 @@ The last configured checkpoint is the seed’s finalized tip, not its full tip.
 A checkpoint above the finalized tip prevents restoration of the non-finalized
 backup, leaving both nodes below the expected seed height.
 
+Set `miner_threads` in the deployment JSON to choose the primary’s internal
+solver count. It defaults to one and persists across resets; the observer stays
+non-mining. The node caps solvers at available CPUs and 256 distinct nonce ranges.
+
 ## Join a run
 
 Use `/v1/network` and `/v1/config` from the dashboard origin together. Build the

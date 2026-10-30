@@ -163,6 +163,7 @@ enable_cookie_auth = false
 [mining]
 miner_address = {address}
 internal_miner = {str(mining).lower()}
+internal_miner_threads = {config.get("miner_threads", 1) if index == 0 else 1}
 extra_coinbase_data = "{run['id']}-node{index}"
 '''
 

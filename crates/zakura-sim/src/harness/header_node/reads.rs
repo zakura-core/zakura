@@ -25,7 +25,10 @@ use std::{
 
 use zakura_network::zakura::diag::{self, ComponentRead, OwnerState, ReadKey};
 
-use super::view::{HeaderSyncView, Reading};
+use super::{
+    tap::read_key,
+    view::{HeaderSyncView, Reading},
+};
 use crate::{
     observe::{ComponentReading, ComponentValue, ReactorFact},
     property::{ComponentKind, Read},
@@ -110,22 +113,53 @@ impl BoundaryReads {
         }
         let step = log.step();
         let mut view = self.view.borrow_mut();
-        for (key, read) in registered {
-            let kind = kind(&key)?;
-            let generation = self.generations.entry(key).or_default();
-            *generation += 1;
-            view.register(kind);
-            self.live.push(Live {
-                kind,
-                generation: *generation,
-                read,
-                last: None,
-                seq: 0,
-            });
+        // In the order the reactor reported them, so a budget that settles
+        // before it registers its read fails, even within one step. The
+        // slot hands each read over right before its `ReadRegistered`, so
+        // the next one handed over is that row's, unless the observer
+        // dropped it.
+        let mut handed = registered.into_iter().peekable();
+        for obs in log.of_step(step) {
+            let Observation::Reactor {
+                instance, event, ..
+            } = obs
+            else {
+                continue;
+            };
+            if *instance != self.reactor {
+                continue;
+            }
+            match event {
+                ReactorFact::ReadRegistered { key: name, .. } => {
+                    let Some((key, read)) =
+                        handed.next_if(|(key, _)| read_key(key).is_ok_and(|key| key == name))
+                    else {
+                        continue;
+                    };
+                    let kind = kind(&key)?;
+                    let generation = self.generations.entry(key).or_default();
+                    *generation += 1;
+                    view.register(kind);
+                    self.live.push(Live {
+                        kind,
+                        generation: *generation,
+                        read,
+                        last: None,
+                        seq: 0,
+                    });
+                }
+                ReactorFact::Settled { .. } if !self.budget_exists => {
+                    self.budget_exists = true;
+                    view.exists(ComponentKind::Budget, step);
+                }
+                _ => {}
+            }
         }
-        if !self.budget_exists && self.reactor_settled(log) {
-            self.budget_exists = true;
-            view.exists(ComponentKind::Budget, step);
+        if let Some((key, _)) = handed.next() {
+            return Err(format!(
+                "UnloggedRead: {key:?}'s read was handed over with no ReadRegistered row at \
+                 step {step}"
+            ));
         }
         // Each read runs on its own, so one that reaches the runtime fails
         // the run as a harness failure, after the mark is cleared, instead
@@ -163,17 +197,6 @@ impl BoundaryReads {
         }
         self.live.retain(|live| live.last != Some(Read::Gone));
         Ok(())
-    }
-
-    /// Whether the node's reactor reported a `Settled` this step.
-    fn reactor_settled(&self, log: &ObservationLog) -> bool {
-        log.of_step(log.step()).any(|obs| {
-            matches!(obs, Observation::Reactor {
-                instance,
-                event: ReactorFact::Settled { .. },
-                ..
-            } if *instance == self.reactor)
-        })
     }
 }
 

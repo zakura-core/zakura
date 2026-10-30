@@ -1436,6 +1436,39 @@ mod tests {
         assert!(!zakura_rt::sim::in_boundary_read());
     }
 
+    /// A budget that registers its read after its reactor's first
+    /// `Settled`, within the same step, fails the run there, since the
+    /// budget acted before it could be read.
+    ///
+    /// This fails if the hub takes a step's registrations before its
+    /// existence evidence, whatever their order.
+    #[test]
+    fn a_budget_registered_after_it_settles_fails() {
+        let (fixture, slot) = Fixture::new(1_000);
+        let owned = Arc::new(zakura_rt::sync::Mutex::new(0));
+        slot.emit(settled(0, false));
+        register_owned(&slot, &owned);
+        let (report, _) = fixture.run(&mut States::default());
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(
+                facts[..],
+                [
+                    (0, ReactorFact::Settled { turn: 0, .. }),
+                    (0, ReactorFact::ReadRegistered { .. })
+                ]
+            ),
+            "both in setup, the Settled first: {facts:?}"
+        );
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail == "Budget's existence evidence arrived at step 0 with no read \
+                    registered"),
+            "{:?}",
+            report.end
+        );
+    }
+
     /// A step whose task changes the budget and exits logs the budget's
     /// read after the records the task emitted and before its exit, since
     /// the hub reads at its observation and `Sim` logs the outcome after.

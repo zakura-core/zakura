@@ -39,10 +39,12 @@
 //! | | | +48 | `IncompleteDrain` |
 //!
 //! A vocabulary of production names, such as [`RetireReason`], ends with
-//! `Unlisted`: a name this version doesn't list. Appending a name, a field
-//! value or a block changes no existing index, but it changes what a corpus
-//! means to libFuzzer, so it bumps [`FEEDBACK_VERSION`] too. The layout tests
-//! pin every block's position and size.
+//! `Unlisted`: a name this version doesn't list. Adding a value to a
+//! vocabulary moves existing indices: it moves `Unlisted`, and it changes the
+//! radix of every block that uses the vocabulary. Adding a value or a block
+//! therefore bumps [`FEEDBACK_VERSION`]. The layout tests pin every
+//! vocabulary's size, one index per block and [`FEEDBACK_VERSION`], so such
+//! a change fails them until the version and the pins move together.
 //!
 //! [`REQUIRED`] is the exact required-state matrix: every state the feature
 //! table requires, and the features that show it, or why none does yet.
@@ -398,7 +400,8 @@ vocabulary! {
         Taken = "taken",
         /// The caller dropped the delivered reply without taking it.
         Dropped = "dropped",
-        /// The completion found no caller to deliver to.
+        /// The completion found its caller gone: a header operation's, or a
+        /// block range read's.
         Undelivered = "undelivered",
         /// The reply reached block sync's handle.
         Delivered = "delivered",
@@ -1358,7 +1361,7 @@ pub const REQUIRED: &[RequiredState] = &[
     ),
     collected(
         Family::RequestReset,
-        "block request reset at its write stage",
+        "block request reset at its pending stage",
         &[BLOCK],
         true,
         |f| {
@@ -1401,12 +1404,20 @@ pub const REQUIRED: &[RequiredState] = &[
             )
         },
     ),
-    waiting(
+    collected(
         Family::CompletionCancellation,
         "completion after cancellation request",
-        "G2a",
-        "header storage logs `CallerDropped`, but no harness drops a pending call; \
-         G2a's storage actions add the cancellation",
+        &[HEADER_STORAGE],
+        false,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Completion {
+                    timing: Timing::AfterCancelRequest,
+                    ..
+                }
+            )
+        },
     ),
     waiting(
         Family::CompletionCancellation,
@@ -1471,15 +1482,13 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::Replacement,
         "connection replacement by work stage",
         &[BLOCK],
-        true,
+        false,
         |f| {
             matches!(
                 f,
                 StateFeature::Replacement {
                     kind: ReplacementKind::Connection,
-                    event: ReplacementEvent::OldEnded
-                        | ReplacementEvent::OldLiveIdle
-                        | ReplacementEvent::OldLiveBusy,
+                    event: ReplacementEvent::OldLiveIdle | ReplacementEvent::OldLiveBusy,
                     ..
                 }
             )

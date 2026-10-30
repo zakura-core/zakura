@@ -17,8 +17,8 @@ use zakura_sim::{
     explore::{
         feedback::{Counters, Feature, Feedback, FEATURES, FEEDBACK_VERSION},
         state::{
-            collector, Coverage, Family, FrameLabel, RetireReason, Row, StateFeature, Transition,
-            REQUIRED, SPAN,
+            collector, Coverage, Disposition, Family, FrameLabel, Operation, RetireReason, Row,
+            Service, StateFeature, Transition, REQUIRED, SPAN,
         },
     },
     harness::{
@@ -28,7 +28,12 @@ use zakura_sim::{
             Policy as BlockPolicy,
         },
         block_sync::{BlockScenario, Storage as BlockStorage},
-        header_node::{Chain, Fork},
+        header_node::{
+            policy::{
+                Allow, Hold as HeaderHold, OpKind, Select as HeaderSelect, Trigger as HeaderTrigger,
+            },
+            Chain, Fork, Policy as HeaderPolicy,
+        },
         header_sync::{Dialer, HeaderWire, MirrorSpec, Storage as HeaderStorage, StorageScenario},
         run_harness,
         wire_plans::act_scenario,
@@ -505,6 +510,16 @@ fn witnesses() -> Vec<Witness> {
         ),
         drawn("header-sync/storage", "header storage default", plan()),
         explicit::<BlockStorage>("block teardown", teardown(), plan()),
+        explicit::<BlockStorage>(
+            "block relink while applying",
+            relink_while_applying(),
+            plan(),
+        ),
+        explicit::<HeaderStorage>(
+            "header storage locator dropped at its timeout",
+            dropped_locator(),
+            plan(),
+        ),
         explicit::<HeaderWire>(
             "header wire status burst",
             act_scenario(Act::StatusBurst),
@@ -580,6 +595,41 @@ fn teardown() -> BlockScenario {
     }
 }
 
+/// Eight blocks, and a second link to `mirror-0`, its first still open, once
+/// the node submits its first block.
+fn relink_while_applying() -> BlockScenario {
+    BlockScenario {
+        blocks: 8,
+        control: vec![ControlStep {
+            action: ControlAction::Relink {
+                peer: "mirror-0".to_owned(),
+            },
+            when: Some(Trigger::Submitted(Select {
+                kind: Some(BlockKind::Apply),
+                ..Select::default()
+            })),
+        }],
+        ..BlockScenario::default()
+    }
+}
+
+/// The node's first locator, held until the reactor's request timeout drops
+/// its call, then completed.
+fn dropped_locator() -> StorageScenario {
+    StorageScenario {
+        policy: HeaderPolicy {
+            holds: vec![HeaderHold {
+                select: HeaderSelect::nth(OpKind::Locator, 1),
+                until: HeaderTrigger::CallerDropped(HeaderSelect::held()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..HeaderPolicy::converging()
+        },
+        ..StorageScenario::default()
+    }
+}
+
 /// Runs `witness` without and with the collector, checks that the two
 /// record the same trace, and returns the states the collector hit.
 fn states(witness: &Witness) -> BTreeSet<StateFeature> {
@@ -627,6 +677,21 @@ fn every_collected_state_has_a_witness() {
             .map(|run| run.join().expect("the witness runs"))
             .collect()
     });
+    // Block storage sends an action's reply to block sync's handle and a
+    // record's to nobody, so only a range read can find its caller gone.
+    for (witness, states) in witnesses.iter().zip(&reached) {
+        let lost = states.iter().find(|state| {
+            matches!(
+                state,
+                StateFeature::Disposition {
+                    service: Service::Block,
+                    op,
+                    disposition: Disposition::Undelivered,
+                } if *op != Operation::ReadRange
+            )
+        });
+        assert_eq!(lost, None, "{}: no caller to lose", witness.name);
+    }
     for row in REQUIRED {
         let Coverage::Collected {
             harnesses,

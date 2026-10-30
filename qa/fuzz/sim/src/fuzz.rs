@@ -4,7 +4,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock, PoisonError},
     time::Instant,
 };
@@ -230,12 +230,56 @@ fn record_failed(property: &str, error: RecordError, input: &Path) -> ! {
 /// inputs can't fill the disk.
 const MAX_KEPT_INPUTS: usize = 256;
 
+/// The distinct inputs one process kept for one bucket and property, by
+/// path, and whether it logged that it reached [`MAX_KEPT_INPUTS`].
+#[derive(Default)]
+struct Kept {
+    inputs: BTreeSet<PathBuf>,
+    logged: bool,
+}
+
+/// What [`save_once`] does with one input.
+#[derive(Debug, PartialEq, Eq)]
+enum Keep {
+    /// The process's first input of the property: save it and record a
+    /// trace.
+    First,
+    /// A later distinct input: save it.
+    Later,
+    /// The first distinct input past [`MAX_KEPT_INPUTS`]: log it.
+    Full,
+    /// An input already kept, or a later one past the limit: nothing.
+    Skip,
+}
+
+impl Kept {
+    /// What to do with the input at `path`, counting it if it's new.
+    fn admit(&mut self, path: PathBuf) -> Keep {
+        if self.inputs.contains(&path) {
+            return Keep::Skip;
+        }
+        if self.inputs.len() >= MAX_KEPT_INPUTS {
+            if std::mem::replace(&mut self.logged, true) {
+                return Keep::Skip;
+            }
+            return Keep::Full;
+        }
+        let first = self.inputs.is_empty();
+        self.inputs.insert(path);
+        if first {
+            Keep::First
+        } else {
+            Keep::Later
+        }
+    }
+}
+
 /// Saves the input of the `Known` or `Draft` violation of `property` under
 /// `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by digest, up to
-/// [`MAX_KEPT_INPUTS`] per process. The first such input in a process also
-/// records a trace under `<bucket>/traces/`, unless an earlier process
-/// already saved one: a property's ID is its signature, so one trace per
-/// property is enough. A rerun that disagrees panics with
+/// [`MAX_KEPT_INPUTS`] distinct inputs per process. The first such input in
+/// a process also records a trace under `<bucket>/traces/`, unless an
+/// earlier process already saved one: a property's ID is its signature, so
+/// one trace per property is enough. A rerun that disagrees panics with
 /// `nondeterministic:`.
 fn save_once(
     entry: &'static HarnessEntry,
@@ -244,29 +288,33 @@ fn save_once(
     property: &str,
     bucket: Bucket,
 ) {
-    static SEEN: Mutex<BTreeMap<(Bucket, String), usize>> = Mutex::new(BTreeMap::new());
-    let seen = {
-        let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = seen.entry((bucket, property.to_owned())).or_insert(0);
-        *count += 1;
-        *count
-    };
+    static KEPT: Mutex<BTreeMap<(Bucket, String), Kept>> = Mutex::new(BTreeMap::new());
     let root = artifacts_root();
     let id = property_id(property);
-    if seen == 1 && !has_trace(&root.join(bucket.name()), property) {
-        let saved = save_failure(entry, input, run, &id, bucket, &root)
-            .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
-        if let Err(error) = saved.trace {
-            record_failed(property, error, &saved.input);
+    let keep = KEPT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((bucket, property.to_owned()))
+        .or_default()
+        .admit(input_path(&root, bucket, Some(&id), input));
+    match keep {
+        Keep::First if !has_trace(&root.join(bucket.name()), property) => {
+            let saved = save_failure(entry, input, run, &id, bucket, &root)
+                .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
+            if let Err(error) = saved.trace {
+                record_failed(property, error, &saved.input);
+            }
         }
-    } else if seen <= MAX_KEPT_INPUTS {
-        save_input(&root, bucket, Some(&id), input)
-            .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
-    } else if seen == MAX_KEPT_INPUTS + 1 {
-        eprintln!(
-            "{}: {property}: kept {MAX_KEPT_INPUTS} inputs in this process; later ones aren't saved",
+        Keep::First | Keep::Later => {
+            save_input(&root, bucket, Some(&id), input)
+                .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
+        }
+        Keep::Full => eprintln!(
+            "{}: {property}: kept {MAX_KEPT_INPUTS} distinct inputs in this process; \
+             later ones aren't saved",
             bucket.name()
-        );
+        ),
+        Keep::Skip => {}
     }
 }
 
@@ -381,5 +429,41 @@ fn act_fixtures(
             "missed: {property}: no find in its base variant within {} s",
             limit.as_secs()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Keep, Kept, MAX_KEPT_INPUTS};
+
+    /// The cap counts distinct inputs: a repeated input neither counts nor
+    /// saves again, and the first distinct input past the cap logs once.
+    #[test]
+    fn kept_counts_distinct_inputs() {
+        let mut kept = Kept::default();
+        let path = |n: usize| PathBuf::from(format!("{n}.bin"));
+        assert_eq!(kept.admit(path(0)), Keep::First);
+        assert_eq!(kept.admit(path(0)), Keep::Skip);
+        for n in 1..MAX_KEPT_INPUTS {
+            assert_eq!(kept.admit(path(n)), Keep::Later, "{n}");
+            assert_eq!(kept.admit(path(n)), Keep::Skip, "{n}");
+        }
+        assert_eq!(kept.admit(path(0)), Keep::Skip);
+        assert_eq!(kept.admit(path(MAX_KEPT_INPUTS)), Keep::Full);
+        assert_eq!(kept.admit(path(MAX_KEPT_INPUTS + 1)), Keep::Skip);
+    }
+
+    /// One input repeated past the cap still leaves room for a second
+    /// distinct input (review of bc06ef3a2).
+    #[test]
+    fn a_repeated_input_leaves_room_for_another() {
+        let mut kept = Kept::default();
+        assert_eq!(kept.admit(PathBuf::from("known.bin")), Keep::First);
+        for _ in 1..=MAX_KEPT_INPUTS {
+            assert_eq!(kept.admit(PathBuf::from("known.bin")), Keep::Skip);
+        }
+        assert_eq!(kept.admit(PathBuf::from("known-1.bin")), Keep::Later);
     }
 }

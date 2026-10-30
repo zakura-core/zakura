@@ -5,7 +5,7 @@
 //! at a time, flushed, with `end` last. A child that dies mid-run leaves the
 //! prefix it wrote. A run without its `end` record never counts as a pass:
 //! a child that failed is a [`ProcessResult::Crashed`], and one that exited
-//! with code 0 is [`ProcessResult::Incomplete`]. A child that wrote `end`
+//! with code 0 is [`ProcessResult::NoEnd`]. A child that wrote `end`
 //! classifies as [`classify_end`] says, as the run did in the parent.
 
 use std::{io, path::Path, process::ExitStatus};
@@ -138,7 +138,7 @@ pub enum ProcessResult {
     },
     /// The child exited with code 0, with no error report, but wrote no
     /// `end` record.
-    Incomplete,
+    NoEnd,
 }
 
 /// A child process's run, classified.
@@ -146,19 +146,20 @@ pub enum ProcessResult {
 pub struct ProcessClassified {
     /// What the run came to.
     pub result: ProcessResult,
-    /// The last step the trace holds, 0 if it holds none.
+    /// The last step the trace holds, 0 if it holds none or doesn't read
+    /// as a valid prefix.
     pub steps: u64,
 }
 
 impl ProcessClassified {
-    /// Where the result is filed: `crash` for a failed child, `incomplete`
-    /// for a run without its `end` record, and else the run's outcome's
+    /// Where the result is filed: `crash` for a failed child, `no-end` for
+    /// a run without its `end` record, and else the run's outcome's
     /// bucket, which is none for a clean run.
     pub fn bucket(&self) -> Option<Bucket> {
         match &self.result {
             ProcessResult::Ended(classified) => classified.outcome.bucket(),
             ProcessResult::Crashed { .. } => Some(Bucket::Crash),
-            ProcessResult::Incomplete => Some(Bucket::Incomplete),
+            ProcessResult::NoEnd => Some(Bucket::NoEnd),
         }
     }
 }
@@ -168,14 +169,17 @@ impl ProcessClassified {
 /// `dir`.
 ///
 /// A missing or empty `trace.jsonl` counts as a trace with no records, as
-/// when the child died before it wrote one. Returns an error only for a
-/// trace that exists but doesn't read as a prefix of a valid trace.
+/// when the child died before it wrote one. A failed child is
+/// [`ProcessResult::Crashed`] whatever its trace holds: one whose trace
+/// doesn't read as a prefix of a valid trace has no `end` and no steps.
+/// Returns an error only for such a trace from a child that didn't fail.
 pub fn classify_process(
     entry: &HarnessEntry,
     exit: ProcessExit,
     stderr: &[u8],
     dir: &Path,
 ) -> Result<ProcessClassified, ReadError> {
+    let failure = ProcessFailure::of(exit, stderr);
     let (end, steps) = match TraceReader::open_prefix(dir) {
         Ok(trace) => (
             trace.end.as_ref().map(|end| classify_end(entry, end)),
@@ -183,12 +187,15 @@ pub fn classify_process(
         ),
         Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (None, 0),
         Err(ReadError::Invalid(Invalid::MissingMeta)) => (None, 0),
+        // A failed child may have written anything, and its failure is
+        // its class.
+        Err(_) if failure.is_some() => (None, 0),
         Err(error) => return Err(error),
     };
-    let result = match (ProcessFailure::of(exit, stderr), end) {
+    let result = match (failure, end) {
         (Some(failure), end) => ProcessResult::Crashed { failure, end },
         (None, Some(classified)) => ProcessResult::Ended(classified),
-        (None, None) => ProcessResult::Incomplete,
+        (None, None) => ProcessResult::NoEnd,
     };
     Ok(ProcessClassified { result, steps })
 }

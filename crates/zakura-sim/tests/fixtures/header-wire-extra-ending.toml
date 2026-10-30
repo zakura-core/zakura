@@ -5,3 +5,5 @@
 harness = "header-sync/wire"
 generator = 2
 sha256 = "f048fb75afd36fbfdb168c504ba7f292dc98f3020a3946e8fc3df90de6283867"
+scenario_sha256 = "268bdc5cb350b587468e7435b862630cf5c109c14f3292dc7077de9b79b2da62"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

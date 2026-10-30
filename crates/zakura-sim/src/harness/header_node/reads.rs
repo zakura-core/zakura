@@ -189,8 +189,9 @@ impl BoundaryReads {
         // In the order the owners reported them, so a component that shows
         // it exists before its read is registered fails, even within one
         // step. The observer is handed each read right before its
-        // `ReadRegistered`, so the next one handed over is that row's,
-        // unless the observer dropped it.
+        // `ReadRegistered`, so the next one handed over is that row's. A
+        // row with none means the observer dropped the read, which fails
+        // the run at once, even if the component never shows it exists.
         let mut handed = registered.into_iter().peekable();
         let mut handed_transport = transported.unwrap_or_default().into_iter().peekable();
         for obs in log.of_step(step) {
@@ -199,11 +200,10 @@ impl BoundaryReads {
                     instance, event, ..
                 } if *instance == self.reactor => match event {
                     ReactorFact::ReadRegistered { key: name, .. } => {
-                        if let Some((key, read)) =
-                            handed.next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
-                        {
-                            self.adopt(&mut view, key, read)?;
-                        }
+                        let (key, read) = handed
+                            .next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
+                            .ok_or_else(|| unhanded(name, step))?;
+                        self.adopt(&mut view, key, read)?;
                     }
                     ReactorFact::Settled { .. } if !self.budget_exists => {
                         self.budget_exists = true;
@@ -215,11 +215,10 @@ impl BoundaryReads {
                     instance, event, ..
                 } if Some(*instance) == transport => match event {
                     TransportFact::ReadRegistered { key: name, .. } => {
-                        if let Some((key, read)) = handed_transport
+                        let (key, read) = handed_transport
                             .next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
-                        {
-                            self.adopt(&mut view, key, read)?;
-                        }
+                            .ok_or_else(|| unhanded(name, step))?;
+                        self.adopt(&mut view, key, read)?;
                     }
                     TransportFact::Registered if !self.map_exists => {
                         self.map_exists = true;
@@ -313,6 +312,12 @@ impl BoundaryReads {
             seq: 0,
         });
     }
+}
+
+/// The failure for `name`'s `ReadRegistered` row at `step`, whose read the
+/// observer never handed over.
+fn unhanded(name: &str, step: u64) -> String {
+    format!("UnhandedRead: {name}'s read-registered row at step {step} came with no read")
 }
 
 /// A panic's message, if it has one.

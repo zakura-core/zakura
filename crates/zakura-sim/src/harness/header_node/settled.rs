@@ -1202,8 +1202,8 @@ mod tests {
         );
         assert!(
             matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
-                if detail == "Budget's existence evidence arrived at step 0 with no read \
-                    registered"),
+                if detail == "UnhandedRead: budget's read-registered row at step 0 came with \
+                    no read"),
             "{:?}",
             report.end
         );

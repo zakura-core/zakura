@@ -559,6 +559,46 @@ mod tests {
         assert_eq!(report.end.steps, 0);
     }
 
+    /// A transport observer that takes the supervisor map's
+    /// `ReadRegistered` but drops its read fails the run at that row, even
+    /// on a run where no connection ever registers to show the map exists.
+    /// The same run with the read kept ends with no harness failure.
+    ///
+    /// This fails if a registration row without its read is accepted.
+    #[test]
+    fn a_registration_without_its_read_fails() {
+        use crate::harness::{
+            header_sync::{HeaderWire, WireScenario},
+            wire_node::dropping_reads,
+        };
+
+        let scenario = WireScenario {
+            peers: Vec::new(),
+            ..WireScenario::default()
+        };
+        let run = || {
+            let mut sim = Sim::new(HeaderWire::config(&scenario), Plan::from_fuzz(&[]));
+            let _wire = HeaderWire::build(&mut sim, &scenario, HeaderWire::prepare(&scenario));
+            sim.run(&mut crate::NoChecks, &mut NullSink)
+        };
+        let kept = run();
+        assert_eq!(kept.end.harness, None, "{:?}", kept.end);
+        assert!(kept.log.entries().iter().all(|entry| !matches!(
+            entry.obs,
+            crate::Observation::Transport {
+                event: crate::observe::TransportFact::Registered,
+                ..
+            }
+        )));
+        let dropped = dropping_reads(run);
+        assert!(
+            matches!(&dropped.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail.starts_with("UnhandedRead: supervisor-map's read-registered row")),
+            "{:?}",
+            dropped.end
+        );
+    }
+
     /// A property that holds at several boundaries, then needs a component
     /// in transition at the run's last, ends `state-unsettled`, with the
     /// last boundary as its gap.

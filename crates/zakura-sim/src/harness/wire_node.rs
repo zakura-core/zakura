@@ -167,6 +167,23 @@ impl WireNode {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set while [`dropping_reads`] runs its closure.
+    static DROP_READS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `run` with every transport tap built on this thread dropping the
+/// boundary reads it's handed, though the handler still reports their
+/// registration, as an observer that forgets `register_read` would.
+#[cfg(test)]
+pub(crate) fn dropping_reads<T>(run: impl FnOnce() -> T) -> T {
+    DROP_READS.with(|drop| drop.set(true));
+    let out = run();
+    DROP_READS.with(|drop| drop.set(false));
+    out
+}
+
 /// Reports the node's failed dials into its [`TransportTap`], in order with
 /// the transport's own events.
 #[derive(Clone)]
@@ -313,6 +330,10 @@ impl TransportObserver for TapObserver {
     /// `ReadRegistered` next. Only a std lock, never held across anything
     /// else.
     fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        #[cfg(test)]
+        if DROP_READS.with(std::cell::Cell::get) {
+            return;
+        }
         self.0
             .reads
             .lock()

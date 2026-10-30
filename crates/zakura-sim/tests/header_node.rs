@@ -782,3 +782,97 @@ fn a_stalled_growth_fails_the_run() {
         "the gated close never opened"
     );
 }
+
+/// A `Grow` that overlaps `mirror-0`'s own sync grows its new tip. The
+/// node holds 16 headers on branch 1, and `mirror-0` starts at genesis.
+/// Steering picks the growth once the node has read headers for
+/// `mirror-0`. Once the growth has read `mirror-0`'s tip, steering holds
+/// the growth's prepare until `mirror-0` has synced past that tip. The
+/// growth then extends the synced tip instead of failing the run with a
+/// stale target.
+#[test]
+fn a_growth_overlapping_the_mirrors_sync_grows_its_new_tip() {
+    use std::cell::{Cell, RefCell};
+
+    use support::steer::{steer, Steer};
+    use zakura_chain::block;
+    use zakura_header_chain::Frontier;
+    use zakura_node_services::header_chain::Port;
+    use zakura_storage::header::adapter::EnginePort;
+
+    const GROW: &str = "peer:mirror-0:grow";
+    // The control task's first lock is the growth's prepare, after it has
+    // read the tip.
+    const PREPARE: &str = "task:control.1:lock#1";
+    let scenario = StorageScenario {
+        node: Chain {
+            main: 0,
+            fork: Some(Fork { branch: 1, len: 16 }),
+        },
+        mirrors: vec![mirror(Chain::main(0), Dialer::Mirror)],
+        controls: vec![step(
+            ControlAction::Grow { len: 1 },
+            Some(Trigger::Completed(Select::nth(OpKind::Read, 1))),
+        )],
+        ..StorageScenario::default()
+    };
+    let port: RefCell<Option<Arc<EnginePort>>> = RefCell::default();
+    let held = Cell::new(0);
+    let rule = |cx: &zakura_sim::StepCtx<'_>| {
+        let pick = cx.pick.to_string();
+        if pick != GROW && cx.enabled.iter().any(|e| e.identity.to_string() == GROW) {
+            return Ok(Steer::Pick(GROW.to_owned()));
+        }
+        let synced = port
+            .borrow()
+            .as_ref()
+            .expect("a run is going")
+            .selected_chain()
+            .borrow()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.frontiers.header_best.height.0 > 0);
+        if pick != PREPARE || synced {
+            return Ok(Steer::Fine);
+        }
+        held.set(held.get() + 1);
+        cx.enabled
+            .iter()
+            .map(|e| e.identity.to_string())
+            .find(|identity| !identity.starts_with("task:control."))
+            .map(Steer::Pick)
+            .ok_or_else(|| "only the growth can go on".to_owned())
+    };
+    for plan in inputs(4, 256) {
+        held.set(0);
+        let mut ran = None;
+        let (report, ..) = steer(plan, &rule, &mut |plan, checker| {
+            let ports = Storage::prepare(&scenario);
+            *port.borrow_mut() = Some(ports.mirrors[0].clone());
+            let mut sink = MemorySink::default();
+            let report = match run_prepared::<Storage>(
+                &scenario,
+                ports.clone(),
+                plan,
+                &mut sink,
+                Some(checker),
+            ) {
+                Ok(report) => report,
+                Err(HarnessError::Run { report, .. }) => *report,
+                Err(error) => panic!("{error}"),
+            };
+            ran = Some(ports);
+            (report, sink.lines())
+        });
+        let ports = ran.expect("a run ran");
+        assert!(held.get() > 0, "steering held the growth's prepare");
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        let synced = scenario.node.tip(&ports.fixture);
+        let grown = ports.fixture.extend(synced, 1, 0);
+        assert_eq!(
+            ports.mirrors[0].snapshot().frontiers.header_best,
+            Frontier::new(block::Height(synced.height.0 + 1), grown[0].hash()),
+            "mirror-0 grew from the tip it synced"
+        );
+    }
+}

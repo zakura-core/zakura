@@ -47,6 +47,8 @@ fn main() {
 mod cli {
     use std::{
         fmt::Write,
+        fs::File,
+        io::Read,
         path::{Path, PathBuf},
         time::Duration,
     };
@@ -57,7 +59,9 @@ mod cli {
         record::{EndRecord, OutcomeKind},
         seed::{self, Failed, SeedReport},
         suite,
-        trace::{self, shrink::REPORT_FILE, ReplayOptions, ShrinkBudget, TraceReader},
+        trace::{
+            self, shrink::REPORT_FILE, ReplayOptions, ShrinkBudget, TraceReader, MAX_INPUT_BYTES,
+        },
         witness::Expect,
     };
 
@@ -559,27 +563,63 @@ mod cli {
     /// the SHA-256 of the file's SHA-256 and the sidecar's, in hex, so two
     /// seeds with the same bytes and different sidecars, such as two `plan`
     /// seeds with different prefixes, keep separate records.
+    ///
+    /// A seed can be quarantined before [`seed::load`] reads its file, such
+    /// as for a stale generator, so nothing has bounded the file yet. A file
+    /// over [`MAX_INPUT_BYTES`], the largest fuzz input a trace holds, isn't
+    /// read in full or copied. Its length and path stand in for its SHA-256
+    /// in `<name>`, and the reason names the limit.
     fn quarantine_seed(dir: &Path, failed: &Failed) -> Result<(), Error> {
-        let read = |path: &Path| {
-            std::fs::read(path)
-                .map_err(|error| Error::Failed(format!("reading {}: {error}", path.display())))
-        };
-        let bytes = read(&failed.path)?;
-        let sidecar = read(&failed.path.with_extension(seed::SIDECAR_EXTENSION))?;
-        let name =
-            seed::sha256(format!("{}{}", seed::sha256(&bytes), seed::sha256(&sidecar)).as_bytes());
-        write(
-            &dir.join(format!("{name}.{}", seed::SEED_EXTENSION)),
-            &bytes,
-        )?;
-        write(
-            &dir.join(format!("{name}.{}", seed::SIDECAR_EXTENSION)),
-            &sidecar,
-        )?;
-        write(
-            &dir.join(format!("{name}.reason")),
-            format!("{}: {}\n", failed.path.display(), failed.error).as_bytes(),
-        )
+        let sidecar_path = failed.path.with_extension(seed::SIDECAR_EXTENSION);
+        let bytes = read_capped(&failed.path)?;
+        let sidecar = read_capped(&sidecar_path)?;
+        let mut reason = format!("{}: {}\n", failed.path.display(), failed.error);
+        let mut digests = String::new();
+        for (path, read) in [(&failed.path, &bytes), (&sidecar_path, &sidecar)] {
+            match read {
+                Ok(bytes) => digests.push_str(&seed::sha256(bytes)),
+                Err(len) => {
+                    // A hex digest holds no `:`, so this can't match one.
+                    let _ = write!(digests, "{len}:{}:", path.display());
+                    let _ = writeln!(
+                        reason,
+                        "{} is {len} bytes, over the {MAX_INPUT_BYTES}-byte MAX_INPUT_BYTES \
+                         limit, so the quarantine holds no copy of it",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let name = seed::sha256(digests.as_bytes());
+        if let Ok(bytes) = &bytes {
+            write(&dir.join(format!("{name}.{}", seed::SEED_EXTENSION)), bytes)?;
+        }
+        if let Ok(sidecar) = &sidecar {
+            write(
+                &dir.join(format!("{name}.{}", seed::SIDECAR_EXTENSION)),
+                sidecar,
+            )?;
+        }
+        write(&dir.join(format!("{name}.reason")), reason.as_bytes())
+    }
+
+    /// The file at `path` if it holds at most [`MAX_INPUT_BYTES`], or its
+    /// length if it holds more. It reads at most one byte past the limit.
+    fn read_capped(path: &Path) -> Result<Result<Vec<u8>, u64>, Error> {
+        let failed =
+            |error: std::io::Error| Error::Failed(format!("reading {}: {error}", path.display()));
+        let file = File::open(path).map_err(failed)?;
+        let mut bytes = Vec::new();
+        (&file)
+            .take(MAX_INPUT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(failed)?;
+        // A usize always fits in a u64 on supported targets.
+        if bytes.len() as u64 <= MAX_INPUT_BYTES {
+            return Ok(Ok(bytes));
+        }
+        let len = file.metadata().map_err(failed)?.len();
+        Ok(Err(len.max(bytes.len() as u64)))
     }
 
     /// `seeds --report`'s JSON: [`SeedReport::rows`]. It serializes

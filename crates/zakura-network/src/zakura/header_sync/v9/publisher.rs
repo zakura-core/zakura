@@ -734,6 +734,10 @@ struct Page {
     count: u32,
     reaches_target: bool,
     frame: Frame,
+    /// The payload bytes the job meant the page to take, from its header
+    /// count and schema, for the page's attempt (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    bytes: u64,
 }
 
 /// What a job found.
@@ -903,8 +907,7 @@ fn settle(
                 sim_chain!(slot => attempting(Some(super::summary::page(
                     id,
                     page.count,
-                    // Widening usize to u64 is lossless on supported targets.
-                    page.frame.payload.len() as u64,
+                    page.bytes,
                     &page.last,
                 ))))
                 .send(page.frame);
@@ -1284,6 +1287,9 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
                 count: sent,
                 reaches_target,
                 frame,
+                // A page's size is far below u64::MAX.
+                #[cfg(any(test, zakura_sim))]
+                bytes: page_bytes(sent, job.schema, HEADER_BYTES) as u64,
             })
         }
         _ => Output::Stall(Stall::Local, "encode"),

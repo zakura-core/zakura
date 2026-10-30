@@ -855,6 +855,16 @@ mod tests {
         for (attempted, said) in [
             (summary("page", Some(1)), Some(summary("page", Some(2)))),
             (
+                FrameSummaryFact {
+                    bytes: 444,
+                    ..summary("page", Some(1))
+                },
+                Some(FrameSummaryFact {
+                    bytes: 600,
+                    ..summary("page", Some(1))
+                }),
+            ),
+            (
                 summary("status", None),
                 Some(FrameSummaryFact {
                     flags: 1,

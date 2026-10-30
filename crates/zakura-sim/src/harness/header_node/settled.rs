@@ -517,61 +517,134 @@ mod tests {
     /// The source label of the fixture's tap.
     const TAP: &str = "reactor:node#0";
 
-    /// A reactor that settles, waits, then resumes with no `Resumed`,
-    /// changes its state and stops at points until the run ends. Every
-    /// boundary of that turn is in transition, never current, because its
-    /// task stopped at a point with no `Settled` after its last report.
+    thread_local! {
+        /// What [`check_reactor`] got from `require` at each step: the
+        /// reactor's unhandled calls, or `None`.
+        static REQUIRED: RefCell<Vec<(u64, Option<Vec<u64>>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Holds whenever `require` hands out the reactor's state, recording
+    /// what it got in [`REQUIRED`].
+    fn check_reactor(cx: &mut CheckCtx<'_, Owned>) -> Verdict {
+        let view = cx.view();
+        let view = view.borrow();
+        let reactor = view
+            .component(ComponentKind::Reactor)
+            .expect("the tier has the reactor");
+        let got = crate::property::require(cx, reactor).map(|available| match available {
+            crate::property::Available::Current(Reading::Reactor(snapshot))
+            | crate::property::Available::Ended {
+                state: Reading::Reactor(snapshot),
+                ..
+            } => snapshot.unhandled_calls.clone(),
+        });
+        let verdict = if got.is_some() {
+            Verdict::Holds
+        } else {
+            Verdict::NotApplicable
+        };
+        REQUIRED.with(|required| required.borrow_mut().push((cx.step, got)));
+        verdict
+    }
+
+    /// A checker running one property that needs the reactor, through
+    /// [`check_reactor`], on `view`.
+    fn requiring(view: &Rc<RefCell<HeaderSyncView>>) -> RegistryChecker<Owned> {
+        let property = Property {
+            id: PropertyId::new("test/reactor"),
+            claim: "a test claim on the reactor",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Component(ComponentKind::Reactor)],
+            status: Status::Active,
+            check: check_reactor,
+            witness: None,
+        };
+        let sources = SourceManifest::storage().sources(Sources::default());
+        RegistryChecker::new(
+            Registry::new(vec![property]).expect("one property"),
+            Rc::new(Owned(view.clone())),
+            Assumptions::none(),
+            &sources,
+        )
+    }
+
+    /// A reactor that settles with call 1 unhandled and waits, then
+    /// resumes with no `Resumed`, handles call 1 in private and stops at
+    /// points until the run ends. `require` hands out the settled snapshot
+    /// while the reactor waits, and nothing at any boundary of the turn
+    /// that changed it, because its task stopped at a point with no
+    /// `Settled` after its last report.
     ///
     /// This fails if markers alone make the reactor current.
     #[test]
     fn a_skipped_resume_never_hands_out_the_old_snapshot() {
         let (mut fixture, slot) = Fixture::new(6);
         slot.emit(settled(0, false));
+        let unhandled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let private = unhandled.clone();
         fixture.sim.scheduler().spawn_root("reactor", async move {
-            start(&slot);
+            slot.emit(resumed(1, ResumeArm::Start));
+            private.store(1, std::sync::atomic::Ordering::Relaxed);
+            slot.emit(ReactorEvent::Settled {
+                turn: 1,
+                last: false,
+                snapshot: Box::new(ReactorSnapshot {
+                    unhandled_calls: vec![1],
+                    ..ReactorSnapshot::default()
+                }),
+            });
             zakura_rt::task::yield_now().await;
-            // The skipped `Resumed`: its turn changes state silently.
+            // The skipped `Resumed`: the turn handles call 1 silently.
+            private.store(0, std::sync::atomic::Ordering::Relaxed);
             loop {
                 point();
             }
         });
-        let mut states = States {
-            lives: vec![fixture.life.clone()],
-            ..States::default()
-        };
-        let (report, life) = fixture.run(&mut states);
+        let mut checker = requiring(&fixture.view);
+        REQUIRED.with(|required| required.borrow_mut().clear());
+        let (report, life) = fixture.run(&mut checker);
         assert_eq!(report.end.harness, None, "{:?}", report.end);
         assert_eq!(life.borrow().task(), Some("reactor.1"));
-        let reached: Vec<u64> = report
-            .log
-            .entries()
-            .iter()
-            .filter(|entry| matches!(&entry.obs, Observation::TaskReached { task, .. } if task == "reactor.1"))
-            .map(|entry| entry.step)
-            .collect();
+        assert_eq!(
+            unhandled.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the reactor handled the call it settled with"
+        );
+        let stops = |pred: fn(&Observation) -> bool| -> Vec<u64> {
+            report
+                .log
+                .entries()
+                .iter()
+                .filter(|entry| pred(&entry.obs))
+                .map(|entry| entry.step)
+                .collect()
+        };
+        let reached = stops(
+            |obs| matches!(obs, Observation::TaskReached { task, .. } if task == "reactor.1"),
+        );
+        let waited =
+            stops(|obs| matches!(obs, Observation::TaskWaiting { task } if task == "reactor.1"));
         assert!(reached.len() >= 3, "the turn stops at points: {reached:?}");
         assert_eq!(
             report.end.steps,
             *reached.last().unwrap(),
             "the run ends mid-turn"
         );
-        let waited = report
-            .log
-            .entries()
-            .iter()
-            .find(|entry| matches!(&entry.obs, Observation::TaskWaiting { task } if task == "reactor.1"))
-            .expect("the reactor waits after settling")
-            .step;
-        for (step, states) in &states.seen {
-            let expected = if reached.contains(step) {
-                "in-transition"
-            } else if *step >= waited {
-                "current"
-            } else {
-                continue;
-            };
-            assert_eq!(states[0], expected, "at step {step}");
+        assert_eq!(waited.len(), 1, "it waits once, settled");
+        let required = REQUIRED.with(|required| required.borrow().clone());
+        for (step, got) in &required {
+            if *step == waited[0] {
+                assert_eq!(got.as_deref(), Some(&[1][..]), "at the wait, step {step}");
+            }
+            if reached.contains(step) {
+                assert_eq!(*got, None, "mid-turn, step {step}");
+            }
         }
+        assert!(
+            required.iter().any(|(step, _)| reached.contains(step)),
+            "the check ran mid-turn"
+        );
     }
 
     /// A reactor whose task completes on the run's last live step without
@@ -582,18 +655,6 @@ mod tests {
     /// This fails if the exit is audited only at a later boundary.
     #[test]
     fn an_exit_on_the_last_step_is_audited() {
-        /// Holds whenever the reactor is current.
-        fn check(cx: &mut CheckCtx<'_, Owned>) -> Verdict {
-            let view = cx.view();
-            let view = view.borrow();
-            let reactor = view
-                .component(ComponentKind::Reactor)
-                .expect("the tier has the reactor");
-            match crate::property::require(cx, reactor) {
-                Some(_) => Verdict::Holds,
-                None => Verdict::NotApplicable,
-            }
-        }
         let (mut fixture, slot) = Fixture::new(1_000);
         slot.emit(settled(0, false));
         let kept = slot.clone();
@@ -602,23 +663,7 @@ mod tests {
             zakura_rt::task::yield_now().await;
             slot.emit(resumed(2, ResumeArm::Shutdown));
         });
-        let property = Property {
-            id: PropertyId::new("test/reactor"),
-            claim: "a test claim on the reactor",
-            kind: Kind::Safety,
-            assumes: &[],
-            needs: &[Source::Component(ComponentKind::Reactor)],
-            status: Status::Active,
-            check,
-            witness: None,
-        };
-        let sources = SourceManifest::storage().sources(Sources::default());
-        let mut registry = RegistryChecker::new(
-            Registry::new(vec![property]).expect("one property"),
-            Rc::new(Owned(fixture.view.clone())),
-            Assumptions::none(),
-            &sources,
-        );
+        let mut registry = requiring(&fixture.view);
         let mut checker = Recording {
             inner: &mut registry,
             end: None,

@@ -7,6 +7,12 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# The registered harness each target runs. `cargo xtask sim-minimize`, the C1
+# suite manifest and campaign tooling read the mapping from here.
+[package.metadata.zakura-sim.targets]
+discovery_wait_complete = "discovery/wait-complete"
+race_fixtures = "fixtures/all"
+
 [features]
 # Tells AddressSanitizer about each coroutine stack switch, which cargo-fuzz's
 # default ASan build needs. A build with `-s none` turns it off with

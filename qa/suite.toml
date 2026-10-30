@@ -1,10 +1,11 @@
 # The full property suite (campaign.md, C1): what the suite runs beyond the
 # harness registry. `cargo xtask sim-suite` joins this file with the
 # registered harnesses and their properties, the coverage manifest, the
-# planted cases under qa/planted/, the committed seeds, the fuzz targets
-# under qa/fuzz/ and the test sources, and fails if any of them is missing
-# here. A new harness, fuzz target or ignored test fails the check until
-# this file runs it, excludes it with a reason, or lists it as missing.
+# planted cases under qa/planted/, the committed seeds, the test and fuzz
+# targets `cargo metadata` reports and their sources, and fails if any of
+# them is missing here. A new harness, fuzz target or ignored test fails
+# the check until this file runs it, excludes it with a reason, or lists it
+# as missing.
 #
 # Timeouts are generous upper bounds for a cold build on an 8-vCPU host.
 # The campaign's calibration run replaces them with measured values.
@@ -150,13 +151,14 @@ build = "sim-asan"
 args = "test --locked -p zakura-rt -p zakura-scheduler --features zakura-scheduler/sanitizer --target x86_64-unknown-linux-gnu --tests"
 timeout-secs = 2700
 
-# Fuzz targets. A `sim` target runs one harness, and starts from that
-# harness's admitted seeds. Its smoke run is short; the campaign sets each
-# target's search budget after calibration.
+# Fuzz targets. A `sim` target runs the one harness that
+# qa/fuzz/sim/Cargo.toml's `[package.metadata.zakura-sim.targets]` table
+# maps it to, and starts from that harness's admitted seeds. Its smoke run
+# is short; the campaign sets each target's search budget after
+# calibration.
 [[target]]
 package = "sim"
 name = "discovery_wait_complete"
-harness = "discovery/wait-complete"
 smoke-secs = 60
 timeout-secs = 1800
 
@@ -166,7 +168,6 @@ timeout-secs = 1800
 [[target]]
 package = "sim"
 name = "race_fixtures"
-harness = "fixtures/all"
 covers = [
     "race/lost-update",
     "race/snapshot-reserve",

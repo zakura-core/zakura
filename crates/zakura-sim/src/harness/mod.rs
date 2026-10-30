@@ -15,11 +15,13 @@ pub mod block_semantic;
 pub mod block_sync;
 pub mod coverage;
 pub mod discovery;
+pub mod evidence_hub;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
 pub mod policy;
 mod record;
+pub mod scenario;
 pub mod wire_node;
 pub mod wire_plans;
 

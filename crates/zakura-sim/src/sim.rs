@@ -109,6 +109,14 @@ pub struct RunReport {
     pub resolved: Plan,
 }
 
+impl RunReport {
+    /// The `end` record the run wrote, or would have written to a sink that
+    /// keeps records.
+    pub(crate) fn end_record(&self) -> EndRecord {
+        end_record(&self.end, &self.properties, self.cleanup, &self.picks)
+    }
+}
+
 /// One simulated run.
 pub struct Sim {
     /// `None` once shut down.
@@ -468,7 +476,7 @@ impl Sim {
                     by: decision.by,
                     offset: decision.offset,
                     draws,
-                    obs: Some(digest(st.log.of_step(st.step))),
+                    obs: Some(digest(st.log.entries_of_step(st.step))),
                 }));
             }
             if let Some(failure) = self.failure.take() {

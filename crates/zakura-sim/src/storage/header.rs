@@ -29,6 +29,7 @@ use zakura_storage::header::{
 use super::{after, body_owner, hash, hex, peer, point, scope};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
+    harness::evidence_hub::Row,
     observe::{
         HeaderStorageState, StorageContinuation, StorageFact, StorageLease, StorageLeaseState,
         StorageOperation, StorageRequest, StorageResult, StorageState, WorkOwner,
@@ -132,6 +133,62 @@ impl HeaderStorage {
             },
             id,
         }
+    }
+
+    /// The storage's registration index in its run.
+    pub(crate) fn instance(&self) -> u64 {
+        self.id.index
+    }
+
+    /// Drains the port's facts, checks them and its owner state against the
+    /// model, and returns them as rows, recording in the checkpoint what it
+    /// delivers to `log`'s step. Each fact keeps the position it was
+    /// published at, and the state gets this observation's.
+    pub(crate) fn drain(&mut self, log: &ObservationLog) -> Result<Vec<Row>, String> {
+        // Only the run holding the checkpoint checks what this delivers.
+        // Run IDs depend on the process, and the failure is replayed, so the
+        // text names neither.
+        if log.run() != self.id.run {
+            return Err("ForeignRun: storage registered with another run".to_owned());
+        }
+        let delivered = match self.delivered {
+            Some(delivered) => delivered,
+            None => {
+                self.port
+                    .bind_to_run()
+                    .map_err(|error| format!("activity before binding: {error}"))?;
+                0
+            }
+        };
+        let facts = self.port.take_facts();
+        let actual = self.port.owner_state();
+        self.model
+            .check_boundary(&facts, &actual)
+            .map_err(|failure| format!("{failure:?}"))?;
+        // After setup, the state is logged only when it may have changed.
+        let with_state = self.delivered.is_none() || !facts.is_empty();
+        let last = facts.last().map_or(delivered, |fact| fact.seq);
+        let mut rows: Vec<Row> = facts
+            .into_iter()
+            .map(|fact| Row::at(fact.pos, observation(fact, self.id.index)))
+            .collect();
+        if with_state {
+            rows.push(Row::at(
+                zakura_rt::sim::next_position(),
+                Observation::StorageState {
+                    service: SERVICE.to_owned(),
+                    instance: self.id.index,
+                    through_seq: actual.through_seq,
+                    state: state(&actual),
+                },
+            ));
+        }
+        self.delivered = Some(last);
+        // The run checks its own log against this, since the log this source
+        // was handed may not be the run's.
+        let sent: Vec<Observation> = rows.iter().map(|row| row.obs.clone()).collect();
+        self.checkpoint.record(log.step(), &sent, last);
+        Ok(rows)
     }
 }
 
@@ -532,48 +589,8 @@ impl ActionSource for HeaderStorage {
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        // Only the run holding the checkpoint checks what this delivers.
-        // Run IDs depend on the process, and the failure is replayed, so the
-        // text names neither.
-        if log.run() != self.id.run {
-            return Err("ForeignRun: storage registered with another run".to_owned());
-        }
-        let delivered = match self.delivered {
-            Some(delivered) => delivered,
-            None => {
-                self.port
-                    .bind_to_run()
-                    .map_err(|error| format!("activity before binding: {error}"))?;
-                0
-            }
-        };
-        let facts = self.port.take_facts();
-        let actual = self.port.owner_state();
-        self.model
-            .check_boundary(&facts, &actual)
-            .map_err(|failure| format!("{failure:?}"))?;
-        // After setup, the state is logged only when it may have changed.
-        let with_state = self.delivered.is_none() || !facts.is_empty();
-        let last = facts.last().map_or(delivered, |fact| fact.seq);
-        let mut sent: Vec<Observation> = facts
-            .into_iter()
-            .map(|fact| observation(fact, self.id.index))
-            .collect();
-        if with_state {
-            sent.push(Observation::StorageState {
-                service: SERVICE.to_owned(),
-                instance: self.id.index,
-                through_seq: actual.through_seq,
-                state: state(&actual),
-            });
-        }
-        for obs in &sent {
-            log.push(obs.clone());
-        }
-        self.delivered = Some(last);
-        // The run checks its own log against this, since the log this source
-        // was handed may not be the run's.
-        self.checkpoint.record(log.step(), &sent, last);
+        let rows = self.drain(log)?;
+        rows.into_iter().for_each(|row| log.push(row.obs));
         Ok(())
     }
 }

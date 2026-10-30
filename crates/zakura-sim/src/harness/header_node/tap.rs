@@ -40,6 +40,7 @@ use super::pair::{PairError, Pairer};
 use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
+    harness::evidence_hub::{position, Row},
     observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
@@ -83,8 +84,9 @@ struct TapState {
 struct Buffer {
     /// The last event number handed out.
     last: u64,
-    /// Each event with its number and storage watermark, in order.
-    events: Vec<(u64, u64, ReactorEvent)>,
+    /// Each event with its number, storage watermark and emission
+    /// position, in order.
+    events: Vec<(u64, u64, Option<u64>, ReactorEvent)>,
 }
 
 impl TapState {
@@ -146,13 +148,15 @@ impl HeaderSyncObserver for TapObserver {
                 0
             }
         };
+        // Taken before the lock, which nothing else takes in between.
+        let pos = position();
         let mut buffer = state.buffer();
         buffer.last = buffer
             .last
             .checked_add(1)
             .expect("a run records fewer than 2^64 events");
         let seq = buffer.last;
-        buffer.events.push((seq, storage_seq, event));
+        buffer.events.push((seq, storage_seq, pos, event));
     }
 }
 
@@ -201,6 +205,11 @@ impl ReactorTap {
             failure: sim.failure(),
         };
         (observer, tap)
+    }
+
+    /// The tap's registration index among the run's taps.
+    pub(crate) fn instance(&self) -> u64 {
+        self.id.index
     }
 
     /// Reads the node's storage facts that this step's drain logged, as
@@ -399,6 +408,22 @@ impl ActionSource for ReactorTap {
     /// which the run reports instead, or records a port panic as the run's
     /// harness failure.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+        let (rows, drained) = self.drain(log)?;
+        rows.into_iter().for_each(|row| log.push(row.obs));
+        drained
+    }
+}
+
+impl ReactorTap {
+    /// Pairs every event recorded since the last observation and returns
+    /// them as rows, in order, recording in the checkpoint what it delivers
+    /// to `log`'s step. A drain that doesn't pair is still returned, with
+    /// its failure, unless the tap is unhealthy, which the run reports
+    /// instead, or records a port panic as the run's harness failure.
+    pub(crate) fn drain(
+        &mut self,
+        log: &ObservationLog,
+    ) -> Result<(Vec<Row>, Result<(), String>), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
         // text names neither.
@@ -406,19 +431,19 @@ impl ActionSource for ReactorTap {
             return Err("ForeignRun: reactor tap registered with another run".to_owned());
         }
         let events = mem::take(&mut self.state.buffer().events);
-        let last = events.last().map_or(self.delivered, |(seq, _, _)| *seq);
-        let mut sent = events
-            .into_iter()
-            .map(|(seq, storage_seq, event)| {
-                Ok(Observation::Reactor {
-                    instance: self.id.index,
-                    seq,
-                    storage_seq,
-                    node: self.node.clone(),
-                    event: fact(event)?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let last = events.last().map_or(self.delivered, |(seq, _, _, _)| *seq);
+        let mut sent = Vec::with_capacity(events.len());
+        let mut positions = Vec::with_capacity(events.len());
+        for (seq, storage_seq, pos, event) in events {
+            sent.push(Observation::Reactor {
+                instance: self.id.index,
+                seq,
+                storage_seq,
+                node: self.node.clone(),
+                event: fact(event)?,
+            });
+            positions.push(pos);
+        }
         let paired = self
             .pairer
             .pair(sent.iter_mut().filter_map(|obs| match obs {
@@ -427,14 +452,16 @@ impl ActionSource for ReactorTap {
                 } => Some((*storage_seq, event)),
                 _ => None,
             }));
-        for obs in &sent {
-            log.push(obs.clone());
-        }
         self.delivered = last;
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        match paired {
+        let rows = positions
+            .into_iter()
+            .zip(sent)
+            .map(|(pos, obs)| Row::at(pos, obs))
+            .collect();
+        let paired = match paired {
             Ok(()) => Ok(()),
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
@@ -453,7 +480,8 @@ impl ActionSource for ReactorTap {
                     });
                 Ok(())
             }
-        }
+        };
+        Ok((rows, paired))
     }
 }
 

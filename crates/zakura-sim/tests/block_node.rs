@@ -136,6 +136,27 @@ fn the_default_scenario_converges() {
     }
 }
 
+/// A run without a teardown step frees the node once it ends, so once the
+/// test drops the ports' service, it holds the last reference to the node's
+/// engine. The node's replies hold its reactor's handle, and the handle's
+/// serving range source holds the service, which holds the replies. Unless
+/// the node clears its replies when it drops, that cycle keeps the node's
+/// whole state alive past the run, and LeakSanitizer reports it under the
+/// `block_sync_storage` fuzz target.
+#[test]
+fn a_run_frees_the_node() {
+    for input in inputs(1, 64) {
+        let (_, ports) = run(&BlockScenario::default(), input);
+        let Ports { node, service, .. } = ports;
+        drop(service);
+        assert_eq!(
+            std::sync::Arc::strong_count(&node),
+            1,
+            "nothing from the run holds the node's engine"
+        );
+    }
+}
+
 /// A node that starts with the first four of eight bodies downloads and
 /// submits only the other four, and reaches the tip.
 #[test]

@@ -15,7 +15,7 @@ use zakura_network::{
     },
     Config,
 };
-use zakura_quic::{Conn, NodeId, RecvStream, SendStream};
+use zakura_quic::{Conn, NodeId, RecvStream, SendStream, WriteError};
 
 /// The peer's side of a handshake: the network config it validates against
 /// and the limits it offers, both production's on Regtest.
@@ -191,12 +191,12 @@ pub(crate) async fn respond(
 }
 
 /// Writes the prelude of a persistent `kind` stream at `version`, with
-/// Regtest header sync's frame cap.
+/// Regtest header sync's frame cap, keeping the write's typed error.
 pub(crate) async fn write_prelude(
     send: &mut SendStream,
     kind: u16,
     version: u16,
-) -> Result<(), String> {
+) -> Result<(), WriteError> {
     let prelude = StreamPrelude {
         magic: STREAM_PRELUDE_MAGIC,
         stream_kind: kind,
@@ -205,10 +205,8 @@ pub(crate) async fn write_prelude(
         max_frame_bytes: RegtestMessage::LAYOUT[0].frame_cap,
     }
     .encode()
-    .map_err(|error| error.to_string())?;
-    send.write_all(&prelude)
-        .await
-        .map_err(|error| format!("prelude: {error}"))
+    .expect("a prelude with no request ID and a fixed cap is in range, so it encodes");
+    send.write_all(&prelude).await
 }
 
 /// Reads a stream prelude: the fixed fields, then the request ID if its

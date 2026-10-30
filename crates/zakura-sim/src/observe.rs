@@ -1,7 +1,8 @@
 //! What a run observed, step by step.
 //!
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
-//! that appended it. Step 0 is setup, before the first pick.
+//! that appended it and its log key ([`Entry`]), and the log is in key
+//! order. Step 0 is setup, before the first pick.
 
 use serde::Serialize;
 
@@ -412,6 +413,45 @@ pub enum Observation {
         /// The credit an update adds, for an `Open` or `Grant`.
         credit: Option<PeerCredit>,
     },
+    /// A scripted peer's record, logged in the step it was made at its own
+    /// position, under the identity the peer knows: its address and the
+    /// QUIC stream. Its resolved rows, such as the `PeerFrame` once the
+    /// node admits the stream, come later and name this position as their
+    /// origin. A record that never resolves keeps only this row.
+    PeerEmitted {
+        /// The peer's address on the connection, which the node sees as the
+        /// remote.
+        remote: String,
+        /// The QUIC stream, or `None` for a record made before any stream,
+        /// such as a failed open.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
+        /// What the peer did.
+        body: EmittedBody,
+    },
+    /// A scripted peer saw its connection end: a write or read returned
+    /// `ConnectionLost`, `Conn::closed` returned, or the peer closed it.
+    PeerConnEnded {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream it was using, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
+        /// Why.
+        reason: ConnEnd,
+    },
+    /// A scripted peer saw one direction of a header stream end while its
+    /// connection may still live.
+    PeerStreamEnded {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream, from the identity map.
+        quic_stream: u64,
+        /// Which half ended.
+        direction: Direction,
+        /// How.
+        end: StreamEnd,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -434,6 +474,129 @@ impl Observation {
             _ => None,
         }
     }
+}
+
+/// A [`Observation::PeerEmitted`] record's content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "record", rename_all = "kebab-case")]
+pub enum EmittedBody {
+    /// A frame the peer is about to write, as its models labelled it.
+    Frame {
+        /// Its position among the peer's frames on the stream, from 0.
+        seq: u64,
+        /// The row whose rule its label enforces.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        row: Option<String>,
+        /// The stream whose table holds `row`.
+        rule_stream: StreamId,
+        /// Its label.
+        label: Label,
+        /// True if its cadence model charged it to an empty bucket.
+        exhausted: bool,
+        /// The exchange it belongs to, if its row has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exchange: Option<u64>,
+        /// Its payload's length in bytes.
+        payload: u64,
+    },
+    /// The peer's write of frame `seq` returned.
+    Written {
+        /// The frame.
+        seq: u64,
+    },
+    /// The peer closed its connection.
+    Closed,
+    /// The peer's reader finished reading one of the node's frames.
+    Received {
+        /// Its position among the node's frames on the stream, from 0.
+        seq: u64,
+        /// Its message type.
+        message_type: u16,
+        /// Its flags.
+        flags: u16,
+        /// Its payload's length in bytes.
+        payload: u64,
+        /// The first 8 bytes of SHA-256 over its payload, in hex, so two
+        /// frames of one type and length stay apart.
+        digest: String,
+    },
+    /// The peer's task handled the node's frame `seq`, which its reader
+    /// had received.
+    Handled {
+        /// The frame.
+        seq: u64,
+    },
+    /// The peer saw its connection end.
+    ConnEnded {
+        /// Why.
+        reason: ConnEnd,
+    },
+    /// The peer saw one direction of the stream end.
+    StreamEnded {
+        /// Which half.
+        direction: Direction,
+        /// How.
+        end: StreamEnd,
+    },
+}
+
+/// Why a scripted peer's connection ended, as its QUIC error says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "kebab-case")]
+pub enum ConnEnd {
+    /// The node closed it with this application code.
+    ReceivedClose {
+        /// The code.
+        code: u64,
+    },
+    /// A transport error or timeout ended it.
+    TransportError {
+        /// The error.
+        detail: String,
+    },
+    /// The peer closed it itself.
+    LocalClose,
+}
+
+/// One half of a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    /// The peer's sending half.
+    Send,
+    /// The peer's receiving half.
+    Receive,
+}
+
+/// How one half of a scripted peer's stream ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "end", rename_all = "kebab-case")]
+pub enum StreamEnd {
+    /// The node stopped the peer's sending half with this code.
+    Stopped {
+        /// The code.
+        code: u64,
+    },
+    /// The node reset the peer's receiving half with this code.
+    Reset {
+        /// The code.
+        code: u64,
+    },
+    /// The half was already finished, reset or stopped.
+    ClosedStream,
+    /// The node finished the stream at a frame boundary.
+    Finished,
+    /// The node finished the stream partway through a frame, after `read`
+    /// of its bytes.
+    Truncated {
+        /// The bytes of the frame read.
+        read: u64,
+    },
+    /// A frame header announced `len` payload bytes, over the stream's cap.
+    Oversized {
+        /// The announced length.
+        len: u64,
+    },
 }
 
 /// A storage fact in plain fields: hashes and peers in hex, counters as
@@ -1987,13 +2150,53 @@ pub enum Exit {
     Panicked,
 }
 
-/// An observation and the step that appended it.
+/// An observation, the step that appended it, and its log key.
+///
+/// Every entry has a key `(pos, sub)`, and keys grow in the log's order. An
+/// entry a source emitted is `(pos, 0)`, where `pos` is the run-wide
+/// position it was emitted at ([`zakura_rt::sim::next_position`]), so
+/// records from separate sources order by when they happened. A row the
+/// evidence hub derives is `(pos, k)` with `k` from 1, where `pos` is the
+/// record that produced it, and it names where its evidence came from in
+/// `origin`. A row the run appends itself takes the next position when it's
+/// appended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The step, from 1. Step 0 is setup.
     pub step: u64,
+    /// The key's emission position.
+    pub pos: u64,
+    /// The key's place among the rows at `pos`, 0 for the emitted record.
+    pub sub: u32,
+    /// For a derived row, the position of the record it came from. A
+    /// resolved peer row is keyed by the record that let it resolve, so it
+    /// names its `peer-emitted` record here.
+    pub origin: Option<u64>,
     /// What happened.
     pub obs: Observation,
+}
+
+/// [`Entry`] as a step's `obs` digest encodes it.
+#[derive(Serialize)]
+pub(crate) struct Keyed<'e> {
+    pos: u64,
+    sub: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<u64>,
+    #[serde(flatten)]
+    obs: &'e Observation,
+}
+
+impl Entry {
+    /// The entry as a digest encodes it.
+    pub(crate) fn keyed(&self) -> Keyed<'_> {
+        Keyed {
+            pos: self.pos,
+            sub: self.sub,
+            origin: self.origin,
+            obs: &self.obs,
+        }
+    }
 }
 
 /// Every observation of a run, in order.
@@ -2004,18 +2207,50 @@ pub struct ObservationLog {
     frozen: bool,
     /// The run the log belongs to, 0 for one no run made.
     run: u64,
+    /// The last key appended, `(0, 0)` before any.
+    last: (u64, u32),
 }
 
 impl ObservationLog {
-    /// Appends `obs` to the current step. Does nothing once the log is
+    /// Appends `obs` to the current step, keyed at the run's next position,
+    /// or after the last key outside a run. Does nothing once the log is
     /// frozen, so cleanup at shutdown leaves no trace in it.
     pub fn push(&mut self, obs: Observation) {
-        if !self.frozen {
-            self.entries.push(Entry {
-                step: self.step,
-                obs,
-            });
+        // A position taken now is past every one handed out before it, so
+        // only a row a hub keyed outside the run's positions can be later.
+        let after = self.last.0 + 1;
+        let pos = zakura_rt::sim::next_position().map_or(after, |pos| pos.max(after));
+        let pushed = self.push_keyed((pos, 0), None, obs);
+        debug_assert!(pushed.is_ok(), "a fresh key is past the last one");
+    }
+
+    /// Appends `obs` to the current step at `key`, naming `origin`, or
+    /// refuses a key that isn't past the last one, since checks read the
+    /// log's order as the order things happened.
+    pub(crate) fn push_keyed(
+        &mut self,
+        key: (u64, u32),
+        origin: Option<u64>,
+        obs: Observation,
+    ) -> Result<(), String> {
+        if self.frozen {
+            return Ok(());
         }
+        if self.entries.last().is_some() && key <= self.last {
+            return Err(format!(
+                "OutOfOrder: a row keyed {key:?} came after {:?}: {obs:?}",
+                self.last
+            ));
+        }
+        self.last = key;
+        self.entries.push(Entry {
+            step: self.step,
+            pos: key.0,
+            sub: key.1,
+            origin,
+            obs,
+        });
+        Ok(())
     }
 
     /// Every entry, in order.
@@ -2031,6 +2266,18 @@ impl ObservationLog {
             .iter()
             .take_while(move |e| e.step == step)
             .map(|e| &e.obs)
+    }
+
+    /// The entries `step` appended, keys included.
+    pub(crate) fn entries_of_step(&self, step: u64) -> &[Entry] {
+        let start = self.entries.partition_point(|e| e.step < step);
+        let end = self.entries.partition_point(|e| e.step <= step);
+        &self.entries[start..end]
+    }
+
+    /// The last key appended, `(0, 0)` before any.
+    pub(crate) fn last_key(&self) -> (u64, u32) {
+        self.last
     }
 
     /// The step being appended to, 0 during setup.

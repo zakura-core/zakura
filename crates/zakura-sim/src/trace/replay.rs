@@ -21,9 +21,10 @@ use super::{
 use crate::{
     check::PropertyReport,
     harness::{self, HarnessEntry, HarnessError},
+    observe::{Entry, Keyed},
     plan::TraceScript,
     record::EndRecord,
-    Divergence, HarnessFailure, Observation, ObservationLog, PlanError, PlanInput,
+    Divergence, HarnessFailure, ObservationLog, PlanError, PlanInput,
 };
 
 /// The full observation log `--observe` writes beside `trace.jsonl`.
@@ -418,12 +419,13 @@ fn meta_difference(recorded: &MetaRecord, rebuilt: &MetaRecord) -> Option<&'stat
     .find_map(|(field, same)| (!same).then_some(field))
 }
 
-/// One line of [`OBSERVATIONS_FILE`]: a step's observations, in order. The
-/// `obs` array serializes as the step's `obs` digest hashes it.
+/// One line of [`OBSERVATIONS_FILE`]: a step's observations, in order, each
+/// with its log key. The `obs` array serializes as the step's `obs` digest
+/// hashes it.
 #[derive(Serialize)]
 struct ObservationLine<'a> {
     step: u64,
-    obs: Vec<&'a Observation>,
+    obs: Vec<Keyed<'a>>,
 }
 
 /// Creates [`OBSERVATIONS_FILE`] in `trace`'s directory. Fails if anything,
@@ -442,7 +444,7 @@ fn write_observations(mut file: File, log: &ObservationLog, steps: u64) -> io::R
     for step in 0..=steps {
         let line = ObservationLine {
             step,
-            obs: log.of_step(step).collect(),
+            obs: log.entries_of_step(step).iter().map(Entry::keyed).collect(),
         };
         serde_json::to_writer(&mut out, &line)?;
         out.push(b'\n');

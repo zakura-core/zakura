@@ -124,6 +124,11 @@ pub struct Fact {
     pub at: Instant,
     /// What changed.
     pub kind: FactKind,
+    /// Its emission position in the run, taken as it's published, so a
+    /// harness that drains it later still orders it where it happened.
+    /// `None` outside a run.
+    #[cfg(zakura_sim)]
+    pub pos: Option<u64>,
 }
 
 /// What a [`Fact`] records. The head kinds name their transaction and come
@@ -371,6 +376,8 @@ impl Ops {
                     txn,
                     at,
                     kind,
+                    #[cfg(zakura_sim)]
+                    pos: zakura_rt::sim::next_position(),
                 }
             })
             .collect();

@@ -136,6 +136,9 @@ thread_local! {
     /// Points skipped in the current or last run because a `watch` lock was
     /// held.
     static SUPPRESSED: Cell<u64> = const { Cell::new(0) };
+    /// The last emission position handed out in the current run. See
+    /// [`next_position`].
+    static POSITION: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The next [`RunId`]. Process-wide, so an id never repeats on any thread.
@@ -183,6 +186,25 @@ pub fn executor_for(run: RunId) -> Option<&'static dyn Executor> {
         .map(|current| current.executor)
 }
 
+/// The next emission position of the run on this thread, from 1, or `None`
+/// outside a run. Every piece of evidence a harness logs takes one where it
+/// happens, so records from separate sources order by when they happened.
+/// It's a plain counter: it takes no preemption point and draws nothing, so
+/// calling it never changes a schedule.
+pub fn next_position() -> Option<u64> {
+    current()?;
+    POSITION
+        .try_with(|cell| {
+            let next = cell
+                .get()
+                .checked_add(1)
+                .expect("a run hands out fewer than 2^64 positions");
+            cell.set(next);
+            next
+        })
+        .ok()
+}
+
 /// The run on this thread, if any.
 fn current() -> Option<Run> {
     RUN.try_with(Cell::get).ok().flatten()
@@ -203,6 +225,7 @@ pub fn enter(executor: &'static dyn Executor) -> RunGuard {
         cell.set(Some(Run { executor, id }));
     });
     let _ = SUPPRESSED.try_with(|cell| cell.set(0));
+    let _ = POSITION.try_with(|cell| cell.set(0));
     crate::collections::reset_run_seed();
     crate::rand::reset_run_stream();
     RunGuard {

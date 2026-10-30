@@ -2,9 +2,7 @@
 //! witness test fails.
 #![cfg(zakura_sim)]
 
-use std::{fs, path::Path, time::Duration};
-
-use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 use zakura_rt::time::sleep;
 use zakura_sim::{
@@ -102,48 +100,6 @@ fn unregistered_property_fails() {
         ),
         Err(WitnessError::Unregistered)
     );
-}
-
-/// A committed fuzz input's sidecar, `<name>.toml` beside `<name>.bin`.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sidecar {
-    /// The harness that runs the input.
-    harness: String,
-    /// The harness's generator version when the input was built.
-    generator: u32,
-    /// The input's SHA-256, in hex.
-    sha256: String,
-}
-
-/// Every committed fuzz input has a sidecar that names a registered
-/// harness at its current generator and matches the input's digest, so the
-/// explorer can seed its corpus from them.
-#[test]
-fn committed_inputs_match_their_sidecars() {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let mut inputs = 0;
-    for entry in fs::read_dir(&fixtures).expect("the fixture directory exists") {
-        let path = entry.expect("the directory lists").path();
-        if path.extension().is_none_or(|e| e != "bin") {
-            continue;
-        }
-        inputs += 1;
-        let sidecar = path.with_extension("toml");
-        let text = fs::read_to_string(&sidecar)
-            .unwrap_or_else(|error| panic!("{}: {error}", sidecar.display()));
-        let sidecar: Sidecar =
-            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", sidecar.display()));
-        let entry = harness::find(&sidecar.harness).expect("the sidecar names a harness");
-        assert_eq!(sidecar.generator, entry.generator, "{}", path.display());
-        let bytes = fs::read(&path).expect("the input reads");
-        let digest: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        assert_eq!(sidecar.sha256, digest, "{}", path.display());
-    }
-    assert!(inputs > 0, "the S4.7 input is committed");
 }
 
 /// What [`Probe`]'s one task does.

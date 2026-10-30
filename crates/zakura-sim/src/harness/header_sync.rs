@@ -6,6 +6,8 @@
 //! adversaries (M5-E1), checked by header sync's generated table properties
 //! and `session/honest-never-punished` (P3d).
 
+pub mod grammar;
+
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use serde::{Deserialize, Serialize};
@@ -23,11 +25,13 @@ use zakura_storage::header::{
 };
 
 use super::{
+    evidence_hub::EvidenceHub,
     header_node::StartupFacts,
     header_node::{
         policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
         HeaderNode, Policy, PolicySource, Topology,
     },
+    scenario::Rejection,
     wire_node::{TransportTap, WireNode},
     wire_plans::SavedPlan,
     NetScenario, Subsystem,
@@ -162,7 +166,8 @@ pub struct MirrorSpec {
     pub dialer: Dialer,
 }
 
-/// The `header-sync/storage` scenario.
+/// The `header-sync/storage` scenario. A fuzz input's prefix encodes it as
+/// [`grammar`] describes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageScenario {
@@ -247,8 +252,8 @@ impl HasView for Storage {
 
 impl Subsystem for Storage {
     const NAME: &'static str = "header-sync/storage";
-    const GENERATOR: u32 = 1;
-    const SCENARIO_BYTES: usize = 0;
+    const GENERATOR: u32 = grammar::GENERATOR;
+    const SCENARIO_BYTES: usize = grammar::LAYOUT.prefix_len();
     type Scenario = StorageScenario;
     type Prepared = Ports;
 
@@ -298,6 +303,7 @@ impl Subsystem for Storage {
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
+        let mut hub = EvidenceHub::new();
         let storage = PolicySource::new(
             sim,
             ports.node.clone(),
@@ -305,7 +311,7 @@ impl Subsystem for Storage {
             effects.clone(),
         );
         let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
-        let storage = storage.with_tap(tap);
+        let storage = storage.with_tap(tap).behind(&mut hub);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
         let mut nodes = vec![HeaderNode::spawn(
@@ -351,6 +357,8 @@ impl Subsystem for Storage {
             predicates,
         );
         sim.add_source(Box::new(control));
+        // Last, so it writes everything the others observed.
+        sim.add_source(Box::new(hub));
         Storage {
             port: ports.node,
             dispatch,
@@ -368,9 +376,21 @@ impl Subsystem for Storage {
         storage_sources()
     }
 
-    /// The default scenario.
-    fn draw(_: &[u8]) -> StorageScenario {
-        StorageScenario::default()
+    /// The scenario [`grammar::decode`] reads from `prefix`. A prefix
+    /// written for another generator draws the default scenario.
+    ///
+    /// # Panics
+    ///
+    /// If `prefix` isn't [`Subsystem::SCENARIO_BYTES`] long, which breaks
+    /// `draw`'s contract.
+    fn draw(prefix: &[u8]) -> StorageScenario {
+        match grammar::decode(prefix) {
+            Ok(scenario) => scenario,
+            Err(Rejection::Version { .. }) => StorageScenario::default(),
+            Err(rejection @ Rejection::Length { .. }) => {
+                panic!("`draw` takes exactly SCENARIO_BYTES bytes, but {rejection}")
+            }
+        }
     }
 }
 
@@ -443,7 +463,7 @@ impl WirePorts {
     /// hasn't admitted yet, so a test whose streams all reach admission
     /// requires none.
     pub fn unplaced_records(&self) -> usize {
-        self.records.borrow().len()
+        self.records.unplaced()
     }
 }
 
@@ -536,9 +556,12 @@ impl Subsystem for HeaderWire {
     /// Adds the network, then spawns the node as `header-sync/storage` does,
     /// with its reactor tapped, behind its transport, which its own tap
     /// reports. Then spawns each peer, and a dial for each peer the node
-    /// dials, and adds the peers' action source.
+    /// dials, and adds the peers' action source. The evidence hub, added
+    /// last, writes what every source observed.
     fn build(sim: &mut Sim, scenario: &WireScenario, ports: WirePorts) -> Self {
+        let mut hub = EvidenceHub::new();
         let net = scenario.net.net();
+        net.write_to(hub.out());
         sim.add_source(Box::new(net.clone()));
         let dispatch = DispatchFlag::default();
         let storage = PolicySource::new(
@@ -548,7 +571,7 @@ impl Subsystem for HeaderWire {
             Effects::default(),
         );
         let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
-        sim.add_source(Box::new(storage.with_tap(tap)));
+        sim.add_source(Box::new(storage.with_tap(tap).behind(&mut hub)));
         let header = HeaderNode::spawn(
             sim,
             "node",
@@ -565,7 +588,7 @@ impl Subsystem for HeaderWire {
             .collect();
         let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
         let dials = tap.dials();
-        sim.add_source(Box::new(tap));
+        sim.add_source(Box::new(tap.writing_to(hub.out())));
         let node = WireNode::spawn(
             sim,
             header,
@@ -576,7 +599,8 @@ impl Subsystem for HeaderWire {
             dials,
         );
         let failure = PeerFailure::default();
-        let mut control = PeerControl::new(failure.clone(), ports.records.clone());
+        let mut control = PeerControl::new(failure.clone());
+        hub.place_peers(ports.records.clone());
         for ((index, spec), name) in scenario.peers.iter().enumerate().zip(names) {
             let (readiness, commands) =
                 control.add(&name, spec.script.clone(), spec.adversary.is_some());
@@ -605,6 +629,7 @@ impl Subsystem for HeaderWire {
             }
         }
         sim.add_source(Box::new(control));
+        sim.add_source(Box::new(hub));
         HeaderWire {
             port: ports.node,
             dispatch,

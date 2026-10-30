@@ -14,7 +14,7 @@
 //! the sender's rules by the [`adapter`] (M5-E2). A peer that closes its
 //! connection with a header stream open logs a `PeerClosed` (M5-F). Each record names its
 //! connection and QUIC stream from the identity map, never from draw order,
-//! so it waits in [`PeerControl`] until the node's transport has admitted
+//! so it waits in the evidence hub until the node's transport has admitted
 //! its stream.
 //!
 //! A peer with an [`AdversarySpec`] also takes [`PeerAction::Act`]s, the
@@ -57,8 +57,8 @@ use zakura_network::zakura::{
 };
 use zakura_quic::{
     sim::{SeededInputs, SimNet},
-    Acceptor, Admit, Conn, IncomingInfo, NodeAddr, QuicBindConfig, QuicConfig, QuicEndpoint,
-    RecvStream, SendStream, VarInt,
+    Acceptor, Admit, Conn, ConnectionError, IncomingInfo, NodeAddr, QuicBindConfig, QuicConfig,
+    QuicEndpoint, ReadError, ReadExactError, RecvStream, SendStream, VarInt, WriteError,
 };
 use zakura_rt::{
     sync::{mpsc, watch},
@@ -66,20 +66,20 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, WireEvidence};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
-    evidence::WireEvidence,
     handshake::{Echo, Local},
     honest::{Honest, HonestChain, HonestSpec},
     limit::{RateLimit, ADVERSARY_RATE},
 };
 use crate::{
+    harness::evidence_hub::position,
     model::{
         CadenceModel, Charge, FrameHeader, FrameModel, Label, Labels, ReaderEnd, SubscriptionModel,
     },
-    observe::{PeerCredit, StreamId},
+    observe::{ConnEnd, Direction, PeerCredit, StreamEnd, StreamId},
     table::rule_row,
     ActionSource, Boundary, Identity, ObservationLog,
 };
@@ -348,20 +348,14 @@ impl Slot {
 pub struct PeerControl {
     slots: Vec<Slot>,
     failure: PeerFailure,
-    /// What the peers' tasks recorded, until the identity map places it.
-    records: PeerRecords,
-    evidence: WireEvidence,
 }
 
 impl PeerControl {
-    /// No peers yet. Failures land in `failure`, and the peers' tasks
-    /// record into `records`.
-    pub(crate) fn new(failure: PeerFailure, records: PeerRecords) -> Self {
+    /// No peers yet. Failures land in `failure`.
+    pub(crate) fn new(failure: PeerFailure) -> Self {
         PeerControl {
             slots: Vec::new(),
             failure,
-            records,
-            evidence: WireEvidence::default(),
         }
     }
 
@@ -426,18 +420,14 @@ impl ActionSource for PeerControl {
         slot.next += 1;
     }
 
-    /// Logs the peers' records the identity map can place, and what the
-    /// node's evidence means for P3b's checks ([`WireEvidence`]), then
-    /// fails the run if a peer couldn't carry out an action. So a node frame
-    /// that stopped its peer is logged with its `NodeFrame` first. This
-    /// source is added after the transport tap, so the identity rows it
-    /// reads are logged first.
-    fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        let observed = self.evidence.observe(&self.records, log);
-        if let Some(failure) = self.failure.get() {
-            return Err(format!("PeerActionFailed: {failure}"));
+    /// Fails the run if a peer couldn't carry out an action. The evidence
+    /// hub, added after this source, still logs the peers' records, so a
+    /// node frame that stopped its peer is logged with its `NodeFrame`.
+    fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
+        match self.failure.get() {
+            Some(failure) => Err(format!("PeerActionFailed: {failure}")),
+            None => Ok(()),
         }
-        observed
     }
 }
 
@@ -479,9 +469,9 @@ enum Ended {
 enum StreamEvent {
     /// The node opened a header stream: the peer's half to write on.
     Header { id: u64, send: SendStream },
-    /// A whole frame from the node arrived on header stream `id`, read at
-    /// `at` since the run's start.
-    Frame { id: u64, frame: Frame, at: Duration },
+    /// The node's frame `seq` on header stream `id` arrived whole, and its
+    /// reader recorded it.
+    Frame { id: u64, seq: u64, frame: Frame },
 }
 
 /// The bytes of a plain `Headers` page's fixed fields: the subscription ID,
@@ -954,26 +944,134 @@ impl Acceptor for Forward {
     }
 }
 
+/// Where a peer's stream tasks record what they see: its records and its
+/// address on the connection.
+#[derive(Clone)]
+struct Recorder {
+    records: PeerRecords,
+    remote: SocketAddr,
+}
+
+impl Recorder {
+    /// Records `body` on QUIC stream `quic_stream`, at the position it
+    /// happens, for the evidence hub to place.
+    fn record(&self, quic_stream: Option<u64>, body: RecordBody) {
+        self.records.push(PeerRecord {
+            pos: position(),
+            remote: self.remote,
+            quic_stream,
+            body,
+        });
+    }
+
+    /// Records how a write or setup on `quic_stream` failed: a lost
+    /// connection ends it, and a stopped or closed stream only the stream's
+    /// sending half.
+    fn write_failed(&self, quic_stream: Option<u64>, error: &WriteError) {
+        let body = match error {
+            WriteError::ConnectionLost(error) => RecordBody::ConnEnded {
+                reason: conn_end(error),
+            },
+            WriteError::Stopped(code) => RecordBody::StreamEnded {
+                direction: Direction::Send,
+                end: StreamEnd::Stopped {
+                    code: code.into_inner(),
+                },
+            },
+            _ => RecordBody::StreamEnded {
+                direction: Direction::Send,
+                end: StreamEnd::ClosedStream,
+            },
+        };
+        self.record(quic_stream, body);
+    }
+
+    /// Records how a read on `quic_stream` failed after `read` bytes of a
+    /// frame: a lost connection ends it, and anything else only the stream's
+    /// receiving half.
+    fn read_failed(&self, quic_stream: u64, read: usize, error: &ReadExactError) {
+        // A frame is under its 2 MiB cap.
+        let read = read as u64;
+        let end = match error {
+            ReadExactError::ReadError(ReadError::ConnectionLost(error)) => {
+                return self.record(
+                    Some(quic_stream),
+                    RecordBody::ConnEnded {
+                        reason: conn_end(error),
+                    },
+                );
+            }
+            ReadExactError::ReadError(ReadError::Reset(code)) => StreamEnd::Reset {
+                code: code.into_inner(),
+            },
+            ReadExactError::FinishedEarly(more) if read + *more as u64 == 0 => StreamEnd::Finished,
+            // A usize count fits u64 on every supported target.
+            ReadExactError::FinishedEarly(more) => StreamEnd::Truncated {
+                read: read + *more as u64,
+            },
+            _ => StreamEnd::ClosedStream,
+        };
+        self.record(
+            Some(quic_stream),
+            RecordBody::StreamEnded {
+                direction: Direction::Receive,
+                end,
+            },
+        );
+    }
+}
+
+/// Why a connection ended, as `error` says.
+fn conn_end(error: &ConnectionError) -> ConnEnd {
+    match error {
+        ConnectionError::ApplicationClosed(close) => ConnEnd::ReceivedClose {
+            code: close.error_code.into_inner(),
+        },
+        ConnectionError::LocallyClosed => ConnEnd::LocalClose,
+        error => ConnEnd::TransportError {
+            detail: error.to_string(),
+        },
+    }
+}
+
 /// Reads frames from the node on header stream `id` until it ends, and
-/// forwards each whole one. Every read is drained, so the node's writer
-/// never stalls on this peer.
-async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSender<StreamEvent>) {
+/// forwards each whole one. Each frame is recorded as received the moment
+/// its last byte is read, numbered among the stream's frames, so a frame
+/// the peer's task never handles keeps its evidence, and so does how the
+/// stream ended. Every read is drained, so the node's writer never stalls
+/// on this peer.
+async fn read_frames(
+    id: u64,
+    mut recv: RecvStream,
+    events: mpsc::UnboundedSender<StreamEvent>,
+    recorder: Recorder,
+) {
     let cap = usize::try_from(RegtestMessage::LAYOUT[0].frame_cap).unwrap_or(usize::MAX);
-    loop {
+    for seq in 0.. {
         let mut header = [0; 8];
-        if recv.read_exact(&mut header).await.is_err() {
-            return;
+        if let Err(error) = recv.read_exact(&mut header).await {
+            return recorder.read_failed(id, 0, &error);
         }
         let len = usize::try_from(u32::from_le_bytes([
             header[4], header[5], header[6], header[7],
         ]))
         .unwrap_or(usize::MAX);
         if len > cap {
-            return;
+            let end = StreamEnd::Oversized {
+                // A u32 length fits u64.
+                len: len as u64,
+            };
+            return recorder.record(
+                Some(id),
+                RecordBody::StreamEnded {
+                    direction: Direction::Receive,
+                    end,
+                },
+            );
         }
         let mut payload = vec![0; len];
-        if recv.read_exact(&mut payload).await.is_err() {
-            return;
+        if let Err(error) = recv.read_exact(&mut payload).await {
+            return recorder.read_failed(id, header.len(), &error);
         }
         let frame = Frame {
             message_type: u16::from_le_bytes([header[0], header[1]]),
@@ -985,7 +1083,20 @@ async fn read_frames(id: u64, mut recv: RecvStream, events: mpsc::UnboundedSende
         let at = zakura_scheduler::hooks::now()
             .expect("a peer reads inside a run")
             .since_start();
-        if events.send(StreamEvent::Frame { id, frame, at }).is_err() {
+        let decoded = decode_frame::<RegtestMessage>(&frame);
+        recorder.record(
+            Some(id),
+            RecordBody::Received {
+                seq,
+                message_type: frame.message_type,
+                // A frame's payload is under its 2 MiB cap.
+                payload: frame.payload.len() as u64,
+                credit: decoded.as_ref().ok().and_then(credit),
+                frame: frame.clone(),
+                at,
+            },
+        );
+        if events.send(StreamEvent::Frame { id, seq, frame }).is_err() {
             return;
         }
     }
@@ -1002,6 +1113,7 @@ async fn serve_stream(
     events: mpsc::UnboundedSender<StreamEvent>,
     name: String,
     failure: PeerFailure,
+    recorder: Recorder,
 ) {
     let Ok(prelude) = handshake::read_prelude(&mut recv).await else {
         return;
@@ -1017,7 +1129,7 @@ async fn serve_stream(
             return;
         }
         if events.send(StreamEvent::Header { id, send }).is_ok() {
-            read_frames(id, recv, events).await;
+            read_frames(id, recv, events, recorder).await;
         }
     } else {
         let _held = send;
@@ -1032,9 +1144,17 @@ async fn accept_streams(
     events: mpsc::UnboundedSender<StreamEvent>,
     name: String,
     failure: PeerFailure,
+    recorder: Recorder,
 ) {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let stream = serve_stream(send, recv, events.clone(), name.clone(), failure.clone());
+        let stream = serve_stream(
+            send,
+            recv,
+            events.clone(),
+            name.clone(),
+            failure.clone(),
+            recorder.clone(),
+        );
         zakura_rt::task::spawn_named("peer_stream", stream);
     }
 }
@@ -1189,25 +1309,24 @@ impl PeerTask {
         }
     }
 
-    /// Records `body` on `remote`'s QUIC stream `quic_stream`, for
-    /// [`PeerControl`] to place.
-    fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
-        self.records.borrow_mut().push_back(PeerRecord {
+    /// The recorder for `remote`'s connection.
+    fn recorder(&self, remote: SocketAddr) -> Recorder {
+        Recorder {
+            records: self.records.clone(),
             remote,
-            quic_stream,
-            body,
-        });
+        }
     }
 
     /// Writes `frames` on `stream` in order, recording the `PeerFrame` of
-    /// each frame of a write before it and their `PeerWritten`s after.
-    /// False once a write fails, which leaves the rest unwritten.
+    /// each frame of a write before it and their `PeerWritten`s after. A
+    /// write that fails leaves the rest unwritten, and its error is
+    /// recorded.
     async fn write(
         &self,
-        remote: SocketAddr,
+        recorder: &Recorder,
         stream: &mut HeaderStream,
         frames: Vec<Outgoing>,
-    ) -> bool {
+    ) -> Result<(), WriteError> {
         for frame in frames {
             let mut written = Vec::with_capacity(frame.records.len());
             for record in frame.records {
@@ -1215,16 +1334,17 @@ impl PeerTask {
                     unreachable!("an outgoing frame records a PeerFrame");
                 };
                 written.push(seq);
-                self.record(remote, stream.id, record);
+                recorder.record(Some(stream.id), record);
             }
-            if stream.send.write_all(&frame.bytes).await.is_err() {
-                return false;
+            if let Err(error) = stream.send.write_all(&frame.bytes).await {
+                recorder.write_failed(Some(stream.id), &error);
+                return Err(error);
             }
             for seq in written {
-                self.record(remote, stream.id, RecordBody::Written { seq });
+                recorder.record(Some(stream.id), RecordBody::Written { seq });
             }
         }
-        true
+        Ok(())
     }
 
     /// Serves one connection from `remote` whose handshake negotiated
@@ -1240,39 +1360,45 @@ impl PeerTask {
         scripts: &mut Scripts,
     ) -> Ended {
         let header_sync = negotiated & ZAKURA_CAP_HEADER_SYNC != 0;
+        let recorder = self.recorder(remote);
         let (events, mut stream_events) = mpsc::unbounded_channel();
         let accept = accept_streams(
             conn.clone(),
             events.clone(),
             self.name.clone(),
             self.failure.clone(),
+            recorder.clone(),
         );
         zakura_rt::task::spawn_named("peer_accept", accept);
         // The header stream the peer writes on, and whether it's settled.
         let mut header: Option<HeaderStream> = None;
-        // Frames read so far on each header stream, the next one's `seq`.
-        let mut reads = BTreeMap::new();
         let mut settled = !header_sync;
         if header_sync && self.spec.dialer == Dialer::Peer {
-            let Ok((mut send, recv)) = conn.open_bi().await else {
-                return Ended::Closed;
+            let (mut send, recv) = match conn.open_bi().await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let reason = conn_end(&error);
+                    recorder.record(None, RecordBody::ConnEnded { reason });
+                    return Ended::Closed;
+                }
             };
+            let id = send.id();
             let opened = handshake::write_prelude(
                 &mut send,
                 ZAKURA_STREAM_HEADER_SYNC,
                 ZAKURA_HEADER_SYNC_STREAM_VERSION,
             )
             .await;
-            if opened.is_err() {
+            if let Err(error) = opened {
+                recorder.write_failed(Some(id), &error);
                 return Ended::Closed;
             }
-            let id = send.id();
-            zakura_rt::task::spawn_named("peer_header", read_frames(id, recv, events.clone()));
-            reads.insert(id, 0);
+            let reader = read_frames(id, recv, events.clone(), recorder.clone());
+            zakura_rt::task::spawn_named("peer_header", reader);
             let mut stream = HeaderStream { id, send };
             if let Some(honest) = scripts.honest.as_mut() {
                 let frames = honest.start_stream();
-                if !self.write(remote, &mut stream, frames).await {
+                if self.write(&recorder, &mut stream, frames).await.is_err() {
                     return Ended::Closed;
                 }
             }
@@ -1295,33 +1421,19 @@ impl PeerTask {
             zakura_rt::select! {
                 Some(event) = stream_events.recv() => match event {
                     StreamEvent::Header { id, send } => {
-                        reads.insert(id, 0);
                         header = Some(HeaderStream { id, send });
                         if let Some(honest) = scripts.honest.as_mut() {
                             frames = honest.start_stream();
                         }
                     }
-                    StreamEvent::Frame { id, frame, at } => {
-                        // Every header stream's reads are recorded, a
-                        // finished or replaced one's included, since the
-                        // node can still write on it.
-                        let read = reads.get_mut(&id).expect("a header stream's reader is known");
-                        let seq = *read;
-                        *read += 1;
+                    StreamEvent::Frame { id, seq, frame } => {
+                        // Every header stream's reads were recorded by its
+                        // reader, a finished or replaced one's included,
+                        // since the node can still write on it.
+                        recorder.record(Some(id), RecordBody::Handled { seq });
                         let current = header.as_ref().is_some_and(|stream| stream.id == id);
                         settled |= current;
                         let decoded = decode_frame::<RegtestMessage>(&frame);
-                        // Recorded before a decode failure ends the run, so
-                        // the frame still gets its `NodeFrame`.
-                        self.record(remote, id, RecordBody::Received {
-                            seq,
-                            message_type: frame.message_type,
-                            // A frame's payload is under its 2 MiB cap.
-                            payload: frame.payload.len() as u64,
-                            credit: decoded.as_ref().ok().and_then(credit),
-                            frame: frame.clone(),
-                            at,
-                        });
                         let Ok(message) = decoded else {
                             return self.fail(format!(
                                 "the node's frame {seq} on stream {id} doesn't decode"
@@ -1339,7 +1451,7 @@ impl PeerTask {
                     self.readiness.taken();
                     self.taken += 1;
                     match action {
-                        PeerAction::Open { kind, version } => open(conn, kind, version).await,
+                        PeerAction::Open { kind, version } => open(conn, kind, version, &recorder).await,
                         PeerAction::FinishHeader => {
                             let Some(mut stream) = header.take() else {
                                 return self.fail("can't finish-header without a header stream");
@@ -1350,10 +1462,12 @@ impl PeerTask {
                         }
                         PeerAction::Close | PeerAction::Disconnect => {
                             conn.close(VarInt::from_u32(0), b"close");
-                            if let Some(stream) = &header {
-                                self.record(remote, stream.id, RecordBody::Closed);
+                            let stream = header.as_ref().map(|stream| stream.id);
+                            if let Some(stream) = stream {
+                                recorder.record(Some(stream), RecordBody::Closed);
                             }
-                            conn.closed().await;
+                            let reason = conn_end(&conn.closed().await);
+                            recorder.record(stream, RecordBody::ConnEnded { reason });
                             return Ended::Closed;
                         }
                         PeerAction::Redial => return self.fail("can't redial a live connection"),
@@ -1382,13 +1496,16 @@ impl PeerTask {
                         frames = honest.tick();
                     }
                 }
-                _ = conn.closed() => {
+                error = conn.closed() => {
                     self.readiness.set(false);
+                    let reason = conn_end(&error);
+                    let stream = header.as_ref().map(|stream| stream.id);
+                    recorder.record(stream, RecordBody::ConnEnded { reason });
                     return Ended::Closed;
                 }
             }
             if let Some(stream) = header.as_mut() {
-                if !frames.is_empty() && !self.write(remote, stream, frames).await {
+                if !frames.is_empty() && self.write(&recorder, stream, frames).await.is_err() {
                     return Ended::Closed;
                 }
             }
@@ -1398,17 +1515,73 @@ impl PeerTask {
 
 /// Opens a `kind` stream at `version` on `conn` and waits, for at most
 /// [`REFUSAL_WAIT`], for the node to reset it, finish it, or close the
-/// connection.
-async fn open(conn: &Conn, kind: u16, version: u16) {
-    let Ok((mut send, mut recv)) = conn.open_bi().await else {
-        return;
+/// connection, recording how the open, the prelude's write or the stream
+/// ended.
+async fn open(conn: &Conn, kind: u16, version: u16, recorder: &Recorder) {
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let reason = conn_end(&error);
+            return recorder.record(None, RecordBody::ConnEnded { reason });
+        }
     };
-    if handshake::write_prelude(&mut send, kind, version)
-        .await
-        .is_err()
-    {
-        return;
+    let id = send.id();
+    if let Err(error) = handshake::write_prelude(&mut send, kind, version).await {
+        return recorder.write_failed(Some(id), &error);
     }
-    let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
-    let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
+    let refused = async {
+        loop {
+            match recv.read_chunk(64 * 1024).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break ReadExactError::FinishedEarly(0),
+                Err(error) => break ReadExactError::ReadError(error),
+            }
+        }
+    };
+    if let Ok(ended) = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await {
+        recorder.read_failed(id, 0, &ended);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer's write that the node stopped ends the stream's sending half
+    /// and leaves the connection, which may still live, alone. A lost
+    /// connection ends the connection. No saved Plan or script reaches a
+    /// stop on a live connection, so this checks the classification only.
+    #[test]
+    fn a_stopped_stream_is_not_a_connection_end() {
+        let records = PeerRecords::default();
+        let recorder = Recorder {
+            records: records.clone(),
+            remote: peer_addr(0, 0),
+        };
+        recorder.write_failed(Some(4), &WriteError::Stopped(VarInt::from_u32(3)));
+        recorder.write_failed(
+            Some(4),
+            &WriteError::ConnectionLost(ConnectionError::TimedOut),
+        );
+        let bodies: Vec<RecordBody> = records
+            .take()
+            .into_iter()
+            .map(|record| record.body)
+            .collect();
+        assert!(
+            matches!(
+                &bodies[..],
+                [
+                    RecordBody::StreamEnded {
+                        direction: Direction::Send,
+                        end: StreamEnd::Stopped { code: 3 },
+                    },
+                    RecordBody::ConnEnded {
+                        reason: ConnEnd::TransportError { .. },
+                    },
+                ]
+            ),
+            "{bodies:?}"
+        );
+    }
 }

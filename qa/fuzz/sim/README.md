@@ -23,25 +23,69 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 
 ## Targets
 
+- `block_sync_storage` runs `block-sync/storage` with its registered storage,
+  stream-6, resource, and semantic properties. Its two-byte prefix selects
+  the scenario. Pass `-max_len=4096`.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
+- `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
+  encodes the scenario in the action grammar of
+  `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
+  isn't the harness's generator, 2, runs the default scenario. Pass
+  `-max_len=4096`, the input size the grammar is built for.
+- `header_sync_wire` runs `header-sync/wire` over simulated QUIC and scripted
+  peers. Its two-byte prefix selects a saved scenario or the default scenario.
+  Pass `-max_len=4096`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
+- `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
+  in data, with a collector that turns each run's end time into a feature.
+  It checks the feedback transport and searches for nothing.
+
+## Semantic feedback
+
+A target with a collector, `sim_target!(Harness, collector)`, adds abstract
+protocol states to libFuzzer's code edges. The collector writes one counter
+per feature into the `__libfuzzer_extra_counters` section. libFuzzer clears
+the section before each input and reads each nonzero counter as a feature,
+so an input that reaches a new state through covered code still joins the
+corpus. The section works on Linux only.
+
+`ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
+doesn't read. The collector still runs, so `on` and `off` runs take the same
+code path and differ only in what libFuzzer reads. Each target with a
+collector logs its backend, version, feature count and mode at startup.
+
+`cargo xtask sim-feedback` builds `feedback_probe` and runs libFuzzer's
+corpus merge with feedback `off` and `on`. With feedback off, an input whose
+code edges another input already covered adds nothing. With feedback on,
+libFuzzer adds it for its one new feature.
 
 ## What a target does with a run
 
-- An `Active` property violation records the run, then panics with the
-  property ID and the trace's directory. A rerun that disagrees with the run
-  panics with `nondeterministic:` instead.
+- An `Active` property violation saves the input under
+  `inputs/active/<property-id>/<sha256>.bin` before anything reruns it, then
+  records the run and panics with the property ID and the trace's directory.
+  A rerun that disagrees with the run panics with `nondeterministic:`
+  instead, keeps both compared records and their first difference under
+  `nondeterministic/<property-id>/<12 hex>/`, and moves the input to
+  `inputs/nondeterministic/<property-id>/`.
 - A harness failure panics with `harness:`.
 - A task's panic violates `sim/no-task-panic`, which is `Active`. Each target
   swaps libFuzzer's panic hook, which aborts at any panic, for the default one
   at startup, so the task's panic reaches the scheduler.
 - Each `Known` and `Draft` violation saves one trace per property under
-  `known/` or `draft/`, and the target goes on.
-- A run whose shutdown abandoned tasks retires the thread it ran on.
+  `known/` or `draft/`, keeps each distinct input under
+  `inputs/<bucket>/<property-id>/`, up to 256 per property per process, and
+  the target goes on.
+- A run whose shutdown abandoned tasks saves its input under
+  `inputs/abandoned/`, whatever else it found, and retires the thread it ran
+  on. Each retired thread keeps what its leaked tasks hold, so once a process
+  has abandoned `ZAKURA_SIM_ABANDON_LIMIT` runs, 1 by default, the target
+  panics with `abandoned:`, and the process's supervisor restarts it.
 
-Traces go to `$ZAKURA_SIM_ARTIFACTS/traces/<property-id>/<12 hex>/`, or under
-`$TMPDIR/zakura-sim/` when the variable is unset.
+Traces and inputs go under `$ZAKURA_SIM_ARTIFACTS`, or under
+`$TMPDIR/zakura-sim/` when the variable is unset. Traces go to
+`traces/<property-id>/<12 hex>/`.
 
 `race_fixtures` expects failures, so it acts differently. A planted variant's
 violation of its own fixture's property is expected, and the target logs the
@@ -63,3 +107,37 @@ RUSTFLAGS="--cfg zakura_sim" cargo run -p zakura-sim -- record --sim discovery/w
 
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
+
+## Seeds
+
+Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`
+with a `<name>.toml` sidecar. The sidecar records the harness, the generator
+version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
+the test or plan the seed comes from, and the property witnesses it carries.
+A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
+scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+
+`cargo xtask sim-seeds` validates every seed against the current generators.
+A required seed that fails, such as one built for an older generator or one
+whose prefix now decodes to another scenario, fails the command with the
+reason. A seed with `required = false` is quarantined instead. With `--sim`
+and `--out`, it writes one harness's admitted seeds into a corpus, each named
+by its SHA-256:
+
+```console
+cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/discovery_wait_complete
+```
+
+`cargo xtask sim-versions --sim <name>` prints the versions that fix what the
+harness's fuzz input means, as `KEY=VALUE` lines. A corpus keyed on all of
+them starts fresh when any of them changes.
+
+## Campaigns
+
+A campaign directory, such as `campaigns/full-suite-20261029/`, holds a
+`manifest.toml` with the PR heads it integrates, each target's workers,
+shard and per-input timeout, and each segment's search budget. Its targets
+are those of `qa/suite.toml`, every fuzz package's included.
+`scripts/fuzz-campaign.py` checks the manifest against `zakura-sim suite`'s
+output and writes each segment's launch script. The campaign's README has
+the commands. Keep campaign outputs outside Git.

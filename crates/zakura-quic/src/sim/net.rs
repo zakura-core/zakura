@@ -185,9 +185,21 @@ struct State {
     sockets: BTreeMap<SocketAddr, Binding>,
     next_binding: u64,
     events: Vec<NetEvent>,
+    /// Each event's emission position, by index into `events`, so a
+    /// harness that drains them later still orders each where it happened.
+    /// `None` outside a run.
+    #[cfg(zakura_sim)]
+    positions: Vec<Option<u64>>,
 }
 
 impl State {
+    /// Records `event`, with its emission position in the simulator build.
+    fn record(&mut self, event: NetEvent) {
+        self.events.push(event);
+        #[cfg(zakura_sim)]
+        self.positions.push(zakura_rt::sim::next_position());
+    }
+
     /// The state of `link`, created from the default model on first use.
     fn link(&mut self, link: Link) -> &mut LinkState {
         let model = self.default_model;
@@ -240,7 +252,7 @@ impl State {
         let earliest = now + state.model.min_delay;
         let latest = now + state.model.max_delay;
         let id = DatagramId { link, seq };
-        self.events.push(NetEvent::Sent {
+        self.record(NetEvent::Sent {
             id,
             len: bytes.len(),
         });
@@ -327,7 +339,7 @@ impl SimNet {
                 fail_next: None,
             },
         );
-        state.events.push(NetEvent::Bound { addr });
+        state.record(NetEvent::Bound { addr });
         Ok(SimSocket {
             net: self.clone(),
             addr,
@@ -421,11 +433,11 @@ impl SimNet {
                 Some(binding) => {
                     binding.queue.push_back((id.link.src, datagram.bytes));
                     let waker = binding.waker.take();
-                    state.events.push(NetEvent::Delivered { id });
+                    state.record(NetEvent::Delivered { id });
                     waker
                 }
                 None => {
-                    state.events.push(NetEvent::Dropped {
+                    state.record(NetEvent::Dropped {
                         id,
                         reason: DropReason::Unbound,
                     });
@@ -451,7 +463,7 @@ impl SimNet {
         }
         link.drops += 1;
         state.in_flight.remove(&id);
-        state.events.push(NetEvent::Dropped {
+        state.record(NetEvent::Dropped {
             id,
             reason: DropReason::Loss,
         });
@@ -488,6 +500,20 @@ impl SimNet {
             .events
             .get(start..)
             .map_or_else(Vec::new, <[NetEvent]>::to_vec)
+    }
+
+    /// [`SimNet::events_since`], each event with the emission position it
+    /// was recorded at, or `None` for one recorded outside a run.
+    #[cfg(zakura_sim)]
+    pub fn positioned_events_since(&self, start: usize) -> Vec<(NetEvent, Option<u64>)> {
+        let state = self.lock();
+        let events = state.events.get(start..).unwrap_or_default();
+        let positions = state.positions.get(start..).unwrap_or_default();
+        events
+            .iter()
+            .cloned()
+            .zip(positions.iter().copied())
+            .collect()
     }
 }
 
@@ -563,7 +589,7 @@ impl Drop for SimSocket {
                 .sockets
                 .remove(&self.addr)
                 .expect("the binding was just found");
-            state.events.push(NetEvent::Unbound {
+            state.record(NetEvent::Unbound {
                 addr: self.addr,
                 unread: binding.queue.len(),
             });

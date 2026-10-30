@@ -1,0 +1,113 @@
+# The full-suite campaign of 2026-10-29. C1's `qa/suite.toml`, checked by
+# `zakura-sim suite`, defines the suite's targets. This file adds only what
+# the campaign decides: the integration it runs, each target's workers,
+# shard and per-input timeout, and each segment's search budget.
+# `scripts/fuzz-campaign.py` refuses a target set that differs from C1's
+# manifest.
+
+schema = 2
+name = "full-suite-20261029"
+status = "incomplete"
+campaign_plan = "https://valargroup.getoutline.com/doc/campaignmd-full-property-suite-execution-and-fuzz-campaigns-pVoq6yEw5j"
+artifacts_root = "/srv/zakura-fuzz/campaigns/full-suite-20261029"
+# The campaign host's vCPUs. No shard's workers may exceed them.
+cpus = 8
+
+# The PR heads merged into the campaign branch. `scripts/fuzz-campaign.py`
+# checks that each is an ancestor of the checkout.
+[integration]
+base = "4eab091b605ff7adab9f37515195d58f1362633c"
+pull_1824 = "a7188518fb2cfbacb762948cbaef9ef024e0dc34"
+pull_1825 = "e3fd6bf5e9c97cb2a5f2216662e8c03a248a8cad"
+pull_1826 = "19d8df59e4be615a92c46bfcc2144c965d8e5b59"
+pull_1830 = "3a99a568551191a17794e9d2af47f9e4ac221db1"
+pull_1831 = "26111ae5fe42e8ddefe3d10167327f60b44a184a"
+pull_1832 = "1d84808bcba8d398dd90db57a80e093c6aed91fa"
+pull_1833 = "b1768050e41dedb650bbb27132ec1c4e6769cef7"
+pull_1837 = "e262629e4616de7a4a5414f3ccdaf7d7617d620e"
+
+# `scripts/fuzz-campaign.py` checks `fuzz`, `trace` and `contract` against
+# the frozen suite manifest, and seeds corpora with `rust`'s cargo.
+[toolchain]
+rust = "1.98.0"
+fuzz = "nightly-2026-07-15"
+sanitizer = "address"
+
+[formats]
+trace = 21
+contract = 1
+feedback_backend = "libfuzzer-extra-counters"
+feedback = 1
+
+# Each segment gives every target its own search budget, passed to
+# libFuzzer as `-max_total_time`. The calibration and pilot budgets follow
+# campaign.md; a revision of this file sets the extended budget from the
+# pilot's measured cost before the extended segment starts.
+[[segment]]
+name = "calibration"
+budget-secs = 900
+
+[[segment]]
+name = "pilot"
+budget-secs = 3600
+
+[[segment]]
+name = "extended"
+budget-secs = 43200
+
+# One row per target of C1's manifest, by its ID. A shard's targets run
+# together; shards run one after another, so each shard may use every vCPU.
+# `input-timeout-secs` is libFuzzer's per-input `-timeout`.
+[[target]]
+id = "target/sim/block_sync_storage"
+shard = "sim"
+workers = 3
+input-timeout-secs = 600
+
+[[target]]
+id = "target/sim/header_sync_wire"
+shard = "sim"
+workers = 2
+input-timeout-secs = 180
+
+[[target]]
+id = "target/sim/header_sync_storage"
+shard = "sim"
+workers = 1
+input-timeout-secs = 120
+
+[[target]]
+id = "target/sim/discovery_wait_complete"
+shard = "sim"
+workers = 1
+input-timeout-secs = 60
+
+[[target]]
+id = "target/sim/race_fixtures"
+shard = "sim"
+workers = 1
+input-timeout-secs = 60
+
+[[target]]
+id = "target/header-chain/fork_transitions"
+shard = "header-chain"
+workers = 2
+input-timeout-secs = 120
+
+[[target]]
+id = "target/header-chain/header_codec_v9"
+shard = "header-chain"
+workers = 2
+input-timeout-secs = 120
+
+[[target]]
+id = "target/header-chain/header_pursuit"
+shard = "header-chain"
+workers = 2
+input-timeout-secs = 120
+
+[[target]]
+id = "target/header-chain/recovery_rows"
+shard = "header-chain"
+workers = 2
+input-timeout-secs = 300

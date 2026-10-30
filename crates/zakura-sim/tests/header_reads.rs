@@ -14,7 +14,7 @@ use zakura_sim::{
         wire_plans::SavedPlan,
         HarnessError, Subsystem,
     },
-    observe::{ComponentReading, ComponentValue},
+    observe::{ComponentReading, ComponentValue, StorageFact, StorageResult},
     MemorySink, Observation, Plan, RunReport,
 };
 
@@ -303,9 +303,9 @@ fn the_selected_chain_is_read_live() {
     );
 }
 
-/// The commit that moves the selected chain completes as a storage
-/// action, with no task running, and that same step's boundary read shows
-/// the new tip, since the hub reads after every step, not only task steps.
+/// The run's first successful apply, which moves the selected chain,
+/// completes as a storage action, with no task running, and that same
+/// step's boundary read, logged after the completion, shows the new tip, since the hub reads after every step, not only task steps.
 ///
 /// This fails if the hub reads before a source action runs instead of
 /// after it.
@@ -320,6 +320,29 @@ fn a_storage_completion_moves_the_selected_chain_at_its_own_boundary() {
     let pick = &report.picks[usize::try_from(step).expect("a step fits usize") - 1].identity;
     assert!(pick.starts_with("storage:"), "step {step} picked {pick}");
     assert_eq!(stop_at(&report, step), None, "no task ran at step {step}");
+    let entries = report.log.entries();
+    let applied = entries.iter().position(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::Storage {
+                fact: StorageFact::Completed {
+                    result: StorageResult::Applied,
+                    ..
+                },
+                ..
+            }
+        )
+    });
+    let read_at = entries.iter().position(|entry| {
+        entry.step == step
+            && matches!(&entry.obs, Observation::ComponentRead { component, .. }
+                if component == "SelectedChain")
+    });
+    assert!(
+        applied.is_some_and(|applied| entries[applied].step == step) && applied < read_at,
+        "the run's first successful apply completes at step {step}, before that step's read: \
+         {applied:?} {read_at:?}"
+    );
 }
 
 /// Prints each saved Plan's wall time with boundary reads on and off,

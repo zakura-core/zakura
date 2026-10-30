@@ -3,14 +3,19 @@
 //!
 //! `qa/suite.toml` names what the harness registry can't: which packages'
 //! tests the suite runs, which ignored tests it runs on demand, which fuzz
-//! target runs each harness, and which rows are planned but unimplemented.
-//! [`manifest`] joins it with [`HARNESSES`], each harness's properties, the
-//! coverage manifest, the retained planted cases, the committed seeds, the
-//! fuzz packages' targets and the test sources. It returns the manifest, or
-//! every problem that keeps the manifest from covering the suite:
+//! targets it runs, and which rows are planned but unimplemented. Each
+//! simulator fuzz target names its harness in its package's
+//! `[package.metadata.zakura-sim.targets]` table. [`manifest`] joins
+//! `qa/suite.toml` with [`HARNESSES`], each harness's properties, the
+//! coverage manifest, the retained planted cases, the committed seeds, and
+//! the test and fuzz targets `cargo metadata` reports, with their sources.
+//! It returns the manifest, or every problem that keeps the manifest from
+//! covering the suite:
 //!
 //! - a harness that no target runs and no `missing-target` row names;
 //! - a fuzz target that `qa/suite.toml` neither maps nor excludes;
+//! - a simulator fuzz target that its package's table maps to no harness;
+//! - a simulator-only test target that a package's `tests` list leaves out;
 //! - an ignored test that `qa/suite.toml` doesn't list;
 //! - a reported property without a coverage row, or an on-demand witness
 //!   that the suite doesn't run;
@@ -67,6 +72,10 @@ pub const NIGHTLY: &str = nightly!();
 
 /// Where the fuzz packages live, relative to the repository's root.
 pub const FUZZ_DIR: &str = "qa/fuzz";
+
+/// The fuzz package under [`FUZZ_DIR`] whose targets run harnesses in the
+/// simulator.
+pub const SIM_FUZZ_PACKAGE: &str = "sim";
 
 /// Where the planted cases live, relative to the repository's root.
 pub const PLANTED_DIR: &str = "qa/planted";
@@ -125,9 +134,9 @@ pub struct SimPackage {
     /// Whether its library's unit tests run. `true` by default.
     #[serde(default = "yes")]
     pub lib: bool,
-    /// The test binaries that run. All of `tests/*.rs` when absent. When
-    /// present, it must list every file in `tests/` that starts with
-    /// `#![cfg(zakura_sim)]`.
+    /// The test targets that run. Every test target `cargo metadata`
+    /// reports when absent. When present, it must list every test target
+    /// whose root file starts with `#![cfg(zakura_sim)]`.
     pub tests: Option<Vec<String>>,
     /// The timeout of each of its rows.
     pub timeout_secs: u64,
@@ -184,7 +193,8 @@ pub struct Lane {
     pub timeout_secs: u64,
 }
 
-/// A fuzz target the suite runs.
+/// A fuzz target the suite runs. A simulator target's harness comes from
+/// its package's `[package.metadata.zakura-sim.targets]` table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Target {
@@ -192,9 +202,7 @@ pub struct Target {
     pub package: String,
     /// The target's `[[bin]]` name.
     pub name: String,
-    /// The harness it runs, for a `sim` target.
-    pub harness: Option<String>,
-    /// Harnesses whose runs it covers through `harness`, such as the race
+    /// Harnesses whose runs it covers through its harness, such as the race
     /// fixtures through `fixtures/all`. Its report must account for each.
     #[serde(default)]
     pub covers: Vec<String>,
@@ -644,7 +652,8 @@ pub struct TargetRow {
     pub package: String,
     /// The target.
     pub name: String,
-    /// The harness it runs, for a `sim` target.
+    /// The harness it runs, from its package's
+    /// `[package.metadata.zakura-sim.targets]` table.
     pub harness: Option<String>,
     /// The harnesses it covers through `harness`.
     pub covers: Vec<String>,
@@ -723,9 +732,11 @@ pub fn manifest_of(
 ) -> Result<Manifest, Problems> {
     let mut builder = Builder {
         root,
+        canonical_root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
         suite,
         problems: Vec::new(),
         ids: BTreeSet::new(),
+        owners: BTreeMap::new(),
     };
     let manifest = builder.build(suite_sha256);
     match builder.problems.is_empty() {
@@ -737,9 +748,28 @@ pub fn manifest_of(
 /// The state of one [`manifest_from`] call.
 struct Builder<'a> {
     root: &'a Path,
+    /// `root` with symbolic links resolved, as `cargo metadata` reports
+    /// paths.
+    canonical_root: PathBuf,
     suite: &'a SuiteFile,
     problems: Vec<String>,
     ids: BTreeSet<String>,
+    /// The test targets and libraries that compile each scanned source
+    /// file, by file.
+    owners: BTreeMap<String, Vec<Owner>>,
+}
+
+/// A test target or library that compiles a source file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Owner {
+    /// Its cargo selector, such as `-p zakura-sim --test harness`.
+    selector: String,
+    /// The build it runs in.
+    build: Build,
+    /// What the full names of the tests at the file's top level start
+    /// with: the file's module path and `::`, or nothing in the crate's
+    /// root.
+    prefix: String,
 }
 
 impl Builder<'_> {
@@ -835,64 +865,9 @@ impl Builder<'_> {
         // Every ignored test in the sources the suite runs, as (file, test),
         // with whether it sits at its file's top level.
         let mut ignored = BTreeMap::new();
-        for package in &self.suite.sim_package {
-            let dir = format!("crates/{}", package.name);
-            if !self.root.join(&dir).join("Cargo.toml").is_file() {
-                self.problem(format!("sim package `{}` has no {dir}", package.name));
-                continue;
-            }
-            if package.lib {
-                let id = self.id(format!("test/{}/lib", package.name));
-                rows.push(TestRow {
-                    id,
-                    expect: Expect::Pass,
-                    kind: TestKind::SimLib,
-                    build: Build::Sim,
-                    command: Build::Sim
-                        .command("test", &format!("--locked -p {} --lib", package.name)),
-                    timeout_secs: package.timeout_secs,
-                    file: None,
-                });
-                for file in files(self.root, &format!("{dir}/src"), "rs") {
-                    ignored.extend(self.ignored_in(&file));
-                }
-            }
-            let found = test_binaries(&self.root.join(&dir).join("tests"));
-            let binaries: Vec<String> = match &package.tests {
-                None => found.keys().cloned().collect(),
-                Some(listed) => {
-                    for (name, sim_only) in &found {
-                        if *sim_only && !listed.contains(name) {
-                            self.problem(format!(
-                                "{dir}/tests/{name}.rs builds only under `--cfg zakura_sim`, \
-                                 and {SUITE_FILE} doesn't list it under `{}`",
-                                package.name
-                            ));
-                        }
-                    }
-                    listed.clone()
-                }
-            };
-            for name in binaries {
-                let file = format!("{dir}/tests/{name}.rs");
-                if !found.contains_key(&name) {
-                    self.problem(format!("sim package `{}` has no {file}", package.name));
-                    continue;
-                }
-                ignored.extend(self.ignored_in(&file));
-                let id = self.id(format!("test/{}/{name}", package.name));
-                rows.push(TestRow {
-                    id,
-                    expect: Expect::Pass,
-                    kind: TestKind::SimTest,
-                    build: Build::Sim,
-                    command: Build::Sim.command(
-                        "test",
-                        &format!("--locked -p {} --test {name}", package.name),
-                    ),
-                    timeout_secs: package.timeout_secs,
-                    file: Some(file),
-                });
+        if let Some(workspace) = self.cargo_packages("Cargo.toml") {
+            for package in &self.suite.sim_package {
+                self.sim_package(package, &workspace, &mut rows, &mut ignored);
             }
         }
         for package in &self.suite.property_package {
@@ -916,12 +891,21 @@ impl Builder<'_> {
                     Some(module_dir) => module_dir.to_owned(),
                     None => file.trim_end_matches(".rs").to_owned(),
                 };
-                ignored.extend(self.ignored_in(&file));
-                for child in self::files(self.root, &children, "rs") {
-                    ignored.extend(self.ignored_in(&child));
+                let features = features(&package.features);
+                for source in
+                    std::iter::once(file.clone()).chain(self::files(self.root, &children, "rs"))
+                {
+                    ignored.extend(self.ignored_in(&source));
+                    self.own(
+                        source.clone(),
+                        Owner {
+                            selector: format!("-p {}{features} --lib", package.name),
+                            build: Build::Ordinary,
+                            prefix: test_prefix(&source, &dir),
+                        },
+                    );
                 }
                 let module = module_path(&file, &dir);
-                let features = features(&package.features);
                 let id = self.id(format!("property-suite/{}/{module}", package.name));
                 rows.push(TestRow {
                     id,
@@ -964,10 +948,10 @@ impl Builder<'_> {
                         ));
                         continue;
                     }
-                    let Some(selector) = self.test_selector(&entry.file) else {
+                    let Some(owner) = self.owner(&entry.file) else {
                         continue;
                     };
-                    let build = match selector.1 {
+                    let build = match owner.build {
                         Build::Ordinary => Build::Ordinary,
                         _ => Build::SimPlanted,
                     };
@@ -981,7 +965,7 @@ impl Builder<'_> {
                             "test",
                             &format!(
                                 "--locked {} -- --ignored --exact {}{}",
-                                selector.0, selector.2, entry.test
+                                owner.selector, owner.prefix, entry.test
                             ),
                         ),
                         timeout_secs,
@@ -1039,48 +1023,191 @@ impl Builder<'_> {
         }
     }
 
-    /// The cargo selector of the test binary or library that holds `file`,
-    /// the build it needs, and the module path its top-level tests' names
-    /// start with: nothing in a simulator package's test binary, and the
-    /// file's module in a library.
-    fn test_selector(&mut self, file: &str) -> Option<(String, Build, String)> {
-        for package in &self.suite.sim_package {
-            let dir = format!("crates/{}/", package.name);
-            let Some(rest) = file.strip_prefix(&dir) else {
+    /// The rows of the simulator package `package`: its library's unit
+    /// tests and its test targets, as `workspace`, the workspace's packages,
+    /// reports them. Adds the ignored tests in the sources they compile to
+    /// `ignored`.
+    fn sim_package(
+        &mut self,
+        package: &SimPackage,
+        workspace: &[CargoPackage],
+        rows: &mut Vec<TestRow>,
+        ignored: &mut BTreeMap<(String, String), bool>,
+    ) {
+        let Some(cargo) = workspace.iter().find(|cargo| cargo.name == package.name) else {
+            self.problem(format!(
+                "sim package `{}` isn't a package of the workspace",
+                package.name
+            ));
+            return;
+        };
+        let dir = self.cargo_path(cargo.manifest_path.parent().unwrap_or(Path::new("")));
+        if package.lib {
+            match cargo.targets.iter().find(|target| target.is("lib")) {
+                Some(lib) => {
+                    let id = self.id(format!("test/{}/lib", package.name));
+                    rows.push(TestRow {
+                        id,
+                        expect: Expect::Pass,
+                        kind: TestKind::SimLib,
+                        build: Build::Sim,
+                        command: Build::Sim
+                            .command("test", &format!("--locked -p {} --lib", package.name)),
+                        timeout_secs: package.timeout_secs,
+                        file: None,
+                    });
+                    let src = self.cargo_path(lib.src_path.parent().unwrap_or(Path::new("")));
+                    for file in files(self.root, &src, "rs") {
+                        ignored.extend(self.ignored_in(&file));
+                        self.own(
+                            file.clone(),
+                            Owner {
+                                selector: format!("-p {} --lib", package.name),
+                                build: Build::Sim,
+                                prefix: test_prefix(&file, &dir),
+                            },
+                        );
+                    }
+                }
+                None => self.problem(format!("sim package `{}` has no library", package.name)),
+            }
+        }
+        // Each test target's root file, by name.
+        let found: BTreeMap<String, String> = cargo
+            .targets
+            .iter()
+            .filter(|target| target.is("test"))
+            .map(|target| (target.name.clone(), self.cargo_path(&target.src_path)))
+            .collect();
+        let names: Vec<String> = match &package.tests {
+            None => found.keys().cloned().collect(),
+            Some(listed) => {
+                for (name, file) in &found {
+                    if !listed.contains(name) && self.sim_only(file) {
+                        self.problem(format!(
+                            "{file} builds only under `--cfg zakura_sim`, and {SUITE_FILE} \
+                             doesn't list its test target `{name}` under `{}`",
+                            package.name
+                        ));
+                    }
+                }
+                listed.clone()
+            }
+        };
+        for name in names {
+            let Some(file) = found.get(&name) else {
+                self.problem(format!(
+                    "sim package `{}` has no test target `{name}`",
+                    package.name
+                ));
                 continue;
             };
-            if let Some(name) = rest
-                .strip_prefix("tests/")
-                .and_then(|name| name.strip_suffix(".rs"))
-                .filter(|name| !name.contains('/'))
-            {
-                return Some((
-                    format!("-p {} --test {name}", package.name),
-                    Build::Sim,
-                    String::new(),
-                ));
+            let (sources, problems) = crate_files(self.root, file);
+            self.problems.extend(problems);
+            for (source, prefix) in sources {
+                ignored.extend(self.ignored_in(&source));
+                self.own(
+                    source,
+                    Owner {
+                        selector: format!("-p {} --test {name}", package.name),
+                        build: Build::Sim,
+                        prefix,
+                    },
+                );
             }
-            // A package whose library doesn't build in the simulator may
-            // still be a property package.
-            if rest.starts_with("src/") && package.lib {
-                return Some((
-                    format!("-p {} --lib", package.name),
-                    Build::Sim,
-                    test_prefix(file, &format!("crates/{}", package.name)),
+            let id = self.id(format!("test/{}/{name}", package.name));
+            rows.push(TestRow {
+                id,
+                expect: Expect::Pass,
+                kind: TestKind::SimTest,
+                build: Build::Sim,
+                command: Build::Sim.command(
+                    "test",
+                    &format!("--locked -p {} --test {name}", package.name),
+                ),
+                timeout_secs: package.timeout_secs,
+                file: Some(file.clone()),
+            });
+        }
+    }
+
+    /// Whether `file`'s first inner attribute is `#![cfg(zakura_sim)]`.
+    fn sim_only(&self, file: &str) -> bool {
+        fs::read_to_string(self.root.join(file)).is_ok_and(|source| {
+            source
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("#!["))
+                .is_some_and(|line| line == "#![cfg(zakura_sim)]")
+        })
+    }
+
+    /// Records that `owner` compiles `file`.
+    fn own(&mut self, file: String, owner: Owner) {
+        let owners = self.owners.entry(file).or_default();
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+
+    /// The one test target or library that compiles `file`. No owner, or
+    /// more than one, is a problem: the suite can't pick the command that
+    /// runs the file's tests.
+    fn owner(&mut self, file: &str) -> Option<Owner> {
+        match self.owners.get(file).map(Vec::as_slice) {
+            Some([owner]) => Some(owner.clone()),
+            Some(owners) if !owners.is_empty() => {
+                let selectors: Vec<&str> =
+                    owners.iter().map(|owner| owner.selector.as_str()).collect();
+                self.problem(format!(
+                    "{file} compiles into more than one test target ({}), so the suite can't \
+                     pick the one that runs its ignored tests",
+                    selectors.join(", ")
                 ));
+                None
+            }
+            _ => {
+                self.problem(format!("no package row runs {file}"));
+                None
             }
         }
-        for package in &self.suite.property_package {
-            if file.starts_with(&format!("crates/{}/src/", package.name)) {
-                return Some((
-                    format!("-p {}{} --lib", package.name, features(&package.features)),
-                    Build::Ordinary,
-                    test_prefix(file, &format!("crates/{}", package.name)),
-                ));
+    }
+
+    /// The packages of the Cargo workspace whose manifest is `manifest`,
+    /// relative to the root, as `cargo metadata --no-deps` reports them.
+    /// A failure is a problem.
+    fn cargo_packages(&mut self, manifest: &str) -> Option<Vec<CargoPackage>> {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(self.root.join(manifest))
+            .current_dir(self.root)
+            .output();
+        let packages = match output {
+            Ok(output) if output.status.success() => {
+                serde_json::from_slice::<CargoMetadata>(&output.stdout)
+                    .map(|metadata| metadata.packages)
+                    .map_err(|error| error.to_string())
             }
-        }
-        self.problem(format!("no package row runs {file}"));
-        None
+            Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        packages
+            .map_err(|error| self.problem(format!("cargo metadata of {manifest}: {error}")))
+            .ok()
+    }
+
+    /// `path`, as `cargo metadata` reports it, relative to the root.
+    fn cargo_path(&self, path: &Path) -> String {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        relative(&self.canonical_root, &path)
     }
 
     /// One row per property directory under `qa/planted/`, each running
@@ -1207,10 +1334,14 @@ impl Builder<'_> {
     }
 
     /// The target rows, the excluded targets' rows, and each fuzz
-    /// package's lockfile digest. Every `[[bin]]` of every fuzz package
-    /// must be mapped or excluded.
+    /// package's lockfile digest. Every binary target of every fuzz
+    /// package must be mapped or excluded, and each one of
+    /// [`SIM_FUZZ_PACKAGE`] must have a harness in its package's
+    /// `[package.metadata.zakura-sim.targets]` table.
     fn targets(&mut self) -> (Vec<TargetRow>, Vec<ExcludedRow>, BTreeMap<String, String>) {
         let mut bins = BTreeSet::new();
+        // The harness each target runs, by (package, target).
+        let mut harnesses = BTreeMap::new();
         let mut lockfiles = BTreeMap::new();
         let dir = self.root.join(FUZZ_DIR);
         let packages = match sorted_dirs(&dir) {
@@ -1221,17 +1352,18 @@ impl Builder<'_> {
             }
         };
         for package in packages {
-            let manifest = dir.join(&package).join("Cargo.toml");
-            let Ok(text) = fs::read_to_string(&manifest) else {
+            let manifest = format!("{FUZZ_DIR}/{package}/Cargo.toml");
+            if !self.root.join(&manifest).is_file() {
                 continue;
-            };
-            match toml::from_str::<FuzzManifest>(&text) {
-                Ok(parsed) => {
-                    for bin in parsed.bin {
-                        bins.insert((package.clone(), bin.name));
-                    }
+            }
+            // A fuzz package is a workspace of its own.
+            for cargo in self.cargo_packages(&manifest).unwrap_or_default() {
+                for target in cargo.targets.iter().filter(|target| target.is("bin")) {
+                    bins.insert((package.clone(), target.name.clone()));
                 }
-                Err(error) => self.problem(format!("{FUZZ_DIR}/{package}/Cargo.toml: {error}")),
+                for (name, harness) in cargo.harnesses() {
+                    harnesses.insert((package.clone(), name), harness);
+                }
             }
             let lockfile = dir.join(&package).join("Cargo.lock");
             lockfiles.insert(
@@ -1239,10 +1371,28 @@ impl Builder<'_> {
                 fs::read(&lockfile).map_or_else(|_| "none".to_owned(), |bytes| sha256(&bytes)),
             );
         }
+        for (package, name) in harnesses.keys() {
+            if !bins.contains(&(package.clone(), name.clone())) {
+                self.problem(format!(
+                    "{FUZZ_DIR}/{package}/Cargo.toml maps `{name}` to a harness, and defines no \
+                     such target"
+                ));
+            }
+        }
+        for key in &bins {
+            if key.0 == SIM_FUZZ_PACKAGE && !harnesses.contains_key(key) {
+                self.problem(format!(
+                    "{FUZZ_DIR}/{} defines the target `{}`, and its \
+                     `[package.metadata.zakura-sim.targets]` table maps it to no harness",
+                    key.0, key.1
+                ));
+            }
+        }
         let mut mapped = BTreeSet::new();
         let mut rows = Vec::new();
         for target in &self.suite.target {
             let key = (target.package.clone(), target.name.clone());
+            let harness: Option<String> = harnesses.get(&key).cloned();
             if !bins.contains(&key) {
                 self.problem(format!(
                     "{SUITE_FILE} maps {FUZZ_DIR}/{}'s target `{}`, which its Cargo.toml \
@@ -1256,7 +1406,7 @@ impl Builder<'_> {
                     target.package, target.name
                 ));
             }
-            for harness in target.harness.iter().chain(&target.covers) {
+            for harness in harness.iter().chain(&target.covers) {
                 if !HARNESSES.iter().any(|entry| entry.name == harness) {
                     self.problem(format!(
                         "the target `{}` names the harness `{harness}`, which isn't registered",
@@ -1264,18 +1414,18 @@ impl Builder<'_> {
                     ));
                 }
             }
-            if target.harness.is_none() && !target.covers.is_empty() {
+            if harness.is_none() && !target.covers.is_empty() {
                 self.problem(format!(
                     "the target `{}` covers harnesses without running one",
                     target.name
                 ));
             }
             let id = self.id(format!("target/{}/{}", target.package, target.name));
-            let build = match target.package.as_str() {
-                "sim" => Build::FuzzSim,
-                _ => Build::Fuzz,
+            let build = match target.package == SIM_FUZZ_PACKAGE {
+                true => Build::FuzzSim,
+                false => Build::Fuzz,
             };
-            let corpus = match &target.harness {
+            let corpus = match &harness {
                 Some(harness) => seed_corpus(harness),
                 None => format!("mkdir -p {EVIDENCE}/corpus"),
             };
@@ -1299,7 +1449,7 @@ impl Builder<'_> {
                 expect: Expect::Pass,
                 package: target.package.clone(),
                 name: target.name.clone(),
-                harness: target.harness.clone(),
+                harness,
                 covers: target.covers.clone(),
                 smoke_secs: target.smoke_secs,
                 command: format!("{corpus} && {fuzz}"),
@@ -1628,19 +1778,69 @@ pub fn unfrozen_by(
     }
 }
 
-/// A fuzz package's `Cargo.toml`, as far as the manifest reads it.
+/// `cargo metadata --no-deps`'s output, as far as the manifest reads it.
 #[derive(Deserialize)]
-struct FuzzManifest {
-    /// Its targets.
-    #[serde(default)]
-    bin: Vec<FuzzBin>,
+struct CargoMetadata {
+    /// The workspace's packages.
+    packages: Vec<CargoPackage>,
 }
 
-/// One `[[bin]]` of a fuzz package.
+/// One package `cargo metadata` reports.
 #[derive(Deserialize)]
-struct FuzzBin {
-    /// The target's name.
+struct CargoPackage {
+    /// Its name.
     name: String,
+    /// Its `Cargo.toml`.
+    manifest_path: PathBuf,
+    /// Every target Cargo builds from it, declared or discovered.
+    targets: Vec<CargoTarget>,
+    /// Its `[package.metadata]` table.
+    metadata: Option<PackageMetadata>,
+}
+
+impl CargoPackage {
+    /// Its `[package.metadata.zakura-sim.targets]` table: the harness each
+    /// target runs, by target.
+    fn harnesses(self) -> BTreeMap<String, String> {
+        self.metadata
+            .and_then(|metadata| metadata.zakura_sim)
+            .map(|sim| sim.targets)
+            .unwrap_or_default()
+    }
+}
+
+/// The part of a package's `[package.metadata]` the manifest reads.
+#[derive(Deserialize)]
+struct PackageMetadata {
+    /// `[package.metadata.zakura-sim]`.
+    #[serde(rename = "zakura-sim")]
+    zakura_sim: Option<SimMetadata>,
+}
+
+/// `[package.metadata.zakura-sim]`.
+#[derive(Deserialize)]
+struct SimMetadata {
+    /// The harness each fuzz target runs, by target.
+    #[serde(default)]
+    targets: BTreeMap<String, String>,
+}
+
+/// One target `cargo metadata` reports.
+#[derive(Deserialize)]
+struct CargoTarget {
+    /// Its name, as `--test` or `cargo fuzz run` takes it.
+    name: String,
+    /// Its kinds, such as `lib`, `bin` or `test`.
+    kind: Vec<String>,
+    /// Its root source file.
+    src_path: PathBuf,
+}
+
+impl CargoTarget {
+    /// Whether it is of `kind`.
+    fn is(&self, kind: &str) -> bool {
+        self.kind.iter().any(|own| own == kind)
+    }
 }
 
 /// Every property ID any harness reports.
@@ -1759,31 +1959,110 @@ pub fn module_path(file: &str, dir: &str) -> String {
         .replace('/', "::")
 }
 
-/// The test binaries in `dir`, `tests/*.rs`, by name, each with whether it
-/// starts with `#![cfg(zakura_sim)]`.
-fn test_binaries(dir: &Path) -> BTreeMap<String, bool> {
-    let mut binaries = BTreeMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return binaries;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+/// The source files of the crate whose root file is `root_file`, both
+/// relative to `root`, each with what the full names of the tests at its
+/// top level start with: nothing for `root_file`, and the module path and
+/// `::` for each file a `mod name;` declaration reaches, as rustc resolves
+/// it, `#[path]` included. Also the problems: each declared module whose
+/// file doesn't exist. The walk reads declarations line by line, so a
+/// declaration inside an inline module resolves as if it were outside, and
+/// fails if that file doesn't exist.
+pub fn crate_files(root: &Path, root_file: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut problems = Vec::new();
+    let mut seen = BTreeSet::new();
+    // (file, prefix, whether its child modules' files sit beside it, as a
+    // crate root's, a `mod.rs`'s and a `#[path]` file's do).
+    let mut stack = vec![(PathBuf::from(root_file), String::new(), true)];
+    while let Some((file, prefix, beside)) = stack.pop() {
+        if !seen.insert(file.clone()) {
             continue;
         }
-        let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-            continue;
+        let source = match fs::read_to_string(root.join(&file)) {
+            Ok(source) => source,
+            Err(error) => {
+                problems.push(format!("reading {}: {error}", file.display()));
+                continue;
+            }
         };
-        let sim_only = fs::read_to_string(&path).is_ok_and(|source| {
-            source
-                .lines()
-                .map(str::trim)
-                .find(|line| line.starts_with("#!["))
-                .is_some_and(|line| line == "#![cfg(zakura_sim)]")
-        });
-        binaries.insert(name, sim_only);
+        let parent = file.parent().unwrap_or(Path::new("")).to_path_buf();
+        let children = match beside || file.file_name().is_some_and(|name| name == "mod.rs") {
+            true => parent.clone(),
+            false => parent.join(file.file_stem().unwrap_or_default()),
+        };
+        for (name, path) in module_declarations(&source) {
+            let candidates = match path {
+                Some(path) => vec![(parent.join(path), true)],
+                None => vec![
+                    (children.join(format!("{name}.rs")), false),
+                    (children.join(&name).join("mod.rs"), false),
+                ],
+            };
+            match candidates
+                .iter()
+                .find(|(candidate, _)| root.join(candidate).is_file())
+            {
+                Some((found, beside)) => {
+                    stack.push((found.clone(), format!("{prefix}{name}::"), *beside));
+                }
+                None => problems.push(format!(
+                    "{} declares `mod {name};`, and {} doesn't exist",
+                    file.display(),
+                    candidates
+                        .iter()
+                        .map(|(candidate, _)| candidate.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )),
+            }
+        }
+        files.push((file.to_string_lossy().into_owned(), prefix));
     }
-    binaries
+    files.sort();
+    (files, problems)
+}
+
+/// The `mod name;` declarations in `source`, outside comments, each with
+/// its `#[path = "..."]` attribute's value, if it has one.
+fn module_declarations(source: &str) -> Vec<(String, Option<String>)> {
+    let mut declarations = Vec::new();
+    let mut path = None;
+    for line in source.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        // Outer attributes, on their own lines or before the item.
+        let mut rest = line;
+        while let Some((attribute, after)) = rest
+            .strip_prefix("#[")
+            .and_then(|attribute| attribute.split_once(']'))
+        {
+            if attribute.starts_with("path") {
+                path = attribute.split('"').nth(1).map(str::to_owned);
+            }
+            rest = after.trim_start();
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        if let Some(name) = module_declaration(rest) {
+            declarations.push((name.to_owned(), path.clone()));
+        }
+        path = None;
+    }
+    declarations
+}
+
+/// The module `line` declares, if it is `mod name;` with any visibility.
+fn module_declaration(line: &str) -> Option<&str> {
+    let line = match line.strip_prefix("pub") {
+        Some(rest) if rest.starts_with('(') => rest.split_once(')')?.1,
+        Some(rest) => rest,
+        None => line,
+    };
+    let (name, _) = line.trim_start().strip_prefix("mod ")?.split_once(';')?;
+    let name = name.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
 }
 
 /// Every file with `extension` under `root`'s `dir`, relative to `root`,
@@ -1897,6 +2176,68 @@ mod tests {
         }
         build.dirty = true;
         assert!(unfrozen_by(&build, Some("c0ffee"), Some("")).is_some());
+    }
+
+    /// A crate's files are its root and the files its `mod name;`
+    /// declarations reach, as rustc resolves them.
+    #[test]
+    fn crate_files_follow_module_declarations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (file, text) in [
+            (
+                "tests/flat.rs",
+                "//! mod commented;\nmod support;\n#[cfg(zakura_sim)] pub(crate) mod gated;\n",
+            ),
+            ("tests/support/mod.rs", "pub mod feed;\n"),
+            ("tests/support/feed.rs", ""),
+            (
+                "tests/gated.rs",
+                "#[path = \"elsewhere/x.rs\"]\nmod renamed;\n",
+            ),
+            ("tests/elsewhere/x.rs", ""),
+            ("tests/nested/main.rs", "mod helpers;\nmod missing;\n"),
+            ("tests/nested/helpers.rs", "mod deeper;\n"),
+            ("tests/nested/helpers/deeper.rs", ""),
+        ] {
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let owned = |files: &[(&str, &str)]| -> Vec<(String, String)> {
+            files
+                .iter()
+                .map(|(file, prefix)| ((*file).to_owned(), (*prefix).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            crate_files(dir.path(), "tests/flat.rs"),
+            (
+                owned(&[
+                    ("tests/elsewhere/x.rs", "gated::renamed::"),
+                    ("tests/flat.rs", ""),
+                    ("tests/gated.rs", "gated::"),
+                    ("tests/support/feed.rs", "support::feed::"),
+                    ("tests/support/mod.rs", "support::"),
+                ]),
+                Vec::new()
+            )
+        );
+        let (files, problems) = crate_files(dir.path(), "tests/nested/main.rs");
+        assert_eq!(
+            files,
+            owned(&[
+                ("tests/nested/helpers.rs", "helpers::"),
+                ("tests/nested/helpers/deeper.rs", "helpers::deeper::"),
+                ("tests/nested/main.rs", ""),
+            ])
+        );
+        assert_eq!(
+            problems,
+            [
+                "tests/nested/main.rs declares `mod missing;`, and tests/nested/missing.rs or \
+              tests/nested/missing/mod.rs doesn't exist"
+            ]
+        );
     }
 
     /// File paths become module paths.

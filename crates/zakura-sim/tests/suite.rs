@@ -3,14 +3,17 @@
 //! and seed, and each gap it can have fails the check with its reason.
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeSet, process::Command};
+use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 use serde_json::Value;
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{coverage::COVERAGE, HARNESSES},
     seed,
-    suite::{self, Expect, MissingTarget, Pending, PendingKind, SuiteFile, NIGHTLY, SUITE_FILE},
+    suite::{
+        self, Expect, Ignored, MissingTarget, Pending, PendingKind, SimPackage, SuiteFile, Target,
+        NIGHTLY, SUITE_FILE,
+    },
 };
 
 /// The committed `qa/suite.toml`.
@@ -42,6 +45,110 @@ fn pending(id: &str, kind: PendingKind) -> Pending {
         kind,
         owner: "none".to_owned(),
         plan: "none".to_owned(),
+    }
+}
+
+/// A checkout in a temporary directory, with a workspace and a simulator
+/// fuzz package:
+///
+/// - the package `demo` has the test targets `tests/flat.rs` and
+///   `tests/nested/main.rs`. `nested` builds only in the simulator, and has
+///   an ignored test at its top level and one in its child module
+///   `helpers`;
+/// - `qa/fuzz/sim` maps its target `mapped` to an unregistered harness, its
+///   target `unmapped` to none, and `stale`, which it doesn't define, to
+///   `fixtures/all`.
+fn scratch() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    for (file, text) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/demo\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/demo/Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        ),
+        ("crates/demo/src/lib.rs", ""),
+        ("crates/demo/tests/flat.rs", "#[test]\nfn flat() {}\n"),
+        (
+            "crates/demo/tests/nested/main.rs",
+            "#![cfg(zakura_sim)]\nmod helpers;\n\n#[test]\n#[ignore = \"slow\"]\nfn top() {}\n",
+        ),
+        (
+            "crates/demo/tests/nested/helpers.rs",
+            "#[test]\n#[ignore = \"slow\"]\nfn child() {}\n",
+        ),
+        (
+            "qa/fuzz/sim/Cargo.toml",
+            "[package]\nname = \"demo-fuzz\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [package.metadata.zakura-sim.targets]\nmapped = \"no/such-harness\"\n\
+             stale = \"fixtures/all\"\n\n\
+             [[bin]]\nname = \"mapped\"\npath = \"fuzz_targets/mapped.rs\"\n\n\
+             [[bin]]\nname = \"unmapped\"\npath = \"fuzz_targets/unmapped.rs\"\n\n\
+             [workspace]\n",
+        ),
+        ("qa/fuzz/sim/fuzz_targets/mapped.rs", "fn main() {}\n"),
+        ("qa/fuzz/sim/fuzz_targets/unmapped.rs", "fn main() {}\n"),
+    ] {
+        let path = dir.path().join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    dir
+}
+
+/// A suite for [`scratch`] that runs `demo`'s test targets `tests`, all of
+/// them if `None`, and lists `ignored`.
+fn scratch_suite(tests: Option<&[&str]>, ignored: &[&str]) -> SuiteFile {
+    SuiteFile {
+        schema: suite::SCHEMA,
+        planted_timeout_secs: 1,
+        seed_timeout_secs: 1,
+        sim_package: vec![SimPackage {
+            name: "demo".to_owned(),
+            lib: true,
+            tests: tests.map(|tests| tests.iter().map(|test| (*test).to_owned()).collect()),
+            timeout_secs: 1,
+        }],
+        property_package: Vec::new(),
+        ignored: ignored
+            .iter()
+            .map(|test| {
+                let (file, test) = test.split_once("::").unwrap();
+                Ignored {
+                    file: file.to_owned(),
+                    test: test.to_owned(),
+                    run: true,
+                    timeout_secs: Some(1),
+                    reason: None,
+                }
+            })
+            .collect(),
+        lane: Vec::new(),
+        target: ["mapped", "unmapped"]
+            .into_iter()
+            .map(|name| Target {
+                package: "sim".to_owned(),
+                name: name.to_owned(),
+                covers: Vec::new(),
+                smoke_secs: 1,
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout_secs: 1,
+            })
+            .collect(),
+        excluded_target: Vec::new(),
+        missing_target: Vec::new(),
+        pending: Vec::new(),
+    }
+}
+
+/// The problems the manifest of the checkout at `root` has with `suite`.
+fn problems_at(root: &Path, suite: &SuiteFile) -> Vec<String> {
+    match suite::manifest_of(root, suite, String::new()) {
+        Ok(_) => Vec::new(),
+        Err(problems) => problems.0,
     }
 }
 
@@ -143,18 +250,101 @@ fn a_harness_both_run_and_missing_fails() {
 }
 
 #[test]
-fn a_target_of_an_unregistered_harness_fails() {
-    let mut suite = committed();
-    for target in &mut suite.target {
-        if target.name == "discovery_wait_complete" {
-            target.harness = Some("no/such-harness".to_owned());
-        }
+fn a_simulator_target_takes_its_harness_from_its_cargo_toml() {
+    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+        panic!("{problems}");
+    });
+    for (name, harness) in [
+        ("discovery_wait_complete", "discovery/wait-complete"),
+        ("race_fixtures", "fixtures/all"),
+    ] {
+        let row = manifest
+            .targets
+            .iter()
+            .find(|row| row.name == name)
+            .expect("the suite runs the target");
+        assert_eq!(row.harness.as_deref(), Some(harness), "{name}");
+        assert!(
+            row.command
+                .starts_with(&format!("cargo xtask sim-seeds --sim {harness} ")),
+            "{}",
+            row.command
+        );
     }
-    let problems = problems(&suite);
-    assert_problem(&problems, "names the harness `no/such-harness`");
+}
+
+#[test]
+fn a_simulator_target_without_a_registered_harness_fails() {
+    let dir = scratch();
+    let problems = problems_at(dir.path(), &scratch_suite(None, &[]));
     assert_problem(
         &problems,
-        "no target runs the harness `discovery/wait-complete`",
+        "the target `mapped` names the harness `no/such-harness`, which isn't registered",
+    );
+    assert_problem(
+        &problems,
+        "qa/fuzz/sim defines the target `unmapped`, and its \
+         `[package.metadata.zakura-sim.targets]` table maps it to no harness",
+    );
+    assert_problem(
+        &problems,
+        "qa/fuzz/sim/Cargo.toml maps `stale` to a harness, and defines no such target",
+    );
+}
+
+#[test]
+fn a_target_row_cant_name_its_harness() {
+    let error = toml::from_str::<SuiteFile>(
+        "schema = 1\nplanted-timeout-secs = 1\nseed-timeout-secs = 1\n\n[[target]]\n\
+         package = \"sim\"\nname = \"race_fixtures\"\nharness = \"fixtures/all\"\n\
+         smoke-secs = 1\ntimeout-secs = 1\n",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field `harness`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_directory_test_target_the_suite_doesnt_list_fails() {
+    let dir = scratch();
+    let problems = problems_at(dir.path(), &scratch_suite(Some(&["flat"]), &[]));
+    assert_problem(
+        &problems,
+        "crates/demo/tests/nested/main.rs builds only under `--cfg zakura_sim`, and \
+         qa/suite.toml doesn't list its test target `nested`",
+    );
+}
+
+#[test]
+fn an_ignored_test_in_a_directory_test_target_fails() {
+    let dir = scratch();
+    let problems = problems_at(dir.path(), &scratch_suite(None, &[]));
+    assert_problem(
+        &problems,
+        "crates/demo/tests/nested/main.rs::top is ignored",
+    );
+    assert_problem(
+        &problems,
+        "crates/demo/tests/nested/helpers.rs::child is ignored",
+    );
+    // Listed, both run in `nested`.
+    let problems = problems_at(
+        dir.path(),
+        &scratch_suite(
+            None,
+            &[
+                "crates/demo/tests/nested/main.rs::top",
+                "crates/demo/tests/nested/helpers.rs::child",
+            ],
+        ),
+    );
+    assert!(
+        !problems
+            .iter()
+            .any(|problem| problem.contains("crates/demo")),
+        "{problems:#?}"
     );
 }
 

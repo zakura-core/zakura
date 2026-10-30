@@ -11,6 +11,17 @@ import network
 
 
 class ArchiveSeedTests(unittest.TestCase):
+    def test_finalized_metadata_uses_a_read_only_preview_of_the_stopped_public_state(self):
+        text = 'rollback plan:\n  old finalized tip: height 4558785, hash ' + 'a' * 64 + '\n'
+        with patch.object(archive_seed, 'command', return_value=text) as command:
+            result = archive_seed.stopped_finalized_tip(dict(root='/dedicated/root', binary='/bin/zakurad'))
+        self.assertEqual(result, {'height': 4558785, 'hash': 'a' * 64})
+        self.assertIn('--dry-run', command.call_args.args)
+        self.assertIn('Testnet', command.call_args.args)
+        with patch.object(archive_seed, 'command', return_value='no finalized metadata'):
+            with self.assertRaisesRegex(ValueError, 'finalized tip'):
+                archive_seed.stopped_finalized_tip(dict(root='/dedicated/root', binary='/bin/zakurad'))
+
     def test_seed_retention_only_removes_the_recorded_older_archive(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

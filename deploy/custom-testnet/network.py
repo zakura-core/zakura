@@ -341,7 +341,8 @@ def cleanup_failed_reset(config):
     with (root / 'reset.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         run = json.loads((root / 'run.json').read_text())
-        run.update(phase='failed', error='reset service ended without completing')
+        if run['phase'] != 'failed':
+            run.update(phase='failed', error='reset service ended without completing')
         atomic_json(root / 'run.json', run)
         for suffix in ('preparation', 'node0', 'node1'):
             command('systemctl', 'stop', f'{config["service_prefix"]}-{suffix}.service')

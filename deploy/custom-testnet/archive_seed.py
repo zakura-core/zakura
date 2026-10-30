@@ -13,6 +13,7 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 import secrets
 import signal
 import shutil
@@ -137,6 +138,32 @@ def verify_archive_history(port):
         if not rpc(port, 'getblock', [block_hash, 0]):
             raise ValueError('archive node cannot return a historical block body')
     return info
+
+
+def stopped_finalized_tip(config):
+    """Read the exact stopped public database tip using the read-only CLI preview.
+
+    The deployed mining binary does not expose finalized height over JSON-RPC.
+    The preview opens the database read-only and never builds a rollback batch.
+    """
+    root = Path(config['root'])
+    output = command(config['binary'], '-c', str(root / 'preparation.toml'),
+                     'rollback-state', '--height', '1', '--network', 'Testnet',
+                     '--cache-dir', str(root / 'preparation/cache'),
+                     '--storage-mode', 'archive', '--dry-run')
+    match = re.search(r'old finalized tip: height ([0-9]+), hash ([0-9a-f]{64})', output)
+    if match is None:
+        raise ValueError('read-only state preview did not report a finalized tip')
+    return {'height': int(match[1]), 'hash': match[2]}
+
+
+def rename_state_network(cache, source, target):
+    """Relabel stopped state paths without altering their database contents."""
+    for version in (cache / 'state').iterdir():
+        (version / source).rename(version / target)
+    backup = cache / 'non_finalized_state' / source
+    if backup.exists():
+        backup.rename(backup.with_name(target))
 
 
 def capture(cache, output, service, reference_url):
@@ -268,16 +295,11 @@ def refresh_seed(config, restore_archive):
         stage('syncing')
         wait_for_rpc('Testnet')
         reference = wait_for_sync(config['reference_status_url'])
-        info = rpc(18432, 'getblockchaininfo')
-        finalized = info['header_chain']['finalized']
         command('systemctl', 'stop', service)
+        finalized = stopped_finalized_tip(config)
         stage('verifying', public_tip=reference)
         name = 'ArchiveProbe' + secrets.token_hex(4)
-        for version in (preparation / 'cache/state').iterdir():
-            (version / 'testnet').rename(version / name.lower())
-        backups = preparation / 'cache/non_finalized_state/testnet'
-        if backups.exists():
-            backups.rename(backups.with_name(name.lower()))
+        rename_state_network(preparation / 'cache', 'testnet', name.lower())
         for directory in ('network', 'identity'):
             shutil.rmtree(preparation / directory, ignore_errors=True)
         probe = {'name': name, 'magic': list(secrets.token_bytes(4)),
@@ -290,8 +312,10 @@ def refresh_seed(config, restore_archive):
         if (not reference['height'] <= info['blocks'] <= reference['height'] + 10
                 or rpc(18432, 'getblockhash', [reference['height']]) != reference['hash']):
             raise ValueError('isolated archive differs from the verified public tip')
-        finalized = info['header_chain']['finalized']
         command('systemctl', 'stop', service)
+        rename_state_network(preparation / 'cache', name.lower(), 'testnet')
+        (root / 'preparation.toml').write_text(preparation_config(root))
+        finalized = stopped_finalized_tip(config)
         size = state_bytes(preparation / 'cache')
         version = max((p.name for p in (preparation / 'cache/state').iterdir()), key=lambda name: int(name[1:]))
         # Preparation is removed before restoring the two validators. Reserving
@@ -305,7 +329,7 @@ def refresh_seed(config, restore_archive):
                        previous_seed_archive=str(archive),
                        seed_height=info['blocks'], seed_hash=info['bestblockhash'],
                        seed_finalized_height=finalized['height'], seed_finalized_hash=finalized['hash'],
-                       seed_network_directory=name.lower(), seed_storage_mode='archive',
+                       seed_network_directory='testnet', seed_storage_mode='archive',
                        seed_state_version=version,
                        seed_unpacked_bytes=size, seed_synced_at=int(time.time()))
         metadata = destination.with_suffix('.json')

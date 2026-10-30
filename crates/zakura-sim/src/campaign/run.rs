@@ -50,6 +50,12 @@ const ARTIFACTS_DIR: &str = "artifacts";
 /// A worker's `ZAKURA_SIM_ARTIFACTS`: the target's saved inputs and traces.
 const SIM_DIR: &str = "sim";
 
+/// The compaction's libFuzzer artifacts: the inputs its merge crashed on.
+const COMPACT_ARTIFACTS_DIR: &str = "compact-artifacts";
+
+/// The compaction's `ZAKURA_SIM_ARTIFACTS`.
+const COMPACT_SIM_DIR: &str = "compact-sim";
+
 /// How long past its budget and per-input timeout a fuzzer process may run
 /// before the supervisor kills it.
 const GRACE: Duration = Duration::from_secs(60);
@@ -205,8 +211,8 @@ pub struct End {
     pub added: usize,
     /// What compacting the snapshot came to, if the run compacted it.
     pub compaction: Option<Compaction>,
-    /// Every file in the workers' artifact and target directories: the
-    /// failing inputs and their traces.
+    /// Every file in the workers' and the compaction's artifact and target
+    /// directories: the failing inputs and their traces.
     pub failures: Vec<FileRecord>,
 }
 
@@ -621,21 +627,26 @@ fn finish(
         .index
         .inputs;
     let snapshot = store.save_snapshot(&sources)?;
-    let mut failures = Vec::new();
-    for plan in &manifest.workers {
-        let worker = worker_dir(&dir, plan.index);
-        for sub in [ARTIFACTS_DIR, SIM_DIR] {
-            for path in files_under(&worker.join(sub))? {
-                failures.push(file_record(store, &path)?);
-            }
-        }
-    }
     let compaction = match (recorded_by, manifest.budget.compact_secs) {
         (Recorder::Supervisor, Some(seconds)) => {
             Some(compact(store, &dir, manifest, &snapshot.digest, seconds)?)
         }
         _ => None,
     };
+    let mut failures = Vec::new();
+    let failure_dirs = manifest
+        .workers
+        .iter()
+        .flat_map(|plan| {
+            let worker = worker_dir(&dir, plan.index);
+            [worker.join(ARTIFACTS_DIR), worker.join(SIM_DIR)]
+        })
+        .chain([dir.join(COMPACT_ARTIFACTS_DIR), dir.join(COMPACT_SIM_DIR)]);
+    for failure_dir in failure_dirs {
+        for path in files_under(&failure_dir)? {
+            failures.push(file_record(store, &path)?);
+        }
+    }
     let status = match recorded_by {
         Recorder::Close => Status::Interrupted,
         Recorder::Supervisor
@@ -675,7 +686,8 @@ fn finish(
 
 /// Compacts `snapshot` with the fuzzer's `-merge=1` into a new directory,
 /// within `seconds`, and saves the result as a new snapshot. `snapshot`
-/// stays as it is whatever happens.
+/// stays as it is whatever happens. The merge's crash files and the
+/// target's saved inputs go under the run's directory.
 fn compact(
     store: &Store,
     dir: &Path,
@@ -684,14 +696,19 @@ fn compact(
     seconds: u64,
 ) -> Result<Compaction, CampaignError> {
     let out = partial_path(dir);
-    fs::create_dir_all(&out).map_err(CampaignError::io(format!("creating {}", out.display())))?;
+    let artifacts = dir.join(COMPACT_ARTIFACTS_DIR);
+    for new in [&out, &artifacts] {
+        fs::create_dir_all(new)
+            .map_err(CampaignError::io(format!("creating {}", new.display())))?;
+    }
     let mut command = fuzzer_command(
         &store.fuzzer_path(&manifest.build.binary),
         None,
         &manifest.budget,
-        &dir.join("compact-sim"),
+        &dir.join(COMPACT_SIM_DIR),
     );
     command
+        .arg(format!("-artifact_prefix={}/", artifacts.display()))
         .arg("-merge=1")
         .arg(&out)
         .arg(store.snapshot_inputs(snapshot));
@@ -701,9 +718,12 @@ fn compact(
         Some(Duration::from_secs(seconds)),
         |_| {},
     )?;
+    // libFuzzer's merge restarts its inner process past an input that
+    // crashes, so a merge that exits 0 finished, whatever reports its log
+    // holds.
     let compaction = match ProcessFailure::of(exit, &output) {
-        Some(failure) => Compaction::Failed { failure },
-        None => {
+        Some(failure) if exit != ProcessExit::Code(0) => Compaction::Failed { failure },
+        _ => {
             let compacted = store.save_snapshot(&[Source::Dir(&out)])?;
             Compaction::Compacted {
                 inputs: compacted.index.inputs.len(),

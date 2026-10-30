@@ -64,6 +64,15 @@ if [ "$merge" = 1 ]; then
     while alive; do sleep 0.05; done
     exit 1
   fi
+  if [ -e "$control/merge-crash" ]; then
+    # libFuzzer's merge restarts its inner process past a crashing input,
+    # and still exits 0.
+    printf 'merge crash %s' "$$" > "${prefix}crash-merge-$$"
+    mkdir -p "$ZAKURA_SIM_ARTIFACTS/inputs/active/stub"
+    printf 'merge crash %s' "$$" > "$ZAKURA_SIM_ARTIFACTS/inputs/active/stub/merge-$$.bin"
+    echo "==$$==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1" >&2
+    echo "MERGE-OUTER: attempt 2" >&2
+  fi
   for dir in "${dirs[@]:1}"; do
     for file in "$dir"/*; do
       [ -f "$file" ] || continue
@@ -600,6 +609,41 @@ fn interrupted_compaction_keeps_every_snapshot() {
             .initial_snapshot,
         snapshot
     );
+}
+
+/// A merge that crashes on an input finishes all the same, as libFuzzer's
+/// does: the run records the compaction, and lists the crash file and the
+/// target's saved input, both kept inside the store.
+#[test]
+fn a_merge_that_crashes_on_an_input_still_compacts() {
+    let fixture = Fixture::new();
+    fixture.set("merge-crash");
+    let mut options = fixture.options(1, 1);
+    options.budget.compact_secs = Some(30);
+    let (run, end) = start(&fixture.store, options);
+    assert!(
+        matches!(end.compaction, Some(Compaction::Compacted { .. })),
+        "{end:?}"
+    );
+    let run_dir = format!("runs/{run}/");
+    let listed: Vec<&str> = end
+        .failures
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| path.starts_with(&run_dir) && !path.contains("/workers/"))
+        .collect();
+    assert_eq!(listed.len(), 2, "{:?}", end.failures);
+    assert!(
+        listed.iter().any(|path| path.contains("/crash-merge-")),
+        "{listed:?}"
+    );
+    assert!(
+        listed.iter().any(|path| path.contains("/merge-")
+            && path.ends_with(".bin")
+            && !path.contains("/crash-")),
+        "{listed:?}"
+    );
+    assert_store_verifies(&fixture.store);
 }
 
 /// Resume refuses another build identity or another feedback, and a new

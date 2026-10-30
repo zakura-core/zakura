@@ -147,8 +147,8 @@ one of three statuses:
 - `interrupted`: the supervisor stopped first, and `close` wrote the record.
 
 Findings don't change the status. The end record lists every file the workers
-left in their libFuzzer artifact directories and their `ZAKURA_SIM_ARTIFACTS`
-directories, by SHA-256, for triage.
+and the compaction left in their libFuzzer artifact directories and their
+`ZAKURA_SIM_ARTIFACTS` directories, by SHA-256, for triage.
 
 Snapshots, manifests and builds are written to temporary names, synced, then
 renamed or linked under their digests, and never change. A run never deletes

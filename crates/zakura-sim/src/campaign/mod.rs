@@ -23,6 +23,8 @@
 //!     workers/<n>/sim/             the target's saved inputs and traces
 //!     workers/<n>/attempts.jsonl   each fuzzer process the worker ran
 //!     workers/<n>/outcome.json     why the worker stopped
+//!     compact-artifacts/           the inputs the compaction's merge crashed on
+//!     compact-sim/                 the compaction's saved inputs and traces
 //!     end.json                     the run's one end record
 //! ```
 //!
@@ -51,9 +53,9 @@
 //!   record. `close` or `resume` wrote it later, from what the workers left.
 //!
 //! The end record names the new snapshot and lists every failure file the
-//! workers left, by digest. `resume` checks both before it trusts them, then
-//! writes a new manifest whose initial snapshot is the end record's, and
-//! whose `resume_parent` is the run it continues. A run of another build,
+//! workers and the compaction left, by digest. `resume` checks both before
+//! it trusts them, then writes a new manifest whose initial snapshot is the
+//! end record's, and whose `resume_parent` is the run it continues. A run of another build,
 //! generator, format or contract version can't resume: it starts a new
 //! campaign segment with an explicit corpus migration, and the previous
 //! segment's manifests and snapshots stay as they are.

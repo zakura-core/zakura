@@ -1236,6 +1236,46 @@ mod tests {
         }
     }
 
+    /// A read that reaches the runtime fails the run as a harness failure
+    /// that names it, with the property reports written and the read's
+    /// mark cleared, rather than unwinding through `Sim`.
+    ///
+    /// This fails if a read's panic escapes the hub.
+    #[test]
+    fn a_read_that_reaches_the_runtime_fails_the_run() {
+        use zakura_network::zakura::diag::{BudgetCounters, OwnerState, Read, ReadKey};
+
+        let (fixture, slot) = Fixture::new(1_000);
+        slot.register_read(
+            ReadKey::Budget,
+            Box::new(|| {
+                point();
+                Read::Current(OwnerState::Budget(BudgetCounters {
+                    capacity: 4_000,
+                    reserved: 0,
+                    owned: 0,
+                }))
+            }),
+        );
+        slot.emit(settled(0, false));
+        let mut registry = requiring(&fixture.view);
+        let (report, _) = fixture.run(&mut registry);
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail.starts_with("FailedRead: Budget's read (generation 1) panicked at step 0: \
+                    a boundary read reached the runtime")),
+            "{:?}",
+            report.end
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            crate::check::PropertyOutcome::Inconclusive {
+                reason: "harness-failed".to_owned()
+            }
+        );
+        assert!(!zakura_rt::sim::in_boundary_read());
+    }
+
     /// A step whose task changes the budget and exits logs the budget's
     /// read after the records the task emitted and before its exit, since
     /// the hub reads at its observation and `Sim` logs the outcome after.

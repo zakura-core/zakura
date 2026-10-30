@@ -5,8 +5,8 @@
 //! through its observer, which keeps it in a [`ReadSink`]. At each step
 //! boundary, after the step's other records are written and before `Sim`
 //! logs its task outcome, [`BoundaryReads`] runs every live read inside
-//! [`zakura_rt::sim::boundary_read`], where any scheduling point, park,
-//! unpark or task wake panics. Each read folds into the view's component,
+//! [`zakura_rt::sim::boundary_read`], where any use of the executor or a
+//! task wake panics. A read that panics fails the run as a harness failure. Each read folds into the view's component,
 //! which moves its `fresh_through` to this boundary, and a read that
 //! differs from the last one logged is logged as
 //! [`Observation::ComponentRead`] with the next `seq`. A read of an owner
@@ -127,10 +127,28 @@ impl BoundaryReads {
             self.budget_exists = true;
             view.exists(ComponentKind::Budget, step);
         }
-        let reads: Vec<diag::Read<OwnerState>> =
-            zakura_rt::sim::boundary_read(|| self.live.iter().map(|live| (live.read)()).collect());
+        // Each read runs on its own, so one that reaches the runtime fails
+        // the run as a harness failure, after the mark is cleared, instead
+        // of unwinding through `Sim`.
+        let reads: Vec<Result<diag::Read<OwnerState>, String>> = self
+            .live
+            .iter()
+            .map(|live| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    zakura_rt::sim::boundary_read(|| (live.read)())
+                }))
+                .map_err(|panic| {
+                    format!(
+                        "FailedRead: {:?}'s read (generation {}) panicked at step {step}: {}",
+                        live.kind,
+                        live.generation,
+                        panic_message(&*panic)
+                    )
+                })
+            })
+            .collect();
         for (live, read) in self.live.iter_mut().zip(reads) {
-            let (read, logged) = reading(read)?;
+            let (read, logged) = reading(read?)?;
             if live.last.as_ref() != Some(&read) {
                 live.seq += 1;
                 log.push(Observation::ComponentRead {
@@ -157,6 +175,15 @@ impl BoundaryReads {
             } if *instance == self.reactor)
         })
     }
+}
+
+/// A panic's message, if it has one.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-string panic")
 }
 
 /// The component `key` reads.

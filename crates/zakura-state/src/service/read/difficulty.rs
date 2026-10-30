@@ -687,7 +687,7 @@ mod tests {
         ] {
             let span = pow_adjustment_block_span_for_height(&network, tip.next().unwrap());
             let result = difficulty_time_and_history_tree(
-                vec![Arc::new(header.clone()); span],
+                (0..span).map(|_| Arc::new(header)).collect(),
                 tip,
                 block.hash(),
                 &network,
@@ -716,7 +716,7 @@ mod tests {
         for fresh_count in [5u32, 6] {
             let tip = Height(seed.0 + fresh_count);
             let span = pow_adjustment_block_span_for_height(&network, tip.next().unwrap());
-            let mut headers = vec![Arc::new(*block.header); span];
+            let mut headers: Vec<_> = (0..span).map(|_| Arc::new(*block.header)).collect();
             for (index, header) in headers.iter_mut().enumerate() {
                 let mut value = **header;
                 value.time = if index < usize::try_from(fresh_count).unwrap() {

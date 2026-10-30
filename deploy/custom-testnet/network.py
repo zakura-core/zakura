@@ -132,6 +132,7 @@ def node_config(config, run, index, mining=False):
     rpc_port = 18232 if index == 0 else 18332
     magic = json.dumps(run['magic_bytes'])
     address = json.dumps(config['miner_address'])
+    checkpoints = json.dumps([[0, list(bytes.fromhex('05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38')[::-1])], [config['seed_height'], list(bytes.fromhex(config['seed_hash'])[::-1])]])
     return f'''[network]
 listen_addr = "0.0.0.0:{port}"
 initial_testnet_peers = ["127.0.0.1:{peer}"]
@@ -141,7 +142,7 @@ identity_dir = "{root}/node{index}/identity"
 [network.network]
 network_name = "{name}"
 network_magic = {magic}
-checkpoints = [[0, "05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38"], [{config['seed_height']}, "{config['seed_hash']}"]]
+checkpoints = {checkpoints}
 inherit_activation_heights = true
 pq_p2sh_activation_height = {run['activation_height']}
 max_block_time_start_height = {config['seed_height'] + 7}

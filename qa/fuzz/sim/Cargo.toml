@@ -11,6 +11,7 @@ cargo-fuzz = true
 # suite manifest and campaign tooling read the mapping from here.
 [package.metadata.zakura-sim.targets]
 discovery_wait_complete = "discovery/wait-complete"
+header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
 
 [features]
@@ -32,6 +33,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(zakura_sim)"] }
 [[bin]]
 name = "discovery_wait_complete"
 path = "fuzz_targets/discovery_wait_complete.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_sync_storage"
+path = "fuzz_targets/header_sync_storage.rs"
 test = false
 doc = false
 bench = false

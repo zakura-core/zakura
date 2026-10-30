@@ -42,6 +42,16 @@ use crate::{
     Observation, ObservationLog, RunConfig, Sim,
 };
 
+/// The variable that turns a fuzz target's semantic feedback `on`, the
+/// default, or `off`. The fuzz package reads it, and a campaign's manifest
+/// sets it.
+pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
+
+/// The start of the line a fuzz target with semantic feedback logs at
+/// startup, followed by `key=value` pairs. A campaign's startup probe reads
+/// the line into its manifest.
+pub const FEEDBACK_LINE: &str = "zakura-sim feedback: ";
+
 /// The feedback backend, for campaign manifests.
 pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 

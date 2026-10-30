@@ -16,7 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    manifest::{Budget, Manifest, WorkerPlan, FEEDBACK_VAR, SANITIZER_VARS},
+    manifest::{Budget, Manifest, WorkerPlan, SANITIZER_VARS},
     snapshot::Source,
     store::{
         now_unix, partial_path, read_record, record_bytes, replace, write_once, CampaignError,
@@ -24,7 +24,10 @@ use super::{
     },
 };
 use crate::{
-    explore::{ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, EXPECT_VAR},
+    explore::{
+        feedback::FEEDBACK_VAR, ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC,
+        ABANDON_LIMIT_VAR, EXPECT_VAR,
+    },
     trace::ARTIFACTS_VAR,
 };
 

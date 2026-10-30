@@ -70,8 +70,7 @@ mod verify;
 pub use build::{build_fuzzer, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
 pub use manifest::{
     prepare_resume, prepare_start, Budget, FeedbackRecord, HarnessRecord, LimitsRecord, Manifest,
-    Migration, ResumeOptions, SeedsRecord, StartOptions, WorkerPlan, FEEDBACK_LINE, FEEDBACK_VAR,
-    SANITIZER_VARS,
+    Migration, ResumeOptions, SeedsRecord, StartOptions, WorkerPlan, SANITIZER_VARS,
 };
 pub use run::{
     close, read_end, Attempt, AttemptEnd, Compaction, End, FileRecord, Prepared, Recorder, Status,

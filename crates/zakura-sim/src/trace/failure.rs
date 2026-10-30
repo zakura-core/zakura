@@ -6,7 +6,9 @@
 //! must violate the same property at the same step: the failure-consistency
 //! check. The second rerun replays that trace Exact: the determinism check.
 //! A trace that passes both is saved under the property's directory, named
-//! by its ID.
+//! by its ID. A trace that fails either check is kept as evidence of
+//! nondeterminism, with the record it was compared against and the first
+//! difference between them.
 
 use std::{
     env, fs, io,
@@ -20,10 +22,12 @@ use std::{
     thread,
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{
-    replay_with, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, TRACE_FILE,
+    replay_with,
+    verify::{end_difference, trace_difference},
+    ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, TRACE_FILE,
 };
 use crate::{
     check::PropertyOutcome,
@@ -37,6 +41,23 @@ pub const ARTIFACTS_VAR: &str = "ZAKURA_SIM_ARTIFACTS";
 
 /// The directory under the artifacts root that holds saved traces.
 pub const TRACES_DIR: &str = "traces";
+
+/// The directory under the artifacts root that keeps the evidence of each
+/// nondeterministic rerun.
+pub const NONDETERMINISTIC_DIR: &str = "nondeterministic";
+
+/// The recording rerun's trace, in a nondeterminism directory.
+pub const RECORDING_DIR: &str = "recording";
+
+/// A second recording of the same input, in a nondeterminism directory.
+pub const RERUN_DIR: &str = "rerun";
+
+/// The first run's `end` record, in a nondeterminism directory.
+pub const FIRST_END_FILE: &str = "first-end.json";
+
+/// The check that failed and the first difference it found, in a
+/// nondeterminism directory.
+pub const DIVERGENCE_FILE: &str = "divergence.json";
 
 /// Characters of the trace ID that name a saved trace's directory.
 const ID_PREFIX: usize = 12;
@@ -72,12 +93,24 @@ pub fn artifacts_root() -> PathBuf {
 ///    draw, `obs` digest and `end` field must match, and so must every
 ///    property's violation evidence.
 ///
-/// Either failure deletes the partial directory and returns
-/// [`RecordError::Nondeterministic`]. A trace that passes both moves to
+/// A trace that passes both moves to
 /// `out_root/traces/<property-id>/<first 12 hex of the trace ID>/`, with
 /// each segment of the property ID a directory. If that directory already
 /// holds the same trace, the new copy is deleted and the saved one is
 /// returned.
+///
+/// Either failure returns [`RecordError::Nondeterministic`], and keeps its
+/// evidence in
+/// `out_root/nondeterministic/<property-id>/<first 12 hex of the trace ID>/`:
+///
+/// - `recording/`, the first rerun's trace;
+/// - `rerun/`, a second recording of the same input, which stands in for the
+///   replay's records, since a replay writes none;
+/// - `first-end.json`, the `end` record of `first`, which wrote no trace;
+/// - `divergence.json`, which names the failed check (`recording` or
+///   `replay`) and its detail, the first `end` field where `first` and the
+///   recording differ, and the first record where the recording and the
+///   rerun differ.
 pub fn record_failure(
     harness: &'static HarnessEntry,
     scenario: &Value,
@@ -104,12 +137,83 @@ pub fn record_failure(
     // Only a crashed process with this process's ID could have left one.
     remove(&partial).map_err(RecordError::Io)?;
     let checked = record_and_replay(harness, scenario, input, property, step, &partial);
-    match checked {
-        Ok(trace) => save(&trace, &partial, &parent),
-        Err(error) => {
-            // The run's error matters more than a failed cleanup.
-            let _ = remove(&partial);
-            Err(error)
+    let error = match checked {
+        Ok(trace) => return save(&trace, &partial, &parent),
+        Err(Unchecked::Diverged {
+            check,
+            detail,
+            recording,
+        }) => {
+            let diverged = Diverged {
+                harness,
+                scenario,
+                input,
+                first,
+                recording: &recording,
+                check,
+                detail: &detail,
+            };
+            match keep_divergence(&diverged, &partial, &property_dir(out_root, property)) {
+                Ok(dir) => RecordError::Nondeterministic {
+                    detail,
+                    evidence: Some(dir),
+                },
+                Err(error) => RecordError::Nondeterministic {
+                    detail: format!("{detail}; saving the evidence failed: {error}"),
+                    evidence: None,
+                },
+            }
+        }
+        Err(Unchecked::Error(error)) => error,
+    };
+    // The run's error matters more than a failed cleanup.
+    let _ = remove(&partial);
+    Err(error)
+}
+
+/// `out_root/nondeterministic/<property-id>/`, with each segment of the
+/// property ID a directory.
+fn property_dir(out_root: &Path, property: &PropertyId) -> PathBuf {
+    property
+        .as_str()
+        .split('/')
+        .fold(out_root.join(NONDETERMINISTIC_DIR), |dir, segment| {
+            dir.join(segment)
+        })
+}
+
+/// Why [`record_and_replay`] checked no trace.
+enum Unchecked {
+    /// The recording failed.
+    Error(RecordError),
+    /// A rerun didn't do what the run before it did.
+    Diverged {
+        /// The check that failed.
+        check: Check,
+        /// What differed.
+        detail: String,
+        /// The recording rerun's trace, boxed since it's far larger than
+        /// an error.
+        recording: Box<Trace>,
+    },
+}
+
+/// A check [`record_failure`] runs on a rerun.
+#[derive(Clone, Copy)]
+enum Check {
+    /// The recording rerun must violate the property at the first run's
+    /// step.
+    Recording,
+    /// The Exact replay of the recording must match it.
+    Replay,
+}
+
+impl Check {
+    /// The check's name in `divergence.json`.
+    fn name(self) -> &'static str {
+        match self {
+            Check::Recording => "recording",
+            Check::Replay => "replay",
         }
     }
 }
@@ -123,9 +227,52 @@ fn record_and_replay(
     property: &PropertyId,
     step: u64,
     partial: &Path,
-) -> Result<Trace, RecordError> {
-    let (scenario, input, partial) = (scenario.clone(), input.to_vec(), partial.to_path_buf());
-    let (trace, recorded) = on_new_thread(move || {
+) -> Result<Trace, Unchecked> {
+    let (trace, recorded) =
+        record_on_new_thread(harness, scenario, input, partial).map_err(Unchecked::Error)?;
+    let found = violated_at(&recorded, property);
+    if found != Some(step) {
+        return Err(Unchecked::Diverged {
+            check: Check::Recording,
+            detail: format!(
+                "the first run violated {property} at step {step}, and the recording run {}",
+                match found {
+                    Some(other) => format!("at step {other}"),
+                    None => "didn't".to_owned(),
+                }
+            ),
+            recording: Box::new(trace),
+        });
+    }
+    let detail = match replay_on_new_thread(trace.clone(), harness) {
+        Err(error) => format!("the replay of the recording failed: {error}"),
+        Ok(replayed) if !replayed.verified() => {
+            "the replay of the recording wasn't verified".to_owned()
+        }
+        Ok(replayed) if replayed.properties != recorded.properties => {
+            "the replay found different violation evidence".to_owned()
+        }
+        Ok(_) => return Ok(trace),
+    };
+    Err(Unchecked::Diverged {
+        check: Check::Replay,
+        detail,
+        recording: Box::new(trace),
+    })
+}
+
+/// Records `input`, the full fuzz input, against `scenario` on `harness` to
+/// `out`, on a new thread with [`on_new_thread`]'s isolation. Returns the
+/// trace and the run's report, also for a run that ended at a harness
+/// failure.
+fn record_on_new_thread(
+    harness: &'static HarnessEntry,
+    scenario: &Value,
+    input: &[u8],
+    out: &Path,
+) -> Result<(Trace, RunReport), RecordError> {
+    let (scenario, input, out) = (scenario.clone(), input.to_vec(), out.to_path_buf());
+    on_new_thread(move || {
         let plan = Plan::from_fuzz(&input[harness.scenario_bytes.min(input.len())..]);
         let written = write_trace(
             harness,
@@ -133,7 +280,7 @@ fn record_and_replay(
             plan,
             Some(&input),
             None,
-            &partial,
+            &out,
             |scenario, plan, sink| match (harness.run)(scenario, plan, sink) {
                 Ok(report) => Ok(report),
                 Err(HarnessError::Run { report, .. }) => Ok(*report),
@@ -142,35 +289,79 @@ fn record_and_replay(
         );
         let clean = matches!(&written, Ok((_, recorded)) if recorded.cleanup.leaked == 0);
         (written, clean)
-    })?;
-    let found = violated_at(&recorded, property);
-    if found != Some(step) {
-        return Err(RecordError::Nondeterministic {
-            detail: format!(
-                "the first run violated {property} at step {step}, and the recording run {}",
-                match found {
-                    Some(other) => format!("at step {other}"),
-                    None => "didn't".to_owned(),
-                }
-            ),
-        });
+    })
+}
+
+/// A failed check of [`record_failure`]'s reruns, with what it compared.
+struct Diverged<'a> {
+    harness: &'static HarnessEntry,
+    scenario: &'a Value,
+    input: &'a [u8],
+    /// The first run, which wrote no trace.
+    first: &'a RunReport,
+    /// The recording rerun's trace, still at the partial directory.
+    recording: &'a Trace,
+    check: Check,
+    detail: &'a str,
+}
+
+/// Moves the recording at `partial` into a new evidence directory under
+/// `parent`, beside a second recording of the same input, the first run's
+/// `end` record and `divergence.json`, as [`record_failure`] describes.
+/// Returns the directory. An evidence directory that already holds the same
+/// recording is kept, and the new copy deleted.
+fn keep_divergence(diverged: &Diverged<'_>, partial: &Path, parent: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".partial-{}-{}",
+        process::id(),
+        NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    // Only a crashed process with this process's ID could have left one.
+    remove(&staging)?;
+    fs::create_dir(&staging)?;
+    if let Err(error) = write_divergence(diverged, partial, &staging) {
+        let _ = remove(&staging);
+        return Err(error);
     }
-    let replayed = replay_on_new_thread(trace.clone(), harness).map_err(|error| {
-        RecordError::Nondeterministic {
-            detail: format!("the replay of the recording failed: {error}"),
+    let dir = parent.join(&diverged.recording.id[..ID_PREFIX]);
+    if let Err(error) = fs::rename(&staging, &dir) {
+        let _ = remove(&staging);
+        // A rename fails onto a directory that holds files: the same
+        // recording, kept by an earlier failure.
+        if fs::symlink_metadata(dir.join(DIVERGENCE_FILE)).is_err() {
+            return Err(error);
         }
-    })?;
-    if !replayed.verified() {
-        return Err(RecordError::Nondeterministic {
-            detail: "the replay of the recording wasn't verified".to_owned(),
-        });
     }
-    if replayed.properties != recorded.properties {
-        return Err(RecordError::Nondeterministic {
-            detail: "the replay found different violation evidence".to_owned(),
-        });
-    }
-    Ok(trace)
+    Ok(dir)
+}
+
+/// Fills `staging` with [`keep_divergence`]'s evidence.
+fn write_divergence(diverged: &Diverged<'_>, partial: &Path, staging: &Path) -> io::Result<()> {
+    fs::rename(partial, staging.join(RECORDING_DIR))?;
+    let rerun = record_on_new_thread(
+        diverged.harness,
+        diverged.scenario,
+        diverged.input,
+        &staging.join(RERUN_DIR),
+    );
+    let first = diverged.first.end_record();
+    let recording = diverged.recording;
+    let divergence = json!({
+        "check": diverged.check.name(),
+        "detail": diverged.detail,
+        "end_difference": recording.end.as_ref().and_then(|end| end_difference(&first, end)),
+        "rerun_difference": rerun.as_ref().ok().and_then(|(rerun, _)| {
+            trace_difference(recording, rerun).map(|(step, field)| json!({
+                "step": step,
+                "field": field,
+            }))
+        }),
+        "rerun_error": rerun.as_ref().err().map(ToString::to_string),
+    });
+    let first = serde_json::to_string(&first).map_err(io::Error::other)?;
+    fs::write(staging.join(FIRST_END_FILE), format!("{first}\n"))?;
+    fs::write(staging.join(DIVERGENCE_FILE), format!("{divergence}\n"))
 }
 
 /// Replays `trace` Exact on `harness` on a new thread, with

@@ -4,7 +4,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde_json::Value;
@@ -77,10 +77,13 @@ pub enum RecordError {
         property: String,
     },
     /// A rerun of a failing run didn't do what that run did, so
-    /// [`crate::trace::record_failure`] kept no trace.
+    /// [`crate::trace::record_failure`] saved no trace under `traces/`.
     Nondeterministic {
         /// What differed.
         detail: String,
+        /// The directory that keeps the compared records and their first
+        /// difference, or `None` if saving them failed.
+        evidence: Option<PathBuf>,
     },
 }
 
@@ -100,9 +103,18 @@ impl fmt::Display for RecordError {
             RecordError::NotViolated { property } => {
                 write!(f, "the run doesn't violate {property}")
             }
-            RecordError::Nondeterministic { detail } => {
-                write!(f, "the rerun is nondeterministic: {detail}")
-            }
+            RecordError::Nondeterministic {
+                detail,
+                evidence: Some(dir),
+            } => write!(
+                f,
+                "the rerun is nondeterministic: {detail} (evidence in {})",
+                dir.display()
+            ),
+            RecordError::Nondeterministic {
+                detail,
+                evidence: None,
+            } => write!(f, "the rerun is nondeterministic: {detail}"),
         }
     }
 }

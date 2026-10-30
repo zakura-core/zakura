@@ -29,19 +29,30 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 
 ## What a target does with a run
 
-- An `Active` property violation records the run, then panics with the
-  property ID and the trace's directory. A rerun that disagrees with the run
-  panics with `nondeterministic:` instead.
+- An `Active` property violation saves the input under
+  `inputs/active/<property-id>/<sha256>.bin` before anything reruns it, then
+  records the run and panics with the property ID and the trace's directory.
+  A rerun that disagrees with the run panics with `nondeterministic:`
+  instead, keeps both compared records and their first difference under
+  `nondeterministic/<property-id>/<12 hex>/`, and moves the input to
+  `inputs/nondeterministic/<property-id>/`.
 - A harness failure panics with `harness:`.
 - A task's panic violates `sim/no-task-panic`, which is `Active`. Each target
   swaps libFuzzer's panic hook, which aborts at any panic, for the default one
   at startup, so the task's panic reaches the scheduler.
 - Each `Known` and `Draft` violation saves one trace per property under
-  `known/` or `draft/`, and the target goes on.
-- A run whose shutdown abandoned tasks retires the thread it ran on.
+  `known/` or `draft/`, keeps each distinct input under
+  `inputs/<bucket>/<property-id>/`, up to 256 per property per process, and
+  the target goes on.
+- A run whose shutdown abandoned tasks saves its input under
+  `inputs/abandoned/`, whatever else it found, and retires the thread it ran
+  on. Each retired thread keeps what its leaked tasks hold, so once a process
+  has abandoned `ZAKURA_SIM_ABANDON_LIMIT` runs, 1 by default, the target
+  panics with `abandoned:`, and the process's supervisor restarts it.
 
-Traces go to `$ZAKURA_SIM_ARTIFACTS/traces/<property-id>/<12 hex>/`, or under
-`$TMPDIR/zakura-sim/` when the variable is unset.
+Traces and inputs go under `$ZAKURA_SIM_ARTIFACTS`, or under
+`$TMPDIR/zakura-sim/` when the variable is unset. Traces go to
+`traces/<property-id>/<12 hex>/`.
 
 `race_fixtures` expects failures, so it acts differently. A planted variant's
 violation of its own fixture's property is expected, and the target logs the

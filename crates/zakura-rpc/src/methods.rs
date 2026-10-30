@@ -2093,7 +2093,6 @@ where
         Ok(GetDeprecationInfoResponse { end_of_service })
     }
 
-    #[allow(clippy::unwrap_in_result)]
     fn get_network_parameters(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "network": self.network.to_string(),
@@ -2102,6 +2101,7 @@ where
         }))
     }
 
+    #[allow(clippy::unwrap_in_result)]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;

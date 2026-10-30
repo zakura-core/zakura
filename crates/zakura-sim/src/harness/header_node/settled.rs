@@ -19,9 +19,9 @@
 //! also reports its own teardown, `Dropping`, from its `Drop`, so it ends
 //! there unsettled if no `Settled{last}` came first: cancelled, or aborted
 //! before its task's first poll. After `Dropping`, only its pending calls'
-//! `dropped` call ends may follow, and once its teardown is done, at its
-//! task's exit, every call it dispatched must have ended, or the run fails
-//! as `UnendedCall`. That covers a call storage never took, whose lost end
+//! `dropped` call ends may follow, and once its teardown is done, when the
+//! task that reported `Dropping` exits, every call it dispatched must have
+//! ended, or the run fails as `UnendedCall`. That covers a call storage never took, whose lost end
 //! leaves no receipt to pair. A task that completes with no
 //! `Settled{last}` fails the run as `NoFinalSnapshot`, and one that panics,
 //! which reports no teardown, ends unsettled at its exit.
@@ -91,6 +91,9 @@ pub struct ReactorLife {
     in_transition: bool,
     /// The calls it dispatched that haven't ended.
     open_calls: std::collections::BTreeSet<u64>,
+    /// Once it reported `Dropping`, the task that ran its teardown, or
+    /// `None` for one outside any task.
+    teardown_task: Option<Option<String>>,
 }
 
 impl ReactorLife {
@@ -109,6 +112,7 @@ impl ReactorLife {
             dropping: false,
             in_transition: false,
             open_calls: std::collections::BTreeSet::new(),
+            teardown_task: None,
         }
     }
 
@@ -269,6 +273,7 @@ impl ReactorLife {
                         ));
                     }
                     self.dropping = true;
+                    self.teardown_task = Some(ran.map(str::to_owned));
                 }
                 // The build's own effects, such as a startup repair's
                 // dispatch, come before its snapshot.
@@ -299,10 +304,15 @@ impl ReactorLife {
             },
             _ => None,
         };
-        let torn_down = match stop {
-            Some(Stop::Exited(_)) => self.dropping,
-            // Torn down before its task's first poll, outside any task.
-            _ => self.dropping && self.task.is_none(),
+        // Its teardown can reach scheduling points, so it's done only once
+        // the task running it exits, or at once outside any task.
+        let torn_down = match &self.teardown_task {
+            Some(Some(task)) => {
+                ran == Some(task.as_str())
+                    && matches!(outcome, Some(Observation::TaskExited { .. }))
+            }
+            Some(None) => true,
+            None => false,
         };
         if let Some(call) = self.open_calls.first().filter(|_| torn_down) {
             return Err(format!(
@@ -988,6 +998,8 @@ mod tests {
         /// Aborts its task, while the test keeps another clone of its
         /// observer.
         Abort,
+        /// Aborts its task at setup, before its first poll.
+        Unpolled,
     }
 
     /// The real reactor, tapped and audited, starting at A5 with the VCT
@@ -1077,13 +1089,17 @@ mod tests {
         startup.observer = slot;
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+        if stopping == Stopping::Unpolled {
+            reactor.abort();
+            return Box::new((handle, actions, repairs));
+        }
         sim.scheduler().spawn_root("stopper", async move {
             for _ in 0..8 {
                 zakura_rt::task::yield_now().await;
             }
             match stopping {
                 Stopping::Shutdown => shutdown.cancel(),
-                Stopping::Abort => reactor.abort(),
+                Stopping::Abort | Stopping::Unpolled => reactor.abort(),
             }
         });
         Box::new((handle, actions, repairs))
@@ -1281,6 +1297,56 @@ mod tests {
                 "keep {keep}"
             );
         }
+    }
+
+    /// A reactor aborted before its task's first poll, with its build's
+    /// startup repair read never polled, reports `Dropping` and then, past
+    /// the release points of its earlier fields, the read's dropped end,
+    /// naming no operation since storage never took it. The run passes and
+    /// the reactor ends unsettled, since the call audit waits for the
+    /// cancelled task's exit.
+    ///
+    /// This fails if the audit runs at the first stop after `Dropping`.
+    #[test]
+    fn a_startup_repair_aborted_before_its_first_poll_ends_its_call() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = repairing_storage(&mut fixture.sim, &fixture.port);
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let (life, held) = {
+            let life = fixture.life.clone();
+            let held = spawn_repairing(&mut fixture.sim, &fixture.port, slot, Stopping::Unpolled);
+            (life, held)
+        };
+        fixture
+            .sim
+            .scheduler()
+            .spawn_root("idle", async { zakura_rt::task::yield_now().await });
+        let (report, _) = fixture.run(&mut States::default());
+        drop(held);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let facts = reactor_facts(&report);
+        let dropping = facts
+            .iter()
+            .position(|(_, fact)| matches!(fact, ReactorFact::Dropping { turn: 0 }))
+            .expect("the reactor tears down");
+        assert!(
+            matches!(facts[0].1, ReactorFact::Dispatched { call: 1, .. }),
+            "the build dispatches the read: {facts:?}"
+        );
+        let step = facts[dropping].0;
+        assert!(
+            report.log.entries().iter().any(|entry| entry.step == step
+                && matches!(&entry.obs, Observation::TaskReached { at, .. } if at.starts_with("release"))),
+            "the teardown reaches a release point in its first step"
+        );
+        assert!(
+            matches!(&facts[dropping + 1..], [(after, ReactorFact::CallEnded { call: 1, end, op: None })]
+                if end == "dropped" && *after > step),
+            "the read ends dropped at a later step: {facts:?}"
+        );
+        assert_eq!(life.borrow().task(), None, "it never started");
+        assert_eq!(name(life.borrow().component().state()), "ended-unsettled");
     }
 
     /// A pairing failure that isn't a dropped call's receipt fails the run

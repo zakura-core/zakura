@@ -35,8 +35,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement,
-        PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
+        CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, OutcomeDisposition,
+        Placement, PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
         TransferDisposition, WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
@@ -387,6 +387,17 @@ fn disposition(ended: TransferDisposition) -> (&'static str, Option<u64>) {
     }
 }
 
+/// `handled`'s name, with the matching request's incarnation.
+fn outcome(handled: OutcomeDisposition) -> (&'static str, Option<u64>) {
+    match handled {
+        OutcomeDisposition::NoActive => ("no-active", None),
+        OutcomeDisposition::OtherRequest => ("other-request", None),
+        OutcomeDisposition::NotReceiving { incarnation } => ("not-receiving", Some(incarnation)),
+        OutcomeDisposition::Retired { incarnation } => ("retired", Some(incarnation)),
+        OutcomeDisposition::Retried { incarnation } => ("retried", Some(incarnation)),
+    }
+}
+
 /// `digest` in plain fields.
 fn digest(digest: zakura_network::zakura::observe::HeldDigest) -> HeldDigest {
     HeldDigest {
@@ -659,6 +670,21 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             count: count as u64,
             after: digest(after),
         },
+        ReactorEvent::Outcome {
+            session_id,
+            subscription,
+            frame: tag,
+            disposition: handled,
+        } => {
+            let (disposition, incarnation) = outcome(handled);
+            ReactorFact::Outcome {
+                session_id,
+                subscription,
+                frame: tag.map(frame),
+                disposition: disposition.to_owned(),
+                incarnation,
+            }
+        }
         ReactorEvent::TransferEnded {
             transfer,
             disposition: ended,

@@ -1495,6 +1495,50 @@ mod tests {
             assert_eq!(derived(&log), []);
         }
 
+        /// Each outcome that retired or retried its matching incarnation is
+        /// one ending `WorkAdmitted` for its frame, and each ignored outcome
+        /// is none.
+        ///
+        /// This fails if an outcome with no active work is admitted.
+        #[test]
+        fn each_qualifying_outcome_admits_once() {
+            let outcome = |disposition: &str, incarnation| {
+                reactor(ReactorFact::Outcome {
+                    session_id: 7,
+                    subscription: 8,
+                    frame: Some(frame(4, HeldDigest::default())),
+                    disposition: disposition.into(),
+                    incarnation,
+                })
+            };
+            let ending = Observation::WorkAdmitted {
+                connection: 1,
+                frame: RowAt::new(S5V9, "headers-outcome"),
+                seq: 4,
+                request: RowAt::new(S5V9, "subscribe-headers"),
+                exchange: 8,
+                objects: 0,
+                bytes: 300,
+                ends: true,
+            };
+            for (disposition, incarnation, admits) in [
+                ("no-active", None, false),
+                ("other-request", None, false),
+                ("not-receiving", Some(1), false),
+                ("retired", Some(1), true),
+                ("retried", Some(1), true),
+            ] {
+                let log =
+                    write(vec![outcome(disposition, incarnation)]).expect("the step is whole");
+                let expected = if admits {
+                    vec![(ending.clone(), true)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(derived(&log), expected, "{disposition}");
+            }
+        }
+
         /// On the wire tier a staged page names a tagged frame of its
         /// session's own stream, and its session must be mapped. Each break
         /// is a harness failure.

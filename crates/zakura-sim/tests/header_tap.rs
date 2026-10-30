@@ -1005,6 +1005,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::EntriesTaken { .. } => "entries-taken",
                 ReactorFact::TransferEnded { .. } => "transfer-ended",
                 ReactorFact::Staged { .. } => "staged",
+                ReactorFact::Outcome { .. } => "outcome",
             }),
             _ => None,
         })
@@ -1040,7 +1041,8 @@ fn tap_adds_no_scheduling_point() {
                 "leases-captured",
                 "entries-taken",
                 "transfer-ended",
-                "staged"
+                "staged",
+                "outcome"
             ])
         );
         let seqs: Vec<u64> = tapped

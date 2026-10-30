@@ -1502,6 +1502,22 @@ pub enum ReactorFact {
         /// append.
         after: HeldDigest,
     },
+    /// The reactor handled a subscription's terminal outcome (M6a-5a).
+    Outcome {
+        /// The session it came on.
+        session_id: u64,
+        /// The subscription it ended.
+        subscription: u64,
+        /// The frame it came in, or `None` on a link with no stream tap.
+        frame: Option<ReactorFrame>,
+        /// What the reactor did with it: `no-active`, `other-request`,
+        /// `not-receiving`, `retired` or `retried`.
+        disposition: String,
+        /// The matching request's incarnation, for `not-receiving`,
+        /// `retired` and `retried`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        incarnation: Option<u64>,
+    },
 }
 
 /// Why no frame explains held work, in [`Observation::UnframedWork`]
@@ -1516,8 +1532,8 @@ pub enum UnframedCause {
     Substituted,
 }
 
-/// The frame a page came in, as the node's session reader took it
-/// (M6a-5a).
+/// The frame a page or outcome came in, as the node's session reader took
+/// it (M6a-5a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ReactorFrame {
     /// Its QUIC stream.

@@ -11,8 +11,8 @@ use std::{
 
 use zakura_sim::{
     explore::{
-        input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
-        Worker, ABANDON_LIMIT_VAR,
+        input_path, save_failure, save_input, traces_root, Bucket, Classified, ExploreOutcome,
+        ExploreRun, Worker, ABANDON_LIMIT_VAR,
     },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
@@ -22,6 +22,10 @@ use zakura_sim::{
 /// The variable that makes a target panic only on one property's
 /// violation, for `cargo fuzz tmin`.
 pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
+
+/// What the filter prints before its panic, followed by the harness's name,
+/// so `cargo xtask sim-minimize` can check which harness a target runs.
+pub const HARNESS_LINE: &str = "zakura-sim-fuzz harness: ";
 
 /// A fuzz target over harness `$harness`: `sim_target!(discovery::WaitComplete)`
 /// for a harness under `zakura_sim::harness`.
@@ -119,7 +123,7 @@ fn abandon_limit() -> usize {
 
 /// [`fuzz_one`]'s action on one classified run.
 fn act(entry: &'static HarnessEntry, input: &[u8], run: &ExploreRun, classified: &Classified) {
-    if met_expectation(classified) {
+    if met_expectation(entry, classified) {
         return;
     }
     if classified.leaked > 0 {
@@ -250,13 +254,13 @@ impl Kept {
     }
 }
 
-/// Saves the input of the `Known` or `Draft` violation of `property` under
-/// `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by digest, up to
-/// [`MAX_KEPT_INPUTS`] distinct inputs per process. The first such input in
-/// a process also records a trace under `<bucket>/traces/`, unless an
-/// earlier process already saved one: a property's ID is its signature, so
-/// one trace per property is enough. A rerun that disagrees panics with
-/// `nondeterministic:`.
+/// Saves the input of a violation of `property` that [`Classified::notes`]
+/// lists, under `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by
+/// digest, up to [`MAX_KEPT_INPUTS`] distinct inputs per process. The first
+/// such input in a process also records a trace under the bucket's
+/// [`traces_root`], unless an earlier process already saved one: a
+/// property's ID is its signature, so one trace per property is enough. A
+/// rerun that disagrees panics with `nondeterministic:`.
 fn save_once(
     entry: &'static HarnessEntry,
     input: &[u8],
@@ -274,7 +278,7 @@ fn save_once(
         .or_default()
         .admit(input_path(&root, bucket, Some(&id), input));
     match keep {
-        Keep::First if !has_trace(&root.join(bucket.name()), property) => {
+        Keep::First if !has_trace(&traces_root(&root, bucket), property) => {
             let saved = save_failure(entry, input, run, &id, bucket, &root)
                 .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
             if let Err(error) = saved.trace {
@@ -306,14 +310,16 @@ fn has_trace(root: &Path, property: &str) -> bool {
     })
 }
 
-/// With `ZAKURA_SIM_EXPECT` set, panics on an `Active` violation of that
-/// property and returns `true` for any other run, so the caller does
-/// nothing else with it. Returns `false` when the variable is unset.
-fn met_expectation(classified: &Classified) -> bool {
+/// With `ZAKURA_SIM_EXPECT` set, prints [`HARNESS_LINE`] with `entry`'s
+/// name and panics on an `Active` violation of that property, and returns
+/// `true` for any other run, so the caller does nothing else with it.
+/// Returns `false` when the variable is unset.
+fn met_expectation(entry: &HarnessEntry, classified: &Classified) -> bool {
     let Some(want) = expected() else {
         return false;
     };
     if matches!(&classified.outcome, ExploreOutcome::Fail { property } if property == want) {
+        eprintln!("{HARNESS_LINE}{}", entry.name);
         panic!("{want}");
     }
     true
@@ -360,7 +366,7 @@ fn act_fixtures(
     run: &ExploreRun,
     classified: &Classified,
 ) {
-    if met_expectation(classified) {
+    if met_expectation(entry, classified) {
         return;
     }
     static FINDS: OnceLock<Mutex<Finds>> = OnceLock::new();

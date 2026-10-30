@@ -7,8 +7,8 @@
 //! check. The second rerun replays that trace Exact: the determinism check.
 //! A trace that passes both is saved under the property's directory, named
 //! by its ID. A trace that fails either check is kept as evidence of
-//! nondeterminism, with the record it was compared against and the first
-//! difference between them.
+//! nondeterminism, with the records and property reports of the run it was
+//! compared against and the first difference between them.
 
 use std::{
     env, fs, io,
@@ -25,15 +25,17 @@ use std::{
 use serde_json::{json, Value};
 
 use super::{
+    replay::{replay_keeping, ReplayRun},
     replay_with,
     verify::{end_difference, trace_difference},
-    ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, TRACE_FILE,
+    FileSink, ReplayError, ReplayOptions, ReplayReport, Trace, TraceReader, BLOBS_DIR, INPUT_FILE,
+    TRACE_FILE,
 };
 use crate::{
-    check::PropertyOutcome,
+    check::{PropertyOutcome, PropertyReport},
     harness::{write_trace, HarnessEntry, HarnessError, RecordError},
     property::PropertyId,
-    Plan, RunReport,
+    Plan, RecordSink, RunReport,
 };
 
 /// The variable that names the directory saved failures go under.
@@ -49,11 +51,16 @@ pub const NONDETERMINISTIC_DIR: &str = "nondeterministic";
 /// The recording rerun's trace, in a nondeterminism directory.
 pub const RECORDING_DIR: &str = "recording";
 
-/// A second recording of the same input, in a nondeterminism directory.
-pub const RERUN_DIR: &str = "rerun";
+/// The records of the Exact replay that disagreed with the recording, in a
+/// nondeterminism directory.
+pub const REPLAY_DIR: &str = "replay";
 
 /// The first run's `end` record, in a nondeterminism directory.
 pub const FIRST_END_FILE: &str = "first-end.json";
+
+/// Each compared run's property reports, with every violation, in a
+/// nondeterminism directory.
+pub const PROPERTIES_FILE: &str = "properties.json";
 
 /// The check that failed and the first difference it found, in a
 /// nondeterminism directory.
@@ -104,13 +111,16 @@ pub fn artifacts_root() -> PathBuf {
 /// `out_root/nondeterministic/<property-id>/<first 12 hex of the trace ID>/`:
 ///
 /// - `recording/`, the first rerun's trace;
-/// - `rerun/`, a second recording of the same input, which stands in for the
-///   replay's records, since a replay writes none;
+/// - `replay/`, for a failed replay check, the records the replay emitted,
+///   after the recording's `meta`, unless the replay failed before its run
+///   started;
 /// - `first-end.json`, the `end` record of `first`, which wrote no trace;
+/// - `properties.json`, the property reports of `first`, the recording and
+///   the replay (`null` if no replay ran);
 /// - `divergence.json`, which names the failed check (`recording` or
 ///   `replay`) and its detail, the first `end` field where `first` and the
-///   recording differ, and the first record where the recording and the
-///   rerun differ.
+///   recording differ, the first record where the recording and the replay
+///   differ, and any error writing or reading the replay's records.
 pub fn record_failure(
     harness: &'static HarnessEntry,
     scenario: &Value,
@@ -139,21 +149,27 @@ pub fn record_failure(
     let checked = record_and_replay(harness, scenario, input, property, step, &partial);
     let error = match checked {
         Ok(trace) => return save(&trace, &partial, &parent),
-        Err(Unchecked::Diverged {
-            check,
-            detail,
-            recording,
-        }) => {
+        Err(Unchecked::Diverged(diverged)) => {
+            let Runs {
+                check,
+                detail,
+                recording,
+                recorded,
+                replay,
+            } = *diverged;
             let diverged = Diverged {
-                harness,
-                scenario,
-                input,
                 first,
                 recording: &recording,
+                recorded: &recorded,
+                replay: replay.as_ref(),
                 check,
-                detail: &detail,
             };
-            match keep_divergence(&diverged, &partial, &property_dir(out_root, property)) {
+            match keep_divergence(
+                &diverged,
+                &detail,
+                &partial,
+                &property_dir(out_root, property),
+            ) {
                 Ok(dir) => RecordError::Nondeterministic {
                     detail,
                     evidence: Some(dir),
@@ -186,16 +202,23 @@ fn property_dir(out_root: &Path, property: &PropertyId) -> PathBuf {
 enum Unchecked {
     /// The recording failed.
     Error(RecordError),
-    /// A rerun didn't do what the run before it did.
-    Diverged {
-        /// The check that failed.
-        check: Check,
-        /// What differed.
-        detail: String,
-        /// The recording rerun's trace, boxed since it's far larger than
-        /// an error.
-        recording: Box<Trace>,
-    },
+    /// A rerun didn't do what the run before it did. Boxed, since the runs
+    /// are far larger than an error.
+    Diverged(Box<Runs>),
+}
+
+/// The reruns of a failed check.
+struct Runs {
+    /// The check that failed.
+    check: Check,
+    /// What differed.
+    detail: String,
+    /// The recording rerun's trace.
+    recording: Trace,
+    /// The recording rerun's property reports.
+    recorded: Vec<PropertyReport>,
+    /// What the replay emitted, for a failed replay check.
+    replay: Option<ReplayRun>,
 }
 
 /// A check [`record_failure`] runs on a rerun.
@@ -232,7 +255,7 @@ fn record_and_replay(
         record_on_new_thread(harness, scenario, input, partial).map_err(Unchecked::Error)?;
     let found = violated_at(&recorded, property);
     if found != Some(step) {
-        return Err(Unchecked::Diverged {
+        return Err(Unchecked::Diverged(Box::new(Runs {
             check: Check::Recording,
             detail: format!(
                 "the first run violated {property} at step {step}, and the recording run {}",
@@ -241,10 +264,13 @@ fn record_and_replay(
                     None => "didn't".to_owned(),
                 }
             ),
-            recording: Box::new(trace),
-        });
+            recording: trace,
+            recorded: recorded.properties,
+            replay: None,
+        })));
     }
-    let detail = match replay_on_new_thread(trace.clone(), harness) {
+    let (replayed, replay) = replay_keeping_on_new_thread(trace.clone(), harness);
+    let detail = match replayed {
         Err(error) => format!("the replay of the recording failed: {error}"),
         Ok(replayed) if !replayed.verified() => {
             "the replay of the recording wasn't verified".to_owned()
@@ -254,11 +280,13 @@ fn record_and_replay(
         }
         Ok(_) => return Ok(trace),
     };
-    Err(Unchecked::Diverged {
+    Err(Unchecked::Diverged(Box::new(Runs {
         check: Check::Replay,
         detail,
-        recording: Box::new(trace),
-    })
+        recording: trace,
+        recorded: recorded.properties,
+        replay: Some(replay),
+    })))
 }
 
 /// Records `input`, the full fuzz input, against `scenario` on `harness` to
@@ -294,23 +322,29 @@ fn record_on_new_thread(
 
 /// A failed check of [`record_failure`]'s reruns, with what it compared.
 struct Diverged<'a> {
-    harness: &'static HarnessEntry,
-    scenario: &'a Value,
-    input: &'a [u8],
     /// The first run, which wrote no trace.
     first: &'a RunReport,
     /// The recording rerun's trace, still at the partial directory.
     recording: &'a Trace,
+    /// The recording rerun's property reports.
+    recorded: &'a [PropertyReport],
+    /// What the replay emitted, for a failed replay check.
+    replay: Option<&'a ReplayRun>,
     check: Check,
-    detail: &'a str,
 }
 
 /// Moves the recording at `partial` into a new evidence directory under
-/// `parent`, beside a second recording of the same input, the first run's
-/// `end` record and `divergence.json`, as [`record_failure`] describes.
+/// `parent`, beside the replay's records, the first run's `end` record,
+/// each run's property reports and `divergence.json`, as [`record_failure`]
+/// describes.
 /// Returns the directory. An evidence directory that already holds the same
 /// recording is kept, and the new copy deleted.
-fn keep_divergence(diverged: &Diverged<'_>, partial: &Path, parent: &Path) -> io::Result<PathBuf> {
+fn keep_divergence(
+    diverged: &Diverged<'_>,
+    detail: &str,
+    partial: &Path,
+    parent: &Path,
+) -> io::Result<PathBuf> {
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(
         ".partial-{}-{}",
@@ -320,7 +354,7 @@ fn keep_divergence(diverged: &Diverged<'_>, partial: &Path, parent: &Path) -> io
     // Only a crashed process with this process's ID could have left one.
     remove(&staging)?;
     fs::create_dir(&staging)?;
-    if let Err(error) = write_divergence(diverged, partial, &staging) {
+    if let Err(error) = write_divergence(diverged, detail, partial, &staging) {
         let _ = remove(&staging);
         return Err(error);
     }
@@ -337,31 +371,103 @@ fn keep_divergence(diverged: &Diverged<'_>, partial: &Path, parent: &Path) -> io
 }
 
 /// Fills `staging` with [`keep_divergence`]'s evidence.
-fn write_divergence(diverged: &Diverged<'_>, partial: &Path, staging: &Path) -> io::Result<()> {
+fn write_divergence(
+    diverged: &Diverged<'_>,
+    detail: &str,
+    partial: &Path,
+    staging: &Path,
+) -> io::Result<()> {
     fs::rename(partial, staging.join(RECORDING_DIR))?;
-    let rerun = record_on_new_thread(
-        diverged.harness,
-        diverged.scenario,
-        diverged.input,
-        &staging.join(RERUN_DIR),
-    );
-    let first = diverged.first.end_record();
     let recording = diverged.recording;
+    // An error writing the replay's records goes in `divergence.json`, and
+    // the rest of the evidence is kept.
+    let replayed = diverged
+        .replay
+        .filter(|replay| !replay.records.is_empty())
+        .map(|replay| {
+            write_replay(
+                recording,
+                &staging.join(RECORDING_DIR),
+                replay,
+                &staging.join(REPLAY_DIR),
+            )
+        });
+    let replay_difference = replayed
+        .as_ref()
+        .and_then(|replayed| replayed.as_ref().ok())
+        .and_then(|replayed| trace_difference(recording, replayed))
+        .map(|(step, field)| json!({ "step": step, "field": field }));
+    let first = diverged.first.end_record();
     let divergence = json!({
         "check": diverged.check.name(),
-        "detail": diverged.detail,
+        "detail": detail,
         "end_difference": recording.end.as_ref().and_then(|end| end_difference(&first, end)),
-        "rerun_difference": rerun.as_ref().ok().and_then(|(rerun, _)| {
-            trace_difference(recording, rerun).map(|(step, field)| json!({
-                "step": step,
-                "field": field,
-            }))
-        }),
-        "rerun_error": rerun.as_ref().err().map(ToString::to_string),
+        "replay_difference": replay_difference,
+        "replay_error": replayed.and_then(Result::err),
+    });
+    let properties = json!({
+        "first": reports_json(&diverged.first.properties),
+        "recording": reports_json(diverged.recorded),
+        "replay": diverged.replay.map(|replay| reports_json(&replay.properties)),
     });
     let first = serde_json::to_string(&first).map_err(io::Error::other)?;
     fs::write(staging.join(FIRST_END_FILE), format!("{first}\n"))?;
+    fs::write(staging.join(PROPERTIES_FILE), format!("{properties}\n"))?;
     fs::write(staging.join(DIVERGENCE_FILE), format!("{divergence}\n"))
+}
+
+/// `reports` as JSON, each with its `violations`, which a report's own
+/// serialization leaves out.
+fn reports_json(reports: &[PropertyReport]) -> Value {
+    reports
+        .iter()
+        .map(|report| {
+            let mut value = json!(report);
+            value["violations"] = json!(report.violations);
+            value
+        })
+        .collect()
+}
+
+/// Writes `replay`'s records to `dir` as a trace, after `recording`'s
+/// `meta`, beside copies of the `input.bin` and fixtures in `recorded`,
+/// the recording's directory, and reads it back. A replay emits no `meta`,
+/// and replays `recording`'s. Returns why the trace couldn't be written or
+/// read.
+fn write_replay(
+    recording: &Trace,
+    recorded: &Path,
+    replay: &ReplayRun,
+    dir: &Path,
+) -> Result<Trace, String> {
+    let mut sink = FileSink::create(dir, &recording.meta).map_err(|error| error.to_string())?;
+    for record in &replay.records {
+        sink.record(record.clone());
+    }
+    // A record past the size limits ends the file early, and the prefix
+    // before it is still evidence, so the artifacts go in first.
+    let finished = sink.finish();
+    copy_artifacts(recorded, dir).map_err(|error| error.to_string())?;
+    finished.map_err(|error| error.to_string())?;
+    TraceReader::open_prefix(dir).map_err(|error| error.to_string())
+}
+
+/// Copies `from`'s `input.bin` and `blobs/` files, those that exist, to
+/// `to`.
+fn copy_artifacts(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(from.join(INPUT_FILE)).is_ok() {
+        fs::copy(from.join(INPUT_FILE), to.join(INPUT_FILE))?;
+    }
+    let blobs = match fs::read_dir(from.join(BLOBS_DIR)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        blobs => blobs?,
+    };
+    fs::create_dir_all(to.join(BLOBS_DIR))?;
+    for blob in blobs {
+        let blob = blob?;
+        fs::copy(blob.path(), to.join(BLOBS_DIR).join(blob.file_name()))?;
+    }
+    Ok(())
 }
 
 /// Replays `trace` Exact on `harness` on a new thread, with
@@ -375,6 +481,19 @@ pub(super) fn replay_on_new_thread(
         let clean = matches!(&replayed, Ok(report)
             if report.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
         (replayed, clean)
+    })
+}
+
+/// [`replay_on_new_thread`], also returning what the replay's run emitted.
+fn replay_keeping_on_new_thread(
+    trace: Trace,
+    harness: &'static HarnessEntry,
+) -> (Result<ReplayReport, ReplayError>, ReplayRun) {
+    on_new_thread(move || {
+        let (replayed, kept) = replay_keeping(&trace, harness);
+        let clean = matches!(&replayed, Ok(report)
+            if report.end.as_ref().is_some_and(|end| end.cleanup.leaked == 0));
+        ((replayed, kept), clean)
     })
 }
 

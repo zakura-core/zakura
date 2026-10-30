@@ -1,0 +1,810 @@
+//! The supervisor that runs a manifest's workers, and the end record each
+//! run gets exactly once.
+
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    manifest::{Budget, Manifest, WorkerPlan, FEEDBACK_VAR},
+    snapshot::Source,
+    store::{
+        now_unix, partial_path, read_record, record_bytes, replace, write_once, CampaignError,
+        Digest, Store, STORE_VERSION,
+    },
+};
+use crate::{
+    explore::{ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR},
+    trace::ARTIFACTS_VAR,
+};
+
+/// A run's end record.
+pub(super) const END_FILE: &str = "end.json";
+
+/// A worker's log of fuzzer processes, one [`Attempt`] per line.
+pub const ATTEMPTS_FILE: &str = "attempts.jsonl";
+
+/// A worker's [`WorkerEnd`], written once when it stops.
+pub const OUTCOME_FILE: &str = "outcome.json";
+
+/// A worker's current fuzzer process ID.
+const PID_FILE: &str = "pid";
+
+/// The directory of a run's workers.
+const WORKERS_DIR: &str = "workers";
+
+/// A worker's libFuzzer corpus: the inputs its processes add.
+const CORPUS_DIR: &str = "corpus";
+
+/// A worker's libFuzzer artifacts: crash, timeout and OOM inputs.
+const ARTIFACTS_DIR: &str = "artifacts";
+
+/// A worker's `ZAKURA_SIM_ARTIFACTS`: the target's saved inputs and traces.
+const SIM_DIR: &str = "sim";
+
+/// How long past its budget and per-input timeout a fuzzer process may run
+/// before the supervisor kills it.
+const GRACE: Duration = Duration::from_secs(60);
+
+/// How often the supervisor checks a process with a deadline.
+const POLL: Duration = Duration::from_millis(50);
+
+/// How a run ended. Each status means one thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Status {
+    /// The supervisor ran every worker to the end of its budget.
+    Complete,
+    /// The supervisor ran every worker until it stopped, and at least one
+    /// stopped at its restart limit before its budget was spent.
+    WorkerStopped,
+    /// The supervisor stopped before it wrote the end record, and `close`
+    /// wrote it from what the workers left.
+    Interrupted,
+}
+
+/// Who wrote an end record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Recorder {
+    /// The run's supervisor, after every worker stopped.
+    Supervisor,
+    /// `close`, or `resume` or `start` through it, after the supervisor
+    /// stopped without one.
+    Close,
+}
+
+/// Why a worker stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkerOutcome {
+    /// Its processes ran for its whole budget.
+    BudgetSpent,
+    /// Its process ended early once more than its restart limit allows.
+    RestartLimit,
+    /// It stopped with its supervisor.
+    Unfinished,
+}
+
+/// How one fuzzer process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttemptEnd {
+    /// It exited 0 at its time limit.
+    Finished,
+    /// The target reached its abandonment limit, and exited for the
+    /// supervisor to restart it.
+    AbandonLimit,
+    /// It failed for any other reason: a crash, a property violation, a
+    /// sanitizer report, a timeout or running out of memory.
+    Failure,
+}
+
+/// A file the store holds, by its path relative to the store's root and
+/// its digest.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRecord {
+    /// The path, relative to the store's root, with `/` separators.
+    pub path: String,
+    /// The file's SHA-256.
+    pub sha256: Digest,
+}
+
+/// One fuzzer process a worker ran: a line of its [`ATTEMPTS_FILE`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attempt {
+    /// The attempt's number in its worker, from 0.
+    pub attempt: u32,
+    /// libFuzzer's `-seed`.
+    pub seed: u32,
+    /// libFuzzer's `-max_total_time`.
+    pub max_total_time: u64,
+    /// When it started, in seconds since the Unix epoch.
+    pub started_unix: u64,
+    /// How long it ran, in milliseconds.
+    pub millis: u64,
+    /// Its exit code, if it exited.
+    pub code: Option<i32>,
+    /// The signal that ended it, if one did. The supervisor's kill at the
+    /// deadline is `killed`, not a signal.
+    pub signal: Option<i32>,
+    /// True if the supervisor killed it at its deadline.
+    pub killed: bool,
+    /// How it ended.
+    pub end: AttemptEnd,
+    /// How it failed, unless it finished.
+    pub failure: Option<ProcessFailure>,
+    /// The artifact files it wrote, such as `crash-<sha1>`.
+    pub artifacts: Vec<FileRecord>,
+}
+
+/// How a worker ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerEnd {
+    /// The worker's number.
+    pub index: usize,
+    /// Why it stopped.
+    pub outcome: WorkerOutcome,
+    /// How many fuzzer processes it ran.
+    pub attempts: u32,
+    /// How long they ran in all, in milliseconds.
+    pub millis: u64,
+}
+
+/// What compacting a run's snapshot came to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Compaction {
+    /// libFuzzer's merge kept these inputs, saved as a new snapshot.
+    Compacted {
+        /// The compacted snapshot.
+        snapshot: Digest,
+        /// How many inputs it holds.
+        inputs: usize,
+    },
+    /// The merge failed or reached its time limit. The run's snapshot is
+    /// the uncompacted one.
+    Failed {
+        /// How.
+        failure: ProcessFailure,
+    },
+}
+
+/// A run's end record, written once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct End {
+    /// [`STORE_VERSION`].
+    pub version: u32,
+    /// The run's manifest.
+    pub manifest: Digest,
+    /// How the run ended.
+    pub status: Status,
+    /// Who wrote this record.
+    pub recorded_by: Recorder,
+    /// When, in seconds since the Unix epoch.
+    pub ended_unix: u64,
+    /// How each worker ended.
+    pub workers: Vec<WorkerEnd>,
+    /// The union of the initial snapshot and every worker's corpus.
+    pub snapshot: Digest,
+    /// How many inputs it holds.
+    pub inputs: usize,
+    /// How many of them the initial snapshot lacked.
+    pub added: usize,
+    /// What compacting the snapshot came to, if the run compacted it.
+    pub compaction: Option<Compaction>,
+    /// Every file in the workers' artifact and target directories: the
+    /// failing inputs and their traces.
+    pub failures: Vec<FileRecord>,
+}
+
+impl End {
+    /// The snapshot the next run starts from: the compacted one if the
+    /// compaction succeeded, and else the run's snapshot.
+    pub fn head(&self) -> &Digest {
+        match &self.compaction {
+            Some(Compaction::Compacted { snapshot, .. }) => snapshot,
+            _ => &self.snapshot,
+        }
+    }
+}
+
+/// Runs manifest `digest`: supervises its workers until each one stops,
+/// then saves the run's snapshot, compacts it if the budget asks, and
+/// writes the end record.
+///
+/// Refuses a run that another process runs or that has an end record.
+/// Fails without an end record if the store can't be read or written; the
+/// run then stays open, and `close` or `resume` ends it later.
+pub fn run(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
+    let manifest = store.read_manifest(digest)?;
+    let _lock = store.lock_run(digest)?;
+    let dir = store.run_dir(digest);
+    if dir.join(END_FILE).exists() {
+        return Err(already_ended(digest));
+    }
+    store.verify_snapshot(&manifest.initial_snapshot)?;
+    store.read_build(&manifest.build.binary)?;
+    let fuzzer = store.fuzzer_path(&manifest.build.binary);
+    let snapshot = store.snapshot_inputs(&manifest.initial_snapshot);
+    let ends: Vec<Result<WorkerEnd, CampaignError>> = thread::scope(|scope| {
+        let handles: Vec<_> = manifest
+            .workers
+            .iter()
+            .map(|plan| {
+                let worker = Worker {
+                    store,
+                    fuzzer: &fuzzer,
+                    budget: &manifest.budget,
+                    plan,
+                    dir: worker_dir(&dir, plan.index),
+                    snapshot: &snapshot,
+                };
+                scope.spawn(move || worker.supervise())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("a worker's supervisor returns its errors rather than panicking")
+            })
+            .collect()
+    });
+    let workers = ends.into_iter().collect::<Result<Vec<_>, _>>()?;
+    finish(store, digest, &manifest, workers, Recorder::Supervisor)
+}
+
+/// Ends open run `digest`, whose supervisor stopped before it wrote the
+/// end record: saves the run's snapshot from what the workers left, and
+/// writes the end record with [`Status::Interrupted`].
+///
+/// Refuses a run that a supervisor still holds, that has an end record,
+/// or whose fuzzer process still runs.
+pub fn close(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
+    let manifest = store.read_manifest(digest)?;
+    let _lock = store.lock_run(digest)?;
+    let dir = store.run_dir(digest);
+    if dir.join(END_FILE).exists() {
+        return Err(already_ended(digest));
+    }
+    let fuzzer = store.fuzzer_path(&manifest.build.binary);
+    let mut workers = Vec::new();
+    for plan in &manifest.workers {
+        let worker = worker_dir(&dir, plan.index);
+        if let Some(pid) = live_fuzzer(&worker, &fuzzer) {
+            return Err(CampaignError::Refused(format!(
+                "worker {}'s fuzzer still runs as process {pid}; stop it, then close the run",
+                plan.index
+            )));
+        }
+        workers.push(stopped_worker(plan, &worker)?);
+    }
+    finish(store, digest, &manifest, workers, Recorder::Close)
+}
+
+/// Reads run `digest`'s end record, and checks that it's this run's.
+pub fn read_end(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
+    let path = store.run_dir(digest).join(END_FILE);
+    let end: End = read_record(&path, None)?;
+    if end.version != STORE_VERSION || &end.manifest != digest {
+        return Err(CampaignError::corrupt(
+            &path,
+            format!(
+                "it's the version {} record of run {}, not the version {STORE_VERSION} record \
+                 of run {digest}",
+                end.version, end.manifest
+            ),
+        ));
+    }
+    Ok(end)
+}
+
+/// Checks that each of `files` is in the store with its digest.
+pub(super) fn verify_files(store: &Store, files: &[FileRecord]) -> Result<(), CampaignError> {
+    for file in files {
+        let relative = Path::new(&file.path);
+        if !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(CampaignError::Refused(format!(
+                "the recorded path `{}` leaves the store",
+                file.path
+            )));
+        }
+        let path = store.root().join(relative);
+        let actual = Digest::of_file(&path)
+            .map_err(CampaignError::io(format!("reading {}", path.display())))?;
+        if actual != file.sha256 {
+            return Err(CampaignError::corrupt(
+                &path,
+                format!(
+                    "it's recorded with digest {}, and has {actual}",
+                    file.sha256
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One worker's supervisor.
+struct Worker<'a> {
+    /// The store, for paths in records.
+    store: &'a Store,
+    /// The fuzzer binary.
+    fuzzer: &'a Path,
+    /// The run's budget.
+    budget: &'a Budget,
+    /// The worker.
+    plan: &'a WorkerPlan,
+    /// The worker's directory.
+    dir: PathBuf,
+    /// The initial snapshot's inputs, which every worker reads.
+    snapshot: &'a Path,
+}
+
+impl Worker<'_> {
+    /// Runs fuzzer processes until the budget is spent or the restart
+    /// limit is passed, logs each one, and writes the worker's outcome.
+    fn supervise(&self) -> Result<WorkerEnd, CampaignError> {
+        let corpus = self.dir.join(CORPUS_DIR);
+        let artifacts = self.dir.join(ARTIFACTS_DIR);
+        for dir in [&corpus, &artifacts] {
+            fs::create_dir_all(dir)
+                .map_err(CampaignError::io(format!("creating {}", dir.display())))?;
+        }
+        let budget = Duration::from_secs(self.budget.seconds);
+        let mut spent = Duration::ZERO;
+        let mut attempts = 0u32;
+        let outcome = loop {
+            let remaining = budget.saturating_sub(spent);
+            if remaining.is_zero() {
+                break WorkerOutcome::BudgetSpent;
+            }
+            // libFuzzer takes whole seconds; rounding up never stops a
+            // worker short.
+            let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            let attempt = self.attempt(attempts, seconds, &corpus, &artifacts)?;
+            spent += Duration::from_millis(attempt.millis);
+            attempts += 1;
+            if attempt.end == AttemptEnd::Finished || spent >= budget {
+                break WorkerOutcome::BudgetSpent;
+            }
+            if attempts > self.budget.max_restarts {
+                break WorkerOutcome::RestartLimit;
+            }
+        };
+        let end = WorkerEnd {
+            index: self.plan.index,
+            outcome,
+            attempts,
+            millis: u64::try_from(spent.as_millis()).unwrap_or(u64::MAX),
+        };
+        let path = self.dir.join(OUTCOME_FILE);
+        write_once(&path, &record_bytes(&end))
+            .map_err(CampaignError::io(format!("writing {}", path.display())))?;
+        Ok(end)
+    }
+
+    /// Runs fuzzer process `number` for `seconds`, and appends its
+    /// [`Attempt`] to the worker's log.
+    fn attempt(
+        &self,
+        number: u32,
+        seconds: u64,
+        corpus: &Path,
+        artifacts: &Path,
+    ) -> Result<Attempt, CampaignError> {
+        let seed = self.plan.seed.wrapping_add(number);
+        let before = file_names(artifacts)?;
+        let mut command = fuzzer_command(
+            self.fuzzer,
+            self.plan.cpus.as_deref(),
+            self.budget,
+            &self.dir.join(SIM_DIR),
+        );
+        command
+            .arg(corpus)
+            .arg(self.snapshot)
+            .arg(format!("-seed={seed}"))
+            .arg(format!("-max_total_time={seconds}"))
+            .arg(format!("-artifact_prefix={}/", artifacts.display()));
+        let deadline = Duration::from_secs(seconds + self.budget.timeout_secs) + GRACE;
+        let started_unix = now_unix();
+        let started = Instant::now();
+        let log = self.dir.join(format!("log-{number}.txt"));
+        let pid = self.dir.join(PID_FILE);
+        let (exit, output) = run_logged(command, &log, Some(deadline), |child| {
+            // The pid file only lets `close` find a live fuzzer, so a
+            // failed write costs nothing else.
+            let _ = replace(&pid, format!("{child}\n").as_bytes());
+        })?;
+        let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let failure = ProcessFailure::of(exit, &output);
+        let end = match &failure {
+            None => AttemptEnd::Finished,
+            Some(_) if String::from_utf8_lossy(&output).contains(ABANDON_LIMIT_PANIC) => {
+                AttemptEnd::AbandonLimit
+            }
+            Some(_) => AttemptEnd::Failure,
+        };
+        let mut written = Vec::new();
+        for name in file_names(artifacts)?.difference(&before) {
+            written.push(file_record(self.store, &artifacts.join(name))?);
+        }
+        let attempt = Attempt {
+            attempt: number,
+            seed,
+            max_total_time: seconds,
+            started_unix,
+            millis,
+            code: match exit {
+                ProcessExit::Code(code) => Some(code),
+                _ => None,
+            },
+            signal: match exit {
+                ProcessExit::Signal(signal) => Some(signal),
+                _ => None,
+            },
+            killed: exit == ProcessExit::TimedOut,
+            end,
+            failure,
+            artifacts: written,
+        };
+        let path = self.dir.join(ATTEMPTS_FILE);
+        let line = json_line(&attempt);
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                file.write_all(&line)?;
+                file.sync_all()
+            })
+            .map_err(CampaignError::io(format!(
+                "appending to {}",
+                path.display()
+            )))?;
+        Ok(attempt)
+    }
+}
+
+/// The fuzzer command for `budget`, before its corpus and per-process
+/// flags: the binary, under `taskset -c <cpus>` if `cpus` is set, with the
+/// budget's libFuzzer flags and the target's variables. The target saves
+/// its inputs and traces under `sim`.
+pub(super) fn fuzzer_command(
+    fuzzer: &Path,
+    cpus: Option<&str>,
+    budget: &Budget,
+    sim: &Path,
+) -> Command {
+    let mut command = match cpus {
+        Some(cpus) => {
+            let mut command = Command::new("taskset");
+            command.arg("-c").arg(cpus).arg(fuzzer);
+            command
+        }
+        None => Command::new(fuzzer),
+    };
+    command
+        .arg(format!("-max_len={}", budget.max_len))
+        .arg(format!("-timeout={}", budget.timeout_secs))
+        .arg(format!("-rss_limit_mb={}", budget.rss_limit_mb))
+        .args(&budget.libfuzzer_args)
+        .env(ARTIFACTS_VAR, sim)
+        .env(ABANDON_LIMIT_VAR, budget.abandon_limit.to_string());
+    match &budget.feedback_mode {
+        Some(mode) => command.env(FEEDBACK_VAR, mode),
+        None => command.env_remove(FEEDBACK_VAR),
+    };
+    command
+}
+
+/// Runs `command` with its standard output and error in the file `log`,
+/// calls `spawned` with its process ID, and waits for it, killing it at
+/// `deadline` if one is given. Returns how it ended and the log.
+pub(super) fn run_logged(
+    mut command: Command,
+    log: &Path,
+    deadline: Option<Duration>,
+    spawned: impl FnOnce(u32),
+) -> Result<(ProcessExit, Vec<u8>), CampaignError> {
+    let io = |what: &str| CampaignError::io(format!("{what} {}", log.display()));
+    let file = File::create(log).map_err(io("creating"))?;
+    let stderr = file.try_clone().map_err(io("opening"))?;
+    command.stdin(Stdio::null()).stdout(file).stderr(stderr);
+    let shown = format!("{:?}", command.get_program());
+    let mut child = command
+        .spawn()
+        .map_err(CampaignError::io(format!("starting {shown}")))?;
+    spawned(child.id());
+    let waited = CampaignError::io(format!("waiting for {shown}"));
+    let exit = match deadline {
+        None => child.wait().map(ProcessExit::from).map_err(waited)?,
+        Some(limit) => {
+            let deadline = Instant::now() + limit;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break ProcessExit::from(status),
+                    Ok(None) if Instant::now() >= deadline => {
+                        // A process that exits between the check and the
+                        // kill still counts as timed out.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break ProcessExit::TimedOut;
+                    }
+                    Ok(None) => thread::sleep(POLL),
+                    Err(error) => return Err(waited(error)),
+                }
+            }
+        }
+    };
+    let output = fs::read(log).map_err(io("reading"))?;
+    Ok((exit, output))
+}
+
+/// Saves run `digest`'s snapshot, compacts it if the supervisor ends the
+/// run and the budget asks, and writes the end record.
+fn finish(
+    store: &Store,
+    digest: &Digest,
+    manifest: &Manifest,
+    workers: Vec<WorkerEnd>,
+    recorded_by: Recorder,
+) -> Result<End, CampaignError> {
+    let dir = store.run_dir(digest);
+    let initial = store.snapshot_inputs(&manifest.initial_snapshot);
+    let corpora: Vec<PathBuf> = manifest
+        .workers
+        .iter()
+        .map(|plan| worker_dir(&dir, plan.index).join(CORPUS_DIR))
+        .collect();
+    let sources: Vec<Source<'_>> = std::iter::once(Source::Dir(&initial))
+        .chain(corpora.iter().map(|corpus| Source::Dir(corpus)))
+        .collect();
+    let initial_inputs = store
+        .verify_snapshot(&manifest.initial_snapshot)?
+        .index
+        .inputs;
+    let snapshot = store.save_snapshot(&sources)?;
+    let mut failures = Vec::new();
+    for plan in &manifest.workers {
+        let worker = worker_dir(&dir, plan.index);
+        for sub in [ARTIFACTS_DIR, SIM_DIR] {
+            for path in files_under(&worker.join(sub))? {
+                failures.push(file_record(store, &path)?);
+            }
+        }
+    }
+    let compaction = match (recorded_by, manifest.budget.compact_secs) {
+        (Recorder::Supervisor, Some(seconds)) => {
+            Some(compact(store, &dir, manifest, &snapshot.digest, seconds)?)
+        }
+        _ => None,
+    };
+    let status = match recorded_by {
+        Recorder::Close => Status::Interrupted,
+        Recorder::Supervisor
+            if workers
+                .iter()
+                .any(|worker| worker.outcome == WorkerOutcome::RestartLimit) =>
+        {
+            Status::WorkerStopped
+        }
+        Recorder::Supervisor => Status::Complete,
+    };
+    let end = End {
+        version: STORE_VERSION,
+        manifest: digest.clone(),
+        status,
+        recorded_by,
+        ended_unix: now_unix(),
+        workers,
+        inputs: snapshot.index.inputs.len(),
+        added: snapshot
+            .index
+            .inputs
+            .len()
+            .saturating_sub(initial_inputs.len()),
+        snapshot: snapshot.digest,
+        compaction,
+        failures,
+    };
+    let path = dir.join(END_FILE);
+    if !write_once(&path, &record_bytes(&end))
+        .map_err(CampaignError::io(format!("writing {}", path.display())))?
+    {
+        return Err(already_ended(digest));
+    }
+    Ok(end)
+}
+
+/// Compacts `snapshot` with the fuzzer's `-merge=1` into a new directory,
+/// within `seconds`, and saves the result as a new snapshot. `snapshot`
+/// stays as it is whatever happens.
+fn compact(
+    store: &Store,
+    dir: &Path,
+    manifest: &Manifest,
+    snapshot: &Digest,
+    seconds: u64,
+) -> Result<Compaction, CampaignError> {
+    let out = partial_path(dir);
+    fs::create_dir_all(&out).map_err(CampaignError::io(format!("creating {}", out.display())))?;
+    let mut command = fuzzer_command(
+        &store.fuzzer_path(&manifest.build.binary),
+        None,
+        &manifest.budget,
+        &dir.join("compact-sim"),
+    );
+    command
+        .arg("-merge=1")
+        .arg(&out)
+        .arg(store.snapshot_inputs(snapshot));
+    let (exit, output) = run_logged(
+        command,
+        &dir.join("compact.log"),
+        Some(Duration::from_secs(seconds)),
+        |_| {},
+    )?;
+    let compaction = match ProcessFailure::of(exit, &output) {
+        Some(failure) => Compaction::Failed { failure },
+        None => {
+            let compacted = store.save_snapshot(&[Source::Dir(&out)])?;
+            Compaction::Compacted {
+                inputs: compacted.index.inputs.len(),
+                snapshot: compacted.digest,
+            }
+        }
+    };
+    // Every kept input is in the new snapshot, or the merge failed.
+    let _ = fs::remove_dir_all(&out);
+    Ok(compaction)
+}
+
+/// A worker that stopped without its supervisor: its outcome record if it
+/// wrote one, and else [`WorkerOutcome::Unfinished`] with the attempts it
+/// logged.
+fn stopped_worker(plan: &WorkerPlan, dir: &Path) -> Result<WorkerEnd, CampaignError> {
+    let outcome = dir.join(OUTCOME_FILE);
+    if outcome.exists() {
+        return read_record(&outcome, None);
+    }
+    let log = dir.join(ATTEMPTS_FILE);
+    let text = match fs::read_to_string(&log) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(CampaignError::Io {
+                context: format!("reading {}", log.display()),
+                error,
+            })
+        }
+    };
+    let mut attempts = 0;
+    let mut millis = 0u64;
+    // A line cut off when the supervisor stopped isn't an attempt.
+    for attempt in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Attempt>(line).ok())
+    {
+        attempts += 1;
+        millis = millis.saturating_add(attempt.millis);
+    }
+    Ok(WorkerEnd {
+        index: plan.index,
+        outcome: WorkerOutcome::Unfinished,
+        attempts,
+        millis,
+    })
+}
+
+/// The process ID in the worker's pid file, if that process still runs
+/// `fuzzer`.
+fn live_fuzzer(worker: &Path, fuzzer: &Path) -> Option<u32> {
+    let pid: u32 = fs::read_to_string(worker.join(PID_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    (fs::canonicalize(fuzzer).ok()? == exe).then_some(pid)
+}
+
+/// Run `dir`'s worker `index`'s directory.
+fn worker_dir(dir: &Path, index: usize) -> PathBuf {
+    dir.join(WORKERS_DIR).join(index.to_string())
+}
+
+/// The refusal for a run that already has its end record.
+fn already_ended(digest: &Digest) -> CampaignError {
+    CampaignError::Refused(format!("run {digest} already has its end record"))
+}
+
+/// The file at `path`, which is under the store's root, as a record.
+fn file_record(store: &Store, path: &Path) -> Result<FileRecord, CampaignError> {
+    let relative = path.strip_prefix(store.root()).map_err(|_| {
+        CampaignError::Refused(format!(
+            "{} isn't under the store's root {}",
+            path.display(),
+            store.root().display()
+        ))
+    })?;
+    Ok(FileRecord {
+        path: relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        sha256: Digest::of_file(path)
+            .map_err(CampaignError::io(format!("reading {}", path.display())))?,
+    })
+}
+
+/// `value` as one line of JSON.
+fn json_line(value: &impl Serialize) -> Vec<u8> {
+    let mut line =
+        serde_json::to_vec(value).expect("store records serialize to JSON without error");
+    line.push(b'\n');
+    line
+}
+
+/// The names of the regular files in `dir`. None if it doesn't exist.
+fn file_names(dir: &Path) -> Result<BTreeSet<String>, CampaignError> {
+    Ok(files_under(dir)?
+        .into_iter()
+        .filter(|path| path.parent() == Some(dir))
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect())
+}
+
+/// Every regular file under `dir`, at any depth, sorted, skipping names
+/// that start with `.`. None if `dir` doesn't exist.
+fn files_under(dir: &Path) -> Result<Vec<PathBuf>, CampaignError> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CampaignError::Io {
+                    context: format!("listing {}", dir.display()),
+                    error,
+                })
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(CampaignError::io(format!("listing {}", dir.display())))?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let kind = entry
+                .file_type()
+                .map_err(CampaignError::io(format!("listing {}", dir.display())))?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}

@@ -98,3 +98,89 @@ cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/dis
 `cargo xtask sim-versions --sim <name>` prints the versions that fix what the
 harness's fuzz input means, as `KEY=VALUE` lines. A corpus keyed on all of
 them starts fresh when any of them changes.
+
+## Campaigns
+
+A campaign runs one target for a long time, on a host that may stop. Its
+state lives in one store directory, on durable storage. The store is the only
+authoritative copy; a CI cache can speed a run up but never holds the only
+copy. To move a campaign to another host, copy the whole store there. Main
+holds the tooling and this documentation. The store, host addresses,
+credentials, worker counts, durations, logs and failure bundles stay outside
+main.
+
+`cargo xtask sim-campaign` runs `zakura-sim campaign`. Its subcommands:
+
+- `build` builds a target with the pinned nightly and cargo-fuzz, and saves
+  the binary in the store with a build record: the commit, whether the tree
+  was dirty, the source and lockfile digests, `rustc`, cargo-fuzz and
+  `libfuzzer-sys` versions, `RUSTFLAGS` and the sanitizer. The build is named
+  by the binary's SHA-256.
+- `start` writes a run manifest and runs it. The manifest records the build,
+  the `zakura-sim` binary that wrote it, the harness's versions, properties
+  and simulator limits, the feedback line the target logs at startup (none
+  for a target without a collector), the suite manifest's digest, each
+  worker's libFuzzer seed and CPUs, the budget and libFuzzer flags, and the
+  initial snapshot, which holds the harness's curated seeds. Each worker runs
+  libFuzzer on its own corpus directory plus the initial snapshot, and
+  restarts a process that ends early, such as at a crash or the abandonment
+  limit, up to `--max-restarts` times. When every worker stops, the run saves
+  the union of the initial snapshot and the workers' corpora as a new
+  snapshot, compacts it with libFuzzer's merge if `--compact-secs` is set,
+  and writes the end record.
+- `resume` continues the last run. If that run has no end record, because
+  its supervisor or host stopped, `resume` first closes it. It checks the
+  run's snapshot and failure files against their digests, then runs a new
+  manifest from that snapshot, with `resume_parent` naming the run. It
+  refuses a build with another identity, another harness version, or other
+  feedback.
+- `close` ends a run whose supervisor stopped: it saves the snapshot from
+  what the workers left and records the run as `interrupted`.
+- `status` lists the runs, and `verify` checks every record in the store.
+
+Every run ends with exactly one end record, `runs/<manifest>/end.json`, with
+one of three statuses:
+
+- `complete`: the supervisor ran every worker to the end of its budget.
+- `worker-stopped`: at least one worker stopped at its restart limit.
+- `interrupted`: the supervisor stopped first, and `close` wrote the record.
+
+Findings don't change the status. The end record lists every file the workers
+left in their libFuzzer artifact directories and their `ZAKURA_SIM_ARTIFACTS`
+directories, by SHA-256, for triage.
+
+Snapshots, manifests and builds are written to temporary names, synced, then
+renamed or linked under their digests, and never change. A run never deletes
+its initial snapshot or a worker's files, so an interrupted run, merge or
+compaction loses nothing that a snapshot already held.
+
+A new commit, generator, format, contract or feedback version starts a new
+campaign segment. `start --parent <run> --corpus carry` carries the last
+snapshot over when the harness's versions didn't change.
+`--corpus seeds` starts from the curated seeds alone. Either way the previous
+segment's manifests and snapshots stay in the store.
+
+```console
+# Build the target and start a campaign of 4 workers for 12 hours each.
+cargo xtask sim-campaign build --store /mnt/campaign --target discovery_wait_complete
+cargo xtask sim-campaign start --store /mnt/campaign --campaign discovery-2026-11 \
+    --sim discovery/wait-complete --build <sha256> --workers 4 --seconds 43200 \
+    --compact-secs 600 --artifacts <uri>
+
+# After the host or the supervisor stopped: check the store and continue.
+cargo xtask sim-campaign verify --store /mnt/campaign
+cargo xtask sim-campaign resume --store /mnt/campaign
+
+# On a new host, rebuild the same commit and resume with that build.
+cargo xtask sim-campaign build --store /mnt/campaign --target discovery_wait_complete
+cargo xtask sim-campaign resume --store /mnt/campaign --build <sha256>
+
+# Record a saved failure as a trace, and replay it Exact.
+cargo xtask record --sim discovery/wait-complete \
+    --input /mnt/campaign/runs/<run>/workers/0/artifacts/crash-… --out <dir>
+cargo xtask replay <dir>
+```
+
+Minimization (`cargo xtask sim-minimize`, T2b) and archive bundles
+(`cargo xtask sim-triage`, E4a) are proposed in their own PRs, and aren't part
+of this tooling yet.

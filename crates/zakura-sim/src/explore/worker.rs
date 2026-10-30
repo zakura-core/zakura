@@ -29,6 +29,11 @@ use crate::{harness::HarnessEntry, NullSink};
 /// exits for its supervisor to restart it.
 pub const ABANDON_LIMIT_VAR: &str = "ZAKURA_SIM_ABANDON_LIMIT";
 
+/// The words a fuzz target's panic message starts with when its process
+/// reaches the abandonment limit. A campaign's supervisor reads them in the
+/// process's log, and restarts the process as the limit asks.
+pub const ABANDON_LIMIT_PANIC: &str = "abandoned: the process reached its abandonment limit";
+
 /// The abandonment limit when [`ABANDON_LIMIT_VAR`] is unset or empty: the
 /// first abandoned run ends the process, until measurements justify more.
 pub const DEFAULT_ABANDON_LIMIT: usize = 1;

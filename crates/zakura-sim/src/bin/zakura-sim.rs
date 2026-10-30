@@ -9,12 +9,13 @@
 //! zakura-sim versions --sim <name>
 //! zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]
 //!     [--quarantine <dir>] [--report <file>]
+//! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 //! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
-//! `cargo xtask sim-versions` and `cargo xtask sim-seeds` build and run it
-//! with that flag.
+//! `cargo xtask sim-versions`, `cargo xtask sim-seeds` and
+//! `cargo xtask sim-campaign` build and run it with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -41,6 +42,10 @@ fn main() {
         }
     }
 }
+
+#[cfg(zakura_sim)]
+#[path = "zakura-sim/campaign.rs"]
+mod campaign;
 
 #[cfg(zakura_sim)]
 mod cli {
@@ -78,7 +83,11 @@ mod cli {
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
              zakura-sim seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>]\n      \
-             [--quarantine <dir>] [--report <file>]\n\n\
+             [--quarantine <dir>] [--report <file>]\n",
+        );
+        text.push_str(super::campaign::USAGE);
+        text.push_str(
+            "\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
@@ -102,9 +111,10 @@ mod cli {
              that harness's seeds, and --out writes each admitted seed's full fuzz input\n\
              there, named by its SHA-256. --quarantine writes each quarantined seed there\n\
              with its reason. --report writes the result as JSON. It exits 1 if any\n\
-             required seed is rejected.\n\n\
-             Harnesses:\n",
+             required seed is rejected.\n",
         );
+        text.push_str(super::campaign::HELP);
+        text.push_str("\nHarnesses:\n");
         for entry in HARNESSES {
             let _ = writeln!(
                 text,
@@ -125,6 +135,7 @@ mod cli {
             Some("shrink") => shrink(args.collect()),
             Some("versions") => versions(args.collect()),
             Some("seeds") => seeds(args.collect()),
+            Some("campaign") => super::campaign::run(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())

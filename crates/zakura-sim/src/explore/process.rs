@@ -10,7 +10,7 @@
 
 use std::{io, path::Path, process::ExitStatus};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{classify_end, Bucket, Classified};
 use crate::{
@@ -46,7 +46,7 @@ impl From<ExitStatus> for ProcessExit {
 
 /// How a child process failed. Each kind stays a process failure until a
 /// rerun confirms what caused it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProcessFailure {
     /// The supervisor killed it at its time limit, or libFuzzer reported a

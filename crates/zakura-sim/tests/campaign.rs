@@ -1,0 +1,774 @@
+//! Durable campaigns: runs end with one status, interrupted runs resume
+//! with their corpus additions and failures, and snapshots survive an
+//! interrupted compaction (explorer implementation plan, E3a-2, and
+//! acceptance tests 3 and 4).
+//!
+//! A shell script stands in for the libFuzzer binary. It takes the flags
+//! the supervisor passes, writes a corpus file every 50 ms until its
+//! `-max_total_time`, and does what the files in its control directory
+//! say: crash once or always, end at the abandonment limit, log a feedback
+//! line, or hang in a merge. It exits when its parent does, as a real
+//! fuzzer does when a terminal's interrupt reaches its process group.
+#![cfg(zakura_sim)]
+
+use std::{
+    collections::BTreeSet,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Child, Command, Output},
+    thread,
+    time::{Duration, Instant},
+};
+
+use tempfile::TempDir;
+use zakura_sim::{
+    campaign::{
+        self, AttemptEnd, Budget, BuildIdentity, CampaignError, Compaction, Digest, End, Migration,
+        Recorder, ResumeOptions, RunState, StartOptions, Status, Store, WorkerOutcome, WorkerPlan,
+        ATTEMPTS_FILE, FUZZ_PACKAGE,
+    },
+    explore::{ProcessFailure, ABANDON_LIMIT_PANIC},
+    harness,
+    trace::BuildInfo,
+};
+
+/// The harness the tests fuzz. It has one committed seed.
+const SIM: &str = "discovery/wait-complete";
+
+/// The stand-in fuzzer. `@CONTROL@` and `@ABANDON@` are replaced.
+const STUB: &str = r#"#!/usr/bin/env bash
+control='@CONTROL@'
+dirs=(); time=0; prefix=""; seed=0; runs=""; merge=""
+for arg in "$@"; do
+  case "$arg" in
+    -max_total_time=*) time=${arg#*=} ;;
+    -artifact_prefix=*) prefix=${arg#*=} ;;
+    -seed=*) seed=${arg#*=} ;;
+    -runs=*) runs=${arg#*=} ;;
+    -merge=*) merge=${arg#*=} ;;
+    -*) ;;
+    *) dirs+=("$arg") ;;
+  esac
+done
+parent=$PPID
+alive() { kill -0 "$parent" 2>/dev/null; }
+if [ -e "$control/feedback" ]; then
+  echo "zakura-sim feedback: backend=stub version=7 features=1 mode=on" >&2
+fi
+if [ "$runs" = 0 ]; then exit 0; fi
+if [ "$merge" = 1 ]; then
+  if [ -e "$control/merge-hangs" ]; then
+    touch "$control/merging"
+    while alive; do sleep 0.05; done
+    exit 1
+  fi
+  for dir in "${dirs[@]:1}"; do
+    for file in "$dir"/*; do
+      [ -f "$file" ] || continue
+      case "$file" in *[0-7]) cp "$file" "${dirs[0]}/" ;; esac
+    done
+  done
+  exit 0
+fi
+out=${dirs[0]}
+end=$(( $(date +%s%N) + time * 1000000000 ))
+i=0
+while [ "$(date +%s%N)" -lt "$end" ]; do
+  alive || exit 1
+  printf 'input %s %s %s %s' "$seed" "$i" "$$" "$RANDOM" > "$out/.partial-$$"
+  mv "$out/.partial-$$" "$out/unit-$$-$i"
+  i=$((i + 1))
+  if [ "$i" = 2 ]; then
+    if mv "$control/crash" "$control/crash-taken-$$" 2>/dev/null || [ -e "$control/always-crash" ]; then
+      printf 'crash %s' "$$" > "${prefix}crash-$$"
+      mkdir -p "$ZAKURA_SIM_ARTIFACTS/inputs/active/stub"
+      printf 'crash %s' "$$" > "$ZAKURA_SIM_ARTIFACTS/inputs/active/stub/$$.bin"
+      echo "==$$== ERROR: libFuzzer: deadly signal" >&2
+      exit 1
+    fi
+    if mv "$control/abandon" "$control/abandon-taken-$$" 2>/dev/null; then
+      echo "panicked: @ABANDON@: 1 runs abandoned their cleanup" >&2
+      exit 1
+    fi
+  fi
+  sleep 0.05
+done
+echo "Done $i runs in $time second(s)" >&2
+exit 0
+"#;
+
+/// A store with the stand-in fuzzer saved as a build.
+struct Fixture {
+    /// Holds every directory.
+    dir: TempDir,
+    /// The store.
+    store: Store,
+    /// The stand-in's control directory.
+    control: PathBuf,
+    /// The stand-in's build.
+    build: Digest,
+}
+
+impl Fixture {
+    /// A new store with the stand-in saved under [`identity`].
+    fn new() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let control = dir.path().join("control");
+        fs::create_dir(&control).unwrap();
+        let stub = dir.path().join("stub");
+        fs::write(
+            &stub,
+            STUB.replace("@CONTROL@", control.to_str().unwrap())
+                .replace("@ABANDON@", ABANDON_LIMIT_PANIC),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = Store::open(&dir.path().join("store")).unwrap();
+        let build = store.save_build(&stub, identity()).unwrap().binary;
+        Fixture {
+            dir,
+            store,
+            control,
+            build,
+        }
+    }
+
+    /// Creates the control file `name`.
+    fn set(&self, name: &str) {
+        fs::write(self.control.join(name), b"").unwrap();
+    }
+
+    /// Removes the control file `name`.
+    fn unset(&self, name: &str) {
+        let _ = fs::remove_file(self.control.join(name));
+    }
+
+    /// `start`'s options: `workers` workers of `seconds` each, two
+    /// restarts, the committed fixtures.
+    fn options(&self, workers: usize, seconds: u64) -> StartOptions {
+        StartOptions {
+            campaign: "test".to_owned(),
+            harness: harness::find(SIM).unwrap(),
+            build: self.build.clone(),
+            workers: (0..workers)
+                .map(|index| WorkerPlan {
+                    index,
+                    seed: 1 + index as u32,
+                    cpus: None,
+                })
+                .collect(),
+            budget: Budget {
+                seconds,
+                max_restarts: 2,
+                max_len: 4096,
+                timeout_secs: 1,
+                rss_limit_mb: 2048,
+                abandon_limit: 1,
+                feedback_mode: None,
+                compact_secs: None,
+                libfuzzer_args: Vec::new(),
+            },
+            fixtures: vec![fixtures()],
+            suite: None,
+            artifacts: None,
+            parent: None,
+        }
+    }
+
+    /// `zakura-sim campaign <args> --store <store>`, run to its end.
+    fn cli(&self, args: &[&str]) -> Output {
+        cli(self.store.root(), args)
+    }
+
+    /// The `start` command line of a two-worker run of `seconds`.
+    fn start_args<'a>(&'a self, seconds: &'a str) -> Vec<&'a str> {
+        vec![
+            "start",
+            "--campaign",
+            "test",
+            "--sim",
+            SIM,
+            "--build",
+            self.build.as_str(),
+            "--workers",
+            "2",
+            "--seconds",
+            seconds,
+            "--timeout",
+            "1",
+            "--fixtures",
+            FIXTURES,
+        ]
+    }
+}
+
+/// `zakura-sim campaign <args> --store <store>`, started.
+fn spawn(store: &Path, args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .arg("campaign")
+        .args(args)
+        .arg("--store")
+        .arg(store)
+        .spawn()
+        .unwrap()
+}
+
+/// `zakura-sim campaign <args> --store <store>`, run to its end.
+fn cli(store: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .arg("campaign")
+        .args(args)
+        .arg("--store")
+        .arg(store)
+        .output()
+        .unwrap()
+}
+
+/// The stand-in's identity: this checkout's commit, so the runner check
+/// passes.
+fn identity() -> BuildIdentity {
+    BuildIdentity {
+        package: FUZZ_PACKAGE.to_owned(),
+        target: "stub".to_owned(),
+        git: BuildInfo::current().git,
+        dirty: false,
+        source: "stub-source".to_owned(),
+        lockfile: "stub-lockfile".to_owned(),
+        fuzz_lockfile: "stub-fuzz-lockfile".to_owned(),
+        rustc: "stub-rustc".to_owned(),
+        cargo_fuzz: "stub-cargo-fuzz".to_owned(),
+        libfuzzer_sys: "0.0.0".to_owned(),
+        rustflags: "--cfg zakura_sim".to_owned(),
+        cargo_args: Vec::new(),
+    }
+}
+
+/// The committed fixture directory.
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// [`FIXTURES`] as a path.
+fn fixtures() -> PathBuf {
+    PathBuf::from(FIXTURES)
+}
+
+/// Waits up to 30 s for `ready`.
+fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The digests of the regular files under `dir`, at any depth, skipping
+/// names that start with `.`.
+fn digests_under(dir: &Path) -> BTreeSet<Digest> {
+    let mut digests = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return digests;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            digests.extend(digests_under(&path));
+        } else {
+            digests.insert(Digest::of_file(&path).unwrap());
+        }
+    }
+    digests
+}
+
+/// The input digests of `snapshot`.
+fn inputs(store: &Store, snapshot: &Digest) -> BTreeSet<Digest> {
+    store
+        .verify_snapshot(snapshot)
+        .unwrap()
+        .index
+        .inputs
+        .into_iter()
+        .map(|entry| entry.sha256)
+        .collect()
+}
+
+/// The only run that no run continues.
+fn leaf(store: &Store) -> Digest {
+    let leaves = store.leaves().unwrap();
+    assert_eq!(leaves.len(), 1, "{leaves:?}");
+    leaves[0].clone()
+}
+
+/// Copies `from` to `to`, recursively, as moving a store to another host
+/// does.
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The run a supervisor holds, once one does.
+fn running(store: &Store) -> Digest {
+    let find = || {
+        store
+            .leaves()
+            .ok()?
+            .into_iter()
+            .find(|run| store.run_state(run).ok() == Some(RunState::Running))
+    };
+    wait_for("a run to start", || find().is_some());
+    find().unwrap()
+}
+
+/// Kills `child`, a supervisor of `run`, and waits for the run's lock to
+/// free.
+fn kill(store: &Store, mut child: Child, run: &Digest) {
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_for("the run's lock to free", || {
+        store.run_state(run).unwrap() == RunState::Open
+    });
+}
+
+/// Starts the CLI command `args` and kills it once both workers of the run
+/// it starts have written at least three corpus files and `also` holds.
+/// Returns the run.
+fn start_and_kill(store: &Store, args: &[&str], also: impl Fn() -> bool) -> Digest {
+    let child = spawn(store.root(), args);
+    let run = running(store);
+    wait_for("both workers to add inputs", || {
+        also()
+            && (0..2).all(|worker| {
+                let corpus = store.run_dir(&run).join(format!("workers/{worker}/corpus"));
+                fs::read_dir(corpus).map_or(0, |entries| entries.count()) >= 3
+            })
+    });
+    kill(store, child, &run);
+    run
+}
+
+/// Every input the run's workers added, and every failure file they left.
+fn left_behind(store: &Store, run: &Digest) -> (BTreeSet<Digest>, BTreeSet<Digest>) {
+    let workers = store.run_dir(run).join("workers");
+    let mut corpus = BTreeSet::new();
+    let mut failures = BTreeSet::new();
+    for worker in fs::read_dir(&workers).unwrap() {
+        let worker = worker.unwrap().path();
+        corpus.extend(digests_under(&worker.join("corpus")));
+        failures.extend(digests_under(&worker.join("artifacts")));
+        failures.extend(digests_under(&worker.join("sim")));
+    }
+    (corpus, failures)
+}
+
+/// Checks that the store's records verify, that each manifest is the file
+/// its digest names, and that every run has exactly one end record.
+fn assert_store_verifies(store: &Store) {
+    let verified = campaign::verify(store).unwrap();
+    assert_eq!(verified.open + verified.running, 0, "{verified:?}");
+    for digest in store.manifests().unwrap().keys() {
+        let bytes = fs::read(store.manifest_path(digest)).unwrap();
+        assert_eq!(&Digest::of(&bytes), digest);
+        assert_eq!(store.run_state(digest).unwrap(), RunState::Ended);
+    }
+}
+
+/// Acceptance test 4 and E3a-2's resume test, locally: a run killed with
+/// its supervisor, then resumed on a copy of the store as on another host,
+/// keeps every input its workers added and every failure they left; so
+/// does a second interruption. Each run ends with exactly one status, and
+/// every record verifies against its digest.
+#[test]
+fn resumed_runs_keep_corpus_additions_and_failures() {
+    let host_a = Fixture::new();
+    host_a.set("crash");
+    let first = start_and_kill(&host_a.store, &host_a.start_args("60"), || {
+        !host_a.control.join("crash").exists()
+    });
+    let (added, failures) = left_behind(&host_a.store, &first);
+    assert!(!failures.is_empty(), "a worker crashed once");
+    let manifest = host_a.store.read_manifest(&first).unwrap();
+    let seeds = inputs(&host_a.store, &manifest.initial_snapshot);
+    assert_eq!(seeds.len(), 1, "the harness has one committed seed");
+
+    // Another host: a copy of the store, without the cache of anything.
+    let other = TempDir::new().unwrap();
+    let host_b = other.path().join("store");
+    copy_tree(host_a.store.root(), &host_b);
+    let store = Store::open(&host_b).unwrap();
+    let output = cli(&host_b, &["resume", "--seconds", "1"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let first_end = campaign::read_end(&store, &first).unwrap();
+    assert_eq!(first_end.status, Status::Interrupted);
+    assert_eq!(first_end.recorded_by, Recorder::Close);
+    let kept = inputs(&store, &first_end.snapshot);
+    assert!(kept.is_superset(&seeds));
+    assert!(kept.is_superset(&added), "every added input is kept");
+    let listed: BTreeSet<Digest> = first_end
+        .failures
+        .iter()
+        .map(|file| file.sha256.clone())
+        .collect();
+    assert_eq!(listed, failures, "every failure file is listed");
+
+    let second = leaf(&store);
+    let second_manifest = store.read_manifest(&second).unwrap();
+    assert_eq!(second_manifest.resume_parent.as_ref(), Some(&first));
+    assert_eq!(second_manifest.initial_snapshot, first_end.snapshot);
+    assert_eq!(second_manifest.segment, 1);
+    let second_end = campaign::read_end(&store, &second).unwrap();
+    assert_eq!(second_end.status, Status::Complete, "{second_end:?}");
+    assert!(second_end
+        .workers
+        .iter()
+        .all(|worker| worker.outcome == WorkerOutcome::BudgetSpent));
+    assert!(inputs(&store, &second_end.snapshot).is_superset(&kept));
+    assert!(second_end.added > 0);
+
+    // A second interruption on the new host, then a second resume.
+    let third = start_and_kill(&store, &["resume", "--seconds", "60"], || true);
+    let (added_third, _) = left_behind(&store, &third);
+    let output = cli(&host_b, &["resume", "--seconds", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let third_end = campaign::read_end(&store, &third).unwrap();
+    assert_eq!(third_end.status, Status::Interrupted);
+    let fourth = leaf(&store);
+    let fourth_end = campaign::read_end(&store, &fourth).unwrap();
+    assert_eq!(fourth_end.status, Status::Complete);
+    let last = inputs(&store, &fourth_end.snapshot);
+    assert!(last.is_superset(&kept));
+    assert!(last.is_superset(&added_third));
+    assert!(last.is_superset(&inputs(&store, &second_end.snapshot)));
+
+    // The first host's failures are still there, by digest.
+    assert_store_verifies(&store);
+    let manifests = store.manifests().unwrap();
+    assert_eq!(manifests.len(), 4);
+    let output = cli(&host_b, &["verify"]);
+    assert!(output.status.success(), "{output:?}");
+    // A fifth resume can't rewrite an end record.
+    for run in [&first, &second, &third, &fourth] {
+        assert!(matches!(
+            campaign::close(&store, run),
+            Err(CampaignError::Refused(_))
+        ));
+    }
+}
+
+/// A worker restarts a fuzzer that crashes or reaches its abandonment
+/// limit, logs each process, and a worker whose fuzzer keeps crashing
+/// stops at its restart limit with the run's status saying so.
+#[test]
+fn workers_restart_failed_fuzzers_up_to_their_limit() {
+    let fixture = Fixture::new();
+    fixture.set("abandon");
+    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 2)).unwrap();
+    let end = campaign::run(&fixture.store, &run).unwrap();
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    assert_eq!(end.workers[0].attempts, 2);
+    let log = fs::read_to_string(
+        fixture
+            .store
+            .run_dir(&run)
+            .join("workers/0")
+            .join(ATTEMPTS_FILE),
+    )
+    .unwrap();
+    let attempts: Vec<campaign::Attempt> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(attempts[0].end, AttemptEnd::AbandonLimit);
+    assert_eq!(attempts[1].end, AttemptEnd::Finished);
+    assert_eq!(attempts[1].seed, attempts[0].seed + 1);
+
+    let fixture = Fixture::new();
+    fixture.set("always-crash");
+    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 30)).unwrap();
+    let end = campaign::run(&fixture.store, &run).unwrap();
+    assert_eq!(end.status, Status::WorkerStopped);
+    assert_eq!(end.workers[0].outcome, WorkerOutcome::RestartLimit);
+    assert_eq!(
+        end.workers[0].attempts, 3,
+        "the first process and 2 restarts"
+    );
+    // Each crash left a libFuzzer artifact and a saved input.
+    assert_eq!(end.failures.len(), 6, "{:?}", end.failures);
+    assert!(end.added > 0, "the crashed processes' additions are kept");
+}
+
+/// Acceptance test 3's compaction part: a compaction that hangs past its
+/// limit, or whose supervisor is killed, leaves the run's snapshot and the
+/// initial one intact, and the failures too. A compaction that finishes
+/// saves a smaller snapshot, which the next run starts from.
+#[test]
+fn interrupted_compaction_keeps_every_snapshot() {
+    let fixture = Fixture::new();
+    fixture.set("crash");
+    fixture.set("merge-hangs");
+    let mut options = fixture.options(1, 1);
+    options.budget.compact_secs = Some(1);
+    let run = campaign::prepare_start(&fixture.store, options).unwrap();
+    let end = campaign::run(&fixture.store, &run).unwrap();
+    assert_eq!(end.status, Status::Complete);
+    assert_eq!(
+        end.compaction,
+        Some(Compaction::Failed {
+            failure: ProcessFailure::Timeout
+        })
+    );
+    assert_eq!(end.head(), &end.snapshot);
+    let manifest = fixture.store.read_manifest(&run).unwrap();
+    fixture
+        .store
+        .verify_snapshot(&manifest.initial_snapshot)
+        .unwrap();
+    assert!(inputs(&fixture.store, &end.snapshot).len() > 1);
+    assert!(!end.failures.is_empty());
+
+    // The supervisor dies while it compacts. The resumed run inherits its
+    // parent's budget, so it compacts too, and the merge hangs.
+    fixture.unset("merging");
+    let child = spawn(fixture.store.root(), &["resume", "--seconds", "1"]);
+    let second = running(&fixture.store);
+    wait_for("the compaction to start", || {
+        fixture.control.join("merging").exists()
+    });
+    kill(&fixture.store, child, &second);
+    let closed = campaign::close(&fixture.store, &second).unwrap();
+    assert_eq!(closed.status, Status::Interrupted);
+    assert_eq!(closed.compaction, None);
+    assert!(inputs(&fixture.store, &closed.snapshot)
+        .is_superset(&inputs(&fixture.store, &end.snapshot)));
+    fixture.store.verify_snapshot(&end.snapshot).unwrap();
+    assert_store_verifies(&fixture.store);
+
+    // A compaction that finishes.
+    fixture.unset("merge-hangs");
+    let output = fixture.cli(&["resume", "--seconds", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let third = leaf(&fixture.store);
+    let compacted = campaign::read_end(&fixture.store, &third).unwrap();
+    let Some(Compaction::Compacted {
+        snapshot,
+        inputs: kept,
+    }) = &compacted.compaction
+    else {
+        panic!("the compaction finished: {compacted:?}");
+    };
+    assert!(
+        *kept < compacted.inputs,
+        "the stand-in's merge drops inputs"
+    );
+    assert_eq!(compacted.head(), snapshot);
+    assert!(
+        inputs(&fixture.store, snapshot).is_subset(&inputs(&fixture.store, &compacted.snapshot))
+    );
+    let output = fixture.cli(&["resume", "--seconds", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let fourth = leaf(&fixture.store);
+    assert_eq!(
+        &fixture
+            .store
+            .read_manifest(&fourth)
+            .unwrap()
+            .initial_snapshot,
+        snapshot
+    );
+}
+
+/// Resume refuses another build identity or another feedback, and a new
+/// segment starts from the seeds alone or carries the corpus.
+#[test]
+fn incompatible_runs_start_a_new_segment() {
+    let fixture = Fixture::new();
+    fixture.set("feedback");
+    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap();
+    let manifest = fixture.store.read_manifest(&run).unwrap();
+    let feedback = manifest.feedback.as_ref().expect("the stand-in logs it");
+    assert_eq!(
+        (
+            feedback.backend.as_str(),
+            feedback.version.as_str(),
+            feedback.mode.as_str()
+        ),
+        ("stub", "7", "on")
+    );
+    let end = campaign::run(&fixture.store, &run).unwrap();
+
+    let other = fixture.dir.path().join("other-stub");
+    fs::copy(fixture.store.fuzzer_path(&fixture.build), &other).unwrap();
+    fs::write(
+        &other,
+        fs::read_to_string(&other).unwrap() + "# another build\n",
+    )
+    .unwrap();
+    let mut changed = identity();
+    changed.cargo_args = vec!["--sanitizer".to_owned(), "none".to_owned()];
+    let other_build = fixture.store.save_build(&other, changed).unwrap().binary;
+    let refused = campaign::prepare_resume(
+        &fixture.store,
+        ResumeOptions {
+            build: Some(other_build.clone()),
+            ..ResumeOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("build cargo_args"),
+        "{refused}"
+    );
+
+    fixture.unset("feedback");
+    let refused = campaign::prepare_resume(&fixture.store, ResumeOptions::default()).unwrap_err();
+    assert!(refused.to_string().contains("feedback"), "{refused}");
+    assert_eq!(
+        fixture.store.manifests().unwrap().len(),
+        1,
+        "nothing written"
+    );
+
+    // A store holds one campaign.
+    let refused = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap_err();
+    assert!(
+        refused.to_string().contains("already holds a campaign"),
+        "{refused}"
+    );
+
+    let mut options = fixture.options(1, 1);
+    options.build = other_build.clone();
+    options.parent = Some((run.clone(), Migration::Seeds));
+    let fresh = campaign::prepare_start(&fixture.store, options).unwrap();
+    let fresh_manifest = fixture.store.read_manifest(&fresh).unwrap();
+    assert_eq!(fresh_manifest.segment, 2);
+    assert_eq!(fresh_manifest.previous_segment.as_ref(), Some(&run));
+    assert_eq!(fresh_manifest.migration, Some(Migration::Seeds));
+    assert_eq!(
+        inputs(&fixture.store, &fresh_manifest.initial_snapshot),
+        inputs(&fixture.store, &manifest.initial_snapshot),
+        "the seeds alone"
+    );
+    // The parent is continued now.
+    let refused = campaign::prepare_resume(
+        &fixture.store,
+        ResumeOptions {
+            parent: Some(run.clone()),
+            ..ResumeOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("already continued"),
+        "{refused}"
+    );
+    let fresh_end = campaign::run(&fixture.store, &fresh).unwrap();
+
+    let mut options = fixture.options(1, 1);
+    options.parent = Some((fresh.clone(), Migration::Carry));
+    let carried = campaign::prepare_start(&fixture.store, options).unwrap();
+    let carried_manifest = fixture.store.read_manifest(&carried).unwrap();
+    assert_eq!(carried_manifest.segment, 3);
+    assert_eq!(
+        carried_manifest.initial_snapshot, fresh_end.snapshot,
+        "the seeds are already in the carried snapshot"
+    );
+    assert!(inputs(&fixture.store, &end.snapshot).len() > 1);
+}
+
+/// A snapshot is named by its index's digest, the same inputs share a
+/// name, and a changed, missing or extra input fails verification. So
+/// does a changed manifest.
+#[test]
+fn snapshots_and_manifests_verify_against_their_digests() {
+    let fixture = Fixture::new();
+    let a = fixture
+        .store
+        .save_snapshot(&[
+            campaign::Source::Input(b"one"),
+            campaign::Source::Input(b"two"),
+        ])
+        .unwrap();
+    let corpus = fixture.dir.path().join("corpus");
+    fs::create_dir(&corpus).unwrap();
+    fs::write(corpus.join("x"), b"two").unwrap();
+    fs::write(corpus.join("y"), b"one").unwrap();
+    fs::write(corpus.join(".partial-1"), b"half").unwrap();
+    let b = fixture
+        .store
+        .save_snapshot(&[campaign::Source::Dir(&corpus)])
+        .unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.index.inputs.len(), 2);
+    let index = fs::read(fixture.store.snapshot_dir(&a.digest).join("snapshot.json")).unwrap();
+    assert_eq!(Digest::of(&index), a.digest);
+
+    let input = fixture
+        .store
+        .snapshot_inputs(&a.digest)
+        .join(a.index.inputs[0].sha256.as_str());
+    fs::write(&input, b"changed").unwrap();
+    assert!(matches!(
+        fixture.store.verify_snapshot(&a.digest),
+        Err(CampaignError::Corrupt { .. })
+    ));
+    fs::remove_file(&input).unwrap();
+    assert!(fixture.store.verify_snapshot(&a.digest).is_err());
+    let extra = fixture
+        .store
+        .save_snapshot(&[campaign::Source::Input(b"three")])
+        .unwrap();
+    fs::write(
+        fixture
+            .store
+            .snapshot_inputs(&extra.digest)
+            .join(Digest::of(b"four").as_str()),
+        b"four",
+    )
+    .unwrap();
+    assert!(fixture.store.verify_snapshot(&extra.digest).is_err());
+
+    let run = campaign::prepare_start(&fixture.store, fixture.options(1, 1)).unwrap();
+    let path = fixture.store.manifest_path(&run);
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace("\"test\"", "\"tset\"")).unwrap();
+    assert!(matches!(
+        fixture.store.read_manifest(&run),
+        Err(CampaignError::Corrupt { .. })
+    ));
+}
+
+/// A run that a supervisor holds can't be closed or resumed, and `status`
+/// says it runs.
+#[test]
+fn a_running_run_is_left_alone() {
+    let fixture = Fixture::new();
+    let child = spawn(fixture.store.root(), &fixture.start_args("60"));
+    let run = running(&fixture.store);
+    let refused = campaign::close(&fixture.store, &run).unwrap_err();
+    assert!(refused.to_string().contains("still going"), "{refused}");
+    let refused = campaign::prepare_resume(&fixture.store, ResumeOptions::default()).unwrap_err();
+    assert!(refused.to_string().contains("still going"), "{refused}");
+    let output = fixture.cli(&["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(": running"), "{stdout}");
+    kill(&fixture.store, child, &run);
+    let output = fixture.cli(&["close"]);
+    assert!(output.status.success(), "{output:?}");
+    let end: End = campaign::read_end(&fixture.store, &run).unwrap();
+    assert_eq!(end.status, Status::Interrupted);
+    assert!(end
+        .workers
+        .iter()
+        .all(|worker| worker.outcome == WorkerOutcome::Unfinished));
+}

@@ -11,6 +11,7 @@
 #![cfg(zakura_sim)]
 
 pub mod action;
+pub mod campaign;
 pub mod check;
 pub mod domain;
 mod downstream;

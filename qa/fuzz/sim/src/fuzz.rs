@@ -12,7 +12,7 @@ use std::{
 use zakura_sim::{
     explore::{
         input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
-        Worker, ABANDON_LIMIT_VAR,
+        Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR,
     },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
@@ -99,7 +99,8 @@ fn run(
             // The count grows only on an abandoned run, so this input is
             // the one that reached the limit.
             panic!(
-                "abandoned: {} runs abandoned their cleanup, and {ABANDON_LIMIT_VAR} is {limit}; \
+                "{ABANDON_LIMIT_PANIC}: {} runs abandoned their cleanup, and {ABANDON_LIMIT_VAR} \
+                 is {limit}; \
                  the process exits for its supervisor to restart it; input at {}",
                 worker.abandoned(),
                 input_path(&artifacts_root(), Bucket::Abandoned, None, input).display()

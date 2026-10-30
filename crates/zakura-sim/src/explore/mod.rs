@@ -30,7 +30,9 @@ pub use process::{
     classify_process, ProcessClassified, ProcessExit, ProcessFailure, ProcessResult,
 };
 pub use save::{input_path, save_failure, save_input, SavedFailure, INPUTS_DIR};
-pub use worker::{abandon_limit, Worker, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT};
+pub use worker::{
+    abandon_limit, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT,
+};
 
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport},

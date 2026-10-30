@@ -27,6 +27,10 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 
+`[package.metadata.zakura-sim.targets]` in `Cargo.toml` maps each target to
+the registered harness it runs. A new target needs both its `[[bin]]` and its
+entry there.
+
 ## What a target does with a run
 
 - An `Active` property violation records the run, then panics with the
@@ -51,7 +55,8 @@ failure of another property, panics. Once a fixture's limit in
 `missed:`.
 
 `ZAKURA_SIM_EXPECT=<property-id>` makes a target panic only on that
-property's `Active` violation and record nothing, for `cargo fuzz tmin`. An
+property's `Active` violation and record nothing, for `cargo fuzz tmin`.
+Before it panics, the target prints `zakura-sim-fuzz harness: <name>`. An
 abort, a stack overflow, a sanitizer report or a timeout still crashes the
 process, so `tmin`'s output is only a candidate.
 
@@ -71,7 +76,8 @@ SHA-256 first. It builds `zakura-sim` and the target once, and pins both in
 processes, or the input is rejected:
 
 1. the pinned target must crash with the property's panic alone, not an
-   abort, a sanitizer report, a timeout or another panic;
+   abort, a sanitizer report, a timeout or another panic, and must name the
+   harness the manifest maps it to;
 2. `zakura-sim confirm` must find the property violated alone, through its
    trigger history, with the original's harness, generator, build,
    assumptions and cleanup;

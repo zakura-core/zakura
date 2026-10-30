@@ -21,7 +21,8 @@
 //! 6. writes `<out>/report.json`.
 //!
 //! A confirmation runs three fresh processes, each within `--child-secs`:
-//! the pinned fuzz target must crash with the property's panic alone,
+//! the pinned fuzz target must crash with the property's panic alone and
+//! name the harness the fuzz package's manifest maps it to,
 //! `zakura-sim confirm` must confirm the property, its trigger history, the
 //! assumptions and the build, and `zakura-sim replay` must replay the
 //! recorded trace Exact.
@@ -30,6 +31,7 @@
 //! `<out>/minimized/` as soon as it passes, so an interrupt keeps both.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsString,
     fmt, fs,
@@ -47,15 +49,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{header_fuzz::PINNED_NIGHTLY, sim::SIM_RUSTFLAGS, BoxError};
 
-/// Each simulation fuzz target and the registered harness it runs. A target
-/// must also be a `[[bin]]` of `qa/fuzz/sim/Cargo.toml`.
-const TARGETS: [(&str, &str); 2] = [
-    ("discovery_wait_complete", "discovery/wait-complete"),
-    ("race_fixtures", "fixtures/all"),
-];
+/// The fuzz package's metadata table that maps each target to the
+/// registered harness it runs.
+const TARGETS_TABLE: &str = "[package.metadata.zakura-sim.targets]";
 
 /// The variable the fuzz target's filter reads (`qa/fuzz/sim/src/fuzz.rs`).
 const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
+
+/// What the fuzz target prints before the filter's panic, followed by the
+/// harness it runs (`qa/fuzz/sim/src/fuzz.rs`).
+const HARNESS_LINE: &str = "zakura-sim-fuzz harness: ";
 
 /// The file `zakura-sim confirm` writes into its `--out`.
 const CONFIRMATION_FILE: &str = "confirmation.json";
@@ -226,7 +229,7 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
     let harness = resolve_target(repo_root, &target)?;
     Ok(Request {
         target,
-        harness: harness.to_owned(),
+        harness,
         input: path::absolute(input)?,
         property,
         out,
@@ -235,33 +238,81 @@ fn parse(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Request
     })
 }
 
-/// The harness `target` runs. The target must be in [`TARGETS`] and a
-/// `[[bin]]` of the simulation fuzz package's manifest.
-fn resolve_target(repo_root: &Path, target: &str) -> Result<&'static str, BoxError> {
-    let harness = TARGETS
+/// The harness `target` runs, from the fuzz package's [`fuzz_targets`].
+fn resolve_target(repo_root: &Path, target: &str) -> Result<String, BoxError> {
+    let mut targets = fuzz_targets(repo_root)?;
+    targets.remove(target).ok_or_else(|| {
+        let known: Vec<_> = targets.keys().map(String::as_str).collect();
+        format!(
+            "unknown simulation fuzz target `{target}`; expected one of {}",
+            known.join(", ")
+        )
+        .into()
+    })
+}
+
+/// Each fuzz target and the harness it runs, as `cargo metadata` reads them
+/// from the fuzz package's manifest: every `[[bin]]` needs an entry in
+/// [`TARGETS_TABLE`], and every entry a `[[bin]]`. `zakura-sim confirm`
+/// checks that the harness is registered, and [`ran_harness`] that the
+/// target runs it.
+fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, String>, BoxError> {
+    let manifest = fuzz_dir(repo_root).join("Cargo.toml");
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let output = Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed on {}: {}",
+            manifest.display(),
+            tail(&String::from_utf8_lossy(&output.stderr))
+        )
+        .into());
+    }
+    let metadata: Value = serde_json::from_slice(&output.stdout)?;
+    let package = &metadata["packages"][0];
+    let bins: Vec<&str> = package["targets"]
+        .as_array()
+        .ok_or_else(|| format!("cargo metadata lists no targets for {}", manifest.display()))?
         .iter()
-        .find(|(name, _)| *name == target)
-        .map(|(_, harness)| *harness)
-        .ok_or_else(|| {
-            let known: Vec<_> = TARGETS.iter().map(|(name, _)| *name).collect();
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+        })
+        .filter_map(|target| target["name"].as_str())
+        .collect();
+    let empty = serde_json::Map::new();
+    let mapped = package["metadata"]["zakura-sim"]["targets"]
+        .as_object()
+        .unwrap_or(&empty);
+    let mut targets = BTreeMap::new();
+    for bin in &bins {
+        let harness = mapped.get(*bin).ok_or_else(|| {
             format!(
-                "unknown simulation fuzz target `{target}`; expected one of {}",
-                known.join(", ")
+                "{} declares fuzz target `{bin}` but maps it to no harness in {TARGETS_TABLE}",
+                manifest.display()
             )
         })?;
-    let manifest = fs::read_to_string(fuzz_dir(repo_root).join("Cargo.toml"))?;
-    let manifest: toml::Value = toml::from_str(&manifest)?;
-    let declared = manifest
-        .get("bin")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|bins| {
-            bins.iter()
-                .any(|bin| bin.get("name").and_then(toml::Value::as_str) == Some(target))
-        });
-    if !declared {
-        return Err(format!("qa/fuzz/sim/Cargo.toml declares no `{target}` target").into());
+        let harness = harness.as_str().ok_or_else(|| {
+            format!(
+                "{} maps `{bin}` to {harness}, not to a harness's name",
+                manifest.display()
+            )
+        })?;
+        targets.insert((*bin).to_owned(), harness.to_owned());
     }
-    Ok(harness)
+    if let Some(name) = mapped.keys().find(|name| !bins.contains(&name.as_str())) {
+        return Err(format!(
+            "{} maps `{name}` to a harness in {TARGETS_TABLE} but declares no such [[bin]]",
+            manifest.display()
+        )
+        .into());
+    }
+    Ok(targets)
 }
 
 /// The simulation fuzz package.
@@ -1180,7 +1231,10 @@ impl Checker<'_> {
     ///    original's confirmation `against` if given;
     /// 3. `zakura-sim replay` must replay the confirmed trace Exact.
     ///
-    /// The first failed check rejects the input. `None` if interrupted.
+    /// The first failed check rejects the input. `None` if interrupted. A
+    /// fuzz target that names another harness than the request's, and a
+    /// `zakura-sim confirm` that refuses its arguments, such as an
+    /// unregistered harness, fail the wrapper instead.
     fn check_input(&self, dir: &Path, against: Option<&Path>) -> Result<Option<Verdict>, BoxError> {
         let out = &self.request.out;
         let input = dir.join(INPUT_FILE);
@@ -1225,6 +1279,24 @@ impl Checker<'_> {
             verdict.crash = Some(crash);
             return Ok(Some(verdict));
         }
+        let (target, harness) = (&self.request.target, &self.request.harness);
+        match ran_harness(&read_log(&fuzz_log)?) {
+            Some(ran) if ran == harness.as_str() => {}
+            Some(ran) => {
+                return Err(format!(
+                    "the fuzz target `{target}` ran harness `{ran}`, \
+                     not `{harness}` as its manifest maps it"
+                )
+                .into())
+            }
+            None => {
+                return Err(format!(
+                    "the fuzz target `{target}` named no harness; see {}",
+                    fuzz_log.display()
+                )
+                .into())
+            }
+        }
 
         let confirm_dir = dir.join("confirm");
         let confirm_log = dir.join("confirm.log");
@@ -1262,7 +1334,8 @@ impl Checker<'_> {
             }
             ChildEnd::Exited(2) => {
                 return Err(format!(
-                    "zakura-sim confirm refused its arguments; see {}",
+                    "zakura-sim confirm refused its arguments: {}; see {}",
+                    usage_error(&read_log(&confirm_log)?),
                     confirm_log.display()
                 )
                 .into())
@@ -1557,6 +1630,22 @@ fn tail(log: &str) -> String {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("no output")
         .to_owned()
+}
+
+/// The harness the fuzz target's output `log` names after [`HARNESS_LINE`],
+/// the last one if it names several.
+fn ran_harness(log: &str) -> Option<&str> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(HARNESS_LINE))
+}
+
+/// The message of `zakura-sim`'s usage error in `log`, which precedes the
+/// usage text, else `log`'s last line.
+fn usage_error(log: &str) -> String {
+    log.lines()
+        .find_map(|line| line.strip_prefix("error: "))
+        .map_or_else(|| tail(log), str::to_owned)
 }
 
 /// A JSON file.

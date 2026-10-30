@@ -13,27 +13,35 @@ use super::*;
 /// `zakura-sim`: `confirm` writes a confirmation whose status the input's
 /// keywords pick, and `replay` fails for a trace named `bad`. A keyword can
 /// also make `confirm` hang, die from a signal, fail without a
-/// confirmation, or refuse its arguments.
+/// confirmation, or refuse its arguments. `confirm` refuses a harness other
+/// than `fixtures/all` and `discovery/wait-complete` the way the real
+/// binary does.
 const SIM: &str = r#"#!/bin/sh
+usage() { echo "error: $1"; echo; echo "usage: zakura-sim <subcommand>"; exit 2; }
 cmd=$1; shift
 case "$cmd" in
 confirm)
   against=
   while [ $# -gt 0 ]; do
     case "$1" in
+      --sim) sim=$2;;
       --input) input=$2;;
       --out) out=$2;;
       --against) against=$2;;
     esac
     shift 2
   done
+  case "$sim" in
+    fixtures/all|discovery/wait-complete) ;;
+    *) usage "no harness is named \`$sim\`" >&2;;
+  esac
   body=$(cat "$input")
   mkdir -p "$out"
   case "$body" in
     *hang-confirm*) sleep 30;;
     *segv-confirm*) kill -SEGV $$;;
     *fail-confirm*) echo "the trace can't go there" >&2; exit 1;;
-    *refuse-confirm*) echo "fixtures/all doesn't register it" >&2; exit 2;;
+    *refuse-confirm*) usage "fixtures/all doesn't register it" >&2;;
   esac
   status=confirmed
   case "$body" in
@@ -57,7 +65,9 @@ exit 2
 "#;
 
 /// The fuzz target: crashes the way the input's keywords say, else with the
-/// filter's panic. It refuses to run without the filter.
+/// filter's panic, after naming its harness: `fixtures/all`, or
+/// `fixtures/none` for an input with `unregistered`. It refuses to run
+/// without the filter.
 const FUZZ: &str = r#"#!/bin/sh
 for input; do :; done
 [ -n "$ZAKURA_SIM_EXPECT" ] || { echo "no filter"; exit 3; }
@@ -68,6 +78,9 @@ case "$body" in
   *timeout*) echo "==1== ERROR: libFuzzer: timeout after 2 seconds"; exit 70;;
   *nocrash*) echo "Executed $input in 1 ms"; exit 0;;
 esac
+harness=fixtures/all
+case "$body" in *unregistered*) harness=fixtures/none;; esac
+echo "zakura-sim-fuzz harness: $harness"
 printf "thread 'zakura-sim-explore' (4242) panicked at src/fuzz.rs:198:9:\n%s\n" "$ZAKURA_SIM_EXPECT"
 printf "thread '<unnamed>' (4241) panicked at library/core/src/panicking.rs:225:5:\n"
 echo "panic in a function that cannot unwind"
@@ -504,7 +517,9 @@ fn a_wrapper_failure_still_writes_a_report() {
     assert_eq!(report.status, Status::Error, "{report:#?}");
     let reason = report.reason.as_deref().unwrap();
     assert!(
-        reason.starts_with("zakura-sim confirm refused its arguments; see "),
+        reason.starts_with(
+            "zakura-sim confirm refused its arguments: fixtures/all doesn't register it; see "
+        ),
         "{reason}"
     );
     assert_eq!(report.reduction.end, ReductionEnd::NotRun);
@@ -517,6 +532,45 @@ fn a_wrapper_failure_still_writes_a_report() {
         error.starts_with("error: zakura-sim confirm refused"),
         "{error}"
     );
+}
+
+/// A target whose mapped harness `zakura-sim` doesn't register ends the run
+/// with an error that names the harness, before `tmin` runs.
+#[test]
+fn an_unregistered_harness_is_an_error() {
+    let original = b"unregistered original input";
+    let mut fake = Fake::new(original, &[b"good"]);
+    fake.request.harness = "fixtures/none".to_owned();
+    let report = fake.run(TminScript::default());
+    assert_eq!(report.status, Status::Error, "{report:#?}");
+    let reason = report.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with(
+            "zakura-sim confirm refused its arguments: no harness is named `fixtures/none`; see "
+        ),
+        "{reason}"
+    );
+    assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+    assert!(!fake.out(TMIN_DIR).exists());
+}
+
+/// A target that runs another harness than the manifest maps it to ends
+/// the run with an error, before `tmin` runs.
+#[test]
+fn a_target_running_another_harness_is_an_error() {
+    let mut fake = Fake::new(ORIGINAL, &[b"good"]);
+    fake.request.harness = "discovery/wait-complete".to_owned();
+    let report = fake.run(TminScript::default());
+    assert_eq!(report.status, Status::Error, "{report:#?}");
+    assert_eq!(
+        report.reason.as_deref(),
+        Some(
+            "the fuzz target `race_fixtures` ran harness `fixtures/all`, \
+             not `discovery/wait-complete` as its manifest maps it"
+        )
+    );
+    assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+    assert!(!fake.out(TMIN_DIR).exists());
 }
 
 /// An interrupt while `tmin` runs kills it, keeps the original and `tmin`'s
@@ -768,13 +822,104 @@ fn tmin_gets_the_budget() {
     );
 }
 
-/// Every target the wrapper maps is a `[[bin]]` of the fuzz package.
+/// The fuzz package's manifest maps its targets.
 #[test]
-fn every_mapped_target_is_declared() {
+fn the_fuzz_package_maps_its_targets() {
     let root = crate::repo_root().unwrap();
-    for (target, harness) in TARGETS {
+    for (target, harness) in [
+        ("discovery_wait_complete", "discovery/wait-complete"),
+        ("race_fixtures", "fixtures/all"),
+    ] {
         assert_eq!(resolve_target(&root, target).unwrap(), harness);
     }
+}
+
+/// A checkout whose fuzz package declares `bins` and maps `mapped` to
+/// harnesses.
+fn fuzz_package(bins: &[&str], mapped: &[(&str, &str)]) -> TempDir {
+    let root = TempDir::new().unwrap();
+    let package = fuzz_dir(root.path());
+    fs::create_dir_all(package.join("fuzz_targets")).unwrap();
+    let mut manifest = "[package]\nname = \"zakura-sim-fuzz\"\nversion = \"0.0.0\"\n\
+                        publish = false\nedition = \"2021\"\n\n\
+                        [package.metadata.zakura-sim.targets]\n"
+        .to_owned();
+    for (target, harness) in mapped {
+        manifest.push_str(&format!("{target} = \"{harness}\"\n"));
+    }
+    for bin in bins {
+        let path = format!("fuzz_targets/{bin}.rs");
+        fs::write(package.join(&path), "fn main() {}\n").unwrap();
+        manifest.push_str(&format!("\n[[bin]]\nname = \"{bin}\"\npath = \"{path}\"\n"));
+    }
+    manifest.push_str("\n[workspace]\n");
+    fs::write(package.join("Cargo.toml"), manifest).unwrap();
+    root
+}
+
+/// A target that the fuzz package declares and maps resolves to its
+/// harness, with no other list to edit.
+#[test]
+fn a_declared_and_mapped_target_resolves() {
+    let bins = ["discovery_wait_complete", "race_fixtures", "header_storage"];
+    let root = fuzz_package(
+        &bins,
+        &[
+            ("discovery_wait_complete", "discovery/wait-complete"),
+            ("race_fixtures", "fixtures/all"),
+            ("header_storage", "header-sync/storage"),
+        ],
+    );
+    assert_eq!(
+        resolve_target(root.path(), "header_storage").unwrap(),
+        "header-sync/storage"
+    );
+    assert_eq!(
+        resolve_target(root.path(), "race_fixtures").unwrap(),
+        "fixtures/all"
+    );
+}
+
+/// A `[[bin]]` without a harness, or a harness without a `[[bin]]`, fails
+/// every resolution with an error that names it.
+#[test]
+fn every_target_needs_a_bin_and_a_harness() {
+    let unmapped = fuzz_package(
+        &["race_fixtures", "header_storage"],
+        &[("race_fixtures", "fixtures/all")],
+    );
+    let manifest = fuzz_dir(unmapped.path()).join("Cargo.toml");
+    for target in ["race_fixtures", "header_storage"] {
+        assert_eq!(
+            resolve_target(unmapped.path(), target)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "{} declares fuzz target `header_storage` but maps it to no harness \
+                 in [package.metadata.zakura-sim.targets]",
+                manifest.display()
+            )
+        );
+    }
+
+    let undeclared = fuzz_package(
+        &["race_fixtures"],
+        &[
+            ("race_fixtures", "fixtures/all"),
+            ("header_storage", "header-sync/storage"),
+        ],
+    );
+    let manifest = fuzz_dir(undeclared.path()).join("Cargo.toml");
+    assert_eq!(
+        resolve_target(undeclared.path(), "race_fixtures")
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "{} maps `header_storage` to a harness in \
+             [package.metadata.zakura-sim.targets] but declares no such [[bin]]",
+            manifest.display()
+        )
+    );
 }
 
 /// Reading the checkout's provenance leaves the git dir alone, so `cargo

@@ -2706,3 +2706,38 @@ async fn the_subscriber_reopens_a_pruned_peer_without_records() {
     );
     harness.check_quiet().await;
 }
+
+/// A page's attempt takes its bytes from what the job meant, not from the
+/// frame it carries: a page whose frame was swapped for one of another
+/// length still attempts the job's bytes, so the writer's summary of the
+/// swapped frame disagrees with it (M6a-6).
+///
+/// This fails if the attempt reads the frame's payload length.
+#[test]
+fn a_page_attempt_keeps_the_jobs_bytes() {
+    let genesis = Frontier::new(
+        block::Height(0),
+        zakura_chain::block::genesis::regtest_genesis_block().hash(),
+    );
+    let last = Frontier::new(block::Height(2), block::Hash([3; 32]));
+    let page = Page {
+        parent: genesis,
+        last,
+        target: last,
+        count: 2,
+        reaches_target: false,
+        frame: Frame {
+            message_type: super::super::message_type::HEADERS,
+            flags: 0,
+            payload: vec![0; 999],
+        },
+        bytes: 444,
+    };
+    let attempt = page_attempt(7, &page);
+    assert_eq!(attempt.bytes, 444);
+    assert_eq!(
+        attempt,
+        super::super::summary::page(7, 2, 444, &last),
+        "the attempt is the job's page"
+    );
+}

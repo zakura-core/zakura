@@ -904,13 +904,7 @@ fn settle(
         // its slot.
         Progress::Page(page, slot) => {
             if lock(shared).commit(id, &page) {
-                sim_chain!(slot => attempting(Some(super::summary::page(
-                    id,
-                    page.count,
-                    page.bytes,
-                    &page.last,
-                ))))
-                .send(page.frame);
+                sim_chain!(slot => attempting(Some(page_attempt(id, &page)))).send(page.frame);
             }
             true
         }
@@ -921,6 +915,15 @@ fn settle(
         }
         Progress::Closed => false,
     }
+}
+
+/// The attempt of `page` for subscription `id`, from what its job meant: its
+/// header count, the bytes the job meant it to take and its last frontier,
+/// never the frame's own length, so a frame substituted after the job
+/// built the page disagrees with it (M6a-6).
+#[cfg(any(test, zakura_sim))]
+fn page_attempt(id: u64, page: &Page) -> crate::zakura::FrameSummary {
+    super::summary::page(id, page.count, page.bytes, &page.last)
 }
 
 /// Wait until any of `signals` is released, or forever if there are none.

@@ -1106,7 +1106,7 @@ impl PeerWorkQueue {
         count: usize,
         named: Option<crate::zakura::header_sync::observe::Placement>,
     ) {
-        use crate::zakura::header_sync::observe::{Placement, ReactorEvent};
+        use crate::zakura::header_sync::observe::{Binding, Placement, ReactorEvent};
 
         let reservation = self
             .request_reservations
@@ -1144,6 +1144,7 @@ impl PeerWorkQueue {
             self.observer.emit(ReactorEvent::Bound {
                 reservation,
                 incarnation,
+                via: Binding::Continuation,
             });
         }
     }
@@ -1152,7 +1153,7 @@ impl PeerWorkQueue {
     /// reservation bound to it.
     #[cfg(any(test, zakura_sim))]
     fn incarnate(&mut self, mut request: ActiveHeaderRequest) -> ActiveHeaderRequest {
-        use crate::zakura::header_sync::observe::ReactorEvent;
+        use crate::zakura::header_sync::observe::{Binding, ReactorEvent};
 
         self.last_incarnation += 1;
         request.incarnation = self.last_incarnation;
@@ -1165,6 +1166,7 @@ impl PeerWorkQueue {
         self.observer.emit(ReactorEvent::Bound {
             reservation,
             incarnation: request.incarnation,
+            via: Binding::Start,
         });
         request
     }

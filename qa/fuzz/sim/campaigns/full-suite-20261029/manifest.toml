@@ -17,14 +17,14 @@ cpus = 8
 # checks that each is an ancestor of the checkout.
 [integration]
 base = "4eab091b605ff7adab9f37515195d58f1362633c"
-pull_1824 = "476415833998f2c17a5cb83558674306a52bc8d6"
-pull_1825 = "93c80ecad678f894120ac08fd2da4f9616765358"
-pull_1826 = "583f3f8fdaa4f1b2de7c85cc2979097985f5e866"
+pull_1824 = "a7188518fb2cfbacb762948cbaef9ef024e0dc34"
+pull_1825 = "e3fd6bf5e9c97cb2a5f2216662e8c03a248a8cad"
+pull_1826 = "19d8df59e4be615a92c46bfcc2144c965d8e5b59"
 pull_1830 = "3a99a568551191a17794e9d2af47f9e4ac221db1"
 pull_1831 = "26111ae5fe42e8ddefe3d10167327f60b44a184a"
 pull_1832 = "1d84808bcba8d398dd90db57a80e093c6aed91fa"
-pull_1833 = "f3a60bb1c0e33021ea94a50b37242c531c908551"
-pull_1837 = "0dfcf619efb0dbd08ccbacd50bdc512446b1d718"
+pull_1833 = "b1768050e41dedb650bbb27132ec1c4e6769cef7"
+pull_1837 = "e262629e4616de7a4a5414f3ccdaf7d7617d620e"
 
 # `scripts/fuzz-campaign.py` checks `fuzz`, `trace` and `contract` against
 # the frozen suite manifest, and seeds corpora with `rust`'s cargo.

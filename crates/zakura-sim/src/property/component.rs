@@ -348,7 +348,10 @@ pub enum Coherence {
     Ready,
     /// Not yet shown to exist.
     Initializing,
-    /// In transition, ended, or with a tag in flux.
+    /// Ended after a current read: its last state is known, but it isn't
+    /// current.
+    Ended,
+    /// In transition, ended in transition, or with a tag in flux.
     Unsettled,
     /// Current, but its read isn't from the boundary.
     Stale,
@@ -361,6 +364,7 @@ impl<T: Clone + PartialEq + Tagged> Part for Component<T> {
             State::Current { .. } if self.fresh_through != Some(step) => Coherence::Stale,
             State::Current { state } if state.in_flux().is_none() => Coherence::Ready,
             State::Initializing => Coherence::Initializing,
+            State::Ended(Ended::Seen { .. }) => Coherence::Ended,
             _ => Coherence::Unsettled,
         }
     }
@@ -375,7 +379,7 @@ impl<T: Clone + PartialEq + Tagged> Part for Component<T> {
 /// run at this boundary (rule 5): every part is current, with no tag
 /// `Creating` or `Releasing`. Otherwise it returns false. A part that exists
 /// but is mid-change records `Inconclusive::Unsettled` and lists a gap. A
-/// part still `Initializing` records nothing, as in [`require`]. A stale
+/// part still `Initializing`, or ended with a known state, records nothing. A stale
 /// part is a harness failure, as in [`require`].
 pub fn require_coherent<S: HasView>(cx: &mut CheckCtx<'_, S>, parts: &[&dyn Part]) -> bool {
     let mut coherent = true;
@@ -388,7 +392,7 @@ pub fn require_coherent<S: HasView>(cx: &mut CheckCtx<'_, S>, parts: &[&dyn Part
                 part.part_kind(),
                 cx.step
             )),
-            Coherence::Initializing => {}
+            Coherence::Initializing | Coherence::Ended => {}
             Coherence::Unsettled => {
                 cx.gap(part.part_kind());
                 unsettled = true;
@@ -524,8 +528,9 @@ mod tests {
     }
 
     /// Reconciliation waits while one part is in transition, another lists
-    /// an object still being created, or a third doesn't exist yet, and
-    /// runs once all are ready. Only the first two record `Unsettled`.
+    /// an object still being created, a third doesn't exist yet, or a
+    /// fourth ended, and runs once all are ready. Only the first two record
+    /// `Unsettled`.
     #[test]
     fn reconciliation_waits_for_coherent_parts() {
         let live = || Objects(vec![TagPhase::Live]);
@@ -559,6 +564,17 @@ mod tests {
             coherent(2, &[&initializing, &ready]),
             (false, None, 0),
             "a part that doesn't exist yet isn't mid-change"
+        );
+        let mut ended = existing();
+        ended.read(1, Read::Current(live())).expect("a first read");
+        ended
+            .read(2, Read::Gone)
+            .expect("a read at the next boundary");
+        assert!(matches!(ended.state(), State::Ended(Ended::Seen { .. })));
+        assert_eq!(
+            coherent(2, &[&ended, &ready]),
+            (false, None, 0),
+            "a part that ended with a known state isn't mid-change"
         );
         creating
             .read(3, Read::Current(Objects(vec![TagPhase::Live; 2])))

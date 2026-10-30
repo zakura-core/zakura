@@ -921,10 +921,15 @@ async fn an_inbound_connection_without_a_permit_is_refused() -> Result<(), BoxEr
     handler.serve_inbound(connection.clone(), None).await;
     assert_eq!(
         recorder.events(),
-        vec![TransportEvent::HandshakeRefused {
-            remote: connection.admitted_addr(),
-            reason: "admission".to_owned(),
-        }]
+        vec![
+            TransportEvent::ReadRegistered {
+                key: crate::zakura::diag::ReadKey::SupervisorMap,
+            },
+            TransportEvent::HandshakeRefused {
+                remote: connection.admitted_addr(),
+                reason: "admission".to_owned(),
+            },
+        ]
     );
     link.close().await;
     Ok(())

@@ -589,10 +589,19 @@ fn a_bad_nonce_echo_is_refused() {
             .iter()
             .map(|event| (event.connection, event.remote.clone(), event.fact.clone()))
             .collect();
+        // The handler registers its map's read first, as it's built (M6a-7b).
         // The node's dial then fails with the same error.
         assert_eq!(
             seen,
             [
+                (
+                    None,
+                    zakura_sim::peer::NODE_ADDR.to_string(),
+                    TransportFact::ReadRegistered {
+                        key: "supervisor-map".to_owned(),
+                        generation: 1,
+                    }
+                ),
                 (
                     None,
                     remote(0, 0),

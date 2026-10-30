@@ -36,6 +36,8 @@ rand_10 = { workspace = true }
 # observation encoding.
 zakura-storage = { path = "../zakura-storage" }
 zakura-header-chain = { path = "../zakura-header-chain" }
+# The sidecars of committed fuzz seeds.
+toml = { workspace = true }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
@@ -46,8 +48,6 @@ rayon = { workspace = true }
 # to check that equal records still write equal bytes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
-# The sidecars of committed fuzz inputs.
-toml = { workspace = true }
 # A runtime for the serving tool in the model agreement tests.
 tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = { workspace = true }

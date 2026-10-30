@@ -6,8 +6,8 @@
 //! A shell script stands in for the libFuzzer binary. It takes the flags
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
-//! say: crash once or always, end at the abandonment limit, log a feedback
-//! line, or hang in a merge. It exits when its parent does, as a real
+//! say: crash once or always, end at the abandonment limit, exit 0 early,
+//! log a feedback line, or hang in a merge. It exits when its parent does, as a real
 //! fuzzer does when a terminal's interrupt reaches its process group.
 #![cfg(zakura_sim)]
 
@@ -97,6 +97,10 @@ while [ "$(date +%s%N)" -lt "$end" ]; do
       printf 'crash %s' "$$" > "$ZAKURA_SIM_ARTIFACTS/inputs/active/stub/$$.bin"
       echo "==$$== ERROR: libFuzzer: deadly signal" >&2
       exit 1
+    fi
+    if [ -e "$control/exit-early" ]; then
+      echo "Done $i runs in 0 second(s)" >&2
+      exit 0
     fi
     if mv "$control/abandon" "$control/abandon-taken-$$" 2>/dev/null; then
       echo "panicked: @ABANDON@: 1 runs abandoned their cleanup" >&2
@@ -531,6 +535,35 @@ fn workers_restart_failed_fuzzers_up_to_their_limit() {
     // Each crash left a libFuzzer artifact and a saved input.
     assert_eq!(end.failures.len(), 6, "{:?}", end.failures);
     assert!(end.added > 0, "the crashed processes' additions are kept");
+}
+
+/// A fuzzer that exits 0 before its time limit hasn't spent its budget:
+/// the worker restarts it, and stops at its restart limit, so the run
+/// isn't complete.
+#[test]
+fn fuzzers_that_exit_early_leave_the_run_incomplete() {
+    let fixture = Fixture::new();
+    fixture.set("exit-early");
+    let (run, end) = start(&fixture.store, fixture.options(1, 30));
+    assert_eq!(end.status, Status::WorkerStopped, "{end:?}");
+    assert_eq!(end.workers[0].outcome, WorkerOutcome::RestartLimit);
+    assert_eq!(
+        end.workers[0].attempts, 3,
+        "the first process and 2 restarts"
+    );
+    let log = fs::read_to_string(
+        fixture
+            .store
+            .run_dir(&run)
+            .join("workers/0")
+            .join(ATTEMPTS_FILE),
+    )
+    .unwrap();
+    assert!(log.lines().all(|line| {
+        serde_json::from_str::<campaign::Attempt>(line).unwrap().end == AttemptEnd::EarlyExit
+    }));
+    let output = fixture.cli(&["resume", "--seconds", "1"]);
+    assert!(!output.status.success(), "{output:?}");
 }
 
 /// Acceptance test 3's compaction part: a compaction that hangs past its

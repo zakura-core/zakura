@@ -38,7 +38,7 @@
 //!
 //! A run is one manifest. Its supervisor runs each worker's fuzzer
 //! processes until the worker's budget is spent, restarting a process that
-//! fails. When the workers stop, it saves the union of the initial snapshot
+//! fails or exits before its time limit. When the workers stop, it saves the union of the initial snapshot
 //! and every worker's corpus as a new snapshot, optionally compacts that
 //! snapshot with libFuzzer's merge into another, and writes the end record.
 //! Every run ends with exactly one end record, whose [`Status`] means one

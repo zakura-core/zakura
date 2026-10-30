@@ -106,6 +106,9 @@ pub enum WorkerOutcome {
 pub enum AttemptEnd {
     /// It exited 0 at its time limit.
     Finished,
+    /// It exited 0 before its time limit, without a failure. The worker
+    /// restarts it, as after a failure, since its budget isn't spent.
+    EarlyExit,
     /// The target reached its abandonment limit, and exited for the
     /// supervisor to restart it.
     AbandonLimit,
@@ -420,7 +423,9 @@ impl Worker<'_> {
             let attempt = self.attempt(attempts, seconds, &corpus, &artifacts)?;
             spent += Duration::from_millis(attempt.millis);
             attempts += 1;
-            if attempt.end == AttemptEnd::Finished || spent >= budget {
+            // Only the time the processes ran spends the budget: a process
+            // that exits 0 early hasn't fuzzed for it.
+            if spent >= budget {
                 break WorkerOutcome::BudgetSpent;
             }
             if attempts > self.budget.max_restarts {
@@ -475,7 +480,8 @@ impl Worker<'_> {
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let failure = ProcessFailure::of(exit, &output);
         let end = match &failure {
-            None => AttemptEnd::Finished,
+            None if millis >= seconds.saturating_mul(1000) => AttemptEnd::Finished,
+            None => AttemptEnd::EarlyExit,
             Some(_) if String::from_utf8_lossy(&output).contains(ABANDON_LIMIT_PANIC) => {
                 AttemptEnd::AbandonLimit
             }

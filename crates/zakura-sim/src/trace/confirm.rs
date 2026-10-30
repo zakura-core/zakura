@@ -409,7 +409,7 @@ fn judge(
             confirmation.trace_id = Some(trace.id);
             Ok(confirmation)
         }
-        Err(RecordError::Nondeterministic { detail }) => {
+        Err(RecordError::Nondeterministic { detail, .. }) => {
             confirmation.status = ConfirmStatus::Nondeterministic;
             confirmation.detail = Some(detail);
             Ok(confirmation)

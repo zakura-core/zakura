@@ -229,6 +229,11 @@ package = "rpc"
 name = "json_rpc_request"
 reason = "JSON-RPC parsing isn't a P2P DoS property; rpc-fuzz.yml keeps fuzzing it nightly"
 
+[[excluded-target]]
+package = "sim"
+name = "feedback_probe"
+reason = "runs no registered harness; `cargo xtask sim-feedback` builds it to check that libFuzzer keeps an input for a semantic feature alone"
+
 # Harnesses no target runs yet. Each stays in the report as unimplemented.
 [[missing-target]]
 harness = "header-sync/smoke"

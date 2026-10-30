@@ -17,6 +17,8 @@
 //!   unsettled if it was cancelled or panicked, and a harness failure if it
 //!   completed without its final snapshot.
 //! * If its task didn't run, nothing it owns changed.
+//! * Dropped before it ever started, as an abort before its task's first
+//!   poll leaves it, it ends unsettled.
 //!
 //! The reactor is bound to the task that ran when it reported
 //! `Resumed{arm: start}`, by that task's scheduler name, which is unique
@@ -236,6 +238,12 @@ impl ReactorLife {
             };
             self.task = Some(task.to_owned());
             self.exists(step)?;
+        }
+        // Dropped before it ever ran, as an abort before the task's first
+        // poll leaves it: it never started, so it ends unsettled.
+        if self.task.is_none() && self.component.live() && self.link.unfinished_drop() {
+            self.exists(step)?;
+            return self.end(step, None);
         }
         let stop = match outcome {
             Some(obs) if ran.is_some() && ran == self.task.as_deref() => match obs {
@@ -1072,6 +1080,43 @@ mod tests {
                 "{stopping:?}"
             );
         }
+    }
+
+    /// The real reactor, aborted at setup, before its task's first poll,
+    /// reports only its build snapshot and never starts. Its task's
+    /// cancellation drops its observer, and it ends unsettled with no
+    /// failure.
+    ///
+    /// This fails if a reactor that never bound its task can't end.
+    #[test]
+    fn a_reactor_aborted_before_its_first_poll_ends_unsettled() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let port: Arc<dyn Port> = fixture.port.clone();
+        let header = HeaderFixture::regtest();
+        let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
+        startup.observer = slot;
+        let (handle, actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+        reactor.abort();
+        fixture
+            .sim
+            .scheduler()
+            .spawn_root("idle", async { zakura_rt::task::yield_now().await });
+        let (report, life) = fixture.run(&mut States::default());
+        drop((handle, actions, repairs));
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(facts[..], [(0, ReactorFact::Settled { turn: 0, .. })]),
+            "only the build reports: {facts:?}"
+        );
+        assert!(
+            report.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::TaskExited { task, exit: Exit::Cancelled } if task.starts_with("header_sync_reactor"))),
+            "the reactor's task is cancelled"
+        );
+        assert_eq!(life.borrow().task(), None, "it never started");
+        assert_eq!(name(life.borrow().component().state()), "ended-unsettled");
     }
 
     /// A pairing failure that isn't a dropped call's receipt fails the run

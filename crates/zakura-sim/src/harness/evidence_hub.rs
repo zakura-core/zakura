@@ -1574,5 +1574,35 @@ mod tests {
             let failed = hub.observe(&mut log).expect_err("no session row maps it");
             assert!(failed.starts_with("UnmappedSession"), "{failed}");
         }
+
+        /// An ignored outcome is no admitted work, but on the wire tier it
+        /// still names a tagged frame of its mapped session's stream. Each
+        /// break is a harness failure.
+        ///
+        /// This fails if only qualifying outcomes are checked.
+        #[test]
+        fn an_ignored_outcome_still_needs_its_identity() {
+            let outcome = |session_id, frame| {
+                reactor(ReactorFact::Outcome {
+                    session_id,
+                    subscription: 8,
+                    frame,
+                    disposition: "no-active".into(),
+                    incarnation: None,
+                })
+            };
+            let tagged = Some(frame(4, HeldDigest::default()));
+            assert_eq!(
+                derived(&write(vec![outcome(7, tagged)]).expect("the step is whole")),
+                []
+            );
+            for (row, name) in [
+                (outcome(7, None), "UntaggedFrame"),
+                (outcome(9, tagged), "UnmappedSession"),
+            ] {
+                let failed = write(vec![row]).expect_err("the outcome can't be attributed");
+                assert!(failed.starts_with(name), "{failed}");
+            }
+        }
     }
 }

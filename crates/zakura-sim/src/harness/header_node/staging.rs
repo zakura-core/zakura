@@ -224,7 +224,9 @@ impl StagedWork {
                 frame,
                 disposition,
                 ..
-            } if disposition == "retired" || disposition == "retried" => {
+            } => {
+                // Every wire outcome names a tagged frame of its session's
+                // stream, whatever the reactor did with it.
                 let frame = frame.ok_or_else(|| {
                     format!(
                         "UntaggedFrame: subscription {subscription}'s outcome came in no tagged \
@@ -232,6 +234,9 @@ impl StagedWork {
                     )
                 })?;
                 let (connection, rows) = joined(evidence, *session_id, &frame)?;
+                if disposition != "retired" && disposition != "retried" {
+                    return Ok(derived);
+                }
                 derived.push(Observation::WorkAdmitted {
                     connection,
                     frame: rows.outcome,

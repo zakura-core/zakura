@@ -52,6 +52,11 @@ def load_config(path):
         raise ValueError('revision must identify the deployed source commit')
     if config['seed_height'] >= 4465026 or config['seed_height'] < 4134000:
         raise ValueError('seed must be after NU6.3 and before public Testnet NU7')
+    if not 0 < config['seed_finalized_height'] <= config['seed_height']:
+        raise ValueError('finalized checkpoint must not exceed the full seed tip')
+    for field in ('seed_hash', 'seed_finalized_hash', 'seed_sha256', 'binary_sha256'):
+        if not re.fullmatch(r'[0-9a-f]{64}', config[field]):
+            raise ValueError('seed and binary hashes must be full lowercase hex values')
     return config
 
 
@@ -132,7 +137,7 @@ def node_config(config, run, index, mining=False):
     rpc_port = 18232 if index == 0 else 18332
     magic = json.dumps(run['magic_bytes'])
     address = json.dumps(config['miner_address'])
-    checkpoints = json.dumps([[0, list(bytes.fromhex('05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38')[::-1])], [config['seed_height'], list(bytes.fromhex(config['seed_hash'])[::-1])]])
+    checkpoints = json.dumps([[0, list(bytes.fromhex('05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38')[::-1])], [config['seed_finalized_height'], list(bytes.fromhex(config['seed_finalized_hash'])[::-1])]])
     return f'''[network]
 listen_addr = "0.0.0.0:{port}"
 initial_testnet_peers = ["127.0.0.1:{peer}"]

@@ -18,7 +18,8 @@ class NetworkTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.config = dict(root=str(self.root), service_prefix='pq-testnet',
                            revision='a' * 40, seed_height=4420648,
-                           seed_hash='b' * 64, miner_address='tmTestMiner',
+                           seed_hash='b' * 64, seed_finalized_height=4419648,
+                           seed_finalized_hash='d' * 64, miner_address='tmTestMiner',
                            public_peer='pq.valargroup.dev', seed_sha256='c' * 64,
                            seed_network_directory='nu7stagingv3', binary='/opt/zakurad')
         self.run = network.new_run(self.config)
@@ -31,7 +32,7 @@ class NetworkTests(unittest.TestCase):
             self.assertEqual(params['activation_heights']['NU7'], 4420649)
             self.assertEqual(params['pq_p2sh_activation_height'], 4420649)
             self.assertEqual(params['max_block_time_start_height'], 4420655)
-            self.assertEqual(params['checkpoints'][1], [4420648, list(bytes.fromhex(self.config['seed_hash'])[::-1])])
+            self.assertEqual(params['checkpoints'][1], [4419648, list(bytes.fromhex(self.config['seed_finalized_hash'])[::-1])])
             self.assertEqual(len(params['checkpoints'][0][1]), 32)
             self.assertFalse(config['mining']['internal_miner'])
         participant = tomllib.loads(network.participant_config(self.config, self.run))

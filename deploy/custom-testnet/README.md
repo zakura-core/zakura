@@ -34,7 +34,7 @@ neither necessary nor a five-minute schedule.
 
 `/etc/zakura-custom-testnet.json` pins the deployment root, service prefix, binary,
 source revision, miner receiving address, public peer, and seed URL provenance,
-height, hash, checksum, and original network directory. It contains no signing
+full and finalized tip heights/hashes, checksum, and original network directory. It contains no signing
 keys. Preserve the seed archive outside the disposable node directories.
 
 `install.py` installs the controller, the two node units, Caddy configuration,
@@ -52,6 +52,10 @@ participant; it does not change public Testnet or Mainnet.
 The seed database format may be upgraded only by the node's supported upgrade
 path. Do not edit its version file or rewind a pruned post-NU7 snapshot to
 fake a pre-NU7 seed. Snapshot restoration and node startup must pass before mining.
+
+The last configured checkpoint is the seed’s finalized tip, not its full tip.
+A checkpoint above the finalized tip prevents restoration of the non-finalized
+backup, leaving both nodes below the expected seed height.
 
 ## Join a run
 

@@ -355,6 +355,7 @@ impl Subsystem for Storage {
         );
         let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
         hub.reactor(tap.link(), Some(owners.clone()));
+        hub.selected_chain(&ports.node);
         let storage = storage.with_tap(tap).behind(&mut hub);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -610,6 +611,7 @@ impl Subsystem for HeaderWire {
         );
         let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
         hub.reactor(tap.link(), Some(owners.clone()));
+        hub.selected_chain(&ports.node);
         sim.add_source(Box::new(storage.with_tap(tap).behind(&mut hub)));
         let header = HeaderNode::spawn(
             sim,

@@ -14,7 +14,9 @@
 //! again.
 //!
 //! The budget's existence evidence is its reactor's first `Settled`, since
-//! the reactor builds the budget before it.
+//! the reactor builds the budget before it. The harness registers the
+//! selected chain's read itself, as it builds the node's port, so that
+//! read's existence evidence is the harness's construction.
 
 use std::{
     cell::{Cell, RefCell},
@@ -24,6 +26,7 @@ use std::{
 };
 
 use zakura_network::zakura::diag::{self, ComponentRead, OwnerState, ReadKey};
+use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     tap::read_key,
@@ -32,6 +35,7 @@ use super::{
 use crate::{
     observe::{ComponentReading, ComponentValue, ReactorFact},
     property::{ComponentKind, Read},
+    storage::point,
     Observation, ObservationLog,
 };
 
@@ -62,11 +66,32 @@ pub fn without_reads<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
+/// A read as the hub runs it: what the view folds, or a failure for a read
+/// it can't fold. The log's form is built only when the read changed (see
+/// [`record`]), so an unchanged read costs no allocation.
+type HarnessRead = Box<dyn Fn() -> Result<Read<Reading>, String>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Set while [`without_selected_chain_read`] runs its closure.
+    static NO_CHAIN_READ: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `run` with every harness built inside it skipping the selected
+/// chain's read registration, though the chain still exists.
+#[cfg(test)]
+pub(crate) fn without_selected_chain_read<T>(run: impl FnOnce() -> T) -> T {
+    NO_CHAIN_READ.with(|skip| skip.set(true));
+    let out = run();
+    NO_CHAIN_READ.with(|skip| skip.set(false));
+    out
+}
+
 /// One registered read the hub still runs.
 struct Live {
     kind: ComponentKind,
     generation: u64,
-    read: ComponentRead,
+    read: HarnessRead,
     /// The last read logged, if any.
     last: Option<Read<Reading>>,
     /// The changes logged so far.
@@ -89,8 +114,14 @@ pub(crate) struct BoundaryReads {
 
 impl BoundaryReads {
     /// The reads registered into `sink` by the reactor on tap `reactor`,
-    /// folded into `view`.
-    pub(crate) fn new(sink: ReadSink, view: Rc<RefCell<HeaderSyncView>>, reactor: u64) -> Self {
+    /// folded into `view`, or none if `off`, as for a hub that writes
+    /// nothing.
+    pub(crate) fn new(
+        sink: ReadSink,
+        view: Rc<RefCell<HeaderSyncView>>,
+        reactor: u64,
+        off: bool,
+    ) -> Self {
         BoundaryReads {
             sink,
             view,
@@ -98,7 +129,7 @@ impl BoundaryReads {
             live: Vec::new(),
             generations: BTreeMap::new(),
             budget_exists: false,
-            off: READS_OFF.with(Cell::get),
+            off: off || READS_OFF.with(Cell::get),
         }
     }
 
@@ -143,7 +174,7 @@ impl BoundaryReads {
                     self.live.push(Live {
                         kind,
                         generation: *generation,
-                        read,
+                        read: Box::new(move || reading(read())),
                         last: None,
                         seq: 0,
                     });
@@ -164,7 +195,7 @@ impl BoundaryReads {
         // Each read runs on its own, so one that reaches the runtime fails
         // the run as a harness failure, after the mark is cleared, instead
         // of unwinding through `Sim`.
-        let reads: Vec<Result<diag::Read<OwnerState>, String>> = self
+        let reads: Vec<Result<Result<Read<Reading>, String>, String>> = self
             .live
             .iter()
             .map(|live| {
@@ -182,14 +213,14 @@ impl BoundaryReads {
             })
             .collect();
         for (live, read) in self.live.iter_mut().zip(reads) {
-            let (read, logged) = reading(read?)?;
+            let read = read??;
             if live.last.as_ref() != Some(&read) {
                 live.seq += 1;
                 log.push(Observation::ComponentRead {
                     component: format!("{:?}", live.kind),
                     generation: live.generation,
                     seq: live.seq,
-                    read: logged,
+                    read: record(&read),
                 });
                 live.last = Some(read.clone());
             }
@@ -197,6 +228,46 @@ impl BoundaryReads {
         }
         self.live.retain(|live| live.last != Some(Read::Gone));
         Ok(())
+    }
+    /// Registers the selected chain's read of the node's `port`, which the
+    /// harness just built, so the chain exists from setup on. The read
+    /// peeks the engine's committed snapshot with no scheduling point, and
+    /// is held while a task holds the engine's lock.
+    pub(crate) fn selected_chain(&mut self, port: &Arc<ControlledPort>) {
+        if self.off {
+            return;
+        }
+        let kind = ComponentKind::SelectedChain;
+        let mut view = self.view.borrow_mut();
+        #[cfg(test)]
+        if NO_CHAIN_READ.with(Cell::get) {
+            view.exists(kind, 0);
+            return;
+        }
+        view.register(kind);
+        view.exists(kind, 0);
+        let port = Arc::downgrade(port);
+        self.live.push(Live {
+            kind,
+            generation: 1,
+            read: Box::new(move || {
+                // Dropped before the read returns, and never the last one,
+                // since the harness keeps the port.
+                let Some(port) = port.upgrade() else {
+                    return Ok(Read::Gone);
+                };
+                let peeked = port.engine().peek_snapshot();
+                drop(port);
+                Ok(match peeked {
+                    Some(chain) => Read::Current(Reading::SelectedChain(chain)),
+                    None => Read::Held {
+                        holder: "a task".to_owned(),
+                    },
+                })
+            }),
+            last: None,
+            seq: 0,
+        });
     }
 }
 
@@ -217,27 +288,45 @@ fn kind(key: &ReadKey) -> Result<ComponentKind, String> {
     }
 }
 
-/// `read` as the view folds it, and as the log holds it.
-fn reading(read: diag::Read<OwnerState>) -> Result<(Read<Reading>, ComponentReading), String> {
+/// `read` as the view folds it.
+fn reading(read: diag::Read<OwnerState>) -> Result<Read<Reading>, String> {
     Ok(match read {
-        diag::Read::Current(OwnerState::Budget(counters)) => (
-            Read::Current(Reading::Budget(counters)),
-            // Counts of at most 4,000 headers fit u64.
+        diag::Read::Current(OwnerState::Budget(counters)) => {
+            Read::Current(Reading::Budget(counters))
+        }
+        diag::Read::Current(unknown) => {
+            return Err(format!("UnknownRead: no component holds {unknown:?}"))
+        }
+        diag::Read::Held { holder } => Read::Held { holder },
+        diag::Read::Gone => Read::Gone,
+    })
+}
+
+/// `read` as the log holds it.
+fn record(read: &Read<Reading>) -> ComponentReading {
+    match read {
+        // Counts of at most 4,000 headers fit u64.
+        Read::Current(Reading::Budget(counters)) => {
             ComponentReading::Current(ComponentValue::Budget {
                 capacity: counters.capacity as u64,
                 reserved: counters.reserved as u64,
                 owned: counters.owned as u64,
-            }),
-        ),
-        diag::Read::Current(unknown) => {
-            return Err(format!("UnknownRead: no component holds {unknown:?}"))
+            })
         }
-        diag::Read::Held { holder } => (
-            Read::Held {
-                holder: holder.clone(),
-            },
-            ComponentReading::Held { holder },
-        ),
-        diag::Read::Gone => (Read::Gone, ComponentReading::Gone),
-    })
+        Read::Current(Reading::SelectedChain(chain)) => {
+            ComponentReading::Current(ComponentValue::SelectedChain {
+                header_generation: chain.header_generation.get(),
+                finalized: point(chain.frontiers.finalized),
+                header_best: point(chain.frontiers.header_best),
+                verified_best: point(chain.frontiers.verified_best),
+            })
+        }
+        Read::Current(Reading::Reactor(_)) => {
+            unreachable!("the reactor reports its own state and registers no read")
+        }
+        Read::Held { holder } => ComponentReading::Held {
+            holder: holder.clone(),
+        },
+        Read::Gone => ComponentReading::Gone,
+    }
 }

@@ -3,8 +3,8 @@
 //! boundary.
 //!
 //! The reactor reports its own state (M6a-3), folded from its settled
-//! snapshots. The budget's counters come from its boundary read (M6a-7a,
-//! see [`super::reads`]). Each later component registers its read, gives
+//! snapshots. The budget's counters and the selected chain come from their
+//! boundary reads (M6a-7a, see [`super::reads`]). Each later component registers its read, gives
 //! [`Reading`] its state, and wires its existence evidence. Until then the
 //! others stay `Initializing`, so a property that needs one never ends
 //! `Held`.
@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use zakura_network::zakura::diag::BudgetCounters;
+use zakura_storage::header::adapter::SelectedChain;
 
 use crate::{
     harness::header_sync::SourceManifest,
@@ -27,14 +28,15 @@ pub enum Reading {
     Reactor(ReactorSnapshot),
     /// The chunk budget's counters.
     Budget(BudgetCounters),
+    /// The engine's committed snapshot's generation and frontiers.
+    SelectedChain(SelectedChain),
 }
 
 impl Tagged for Reading {
-    /// None: neither the reactor's snapshot nor the budget's counters list
-    /// tagged objects yet.
+    /// None: no component lists tagged objects yet.
     fn in_flux(&self) -> Option<TagPhase> {
         match self {
-            Reading::Reactor(_) | Reading::Budget(_) => None,
+            Reading::Reactor(_) | Reading::Budget(_) | Reading::SelectedChain(_) => None,
         }
     }
 }
@@ -385,8 +387,9 @@ mod tests {
     /// `Initializing` before any source observes, and the hub closes its
     /// boundaries, so after a run the view shows the last step's: the
     /// reactor, which reports its own state, has started, the budget, which
-    /// its boundary read shows, exists, and the rest, which have no read
-    /// yet, are still `Initializing`.
+    /// its boundary read shows, exists, the selected chain exists from the
+    /// harness's construction, and the rest, which have no read yet, are
+    /// still `Initializing`.
     #[test]
     fn the_storage_tier_has_the_composite_view() {
         let scenario = StorageScenario::default();
@@ -400,7 +403,12 @@ mod tests {
                 .map(|row| {
                     let component = view.component(row.kind).expect("a row has a component");
                     let read = started
-                        && matches!(row.kind, ComponentKind::Reactor | ComponentKind::Budget);
+                        && matches!(
+                            row.kind,
+                            ComponentKind::Reactor
+                                | ComponentKind::Budget
+                                | ComponentKind::SelectedChain
+                        );
                     assert_eq!(
                         component.state() == State::Initializing,
                         !read,
@@ -516,6 +524,32 @@ mod tests {
             Some(0),
             "it holds nothing once synced"
         );
+    }
+
+    /// A harness that builds the node's port, the selected chain's
+    /// existence evidence, without registering its read fails the run at
+    /// the first boundary, in a run with no peers.
+    ///
+    /// This fails if the chain's existence needs no read.
+    #[test]
+    fn an_unregistered_selected_chain_fails() {
+        let scenario = StorageScenario {
+            mirrors: Vec::new(),
+            ..StorageScenario::default()
+        };
+        let report = crate::harness::header_node::reads::without_selected_chain_read(|| {
+            let mut sim = Sim::new(Storage::config(&scenario), Plan::from_fuzz(&[]));
+            let _storage = Storage::build(&mut sim, &scenario, Storage::prepare(&scenario));
+            sim.run(&mut crate::NoChecks, &mut NullSink)
+        });
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail == "SelectedChain's existence evidence arrived at step 0 with no read \
+                    registered"),
+            "{:?}",
+            report.end
+        );
+        assert_eq!(report.end.steps, 0);
     }
 
     /// A property that holds at several boundaries, then needs a component

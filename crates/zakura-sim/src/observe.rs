@@ -553,6 +553,17 @@ pub enum ComponentValue {
         /// Headers owned.
         owned: u64,
     },
+    /// The engine's committed snapshot.
+    SelectedChain {
+        /// The selected-header work generation.
+        header_generation: u64,
+        /// The finalized frontier.
+        finalized: StoragePoint,
+        /// The best header-valid frontier.
+        header_best: StoragePoint,
+        /// The best body-verified frontier on the selected path.
+        verified_best: StoragePoint,
+    },
 }
 
 impl Observation {

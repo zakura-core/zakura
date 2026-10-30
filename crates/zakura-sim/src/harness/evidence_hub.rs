@@ -38,6 +38,8 @@ use super::header_node::{
     view::{HeaderSyncView, Owners},
     PredicateFeed,
 };
+use zakura_storage::header::controlled::ControlledPort;
+
 use crate::{
     peer::{PeerRecord, PeerRecords, WireEvidence},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog,
@@ -223,15 +225,32 @@ impl EvidenceHub {
     ) -> Rc<RefCell<ReactorLife>> {
         if let Some(view) = &view {
             assert!(self.reads.is_none(), "a hub's view has one node reactor");
+            #[cfg(test)]
+            let off = self.off;
+            #[cfg(not(test))]
+            let off = false;
             self.reads = Some(BoundaryReads::new(
                 link.reads.clone(),
                 view.clone(),
                 link.instance,
+                off,
             ));
         }
         let life = Rc::new(RefCell::new(ReactorLife::new(link, view)));
         self.reactors.push(life.clone());
         life
+    }
+
+    /// Reads the node's selected chain from `port` at each boundary.
+    ///
+    /// # Panics
+    ///
+    /// Before [`reactor`](Self::reactor) gave the hub its view.
+    pub(crate) fn selected_chain(&mut self, port: &std::sync::Arc<ControlledPort>) {
+        self.reads
+            .as_mut()
+            .expect("the node's reactor gives the hub its view first")
+            .selected_chain(port);
     }
 
     /// Closes the owners' boundary after `step`, if the hub has owners.

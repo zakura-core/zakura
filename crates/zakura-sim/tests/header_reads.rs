@@ -1,6 +1,6 @@
 //! The evidence hub's boundary reads on `header-sync/wire` (M6a-7a): the
-//! chunk budget's counters, read at every step boundary with no scheduling
-//! point. These only build with `RUSTFLAGS="--cfg zakura_sim"`, in a
+//! chunk budget's counters and the node's selected chain, read at every
+//! step boundary with no scheduling point. These only build with `RUSTFLAGS="--cfg zakura_sim"`, in a
 //! separate `CARGO_TARGET_DIR`.
 #![cfg(zakura_sim)]
 
@@ -90,6 +90,31 @@ fn budget_reads(report: &RunReport) -> Vec<(u64, &ComponentReading)> {
         .collect()
 }
 
+/// The selected chain's logged reads, with their steps.
+fn chain_reads(report: &RunReport) -> Vec<(u64, &ComponentReading)> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::ComponentRead {
+                component, read, ..
+            } if component == "SelectedChain" => Some((entry.step, read)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The selected chain read's header tip height, if it's current.
+fn header_tip(read: &ComponentReading) -> Option<u64> {
+    match read {
+        ComponentReading::Current(ComponentValue::SelectedChain { header_best, .. }) => {
+            Some(u64::from(header_best.height))
+        }
+        _ => None,
+    }
+}
+
 /// The budget read's owned count, if it's current.
 fn owned(read: &ComponentReading) -> Option<u64> {
     match read {
@@ -109,16 +134,17 @@ fn claimed(read: &ComponentReading) -> Option<u64> {
 }
 
 /// Every saved Plan takes the same picks, draws and task stops with the
-/// budget's boundary reads as without them, and its end record is the
-/// same. The runs with reads first show the reads ran: the budget reads
-/// current, with headers owned, and in transition while the reactor
-/// holds its lock.
+/// budget's and the selected chain's boundary reads as without them, and
+/// its end record is the same. The runs with reads first show the reads
+/// ran: the budget reads current, with headers owned, and in transition
+/// while the reactor holds its lock, and the selected chain reads current
+/// and moves.
 ///
 /// This fails if a read reaches a scheduling point the scheduler records,
 /// or changes what any task does.
 #[test]
 fn budget_reads_add_no_scheduling_point() {
-    let (mut owning, mut held) = (false, false);
+    let (mut owning, mut held, mut moved) = (false, false, false);
     for plan in SavedPlan::ALL {
         let input = committed(plan);
         let (read, read_lines) = replay(&input);
@@ -126,6 +152,14 @@ fn budget_reads_add_no_scheduling_point() {
         let reads = budget_reads(&read);
         assert!(!reads.is_empty(), "{}: the budget is read", plan.name());
         assert!(budget_reads(&unread).is_empty(), "{}", plan.name());
+        let chain = chain_reads(&read);
+        assert!(
+            matches!(chain.first(), Some((0, read)) if header_tip(read).is_some()),
+            "{}: the selected chain is read from setup",
+            plan.name()
+        );
+        assert!(chain_reads(&unread).is_empty(), "{}", plan.name());
+        moved |= chain.len() > 1;
         owning |= reads.iter().any(|(_, read)| owned(read) > Some(0));
         held |= reads
             .iter()
@@ -147,6 +181,7 @@ fn budget_reads_add_no_scheduling_point() {
     }
     assert!(owning, "some read shows owned headers");
     assert!(held, "some read shows the budget held");
+    assert!(moved, "some read shows the selected chain move");
 }
 
 /// The step at whose boundary each of `report`'s task stops was logged,
@@ -216,6 +251,61 @@ fn a_parked_holder_reads_in_transition() {
         "the honest sync releases owned and reserved headers: {owned_released} \
          {reserved_released}"
     );
+}
+
+/// The honest sync's selected chain reads current from setup, at the
+/// node's preloaded 50-header tip, and the boundary right after the
+/// commit that adopts the peer's chain shows the new 120-header tip, which
+/// is the tip the engine ends with. No read is held: the controlled port
+/// runs engine operations as storage actions, outside any task, so no
+/// task holds the engine's lock at a boundary.
+///
+/// This fails if the read goes through `snapshot()`, which locks the
+/// engine and so reaches a scheduling point.
+#[test]
+fn the_selected_chain_is_read_live() {
+    let input = committed(SavedPlan::HonestSync);
+    let (prefix, plan) = input.split_at(HeaderWire::SCENARIO_BYTES);
+    let scenario = HeaderWire::draw(prefix);
+    let ports = HeaderWire::prepare(&scenario);
+    let report = match run_prepared::<HeaderWire>(
+        &scenario,
+        ports.clone(),
+        Plan::from_fuzz(plan),
+        &mut MemorySink::default(),
+        None,
+    ) {
+        Ok(report) => report,
+        Err(error) => panic!("{error}"),
+    };
+    let tips: Vec<(u64, Option<u64>)> = chain_reads(&report)
+        .into_iter()
+        .map(|(step, read)| (step, header_tip(read)))
+        .collect();
+    assert!(
+        matches!(tips[..], [(0, Some(50)), (step, Some(120))] if step > 0),
+        "{tips:?}"
+    );
+    assert_eq!(ports.selected_tip().height.0, 120);
+}
+
+/// The commit that moves the selected chain completes as a storage
+/// action, with no task running, and that same step's boundary read shows
+/// the new tip, since the hub reads after every step, not only task steps.
+///
+/// This fails if the hub reads before a source action runs instead of
+/// after it.
+#[test]
+fn a_storage_completion_moves_the_selected_chain_at_its_own_boundary() {
+    let (report, _) = replay(&committed(SavedPlan::HonestSync));
+    let (step, read) = *chain_reads(&report)
+        .iter()
+        .find(|(step, _)| *step > 0)
+        .expect("the honest sync moves the selected chain");
+    assert_eq!(header_tip(read), Some(120));
+    let pick = &report.picks[usize::try_from(step).expect("a step fits usize") - 1].identity;
+    assert!(pick.starts_with("storage:"), "step {step} picked {pick}");
+    assert_eq!(stop_at(&report, step), None, "no task ran at step {step}");
 }
 
 /// Prints each saved Plan's wall time with boundary reads on and off,

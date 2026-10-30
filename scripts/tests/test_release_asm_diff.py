@@ -313,8 +313,10 @@ def aligned(base_text, head_text, extra=None):
         repo = Path(tmp)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
-        # A user setting that drops the a/ and b/ prefixes mustn't matter.
+        # User settings that drop the a/ and b/ prefixes or merge nearby
+        # hunks mustn't matter.
         subprocess.run(git + ["config", "diff.noprefix", "true"], check=True)
+        subprocess.run(git + ["config", "diff.interHunkContext", "3"], check=True)
         for name, text in (extra or {}).items():
             (repo / name).write_text(text)
         revs = []
@@ -349,6 +351,14 @@ class AlignmentTests(unittest.TestCase):
         (base, head), made = aligned("\n".join(SOURCE), "\n".join(head))
         self.assertEqual(made, [[("lib.rs", 2, 2)], []])
         for line in ("    x.expect(\"bad peer\")", "    tracing::info!(\"done\");", "fn log() {"):
+            self.assertEqual(where(base, line), where(head, line), line)
+
+    def test_hunks_split_by_unchanged_lines_stay_apart(self):
+        """A cfg-only statement moved past two unchanged lines still lines those lines up."""
+        base = ["fn f() {", "    #[cfg(zakura_sim)]", "    let () = ();", "    a();", "    b();", "}", ""]
+        head = ["fn f() {", "    a();", "    b();", "    #[cfg(zakura_sim)]", "    let () = ();", "}", ""]
+        (base, head), _ = aligned("\n".join(base), "\n".join(head))
+        for line in ("    a();", "    b();", "}"):
             self.assertEqual(where(base, line), where(head, line), line)
 
     def test_a_moved_release_line_stays_apart(self):

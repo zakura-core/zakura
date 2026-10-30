@@ -254,10 +254,12 @@ def align_tree(tree, file_hunks, side):
 
 def rust_hunks(repo, base, head):
     """The `-U0` diff hunks of every `.rs` file that both revisions have."""
-    # Explicit prefixes, so a `diff.noprefix` or `diff.mnemonicPrefix`
-    # setting can't change the headers `parse_file_hunks` reads.
-    diff = rw.run(["git", "-C", repo, "diff", "-U0", "--no-ext-diff", "--no-color", "--no-renames",
-                   "--src-prefix=a/", "--dst-prefix=b/", base, head, "--", "*.rs"], capture=True)
+    # Explicit prefixes and no inter-hunk context, so a user's
+    # `diff.noprefix`, `diff.mnemonicPrefix` or `diff.interHunkContext`
+    # setting can't change the headers `parse_file_hunks` reads or merge
+    # hunks around unchanged lines.
+    diff = rw.run(["git", "-C", repo, "diff", "-U0", "--inter-hunk-context=0", "--no-ext-diff", "--no-color",
+                   "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", base, head, "--", "*.rs"], capture=True)
     return parse_file_hunks(diff)
 
 

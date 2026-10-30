@@ -477,30 +477,38 @@ fn port_panic_outranks_an_earlier_sources_failure() {
 }
 
 /// An observer that forwards to the tap's, except that it panics on the
-/// first replied call end instead of recording it, as an observer bug would.
+/// first replied call end instead of recording it, as an observer bug would,
+/// and, with `again` set, on every event after that.
 #[derive(Debug)]
-struct PanicsOnReply(Arc<dyn HeaderSyncObserver>);
+struct PanicsOnReply {
+    inner: Arc<dyn HeaderSyncObserver>,
+    again: bool,
+    panicked: std::sync::atomic::AtomicBool,
+}
 
 impl HeaderSyncObserver for PanicsOnReply {
     /// Panics on a replied `CallEnded`, which unwinds the reactor, and
     /// forwards anything else.
     fn observe(&self, event: ReactorEvent) {
-        if matches!(
+        let replied = matches!(
             event,
             ReactorEvent::CallEnded {
                 end: CallEnd::Replied,
                 ..
             }
-        ) {
-            panic!("the test observer panics on a replied call end");
+        );
+        if replied || (self.again && self.panicked.load(std::sync::atomic::Ordering::Relaxed)) {
+            self.panicked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            panic!("the test observer panics on {event:?}");
         }
-        self.0.observe(event);
+        self.inner.observe(event);
     }
 }
 
 /// The node at genesis, tapped through [`PanicsOnReply`], syncing from
 /// `mirror-0` at A5, converging.
-fn observer_panic_run(input: PlanInput) -> RunReport {
+fn observer_panic_run(input: PlanInput, again: bool) -> RunReport {
     let fixture = HeaderFixture::regtest();
     let node = Arc::new(ControlledPort::new(&fixture));
     let mirror = Arc::new(EnginePort::new(&fixture));
@@ -525,7 +533,13 @@ fn observer_panic_run(input: PlanInput) -> RunReport {
                     &fixture,
                     Chain::default().tip(&fixture),
                     dispatch.clone(),
-                    Some(observer.wrapped(|inner| Arc::new(PanicsOnReply(inner)))),
+                    Some(observer.wrapped(|inner| {
+                        Arc::new(PanicsOnReply {
+                            inner,
+                            again,
+                            panicked: std::sync::atomic::AtomicBool::new(false),
+                        })
+                    })),
                 ),
                 HeaderNode::spawn(
                     sim,
@@ -555,7 +569,26 @@ fn observer_panic_run(input: PlanInput) -> RunReport {
 #[test]
 fn an_observer_panic_ends_the_run_reactor_gone() {
     for input in inputs(8, 256) {
-        let report = observer_panic_run(input);
+        let report = observer_panic_run(input, false);
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("expected a source evidence failure, got {:?}", report.end);
+        };
+        assert!(detail.starts_with("ReactorGone"), "{source}: {detail}");
+        assert_eq!(source, "reactor:node#0");
+    }
+}
+
+/// An observer that panics again on whatever comes after its first panic
+/// doesn't abort the process: the reactor reports neither its teardown nor
+/// its pending calls' drops while its task unwinds, so the run still ends
+/// `ReactorGone` on the node's tap.
+///
+/// This fails if teardown reports reach the observer during an unwind,
+/// where its second panic aborts the test process.
+#[test]
+fn an_observer_that_panics_again_at_teardown_still_ends_reactor_gone() {
+    for input in inputs(4, 256) {
+        let report = observer_panic_run(input, true);
         let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
             panic!("expected a source evidence failure, got {:?}", report.end);
         };

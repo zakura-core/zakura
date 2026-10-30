@@ -1250,10 +1250,7 @@ async fn observer_does_not_change_behaviour() {
                     call: 2,
                     panicked: false
                 },
-                ReactorEvent::Dropping {
-                    unwinding: false,
-                    ..
-                },
+                ReactorEvent::Dropping { .. },
             ]
         ),
         "the history exercises every hook it passes: {events:#?}"
@@ -1764,13 +1761,7 @@ fn assert_turns(events: &[ReactorEvent]) -> Vec<observe::ResumeArm> {
         }
         if last {
             assert!(
-                matches!(
-                    event,
-                    ReactorEvent::Dropping {
-                        unwinding: false,
-                        ..
-                    }
-                ),
+                matches!(event, ReactorEvent::Dropping { .. }),
                 "the teardown follows the final Settled: {event:?}"
             );
             dropping = true;
@@ -2036,10 +2027,7 @@ async fn teardown_reports_each_pending_call_dropped() {
     assert_eq!(
         recorder.take(),
         vec![
-            ReactorEvent::Dropping {
-                turn: 0,
-                unwinding: false,
-            },
+            ReactorEvent::Dropping { turn: 0 },
             ReactorEvent::CallEnded {
                 call: 2,
                 end: CallEnd::Dropped,

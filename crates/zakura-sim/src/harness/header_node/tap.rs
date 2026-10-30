@@ -19,8 +19,8 @@
 //! the run as `Unobserved` (M6a-3). It logs every `Settled` and `Resumed`
 //! marker, but a snapshot only when it differs from the last one logged.
 //! The reactor reports its own teardown, `Dropping`, so its observer's drop
-//! after a clean `Dropping` is expected. Any other drop, before one or
-//! while the reactor unwinds from a panic, is `ReactorGone`.
+//! after one is expected. A drop with none before it, as when the reactor
+//! unwinds from a panic, which reports nothing, is `ReactorGone`.
 //!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
@@ -94,8 +94,8 @@ struct TapState {
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
-    /// Set once the reactor reported its teardown, `Dropping`, with no panic
-    /// unwinding, after which its observer may go.
+    /// Set once the reactor reported its teardown, `Dropping`, after which
+    /// its observer may go.
     torn_down: AtomicBool,
     buffer: Mutex<Buffer>,
 }
@@ -175,13 +175,7 @@ impl HeaderSyncObserver for TapObserver {
                 0
             }
         };
-        if matches!(
-            event,
-            ReactorEvent::Dropping {
-                unwinding: false,
-                ..
-            }
-        ) {
+        if matches!(event, ReactorEvent::Dropping { .. }) {
             state.torn_down.store(true, Ordering::Relaxed);
         }
         // Taken before the lock, which nothing else takes in between.
@@ -537,7 +531,7 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             last,
             snapshot: Some(Box::new(snapshot(*settled))),
         },
-        ReactorEvent::Dropping { turn, unwinding } => ReactorFact::Dropping { turn, unwinding },
+        ReactorEvent::Dropping { turn } => ReactorFact::Dropping { turn },
         ReactorEvent::Resumed { turn, arm: at } => ReactorFact::Resumed {
             turn,
             arm: arm(at).to_owned(),

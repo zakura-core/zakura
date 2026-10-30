@@ -395,10 +395,14 @@ fn reactor_snapshots_add_no_scheduling_point() {
         assert!(
             matches!(events.first(), Some(ReactorEvent::Settled { turn: 0, .. }))
                 && matches!(
-                    events.last(),
-                    Some(ReactorEvent::Settled { last: true, .. })
+                    events[..],
+                    [
+                        ..,
+                        ReactorEvent::Settled { last: true, .. },
+                        ReactorEvent::Dropping { .. }
+                    ]
                 ),
-            "each reactor settles at build and at its end"
+            "each reactor settles at build and at its end, then tears down"
         );
         assert!(
             arms.contains("Start") && arms.contains("Shutdown") && arms.len() > 2,

@@ -477,6 +477,21 @@ impl HeaderNode {
         if let Some(observer) = observer {
             startup.observer = observer;
         }
+        Self::from_startup(sim, name, seed, port, startup, vct_repairs, dispatch)
+    }
+
+    /// [`spawn`](Self::spawn)'s second half: starts a reactor and its service
+    /// from `startup`, which [`startup`] made for `port`, with
+    /// `vct_repairs` its repair watch's sender.
+    pub(crate) fn from_startup(
+        sim: &mut Sim,
+        name: &str,
+        seed: u8,
+        port: Arc<dyn Port>,
+        startup: HeaderSyncStartup,
+        vct_repairs: watch::Sender<VctRootRepairStatus>,
+        dispatch: DispatchFlag,
+    ) -> Self {
         let facts = StartupFacts {
             config: startup.config.clone(),
             request_timeout: startup.request_timeout,

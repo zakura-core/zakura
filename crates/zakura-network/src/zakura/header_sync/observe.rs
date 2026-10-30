@@ -203,14 +203,14 @@ pub enum ReactorEvent {
         snapshot: Box<ReactorSnapshot>,
     },
     /// The reactor is being dropped: its loop returned, its task was
-    /// cancelled or unwound, or it was dropped before it ran. Reported from
-    /// its `Drop`, before any of its fields drop, so the only events after
-    /// it are its pending calls' `CallEnded{end: Dropped}`.
+    /// cancelled, or it was dropped before it ran. Reported from its
+    /// `Drop`, before any of its fields drop, so the only events after it
+    /// are its pending calls' `CallEnded{end: Dropped}`. Neither is
+    /// reported while the thread unwinds from a panic, since an observer
+    /// that panicked once could panic again and abort the process.
     Dropping {
         /// Its turn when it was dropped.
         turn: u64,
-        /// Whether it's dropped while its task unwinds from a panic.
-        unwinding: bool,
     },
     /// The reactor resumed from a wait, or started. It's the first thing
     /// the turn reports, and the reactor's state is in transition until
@@ -553,13 +553,18 @@ impl PortTap {
     }
 }
 
-/// A port call's future, guarded so that dropping it unfinished, as the
-/// reactor's teardown drops its pending calls, reports
-/// `CallEnded{end: Dropped}` through the call's tap. The future drops
-/// first, so a storage receipt its drop leaves comes before the end.
+/// A port call's storage future, guarded so that dropping it unfinished,
+/// as the reactor's teardown drops its pending calls, reports
+/// `CallEnded{end: Dropped}` through the call's tap. It wraps only the
+/// storage future, inside the panic catch and the completion that holds
+/// the call's captured capacity, so the storage receipt its drop leaves
+/// and the end come with no scheduling point between them.
 pub(crate) struct PendingCall<F> {
     future: Option<F>,
     tap: PortTap,
+    /// Set once a poll returned or unwound, so the call's own end, or the
+    /// panic arm's, reports it.
+    done: bool,
 }
 
 impl<F> PendingCall<F> {
@@ -568,6 +573,7 @@ impl<F> PendingCall<F> {
         Self {
             future: Some(future),
             tap,
+            done: false,
         }
     }
 }
@@ -584,16 +590,30 @@ impl<F: std::future::Future + Unpin> std::future::Future for PendingCall<F> {
             .future
             .as_mut()
             .expect("a pending call's future lives until its guard drops");
-        std::pin::Pin::new(future).poll(cx)
+        let polled =
+            std::panic::catch_unwind(AssertUnwindSafe(|| std::pin::Pin::new(future).poll(cx)));
+        match polled {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(ready) => {
+                self.done = true;
+                ready
+            }
+            Err(payload) => {
+                self.done = true;
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 }
 
 impl<F> Drop for PendingCall<F> {
-    /// Drops the future, then reports the call dropped unless its end was
-    /// already reported.
+    /// Drops the future, then reports the call dropped unless a poll
+    /// finished or its end was already reported, or the thread is
+    /// unwinding (see [`ReactorEvent::Dropping`]).
     fn drop(&mut self) {
         drop(self.future.take());
-        if self.tap.call != 0 && self.tap.ended.load(counter::Ordering::Relaxed) == 0 {
+        let reported = self.done || self.tap.ended.load(counter::Ordering::Relaxed) != 0;
+        if self.tap.call != 0 && !reported && !std::thread::panicking() {
             self.tap.end_after_catch(CallEnd::Dropped);
         }
     }

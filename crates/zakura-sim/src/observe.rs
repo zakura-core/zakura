@@ -1396,8 +1396,6 @@ pub enum ReactorFact {
     Dropping {
         /// Its turn then.
         turn: u64,
-        /// Whether its task was unwinding from a panic.
-        unwinding: bool,
     },
     /// The reactor resumed from a wait, or started, and its state is in
     /// transition until the next `Settled` (M6a-3).

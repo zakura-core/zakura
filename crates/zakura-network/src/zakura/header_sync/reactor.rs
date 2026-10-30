@@ -532,15 +532,12 @@ struct HeaderSyncReactor {
 /// before any field drops, its pending calls' futures included.
 #[cfg(any(test, zakura_sim))]
 impl Drop for HeaderSyncReactor {
-    /// Reports `Dropping` with the turn it's in.
+    /// Reports `Dropping` with the turn it's in, unless the thread is
+    /// unwinding (see [`ReactorEvent::Dropping`]).
     fn drop(&mut self) {
-        observe!(
-            self,
-            ReactorEvent::Dropping {
-                turn: self.turn,
-                unwinding: std::thread::panicking(),
-            }
-        );
+        if !std::thread::panicking() {
+            observe!(self, ReactorEvent::Dropping { turn: self.turn });
+        }
     }
 }
 
@@ -4705,6 +4702,8 @@ impl HeaderSyncReactor {
                     }) as HeaderSyncPortCompletion
                 }),
             };
+        #[cfg(any(test, zakura_sim))]
+        let operation = Box::pin(observe::PendingCall::new(operation, pending_tap));
         let operation = AssertUnwindSafe(operation)
             .catch_unwind()
             .map(move |result| {
@@ -4739,8 +4738,6 @@ impl HeaderSyncReactor {
         if let Some(op) = dispatched {
             observe!(self, ReactorEvent::Dispatched { call, op });
         }
-        #[cfg(any(test, zakura_sim))]
-        let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         true
     }

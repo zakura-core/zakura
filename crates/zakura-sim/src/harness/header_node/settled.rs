@@ -17,10 +17,11 @@
 //!
 //! It ends seen with its final snapshot at `Settled{last}`. The reactor
 //! also reports its own teardown, `Dropping`, from its `Drop`, so it ends
-//! there unsettled if no `Settled{last}` came first: cancelled, unwound, or
-//! aborted before its task's first poll. After `Dropping`, only its pending
-//! calls' `dropped` call ends may follow. A task that completes with no
-//! `Settled{last}` fails the run as `NoFinalSnapshot`.
+//! there unsettled if no `Settled{last}` came first: cancelled, or aborted
+//! before its task's first poll. After `Dropping`, only its pending calls'
+//! `dropped` call ends may follow. A task that completes with no
+//! `Settled{last}` fails the run as `NoFinalSnapshot`, and one that panics,
+//! which reports no teardown, ends unsettled at its exit.
 //!
 //! The reactor is bound to the task that ran when it reported
 //! `Resumed{arm: start}`, by that task's scheduler name, which is unique
@@ -505,12 +506,9 @@ mod tests {
         ReactorEvent::Resumed { turn, arm }
     }
 
-    /// A clean `Dropping{turn}`, as the reactor's `Drop` reports it.
+    /// `Dropping{turn}`, as the reactor's `Drop` reports it.
     fn dropping(turn: u64) -> ReactorEvent {
-        ReactorEvent::Dropping {
-            turn,
-            unwinding: false,
-        }
+        ReactorEvent::Dropping { turn }
     }
 
     /// A preemption point, as the reactor's mid-turn locks and atomics are.
@@ -1127,13 +1125,7 @@ mod tests {
                     facts[..],
                     [
                         (0, ReactorFact::Settled { turn: 0, .. }),
-                        (
-                            _,
-                            ReactorFact::Dropping {
-                                turn: 0,
-                                unwinding: false
-                            }
-                        ),
+                        (_, ReactorFact::Dropping { turn: 0 }),
                     ]
                 ),
                 "keep {keep}: only the build and the teardown report: {facts:?}"
@@ -1399,6 +1391,164 @@ mod tests {
                 .iter()
                 .any(|(_, fact)| matches!(fact, ReactorFact::Settled { last: true, .. })),
             "the run fails before the reactor's teardown"
+        );
+    }
+
+    /// Forwards every event to `inner`, and sets `prepared` once a prepare
+    /// call is dispatched.
+    #[derive(Debug)]
+    struct Prepared {
+        inner: Arc<dyn zakura_network::zakura::observe::HeaderSyncObserver>,
+        prepared: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl zakura_network::zakura::observe::HeaderSyncObserver for Prepared {
+        /// Forwards `event`, noting a prepare's dispatch.
+        fn observe(&self, event: ReactorEvent) {
+            if matches!(
+                event,
+                ReactorEvent::Dispatched {
+                    op: zakura_network::zakura::observe::PortCall::Prepare { .. },
+                    ..
+                }
+            ) {
+                self.prepared
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.observe(event);
+        }
+    }
+
+    /// The node at genesis syncing from `mirror-0` at A5, with storage
+    /// holding its first prepare for good, shut down once that prepare is
+    /// dispatched. The prepare's future holds the staged headers' capacity
+    /// leases, whose last clones it releases as it drops.
+    fn held_prepare_shutdown() -> RunReport {
+        use crate::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
+
+        let (mut fixture, slot) = Fixture::new(5_000);
+        let header = HeaderFixture::regtest();
+        let held = Policy {
+            bound_ms: None,
+            holds: vec![Hold {
+                select: Select {
+                    kind: Some(OpKind::Prepare),
+                    ..Select::default()
+                },
+                // Never: the node makes one prepare.
+                until: Trigger::Submitted(Select::nth(OpKind::Prepare, 2)),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        };
+        let storage = PolicySource::new(
+            &mut fixture.sim,
+            fixture.port.clone(),
+            held,
+            Effects::default(),
+        );
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let mirror_port = Arc::new(zakura_storage::header::adapter::EnginePort::new(&header));
+        crate::harness::header_node::preload(&mirror_port, &header, &Chain::main(5));
+        let port: Arc<dyn Port> = fixture.port.clone();
+        let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
+        let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        startup.observer = slot.wrapped(|inner| {
+            Arc::new(Prepared {
+                inner,
+                prepared: prepared.clone(),
+            })
+        });
+        let shutdown = startup.shutdown.clone();
+        let dispatch = DispatchFlag::default();
+        let node = HeaderNode::from_startup(
+            &mut fixture.sim,
+            "node",
+            1,
+            port,
+            startup,
+            repairs,
+            dispatch.clone(),
+        );
+        let mirror = HeaderNode::spawn(
+            &mut fixture.sim,
+            "mirror-0",
+            2,
+            mirror_port,
+            &header,
+            Chain::main(5).tip(&header),
+            dispatch,
+            None,
+        );
+        let topology = Rc::new(Topology::new(vec![node, mirror], Effects::default()));
+        topology.link(1, 0);
+        fixture.sim.scheduler().spawn_root("stopper", async move {
+            for _ in 0..2_000 {
+                if prepared.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                zakura_rt::task::yield_now().await;
+            }
+            for _ in 0..8 {
+                zakura_rt::task::yield_now().await;
+            }
+            shutdown.cancel();
+        });
+        let (report, _) = fixture.run(&mut States::default());
+        drop(topology);
+        report
+    }
+
+    /// A reactor shut down with a prepare held in storage drops the
+    /// prepare's future, which leaves `CallerDropped`, and then the staged
+    /// headers' capacity, whose release reaches scheduling points. Its
+    /// `CallEnded{dropped}` comes right after the receipt, in the same
+    /// step, so it pairs, and the run is clean.
+    ///
+    /// This fails if the guard reports the end only after the captured
+    /// capacity drops.
+    #[test]
+    fn a_dropped_prepare_pairs_before_its_capacity_releases() {
+        let report = held_prepare_shutdown();
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let facts = reactor_facts(&report);
+        let prepare = facts
+            .iter()
+            .find_map(|(_, fact)| match fact {
+                ReactorFact::Dispatched {
+                    call,
+                    port: crate::observe::ReactorCall::Prepare { .. },
+                } => Some(*call),
+                _ => None,
+            })
+            .expect("the node dispatches a prepare");
+        assert!(
+            facts.iter().any(|(_, fact)| matches!(fact,
+                ReactorFact::Settled { snapshot: Some(snapshot), last: false, .. }
+                    if snapshot.work.iter().any(|work| matches!(&work.state,
+                        crate::observe::ReactorWorkState::Active { target_phase, .. }
+                            if target_phase == "preparing")))),
+            "the reactor settles with its work preparing, its staged headers moved into the call"
+        );
+        let ended = facts
+            .iter()
+            .find_map(|(step, fact)| match fact {
+                ReactorFact::CallEnded { call, end, op } if *call == prepare => {
+                    Some((*step, end.clone(), *op))
+                }
+                _ => None,
+            })
+            .expect("the prepare's call ends");
+        assert!(
+            matches!(&ended, (_, end, Some(_)) if end == "dropped"),
+            "its dropped end pairs: {ended:?}"
+        );
+        assert_eq!(
+            receipt_step(&report, true),
+            ended.0,
+            "the receipt and end share a step"
         );
     }
 }

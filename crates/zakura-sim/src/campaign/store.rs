@@ -4,7 +4,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, Write},
+    io::{self, BufReader, Write},
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -13,8 +13,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
-use crate::seed::sha256;
+use crate::{seed::sha256, trace::meta::hex};
 
 /// The version of every record in the store: build records, snapshot
 /// indexes, manifests, attempts and end records. Bump it when a record's
@@ -58,9 +59,12 @@ impl Digest {
         Digest(sha256(bytes))
     }
 
-    /// The digest of the file at `path`.
+    /// The digest of the file at `path`, read in pieces, so a large file
+    /// costs no memory.
     pub fn of_file(path: &Path) -> io::Result<Digest> {
-        fs::read(path).map(|bytes| Digest::of(&bytes))
+        let mut hasher = Sha256::default();
+        io::copy(&mut File::open(path)?, &mut hasher)?;
+        Ok(Digest(hex(&sha2::Digest::finalize(hasher))))
     }
 
     /// The hex digits.
@@ -386,14 +390,16 @@ pub(super) fn record_bytes(value: &impl Serialize) -> Vec<u8> {
     bytes
 }
 
-/// Reads the record at `path`, and checks its digest if `digest` names it.
+/// Reads the record at `path`, and checks its digest first if `digest`
+/// names it. Neither step holds the file's bytes in memory, so a file that
+/// doesn't match or doesn't parse costs no more memory than its records.
 pub(super) fn read_record<T: for<'de> Deserialize<'de>>(
     path: &Path,
     digest: Option<&Digest>,
 ) -> Result<T, CampaignError> {
-    let bytes = fs::read(path).map_err(CampaignError::io(format!("reading {}", path.display())))?;
+    let io = CampaignError::io(format!("reading {}", path.display()));
     if let Some(digest) = digest {
-        let actual = Digest::of(&bytes);
+        let actual = Digest::of_file(path).map_err(io)?;
         if &actual != digest {
             return Err(CampaignError::corrupt(
                 path,
@@ -401,7 +407,10 @@ pub(super) fn read_record<T: for<'de> Deserialize<'de>>(
             ));
         }
     }
-    serde_json::from_slice(&bytes).map_err(|error| CampaignError::corrupt(path, error.to_string()))
+    let file =
+        File::open(path).map_err(CampaignError::io(format!("reading {}", path.display())))?;
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|error| CampaignError::corrupt(path, error.to_string()))
 }
 
 /// Seconds since the Unix epoch.
@@ -423,5 +432,15 @@ mod tests {
         assert!(digest.as_str().to_uppercase().parse::<Digest>().is_err());
         assert!("../x".parse::<Digest>().is_err());
         assert!(digest.as_str()[1..].parse::<Digest>().is_err());
+    }
+
+    /// A file's digest is the digest of its bytes.
+    #[test]
+    fn file_digests_match_byte_digests() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("file");
+        let bytes: Vec<u8> = (0..200_000u32).map(|n| n as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(Digest::of_file(&path).unwrap(), Digest::of(&bytes));
     }
 }

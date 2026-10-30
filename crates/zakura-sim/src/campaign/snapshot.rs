@@ -176,32 +176,47 @@ impl Store {
             ));
         }
         let inputs = dir.join(INPUTS_DIR);
-        let on_disk = files(&inputs)?;
-        if on_disk.len() != index.inputs.len() {
+        // Counting stops one past the index, so an overfull directory costs
+        // no more than a full one.
+        let on_disk = regular_files(&inputs)?
+            .take(index.inputs.len().saturating_add(1))
+            .try_fold(0usize, |count, file| file.map(|_| count + 1))?;
+        if on_disk != index.inputs.len() {
             return Err(CampaignError::corrupt(
                 &inputs,
                 format!(
-                    "it holds {} files, and the index lists {}",
-                    on_disk.len(),
+                    "it holds {}{on_disk} files, and the index lists {}",
+                    if on_disk > index.inputs.len() {
+                        "at least "
+                    } else {
+                        ""
+                    },
                     index.inputs.len()
                 ),
             ));
         }
         for entry in &index.inputs {
             let path = inputs.join(entry.sha256.as_str());
-            let bytes = fs::read(&path)
-                .map_err(CampaignError::io(format!("reading {}", path.display())))?;
-            let actual = Digest::of(&bytes);
-            // A usize always fits in a u64 on supported targets.
-            if actual != entry.sha256 || bytes.len() as u64 != entry.len {
+            let io = || CampaignError::io(format!("reading {}", path.display()));
+            // The length comes first, so a file of the wrong size is never
+            // read.
+            let len = fs::metadata(&path).map_err(io())?.len();
+            if len != entry.len {
                 return Err(CampaignError::corrupt(
                     &path,
                     format!(
-                        "the index lists {} bytes with digest {}, and the file has {} bytes \
-                         with digest {actual}",
-                        entry.len,
-                        entry.sha256,
-                        bytes.len()
+                        "the index lists {} bytes, and the file has {len}",
+                        entry.len
+                    ),
+                ));
+            }
+            let actual = Digest::of_file(&path).map_err(io())?;
+            if actual != entry.sha256 {
+                return Err(CampaignError::corrupt(
+                    &path,
+                    format!(
+                        "the index lists digest {}, and the file has {actual}",
+                        entry.sha256
                     ),
                 ));
             }
@@ -216,9 +231,19 @@ impl Store {
 /// The regular files in `dir`, sorted, skipping names that start with `.`.
 /// A directory that doesn't exist holds none.
 fn files(dir: &Path) -> Result<Vec<PathBuf>, CampaignError> {
+    let mut paths = regular_files(dir)?.collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    Ok(paths)
+}
+
+/// The regular files in `dir`, in the directory's order, skipping names
+/// that start with `.`. A directory that doesn't exist holds none.
+fn regular_files(
+    dir: &Path,
+) -> Result<impl Iterator<Item = Result<PathBuf, CampaignError>> + '_, CampaignError> {
     let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(CampaignError::Io {
                 context: format!("listing {}", dir.display()),
@@ -226,18 +251,17 @@ fn files(dir: &Path) -> Result<Vec<PathBuf>, CampaignError> {
             })
         }
     };
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(CampaignError::io(format!("listing {}", dir.display())))?;
+    let listing = move || CampaignError::io(format!("listing {}", dir.display()));
+    Ok(entries.into_iter().flatten().filter_map(move |entry| {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(listing()(error))),
+        };
+        let file = match entry.file_type() {
+            Ok(kind) => kind.is_file(),
+            Err(error) => return Some(Err(listing()(error))),
+        };
         let hidden = entry.file_name().to_string_lossy().starts_with('.');
-        let file = entry
-            .file_type()
-            .map_err(CampaignError::io(format!("listing {}", dir.display())))?
-            .is_file();
-        if file && !hidden {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
+        (file && !hidden).then(|| Ok(entry.path()))
+    }))
 }

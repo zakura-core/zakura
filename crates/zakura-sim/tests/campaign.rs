@@ -1004,8 +1004,8 @@ fn dirty_builds_resume_only_on_their_own_binary() {
 }
 
 /// A snapshot is named by its index's digest, the same inputs share a
-/// name, and a changed, missing or extra input fails verification. So
-/// does a changed manifest.
+/// name, and a changed, missing, extra or resized input fails
+/// verification. So does a changed manifest.
 #[test]
 fn snapshots_and_manifests_verify_against_their_digests() {
     let fixture = Fixture::new();
@@ -1041,6 +1041,25 @@ fn snapshots_and_manifests_verify_against_their_digests() {
     ));
     fs::remove_file(&input).unwrap();
     assert!(fixture.store.verify_snapshot(&a.digest).is_err());
+    // A file of another length is refused by its length, unread.
+    let sized = fixture
+        .store
+        .save_snapshot(&[campaign::Source::Input(b"five")])
+        .unwrap();
+    let unread = fixture
+        .store
+        .snapshot_inputs(&sized.digest)
+        .join(Digest::of(b"five").as_str());
+    fs::write(&unread, b"five and more").unwrap();
+    fs::set_permissions(&unread, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        matches!(
+            fixture.store.verify_snapshot(&sized.digest),
+            Err(CampaignError::Corrupt { .. })
+        ),
+        "{:?}",
+        fixture.store.verify_snapshot(&sized.digest)
+    );
     let extra = fixture
         .store
         .save_snapshot(&[campaign::Source::Input(b"three")])

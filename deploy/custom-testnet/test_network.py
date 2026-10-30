@@ -175,6 +175,20 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
         command.assert_any_call('systemctl', 'stop', 'pq-testnet-preparation.service')
 
+    def test_new_reset_does_not_report_the_previous_preparation_failure(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), refresh_seed=True)
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+        network.atomic_json(self.root / 'seed-progress.json', {'phase': 'failed'})
+        def refresh(config, restore):
+            self.assertEqual(json.loads((self.root / 'seed-progress.json').read_text())['phase'], 'verifying')
+            raise RuntimeError('preparation unavailable')
+        with patch.object(network, 'verify_archive'), patch.object(network.archive_seed, 'refresh_seed', side_effect=refresh), patch.object(network, 'command'):
+            with self.assertRaisesRegex(RuntimeError, 'preparation unavailable'):
+                network.reset(self.config, 600, self.root / 'config.json')
+
     def test_cancellation_is_not_retried_by_miner_readiness(self):
         with patch.object(network, 'rpc', side_effect=network.archive_seed.OperationCancelled):
             with self.assertRaises(network.archive_seed.OperationCancelled):

@@ -256,6 +256,8 @@ def reset(config, delay, config_path=None):
             expired.unlink()
     run = new_run(config)
     command('systemctl', 'stop', f'{config["service_prefix"]}-controller.service')
+    if config.get('refresh_seed'):
+        atomic_json(root / 'seed-progress.json', {'phase': 'verifying', 'observed_at': int(time.time())})
     atomic_json(root / 'run.json', run)
     try:
         for suffix in ('node0', 'node1'):

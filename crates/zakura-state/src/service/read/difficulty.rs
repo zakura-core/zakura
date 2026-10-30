@@ -265,7 +265,7 @@ fn difficulty_time_and_history_tree(
     // We ignore the height as we are checkpointing on Canopy or higher in Mainnet and Testnet.
     let candidate_height = tip_height
         .next()
-        .ok_or("candidate height exceeds the height range")?;
+        .map_err(|_| "candidate height exceeds the height range")?;
     let max_time = if network.is_max_block_time_enforced(candidate_height) {
         median_time_past
             .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
@@ -697,6 +697,69 @@ mod tests {
             )
             .unwrap();
             assert_eq!(result.cur_time, expected);
+        }
+    }
+
+    #[test]
+    fn historical_seed_time_bound_resumes_after_six_fresh_headers() {
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let seed = Height(3_000_000);
+        let activation = Height(seed.0 + 7);
+        let network = Parameters::build()
+            .with_max_block_time_start_height(activation)
+            .to_network()
+            .unwrap();
+        let old_time = DateTime32::from(1_700_000_000);
+        let now = old_time.saturating_add(Duration32::from_seconds(30 * 24 * 3600));
+        for fresh_count in [5u32, 6] {
+            let tip = Height(seed.0 + fresh_count);
+            let span = pow_adjustment_block_span_for_height(&network, tip.next().unwrap());
+            let mut headers = vec![Arc::new(*block.header); span];
+            for (index, header) in headers.iter_mut().enumerate() {
+                let mut value = **header;
+                value.time = if index < usize::try_from(fresh_count).unwrap() {
+                    now.to_chrono()
+                } else {
+                    old_time.to_chrono()
+                };
+                *header = Arc::new(value);
+            }
+            let result = difficulty_time_and_history_tree(
+                headers.clone(),
+                tip,
+                block.hash(),
+                &network,
+                now.saturating_add(Duration32::from_seconds(451)),
+                Arc::new(HistoryTree::default()),
+                ValueBalance::zero(),
+            )
+            .unwrap();
+            assert_eq!(
+                result.cur_time,
+                now.saturating_add(Duration32::from_seconds(451))
+            );
+            let adjustment = AdjustedDifficulty::new_from_header_time(
+                result.cur_time.to_chrono(),
+                tip,
+                &network,
+                headers
+                    .iter()
+                    .map(|header| (header.difficulty_threshold, header.time)),
+            )
+            .unwrap();
+            zakura_header_chain::validate_contextual_difficulty_and_time(
+                result.expected_difficulty,
+                adjustment,
+            )
+            .expect("fresh fork time must pass the same rules used by validators");
+            if fresh_count == 6 {
+                assert_eq!(
+                    result.max_time,
+                    now.saturating_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+                );
+            }
         }
     }
 

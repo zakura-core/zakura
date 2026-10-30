@@ -225,6 +225,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/nu7-fork -p 'test_*.py'
 
+      - name: Custom Testnet reset tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/custom-testnet -p 'test_*.py'
+
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py

@@ -35,9 +35,9 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement, PortCall,
-        ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm, TransferDisposition,
-        WaitCause, WorkPhase,
+        CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement,
+        PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
+        TransferDisposition, WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
@@ -51,9 +51,9 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     harness::evidence_hub::{position, Row},
     observe::{
-        ReactorAdopted, ReactorCall, ReactorCursor, ReactorFact, ReactorHolding, ReactorLease,
-        ReactorPlacement, ReactorPurpose, ReactorRequest, ReactorSession, ReactorSnapshot,
-        ReactorWork, ReactorWorkState, StorageFact,
+        HeldDigest, ReactorAdopted, ReactorCall, ReactorCursor, ReactorFact, ReactorFrame,
+        ReactorHolding, ReactorLease, ReactorPlacement, ReactorPurpose, ReactorRequest,
+        ReactorSession, ReactorSnapshot, ReactorWork, ReactorWorkState, StorageFact,
     },
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
@@ -387,6 +387,25 @@ fn disposition(ended: TransferDisposition) -> (&'static str, Option<u64>) {
     }
 }
 
+/// `digest` in plain fields.
+fn digest(digest: zakura_network::zakura::observe::HeldDigest) -> HeldDigest {
+    HeldDigest {
+        value: digest.value,
+        len: digest.len,
+    }
+}
+
+/// `tag` in plain fields.
+fn frame(tag: FrameTag) -> ReactorFrame {
+    ReactorFrame {
+        quic_stream: tag.quic_stream,
+        seq: tag.seq,
+        // A frame's payload fits a u32.
+        payload_len: tag.payload_len as u64,
+        received: digest(tag.received),
+    }
+}
+
 /// `cause`'s name.
 fn cause(cause: WaitCause) -> &'static str {
     match cause {
@@ -470,6 +489,7 @@ fn snapshot(settled: Snapshot) -> ReactorSnapshot {
                         purpose: why,
                         phase: at,
                         held,
+                        held_digest,
                         cursor,
                     } => ReactorWorkState::Active {
                         incarnation,
@@ -479,6 +499,7 @@ fn snapshot(settled: Snapshot) -> ReactorSnapshot {
                         target_phase: phase(at).to_owned(),
                         // A queue holds at most a few thousand headers.
                         held: held as u64,
+                        held_digest: digest(held_digest),
                         cursor: cursor.map(|cursor| ReactorCursor {
                             height: cursor.height.0,
                             hash: hash(cursor.hash),
@@ -618,11 +639,25 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             incarnation,
             transfer,
             count,
+            chain,
         } => ReactorFact::EntriesTaken {
             incarnation,
             transfer,
             // A transfer holds at most a few thousand headers.
             count: count as u64,
+            chain: digest(chain),
+        },
+        ReactorEvent::Staged {
+            incarnation,
+            frame: tag,
+            count,
+            after,
+        } => ReactorFact::Staged {
+            incarnation,
+            frame: tag.map(frame),
+            // A page holds at most a few thousand headers.
+            count: count as u64,
+            after: digest(after),
         },
         ReactorEvent::TransferEnded {
             transfer,

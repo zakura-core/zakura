@@ -287,6 +287,29 @@ pub enum Observation {
         /// terminal outcome does.
         ends: bool,
     },
+    /// The node holds work that no frame explains (M6a-5a): staged entries
+    /// beyond what its staged frames delivered, or entries that differ from
+    /// them. Derived from the node's own evidence by the evidence hub, which
+    /// keeps its own expected digest of each work incarnation's entries,
+    /// built from the frames' decoded digests alone. `receiver-work-authorized`
+    /// fails on it directly.
+    UnframedWork {
+        /// The connection.
+        connection: u64,
+        /// The request or subscription row the work answers.
+        request: RowAt,
+        /// The exchange or subscription key.
+        exchange: u64,
+        /// The held objects no frame explains: the excess for `extra`, and
+        /// every held object for `substituted`, since a digest can't say
+        /// which one changed.
+        objects: u64,
+        /// The payload bytes they came in, which is 0: no frame delivered
+        /// them.
+        bytes: u64,
+        /// Why no frame explains it.
+        cause: UnframedCause,
+    },
     /// The node installed an owner for serving the peer's request: an actual
     /// effect, read where the owner is created.
     Serving {
@@ -1448,6 +1471,9 @@ pub enum ReactorFact {
         transfer: u64,
         /// How many headers it took.
         count: u64,
+        /// The digest of the headers it took, as the incarnation held them
+        /// (M6a-5a).
+        chain: HeldDigest,
     },
     /// A transfer's last handle dropped, ending it (M6a-4).
     TransferEnded {
@@ -1462,6 +1488,78 @@ pub enum ReactorFact {
         #[serde(skip_serializing_if = "Option::is_none")]
         apply: Option<u64>,
     },
+    /// The reactor appended a page's headers to an incarnation's staged
+    /// entries (M6a-5a).
+    Staged {
+        /// The incarnation that holds them.
+        incarnation: u64,
+        /// The frame the page came in, or `None` on a link with no stream
+        /// tap.
+        frame: Option<ReactorFrame>,
+        /// How many headers it appended.
+        count: u64,
+        /// The digest of every entry the incarnation holds after the
+        /// append.
+        after: HeldDigest,
+    },
+}
+
+/// Why no frame explains held work, in [`Observation::UnframedWork`]
+/// (M6a-5a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnframedCause {
+    /// The work holds more entries than its staged frames delivered.
+    Extra,
+    /// The work holds entries that differ from what its staged frames
+    /// delivered.
+    Substituted,
+}
+
+/// The frame a page came in, as the node's session reader took it
+/// (M6a-5a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorFrame {
+    /// Its QUIC stream.
+    pub quic_stream: u64,
+    /// Its read sequence number on that stream, as
+    /// [`TransportFact::HeaderRead`] numbers it.
+    pub seq: u64,
+    /// Its payload length in bytes.
+    pub payload_len: u64,
+    /// The digest of the entries the reader decoded from it.
+    pub received: HeldDigest,
+}
+
+/// A composable digest of a sequence of header entries, over every field of
+/// each entry (M6a-5a). See the node's
+/// [`HeldDigest`](zakura_network::zakura::observe::HeldDigest), which this
+/// mirrors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HeldDigest {
+    /// The digest's value.
+    pub value: u64,
+    /// The entries it covers.
+    pub len: u64,
+}
+
+impl HeldDigest {
+    /// The digest of this sequence followed by `next`'s, as the node
+    /// composes them.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        use zakura_network::zakura::observe::HeldDigest as Node;
+
+        let node = |digest: Self| Node {
+            value: digest.value,
+            len: digest.len,
+        };
+        let composed = node(self).then(node(next));
+        HeldDigest {
+            value: composed.value,
+            len: composed.len,
+        }
+    }
 }
 
 /// The work a reservation was placed for (M6a-4).
@@ -1573,6 +1671,8 @@ pub enum ReactorWorkState {
         target_phase: String,
         /// The staged headers it holds.
         held: u64,
+        /// The digest of the staged headers it holds (M6a-5a).
+        held_digest: HeldDigest,
         /// The cursor of its last staged page.
         cursor: Option<ReactorCursor>,
     },

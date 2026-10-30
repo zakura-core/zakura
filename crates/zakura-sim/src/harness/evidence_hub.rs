@@ -15,7 +15,9 @@
 //!
 //! A derived row is keyed `(pos, k)` after the record it came from, so it
 //! sits right after its source and before anything later: a `FrameJudged`
-//! or `ConnectionClosed` after its transport event, and a peer row placed
+//! or `ConnectionClosed` after its transport event, a `WorkAdmitted` or
+//! `UnframedWork` after the reactor record it came from (see
+//! [`StagedWork`]), and a peer row placed
 //! by the identity map after the record that let it resolve, naming the
 //! peer record's own position as its origin. After writing, the hub feeds
 //! the step to the storage policy's predicates in the same order.
@@ -28,6 +30,7 @@ use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc};
 
 use super::header_node::{
     settled::ReactorLife,
+    staging::StagedWork,
     tap::ReactorLink,
     view::{HeaderSyncView, Owners},
     PredicateFeed,
@@ -128,6 +131,8 @@ pub struct EvidenceHub {
 struct Peers {
     records: PeerRecords,
     evidence: WireEvidence,
+    /// The reactor's staged work, joined to the peers' frames (M6a-5a).
+    staged: StagedWork,
     /// Records drained and not yet placed, oldest first.
     pending: Vec<PeerRecord>,
 }
@@ -184,6 +189,7 @@ impl EvidenceHub {
         self.peers = Some(Peers {
             records,
             evidence: WireEvidence::default(),
+            staged: StagedWork::default(),
             pending: Vec::new(),
         });
     }
@@ -270,7 +276,10 @@ impl EvidenceHub {
             let placeable = match item {
                 Item::Row(row) => {
                     let derived = match self.peers.as_mut() {
-                        Some(peers) => peers.evidence.row(&row.obs),
+                        Some(peers) => peers.evidence.row(&row.obs).and_then(|mut derived| {
+                            derived.extend(peers.staged.row(&row.obs, &peers.evidence)?);
+                            Ok(derived)
+                        }),
                         None => Ok(Vec::new()),
                     };
                     let identity = matches!(
@@ -1092,6 +1101,434 @@ mod tests {
         assert_eq!(stops.len(), stops_off.len());
         for (on, off) in stops.iter().zip(&stops_off) {
             assert_eq!(on, off);
+        }
+    }
+
+    /// Staged work's crafted evidence (M6a-5a): a node on connection 1's
+    /// session 7, QUIC stream 4, whose reactor runs incarnation 1 for
+    /// subscription 8, and the peer's conformant, judged page frames 0 to 3
+    /// and its outcome frame 4.
+    mod staged {
+        use super::*;
+        use crate::observe::{
+            HeldDigest, ReactorFact, ReactorFrame, ReactorHolding, ReactorLease, ReactorPurpose,
+            ReactorRequest, ReactorSnapshot, ReactorWork, ReactorWorkState, StorageBranch,
+            UnframedCause, WorkOwner, WorkScope,
+        };
+
+        /// `event` as the node reactor's row.
+        fn reactor(event: ReactorFact) -> Observation {
+            Observation::Reactor {
+                instance: 0,
+                seq: 0,
+                storage_seq: 0,
+                node: "node".to_owned(),
+                event,
+            }
+        }
+
+        /// Incarnation 1's start, for subscription 8 on session 7.
+        fn started() -> Observation {
+            let scope = WorkScope {
+                header_generation: 1,
+                branch: StorageBranch {
+                    anchor: "aa".into(),
+                    target: "bb".into(),
+                },
+            };
+            reactor(ReactorFact::Started {
+                request: ReactorRequest {
+                    peer: "01".into(),
+                    session_id: 7,
+                    request_id: 8,
+                    incarnation: 1,
+                    owner: WorkOwner {
+                        kind: "header".into(),
+                        scope,
+                        verified_generation: None,
+                        body_work_epoch: None,
+                        session_id: 7,
+                        request_id: 8,
+                    },
+                    target: "bb".into(),
+                },
+                purpose: ReactorPurpose::Normal,
+            })
+        }
+
+        /// A made-up one-entry digest.
+        fn entry(value: u64) -> HeldDigest {
+            HeldDigest { value, len: 1 }
+        }
+
+        /// The digest of `entries`, composed as the node does.
+        fn of(entries: &[HeldDigest]) -> HeldDigest {
+            entries
+                .iter()
+                .fold(HeldDigest::default(), |digest, next| digest.then(*next))
+        }
+
+        /// Frame `seq` on QUIC stream 4, whose entries digest to `received`.
+        fn frame(seq: u64, received: HeldDigest) -> ReactorFrame {
+            ReactorFrame {
+                quic_stream: 4,
+                seq,
+                payload_len: 300,
+                received,
+            }
+        }
+
+        /// Incarnation 1 staging frame `seq`'s `received`, holding `after`.
+        fn staged(seq: u64, received: HeldDigest, after: HeldDigest) -> Observation {
+            reactor(ReactorFact::Staged {
+                incarnation: 1,
+                frame: Some(frame(seq, received)),
+                count: received.len,
+                after,
+            })
+        }
+
+        /// A settled snapshot where incarnation 1 holds `held`, with
+        /// `leased` headers in its leases.
+        fn settled(turn: u64, held: HeldDigest, leased: u64) -> Observation {
+            let ReactorFact::Started { request, .. } = (match started() {
+                Observation::Reactor { event, .. } => event,
+                _ => unreachable!("a reactor row"),
+            }) else {
+                unreachable!("a start");
+            };
+            reactor(ReactorFact::Settled {
+                turn,
+                last: false,
+                snapshot: Some(Box::new(ReactorSnapshot {
+                    work: vec![ReactorWork {
+                        peer: "01".into(),
+                        session_id: 7,
+                        target: "bb".into(),
+                        state: ReactorWorkState::Active {
+                            incarnation: 1,
+                            request_id: 8,
+                            owner: Box::new(request.owner),
+                            purpose: ReactorPurpose::Normal,
+                            target_phase: "receiving".into(),
+                            held: held.len,
+                            held_digest: held,
+                            cursor: None,
+                        },
+                    }],
+                    holdings: vec![ReactorHolding {
+                        peer: "01".into(),
+                        reservation: None,
+                        leases: vec![ReactorLease {
+                            lease: 2,
+                            count: leased,
+                        }],
+                    }],
+                    ..ReactorSnapshot::default()
+                })),
+            })
+        }
+
+        /// The peer's frames 0 to 4, conformant and judged: pages of
+        /// subscription 8, then its outcome.
+        fn peer_frames(log: &mut ObservationLog) {
+            for seq in 0..5 {
+                log.push(Observation::PeerFrame {
+                    connection: 1,
+                    stream: S5V9,
+                    quic_stream: Some(4),
+                    seq,
+                    row: Some(
+                        if seq < 4 {
+                            "headers"
+                        } else {
+                            "headers-outcome"
+                        }
+                        .to_owned(),
+                    ),
+                    rule_stream: S5V9,
+                    label: Label::Conformant,
+                    exhausted: false,
+                    exchange: Some(8),
+                    payload: 300,
+                });
+                log.push(Observation::FrameJudged {
+                    connection: 1,
+                    stream: S5V9,
+                    quic_stream: Some(4),
+                    seq,
+                });
+            }
+        }
+
+        /// Writes the session, the start, then `rows`, as one step, and
+        /// returns the log.
+        fn write(rows: Vec<Observation>) -> Result<ObservationLog, String> {
+            let (mut hub, _) = hub();
+            let mut log = ObservationLog::default();
+            peer_frames(&mut log);
+            let rows = [session(), started()]
+                .into_iter()
+                .chain(rows)
+                .enumerate()
+                .map(|(pos, obs)| at(100 + pos as u64, obs))
+                .collect();
+            hand(&hub, &mut log, rows);
+            hub.observe(&mut log).map(|()| log)
+        }
+
+        /// The `WorkAdmitted` and `UnframedWork` rows of `log`, with
+        /// `receiver-work-authorized`'s verdict on each, for the page row.
+        fn derived(log: &ObservationLog) -> Vec<(Observation, bool)> {
+            let page = RowAt::new(S5V9, "headers");
+            let entries = log.entries();
+            (0..entries.len())
+                .filter(|at| {
+                    matches!(
+                        entries[*at].obs,
+                        Observation::WorkAdmitted { .. } | Observation::UnframedWork { .. }
+                    )
+                })
+                .map(|at| {
+                    let page_verdict = crate::downstream::work_authorized(entries, at, &page);
+                    let outcome_verdict = crate::downstream::work_authorized(
+                        entries,
+                        at,
+                        &RowAt::new(S5V9, "headers-outcome"),
+                    );
+                    let ok = page_verdict.or(outcome_verdict).map(|v| v.is_ok());
+                    (entries[at].obs.clone(), ok.expect("the check judges it"))
+                })
+                .collect()
+        }
+
+        /// Held work's `UnframedWork`, with its cause and objects.
+        fn unframed(cause: UnframedCause, objects: u64) -> Observation {
+            Observation::UnframedWork {
+                connection: 1,
+                request: RowAt::new(S5V9, "subscribe-headers"),
+                exchange: 8,
+                objects,
+                bytes: 0,
+                cause,
+            }
+        }
+
+        /// Page frame `seq`'s `WorkAdmitted`, of `objects` headers.
+        fn admitted(seq: u64, objects: u64) -> Observation {
+            Observation::WorkAdmitted {
+                connection: 1,
+                frame: RowAt::new(S5V9, "headers"),
+                seq,
+                request: RowAt::new(S5V9, "subscribe-headers"),
+                exchange: 8,
+                objects,
+                bytes: 300,
+                ends: false,
+            }
+        }
+
+        /// Each staged page is admitted work right after its record, named
+        /// by its frame on the session's connection, and
+        /// `receiver-work-authorized` holds on it. Matching digests derive
+        /// nothing else.
+        #[test]
+        fn staged_work_is_admitted_after_its_record() {
+            let page = of(&[entry(1), entry(2)]);
+            let log =
+                write(vec![staged(0, page, page), settled(1, page, 2)]).expect("the step is whole");
+            assert_eq!(derived(&log), [(admitted(0, 2), true)]);
+            let entries = log.entries();
+            let at = entries
+                .iter()
+                .position(|entry| matches!(entry.obs, Observation::WorkAdmitted { .. }))
+                .expect("logged");
+            assert!(matches!(
+                entries[at - 1].obs,
+                Observation::Reactor {
+                    event: ReactorFact::Staged { .. },
+                    ..
+                }
+            ));
+            assert_eq!(entries[at].origin, Some(entries[at - 1].pos));
+        }
+
+        /// A second writer appends an entry no `Staged` reports. The next
+        /// settled boundary holds more than the frames explain, which is
+        /// `UnframedWork{Extra}`, and `receiver-work-authorized` fails on it
+        /// while the framed page still passes.
+        ///
+        /// This fails if the check passes unframed work.
+        #[test]
+        fn staging_by_another_writer_reaches_the_downstream_check() {
+            let page = of(&[entry(1), entry(2)]);
+            let extra = page.then(entry(9));
+            let log = write(vec![staged(0, page, page), settled(1, extra, 2)])
+                .expect("the step is whole");
+            assert_eq!(
+                derived(&log),
+                [
+                    (admitted(0, 2), true),
+                    (unframed(UnframedCause::Extra, 1), false)
+                ]
+            );
+        }
+
+        /// An entry replaced after its append, with the count unchanged,
+        /// shows at the next settled boundary as `UnframedWork{Substituted}`,
+        /// once while it lasts.
+        ///
+        /// This fails if the fold compares counts only.
+        #[test]
+        fn an_equal_count_substitution_is_seen() {
+            let page = of(&[entry(1), entry(2)]);
+            let substituted = of(&[entry(1), entry(3)]);
+            let log = write(vec![
+                staged(0, page, page),
+                settled(1, substituted, 2),
+                settled(2, substituted, 2),
+            ])
+            .expect("the step is whole");
+            assert_eq!(
+                derived(&log),
+                [
+                    (admitted(0, 2), true),
+                    (unframed(UnframedCause::Substituted, 2), false)
+                ]
+            );
+        }
+
+        /// An entry replaced between the decode and the append keeps its
+        /// count and frame, but the reactor's `after` differs from the
+        /// fold's own expected digest, so it's unframed at the `Staged`.
+        ///
+        /// This fails if the fold adopts `after` as its expectation.
+        #[test]
+        fn a_substitution_before_the_append_is_seen() {
+            let page = of(&[entry(1), entry(2)]);
+            let appended = of(&[entry(1), entry(3)]);
+            let log = write(vec![staged(0, page, appended), settled(1, appended, 2)])
+                .expect("the step is whole");
+            assert_eq!(
+                derived(&log),
+                [
+                    (admitted(0, 2), true),
+                    (unframed(UnframedCause::Substituted, 2), false)
+                ]
+            );
+        }
+
+        /// An older entry changed before the next page's append: that
+        /// page's `after` covers the changed entry, so it differs from the
+        /// fold's expectation, which the fold keeps, so a third page that
+        /// extends the changed history differs too.
+        ///
+        /// This fails if a later append absorbs the change.
+        #[test]
+        fn a_substitution_during_a_later_append_is_seen() {
+            let (first, second, third) = (entry(1), entry(2), entry(3));
+            let changed = entry(7);
+            let log = write(vec![
+                staged(0, first, first),
+                staged(1, second, of(&[changed, second])),
+                staged(2, third, of(&[changed, second, third])),
+            ])
+            .expect("the step is whole");
+            assert_eq!(
+                derived(&log),
+                [
+                    (admitted(0, 1), true),
+                    (admitted(1, 1), true),
+                    (unframed(UnframedCause::Substituted, 2), false),
+                    (admitted(2, 1), true),
+                    (unframed(UnframedCause::Substituted, 3), false),
+                ]
+            );
+        }
+
+        /// A prepare's take restarts the expectation empty, so a take whose
+        /// chain is what the frames delivered, and the empty held digest
+        /// after it, derive nothing.
+        ///
+        /// This fails if the fold keeps its expectation across the take.
+        #[test]
+        fn a_take_restarts_the_expectation() {
+            let page = of(&[entry(1), entry(2)]);
+            let take = |chain| {
+                reactor(ReactorFact::EntriesTaken {
+                    incarnation: 1,
+                    transfer: 1,
+                    count: 2,
+                    chain,
+                })
+            };
+            let log = write(vec![
+                staged(0, page, page),
+                take(page),
+                settled(1, HeldDigest::default(), 2),
+            ])
+            .expect("the step is whole");
+            assert_eq!(derived(&log), [(admitted(0, 2), true)]);
+            // A take of more than the frames delivered is unframed.
+            let log = write(vec![
+                staged(0, page, page),
+                take(page.then(entry(9))),
+                settled(1, HeldDigest::default(), 3),
+            ])
+            .expect("the step is whole");
+            assert_eq!(
+                derived(&log),
+                [
+                    (admitted(0, 2), true),
+                    (unframed(UnframedCause::Extra, 1), false)
+                ]
+            );
+        }
+
+        /// Capacity consumed with nothing staged, as a settled snapshot's
+        /// leases show it, is no admitted work: only a `Staged` admits.
+        ///
+        /// This fails if admitted work comes from the budget.
+        #[test]
+        fn consumed_but_unstaged_work_is_not_admitted() {
+            let log = write(vec![settled(1, HeldDigest::default(), 2)]).expect("the step is whole");
+            assert_eq!(derived(&log), []);
+        }
+
+        /// On the wire tier a staged page names a tagged frame of its
+        /// session's own stream, and its session must be mapped. Each break
+        /// is a harness failure.
+        #[test]
+        fn an_untagged_foreign_or_unmapped_stage_fails() {
+            let page = entry(1);
+            let untagged = reactor(ReactorFact::Staged {
+                incarnation: 1,
+                frame: None,
+                count: 1,
+                after: page,
+            });
+            let foreign = reactor(ReactorFact::Staged {
+                incarnation: 1,
+                frame: Some(ReactorFrame {
+                    quic_stream: 8,
+                    ..frame(0, page)
+                }),
+                count: 1,
+                after: page,
+            });
+            for (row, name) in [(untagged, "UntaggedFrame"), (foreign, "ForeignFrame")] {
+                let failed = write(vec![row]).expect_err("the stage can't be attributed");
+                assert!(failed.starts_with(name), "{failed}");
+            }
+            let (mut hub, _) = hub();
+            let mut log = ObservationLog::default();
+            hand(
+                &hub,
+                &mut log,
+                vec![at(1, started()), at(2, staged(0, page, page))],
+            );
+            let failed = hub.observe(&mut log).expect_err("no session row maps it");
+            assert!(failed.starts_with("UnmappedSession"), "{failed}");
         }
     }
 }

@@ -23,6 +23,11 @@ pub enum ComponentKind {
     CallHolders,
     /// Headers moved out of a work incarnation.
     Transfers,
+    /// Staged header work's effect rows, `WorkAdmitted` and `UnframedWork`
+    /// (M6a-5a). They're effects the evidence hub derives, not a read, so
+    /// no view component holds them, but a tier that can't derive them
+    /// excludes them like a component.
+    StagedWork,
     /// A session's header publisher.
     Publisher,
     /// The engine's committed snapshot.

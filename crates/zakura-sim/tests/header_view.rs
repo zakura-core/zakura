@@ -1074,6 +1074,7 @@ fn transfer_facts(report: &RunReport) -> std::collections::BTreeMap<u64, Transfe
                 incarnation,
                 transfer,
                 count,
+                ..
             } => transfers.entry(*transfer).or_default().taken = Some((*incarnation, *count)),
             ReactorFact::Dispatched {
                 call,

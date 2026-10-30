@@ -66,7 +66,7 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, WireEvidence};
+pub(crate) use self::evidence::{rules, PeerRecord, PeerRecords, RecordBody, WireEvidence};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,

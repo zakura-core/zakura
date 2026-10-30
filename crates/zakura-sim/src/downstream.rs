@@ -124,7 +124,29 @@ impl Quantity {
 /// peer's models labelled `Conformant` and the node's reader judged, on a
 /// connection still open. The work from each frame stays within that
 /// frame's bytes: one frame's unused bytes never cover another's work.
+///
+/// Held work no frame explains, [`Observation::UnframedWork`], fails every
+/// row of its stream directly, since no frame of any row delivered it.
 pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Found {
+    if let Observation::UnframedWork {
+        connection,
+        request,
+        exchange,
+        objects,
+        cause,
+        ..
+    } = &entries[at].obs
+    {
+        return (request.stream == row.stream).then(|| {
+            Err(Failure::new(
+                format!(
+                    "connection {connection}'s held work for {request} exchange {exchange} comes \
+                     from the frames it staged"
+                ),
+                format!("it holds {objects} objects no frame explains ({cause:?})"),
+            ))
+        });
+    }
     let Observation::WorkAdmitted {
         connection,
         frame,

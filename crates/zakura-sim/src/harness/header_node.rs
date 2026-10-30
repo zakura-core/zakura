@@ -13,6 +13,7 @@
 mod pair;
 pub mod policy;
 pub mod settled;
+pub(crate) mod staging;
 pub mod tap;
 pub mod view;
 pub mod work;

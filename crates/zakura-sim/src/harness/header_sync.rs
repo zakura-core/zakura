@@ -882,6 +882,8 @@ pub struct ManifestRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceManifest {
     rows: Vec<ManifestRow>,
+    /// Effect evidence it observes, which has no read and so no row.
+    effects: Vec<ComponentKind>,
     excluded: Vec<(ComponentKind, &'static str)>,
 }
 
@@ -939,17 +941,21 @@ fn transport_rows() -> [ManifestRow; 8] {
 const NO_SESSIONS: &str = "header sync reserves no sessions";
 
 impl SourceManifest {
-    /// `header-sync/wire`'s components: all but the session slots.
+    /// `header-sync/wire`'s components: all but the session slots, and its
+    /// staged work's effect rows.
     pub fn wire() -> Self {
         SourceManifest {
             rows: node_rows().into_iter().chain(transport_rows()).collect(),
+            effects: vec![ComponentKind::StagedWork],
             excluded: vec![(ComponentKind::SessionSlots, NO_SESSIONS)],
         }
     }
 
     /// `header-sync/storage`'s components: the node's. It has no transport
     /// and no session slots, and it excludes gauges, since its mirror
-    /// reactors share the node's gauge names.
+    /// reactors share the node's gauge names. It excludes staged work's
+    /// effect rows too, since its in-memory links have no read seqs to name
+    /// a frame by.
     pub fn storage() -> Self {
         let mut excluded: Vec<_> = transport_rows()
             .iter()
@@ -961,8 +967,13 @@ impl SourceManifest {
             ComponentKind::Gauges,
             "mirror reactors share the gauge names",
         ));
+        excluded.push((
+            ComponentKind::StagedWork,
+            "in-memory links have no read seqs",
+        ));
         SourceManifest {
             rows: node_rows().to_vec(),
+            effects: Vec::new(),
             excluded,
         }
     }
@@ -972,11 +983,16 @@ impl SourceManifest {
         &self.rows
     }
 
-    /// `sources`, observing each row's component and excluding the others
-    /// with their reasons.
+    /// `sources`, observing each row's component and each effect, and
+    /// excluding the others with their reasons.
     pub fn sources(&self, sources: Sources) -> Sources {
-        let sources = self.rows.iter().fold(sources, |sources, row| {
-            sources.observing(Source::Component(row.kind))
+        let observed = self
+            .rows
+            .iter()
+            .map(|row| row.kind)
+            .chain(self.effects.iter().copied());
+        let sources = observed.fold(sources, |sources, kind| {
+            sources.observing(Source::Component(kind))
         });
         self.excluded
             .iter()
@@ -1247,6 +1263,50 @@ mod tests {
         assert_eq!(
             report.excluded.as_deref(),
             Some("Component(Publisher): no transport")
+        );
+    }
+
+    /// Staged work's effect rows are a source `header-sync/wire` observes
+    /// and `header-sync/storage` excludes, since its in-memory links have
+    /// no read seqs, so a property that needs them is `NotApplicable` there
+    /// with that reason (M6a-5a).
+    #[test]
+    fn storage_excludes_staged_work() {
+        let property = |sources: &Sources| {
+            RegistryChecker::new(
+                Registry::new(vec![Property {
+                    id: PropertyId::new("test/staged-work"),
+                    claim: "a test claim on staged work",
+                    kind: Kind::Safety,
+                    assumes: &[],
+                    needs: &[Source::Component(ComponentKind::StagedWork)],
+                    status: Status::Active,
+                    check: check_publisher,
+                    witness: None,
+                }])
+                .expect("one property"),
+                Rc::new(Nothing),
+                Assumptions::none(),
+                sources,
+            )
+        };
+        assert_eq!(property(&HeaderWire::sources()).harness_failure(), None);
+        let mut storage = property(&storage_sources());
+        assert_eq!(storage.harness_failure(), None);
+        let end = RunEnd {
+            outcome: Outcome::Idle {
+                status: IdleStatus::Quiescent,
+            },
+            steps: 0,
+            violation: None,
+            drain: None,
+            harness: None,
+        };
+        let reports = storage.at_end(&end, &ObservationLog::default());
+        assert_eq!(reports[0].outcome, PropertyOutcome::NotApplicable);
+        assert_eq!(
+            reports[0].excluded.as_deref(),
+            Some("Component(StagedWork): in-memory links have no read seqs")
         );
     }
 

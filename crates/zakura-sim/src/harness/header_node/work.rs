@@ -8,7 +8,7 @@
 //! `LeasesCaptured` joins the call to the incarnation and the lease IDs it
 //! holds. A prepare takes its incarnation's staged headers as a transfer,
 //! `EntriesTaken`, which ends once, `TransferEnded`, when its last handle
-//! drops. [`WorkLedger`] folds those records in log order and checks them
+//! drops. A page's `Staged` names a live round (M6a-5a). [`WorkLedger`] folds those records in log order and checks them
 //! against each settled snapshot, whose holdings it reads from the queue's
 //! own maps. Any break is a structural failure of the tap's evidence. A
 //! transfer still live when the log freezes is pending, not a failure.
@@ -216,6 +216,7 @@ impl WorkLedger {
                 incarnation,
                 transfer,
                 count,
+                ..
             } => {
                 if !self
                     .incarnations
@@ -265,6 +266,18 @@ impl WorkLedger {
                     }
                 }
                 taken.ended = Some((disposition.clone(), *apply));
+            }
+            ReactorFact::Staged { incarnation, .. } => {
+                // Only a live round stages pages.
+                match self.incarnations.get(incarnation) {
+                    Some(work) if work.started.is_some() && !work.retired => {}
+                    _ => {
+                        return Err(format!(
+                            "UnknownIncarnation: {fact:?} names incarnation {incarnation}, \
+                             which isn't a started round"
+                        ))
+                    }
+                }
             }
             ReactorFact::LeasesCaptured {
                 call, incarnation, ..
@@ -457,6 +470,7 @@ mod tests {
                     purpose: ReactorPurpose::Normal,
                     target_phase: "receiving".into(),
                     held: 0,
+                    held_digest: Default::default(),
                     cursor: None,
                 },
             }],
@@ -604,6 +618,7 @@ mod tests {
             incarnation,
             transfer,
             count,
+            chain: Default::default(),
         }
     }
 

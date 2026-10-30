@@ -1004,6 +1004,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::LeasesCaptured { .. } => "leases-captured",
                 ReactorFact::EntriesTaken { .. } => "entries-taken",
                 ReactorFact::TransferEnded { .. } => "transfer-ended",
+                ReactorFact::Staged { .. } => "staged",
             }),
             _ => None,
         })
@@ -1038,7 +1039,8 @@ fn tap_adds_no_scheduling_point() {
                 "bound",
                 "leases-captured",
                 "entries-taken",
-                "transfer-ended"
+                "transfer-ended",
+                "staged"
             ])
         );
         let seqs: Vec<u64> = tapped
@@ -1173,6 +1175,75 @@ fn transfer_events_add_no_scheduling_point() {
             )),
             "the handed transfer was taken and its prepare names it"
         );
+        assert_eq!(tapped.end, bare.end);
+        assert_eq!(support::picks(&tapped), support::picks(&bare));
+        assert_eq!(stops(&tapped), stops(&bare));
+    }
+}
+
+/// Staged work adds no scheduling point (M6a-5a): under every plan, the
+/// tapped run makes the same picks and stops every task at the same point,
+/// object and site as the bare run, and the tapped run stages pages with
+/// the digest of what it then holds, settles with each active work's held
+/// digest, and takes a transfer whose chain is its last stage's digest.
+///
+/// The session reader's frame tag only exists on a tapped stream, which
+/// this tier's in-memory links don't have, so its pages name no frame. The
+/// schedule gate's saved wire Plans cover that path.
+///
+/// This fails if the staging capture path reads anything through the
+/// simulator's primitives.
+#[test]
+fn frame_tags_add_no_scheduling_point() {
+    for input in inputs(8, 256) {
+        let bare = node_run(input.clone(), false);
+        let tapped = node_run(input, true);
+        let facts: Vec<&ReactorFact> = tapped
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Reactor { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        let mut last = std::collections::BTreeMap::new();
+        let (mut staged, mut held, mut chained) = (false, false, false);
+        for fact in &facts {
+            match fact {
+                ReactorFact::Staged {
+                    incarnation,
+                    frame: None,
+                    count,
+                    after,
+                } if *count > 0 && after.len >= *count => {
+                    staged = true;
+                    last.insert(*incarnation, *after);
+                }
+                ReactorFact::EntriesTaken {
+                    incarnation,
+                    count,
+                    chain,
+                    ..
+                } => chained |= *count > 0 && last.get(incarnation) == Some(chain),
+                ReactorFact::Settled {
+                    snapshot: Some(snapshot),
+                    ..
+                } => {
+                    held |= snapshot.work.iter().any(|work| {
+                        matches!(
+                            &work.state,
+                            zakura_sim::observe::ReactorWorkState::Active { held, held_digest, .. }
+                                if held_digest.len == *held
+                        )
+                    })
+                }
+                _ => {}
+            }
+        }
+        assert!(staged, "the node staged a page");
+        assert!(held, "a settled snapshot digests its active work's headers");
+        assert!(chained, "a take carries its last stage's digest");
         assert_eq!(tapped.end, bare.end);
         assert_eq!(support::picks(&tapped), support::picks(&bare));
         assert_eq!(stops(&tapped), stops(&bare));

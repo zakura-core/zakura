@@ -225,8 +225,8 @@ pub(crate) struct WireEvidence {
     /// Each admitted stream's kind and version, by connection and QUIC
     /// stream.
     streams: BTreeMap<(u64, u64), StreamId>,
-    /// Each admitted session's connection, by session ID.
-    sessions: BTreeMap<u64, u64>,
+    /// Each admitted session's connection and QUIC stream, by session ID.
+    sessions: BTreeMap<u64, (u64, u64)>,
     /// Each logged `PeerFrame`'s label, by connection, QUIC stream and
     /// `seq`.
     labels: BTreeMap<(u64, u64, u64), Label>,
@@ -302,7 +302,8 @@ impl WireEvidence {
                     version: *version,
                 };
                 self.streams.insert((*connection, *quic_stream), stream);
-                self.sessions.insert(*session_id, *connection);
+                self.sessions
+                    .insert(*session_id, (*connection, *quic_stream));
             }
             _ => {}
         }
@@ -526,6 +527,7 @@ impl WireEvidence {
             } => {
                 let connection = origin
                     .and_then(|session| self.sessions.get(&session))
+                    .map(|(connection, _)| connection)
                     .ok_or_else(|| {
                         format!(
                             "UnattributedMisbehavior: peer {peer}'s misbehavior names no \
@@ -634,6 +636,14 @@ impl WireEvidence {
         Ok(None)
     }
 
+    /// Admitted session `session_id`'s connection, QUIC stream and stream,
+    /// as its `Session` row named them (M6a-5a).
+    pub(crate) fn session(&self, session_id: u64) -> Option<(u64, u64, StreamId)> {
+        let (connection, quic_stream) = *self.sessions.get(&session_id)?;
+        let stream = *self.streams.get(&(connection, quic_stream))?;
+        Some((connection, quic_stream, stream))
+    }
+
     /// The admitted stream of `connection`'s `quic_stream`.
     fn stream(&self, connection: u64, quic_stream: u64) -> Result<StreamId, String> {
         self.streams
@@ -659,7 +669,7 @@ impl WireEvidence {
 }
 
 /// The rows of a stream the wire harness runs, if it has a table.
-fn rules(stream: StreamId) -> Option<&'static [MessageRule]> {
+pub(crate) fn rules(stream: StreamId) -> Option<&'static [MessageRule]> {
     RegtestMessage::LAYOUT
         .iter()
         .find(|layout| (layout.kind, layout.version) == (stream.kind, stream.version))

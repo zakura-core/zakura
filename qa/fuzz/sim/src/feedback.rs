@@ -39,7 +39,11 @@ pub fn feedback(collector: NewCollector) -> Feedback {
 fn counters() -> &'static Counters {
     static PICKED: OnceLock<&'static Counters> = OnceLock::new();
     PICKED.get_or_init(|| {
-        let mode = env::var(FEEDBACK_VAR).unwrap_or_else(|_| "on".to_owned());
+        // A value that isn't UTF-8 reaches the panic below, not `on`.
+        let mode = env::var_os(FEEDBACK_VAR).map_or_else(
+            || "on".to_owned(),
+            |value| value.to_string_lossy().into_owned(),
+        );
         let counters = match mode.as_str() {
             "on" if cfg!(target_os = "linux") => &COUNTERS,
             "on" => panic!("{FEEDBACK_VAR}=on: libFuzzer reads extra counters only on Linux"),

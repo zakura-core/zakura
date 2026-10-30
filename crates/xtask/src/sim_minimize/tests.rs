@@ -818,7 +818,7 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
         (
             full.replace("race_fixtures", "header_pursuit"),
             "unknown simulation fuzz target `header_pursuit`; expected one of \
-             discovery_wait_complete, race_fixtures",
+             discovery_wait_complete, header_sync_storage, race_fixtures",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (

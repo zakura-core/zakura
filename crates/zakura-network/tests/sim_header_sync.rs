@@ -107,8 +107,22 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
     startup
 }
 
+/// Where `outcome` left its task: the point it reached, with the point's
+/// object and site, or how it waited or ended.
+fn stop(outcome: &RunOutcome) -> String {
+    match outcome {
+        RunOutcome::Reached(at) => {
+            let site = at.site.map_or_else(String::new, |site| {
+                format!("{}:{}", site.file(), site.line())
+            });
+            format!("reached {at} {:?} {site}", at.object)
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 /// Runs ready tasks, picked by `plan`, until none is ready. Records each
-/// step in `steps`.
+/// step in `steps`, as its pick and where the task stopped.
 fn run_until_idle(sched: &mut Scheduler, plan: &RefCell<Plan>, steps: &mut Vec<String>) -> Status {
     loop {
         assert!(steps.len() < MAX_STEPS, "the run took {MAX_STEPS} steps");
@@ -119,8 +133,10 @@ fn run_until_idle(sched: &mut Scheduler, plan: &RefCell<Plan>, steps: &mut Vec<S
         let ready = sched.ready();
         let index = plan.borrow_mut().below(ready.len() as u64); // a Vec's length fits in u64
         let pick = ready[index as usize]; // below `ready.len()`, a usize
-        steps.push(format!("{}:{}", sched.task_name(pick.task), pick.at));
-        if let RunOutcome::Panicked(message) = sched.run(pick.task) {
+        let picked = format!("{}:{}", sched.task_name(pick.task), pick.at);
+        let outcome = sched.run(pick.task);
+        steps.push(format!("{picked} -> {}", stop(&outcome)));
+        if let RunOutcome::Panicked(message) = outcome {
             steps.push(format!("panicked: {message}"));
         }
     }
@@ -255,13 +271,20 @@ impl HeaderSyncObserver for Events {
 }
 
 /// [`two_reactors_meet_over_memory_streams`]'s run, with each reactor
-/// observed by its entry of `observers`, if given. Returns every step.
-fn meet(observers: Option<[Arc<Events>; 2]>) -> Vec<String> {
+/// observed by its entry of `observers`, if given. Returns every step, with
+/// where its task stopped, and every draw.
+fn meet(observers: Option<[Arc<Events>; 2]>) -> (Vec<String>, Vec<String>) {
     let plan = Rc::new(RefCell::new(Plan(3)));
+    let draws = Rc::new(RefCell::new(Vec::new()));
     let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
     {
-        let plan = Rc::clone(&plan);
-        sched.set_draws(move |draw| plan.borrow_mut().below(draw.bound));
+        let (plan, draws) = (Rc::clone(&plan), Rc::clone(&draws));
+        sched.set_draws(move |draw| {
+            draws
+                .borrow_mut()
+                .push(format!("{:?}/{}", draw.kind, draw.bound));
+            plan.borrow_mut().below(draw.bound)
+        });
     }
 
     let shutdown = CancellationToken::new();
@@ -343,11 +366,14 @@ fn meet(observers: Option<[Arc<Events>; 2]>) -> Vec<String> {
         !steps.iter().any(|step| step.starts_with("panicked")),
         "{steps:?}"
     );
-    steps
+    let draws = draws.take();
+    (steps, draws)
 }
 
 /// The reactors' settled snapshots and resume markers add no scheduling
-/// point: the meeting takes the same steps with and without observers, and
+/// point: the meeting takes the same steps, with every task stopping at the
+/// same point, object and site, and the same draws, with and without
+/// observers, and
 /// the observed run reaches each reactor's build, start, a wait it resumes
 /// from, its shutdown and its final snapshot, with its session listed.
 ///
@@ -384,7 +410,13 @@ fn reactor_snapshots_add_no_scheduling_point() {
             "a settled snapshot lists the session"
         );
     }
-    assert_eq!(observed, meet(None));
+    let (steps, draws) = observed;
+    assert!(
+        steps.iter().any(|step| step.contains("-> reached"))
+            && steps.iter().any(|step| step.contains("-> Waiting")),
+        "the steps record where each task stopped"
+    );
+    assert_eq!((steps, draws), meet(None));
 }
 
 /// Reactor `a`'s session with peer `b` is replaced while its pipe still runs. The

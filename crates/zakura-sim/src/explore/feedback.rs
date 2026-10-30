@@ -184,6 +184,12 @@ impl Feedback {
         }
     }
 
+    /// The counters, which hold the last input's features once its run
+    /// ends.
+    pub fn counters(&self) -> &'static Counters {
+        self.map.counters
+    }
+
     /// Clears the counters and makes a fresh collector, so no feature or
     /// history carries over from an earlier input.
     pub fn start(&self) -> Collecting {

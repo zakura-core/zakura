@@ -382,7 +382,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask sim-verify-archive <dir>")?;
     writeln!(
         output,
-        "  cargo xtask sim-campaign (build|start|resume|close|status|verify) --store <dir> ..."
+        "  cargo xtask sim-campaign (build|start|resume|close|status|verify|evidence) --store <dir> ..."
     )?;
     writeln!(output)?;
     writeln!(

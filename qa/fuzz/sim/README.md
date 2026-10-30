@@ -134,7 +134,10 @@ them starts fresh when any of them changes.
 
 ## Campaigns
 
-`campaigns/full-suite-20261029/manifest.toml` maps the broader campaign's
-targets to harnesses, seeds, worker counts, and libFuzzer options. Its README
-contains the launch and resume commands. Its C1 inventory records the coverage
-that existed when the campaign started. Keep campaign outputs outside Git.
+A campaign directory, such as `campaigns/full-suite-20261029/`, holds a
+`manifest.toml` with the PR heads it integrates, each target's workers,
+shard and per-input timeout, and each segment's search budget. Its targets
+are those of `qa/suite.toml`, every fuzz package's included.
+`scripts/fuzz-campaign.py` checks the manifest against `zakura-sim suite`'s
+output and writes each segment's launch script. The campaign's README has
+the commands. Keep campaign outputs outside Git.

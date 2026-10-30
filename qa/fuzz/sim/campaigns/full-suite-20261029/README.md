@@ -1,70 +1,83 @@
 # Full-suite campaign 2026-10-29
 
-This configuration starts an intentionally incomplete campaign over every
-mapped fuzz target. The manifest records the exact input PR heads. The
-deployment record adds the integration commit, toolchain output, version
-reports, seed digest, corpus digest, and start time.
+This campaign runs every fuzz target of C1's suite manifest. `qa/suite.toml`
+maps those targets, and `zakura-sim suite` checks that no target, harness
+or property is missing from it. `manifest.toml` adds only the campaign's
+choices: the PR heads it integrates, each target's shard, workers and
+per-input timeout, and each segment's search budget.
+`scripts/fuzz-campaign.py` refuses a `manifest.toml` whose targets differ
+from the suite manifest's.
 
-## Validate and populate
+The campaign is incomplete. The suite manifest's `pending` rows list the
+planned harnesses, properties, protocol-state features and targets that
+haven't landed, such as H1, H2, H4, H5 and P8. They stay unimplemented in
+the report even if every target runs clean.
 
-Run these commands from the repository root. Set `CAMPAIGN_ROOT` to persistent
-disk. Do not put the campaign under `/tmp` or `/dev/shm`.
+## Validate and freeze
+
+Run these commands from a clean checkout of the campaign commit. Set
+`CAMPAIGN_ROOT` to persistent disk, not `/tmp` or `/dev/shm`.
 
 ```console
 export CAMPAIGN_ROOT=/srv/zakura-fuzz/campaigns/full-suite-20261029
-export RUSTFLAGS="--cfg zakura_sim"
-cargo +1.97.0 test -p zakura-sim --locked
-cargo +1.97.0 xtask sim-seeds --report "$CAMPAIGN_ROOT/seed-report.json"
-cargo +1.97.0 xtask sim-seeds --sim block-sync/storage --out "$CAMPAIGN_ROOT/corpus/block_sync_storage"
-cargo +1.97.0 xtask sim-seeds --sim header-sync/wire --out "$CAMPAIGN_ROOT/corpus/header_sync_wire"
-cargo +1.97.0 xtask sim-seeds --sim header-sync/storage --out "$CAMPAIGN_ROOT/corpus/header_sync_storage"
-cargo +1.97.0 xtask sim-seeds --sim discovery/wait-complete --out "$CAMPAIGN_ROOT/corpus/discovery_wait_complete"
+mkdir -p "$CAMPAIGN_ROOT"
+RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --locked
+cargo xtask sim-suite --frozen --out "$CAMPAIGN_ROOT/suite.json"
+python3 scripts/fuzz-campaign.py --campaign qa/fuzz/sim/campaigns/full-suite-20261029 \
+  --suite-manifest "$CAMPAIGN_ROOT/suite.json" --check
 ```
 
-Build and smoke every target from `qa/fuzz/sim`:
+`suite.json` is the campaign's frozen inventory. It records the commit,
+the source and lockfile digests, `qa/suite.toml`'s digest, every target,
+harness, property, witness and pending row, and the seed report. Its
+target rows hold each target's 60-second smoke command over its seeds. Run
+them before the calibration segment.
+
+## Run a segment
+
+A segment gives every target the segment's search budget, which the
+launch script passes to libFuzzer as `-max_total_time`. The per-input
+`-timeout` is the target's `input-timeout-secs`. An outer `timeout` stops
+a run that outlives its budget, one input's timeout and five minutes.
+
+Run the segments in order: `calibration`, `pilot`, then `extended`. Run a
+segment's shards one after another, since each shard uses every vCPU:
 
 ```console
-export RUSTFLAGS="--cfg zakura_sim"
-for target in block_sync_storage header_sync_wire header_sync_storage discovery_wait_complete race_fixtures feedback_probe; do
-  cargo +nightly-2026-07-15 fuzz build --fuzz-dir . "$target"
+for shard in sim header-chain; do
+  python3 scripts/fuzz-campaign.py --campaign qa/fuzz/sim/campaigns/full-suite-20261029 \
+    --suite-manifest "$CAMPAIGN_ROOT/suite.json" --segment calibration --shard "$shard" \
+    > "$CAMPAIGN_ROOT/calibration-$shard.sh"
+  bash "$CAMPAIGN_ROOT/calibration-$shard.sh"
 done
-cargo +1.97.0 xtask sim-feedback
 ```
 
-Run each correctness target for 60 seconds before the unbounded campaign.
-Use its populated corpus and a distinct artifact directory.
+The script builds the shard's targets under AddressSanitizer, seeds each
+`sim` target's corpus from its harness's admitted seeds once, and runs the
+targets together. It leaves `ZAKURA_SIM_FEEDBACK` unset, so semantic
+feedback stays off: no harness emits protocol-state features yet. Each run
+writes `run.log`, `exit-status`, libFuzzer's artifacts and
+`ZAKURA_SIM_ARTIFACTS`' classified inputs under
+`$CAMPAIGN_ROOT/segments/<segment>/<shard>/<package>/<target>/`. The
+shard's directory also holds `segment.json`, `suite.json`, and the start
+and finish times. Every segment of a target grows the same corpus,
+`$CAMPAIGN_ROOT/corpus/<package>/<target>/`.
 
-## Launch and resume
+A segment's script refuses to reuse a segment's directory. To continue an
+interrupted segment, run its next attempt with `--attempt 2` (then 3, and
+so on), optionally limited to the unfinished targets with `--target <id>`.
+The attempt writes `segments/<segment>.<attempt>/`, records the previous
+attempt as its parent, and leaves the earlier evidence in place.
 
-The launch command and the resume command are identical. libFuzzer resumes
-from each target's persistent corpus. Run one service per target. Set
-`ZAKURA_SIM_ARTIFACTS` to preserve classified inputs and traces outside the
-cargo-fuzz artifact directory.
-
-```console
-cd qa/fuzz/sim
-export RUSTFLAGS="--cfg zakura_sim"
-export ZAKURA_SIM_ARTIFACTS="$CAMPAIGN_ROOT/evidence/block_sync_storage"
-cargo +nightly-2026-07-15 fuzz run --fuzz-dir . block_sync_storage "$CAMPAIGN_ROOT/corpus/block_sync_storage" -- -jobs=3 -workers=3 -max_len=4096 -timeout=600 -rss_limit_mb=4096 -artifact_prefix="$CAMPAIGN_ROOT/artifacts/block_sync_storage/"
-```
-
-Repeat that command with these substitutions:
-
-| Target | Jobs and workers | Timeout seconds |
-| --- | ---: | ---: |
-| `header_sync_wire` | 2 | 180 |
-| `header_sync_storage` | 1 | 120 |
-| `discovery_wait_complete` | 1 | 60 |
-| `race_fixtures` | 1 | 60 |
-
-The first deployment uses AddressSanitizer. A later throughput rotation may
-add `-s none --no-default-features`, but it must use separate binaries, logs,
-and service names so the deployment record identifies each mode.
+Set the extended budget from the pilot's measured cost in a new revision of
+`manifest.toml` before the extended segment starts. A source, build or
+generator change starts a new campaign directory; it can't reuse the old
+segments' results as evidence for the new commit.
 
 ## Reporting
 
-Treat every crash, timeout, abandonment, nondeterministic result, and property
-violation as evidence. Preserve the input before triage. Replay ordinary
-property failures exactly. Report correctness findings separately from C1-C4
-completeness. Missing H1, H2, H4, H5, P8, and typed protocol-state collectors
-keep this campaign incomplete even if every running target stays clean.
+Treat every crash, timeout, abandonment, nondeterministic result and
+property violation as evidence. Preserve the input before triage. Replay
+ordinary property failures exactly. Report each target's budget, exit
+status and finished segments beside the suite manifest's rows. Report
+correctness findings separately from C1–C4 completeness.

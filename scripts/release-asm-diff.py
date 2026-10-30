@@ -628,20 +628,54 @@ def emit_lib(cargo, tree, target, inputs, package, crate, cgu, out_dir, asm):
     which the comparison skips, is turned off too: its size changes with
     any source edit and would move every section after it in the object.
     `zakurad` builds exactly as it ships.
+
+    The objects come from the rlib cargo builds, since without debug info
+    rustc deletes a multi-unit crate's loose objects. Removing the old rlib
+    first makes cargo build it again.
     """
     deps = target / "release" / "deps"
-    for suffix in (".o", ".s"):
-        for stale in deps.glob(crate + "-*" + suffix):
-            stale.unlink()
+    for stale in list(deps.glob(crate + "-*.s")) + list(deps.glob("lib" + crate + "-*.rlib")):
+        stale.unlink()
     print("== %s: %s, codegen-units=%d" % (tree.name, package, cgu), flush=True)
-    emit = "obj,asm,link" if asm else "obj,link"
     rw.run(
         [cargo, "rustc", "--release", "--locked", "-p", package, "--lib", "--",
-         "--emit=" + emit, "-C", "codegen-units=%d" % cgu, "-C", "linker-plugin-lto=no", "-C", "debuginfo=0"],
+         "--emit=asm,link" if asm else "--emit=link", "-C", "codegen-units=%d" % cgu,
+         "-C", "linker-plugin-lto=no", "-C", "debuginfo=0"],
         cwd=tree, env=build_env(target, inputs),
     )
-    found = collect(deps, crate + "-", (".o", ".s"), out_dir)
-    return found[".o"], found[".s"]
+    rlibs = sorted(deps.glob("lib" + crate + "-*.rlib"))
+    if len(rlibs) != 1:
+        raise rw.CommandFailed(["cargo", "rustc", "-p", package], "built %d rlibs for %s, not 1" % (len(rlibs), crate))
+    found = collect(deps, crate + "-", (".s",), out_dir / "asm")
+    return rlib_objects(rlibs[0], out_dir / "objects"), found[".s"]
+
+
+def rlib_objects(rlib, out_dir):
+    """Extracts the object files a BSD- or GNU-format rlib holds into a fresh `out_dir`, and lists them."""
+    data = Path(rlib).read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("%s isn't an ar archive" % rlib)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    offset, long_names = 8, b""
+    while offset + 60 <= len(data):
+        header = data[offset:offset + 60]
+        name, size = header[:16].rstrip(b" "), int(header[48:58])
+        body = data[offset + 60:offset + 60 + size]
+        if name.startswith(b"#1/"):
+            length = int(name[3:])
+            name, body = body[:length].rstrip(b"\0"), body[length:]
+        elif name == b"//":
+            long_names = body
+        elif name.startswith(b"/") and name[1:].isdigit():
+            start = int(name[1:])
+            name = long_names[start:long_names.index(b"/\n", start)]
+        else:
+            name = name.rstrip(b"/")
+        if name.endswith(b".o"):
+            (out_dir / os.path.basename(name.decode())).write_bytes(body)
+        offset += 60 + size + (size & 1)
+    return sorted(out_dir.glob("*.o"))
 
 
 def emit_binary(cargo, tree, target, inputs, cgu, out_dir, asm):

@@ -446,12 +446,18 @@ class ExplainTests(unittest.TestCase):
 # A fake `cargo`: `metadata` prints an empty workspace, and any build records
 # the build metadata that Git and `SOURCE_DATE_EPOCH` give a crate directory,
 # the way `zakurad`'s build script reads it. The first `FAKE_CARGO_PASSES`
-# builds succeed, and later ones fail with status 7.
+# builds succeed, each leaving an empty rlib, and later ones fail with
+# status 7.
 FAKE_CARGO = """#!/bin/sh
 if [ "$1" = metadata ]; then echo '{"packages": []}'; exit 0; fi
 cd crates/x
 echo "$(git rev-parse HEAD) $(git describe --always --tags --match 'v*.*.*') $SOURCE_DATE_EPOCH" >> "$FAKE_CARGO_LOG"
-[ "$(wc -l < "$FAKE_CARGO_LOG")" -le "${FAKE_CARGO_PASSES:-0}" ] && exit 0
+if [ "$(wc -l < "$FAKE_CARGO_LOG")" -le "${FAKE_CARGO_PASSES:-0}" ]; then
+  while [ "$1" != "-p" ]; do shift; done
+  mkdir -p "$CARGO_TARGET_DIR/release/deps"
+  printf '!<arch>\\n' > "$CARGO_TARGET_DIR/release/deps/lib$(echo "$2" | tr - _)-0.rlib"
+  exit 0
+fi
 exit 7
 """
 
@@ -486,7 +492,11 @@ code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"sa
               "debug": (b"same", b"same")}[mode]
 debug = [] if "debuginfo=0" in sys.argv else [("__DWARF", "__debug_line", b"d" * len(source.read_bytes()), 0)]
 sections = debug + [("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]
-(deps / (crate + "-0.o")).write_bytes(macho(sections))
+member = macho(sections)
+name = (crate + "-0.o").encode()
+header = b"#1/%%-13d" %% len(name) + b"0" * 12 + b"0" * 6 + b"0" * 6 + b"100644  " + b"%%-10d" %% (len(name) + len(member)) + b"`\\n"
+archive = b"!<arch>\\n" + header + name + member + (b"\\n" if (len(name) + len(member)) %% 2 else b"")
+(deps / ("lib" + crate + "-0.rlib")).write_bytes(archive)
 """ % inspect.getsource(macho)
 
 

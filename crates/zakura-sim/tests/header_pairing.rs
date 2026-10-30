@@ -504,6 +504,15 @@ impl HeaderSyncObserver for PanicsOnReply {
         }
         self.inner.observe(event);
     }
+
+    /// Forwards the read.
+    fn register_read(
+        &self,
+        key: zakura_network::zakura::diag::ReadKey,
+        read: zakura_network::zakura::diag::ComponentRead,
+    ) {
+        self.inner.register_read(key, read);
+    }
 }
 
 /// The node at genesis, tapped through [`PanicsOnReply`], syncing from

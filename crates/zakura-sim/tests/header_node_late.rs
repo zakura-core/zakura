@@ -1100,9 +1100,13 @@ fn apply_committed_before_close_stays_committed() {
         let history = History::new(&report, initial_generation(&ports));
         for (_, line, _, event) in history.events() {
             if line.step == 0 {
-                // The reactor's build, at setup, reports its first snapshot.
+                // The reactor's build, at setup, registers its budget's read
+                // and reports its first snapshot.
                 assert!(
-                    matches!(event, ReactorFact::Settled { turn: 0, .. }),
+                    matches!(
+                        event,
+                        ReactorFact::ReadRegistered { .. } | ReactorFact::Settled { turn: 0, .. }
+                    ),
                     "{event:?}"
                 );
                 continue;

@@ -371,6 +371,22 @@ pub enum Observation {
         /// True if the row ends the exchange.
         ends: bool,
     },
+    /// A shared component's boundary read changed (M6a-7a, rule 1 of the
+    /// observation contract). The evidence hub runs every registered read
+    /// at each step boundary, after the step's other records and before its
+    /// task outcome, and logs a read only when it differs from the last one
+    /// logged.
+    ComponentRead {
+        /// The component, such as `Budget`.
+        component: String,
+        /// How many allocations have registered a read under this
+        /// component's key, from 1, so a rebuilt owner reads apart.
+        generation: u64,
+        /// The changes logged for this read, from 1.
+        seq: u64,
+        /// What the read showed.
+        read: ComponentReading,
+    },
     /// A datagram on the simulated network was sent, or left it. Each
     /// datagram logs `sent`, then at most one of the others.
     Datagram {
@@ -506,6 +522,36 @@ pub enum Observation {
         source: String,
         /// What happened.
         event: String,
+    },
+}
+
+/// One logged boundary read, as [`Observation::ComponentRead`] holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentReading {
+    /// The owner's value, read with nobody holding it.
+    Current(ComponentValue),
+    /// A stopped task held the owner's lock.
+    Held {
+        /// The holder, as `task <n>` with the scheduler's raw task ID.
+        holder: String,
+    },
+    /// The owner's allocation dropped.
+    Gone,
+}
+
+/// A component's value, in plain fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "component", rename_all = "kebab-case")]
+pub enum ComponentValue {
+    /// The header chunk budget's counters.
+    Budget {
+        /// The headers it can hold at once.
+        capacity: u64,
+        /// Headers reserved and not yet owned.
+        reserved: u64,
+        /// Headers owned.
+        owned: u64,
     },
 }
 
@@ -1442,6 +1488,14 @@ pub enum ReactorFact {
         /// `Settled`'s.
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot: Option<Box<ReactorSnapshot>>,
+    },
+    /// The reactor registered the boundary read of a shared component it
+    /// owns, as it built it (M6a-7a).
+    ReadRegistered {
+        /// The component's key, such as `budget`.
+        key: String,
+        /// How many reads this tap has seen registered under `key`, from 1.
+        generation: u64,
     },
     /// The reactor is being dropped, before any of its fields are. Only its
     /// pending calls' `dropped` call ends follow (M6a-3).

@@ -548,6 +548,15 @@ impl HeaderSyncObserver for Loses {
             self.inner.observe(event);
         }
     }
+
+    /// Forwards the read.
+    fn register_read(
+        &self,
+        key: zakura_network::zakura::diag::ReadKey,
+        read: zakura_network::zakura::diag::ComponentRead,
+    ) {
+        self.inner.register_read(key, read);
+    }
 }
 
 /// An event the slot counted but the observer dropped fails the run with
@@ -900,10 +909,20 @@ impl HeaderSyncObserver for LosesNth {
             self.inner.observe(event);
         }
     }
+
+    /// Forwards the read.
+    fn register_read(
+        &self,
+        key: zakura_network::zakura::diag::ReadKey,
+        read: zakura_network::zakura::diag::ComponentRead,
+    ) {
+        self.inner.register_read(key, read);
+    }
 }
 
 /// A real reactor whose observer drops one event fails the run at the
-/// step that emitted it: its first `Settled`, at setup, a `Resumed`
+/// step that emitted it: its first event, the budget's read registration,
+/// at setup, a `Resumed`
 /// mid-run, and the last event before the run ends with `Unobserved`, and
 /// its last `CallEnded` with the storage receipt it leaves unpaired. The
 /// faithful run passes, and dropping changes no pick.
@@ -925,8 +944,10 @@ fn suppression_is_caught_at_the_first_middle_and_last_event() {
         .collect();
     let first = events[0];
     assert!(
-        matches!(first.2, ReactorFact::Settled { turn: 0, .. }) && first.1 == 0,
-        "the first event is the build's Settled, at setup: {first:?}"
+        matches!(first.2, ReactorFact::ReadRegistered { .. })
+            && matches!(events[1].2, ReactorFact::Settled { turn: 0, .. })
+            && first.1 == 0,
+        "the first events are the build's budget read and Settled, at setup: {first:?}"
     );
     let resumes: Vec<_> = events
         .iter()
@@ -999,6 +1020,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Settled { .. } => "settled",
                 ReactorFact::Resumed { .. } => "resumed",
                 ReactorFact::Dropping { .. } => "dropping",
+                ReactorFact::ReadRegistered { .. } => "read-registered",
                 ReactorFact::Placed { .. } => "placed",
                 ReactorFact::Bound { .. } => "bound",
                 ReactorFact::LeasesCaptured { .. } => "leases-captured",
@@ -1016,7 +1038,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
 /// run with the tap makes the same picks and logs the same storage entries
 /// as the run without it, and the node's dispatches, call ends, completions,
 /// starts, retirements, settled markers, placements, bindings, captured
-/// leases and transfers all reach the log, in sequence.
+/// leases, transfers and its budget's read registration all reach the log,
+/// in sequence.
 #[test]
 fn tap_adds_no_scheduling_point() {
     for input in inputs(16, 256) {
@@ -1042,7 +1065,8 @@ fn tap_adds_no_scheduling_point() {
                 "entries-taken",
                 "transfer-ended",
                 "staged",
-                "outcome"
+                "outcome",
+                "read-registered"
             ])
         );
         let seqs: Vec<u64> = tapped

@@ -22,13 +22,16 @@
 //! peer record's own position as its origin. After writing, the hub feeds
 //! the step to the storage policy's predicates in the same order.
 //!
-//! Once the step's task outcome is logged too, the hub's
-//! [`settle`](ActionSource::settle) folds each tapped reactor's settled
-//! state (see [`ReactorLife`]) and closes the owners' boundary.
+//! Last in its observation, before `Sim` logs the step's task outcome, the
+//! hub runs the node's boundary reads (see [`BoundaryReads`]). Once the
+//! outcome is logged too, the hub's [`settle`](ActionSource::settle) folds
+//! each tapped reactor's settled state (see [`ReactorLife`]) and closes the
+//! owners' boundary.
 
 use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc};
 
 use super::header_node::{
+    reads::BoundaryReads,
     settled::ReactorLife,
     staging::StagedWork,
     tap::ReactorLink,
@@ -122,6 +125,8 @@ pub struct EvidenceHub {
     owners: Option<Rc<RefCell<dyn Owners>>>,
     /// Each tapped reactor's settled-state fold (M6a-3).
     reactors: Vec<Rc<RefCell<ReactorLife>>>,
+    /// The node reactor's boundary reads (M6a-7a).
+    reads: Option<BoundaryReads>,
     /// Built under [`without_capture`], so it writes nothing.
     #[cfg(test)]
     off: bool,
@@ -205,12 +210,25 @@ impl EvidenceHub {
     }
 
     /// Folds `link`'s reactor into a component at each boundary, and into
-    /// `view`'s reactor component too, if it's given. Returns the fold.
+    /// `view`'s reactor component too, if it's given, with the reads it
+    /// registers. Returns the fold.
+    ///
+    /// # Panics
+    ///
+    /// If a second reactor is given a view, since a view has one node.
     pub(crate) fn reactor(
         &mut self,
         link: ReactorLink,
         view: Option<Rc<RefCell<HeaderSyncView>>>,
     ) -> Rc<RefCell<ReactorLife>> {
+        if let Some(view) = &view {
+            assert!(self.reads.is_none(), "a hub's view has one node reactor");
+            self.reads = Some(BoundaryReads::new(
+                link.reads.clone(),
+                view.clone(),
+                link.instance,
+            ));
+        }
         let life = Rc::new(RefCell::new(ReactorLife::new(link, view)));
         self.reactors.push(life.clone());
         life
@@ -390,8 +408,9 @@ impl ActionSource for EvidenceHub {
     }
 
     /// Writes this step's rows in key order and feeds them to the
-    /// predicates. Every row is written even when one fails, so a failure a
-    /// source's record explains is logged with it.
+    /// predicates, then runs the boundary reads. Every row is written even
+    /// when one fails, so a failure a source's record explains is logged
+    /// with it.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         #[cfg(test)]
         if self.off {
@@ -411,7 +430,11 @@ impl ActionSource for EvidenceHub {
                 .feed(log.entries()[start..].iter().map(|entry| &entry.obs)),
             None => Ok(()),
         };
-        ordered.and(written).and(fed)
+        let read = match &mut self.reads {
+            Some(reads) => reads.boundary(log),
+            None => Ok(()),
+        };
+        ordered.and(written).and(fed).and(read)
     }
 
     /// Folds each reactor's rows and its task's outcome, now that the step

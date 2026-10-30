@@ -536,6 +536,24 @@ mod tests {
         }
     }
 
+    /// A fake reactor's build, as a real one makes it: its budget's read,
+    /// here of an idle budget, then its turn 0 snapshot.
+    fn build(slot: &ObserverSlot) {
+        use zakura_network::zakura::diag::{BudgetCounters, OwnerState, Read, ReadKey};
+
+        slot.register_read(
+            ReadKey::Budget,
+            Box::new(|| {
+                Read::Current(OwnerState::Budget(BudgetCounters {
+                    capacity: 4_000,
+                    reserved: 0,
+                    owned: 0,
+                }))
+            }),
+        );
+        slot.emit(settled(0, false));
+    }
+
     /// `Resumed{turn, arm}`.
     fn resumed(turn: u64, arm: ResumeArm) -> ReactorEvent {
         ReactorEvent::Resumed { turn, arm }
@@ -582,6 +600,7 @@ mod tests {
                 state: Reading::Reactor(snapshot),
                 ..
             } => snapshot.unhandled_calls.clone(),
+            other => unreachable!("the reactor's component holds its snapshot, not {other:?}"),
         });
         let verdict = if got.is_some() {
             Verdict::Holds
@@ -625,7 +644,7 @@ mod tests {
     #[test]
     fn a_skipped_resume_never_hands_out_the_old_snapshot() {
         let (mut fixture, slot) = Fixture::new(6);
-        slot.emit(settled(0, false));
+        build(&slot);
         let unhandled = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let private = unhandled.clone();
         fixture.sim.scheduler().spawn_root("reactor", async move {
@@ -701,7 +720,7 @@ mod tests {
     #[test]
     fn an_exit_on_the_last_step_is_audited() {
         let (mut fixture, slot) = Fixture::new(1_000);
-        slot.emit(settled(0, false));
+        build(&slot);
         let kept = slot.clone();
         fixture.sim.scheduler().spawn_root("reactor", async move {
             start(&slot);
@@ -794,7 +813,7 @@ mod tests {
             (true, true, false, None),
         ] {
             let (mut fixture, slot) = Fixture::new(1_000);
-            slot.emit(settled(0, false));
+            build(&slot);
             let kept = keep.then(|| slot.clone());
             fixture.sim.scheduler().spawn_root("reactor", async move {
                 start(&slot);
@@ -1068,14 +1087,16 @@ mod tests {
         let facts = reactor_facts(&report);
         assert!(
             matches!(
-                facts[..2],
+                facts[..3],
                 [
+                    (0, ReactorFact::ReadRegistered { .. }),
                     (0, ReactorFact::Dispatched { call: 1, port: crate::observe::ReactorCall::VctContext { .. } }),
                     (0, ReactorFact::Settled { turn: 0, snapshot: Some(ref snapshot), .. }),
                 ] if snapshot.unhandled_calls == [1]
             ),
-            "the build dispatches, then settles with the call: {:?}",
-            &facts[..2]
+            "the build registers its budget's read, dispatches, then settles with the call: \
+             {:?}",
+            &facts[..3]
         );
         assert!(life.borrow().task().is_some(), "the reactor starts");
         assert_eq!(name(life.borrow().component().state()), "ended-seen");
@@ -1132,6 +1153,176 @@ mod tests {
         }
     }
 
+    /// Forwards events to the tap it wraps but drops every boundary read, as
+    /// a budget that skipped its registration would leave it.
+    #[derive(Debug)]
+    struct DropsReads(Arc<dyn zakura_network::zakura::observe::HeaderSyncObserver>);
+
+    impl zakura_network::zakura::observe::HeaderSyncObserver for DropsReads {
+        /// Forwards `event`.
+        fn observe(&self, event: ReactorEvent) {
+            self.0.observe(event);
+        }
+
+        /// Drops the read.
+        fn register_read(
+            &self,
+            _: zakura_network::zakura::diag::ReadKey,
+            _: zakura_network::zakura::diag::ComponentRead,
+        ) {
+        }
+    }
+
+    /// A real reactor whose budget's read never reaches the hub fails the
+    /// run at its first `Settled`, the budget's existence evidence.
+    ///
+    /// This fails if the hub accepts a budget that acted with no read.
+    #[test]
+    fn an_unregistered_budget_fails() {
+        let (fixture, slot) = Fixture::new(1_000);
+        let port: Arc<dyn Port> = fixture.port.clone();
+        let header = HeaderFixture::regtest();
+        let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
+        startup.observer = slot.wrapped(|inner| Arc::new(DropsReads(inner)));
+        let (handle, actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+        let (report, _) = fixture.run(&mut States::default());
+        drop((handle, actions, repairs, reactor));
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(
+                facts[..],
+                [
+                    (0, ReactorFact::ReadRegistered { .. }),
+                    (0, ReactorFact::Settled { turn: 0, .. }),
+                    ..
+                ]
+            ),
+            "the reactor registered its read and settled: {facts:?}"
+        );
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail == "Budget's existence evidence arrived at step 0 with no read \
+                    registered"),
+            "{:?}",
+            report.end
+        );
+    }
+
+    /// A reactor tap that hands its rows to the evidence hub, as the
+    /// header harnesses' storage source does.
+    struct ThroughHub {
+        tap: ReactorTap,
+        out: crate::harness::evidence_hub::Out,
+    }
+
+    impl crate::ActionSource for ThroughHub {
+        /// Nothing.
+        fn enabled(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<(crate::Identity, u64)>) {}
+
+        /// Nothing.
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<crate::Boundary>) {}
+
+        /// Never called, since it offers nothing.
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the tap offers no actions");
+        }
+
+        /// Drains the tap into the hub.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            let (rows, drained) = self.tap.drain(log)?;
+            self.out.write(log, rows);
+            drained
+        }
+    }
+
+    /// A step whose task changes the budget and exits logs the budget's
+    /// read after the records the task emitted and before its exit, since
+    /// the hub reads at its observation and `Sim` logs the outcome after.
+    ///
+    /// This fails if the reads run after the outcome is logged.
+    #[test]
+    fn boundary_reads_sit_before_the_task_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use zakura_network::zakura::diag::{BudgetCounters, OwnerState, Read, ReadKey};
+
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let owned = Arc::new(AtomicUsize::new(0));
+        let counter = owned.clone();
+        slot.register_read(
+            ReadKey::Budget,
+            Box::new(move || {
+                Read::Current(OwnerState::Budget(BudgetCounters {
+                    capacity: 4_000,
+                    reserved: 0,
+                    owned: counter.load(Ordering::Relaxed),
+                }))
+            }),
+        );
+        slot.emit(settled(0, false));
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            start(&slot);
+            zakura_rt::task::yield_now().await;
+            slot.emit(resumed(2, ResumeArm::Shutdown));
+            owned.store(7, Ordering::Relaxed);
+            slot.emit(ReactorEvent::Settled {
+                turn: 2,
+                last: true,
+                snapshot: Box::<ReactorSnapshot>::default(),
+            });
+            slot.emit(dropping(2));
+        });
+        // Through the hub, as the header harnesses write it, so the hub
+        // orders the task's records and the read.
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        let out = fixture.hub.out();
+        fixture.sim.add_source(Box::new(ThroughHub { tap, out }));
+        let (report, _) = fixture.run(&mut States::default());
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let entries = report.log.entries();
+        let read = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::ComponentRead {
+                        read: crate::observe::ComponentReading::Current(
+                            crate::observe::ComponentValue::Budget { owned: 7, .. }
+                        ),
+                        ..
+                    }
+                )
+            })
+            .expect("the budget's change is read");
+        let step = entries[read].step;
+        let of_step: Vec<&Observation> = entries
+            .iter()
+            .filter(|entry| entry.step == step)
+            .map(|entry| &entry.obs)
+            .collect();
+        let at = read
+            - entries
+                .iter()
+                .position(|entry| entry.step == step)
+                .unwrap_or(0);
+        assert!(
+            matches!(of_step.last(), Some(Observation::TaskExited { task, .. }) if task.starts_with("reactor")),
+            "the step ends with the task's exit: {of_step:?}"
+        );
+        assert_eq!(at, of_step.len() - 2, "the read is right before the exit");
+        assert!(
+            of_step[..at].iter().any(|obs| matches!(
+                obs,
+                Observation::Reactor {
+                    event: ReactorFact::Dropping { .. },
+                    ..
+                }
+            )),
+            "the task's records come first: {of_step:?}"
+        );
+    }
+
     /// The real reactor, aborted at setup, before its task's first poll,
     /// reports only its build snapshot, never starts, and reports its
     /// teardown when its task's cancellation drops it. It ends unsettled
@@ -1163,6 +1354,7 @@ mod tests {
                 matches!(
                     facts[..],
                     [
+                        (0, ReactorFact::ReadRegistered { .. }),
                         (0, ReactorFact::Settled { turn: 0, .. }),
                         (_, ReactorFact::Dropping { turn: 0 }),
                     ]
@@ -1201,7 +1393,7 @@ mod tests {
         );
         let tap = fixture.tap.take().expect("the fixture has its tap");
         fixture.sim.add_source(Box::new(storage.with_tap(tap)));
-        slot.emit(settled(0, false));
+        build(&slot);
         fixture.sim.scheduler().spawn_root("reactor", async move {
             slot.emit(resumed(1, ResumeArm::Start));
             slot.emit(ReactorEvent::CallEnded {
@@ -1263,7 +1455,7 @@ mod tests {
         let tap = fixture.tap.take().expect("the fixture has its tap");
         fixture.sim.add_source(Box::new(storage.with_tap(tap)));
         let port = fixture.port.clone();
-        slot.emit(settled(0, false));
+        build(&slot);
         let body = turn(port, slot.clone());
         fixture.sim.scheduler().spawn_root("reactor", async move {
             start(&slot);
@@ -1456,6 +1648,15 @@ mod tests {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             self.inner.observe(event);
+        }
+
+        /// Forwards the read.
+        fn register_read(
+            &self,
+            key: zakura_network::zakura::diag::ReadKey,
+            read: zakura_network::zakura::diag::ComponentRead,
+        ) {
+            self.inner.register_read(key, read);
         }
     }
 
@@ -1664,6 +1865,15 @@ mod tests {
                 }
             }
             self.inner.observe(event);
+        }
+
+        /// Forwards the read.
+        fn register_read(
+            &self,
+            key: zakura_network::zakura::diag::ReadKey,
+            read: zakura_network::zakura::diag::ComponentRead,
+        ) {
+            self.inner.register_read(key, read);
         }
     }
 

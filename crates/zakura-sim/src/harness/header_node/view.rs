@@ -2,13 +2,16 @@
 //! the tier's [`SourceManifest`], folded by the evidence hub at each step
 //! boundary.
 //!
-//! Only the reactor has a read so far (M6a-3), folded from its own settled
-//! snapshots. Each component that M6a-4 onward adds registers its read,
-//! gives [`Reading`] its state, and wires its existence evidence. Until
-//! then the others stay `Initializing`, so a property that needs one ends
-//! `Inconclusive`, never `Held`.
+//! The reactor reports its own state (M6a-3), folded from its settled
+//! snapshots. The budget's counters come from its boundary read (M6a-7a,
+//! see [`super::reads`]). Each later component registers its read, gives
+//! [`Reading`] its state, and wires its existence evidence. Until then the
+//! others stay `Initializing`, so a property that needs one never ends
+//! `Held`.
 
 use std::collections::BTreeMap;
+
+use zakura_network::zakura::diag::BudgetCounters;
 
 use crate::{
     harness::header_sync::SourceManifest,
@@ -22,13 +25,16 @@ use crate::{
 pub enum Reading {
     /// The reactor's last settled snapshot.
     Reactor(ReactorSnapshot),
+    /// The chunk budget's counters.
+    Budget(BudgetCounters),
 }
 
 impl Tagged for Reading {
-    /// None: the reactor's snapshot lists no tagged objects yet.
+    /// None: neither the reactor's snapshot nor the budget's counters list
+    /// tagged objects yet.
     fn in_flux(&self) -> Option<TagPhase> {
         match self {
-            Reading::Reactor(_) => None,
+            Reading::Reactor(_) | Reading::Budget(_) => None,
         }
     }
 }
@@ -378,8 +384,9 @@ mod tests {
     /// `Storage`'s view holds the storage tier's components, each
     /// `Initializing` before any source observes, and the hub closes its
     /// boundaries, so after a run the view shows the last step's: the
-    /// reactor, which reports its own state, has started, and the rest,
-    /// which have no read yet, are still `Initializing`.
+    /// reactor, which reports its own state, has started, the budget, which
+    /// its boundary read shows, exists, and the rest, which have no read
+    /// yet, are still `Initializing`.
     #[test]
     fn the_storage_tier_has_the_composite_view() {
         let scenario = StorageScenario::default();
@@ -392,10 +399,11 @@ mod tests {
                 .iter()
                 .map(|row| {
                     let component = view.component(row.kind).expect("a row has a component");
-                    let reactor = started && row.kind == ComponentKind::Reactor;
+                    let read = started
+                        && matches!(row.kind, ComponentKind::Reactor | ComponentKind::Budget);
                     assert_eq!(
                         component.state() == State::Initializing,
-                        !reactor,
+                        !read,
                         "{:?}",
                         row.kind
                     );
@@ -419,6 +427,95 @@ mod tests {
         assert!(report.end.steps > 0, "the run takes steps");
         assert_eq!(storage.captured(), Capture::AfterStep(report.end.steps));
         assert_eq!(kinds(&storage.view().owners.borrow(), true), before);
+    }
+
+    thread_local! {
+        /// The budget counters [`check_reactor_and_budget`] got, by step.
+        static COHERENT: RefCell<Vec<(u64, zakura_network::zakura::diag::BudgetCounters)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Holds at a boundary where the reactor and the budget are both
+    /// current, recording the budget's counters there.
+    fn check_reactor_and_budget(cx: &mut CheckCtx<'_, Storage>) -> Verdict {
+        use crate::property::{require_coherent, Available};
+
+        let view = cx.view();
+        let owners = view.owners.borrow();
+        let reactor = owners
+            .component(ComponentKind::Reactor)
+            .expect("the storage tier has the reactor");
+        let budget = owners
+            .component(ComponentKind::Budget)
+            .expect("the storage tier has the budget");
+        if !require_coherent(cx, &[reactor, budget]) {
+            return Verdict::NotApplicable;
+        }
+        match (require(cx, reactor), require(cx, budget)) {
+            (
+                Some(Available::Current(Reading::Reactor(_))),
+                Some(Available::Current(Reading::Budget(counters))),
+            ) => {
+                COHERENT.with(|seen| seen.borrow_mut().push((cx.step, *counters)));
+                Verdict::Holds
+            }
+            other => panic!("a coherent boundary hands out both values, not {other:?}"),
+        }
+    }
+
+    /// A real `header-sync/storage` run hands a property the reactor's and
+    /// the budget's current values together at coherent boundaries, the
+    /// budget's counters included while the node holds the headers it's
+    /// syncing from its mirror, and back at zero once it's done.
+    ///
+    /// This fails if `Storage`'s view gets no owners.
+    #[test]
+    fn the_storage_tier_reads_its_components() {
+        let scenario = StorageScenario::default();
+        let mut sim = Sim::new(Storage::config(&scenario), Plan::from_fuzz(&[]));
+        let storage = Rc::new(Storage::build(
+            &mut sim,
+            &scenario,
+            Storage::prepare(&scenario),
+        ));
+        let property = Property {
+            id: PropertyId::new("test/reactor-and-budget"),
+            claim: "a test claim on two components",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[
+                Source::Component(ComponentKind::Reactor),
+                Source::Component(ComponentKind::Budget),
+            ],
+            status: Status::Active,
+            check: check_reactor_and_budget,
+            witness: None,
+        };
+        let mut checker = RegistryChecker::new(
+            Registry::new(vec![property]).expect("the IDs are unique"),
+            storage.clone(),
+            Assumptions::none(),
+            &Storage::sources(),
+        );
+        COHERENT.with(|seen| seen.borrow_mut().clear());
+        let report = sim.run(&mut checker, &mut NullSink);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let seen = COHERENT.with(|seen| seen.take());
+        assert!(
+            seen.iter()
+                .any(|(_, counters)| counters.owned + counters.reserved > 0),
+            "the node holds headers at some coherent boundary: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, counters)| counters.capacity == 4_000),
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.last()
+                .map(|(_, counters)| counters.owned + counters.reserved),
+            Some(0),
+            "it holds nothing once synced"
+        );
     }
 
     /// A property that holds at several boundaries, then needs a component

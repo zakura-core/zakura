@@ -22,10 +22,14 @@
 //! after one is expected. A drop with none before it, as when the reactor
 //! unwinds from a panic, which reports nothing, is `ReactorGone`.
 //!
+//! The observer also keeps each boundary read the reactor registers (M6a-7a)
+//! for the evidence hub, which runs them (see [`super::reads`]).
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
 use std::{
+    collections::BTreeMap,
     mem,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -34,6 +38,7 @@ use std::{
 };
 
 use zakura_network::zakura::{
+    diag::{ComponentRead, ReadKey},
     observe::{
         CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, OutcomeDisposition,
         Placement, PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
@@ -45,7 +50,10 @@ use zakura_rt::sim::RunId;
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::ControlledPort;
 
-use super::pair::{PairError, Pairer};
+use super::{
+    pair::{PairError, Pairer},
+    reads::ReadSink,
+};
 use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
@@ -76,6 +84,9 @@ pub struct ReactorTap {
     /// The last snapshot logged, which an unchanged `Settled` doesn't
     /// repeat.
     snapshot: Option<ReactorSnapshot>,
+    /// How many reads were registered under each key, for their
+    /// `ReadRegistered` facts.
+    generations: BTreeMap<String, u64>,
 }
 
 /// What the observer and the reader share.
@@ -100,6 +111,8 @@ struct TapState {
     /// its observer may go.
     torn_down: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// The boundary reads the reactor registered, for the evidence hub.
+    reads: ReadSink,
 }
 
 /// Events recorded and not yet drained.
@@ -190,6 +203,17 @@ impl HeaderSyncObserver for TapObserver {
         let seq = buffer.last;
         buffer.events.push((seq, storage_seq, pos, event));
     }
+
+    /// Keeps `read` for the evidence hub. The slot reports its
+    /// `ReadRegistered` next, through [`observe`](Self::observe). Only a std
+    /// lock, never held across anything else.
+    fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        self.0
+            .reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((key, read));
+    }
 }
 
 impl ReactorTap {
@@ -220,6 +244,7 @@ impl ReactorTap {
                 port_gone: AtomicBool::new(false),
                 torn_down: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                reads: ReadSink::default(),
             }))
         });
         let state = observer.0.clone();
@@ -240,6 +265,7 @@ impl ReactorTap {
             pairer: Pairer::default(),
             failure: sim.failure(),
             snapshot: None,
+            generations: BTreeMap::new(),
         };
         (ObserverSlot::counting(observer, emitted), tap)
     }
@@ -255,6 +281,7 @@ impl ReactorTap {
         ReactorLink {
             instance: self.id.index,
             source: self.checkpoint.kind().source(self.id.index),
+            reads: self.state.reads.clone(),
         }
     }
 
@@ -275,6 +302,18 @@ pub(crate) struct ReactorLink {
     pub(crate) instance: u64,
     /// The tap's source label, for failures.
     pub(crate) source: String,
+    /// The boundary reads the reactor registered.
+    pub(crate) reads: ReadSink,
+}
+
+/// `key`'s name, or an error for a key this build can't encode.
+pub(crate) fn read_key(key: &ReadKey) -> Result<&'static str, String> {
+    match key {
+        ReadKey::Budget => Ok("budget"),
+        unknown => Err(format!(
+            "UnknownEvent: the tap can't encode the read key {unknown:?}"
+        )),
+    }
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
@@ -749,7 +788,18 @@ impl ReactorTap {
         let mut sent = Vec::with_capacity(events.len());
         let mut positions = Vec::with_capacity(events.len());
         for (seq, storage_seq, pos, event) in events {
-            let mut event = fact(event)?;
+            let mut event = match event {
+                ReactorEvent::ReadRegistered { key } => {
+                    let key = read_key(&key)?.to_owned();
+                    let generation = self.generations.entry(key.clone()).or_default();
+                    *generation += 1;
+                    ReactorFact::ReadRegistered {
+                        key,
+                        generation: *generation,
+                    }
+                }
+                event => fact(event)?,
+            };
             // Every marker is logged, but an unchanged snapshot only once.
             if let ReactorFact::Settled { snapshot, .. } = &mut event {
                 let settled = snapshot.take().map(|settled| *settled);

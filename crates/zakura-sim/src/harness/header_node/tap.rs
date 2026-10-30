@@ -35,7 +35,7 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement, PortCall,
+        Binding, CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement, PortCall,
         ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm, TransferDisposition,
         WaitCause, WorkPhase,
     },
@@ -601,9 +601,15 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
         ReactorEvent::Bound {
             reservation,
             incarnation,
+            via,
         } => ReactorFact::Bound {
             reservation,
             incarnation,
+            via: match via {
+                Binding::Start => "start",
+                Binding::Continuation => "continuation",
+            }
+            .to_owned(),
         },
         ReactorEvent::LeasesCaptured {
             call,

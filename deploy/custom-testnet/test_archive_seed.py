@@ -11,6 +11,16 @@ import network
 
 
 class ArchiveSeedTests(unittest.TestCase):
+    def test_seed_retention_only_removes_the_recorded_older_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old, base, current, unrelated = [root / f'{name}.tar.zst' for name in ('old', 'base', 'current', 'unrelated')]
+            for path in (old, base, current, unrelated):
+                path.write_bytes(b'archive')
+            archive_seed.retire_old_seed(dict(seed_archive=str(base), previous_seed_archive=str(old)), current)
+            self.assertFalse(old.exists())
+            self.assertTrue(all(path.exists() for path in (base, current, unrelated)))
+
     def test_existing_archive_cannot_be_replaced(self):
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / 'seed.tar.zst'

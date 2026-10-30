@@ -120,7 +120,7 @@ class NetworkTests(unittest.TestCase):
         binary.write_bytes(b'compiled node')
         self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), seed_archive='preserved')
         network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
-        def restore(archive, destination, name):
+        def restore(archive, destination, name, state_version=None):
             destination.mkdir()
             (destination / 'identity').write_text(name)
         with patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command:
@@ -153,7 +153,7 @@ class NetworkTests(unittest.TestCase):
         self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
         network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
 
-        def restore(archive, destination, name):
+        def restore(archive, destination, name, state_version=None):
             destination.mkdir()
 
         def command(*args):
@@ -186,7 +186,7 @@ class NetworkTests(unittest.TestCase):
         binary.write_bytes(b'compiled node')
         self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
         network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
-        def restore(archive, destination, name):
+        def restore(archive, destination, name, state_version=None):
             destination.mkdir()
         with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', side_effect=network.archive_seed.OperationCancelled), patch.object(network, 'command'):
             with self.assertRaises(network.archive_seed.OperationCancelled):
@@ -241,6 +241,30 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue((destination / 'state/v29/newfork').is_dir())
         self.assertTrue((destination / 'non_finalized_state/newfork').is_dir())
         self.assertFalse((destination / 'non_finalized_state/oldnet').exists())
+
+    def test_restore_ignores_obsolete_formats_but_rejects_links_in_the_active_format(self):
+        for version, accepted in [('v28', True), ('v30', False)]:
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode='w') as archive:
+                directory = tarfile.TarInfo('state/v30/testnet/')
+                directory.type = tarfile.DIRTYPE
+                archive.addfile(directory)
+                link = tarfile.TarInfo(f'state/{version}/testnet/table.sst')
+                link.type = tarfile.LNKTYPE
+                link.linkname = 'state/v30/testnet/other.sst'
+                archive.addfile(link)
+            process = unittest.mock.MagicMock()
+            process.__enter__.return_value = process
+            process.stdout = io.BytesIO(payload.getvalue())
+            process.wait.return_value = 0
+            destination = self.root / version
+            with patch.object(network.subprocess, 'Popen', return_value=process):
+                if accepted:
+                    network.restore_archive('unused', destination, 'Fork', 'v30')
+                    self.assertFalse((destination / 'state/v28').exists())
+                else:
+                    with self.assertRaisesRegex(ValueError, 'link'):
+                        network.restore_archive('unused', destination, 'Fork', 'v30')
 
     def test_intervals_exclude_the_historical_seed_time_jump(self):
         controller = self.controller('mining')

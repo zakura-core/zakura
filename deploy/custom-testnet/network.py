@@ -95,7 +95,7 @@ def verify_archive(config):
         raise ValueError('insufficient free disk space for two restored databases')
 
 
-def restore_archive(archive, destination, network_name):
+def restore_archive(archive, destination, network_name, state_version=None):
     """Extract state files without trusting archive paths, links, or special files."""
     destination.mkdir()
     with subprocess.Popen(['zstd', '-dc', str(archive)], stdout=subprocess.PIPE) as decompressor:
@@ -106,6 +106,11 @@ def restore_archive(archive, destination, network_name):
                     raise ValueError('unsafe seed archive path')
                 if not parts or parts[0] not in ('state', 'non_finalized_state'):
                     raise ValueError('seed archive contains files outside chain state')
+                # Source caches can retain obsolete repair databases with hard-linked
+                # tables. Only the explicitly pinned active format belongs to this seed.
+                if (state_version is not None and parts[0] == 'state' and len(parts) > 1
+                        and parts[1] != state_version):
+                    continue
                 if not member.isdir() and not member.isfile():
                     raise ValueError('seed archive contains a link or special file')
                 target = destination.joinpath(*parts)
@@ -273,7 +278,7 @@ def reset(config, delay, config_path=None):
             if node.exists():
                 shutil.rmtree(node)
             node.mkdir()
-            restore_archive(config['seed_archive'], node / 'cache', run['network']['name'])
+            restore_archive(config['seed_archive'], node / 'cache', run['network']['name'], config.get('seed_state_version'))
             if config.get('node_user'):
                 for path in [node, *node.rglob('*')]:
                     shutil.chown(path, user=config['node_user'], group=config['node_user'])

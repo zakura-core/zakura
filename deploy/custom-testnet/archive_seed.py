@@ -53,6 +53,19 @@ def checksum(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+def retire_old_seed(config, current):
+    """Keep the new seed and its previous base; remove only a recorded older file."""
+    if not config.get('previous_seed_archive'):
+        return
+    previous = Path(config['previous_seed_archive'])
+    base = Path(config['seed_archive'])
+    if previous in (base, current):
+        return
+    if previous.parent != base.parent or previous.is_symlink() or previous.suffixes != ['.tar', '.zst']:
+        raise ValueError('refusing to retire a seed outside the recorded archive directory')
+    previous.unlink(missing_ok=True)
+
+
 def state_bytes(cache):
     return sum(p.stat().st_size for name in ('state', 'non_finalized_state')
                for p in (Path(cache) / name).rglob('*') if p.is_file())
@@ -69,7 +82,7 @@ def pack_state(cache, archive):
         raise ValueError('archive source has no finalized state')
     try:
         with temporary.open('wb') as output:
-            tar = subprocess.Popen(['tar', '-C', str(cache), '-cf', '-', *names], stdout=subprocess.PIPE)
+            tar = subprocess.Popen(['tar', '--hard-dereference', '-C', str(cache), '-cf', '-', *names], stdout=subprocess.PIPE)
             try:
                 compressor = subprocess.Popen(['zstd', '-T2', '-3', '-q'], stdin=tar.stdout, stdout=output)
                 tar.stdout.close()
@@ -244,7 +257,7 @@ def refresh_seed(config, restore_archive):
     preparation.mkdir()
     stage('restoring')
     try:
-        restore_archive(archive, preparation / 'cache', 'Testnet')
+        restore_archive(archive, preparation / 'cache', 'Testnet', config.get('seed_state_version'))
         command('chown', '-R', f'{config["node_user"]}:{config["node_user"]}', str(preparation))
         (root / 'preparation.toml').write_text(preparation_config(root))
         command('systemctl', 'start', service)
@@ -284,10 +297,12 @@ def refresh_seed(config, restore_archive):
         destination = archive.parent / f'archive-seed-{info["blocks"]}-{name.lower()}.tar.zst'
         digest = pack_state(preparation / 'cache', destination)
         updated = dict(config, seed_archive=str(destination), seed_sha256=digest,
+                       previous_seed_archive=str(archive),
                        seed_height=info['blocks'], seed_hash=info['bestblockhash'],
                        seed_finalized_height=finalized['height'], seed_finalized_hash=finalized['hash'],
                        seed_network_directory=name.lower(), seed_storage_mode='archive',
                        seed_unpacked_bytes=size, seed_synced_at=int(time.time()))
+        retire_old_seed(config, destination)
         stage('ready', public_tip=reference, seed_height=info['blocks'])
         return updated
     except Exception as error:

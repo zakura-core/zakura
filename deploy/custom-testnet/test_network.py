@@ -193,6 +193,18 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue((destination / 'non_finalized_state/newfork').is_dir())
         self.assertFalse((destination / 'non_finalized_state/oldnet').exists())
 
+    def test_intervals_exclude_the_historical_seed_time_jump(self):
+        controller = self.controller('mining')
+        def response(port, method, params):
+            if method == 'getblockhash':
+                return str(params[0])
+            height = int(params[0])
+            return {'time': 100 if height < 4420649 else 2000000 + (height - 4420649) * 451}
+        with patch.object(network, 'rpc', side_effect=response):
+            blocks, interval = controller.recent_blocks({'height': 4420650, 'hash': 'tip'}, 4420649)
+        self.assertEqual(len(blocks), 6)
+        self.assertEqual(interval, 451)
+
     def test_activation_delay_is_bounded(self):
         self.assertEqual(network.activation_delay('5m'), 300)
         for invalid in ('0m', '-1s', '1h', '999999m'):

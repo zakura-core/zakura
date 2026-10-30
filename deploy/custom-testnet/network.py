@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import statistics
 import subprocess
 import tarfile
 import threading
@@ -281,6 +282,21 @@ class Controller:
         self.config = config
         self.root = Path(config['root'])
         self.lock = threading.Lock()
+        self.recent_tip = None
+        self.recent = []
+
+    def recent_blocks(self, tip, activation):
+        key = (tip['height'], tip['hash'])
+        if key != self.recent_tip:
+            blocks = []
+            for height in range(max(0, tip['height'] - 5), tip['height'] + 1):
+                block_hash = rpc(18232, 'getblockhash', [height])
+                header = rpc(18232, 'getblockheader', [block_hash, True])
+                blocks.append({'height': height, 'hash': block_hash, 'time': header['time']})
+            self.recent = blocks
+            self.recent_tip = key
+        intervals = [right['time'] - left['time'] for left, right in zip(self.recent, self.recent[1:]) if left['height'] >= activation]
+        return self.recent, statistics.median(intervals) if intervals else None
 
     def sample(self, advance=False):
         with self.lock:
@@ -309,6 +325,14 @@ class Controller:
                 result['healthy'] = bool(result['nodes'])
             except Exception as error:
                 result.update(healthy=False, error=str(error))
+            result['recent_blocks'] = []
+            result['median_interval_seconds'] = None
+            result['mining_enabled'] = run['phase'] in ('mining', 'active')
+            if result['nodes']:
+                try:
+                    result['recent_blocks'], result['median_interval_seconds'] = self.recent_blocks(result['nodes'][0], run['activation_height'])
+                except Exception:
+                    result['recent_blocks_available'] = False
             result['countdown_seconds'] = max(0, run.get('mining_at', 0) - int(time.time()))
             result['config'] = participant_config(self.config, run)
             result['build_features'] = ['pq', 'internal-miner']

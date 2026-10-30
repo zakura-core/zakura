@@ -252,4 +252,46 @@ fn a_second_writer_changes_the_held_digest() {
             .expect("the round is active")
             .entries[1] = kept;
     }
+
+    // An older entry changes before the next page's append: that page's
+    // `after` covers the entries actually held, changed one included, not
+    // the frames' digests extended.
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the round is active")
+        .entries[1]
+        .body_size += 1;
+    let mut third = page(
+        &snapshot,
+        &open,
+        target,
+        headers(
+            zakura_header_chain::Frontier::new(block::Height(4), entries[3].header.hash()),
+            2,
+        ),
+    );
+    third.common_ancestor_height = block::Height(4);
+    third.common_ancestor_hash = entries[3].header.hash();
+    let tag2 = tag(&third, 2);
+    recorder.take();
+    deliver_tagged(&mut reactor, &peer, third, 2);
+    let held_now = HeldDigest::of(
+        &reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the round is active")
+            .entries,
+    );
+    let [(1, Some(frame), 2, after)] = staged(&recorder.take())[..] else {
+        panic!("the third page staged");
+    };
+    assert_eq!(frame, tag2);
+    assert_eq!(after, held_now, "`after` digests the entries held");
+    assert_eq!(after.len, 6);
+    assert_ne!(
+        after,
+        expected.then(tag2.received),
+        "the changed entry shows in `after`"
+    );
 }

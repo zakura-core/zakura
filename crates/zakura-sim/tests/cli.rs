@@ -3,7 +3,7 @@
 #![cfg(zakura_sim)]
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::HARNESSES,
-    trace::{TraceReader, INPUT_FILE, OBSERVATIONS_FILE, TRACE_FILE},
+    trace::{TraceReader, INPUT_FILE, MAX_INPUT_BYTES, OBSERVATIONS_FILE, TRACE_FILE},
 };
 
 /// Runs the binary with `args`.
@@ -432,6 +432,55 @@ fn seeds_reject_and_quarantine() {
     assert!(
         stdout.contains("0 admitted, 0 quarantined, 1 rejected"),
         "{stdout}"
+    );
+}
+
+/// An optional seed quarantined for a stale generator, before `seeds`
+/// reads its file, keeps its sidecar and reason in `--quarantine`. A file
+/// over `MAX_INPUT_BYTES` isn't copied, and the reason names the limit.
+#[test]
+fn quarantine_skips_an_oversized_file() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let sidecar = std::fs::read_to_string(fixtures.join("discovery-wait-complete.toml"))
+        .unwrap()
+        .replacen("generator = 1", "generator = 0\nrequired = false", 1);
+    let dir = TempDir::new().unwrap();
+    let seeds = dir.path().join("seeds");
+    std::fs::create_dir(&seeds).unwrap();
+    // A sparse file, so the test writes no data.
+    std::fs::File::create(seeds.join("big.bin"))
+        .unwrap()
+        .set_len(MAX_INPUT_BYTES + 1)
+        .unwrap();
+    std::fs::write(seeds.join("big.toml"), &sidecar).unwrap();
+    let quarantine = dir.path().join("quarantine");
+    let output = zakura_sim(&[
+        "seeds",
+        "--sim",
+        "discovery/wait-complete",
+        "--fixtures",
+        seeds.to_str().unwrap(),
+        "--quarantine",
+        quarantine.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&quarantine)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    let [reason, toml] = <[_; 2]>::try_from(files).expect("a sidecar and a reason, no .bin");
+    assert_eq!(reason.extension().unwrap(), "reason");
+    assert_eq!(toml, reason.with_extension("toml"));
+    assert_eq!(std::fs::read_to_string(&toml).unwrap(), sidecar);
+    let reason = std::fs::read_to_string(&reason).unwrap();
+    assert!(reason.contains("built for generator 0"), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "is {} bytes, over the {MAX_INPUT_BYTES}-byte MAX_INPUT_BYTES limit",
+            MAX_INPUT_BYTES + 1
+        )),
+        "{reason}"
     );
 }
 

@@ -847,6 +847,9 @@ def main(argv=None):
                         for variant in (("padded", "unpadded") if padded else ("padded",)):
                             if variant == "unpadded":
                                 rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
+                                # Every crate rebuilds, so each emits its objects again.
+                                for source in rust_sources(tree):
+                                    os.utime(source)
                             for name in names:
                                 for cgu in cgus:
                                     out = work / "out" / variant / side / ("%s-cgu%d" % (name, cgu))

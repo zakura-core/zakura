@@ -477,22 +477,29 @@ exit 7
 """
 
 
-# A fake `cargo` that "builds" crate `x` as a Mach-O file holding the line
-# count of `crates/x/lib.rs`, in an instruction section when
-# `FAKE_LINES_IN` is `code` and in a data section when it's `data`, the way
-# a line number reaches code or only data.
+# A fake `cargo` that "builds" the crate `-p` names, `x` or `y`, as a Mach-O
+# file holding the line count of `crates/<crate>/lib.rs`, in an instruction
+# section when `FAKE_LINES_IN` is `code` and in a data section when it's
+# `data`, the way a line number reaches code or only data. Like cargo, it
+# skips a crate whose source is older than its last build.
 FAKE_OBJECT_CARGO = """#!/usr/bin/env python3
 import json, os, struct, sys
 from pathlib import Path
 %s
 if sys.argv[1] == "metadata":
-    print(json.dumps({"packages": [{"name": "x", "targets": [{"name": "x", "kind": ["lib"]}]}]}))
+    print(json.dumps({"packages": [{"name": name, "targets": [{"name": name, "kind": ["lib"]}]} for name in "xy"]}))
     sys.exit(0)
-lines = struct.pack("<I", Path("crates/x/lib.rs").read_text().count("\\n"))
-code, data = (lines, b"same") if os.environ["FAKE_LINES_IN"] == "code" else (b"same", lines)
+crate = sys.argv[sys.argv.index("-p") + 1]
+source = Path("crates") / crate / "lib.rs"
 deps = Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "deps"
 deps.mkdir(parents=True, exist_ok=True)
-(deps / "x-0.o").write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
+stamp = deps / (crate + ".stamp")
+if stamp.exists() and stamp.stat().st_mtime >= source.stat().st_mtime:
+    sys.exit(0)
+stamp.write_text("")
+lines = struct.pack("<I", source.read_text().count("\\n"))
+code, data = (lines, b"same") if os.environ["FAKE_LINES_IN"] == "code" else (b"same", lines)
+(deps / (crate + "-0.o")).write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
 """ % inspect.getsource(macho)
 
 
@@ -501,7 +508,9 @@ class LineCheckTests(unittest.TestCase):
         """Runs the gate on a cfg-only hook above `crates/x/lib.rs` code, with the fake object cargo."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
-            (repo / "crates" / "x").mkdir(parents=True)
+            for crate in "xy":
+                (repo / "crates" / crate).mkdir(parents=True)
+            (repo / "crates" / "y" / "lib.rs").write_text("\n".join(SOURCE))
             git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
             subprocess.run(git + ["init", "-q"], check=True)
             hook = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
@@ -518,7 +527,8 @@ class LineCheckTests(unittest.TestCase):
                 with redirect_stdout(out), redirect_stderr(err):
                     status = asm_diff.main([
                         "--repo", str(repo), "--base", "HEAD~1", "--head", "HEAD", "--cargo", str(cargo),
-                        "--package", "x", "--cgu", "4", "--no-binary", "--work-dir", str(Path(tmp) / "work"),
+                        "--package", "x", "--package", "y", "--cgu", "4", "--no-binary",
+                        "--work-dir", str(Path(tmp) / "work"),
                     ])
             finally:
                 del os.environ["FAKE_LINES_IN"]
@@ -537,6 +547,12 @@ class LineCheckTests(unittest.TestCase):
         status, output = self.run_gate("data")
         self.assertEqual(status, 0, output)
         self.assertIn("line check base x codegen-units=4: code unchanged by padding", output)
+
+    def test_unpadded_crates_rebuild_for_the_line_check(self):
+        """A crate with no padded file still rebuilds for the committed tree, so its line check has objects."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("line check base y codegen-units=4: code unchanged by padding", output)
 
 
 class CommandTests(unittest.TestCase):

@@ -31,9 +31,10 @@ both sides first, so that only real changes differ:
     A padded side is also built as committed. Its instruction sections must
     match the padded build byte for byte (see `run_line_checks`), so a line
     number that reaches code, by any route, such as `line!` forwarded
-    through a macro, fails. And no padded file's committed bytes may appear
-    in its data sections (see `run_embed_checks`), so a padded file that
-    `include_str!` or `include_bytes!` embeds, under any name, fails.
+    through a macro, fails. And every file that either side pads ends with
+    the same probe comment on both sides, which no padded build's data may
+    hold (see `run_embed_checks`), so a padded file that `include_str!` or
+    `include_bytes!` embeds, under any name, fails.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
@@ -57,12 +58,13 @@ Usage:
 
 Exit status: 0 when everything matches; 1 when anything differs or is on
 one side only, or a line number reaches code; 2 when a side built no
-objects; 3 when a command fails or padding is refused.
+objects; 3 when a command fails or padding or a probe is refused.
 """
 
 import argparse
 import collections
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -230,24 +232,63 @@ def rust_sources(tree):
     return [path for path in sorted(tree.rglob("*.rs")) if path.relative_to(tree).parts[0] != "target"]
 
 
-def align_tree(tree, file_hunks, side):
+def side_inserts(text, hunks, side):
+    """The `(after_line, count)` blank lines that pad `side`'s `text` of a file with these hunks."""
+    # Padding with no unchanged line after it aligns nothing, such as
+    # all of an empty file's, so it's left out.
+    lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+    return [(after, count) for after, count in paddings(hunks)[0 if side == "base" else 1] if after < lines]
+
+
+def embed_probes(repo, base, head, file_hunks):
+    """The embed probe of each file that either side pads, by path (see `append_probe`).
+
+    Each probe is unique to the base, the head and the path, so no other
+    data holds it.
+    """
+    probes = {}
+    for path, hunks in sorted(file_hunks.items()):
+        for side, rev in (("base", base), ("head", head)):
+            text = rw.run(["git", "-C", repo, "cat-file", "blob", "%s:%s" % (rev, path)], capture=True)
+            if side_inserts(text, hunks, side):
+                digest = hashlib.sha256(("%s %s %s" % (base, head, path)).encode()).hexdigest()
+                probes[path] = "zakura-release-gate embed probe " + digest[:32]
+                break
+    return probes
+
+
+def append_probe(text, probe, path="<text>"):
+    """Appends `probe` to `text` as a line comment, refusing when `text` ends inside a literal or block comment.
+
+    A comment after the last line changes no token and moves no line, so
+    the build stays the same unless the file is embedded, which then holds
+    the probe.
+    """
+    if text.count("\n") + 1 not in safe_boundaries(text):
+        raise PaddingError("the embed probe after %s would land inside a literal or block comment" % path)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + "// " + probe + "\n"
+
+
+def align_tree(tree, file_hunks, side, probes):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Refuses padding inside a literal (see `pad_text`). Returns the
+    Appends each file's probe from `probes` too, on both sides, so the
+    embed check can find it (see `run_embed_checks`). Refuses padding or a
+    probe inside a literal (see `pad_text` and `append_probe`). Returns the
     `(path, after_line, count)` paddings it made.
     """
     tree = Path(tree).resolve()
     made = []
     for path, hunks in sorted(file_hunks.items()):
+        if path not in probes:
+            continue
         file = tree / path
         text = file.read_bytes().decode(errors="surrogateescape")
-        # Padding with no unchanged line after it aligns nothing, such as
-        # all of an empty file's, so it's left out.
-        lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
-        inserts = [(after, count) for after, count in paddings(hunks)[0 if side == "base" else 1] if after < lines]
-        if not inserts:
-            continue
-        file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
+        inserts = side_inserts(text, hunks, side)
+        text = append_probe(pad_text(text, inserts, path), probes[path], path)
+        file.write_bytes(text.encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
     return made
 
@@ -790,30 +831,19 @@ def run_line_checks(items):
 
 
 def run_embed_checks(items):
-    """Checks that no padded file is embedded in its side's release data, returning the worst exit status.
+    """Checks that no padded file is embedded in a padded build's data, returning the worst exit status.
 
-    Each item is `(title, committed files, padded files, {path: (committed
-    bytes, padded bytes)})`. `include_str!` and `include_bytes!` store a
-    file whole, whatever name they're called by. So a padded file is
-    embedded when its committed bytes appear more often in the committed
-    build's data sections than in the padded build's, or its padded bytes
-    appear more often in the padded build's than in the committed build's.
-    Either way padding changed that data, which the padded comparison
-    can't vouch for. Checking both texts catches padding at a file's start
-    or end, where one text holds the other, and counting both builds keeps
-    a short file's text that happens to appear elsewhere in data from
-    counting.
+    Each item is `(title, padded files, {path: probe})`. `include_str!` and
+    `include_bytes!` store a file whole, whatever name they're called by,
+    so an embedded padded file brings its probe (see `append_probe`) into
+    the data sections. Padding changed that data, which the padded
+    comparison can't vouch for.
     """
-
-    def occurrences(files, text):
-        """How often `text` appears in the data sections of `files`."""
-        return sum(section.count(text) for path in files for section in data_sections(path))
-
     status = EXIT_SAME
-    for title, committed_files, padded_files, padded in items:
-        found = sorted(path for path, (committed, text) in padded.items()
-                       if occurrences(committed_files, committed) > occurrences(padded_files, committed)
-                       or occurrences(padded_files, text) > occurrences(committed_files, text))
+    for title, files, probes in items:
+        sections = [section for path in files for section in data_sections(path)]
+        found = sorted(path for path, probe in probes.items()
+                       if any(probe.encode() in section for section in sections))
         print("%s: %s" % (title, "padded files embedded: " + ", ".join(found) if found else "no padded file embedded"))
         if found:
             status = max(status, EXIT_DIFFERS)
@@ -848,16 +878,18 @@ def main(argv=None):
         base, head = rw.resolve(repo, args.base), rw.resolve(repo, args.head)
         print("base %s, head %s" % (base, head), flush=True)
         file_hunks = rust_hunks(repo, base, head)
+        probes = embed_probes(repo, base, head, file_hunks)
         with rw.work_dir(args.work_dir) as work:
             inputs = metadata_env(work, repo, base)
             built, checks, embeds = {}, [], []
             names = list(packages) + ([] if args.no_binary else [BINARY])
             for side, rev in (("base", base), ("head", head)):
                 with rw.worktree(repo, rev, work / "src") as tree:
-                    padded = align_tree(tree, file_hunks, side)
+                    padded = align_tree(tree, file_hunks, side, probes)
                     for path, after, count in padded:
                         print("padded %s: %d blank lines after %s:%d" % (side, count, path, after))
-                    padded_texts = {path: (tree / path).read_bytes() for path, _, _ in padded}
+                    for path in sorted(probes):
+                        print("probed %s: %s" % (side, path))
                     crates = lib_crates(read_metadata(args.cargo, tree))
                     with side_target(work, side) as target:
                         # The padded tree first, then, when this side was
@@ -865,7 +897,6 @@ def main(argv=None):
                         for variant in (("padded", "unpadded") if padded else ("padded",)):
                             if variant == "unpadded":
                                 rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
-                                texts = {path: ((tree / path).read_bytes(), padded_texts[path]) for path in padded_texts}
                                 # Every crate rebuilds, so each emits its objects again.
                                 for source in rust_sources(tree):
                                     os.utime(source)
@@ -879,14 +910,14 @@ def main(argv=None):
                                         crate = crates.get(name, name.replace("-", "_"))
                                         result = emit_lib(args.cargo, tree, target, inputs, name, crate, cgu, out, asm)
                                     built[variant, side, name, cgu] = result
-                    if padded:
-                        for name in names:
-                            for cgu in cgus:
-                                label = "%s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu)
-                                unpadded = built["unpadded", side, name, cgu][0]
-                                checks.append(("line check " + label, unpadded, built["padded", side, name, cgu][0]))
-                                embeds.append(("embed check " + label, unpadded,
-                                               built["padded", side, name, cgu][0], texts))
+                    for name in names:
+                        for cgu in cgus:
+                            label = "%s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu)
+                            if padded:
+                                checks.append(("line check " + label, built["unpadded", side, name, cgu][0],
+                                               built["padded", side, name, cgu][0]))
+                            if probes:
+                                embeds.append(("embed check " + label, built["padded", side, name, cgu][0], probes))
             padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
             status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
             return max(status, run_line_checks(checks), run_embed_checks(embeds))

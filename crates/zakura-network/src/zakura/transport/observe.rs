@@ -49,6 +49,96 @@ pub trait TransportObserver: Send + Sync + fmt::Debug {
     }
 }
 
+/// The transport observer a handler reports to, with its delivery count:
+/// the counted delivery path of rule 7 of the M6a observation contract.
+///
+/// Every transport event goes through [`emit`](Self::emit), which bumps
+/// the count before calling the observer. The count is shared by every
+/// clone, and a reader that holds it, such as a simulator tap, keeps it
+/// after the transport and its observer are gone, so an event the observer
+/// never recorded shows as a count it never reached.
+#[derive(Clone)]
+pub struct TransportSlot {
+    observer: Arc<dyn TransportObserver>,
+    /// Events [`emit`](Self::emit) handed to the observer, counted before
+    /// each call.
+    emitted: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for TransportSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportSlot")
+            .field("emitted", &self.emitted())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransportSlot {
+    /// A slot that delivers to `observer`, with nothing emitted yet.
+    pub fn new(observer: Arc<dyn TransportObserver>) -> Self {
+        Self::counting(observer, Arc::default())
+    }
+
+    /// A slot that delivers to `observer` and counts into `emitted`, which
+    /// the caller keeps.
+    pub fn counting(observer: Arc<dyn TransportObserver>, emitted: Arc<AtomicU64>) -> Self {
+        Self { observer, emitted }
+    }
+
+    /// A slot that delivers to what `wrap` makes of this slot's observer
+    /// and shares this slot's count, so a reader of the count also sees
+    /// what the wrapper drops.
+    pub fn wrapped(
+        &self,
+        wrap: impl FnOnce(Arc<dyn TransportObserver>) -> Arc<dyn TransportObserver>,
+    ) -> Self {
+        Self {
+            observer: wrap(self.observer.clone()),
+            emitted: self.emitted.clone(),
+        }
+    }
+
+    /// The events emitted so far, through any clone.
+    pub fn emitted(&self) -> u64 {
+        self.emitted.load(Ordering::Relaxed)
+    }
+
+    /// Delivers `event` to the observer, counting it first. The count is a
+    /// plain std atomic, so this adds no scheduling point.
+    pub fn emit(&self, event: TransportEvent) {
+        self.emitted.fetch_add(1, Ordering::Relaxed);
+        self.observer.observe(event);
+    }
+
+    /// Hands `read`, the boundary read of the component `key` names, to
+    /// the observer, then reports its registration as
+    /// [`TransportEvent::ReadRegistered`] through [`emit`](Self::emit).
+    pub fn register_read(
+        &self,
+        key: crate::zakura::diag::ReadKey,
+        read: crate::zakura::diag::ComponentRead,
+    ) {
+        self.observer.register_read(key.clone(), read);
+        self.emit(TransportEvent::ReadRegistered { key });
+    }
+}
+
+impl<O: TransportObserver + 'static> From<Arc<O>> for TransportSlot {
+    /// An uncounted slot for `observer`, as a test that reads no count
+    /// builds one.
+    fn from(observer: Arc<O>) -> Self {
+        Self::new(observer)
+    }
+}
+
+impl From<Arc<dyn TransportObserver>> for TransportSlot {
+    /// An uncounted slot for `observer`.
+    fn from(observer: Arc<dyn TransportObserver>) -> Self {
+        Self::new(observer)
+    }
+}
+
 /// One transport event.
 ///
 /// A connection's events before [`TransportEvent::Registered`] are keyed by
@@ -512,7 +602,7 @@ pub enum HeaderCheck {
 /// One connection's observer, from just before registration.
 #[derive(Debug)]
 pub(crate) struct ConnTap {
-    observer: Arc<dyn TransportObserver>,
+    observer: TransportSlot,
     remote: SocketAddr,
     /// Set when the supervisor registers the connection.
     conn_id: OnceLock<ZakuraConnId>,
@@ -526,10 +616,10 @@ pub(crate) struct ConnTap {
 
 impl ConnTap {
     /// A tap that reports the events of the connection from `remote` to
-    /// `observer`.
-    pub(crate) fn new(observer: Arc<dyn TransportObserver>, remote: SocketAddr) -> Self {
+    /// `observer`, through its counted path.
+    pub(crate) fn new(observer: impl Into<TransportSlot>, remote: SocketAddr) -> Self {
         Self {
-            observer,
+            observer: observer.into(),
             remote,
             conn_id: OnceLock::new(),
             decided: AtomicU64::new(0),
@@ -558,7 +648,7 @@ impl ConnTap {
         if self.panicked.load(Ordering::Acquire) == 1 {
             return;
         }
-        let observed = std::panic::catch_unwind(AssertUnwindSafe(|| self.observer.observe(event)));
+        let observed = std::panic::catch_unwind(AssertUnwindSafe(|| self.observer.emit(event)));
         if let Err(payload) = observed {
             self.panicked.store(1, Ordering::Release);
             if !std::thread::panicking() {

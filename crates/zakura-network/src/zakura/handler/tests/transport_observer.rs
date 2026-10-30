@@ -546,12 +546,12 @@ fn no_observer_evaluates_nothing() {
         evaluated.set(evaluated.get() + 1);
         TransportEvent::TornDown { conn_id: CONN }
     };
-    let mut observer: Option<Arc<dyn TransportObserver>> = None;
+    let mut observer: Option<crate::zakura::TransportSlot> = None;
     transport_observe!(observer, event());
     assert_eq!(evaluated.get(), 0);
 
     let recorder = Arc::new(Recorder::default());
-    observer = Some(recorder.clone());
+    observer = Some(recorder.clone().into());
     transport_observe!(observer, event());
     assert_eq!(evaluated.get(), 1);
     assert_eq!(

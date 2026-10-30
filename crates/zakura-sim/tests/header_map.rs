@@ -6,18 +6,23 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use support::inputs;
+use zakura_network::zakura::{
+    TransportEvent, TransportObserver, ZAKURA_CAP_HEADER_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+};
 use zakura_sim::{
     harness::{
         header_node::{reads::without_reads, Chain, Policy},
-        header_sync::{HeaderWire, WireScenario},
-        run_prepared, HarnessError, Subsystem,
+        header_sync::{wire_config, HeaderWire, WireScenario},
+        run_prepared,
+        wire_node::TransportTap,
+        HarnessError, NetScenario, Subsystem,
     },
     observe::{ComponentReading, ComponentValue, MapRow, TransportFact},
     peer::{honest::HonestSpec, peer_addr, PeerAction, PeerSpec},
-    MemorySink, Observation, Plan, PlanInput, RunReport,
+    HarnessFailure, MemorySink, NoChecks, Observation, Plan, PlanInput, RunReport, Sim,
 };
 
 /// `peer-0`, an honest peer with 120 headers, dials the node at 50,
@@ -32,6 +37,22 @@ fn replacement() -> WireScenario {
                 subscribe: None,
             }),
             script: vec![PeerAction::Close, PeerAction::Redial],
+            ..PeerSpec::dialing()
+        }],
+        policy: Policy::converging(),
+        ..WireScenario::default()
+    }
+}
+
+/// `peer-0`, an honest peer with 120 headers, dials the node at 50.
+fn honest() -> WireScenario {
+    WireScenario {
+        node: Chain::main(50),
+        peers: vec![PeerSpec {
+            honest: Some(HonestSpec {
+                chain: 120,
+                subscribe: None,
+            }),
             ..PeerSpec::dialing()
         }],
         policy: Policy::converging(),
@@ -222,5 +243,144 @@ fn map_reads_add_no_scheduling_point() {
         assert_eq!(read.end, unread.end);
         assert_eq!(support::picks(&read), support::picks(&unread));
         assert_eq!(stops(&read), stops(&unread));
+    }
+}
+
+/// Each registry record carries the services the registry reached: every
+/// fanout's mask is within the mask its peer carried, a connection's
+/// fanout reaches header sync exactly when its header stream was admitted
+/// before it, and each `registry-removed` names the union of its
+/// connection's fanout masks, the services its cleanup guard removes. The
+/// runs first show a fanout that reaches header sync and a removal, on the
+/// honest sync and on both connections of the replacement history.
+///
+/// This fails if a record names services the call didn't reach.
+#[test]
+fn registry_records_carry_their_masks() {
+    for scenario in [honest(), replacement()] {
+        let report = run(&scenario, Plan::from_fuzz(&[]));
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let mut admitted: BTreeMap<u64, bool> = BTreeMap::new();
+        let mut reached: BTreeMap<u64, u64> = BTreeMap::new();
+        let (mut header_fanouts, mut removals) = (0, 0);
+        for entry in report.log.entries() {
+            let Observation::Transport {
+                connection: Some(connection),
+                event,
+                ..
+            } = &entry.obs
+            else {
+                continue;
+            };
+            match event {
+                TransportFact::Admitted { kind, .. } if *kind == ZAKURA_STREAM_HEADER_SYNC => {
+                    admitted.insert(*connection, true);
+                }
+                TransportFact::RegistryFanout {
+                    negotiated,
+                    admitted_mask,
+                } => {
+                    assert_eq!(
+                        admitted_mask & !negotiated,
+                        0,
+                        "{connection}: within the peer"
+                    );
+                    let header = admitted_mask & ZAKURA_CAP_HEADER_SYNC != 0;
+                    assert_eq!(
+                        header,
+                        admitted.remove(connection).unwrap_or(false),
+                        "{connection}: the fanout reaches header sync after its stream"
+                    );
+                    header_fanouts += usize::from(header);
+                    *reached.entry(*connection).or_default() |= admitted_mask;
+                }
+                TransportFact::RegistryRemoved { admitted_mask } => {
+                    assert_eq!(
+                        Some(*admitted_mask),
+                        reached.remove(connection),
+                        "{connection}: the removal names what its fanouts reached"
+                    );
+                    removals += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(header_fanouts > 0, "a fanout reaches header sync");
+        assert!(removals > 0 || scenario.peers[0].script.is_empty());
+    }
+}
+
+/// Drops every `RegistryRemoved` it's handed.
+#[derive(Debug)]
+struct DropsRemovals(Arc<dyn TransportObserver>);
+
+impl TransportObserver for DropsRemovals {
+    fn observe(&self, event: TransportEvent) {
+        if !matches!(event, TransportEvent::RegistryRemoved { .. }) {
+            self.0.observe(event);
+        }
+    }
+}
+
+/// The transport counts each event before its observer sees it, so an
+/// observer that drops a `RegistryRemoved` fails the run as unobserved
+/// evidence at that boundary, and the same events delivered whole pass.
+/// The task reports a registration, a fanout and a removal.
+///
+/// This fails if the tap's checkpoint ignores the transport's count.
+#[test]
+fn a_dropped_registry_record_fails_the_run() {
+    for drop_removals in [false, true] {
+        let mut sim = Sim::new(wire_config(), Plan::from_fuzz(&[]));
+        let (slot, tap) = TransportTap::new(
+            &mut sim,
+            "node",
+            NetScenario::default().net(),
+            vec!["peer-0".to_owned()],
+        );
+        sim.add_source(Box::new(tap));
+        let reporter = if drop_removals {
+            slot.wrapped(|inner| Arc::new(DropsRemovals(inner)))
+        } else {
+            slot.clone()
+        };
+        sim.scheduler().spawn_root("node", async move {
+            reporter.emit(TransportEvent::Registered {
+                conn_id: 1,
+                remote: peer_addr(0, 0),
+            });
+            reporter.emit(TransportEvent::RegistryFanout {
+                conn_id: 1,
+                negotiated: ZAKURA_CAP_HEADER_SYNC,
+                admitted_mask: ZAKURA_CAP_HEADER_SYNC,
+            });
+            reporter.emit(TransportEvent::RegistryRemoved {
+                conn_id: 1,
+                admitted_mask: ZAKURA_CAP_HEADER_SYNC,
+            });
+        });
+        let report = sim.run(&mut NoChecks, &mut MemorySink::default());
+        // The observer outlives the run, as the node's handler does.
+        drop(slot);
+        let removed = report.log.entries().iter().any(|entry| {
+            matches!(
+                entry.obs,
+                Observation::Transport {
+                    event: TransportFact::RegistryRemoved { .. },
+                    ..
+                }
+            )
+        });
+        if !drop_removals {
+            assert_eq!(report.end.harness, None, "{:?}", report.end);
+            assert!(removed, "the whole run logs the removal");
+            continue;
+        }
+        assert!(!removed);
+        let Some(HarnessFailure::SourceEvidence { source, detail }) = &report.end.harness else {
+            panic!("expected an evidence failure, got {:?}", report.end);
+        };
+        assert_eq!(source, "transport:node#0");
+        assert!(detail.starts_with("Unobserved"), "{detail}");
     }
 }

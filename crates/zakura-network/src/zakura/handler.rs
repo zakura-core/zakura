@@ -2434,7 +2434,7 @@ pub struct ZakuraProtocolHandler {
     local_node_id: Option<NodeId>,
     /// Receives this handler's transport events.
     #[cfg(any(test, zakura_sim))]
-    transport_observer: Option<Arc<dyn super::TransportObserver>>,
+    transport_observer: Option<super::TransportSlot>,
 }
 
 fn random_stream_session_seed() -> u64 {
@@ -2541,11 +2541,20 @@ impl ZakuraProtocolHandler {
     /// The observer takes the supervisor map's boundary read now, then
     /// gets its `ReadRegistered` (M6a-7b).
     #[cfg(any(test, zakura_sim))]
-    pub fn with_transport_observer(mut self, observer: Arc<dyn super::TransportObserver>) -> Self {
-        let key = crate::zakura::diag::ReadKey::SupervisorMap;
-        observer.register_read(key.clone(), self.supervisor.read());
-        observer.observe(super::TransportEvent::ReadRegistered { key });
-        self.transport_observer = Some(observer);
+    pub fn with_transport_observer(self, observer: Arc<dyn super::TransportObserver>) -> Self {
+        self.with_transport_slot(super::TransportSlot::new(observer))
+    }
+
+    /// [`with_transport_observer`](Self::with_transport_observer), through
+    /// `slot`, whose delivery count its caller may keep (rule 7 of the M6a
+    /// observation contract).
+    #[cfg(any(test, zakura_sim))]
+    pub fn with_transport_slot(mut self, slot: super::TransportSlot) -> Self {
+        slot.register_read(
+            crate::zakura::diag::ReadKey::SupervisorMap,
+            self.supervisor.read(),
+        );
+        self.transport_observer = Some(slot);
         self
     }
 

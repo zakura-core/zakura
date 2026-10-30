@@ -49,7 +49,7 @@ pub use message_rule::{
 #[cfg(any(test, zakura_sim))]
 pub use observe::{
     frame_fingerprint, FrameSummary, HeaderCheck, OutputOutcome, Producer, Summarizer,
-    SummaryCursor, Transition, TransportEvent, TransportObserver, Unwritten,
+    SummaryCursor, Transition, TransportEvent, TransportObserver, TransportSlot, Unwritten,
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
@@ -81,7 +81,7 @@ pub use sim_reader::{read_framed_channel, StreamReader};
 macro_rules! transport_observe {
     ($observer:expr, $event:expr) => {
         if let Some(observer) = &$observer {
-            observer.observe($event)
+            observer.emit($event)
         }
     };
 }

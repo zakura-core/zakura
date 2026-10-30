@@ -35,7 +35,7 @@ use zakura_network::{
     zakura::{
         diag::{ComponentRead, ReadKey},
         FrameSummary, HeaderCheck, HeaderSyncService, OutputOutcome, Producer, Service,
-        ServiceRegistry, Transition, TransportEvent, TransportObserver, Unwritten,
+        ServiceRegistry, Transition, TransportEvent, TransportObserver, TransportSlot, Unwritten,
         ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
         ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace,
     },
@@ -98,7 +98,7 @@ impl WireNode {
         network: &Network,
         net: SimNet,
         seed: [u8; 32],
-        observer: Arc<dyn TransportObserver>,
+        observer: TransportSlot,
         dials: DialReporter,
     ) -> Self {
         let (bound, endpoint) = watch::channel(None);
@@ -124,7 +124,7 @@ impl WireNode {
                 ZakuraTrace::noop(),
             )
             .with_local_node_id(quic.local_id())
-            .with_transport_observer(observer);
+            .with_transport_slot(observer);
             quic.serve(handler.clone()).expect("the node serves");
             bound.send_replace(Some((ZakuraEndpoint::new(quic, handler), limits)));
             // The endpoint lives as long as the run.
@@ -215,6 +215,9 @@ struct TapState {
     buffer: Mutex<Buffer>,
     /// The boundary reads the handler registered, for the evidence hub.
     reads: ReadSink,
+    /// The transport's events, counted before each reached the observer
+    /// (rule 7 of the M6a observation contract).
+    emitted: Arc<zakura_rt::sync::counter::AtomicU64>,
 }
 
 /// Events reported and not yet drained.
@@ -222,6 +225,9 @@ struct TapState {
 struct Buffer {
     /// The last event number handed out.
     last: u64,
+    /// The transport's events among them, which the transport counted as
+    /// it emitted them. The wire node's own dial failures aren't.
+    observed: u64,
     /// Each event with its number and emission position, in order.
     events: Vec<(u64, Option<u64>, Reported)>,
 }
@@ -257,15 +263,23 @@ impl TapState {
             .checked_add(1)
             .expect("a run reports fewer than 2^64 events");
         let seq = buffer.last;
+        if matches!(event, Reported::Event(_)) {
+            buffer.observed += 1;
+        }
         buffer.events.push((seq, pos, event));
     }
 }
 
 /// A transport tap publishes transport events.
 impl LiveEvidence for TapState {
-    /// The last event reported.
+    /// The last event reported, plus each event the transport emitted that
+    /// its observer never recorded, which the log then can't hold.
     fn last_seq(&self) -> u64 {
-        self.buffer().last
+        let buffer = self.buffer();
+        let emitted = self
+            .emitted
+            .load(zakura_rt::sync::counter::Ordering::Relaxed);
+        buffer.last + emitted.saturating_sub(buffer.observed)
     }
 
     /// Whether an event was reported outside the tap's run.
@@ -310,8 +324,8 @@ impl TransportObserver for TapObserver {
 impl TransportTap {
     /// A tap on the transport of the node named `node`, whose peers are
     /// named `peers` by index, opening each admitted session's links on
-    /// `net`. Returns the observer, for the node's handler and nothing else,
-    /// and the reader. Its checkpoint is registered with `sim` now.
+    /// `net`. Returns the observer's counted slot, for the node's handler and
+    /// nothing else, and the reader. Its checkpoint is registered with `sim` now.
     ///
     /// # Panics
     ///
@@ -322,7 +336,7 @@ impl TransportTap {
         node: &str,
         net: Net,
         peers: Vec<String>,
-    ) -> (Arc<dyn TransportObserver>, TransportTap) {
+    ) -> (TransportSlot, TransportTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
@@ -331,6 +345,7 @@ impl TransportTap {
                 refused: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 reads: ReadSink::default(),
+                emitted: Arc::default(),
             }))
         });
         let state = observer.0.clone();
@@ -357,7 +372,8 @@ impl TransportTap {
             out: Out::default(),
             generations: BTreeMap::new(),
         };
-        (observer, tap)
+        let emitted = observer.0.emitted.clone();
+        (TransportSlot::counting(observer, emitted), tap)
     }
 
     /// This tap, handing its rows to `out` instead of the log.

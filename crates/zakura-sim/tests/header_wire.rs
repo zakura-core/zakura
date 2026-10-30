@@ -5,16 +5,15 @@
 //! from its transport events and the identity map's `Session` rows.
 #![cfg(zakura_sim)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        TransportEvent, TransportObserver, ZakuraLocalLimits, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+        TransportEvent, ZakuraLocalLimits, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_DISCOVERY,
+        ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     Config,
 };
@@ -825,18 +824,18 @@ fn tap_run(edit: fn(Vec<Observation>) -> Vec<Observation>) -> RunReport {
         vec!["peer-0".to_owned()],
     );
     sim.add_source(Box::new(Rewrite { inner: tap, edit }));
-    let reporter: Arc<dyn TransportObserver> = observer.clone();
+    let reporter = observer.clone();
     sim.scheduler().spawn_root("node", async move {
         let config = Config {
             network: Network::new_regtest(Default::default()),
             ..Config::default()
         };
         let limits = ZakuraLocalLimits::from_config(&config);
-        reporter.observe(TransportEvent::Registered {
+        reporter.emit(TransportEvent::Registered {
             conn_id: 1,
             remote: peer_addr(0, 0),
         });
-        reporter.observe(TransportEvent::Admitted {
+        reporter.emit(TransportEvent::Admitted {
             conn_id: 1,
             quic_stream: 4,
             kind: ZAKURA_STREAM_HEADER_SYNC,

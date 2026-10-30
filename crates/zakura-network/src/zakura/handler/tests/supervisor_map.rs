@@ -268,3 +268,130 @@ async fn the_map_registers_its_read() {
         .expect("no test panics while holding it");
     assert_eq!(entries(&reads[0]), Some(vec![(conn_id, peer, Some(ip(1)))]));
 }
+
+/// Drops every `RegistryRemoved` it's handed, and records the rest.
+#[derive(Debug, Default)]
+struct DropsRemovals(Mutex<Vec<TransportEvent>>);
+
+impl TransportObserver for DropsRemovals {
+    fn observe(&self, event: TransportEvent) {
+        if !matches!(event, TransportEvent::RegistryRemoved { .. }) {
+            self.0
+                .lock()
+                .expect("no test panics while holding it")
+                .push(event);
+        }
+    }
+}
+
+/// The transport counts each event before its observer sees it, through
+/// the handler's slot and a connection's tap alike, so an observer that
+/// drops one leaves the count ahead of what it recorded.
+///
+/// This fails if an event reaches the observer uncounted.
+#[test]
+fn the_transport_counts_every_event_before_its_observer() {
+    let observer = Arc::new(DropsRemovals::default());
+    let emitted = Arc::new(zakura_rt::sync::counter::AtomicU64::new(0));
+    let slot = crate::zakura::TransportSlot::counting(observer.clone(), emitted.clone());
+    let handler = ZakuraProtocolHandler::new(
+        ZakuraSupervisorHandle::new(4),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        ZakuraLocalLimits::from_config(&Config::default()),
+    )
+    .with_transport_slot(slot.clone());
+    let tap = crate::zakura::ConnTap::new(slot, std::net::SocketAddr::new(ip(1), 9));
+    tap.registered(7);
+    tap.emit(TransportEvent::RegistryFanout {
+        conn_id: 7,
+        negotiated: ZAKURA_CAP_HEADER_SYNC,
+        admitted_mask: ZAKURA_CAP_HEADER_SYNC,
+    });
+    tap.emit(TransportEvent::RegistryRemoved {
+        conn_id: 7,
+        admitted_mask: ZAKURA_CAP_HEADER_SYNC,
+    });
+    let recorded = observer
+        .0
+        .lock()
+        .expect("no test panics while holding it")
+        .len();
+    assert_eq!(
+        recorded, 2,
+        "the observer kept the registration and the fanout"
+    );
+    assert_eq!(
+        emitted.load(zakura_rt::sync::counter::Ordering::Relaxed),
+        3,
+        "the dropped removal was counted"
+    );
+    drop(handler);
+}
+
+/// Each `remove_peer` fanout of a connection's cleanup guard is reported
+/// through the connection's tap, with the services it reached: the
+/// awaited cleanup, the guard's `Drop`, and none for a guard that reached
+/// no service.
+///
+/// This fails if a removal goes unreported or names the wrong services.
+#[tokio::test]
+async fn the_cleanup_guard_reports_each_removal() {
+    let observer = Arc::new(Events::default());
+    let supervisor = ZakuraSupervisorHandle::new(4);
+    let registry = Arc::new(ServiceRegistry::default());
+    let tap = Arc::new(crate::zakura::ConnTap::new(
+        observer.clone(),
+        std::net::SocketAddr::new(ip(1), 9),
+    ));
+    let guard = |conn_id, mask| {
+        let mut guard = RegisteredPeerCleanupGuard::new(
+            supervisor.clone(),
+            registry.clone(),
+            test_peer(1),
+            conn_id,
+            CancellationToken::new(),
+        );
+        guard.observe_with(Some(&tap));
+        guard.add_admitted_capabilities(mask);
+        guard
+    };
+    guard(7, ZAKURA_CAP_HEADER_SYNC | 1)
+        .cleanup_registered_peer()
+        .await;
+    drop(guard(8, ZAKURA_CAP_HEADER_SYNC));
+    drop(guard(9, 0));
+    assert_eq!(
+        observer.take(),
+        [
+            TransportEvent::RegistryRemoved {
+                conn_id: 7,
+                admitted_mask: ZAKURA_CAP_HEADER_SYNC | 1,
+            },
+            TransportEvent::RegistryRemoved {
+                conn_id: 8,
+                admitted_mask: ZAKURA_CAP_HEADER_SYNC,
+            },
+        ]
+    );
+}
+
+/// Records every event, in order.
+#[derive(Debug, Default)]
+struct Events(Mutex<Vec<TransportEvent>>);
+
+impl TransportObserver for Events {
+    fn observe(&self, event: TransportEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(event);
+    }
+}
+
+impl Events {
+    /// The events recorded since the last call.
+    fn take(&self) -> Vec<TransportEvent> {
+        std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
+    }
+}

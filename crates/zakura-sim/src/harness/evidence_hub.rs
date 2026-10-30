@@ -513,6 +513,7 @@ mod tests {
                 id,
                 request: crate::observe::StorageRequest::ContinuationLocator,
                 digest: String::new(),
+                call: None,
             },
         }
     }

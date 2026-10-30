@@ -1092,7 +1092,7 @@ mod tests {
                 })
                 .collect();
             assert!(
-                matches!(ends[..], [(1, "dropped", None)]),
+                matches!(ends[..], [(1, "dropped", Some(_))]),
                 "{stopping:?}: the call ends dropped: {ends:?}"
             );
             assert!(
@@ -1293,7 +1293,8 @@ mod tests {
                 .await
         });
         assert!(
-            (&mut future).now_or_never().is_none(),
+            zakura_network::zakura::observe::as_call(call, || (&mut future).now_or_never())
+                .is_none(),
             "storage holds the call"
         );
         future
@@ -1556,7 +1557,7 @@ mod tests {
             })
             .expect("the prepare's call ends");
         assert!(
-            matches!(&ended, (_, end, None) if end == "dropped"),
+            matches!(&ended, (_, end, Some(_)) if end == "dropped"),
             "it ends dropped: {ended:?}"
         );
         assert!(
@@ -1565,17 +1566,22 @@ mod tests {
         );
     }
 
-    /// Whether call `call` ended `dropped` before storage published a drop
-    /// receipt: the end's storage watermark is below the receipt's
-    /// sequence number.
+    /// Whether call `call` ended `dropped`, naming its operation, before
+    /// storage published that operation's drop receipt: the end's storage
+    /// watermark is below the receipt's sequence number.
     fn end_precedes_receipt(report: &RunReport, call: u64) -> bool {
         let entries = report.log.entries();
-        let Some(watermark) = entries.iter().find_map(|entry| match &entry.obs {
+        let Some((watermark, op)) = entries.iter().find_map(|entry| match &entry.obs {
             Observation::Reactor {
                 storage_seq,
-                event: ReactorFact::CallEnded { call: c, end, .. },
+                event:
+                    ReactorFact::CallEnded {
+                        call: c,
+                        end,
+                        op: Some(op),
+                    },
                 ..
-            } if *c == call && end == "dropped" => Some(*storage_seq),
+            } if *c == call && end == "dropped" => Some((*storage_seq, *op)),
             _ => None,
         }) else {
             return false;
@@ -1585,10 +1591,10 @@ mod tests {
                 entry.obs,
                 Observation::Storage {
                     seq,
-                    fact: crate::observe::StorageFact::CallerDropped { .. }
-                        | crate::observe::StorageFact::ReplyDropped { .. },
+                    fact: crate::observe::StorageFact::CallerDropped { id }
+                        | crate::observe::StorageFact::ReplyDropped { id },
                     ..
-                } if seq > watermark
+                } if seq > watermark && id == op
             )
         })
     }
@@ -1755,11 +1761,11 @@ mod tests {
         );
     }
 
-    /// A `dropped` end waits only for the drop receipt of an operation
-    /// storage held when the end came. Call 1 ends dropped while its
-    /// operation is pending and never gets a receipt. Call 2, submitted
-    /// after, is dropped with no end, and its `CallerDropped` fails the
-    /// run at its own step, though call 1 is still waiting.
+    /// A `dropped` end waits only for the drop receipt of the operation its
+    /// own call submitted. Call 1 ends dropped while its operation is
+    /// pending. Call 2, submitted after, is dropped with no end, and its
+    /// `CallerDropped` fails the run at its own step, though call 1 is still
+    /// waiting.
     ///
     /// This fails if a waiting dropped call takes any later receipt of its
     /// kind.

@@ -460,6 +460,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id: id.0,
             request: request(&asked),
             digest: hex(&request_digest),
+            call: fact.call,
         },
         FactKind::CallerDropped { id } => StorageFact::CallerDropped { id: id.0 },
         FactKind::ReplyTaken { id } => StorageFact::ReplyTaken { id: id.0 },

@@ -554,6 +554,112 @@ impl PortTap {
     }
 }
 
+/// A port call's number, from 1, as [`ReactorEvent::Dispatched`] hands it
+/// out. In a simulator build, storage tags each operation a call's poll
+/// submits with it (see [`as_call`]), so each storage receipt pairs with exactly the call that
+/// submitted it. M6a-4 is expected to build its work identities on it,
+/// joining a call to its work incarnation and the reservation and lease IDs
+/// its dispatch captures.
+pub type CallId = u64;
+
+/// Runs `poll` as call `call`'s poll, so in a simulator build
+/// `polling_call` names `call` inside it, on this task only, as a storage
+/// call submitted there reads it. The task's previous call is restored
+/// after, on unwind too.
+pub fn as_call<R>(call: CallId, poll: impl FnOnce() -> R) -> R {
+    #[cfg(zakura_sim)]
+    let _scope = call_scope::CallScope::enter(call);
+    #[cfg(not(zakura_sim))]
+    let _ = call;
+    poll()
+}
+
+/// The call whose poll the current task is running, if any. See
+/// [`as_call`].
+#[cfg(zakura_sim)]
+pub fn polling_call() -> Option<CallId> {
+    call_scope::current()
+}
+
+/// Each task's polling call. Keyed by run and task, not just by thread,
+/// because a poll can reach a scheduling point, and the run then switches to
+/// another task on this thread before the poll returns.
+#[cfg(zakura_sim)]
+mod call_scope {
+    use std::cell::RefCell;
+
+    use zakura_rt::sim::{RunId, TaskId};
+
+    use super::CallId;
+
+    std::thread_local! {
+        /// Each task's polling call, with `None` for code outside a run or
+        /// a task.
+        static CALLS: RefCell<Vec<(Task, CallId)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A run's task.
+    type Task = (Option<RunId>, Option<TaskId>);
+
+    /// The task running now.
+    fn task() -> Task {
+        (
+            zakura_rt::sim::run_id(),
+            zakura_rt::sim::executor().and_then(|executor| executor.current_task()),
+        )
+    }
+
+    /// The current task's polling call.
+    pub(super) fn current() -> Option<CallId> {
+        let task = task();
+        CALLS.with_borrow(|calls| {
+            calls
+                .iter()
+                .find(|(t, _)| *t == task)
+                .map(|(_, call)| *call)
+        })
+    }
+
+    /// One task's call, until dropped.
+    pub(super) struct CallScope {
+        task: Task,
+        previous: Option<CallId>,
+    }
+
+    impl CallScope {
+        /// Makes `call` the current task's polling call.
+        pub(super) fn enter(call: CallId) -> Self {
+            let task = task();
+            let previous =
+                CALLS.with_borrow_mut(|calls| match calls.iter_mut().find(|(t, _)| *t == task) {
+                    Some((_, current)) => Some(std::mem::replace(current, call)),
+                    None => {
+                        calls.push((task, call));
+                        None
+                    }
+                });
+            Self { task, previous }
+        }
+    }
+
+    impl Drop for CallScope {
+        /// Restores the task's previous polling call, or none.
+        fn drop(&mut self) {
+            CALLS.with_borrow_mut(|calls| {
+                let Some(index) = calls.iter().position(|(t, _)| *t == self.task) else {
+                    return;
+                };
+                match self.previous {
+                    Some(previous) => calls[index].1 = previous,
+                    None => {
+                        calls.swap_remove(index);
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// A port call's whole future, guarded so that dropping it unfinished, as
 /// the reactor's teardown drops its pending calls, reports
 /// `CallEnded{end: Dropped}` through the call's tap. It reports first,
@@ -584,17 +690,19 @@ impl<F> PendingCall<F> {
 impl<F: std::future::Future + Unpin> std::future::Future for PendingCall<F> {
     type Output = F::Output;
 
-    /// Polls the guarded future.
+    /// Polls the guarded future as its call's (see [`as_call`]).
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<F::Output> {
+        let call = self.tap.call;
         let future = self
             .future
             .as_mut()
             .expect("a pending call's future lives until its guard drops");
-        let polled =
-            std::panic::catch_unwind(AssertUnwindSafe(|| std::pin::Pin::new(future).poll(cx)));
+        let polled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            as_call(call, || std::pin::Pin::new(future).poll(cx))
+        }));
         match polled {
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Ok(ready) => {

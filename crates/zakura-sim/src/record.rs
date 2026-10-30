@@ -544,6 +544,7 @@ mod tests {
                     id: 1,
                     request: request.clone(),
                     digest: "ef".into(),
+                    call: None,
                 },
             ),
             storage(

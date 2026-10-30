@@ -612,6 +612,10 @@ pub enum StorageFact {
         request: StorageRequest,
         /// A digest of the request.
         digest: String,
+        /// The header-sync reactor's port call that submitted it, or `None`
+        /// for an operation no reactor call's poll submitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
     },
     /// The caller dropped its call while the operation was pending.
     CallerDropped {

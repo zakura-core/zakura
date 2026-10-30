@@ -129,6 +129,11 @@ pub struct Fact {
     /// `None` outside a run.
     #[cfg(zakura_sim)]
     pub pos: Option<u64>,
+    /// The header-sync reactor's port call whose poll published it, so a
+    /// `Submitted` fact names the call that submitted its operation. `None`
+    /// outside a call's poll. See `zakura_network`'s `observe::as_call`.
+    #[cfg(zakura_sim)]
+    pub call: Option<u64>,
 }
 
 /// What a [`Fact`] records. The head kinds name their transaction and come
@@ -378,6 +383,8 @@ impl Ops {
                     kind,
                     #[cfg(zakura_sim)]
                     pos: zakura_rt::sim::next_position(),
+                    #[cfg(zakura_sim)]
+                    call: zakura_network::zakura::observe::polling_call(),
                 }
             })
             .collect();

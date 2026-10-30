@@ -410,6 +410,24 @@ async fn local_activation_is_enforced_by_transaction_validation() {
         .is_ok());
 }
 
+#[tokio::test]
+async fn isolated_custom_testnet_enforces_pq_activation() {
+    let _guard = zakura_test::init();
+    let custom = zakura_chain::parameters::testnet::Parameters::build()
+        .with_network_name("PqActivationFixture").unwrap()
+        .with_network_magic(zakura_chain::parameters::Magic([80, 81, 84, 50])).unwrap()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu5: Some(1), ..Default::default()
+        }).unwrap()
+        .with_funding_streams(Vec::new())
+        .with_pq_p2sh_activation_height(ACTIVATION)
+        .to_network().unwrap();
+    assert!(matches!(verify_block(&SPEND, &custom, Height(9)).await,
+        Err(TransactionError::Script(_))));
+    assert!(verify_block(&SPEND, &custom, ACTIVATION).await.is_ok());
+    assert!(verify_block(&SPEND, &custom, Height(11)).await.is_ok());
+}
+
 #[test]
 fn public_networks_and_legacy_constructor_cannot_select_pq() {
     for network in [

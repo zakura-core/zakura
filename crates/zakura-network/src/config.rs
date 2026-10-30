@@ -967,7 +967,7 @@ where
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
-    /// Local regtest-only PQ activation. Requires a node built with the `pq` feature.
+    /// Local PQ activation on Regtest or an explicitly isolated custom Testnet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_p2sh_activation_height: Option<u32>,
     network_name: Option<String>,
@@ -1495,10 +1495,26 @@ where
         regtest: _,
     } = params;
 
-    if pq_p2sh_activation_height.is_some() {
-        return Err(de::Error::custom(
-            "pq_p2sh_activation_height is only supported on Regtest",
-        ));
+    if let Some(height) = pq_p2sh_activation_height {
+        if !cfg!(feature = "pq") {
+            return Err(de::Error::custom(
+                "pq_p2sh_activation_height requires a node built with the pq feature",
+            ));
+        }
+        if height == 0
+            || network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some([0xfa, 0x1a, 0xf9, 0xbf])
+        {
+            return Err(de::Error::custom(
+                "custom Testnet PQ activation requires a positive height and explicit network_name and network_magic",
+            ));
+        }
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "PQ Testnet requires explicit isolated peers",
+            ));
+        }
     }
     let mut params_builder = testnet::Parameters::build();
 
@@ -1605,6 +1621,11 @@ where
             .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))?;
 
         params_builder = params_builder.with_initial_nsm_value_balance(balance);
+    }
+
+    if let Some(height) = pq_p2sh_activation_height {
+        params_builder =
+            params_builder.with_pq_p2sh_activation_height(zakura_chain::block::Height(height));
     }
 
     // An omitted seed and otherwise default parameters select public Testnet.

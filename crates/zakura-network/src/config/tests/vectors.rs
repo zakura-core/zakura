@@ -1654,7 +1654,7 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
 }
 
 #[test]
-fn pq_activation_config_is_regtest_only_and_requires_support() {
+fn pq_activation_config_requires_an_isolated_network_and_support() {
     let default: Config = toml::from_str("network = 'Regtest'").unwrap();
     assert_eq!(default.network.pq_p2sh_activation_height(), None);
     for height in [0, 10, 100] {
@@ -1684,5 +1684,40 @@ fn pq_activation_config_is_regtest_only_and_requires_support() {
     }
     let error =
         toml::from_str::<Config>("network = { pq_p2sh_activation_height = 0 }").unwrap_err();
-    assert!(error.to_string().contains("only supported on Regtest"));
+    assert!(error.to_string().contains(if cfg!(feature = "pq") {
+        "explicit network_name"
+    } else {
+        "pq feature"
+    }));
+}
+
+#[test]
+fn custom_testnet_pq_configuration_round_trips() {
+    let source = r#"
+initial_testnet_peers = ["127.0.0.1:18333"]
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], pq_p2sh_activation_height = 4420649 }
+"#;
+    let parsed = toml::from_str::<Config>(source);
+    if cfg!(feature = "pq") {
+        let config = parsed.expect("an explicitly isolated PQ Testnet is supported");
+        assert_eq!(
+            config.network.pq_p2sh_activation_height(),
+            Some(Height(4_420_649))
+        );
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.network, config.network);
+        for invalid in [
+            source.replace("4420649", "0"),
+            source.replace("[80, 81, 84, 49]", "[250, 26, 249, 191]"),
+            source.replace("PqFork", "Testnet"),
+        ] {
+            assert!(toml::from_str::<Config>(&invalid).is_err());
+        }
+        assert!(toml::from_str::<Config>(
+            &source.replace("initial_testnet_peers = [\"127.0.0.1:18333\"]", "")
+        )
+        .is_err());
+    } else {
+        assert!(parsed.unwrap_err().to_string().contains("pq feature"));
+    }
 }

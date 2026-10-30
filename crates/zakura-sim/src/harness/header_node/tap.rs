@@ -37,8 +37,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        Binding, CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot,
-        Placement, PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
+        Binding, CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement,
+        PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
         TransferDisposition, WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,

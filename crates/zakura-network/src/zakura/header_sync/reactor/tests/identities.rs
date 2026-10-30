@@ -10,6 +10,7 @@ use std::sync::Mutex as StdMutex;
 
 use super::{
     aux_fallback::{answer_locator, next_update, pruned_status},
+    status_offers::{ready_repair, status_for},
     *,
 };
 use crate::zakura::{
@@ -558,4 +559,83 @@ fn a_rebound_owner_follows_the_prefix() {
         "the snapshot lists the rebound owner: {:?}",
         settled.work
     );
+}
+
+/// A repair reserves before it stages its work, so it names the work it
+/// reserves for: the supplier's session, the repair's scope and the round's
+/// target, the same that its request then starts with. When the open fails,
+/// that placement is all that's left, with no binding or start.
+///
+/// This fails if the queue ignores the repair's named placement.
+#[test]
+fn a_failed_repair_open_keeps_its_placement() {
+    let mut started = None;
+    for refused in [false, true] {
+        let mut snapshot = genesis();
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, mut actions) = observed(&snapshot, &recorder, false);
+        reactor.startup.committed_snapshots = None;
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
+        reactor.observe_latest_committed_snapshot(snapshot.clone());
+        let (supplier, send, _outbound) = connect(&mut reactor, 0x71);
+        let mut status = status_for(&snapshot, block::Hash([0x42; 32]));
+        status.tree_aux_schema_mask = AuxSchema::V1.mask_bit();
+        reactor.handle_status(supplier.clone(), 0, status);
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(HeaderPortOperation::QueryHeaderLocator { .. })
+        ));
+        if refused {
+            let filler = Frame {
+                message_type: 1,
+                flags: 0,
+                payload: Vec::new(),
+            };
+            while send.try_send(filler.clone()).is_ok() {}
+        }
+        recorder.take();
+        ready_repair(&mut reactor, &mut actions, &snapshot);
+
+        let events = identities(recorder.take());
+        let Some(ReactorEvent::Placed {
+            peer, placement, ..
+        }) = events.first().cloned()
+        else {
+            panic!("the repair reserved first: {events:?}");
+        };
+        assert_eq!(peer, supplier);
+        let placement = placement.expect("the repair names its placement");
+        if !refused {
+            let Some(ReactorEvent::Started { request, purpose }) = events.get(2) else {
+                panic!("the repair bound and started: {events:?}");
+            };
+            assert!(matches!(
+                purpose,
+                HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+            ));
+            assert_eq!(
+                placement,
+                observe::Placement {
+                    session_id: request.session_id,
+                    scope: request.owner.header_authority(),
+                    target_tip_hash: request.target_tip_hash,
+                },
+                "it's placed for the work it starts"
+            );
+            started = Some(placement);
+            continue;
+        }
+        assert!(
+            reactor.peer_work_queue.active(&supplier).is_none(),
+            "the full queue refused the repair's open"
+        );
+        assert_eq!(events.len(), 1, "no binding and no start: {events:?}");
+        assert_eq!(
+            Some(placement),
+            started,
+            "the refused repair names the same work"
+        );
+        assert!(settle(&reactor, &recorder).holdings.is_empty());
+    }
 }

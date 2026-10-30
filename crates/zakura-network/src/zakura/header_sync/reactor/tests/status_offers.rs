@@ -697,7 +697,7 @@ fn in_flight_locator_waits_for_committed_resource_stall_to_clear() {
     );
 }
 
-fn ready_repair(
+pub(super) fn ready_repair(
     reactor: &mut HeaderSyncReactor,
     actions: &mut mpsc::Receiver<HeaderPortOperation>,
     snapshot: &zakura_header_chain::EngineSnapshot,

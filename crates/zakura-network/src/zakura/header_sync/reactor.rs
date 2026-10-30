@@ -3683,9 +3683,17 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .reservable_repair_header_count(request_count)
                 != request_count
-                || !self
-                    .peer_work_queue
-                    .reserve_repair_request(&peer, request_count)
+                || !sim_arg!(self.peer_work_queue.reserve_repair_request(&peer, request_count); observe::Placement {
+                    session_id: session.session_id(),
+                    scope: task.owner.header,
+                    // The round's target, as its request names it below.
+                    target_tip_hash: usize::try_from(request_count)
+                        .ok()
+                        .and_then(|count| context.bounded_prefix(count))
+                        .map_or(context.request_target().hash, |prefix| {
+                            prefix.request_target().hash
+                        }),
+                })
             {
                 local_capacity_unavailable = true;
                 continue;

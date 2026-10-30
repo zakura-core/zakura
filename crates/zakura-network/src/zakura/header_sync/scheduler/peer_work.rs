@@ -900,15 +900,19 @@ impl PeerWorkQueue {
         };
         self.request_reservations.insert(peer.clone(), reservation);
         #[cfg(any(test, zakura_sim))]
-        self.placed(peer, count);
+        self.placed(peer, count, None);
         true
     }
 
     /// Reserve aggregate capacity for one selected auxiliary repair range.
+    ///
+    /// A repair reserves before it stages its work, so in test and simulator
+    /// builds the caller names the work it reserves for as `placement`.
     pub(in crate::zakura::header_sync) fn reserve_repair_request(
         &mut self,
         peer: &ZakuraPeerId,
         count: u32,
+        #[cfg(any(test, zakura_sim))] placement: crate::zakura::header_sync::observe::Placement,
     ) -> bool {
         if self.request_reservations.contains_key(peer) {
             return false;
@@ -919,7 +923,7 @@ impl PeerWorkQueue {
         };
         self.request_reservations.insert(peer.clone(), reservation);
         #[cfg(any(test, zakura_sim))]
-        self.placed(peer, count);
+        self.placed(peer, count, Some(placement));
         true
     }
 
@@ -1088,11 +1092,17 @@ impl PeerWorkQueue {
     }
 
     /// Reports the reservation just placed for `peer`, with the work the
-    /// queue holds for it, and binds it at once to that work's incarnation
-    /// if it's active, since an active request's pages spend its peer's
+    /// queue holds for it, or `named`, the work a repair names before it
+    /// stages it, and binds it at once to the held work's incarnation if
+    /// it's active, since an active request's pages spend its peer's
     /// reservation.
     #[cfg(any(test, zakura_sim))]
-    fn placed(&self, peer: &ZakuraPeerId, count: usize) {
+    fn placed(
+        &self,
+        peer: &ZakuraPeerId,
+        count: usize,
+        named: Option<crate::zakura::header_sync::observe::Placement>,
+    ) {
         use crate::zakura::header_sync::observe::{Placement, ReactorEvent};
 
         let reservation = self
@@ -1120,6 +1130,7 @@ impl PeerWorkQueue {
             ),
             None => (None, None),
         };
+        let placement = named.or(placement);
         self.observer.emit(ReactorEvent::Placed {
             reservation,
             peer: peer.clone(),

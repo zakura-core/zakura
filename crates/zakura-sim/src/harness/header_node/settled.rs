@@ -1283,11 +1283,13 @@ mod tests {
             .collect()
     }
 
+    /// One step's [`check_budget`] record: the step, then the budget's
+    /// owned count from `require` and from `require_every`, or `None`.
+    type BudgetSeen = (u64, Option<usize>, Option<usize>);
+
     thread_local! {
-        /// What [`check_budget`] got at each step: the budget's owned count
-        /// from `require`, then from `require_every`, or `None`.
-        static BUDGET_SEEN: RefCell<Vec<(u64, Option<usize>, Option<usize>)>> =
-            const { RefCell::new(Vec::new()) };
+        /// What [`check_budget`] got at each step.
+        static BUDGET_SEEN: RefCell<Vec<BudgetSeen>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Records what `require` and `require_every` hand out for the budget.

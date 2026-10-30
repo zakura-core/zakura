@@ -329,7 +329,19 @@ impl Drop for ClearRun {
 }
 
 /// Runs `f` on this thread's run state, or returns `None` outside a run.
+///
+/// # Panics
+///
+/// Inside a `zakura_rt` boundary read. Every hook, the task waker and the
+/// executor bridge reach the run's state through here, so a read that
+/// would change the schedule it observes fails before it does.
+#[track_caller]
 pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
+    #[cfg(zakura_sim)]
+    assert!(
+        !zakura_rt::sim::in_boundary_read(),
+        "a boundary read reached the scheduler's run state"
+    );
     RUN.with(|r| r.borrow_mut().as_mut().map(f))
 }
 
@@ -403,13 +415,8 @@ impl Wake for TaskWaker {
             self.thread,
             "a simulated task's waker fired from another OS thread"
         );
-        // A wake changes the ready set without reaching a runtime point, so
-        // a boundary read could otherwise change the schedule it observes.
-        #[cfg(zakura_sim)]
-        assert!(
-            !zakura_rt::sim::in_boundary_read(),
-            "a boundary read woke a simulated task"
-        );
+        // A wake reaches the run's state through `with_run`, which refuses
+        // it inside a boundary read.
         with_run(|s| {
             if s.gen != self.gen {
                 return;

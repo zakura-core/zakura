@@ -1917,3 +1917,39 @@ fn a_read_that_moves_a_timer_or_draws_panics() {
     }));
     assert_eq!(draws.get(), 0, "no draw was taken");
 }
+
+/// A boundary read that calls the scheduler's `unpark_all` hook directly
+/// for a parked task, with no `zakura-rt` call, panics before the task
+/// becomes ready. The same call outside a read makes it ready.
+///
+/// This fails if the scheduler's hooks reach the run's state without
+/// checking the mark.
+#[test]
+fn a_direct_unpark_inside_a_read_panics() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let lock = Arc::new(RtMutex::new(()));
+    let guard = lock.lock().unwrap();
+    let l = lock.clone();
+    let waiter = s.spawn_root("waiter", async move {
+        drop(l.lock().unwrap());
+    });
+    assert!(matches!(s.run(waiter.task()), Reached(_)), "at its lock");
+    let Parked(object) = s.run(waiter.task()) else {
+        panic!("the waiter parks on the guard");
+    };
+    let refused = std::panic::catch_unwind(|| {
+        sim::boundary_read(|| zakura_scheduler::hooks::unpark_all(object));
+    });
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != waiter.task()),
+        "the waiter wasn't woken"
+    );
+    zakura_scheduler::hooks::unpark_all(object);
+    assert!(s.ready().iter().any(|ready| ready.task == waiter.task()));
+    drop(guard);
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+}

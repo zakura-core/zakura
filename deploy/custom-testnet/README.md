@@ -35,7 +35,8 @@ neither necessary nor a five-minute schedule.
 `/etc/zakura-custom-testnet.json` pins the deployment root, service prefix, binary,
 source revision, miner receiving address, public peer, and seed URL provenance,
 full and finalized tip heights/hashes, checksum, and original network directory.
-It contains no signing keys. Preserve the seed archive outside the disposable node directories.
+It contains no signing keys. Preserve the seed archive outside the disposable
+node directories.
 
 `install.py` installs the controller, the two node units, Caddy configuration,
 and the operator command from a checked-out source revision. It requires an

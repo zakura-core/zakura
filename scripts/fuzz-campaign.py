@@ -82,11 +82,6 @@ def check(campaign, suite_text, manifest, head, is_ancestor):
     if manifest.get("suite_sha256") != hashlib.sha256(suite_text).hexdigest():
         problems.append(f"the suite manifest read another {SUITE_FILE}")
     toolchain = campaign.get("toolchain", {})
-    default_sanitizer = toolchain.get("sanitizer")
-    if default_sanitizer not in {"address", "none"}:
-        problems.append(
-            f"toolchain.sanitizer is {default_sanitizer}, not `address` or `none`"
-        )
     formats = campaign.get("formats", {})
     for name, expected, actual in [
         ("toolchain.fuzz", toolchain.get("fuzz"), manifest.get("nightly")),
@@ -131,11 +126,6 @@ def check(campaign, suite_text, manifest, head, is_ancestor):
         shard = target.get("shard")
         if not shard:
             problems.append(f"`{target_id}` has no shard")
-        sanitizer = target.get("sanitizer", default_sanitizer)
-        if sanitizer not in {"address", "none"}:
-            problems.append(
-                f"`{target_id}`'s sanitizer is {sanitizer}, not `address` or `none`"
-            )
         workers[shard] = workers.get(shard, 0) + target.get("workers", 0)
     for target_id in sorted(expected - seen):
         problems.append(f"the suite manifest maps `{target_id}`, and manifest.toml doesn't run it")
@@ -146,15 +136,7 @@ def check(campaign, suite_text, manifest, head, is_ancestor):
     return problems
 
 
-def fuzz_mode_args(sanitizer, package):
-    """The cargo-fuzz arguments for `sanitizer` and `package`."""
-    args = ["-s", sanitizer]
-    if sanitizer == "none" and package == "sim":
-        args.append("--no-default-features")
-    return args
-
-
-def run_command(target, row, budget, corpus, evidence, toolchain, sanitizer, repo):
+def run_command(target, row, budget, corpus, evidence, toolchain, repo):
     """The shell command that runs one target for `budget` seconds."""
     package, name = row["package"], row["name"]
     workers = target["workers"]
@@ -170,7 +152,7 @@ def run_command(target, row, budget, corpus, evidence, toolchain, sanitizer, rep
     words = ["env", *env, "timeout", f"--kill-after={GRACE_SECS}", str(budget + timeout + GRACE_SECS)]
     words += [
         "cargo", f"+{toolchain}", "fuzz", "run", "--fuzz-dir", str(repo / "qa/fuzz" / package),
-        *fuzz_mode_args(sanitizer, package), name, str(corpus), "--", *args,
+        name, str(corpus), "--", *args,
     ]
     return shlex.join(words)
 
@@ -183,7 +165,6 @@ def segment_script(campaign, rows, suite_manifest, segment, shard, attempt, only
     """
     budget = next(row["budget-secs"] for row in campaign["segment"] if row["name"] == segment)
     toolchain = campaign["toolchain"]["fuzz"]
-    default_sanitizer = campaign["toolchain"]["sanitizer"]
     targets = [
         target for target in campaign["target"]
         if target["shard"] == shard and (not only or target["id"] in only)
@@ -224,13 +205,10 @@ def segment_script(campaign, rows, suite_manifest, segment, shard, attempt, only
     for target in targets:
         row = rows[target["id"]]
         package, name = row["package"], row["name"]
-        sanitizer = target.get("sanitizer", default_sanitizer)
         corpus = root / "corpus" / package / name
         rustflags = f"RUSTFLAGS={q(SIM_RUSTFLAGS)} " if package == "sim" else ""
-        mode = " ".join(q(arg) for arg in fuzz_mode_args(sanitizer, package))
         lines.append(
-            f"{rustflags}cargo +{toolchain} fuzz build --fuzz-dir "
-            f"{q(str(repo / 'qa/fuzz' / package))} {mode} {q(name)}"
+            f"{rustflags}cargo +{toolchain} fuzz build --fuzz-dir {q(str(repo / 'qa/fuzz' / package))} {q(name)}"
         )
         harness = row.get("harness")
         seed = (
@@ -240,12 +218,9 @@ def segment_script(campaign, rows, suite_manifest, segment, shard, attempt, only
         lines.append(f"test -d {q(str(corpus))} || {{ mkdir -p {q(str(corpus))}{seed}; }}")
     for target in targets:
         row = rows[target["id"]]
-        sanitizer = target.get("sanitizer", default_sanitizer)
         evidence = out / row["package"] / row["name"]
         corpus = root / "corpus" / row["package"] / row["name"]
-        command = run_command(
-            target, row, budget, corpus, evidence, toolchain, sanitizer, repo
-        )
+        command = run_command(target, row, budget, corpus, evidence, toolchain, repo)
         lines += [
             f"mkdir -p {q(str(evidence / 'artifacts'))} {q(str(evidence / 'sim'))}",
             f"( cd {q(str(evidence))} && status=0 && {{ {command} > run.log 2>&1 || status=$?; }} "

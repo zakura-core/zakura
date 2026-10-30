@@ -1874,25 +1874,29 @@ mod tests {
     #[test]
     fn frozen_needs_a_clean_checkout_at_the_builds_commit() {
         let mut build = ManifestBuild::from(BuildInfo::current());
-        build.git = "abc".to_owned();
+        build.git = "c0ffee".to_owned();
         build.dirty = false;
-        assert_eq!(unfrozen_by(&build, Some("abc\n"), Some("")), None);
+        assert_eq!(unfrozen_by(&build, Some("c0ffee\n"), Some("")), None);
         for (head, status, why) in [
-            (Some("abd"), Some(""), "the checkout is at abd"),
-            (Some("abc"), Some(" M qa/suite.toml\n"), "M qa/suite.toml"),
+            (Some("c0ffef"), Some(""), "the checkout is at c0ffef"),
             (
-                Some("abc"),
+                Some("c0ffee"),
+                Some(" M qa/suite.toml\n"),
+                "M qa/suite.toml",
+            ),
+            (
+                Some("c0ffee"),
                 Some("?? qa/planted/x/y.patch\n"),
                 "?? qa/planted",
             ),
             (None, Some(""), "git can't say"),
-            (Some("abc"), None, "git can't say"),
+            (Some("c0ffee"), None, "git can't say"),
         ] {
             let problem = unfrozen_by(&build, head, status).unwrap_or_default();
             assert!(problem.contains(why), "{problem}");
         }
         build.dirty = true;
-        assert!(unfrozen_by(&build, Some("abc"), Some("")).is_some());
+        assert!(unfrozen_by(&build, Some("c0ffee"), Some("")).is_some());
     }
 
     /// File paths become module paths.

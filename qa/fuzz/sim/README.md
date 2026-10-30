@@ -340,8 +340,8 @@ The compaction's merge writes no stats.
 reports each worker's outcome, its processes by how they ended, and its
 counts; the run's totals; the totals of complete files alone; each
 property's assumption losses (`assumptions-never-held` and
-`assumption-lost`); the features reached, by family; and the properties no
-complete file saw apply. It lists every gap: a worker that didn't spend its
+`assumption-lost`); the features reached, by family; and the properties, the
+harness's and any file's, that no complete file saw apply. It lists every gap: a worker that didn't spend its
 budget, a process that left no file, a file whose process didn't exit
 cleanly, a file the attempts log doesn't list, and a file that can't be read
 or that another harness wrote. Feature counts come only from a target with

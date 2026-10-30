@@ -10,7 +10,11 @@
 //! log doesn't list. Only complete files count toward
 //! [`Evidence::complete_totals`], and so toward [`Evidence::unapplied`].
 
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::Path,
+};
 
 use serde::Serialize;
 
@@ -38,8 +42,9 @@ pub struct Evidence {
     pub totals: Counts,
     /// The complete stats files' counts, summed.
     pub complete_totals: Counts,
-    /// The properties no complete stats file saw apply: none of their runs
-    /// held with an applicable evaluation or violated them.
+    /// The properties, of the harness's and of any stats file, that no
+    /// complete stats file saw apply: none of their runs held with an
+    /// applicable evaluation or violated them.
     pub unapplied: Vec<String>,
     /// Every way the counts fall short, by worker.
     pub incomplete: Vec<Incomplete>,
@@ -200,11 +205,18 @@ pub fn evidence(store: &Store, digest: &Digest) -> Result<Evidence, CampaignErro
             counts,
         });
     }
+    // The harness's properties count even if no file names them, so a run
+    // without stats files leaves every property unapplied.
     let complete = &evidence.complete_totals.properties;
-    evidence.unapplied = evidence
-        .totals
+    let properties: BTreeSet<&String> = manifest
+        .harness
         .properties
-        .keys()
+        .iter()
+        .map(|property| &property.id)
+        .chain(evidence.totals.properties.keys())
+        .collect();
+    evidence.unapplied = properties
+        .into_iter()
         .filter(|id| !complete.get(*id).is_some_and(|counts| counts.applied()))
         .cloned()
         .collect();

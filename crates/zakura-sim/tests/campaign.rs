@@ -1333,6 +1333,21 @@ fn stats_template(harness: &str) -> String {
         .replace("\"complete\":false", "\"complete\":@COMPLETE@")
 }
 
+/// The properties no complete file saw apply when every file holds
+/// [`template_counts`]: the harness's own, which no file names, and
+/// `p/unapplied`, plus `p/applied` if `applied` is false.
+fn unapplied(applied: bool) -> Vec<String> {
+    let entry = harness::find(SIM).unwrap();
+    let mut ids: Vec<String> = (entry.properties)()
+        .into_iter()
+        .map(|property| property.id)
+        .chain(["p/unapplied".to_owned()])
+        .chain((!applied).then(|| "p/applied".to_owned()))
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// `counts` added up `n` times.
 fn times(counts: &Counts, n: usize) -> Counts {
     let mut sum = Counts::default();
@@ -1396,7 +1411,7 @@ fn evidence_sums_each_workers_processes() {
     let doubled = times(&template, 2);
     assert_eq!(evidence.totals, doubled);
     assert_eq!(evidence.complete_totals, doubled);
-    assert_eq!(evidence.unapplied, ["p/unapplied"]);
+    assert_eq!(evidence.unapplied, unapplied(true));
     assert_eq!(evidence.incomplete, []);
 
     let totals = &evidence.totals;
@@ -1441,6 +1456,7 @@ fn evidence_sums_each_workers_processes() {
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
     assert_eq!(written, serde_json::to_value(&evidence).unwrap());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    let unapplied_line = format!("unapplied: {}", unapplied(true).join(", "));
     for line in [
         "worker 0: budget-spent; processes: finished 1; stats files: 1; 3 runs (clean 2, fail 1)",
         "total: 6 runs (clean 4, fail 2)",
@@ -1449,7 +1465,7 @@ fn evidence_sums_each_workers_processes() {
         "features: 3 distinct (feature/budget 1, feature/request-reset 1, other 1)",
         "property p/applied [active]: held 4 (10 evaluations), not applicable 0, inconclusive 2 \
          (assumption-lost 2), assumption losses 2, violated 2",
-        "unapplied: p/unapplied",
+        &unapplied_line,
     ] {
         assert!(stdout.lines().any(|got| got == line), "{line}\n{stdout}");
     }
@@ -1564,7 +1580,39 @@ fn evidence_lists_incomplete_processes() {
     fs::remove_file(stats.join(format!("stats-{stray}.json"))).unwrap();
     let evidence = campaign::evidence(&fixture.store, &run).unwrap();
     assert_eq!(evidence.complete_totals, Counts::default());
-    assert_eq!(evidence.unapplied, ["p/applied", "p/unapplied"]);
+    assert_eq!(evidence.unapplied, unapplied(false));
+}
+
+/// E4b-min: a run whose processes wrote no stats files lists every attempt
+/// as missing its stats, and leaves every one of the harness's properties
+/// unapplied.
+#[test]
+fn evidence_without_stats_files_leaves_every_property_unapplied() {
+    let fixture = Fixture::new();
+    let (run, end) = start(&fixture.store, fixture.options(1, 1));
+    assert_eq!(end.status, Status::Complete, "{end:?}");
+    let entry = harness::find(SIM).unwrap();
+    let mut harness_ids: Vec<String> = (entry.properties)()
+        .into_iter()
+        .map(|property| property.id)
+        .collect();
+    harness_ids.sort();
+    assert!(!harness_ids.is_empty());
+    let evidence = campaign::evidence(&fixture.store, &run).unwrap();
+    assert!(
+        matches!(
+            evidence.incomplete.as_slice(),
+            [Incomplete::MissingStats {
+                worker: 0,
+                attempt: 0,
+                ..
+            }]
+        ),
+        "{:?}",
+        evidence.incomplete
+    );
+    assert_eq!(evidence.totals, Counts::default());
+    assert_eq!(evidence.unapplied, harness_ids);
 }
 
 /// E4b-min: a worker that stops at its restart limit, and the workers of a

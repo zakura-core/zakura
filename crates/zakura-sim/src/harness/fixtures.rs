@@ -135,6 +135,8 @@ impl<F: Fixture> Subsystem for Race<F> {
     const NAME: &'static str = F::NAME;
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 2;
+    /// Every variant but [`Variant::Fixed`] plants the race.
+    const PLANTED: bool = true;
     type Scenario = Scenario;
     type Prepared = ();
 
@@ -866,6 +868,23 @@ impl<const FIXED_ONLY: bool> Subsystem for Pick<FIXED_ONLY> {
     };
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 3;
+    /// [`All`] picks any fixture in any variant, so its runs include each
+    /// fixture's own harness's and [`Fixed`]'s.
+    const COMPOSES: &'static [&'static str] = if FIXED_ONLY {
+        &[]
+    } else {
+        &[
+            LostUpdate::NAME,
+            SnapshotReserve::NAME,
+            MissedNotify::NAME,
+            TimerCancel::NAME,
+            AbBa::NAME,
+            AbortWithoutJoin::NAME,
+            <Fixed as Subsystem>::NAME,
+        ]
+    };
+    /// [`All`] picks the planted variants too. [`Fixed`] never does.
+    const PLANTED: bool = !FIXED_ONLY;
     type Scenario = PickScenario;
     type Prepared = ();
 

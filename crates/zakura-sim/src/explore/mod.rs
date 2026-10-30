@@ -13,14 +13,21 @@
 //!
 //! A run's result has independent parts: its property reports, a harness
 //! failure and its cleanup. [`Classified`] keeps the target's action, each
-//! `Known` and `Draft` violation, and an abandoned cleanup apart, so the
-//! action never hides the rest. [`classify_process`] classifies a run in a
-//! fresh process from the trace it wrote, by the same rules, and adds how
-//! the process ended. [`save_input`] and [`save_failure`] keep a failing
-//! input on disk before anything reruns it.
+//! `Known` and `Draft` violation, an `Active` violation in a run that ended
+//! at a harness failure, and an abandoned cleanup apart, so the action never
+//! hides the rest. [`classify_process`] classifies a run in a fresh process
+//! from the trace it wrote, by the same rules, and adds how the process
+//! ended. [`save_input`] and [`save_failure`] keep a failing input on disk
+//! before anything reruns it.
+//!
+//! [`feedback`] turns abstract protocol states into features libFuzzer
+//! reads beside its code edges (E2a), and [`state`] collects the protocol
+//! states of the feature table as those features (E2b).
 
+pub mod feedback;
 mod process;
 mod save;
+pub mod state;
 mod worker;
 
 use serde::Serialize;
@@ -29,7 +36,7 @@ use serde_json::Value;
 pub use process::{
     classify_process, ProcessClassified, ProcessExit, ProcessFailure, ProcessResult,
 };
-pub use save::{input_path, save_failure, save_input, SavedFailure, INPUTS_DIR};
+pub use save::{input_path, save_failure, save_input, traces_root, SavedFailure, INPUTS_DIR};
 pub use worker::{
     abandon_limit, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT,
 };
@@ -203,8 +210,10 @@ pub struct Classified {
     /// What the target does.
     pub outcome: ExploreOutcome,
     /// Each `Known` and `Draft` property the run violated, with its bucket,
-    /// in report order, whatever the outcome. One entry per property, since
-    /// a property's ID is its failure signature.
+    /// in report order, whatever the outcome. After them, for a harness
+    /// failure, the `Active` property [`ExploreOutcome::Fail`] would have
+    /// named, under `active`. One entry per property, since a property's ID
+    /// is its failure signature.
     pub notes: Vec<(String, Bucket)>,
     /// Tasks the run's shutdown leaked, whatever the outcome. Nonzero
     /// exactly when cleanup abandoned the run, so a run that failed and was
@@ -233,7 +242,8 @@ impl Classified {
 /// Classifies `run` of `entry`'s harness.
 ///
 /// A harness failure ranks first, and the run keeps its partial property
-/// reports for diagnosis. Next, a violation in `end.violation`, or any
+/// reports for diagnosis. Its `Active` violation, if any, joins
+/// [`Classified::notes`]. Next, a violation in `end.violation`, or any
 /// `Violated` report whose property is `Active`, is a failure. The second
 /// case covers an obligation that expires in `at_end`, which the step loop
 /// calls after it picks the run's end (review E-01). Then an abandoned run
@@ -287,7 +297,7 @@ fn classify_parts(
     leaked: usize,
 ) -> Classified {
     let status = |property: &str| entry.status(property).unwrap_or(Status::Active);
-    let notes = properties
+    let mut notes: Vec<(String, Bucket)> = properties
         .iter()
         .filter(|report| violated(report))
         .filter_map(|report| match status(&report.property) {
@@ -303,7 +313,10 @@ fn classify_parts(
             .map(|report| report.property.clone())
     });
     let outcome = match (harness, failed) {
-        (Some(reason), _) => ExploreOutcome::HarnessFailure { reason },
+        (Some(reason), failed) => {
+            notes.extend(failed.map(|property| (property, Bucket::Active)));
+            ExploreOutcome::HarnessFailure { reason }
+        }
         (None, Some(property)) => ExploreOutcome::Fail { property },
         (None, None) if leaked > 0 => ExploreOutcome::Abandoned { leaked },
         (None, None) => ExploreOutcome::Clean,

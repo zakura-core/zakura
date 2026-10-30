@@ -24,12 +24,40 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 ## Targets
 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
+- `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
+  encodes the scenario in the action grammar of
+  `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
+  isn't the harness's generator, 2, runs the default scenario. Pass
+  `-max_len=4096`, the input size the grammar is built for.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
+- `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
+  in data, with a collector that turns each run's end time into a feature.
+  It checks the feedback transport and searches for nothing.
+
+## Semantic feedback
+
+A target with a collector, `sim_target!(Harness, collector)`, adds abstract
+protocol states to libFuzzer's code edges. The collector writes one counter
+per feature into the `__libfuzzer_extra_counters` section. libFuzzer clears
+the section before each input and reads each nonzero counter as a feature,
+so an input that reaches a new state through covered code still joins the
+corpus. The section works on Linux only.
+
+`ZAKURA_SIM_FEEDBACK=off` moves the collector's writes to counters libFuzzer
+doesn't read. The collector still runs, so `on` and `off` runs take the same
+code path and differ only in what libFuzzer reads. Each target with a
+collector logs its backend, version, feature count and mode at startup.
+
+`cargo xtask sim-feedback` builds `feedback_probe` and runs libFuzzer's
+corpus merge with feedback `off` and `on`. With feedback off, an input whose
+code edges another input already covered adds nothing. With feedback on,
+libFuzzer adds it for its one new feature.
 
 `[package.metadata.zakura-sim.targets]` in `Cargo.toml` maps each target to
-the registered harness it runs. A new target needs both its `[[bin]]` and its
-entry there.
+the registered harness it runs. Each entry there needs a `[[bin]]`.
+`cargo xtask sim-minimize` minimizes only a target with an entry.
+`feedback_probe` runs no registered harness, so it has no entry.
 
 ## What a target does with a run
 
@@ -37,10 +65,12 @@ entry there.
   `inputs/active/<property-id>/<sha256>.bin` before anything reruns it, then
   records the run and panics with the property ID and the trace's directory.
   A rerun that disagrees with the run panics with `nondeterministic:`
-  instead, keeps both compared records and their first difference under
-  `nondeterministic/<property-id>/<12 hex>/`, and moves the input to
-  `inputs/nondeterministic/<property-id>/`.
-- A harness failure panics with `harness:`.
+  instead, keeps the compared runs' records and property reports and their
+  first difference under `nondeterministic/<property-id>/<12 hex>/`, and
+  moves the input to `inputs/nondeterministic/<property-id>/`.
+- A harness failure panics with `harness:`. If the run also violated an
+  `Active` property, the target first saves that violation's input and
+  trace as it does for a `Known` one, under `inputs/active/` and `traces/`.
 - A task's panic violates `sim/no-task-panic`, which is `Active`. Each target
   swaps libFuzzer's panic hook, which aborts at any panic, for the default one
   at startup, so the task's panic reaches the scheduler.

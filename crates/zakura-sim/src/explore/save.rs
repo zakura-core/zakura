@@ -91,6 +91,15 @@ pub fn save_input(
     Ok(path)
 }
 
+/// The root [`save_failure`] records `bucket`'s traces under: `root` for
+/// `active`, else `root/<bucket>`.
+pub fn traces_root(root: &Path, bucket: Bucket) -> PathBuf {
+    match bucket {
+        Bucket::Active => root.to_owned(),
+        bucket => root.join(bucket.name()),
+    }
+}
+
 /// A failure [`save_failure`] saved.
 #[derive(Debug)]
 pub struct SavedFailure {
@@ -128,11 +137,14 @@ pub fn save_failure(
     let report = run
         .report()
         .expect("a run that reports a violation has a report");
-    let traces = match bucket {
-        Bucket::Active => root.to_owned(),
-        bucket => root.join(bucket.name()),
-    };
-    let trace = record_failure(entry, scenario, input, property, report, &traces);
+    let trace = record_failure(
+        entry,
+        scenario,
+        input,
+        property,
+        report,
+        &traces_root(root, bucket),
+    );
     let saved = match &trace {
         Err(RecordError::Nondeterministic { .. }) => {
             move_input(&saved, root, Bucket::Nondeterministic, property, input).unwrap_or(saved)

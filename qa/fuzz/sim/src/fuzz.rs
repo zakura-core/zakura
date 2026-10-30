@@ -12,8 +12,9 @@ use std::{
 pub use zakura_sim::explore::EXPECT_VAR;
 use zakura_sim::{
     explore::{
-        input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
-        Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR,
+        feedback::{Feedback, NewCollector},
+        input_path, save_failure, save_input, traces_root, Bucket, Classified, ExploreOutcome,
+        ExploreRun, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR,
     },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
@@ -25,7 +26,9 @@ use zakura_sim::{
 pub const HARNESS_LINE: &str = "zakura-sim-fuzz harness: ";
 
 /// A fuzz target over harness `$harness`: `sim_target!(discovery::WaitComplete)`
-/// for a harness under `zakura_sim::harness`.
+/// for a harness under `zakura_sim::harness`. With a second argument,
+/// `$collector` makes each input's collector, whose features libFuzzer reads
+/// beside its code edges: `sim_target!(feedback::Probe, feedback::probe_collector)`.
 #[macro_export]
 macro_rules! sim_target {
     ($harness:ty) => {
@@ -34,6 +37,19 @@ macro_rules! sim_target {
         libfuzzer_sys::fuzz_target!(init: $crate::unwind_task_panics(), |input: &[u8]| {
             $crate::fuzz_one(&ENTRY, input);
         });
+    };
+    ($harness:ty, $collector:path) => {
+        static ENTRY: zakura_sim::harness::HarnessEntry = zakura_sim::harness::entry::<$harness>();
+
+        libfuzzer_sys::fuzz_target!(
+            init: {
+                $crate::unwind_task_panics();
+                $crate::init_feedback();
+            },
+            |input: &[u8]| {
+                $crate::fuzz_one_with(&ENTRY, $collector, input);
+            }
+        );
     };
 }
 
@@ -76,23 +92,31 @@ thread_local! {
 /// process, so `cargo fuzz tmin`'s output is a candidate that triage
 /// revalidates.
 pub fn fuzz_one(entry: &'static HarnessEntry, input: &[u8]) {
-    run(entry, input, act);
+    run(entry, input, None, act);
 }
 
-/// Runs `input` on `entry`'s harness on this thread's worker, and calls
-/// `then` on the worker's thread with the run and its class. Then panics
-/// with `abandoned:` if the process has reached its abandonment limit.
+/// [`fuzz_one`], with `collector`'s features in the counters
+/// `ZAKURA_SIM_FEEDBACK` picks ([`crate::feedback`]).
+pub fn fuzz_one_with(entry: &'static HarnessEntry, collector: NewCollector, input: &[u8]) {
+    run(entry, input, Some(crate::feedback(collector)), act);
+}
+
+/// Runs `input` on `entry`'s harness on this thread's worker, with
+/// `feedback`'s collector if there is one, and calls `then` on the worker's
+/// thread with the run and its class. Then panics with `abandoned:` if the
+/// process has reached its abandonment limit.
 ///
 /// Under `ZAKURA_SIM_EXPECT` the limit doesn't apply: `tmin` must crash
 /// only on the expected property, and its own run count bounds it.
 fn run(
     entry: &'static HarnessEntry,
     input: &[u8],
+    feedback: Option<Feedback>,
     then: fn(&'static HarnessEntry, &[u8], &ExploreRun, &Classified),
 ) {
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
-        worker.explore(entry, input, move |input, run, classified| {
+        worker.explore_with(entry, input, feedback, move |input, run, classified| {
             then(entry, input, run, classified)
         });
         let limit = abandon_limit();
@@ -252,13 +276,13 @@ impl Kept {
     }
 }
 
-/// Saves the input of the `Known` or `Draft` violation of `property` under
-/// `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by digest, up to
-/// [`MAX_KEPT_INPUTS`] distinct inputs per process. The first such input in
-/// a process also records a trace under `<bucket>/traces/`, unless an
-/// earlier process already saved one: a property's ID is its signature, so
-/// one trace per property is enough. A rerun that disagrees panics with
-/// `nondeterministic:`.
+/// Saves the input of a violation of `property` that [`Classified::notes`]
+/// lists, under `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by
+/// digest, up to [`MAX_KEPT_INPUTS`] distinct inputs per process. The first
+/// such input in a process also records a trace under the bucket's
+/// [`traces_root`], unless an earlier process already saved one: a
+/// property's ID is its signature, so one trace per property is enough. A
+/// rerun that disagrees panics with `nondeterministic:`.
 fn save_once(
     entry: &'static HarnessEntry,
     input: &[u8],
@@ -276,7 +300,7 @@ fn save_once(
         .or_default()
         .admit(input_path(&root, bucket, Some(&id), input));
     match keep {
-        Keep::First if !has_trace(&root.join(bucket.name()), property) => {
+        Keep::First if !has_trace(&traces_root(&root, bucket), property) => {
             let saved = save_failure(entry, input, run, &id, bucket, &root)
                 .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
             if let Err(error) = saved.trace {
@@ -347,7 +371,7 @@ fn expected() -> Option<&'static str> {
 /// `ZAKURA_SIM_EXPECT` works as in [`fuzz_one`], and replaces the policy.
 pub fn fuzz_fixtures(input: &[u8]) {
     static ENTRY: HarnessEntry = zakura_sim::harness::entry::<fixtures::All>();
-    run(&ENTRY, input, act_fixtures);
+    run(&ENTRY, input, None, act_fixtures);
 }
 
 /// When the target first ran, and each fixture whose `Base` variant it

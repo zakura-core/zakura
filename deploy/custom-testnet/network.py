@@ -439,6 +439,12 @@ def serve(config):
             time.sleep(2)
 
     class Handler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            if self.path == '/snapshots/seed.tar.zst':
+                self.do_GET()
+            else:
+                self.send_error(405, 'Use GET for this endpoint')
+
         def do_GET(self):
             if self.path == '/snapshots/seed.tar.zst':
                 self.send_response(307)

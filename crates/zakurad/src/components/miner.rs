@@ -7,7 +7,7 @@
 //! - move common code into zakura-chain or zakura-node-services and remove the RPC dependency.
 
 use std::{
-    cmp::min,
+    num::NonZeroUsize,
     sync::Arc,
     thread::{self, available_parallelism},
     time::Duration,
@@ -39,12 +39,11 @@ use zakura_rpc::{
         GetBlockTemplateRequestMode::Template,
         HexData,
     },
+    config::mining::Config,
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
 };
 use zakura_state::{ReadState as ReadStateService, State as StateService, WatchReceiver};
-
-use crate::components::metrics::Config;
 
 mod priority;
 
@@ -126,6 +125,23 @@ async fn wait_for_mining_template_change(
     let _ = tokio::time::timeout(BLOCK_TEMPLATE_WAIT_TIME, template_receiver.changed()).await;
 }
 
+/// Limit work to available CPUs and the distinct nonce prefixes represented by solver IDs.
+fn mining_solver_count(configured: NonZeroUsize, available: NonZeroUsize) -> usize {
+    configured
+        .get()
+        .min(available.get())
+        .min(usize::from(u8::MAX) + 1)
+}
+
+/// Give each worker its own nonce range without modifying the shared template.
+fn solver_header(template: &block::Header, solver_id: u8) -> block::Header {
+    let mut header = *template;
+    // Both ends distinguish ranges regardless of the solver's nonce increment order.
+    header.nonce.0[0] = solver_id;
+    header.nonce.0[31] = solver_id;
+    header
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -156,7 +172,7 @@ where
 ///
 /// See [`run_mining_solver()`] for more details.
 pub async fn init<Mempool, State, ReadState, Tip, BlockVerifierRouter, SyncStatus, AddressBook>(
-    _config: Config,
+    config: Config,
     rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> Result<(), Report>
 where
@@ -168,15 +184,8 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
-    // TODO: change this to `config.internal_miner_threads` once mining tasks are cancelled when the best tip changes (#8797)
-    let configured_threads = 1;
-    // If we can't detect the number of cores, use the configured number.
-    let available_threads = available_parallelism()
-        .map(usize::from)
-        .unwrap_or(configured_threads);
-
-    // Use the minimum of the configured and available threads.
-    let solver_count = min(configured_threads, available_threads);
+    let available_threads = available_parallelism().unwrap_or(config.internal_miner_threads);
+    let solver_count = mining_solver_count(config.internal_miner_threads, available_threads);
 
     info!(
         ?solver_count,
@@ -197,10 +206,8 @@ where
 
     let mut mining_solvers = FuturesUnordered::new();
     for solver_id in 0..solver_count {
-        // Assume there are less than 256 cores. If there are more, only run 256 tasks.
-        let solver_id = min(solver_id, usize::from(u8::MAX))
-            .try_into()
-            .expect("just limited to u8::MAX");
+        let solver_id = u8::try_from(solver_id)
+            .expect("at most 256 solvers have identifiers from zero through 255");
 
         let solver = spawn_erased(
             run_mining_solver(solver_id, template_receiver.clone(), rpc.clone()).in_current_span(),
@@ -548,15 +555,7 @@ pub async fn mine_a_block<F>(
 where
     F: FnMut() -> Result<(), SolverCancelled> + Send + Sync + 'static,
 {
-    // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
-    // https://github.com/rust-lang/rust/issues/93610
-    let mut header = *template.header;
-
-    // Use a different nonce for each solver thread.
-    // Change both the first and last bytes, so we don't have to care if the nonces are incremented in
-    // big-endian or little-endian order. And we can see the thread that mined a block from the nonce.
-    *header.nonce.first_mut().unwrap() = solver_id;
-    *header.nonce.last_mut().unwrap() = solver_id;
+    let header = solver_header(&template.header, solver_id);
 
     // Mine one or more blocks using the solver, in a low-priority blocking thread.
     let span = Span::current();
@@ -607,6 +606,48 @@ mod tests {
     use zakura_test::mock_service::MockService;
 
     use super::*;
+
+    #[test]
+    fn solver_counts_preserve_unique_ranges_and_available_cpu_capacity() {
+        for (configured, available, expected) in
+            [(1, 8, 1), (6, 8, 6), (8, 4, 4), (1000, 1000, 256)]
+        {
+            assert_eq!(
+                mining_solver_count(
+                    NonZeroUsize::new(configured).unwrap(),
+                    NonZeroUsize::new(available).unwrap()
+                ),
+                expected
+            );
+        }
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .unwrap();
+        let original_nonce = block.header.nonce;
+        let nonces: std::collections::HashSet<_> = (0..=u8::MAX)
+            .map(|id| solver_header(&block.header, id).nonce.0)
+            .collect();
+        assert_eq!(nonces.len(), 256);
+        assert_eq!(block.header.nonce, original_nonce);
+    }
+
+    #[test]
+    fn parallel_solvers_all_cancel_when_the_parent_changes() {
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .unwrap();
+        let old_header = *block.header;
+        let (sender, receiver) = watch::channel(Some(block.clone()));
+        let mut receivers: Vec<_> = (0..6)
+            .map(|_| WatchReceiver::new(receiver.clone()))
+            .collect();
+        let mut replacement = (*block).clone();
+        Arc::make_mut(&mut replacement.header).previous_block_hash.0[0] ^= 1;
+        sender.send_replace(Some(Arc::new(replacement)));
+        for receiver in &mut receivers {
+            assert!(cancel_if_mining_template_changed(receiver, old_header).is_err());
+        }
+    }
 
     #[test]
     fn mining_template_updates_respect_submit_old() {

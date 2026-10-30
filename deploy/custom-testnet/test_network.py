@@ -230,6 +230,16 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual([block['hash'] for block in blocks], ['genesis', 'parent', 'tip'])
         self.assertEqual(interval, 100)
 
+    def test_parallel_mining_configuration_survives_a_reset(self):
+        import tomllib
+        self.config['miner_threads'] = 6
+        for index, expected in ((0, 6), (1, 1)):
+            first = tomllib.loads(network.node_config(self.config, self.run, index, mining=index == 0))
+            next_run = network.new_run(self.config)
+            second = tomllib.loads(network.node_config(self.config, next_run, index, mining=index == 0))
+            self.assertEqual(first['mining']['internal_miner_threads'], expected)
+            self.assertEqual(second['mining']['internal_miner_threads'], expected)
+
     def test_activation_delay_is_bounded(self):
         self.assertEqual(network.activation_delay('5m'), 300)
         for invalid in ('0m', '-1s', '1h', '999999m'):

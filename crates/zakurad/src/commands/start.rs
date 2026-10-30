@@ -976,7 +976,7 @@ impl StartCmd {
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.metrics, rpc_impl)
+            components::miner::spawn_init(&config.mining, rpc_impl)
         } else {
             spawn_erased(std::future::pending().in_current_span())
         };

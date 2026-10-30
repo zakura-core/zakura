@@ -72,8 +72,10 @@ cargo xtask sim-minimize race_fixtures artifacts/race_fixtures/crash-… \
 
 The wrapper copies the original into `<dir>/original/` and checks its
 SHA-256 first. It builds `zakura-sim` and the target once, and pins both in
-`<dir>/bin/`. The original and each smaller candidate then pass three fresh
-processes, or the input is rejected:
+`<dir>/bin/`. `zakura-sim properties` must list `--property` for the
+harness, or the run ends with `error` before any check. The original and
+each smaller candidate then pass three fresh processes, or the input is
+rejected:
 
 1. the pinned target must crash with the property's panic alone, not an
    abort, a sanitizer report, a timeout or another panic, and must name the
@@ -89,7 +91,8 @@ Candidates run smallest first, and the first that passes moves to
 `build-failed` or `error`), each candidate's rejection reason, the counts,
 the budgets, the elapsed time and whether `tmin` reached its fixed point.
 `error` means the wrapper itself failed, and its reason is the error. The
-command exits 0 only for `minimized`. Ctrl-C, SIGTERM and SIGHUP stop the run
+report keeps what ran before the failure. The command exits 0 only for
+`minimized`. Ctrl-C, SIGTERM and SIGHUP stop the run
 and still write the report.
 
 Reproduce a crash input as a trace with the `zakura-sim` binary:

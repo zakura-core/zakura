@@ -439,3 +439,37 @@ fn the_binary_confirms_in_a_fresh_process() {
     let (code, none, _) = confirm("test/minimize/a", "unregistered", None);
     assert_eq!((code, none), (2, None));
 }
+
+/// `zakura-sim properties` prints the harness's registry, one ID per line,
+/// which `cargo xtask sim-minimize` checks `--property` against before it
+/// runs the fuzz target. It exits 2 for an unknown harness.
+#[test]
+fn the_binary_lists_a_harness_properties() {
+    let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .args(["properties", "--sim", "fixtures/all"])
+        .output()
+        .expect("the binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let listed: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let entry = zakura_sim::harness::find("fixtures/all").unwrap();
+    let registered: Vec<String> = (entry.properties)()
+        .into_iter()
+        .map(|property| property.id)
+        .collect();
+    assert_eq!(listed, registered);
+    assert!(listed.iter().any(|id| id == "race/lost-update"));
+    assert!(!listed.iter().any(|id| id == A));
+
+    assert_eq!(
+        zakura_sim(&[
+            Path::new("properties"),
+            Path::new("--sim"),
+            Path::new("fixtures/none")
+        ]),
+        2
+    );
+}

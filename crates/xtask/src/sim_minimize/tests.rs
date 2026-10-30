@@ -10,16 +10,25 @@ use tempfile::TempDir;
 
 use super::*;
 
-/// `zakura-sim`: `confirm` writes a confirmation whose status the input's
-/// keywords pick, and `replay` fails for a trace named `bad`. A keyword can
-/// also make `confirm` hang, die from a signal, fail without a
-/// confirmation, or refuse its arguments. `confirm` refuses a harness other
-/// than `fixtures/all` and `discovery/wait-complete` the way the real
-/// binary does.
+/// `zakura-sim`: `properties` lists `race/lost-update` and
+/// `sim/no-task-panic`, `confirm` writes a confirmation whose status the
+/// input's keywords pick, and `replay` fails for a trace named `bad`. A
+/// keyword can also make `confirm` hang, die from a signal, fail without a
+/// confirmation, or refuse its arguments. `properties` and `confirm` refuse
+/// a harness other than `fixtures/all` and `discovery/wait-complete` the
+/// way the real binary does.
 const SIM: &str = r#"#!/bin/sh
 usage() { echo "error: $1"; echo; echo "usage: zakura-sim <subcommand>"; exit 2; }
 cmd=$1; shift
 case "$cmd" in
+properties)
+  case "$2" in
+    fixtures/all|discovery/wait-complete) ;;
+    *) usage "no harness is named \`$2\`" >&2;;
+  esac
+  echo race/lost-update
+  echo sim/no-task-panic
+  exit 0;;
 confirm)
   against=
   while [ $# -gt 0 ]; do
@@ -535,7 +544,7 @@ fn a_wrapper_failure_still_writes_a_report() {
 }
 
 /// A target whose mapped harness `zakura-sim` doesn't register ends the run
-/// with an error that names the harness, before `tmin` runs.
+/// with an error that names the harness, before any check runs.
 #[test]
 fn an_unregistered_harness_is_an_error() {
     let original = b"unregistered original input";
@@ -546,12 +555,58 @@ fn an_unregistered_harness_is_an_error() {
     let reason = report.reason.as_deref().unwrap();
     assert!(
         reason.starts_with(
-            "zakura-sim confirm refused its arguments: no harness is named `fixtures/none`; see "
+            "zakura-sim properties refused its arguments: no harness is named `fixtures/none`; see "
         ),
         "{reason}"
     );
+    assert_eq!(report.original.check, None);
     assert_eq!(report.reduction.end, ReductionEnd::NotRun);
     assert!(!fake.out(TMIN_DIR).exists());
+}
+
+/// A `--property` the harness doesn't register ends the run with an error
+/// before the fuzz target runs, not with `original-rejected`.
+#[test]
+fn an_unregistered_property_is_an_error() {
+    let mut fake = Fake::new(ORIGINAL, &[b"good"]);
+    fake.request.property = "race/no-such-property".to_owned();
+    let report = fake.run(TminScript::default());
+    assert_eq!(report.status, Status::Error, "{report:#?}");
+    let reason = report.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("fixtures/all doesn't register property `race/no-such-property`; see "),
+        "{reason}"
+    );
+    assert_eq!(report.original.check, None);
+    assert!(!fake.out(ORIGINAL_DIR).join("fuzz.log").exists());
+    assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+    assert!(report.build.is_some());
+    assert_eq!(fake.written()["status"], "error");
+}
+
+/// A wrapper failure after `tmin`, here on a candidate that `zakura-sim
+/// confirm` refuses, keeps the report as far as it got: the build, the
+/// original's check, the reduction and the candidates.
+#[test]
+fn a_late_wrapper_failure_keeps_the_report() {
+    let fake = Fake::new(ORIGINAL, &[b"refuse-confirm"]);
+    let report = fake.run(TminScript::default());
+    assert_eq!(report.status, Status::Error, "{report:#?}");
+    let reason = report.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("zakura-sim confirm refused its arguments: "),
+        "{reason}"
+    );
+    assert!(report.build.as_ref().unwrap().sim_build.is_some());
+    assert!(report.original.check.as_ref().unwrap().accepted);
+    assert_eq!(report.reduction.end, ReductionEnd::Finished);
+    assert_eq!(report.counts.produced, 1);
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].check, None);
+    let written = fake.written();
+    assert_eq!(written["status"], "error");
+    assert_eq!(written["reduction"]["end"], "finished");
+    assert_eq!(written["candidates"].as_array().unwrap().len(), 1);
 }
 
 /// A target that runs another harness than the manifest maps it to ends

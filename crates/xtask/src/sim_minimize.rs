@@ -12,13 +12,15 @@
 //!    SHA-256 before it starts any child;
 //! 2. builds the simulator binary and the fuzz target once, and pins both by
 //!    copying them into `<out>/bin/`;
-//! 3. confirms the original in fresh processes ([`check_input`]);
-//! 4. runs `cargo fuzz tmin` with the filter, `--runs` attempts per step and
+//! 3. checks that the harness registers the property
+//!    ([`check_property`]);
+//! 4. confirms the original in fresh processes ([`check_input`]);
+//! 5. runs `cargo fuzz tmin` with the filter, `--runs` attempts per step and
 //!    a `--wall-secs` limit;
-//! 5. confirms each smaller candidate the same way, smallest first, and
+//! 6. confirms each smaller candidate the same way, smallest first, and
 //!    against the original's confirmation, and accepts the first that
 //!    passes;
-//! 6. writes `<out>/report.json`.
+//! 7. writes `<out>/report.json`.
 //!
 //! A confirmation runs three fresh processes, each within `--child-secs`:
 //! the pinned fuzz target must crash with the property's panic alone and
@@ -653,9 +655,10 @@ pub(super) enum Status {
     /// The simulator binary or the fuzz target didn't build, so no check
     /// ran. The original's copy is kept.
     BuildFailed,
-    /// The wrapper itself failed, such as on an I/O error or a child that
-    /// refused its arguments; the reason is the error. The original's copy
-    /// is kept.
+    /// The wrapper itself failed, such as on an I/O error, a child that
+    /// refused its arguments, or a property the harness doesn't register;
+    /// the reason is the error. The original's copy is kept, and the report
+    /// keeps what ran before the failure.
     Error,
 }
 
@@ -939,11 +942,18 @@ impl Report {
         self.reason = Some(reason.into());
         self
     }
+
+    /// Ends the run with `status` and `reason`.
+    fn end(&mut self, status: Status, reason: impl Into<String>) {
+        self.status = status;
+        self.reason = Some(reason.into());
+    }
 }
 
 /// Confirms the original, runs `tmin`, and confirms its candidates, with
-/// `tools`. Writes and returns the report, an [`Status::Error`] one if the
-/// wrapper itself fails. The original must already be preserved
+/// `tools`. Writes and returns the report. If the wrapper itself fails, the
+/// report keeps what ran before the failure, with [`Status::Error`] and the
+/// error as its reason. The original must already be preserved
 /// ([`preserve_original`]).
 pub(super) fn minimize_with(
     request: &Request,
@@ -952,20 +962,24 @@ pub(super) fn minimize_with(
     started: Instant,
     interrupt: &AtomicBool,
 ) -> Result<Report, BoxError> {
-    reduce(request, tools, original.clone(), started, interrupt)
-        .or_else(|error| wrapper_failed(request, original, started, error))
+    let mut report = Report::new(request, original, Status::OriginalKept, started);
+    if let Err(error) = reduce(request, tools, &mut report, interrupt) {
+        report.status = Status::Error;
+        report.reason = Some(error.to_string());
+        return write_report(request, report, started).map_err(|_| error);
+    }
+    write_report(request, report, started)
 }
 
-/// [`minimize_with`]'s steps, with the wrapper's own failures as errors.
+/// [`minimize_with`]'s steps: fills in `report`, with the wrapper's own
+/// failures as errors.
 fn reduce(
     request: &Request,
     tools: &Tools,
-    original: Original,
-    started: Instant,
+    report: &mut Report,
     interrupt: &AtomicBool,
-) -> Result<Report, BoxError> {
+) -> Result<(), BoxError> {
     let out = &request.out;
-    let mut report = Report::new(request, original, Status::OriginalKept, started);
     report.build = Some(BuildRecord {
         source: tools.source.clone(),
         toolchain: PINNED_NIGHTLY,
@@ -976,20 +990,28 @@ fn reduce(
         generator: None,
     });
 
-    // The original, in fresh processes.
     let checker = Checker {
         request,
         tools,
         interrupt,
     };
+    // The property, before the fuzz target's filter waits for it.
+    if !checker.check_property()? {
+        report.end(
+            Status::Interrupted,
+            "interrupted while checking the property",
+        );
+        return Ok(());
+    }
+
+    // The original, in fresh processes.
     let original_dir = out.join(ORIGINAL_DIR);
     let Some(verdict) = checker.check_input(&original_dir, None)? else {
-        report.status = Status::Interrupted;
-        return write_report(
-            request,
-            report.with_reason("interrupted while checking the original"),
-            started,
+        report.end(
+            Status::Interrupted,
+            "interrupted while checking the original",
         );
+        return Ok(());
     };
     if let (Some(build), Some(file)) = (report.build.as_mut(), &verdict.confirmation_file) {
         let confirmation = read_json(&out.join(file))?;
@@ -1000,8 +1022,8 @@ fn reduce(
     let detail = describe(&verdict);
     report.original.check = Some(verdict);
     if !accepted {
-        report.status = Status::OriginalRejected;
-        return write_report(request, report.with_reason(detail), started);
+        report.end(Status::OriginalRejected, detail);
+        return Ok(());
     }
 
     // The reduction.
@@ -1038,14 +1060,10 @@ fn reduce(
         log: Some(log),
     };
     if end == ChildEnd::Interrupted {
-        report.status = Status::Interrupted;
         report.candidates = candidates(out, &tmin_dir, &report.original)?;
         report.counts.produced = report.candidates.len();
-        return write_report(
-            request,
-            report.with_reason("interrupted while tmin ran"),
-            started,
-        );
+        report.end(Status::Interrupted, "interrupted while tmin ran");
+        return Ok(());
     }
 
     // The candidates, smallest first.
@@ -1065,12 +1083,11 @@ fn reduce(
         .map(|file| out.join(file));
     for index in 0..report.candidates.len() {
         if interrupt.load(Ordering::SeqCst) {
-            report.status = Status::Interrupted;
-            return write_report(
-                request,
-                report.with_reason("interrupted while checking a candidate"),
-                started,
+            report.end(
+                Status::Interrupted,
+                "interrupted while checking a candidate",
             );
+            return Ok(());
         }
         let candidate = &report.candidates[index];
         let dir = out
@@ -1087,12 +1104,11 @@ fn reduce(
             checker.check_input(&dir, against.as_deref())?
         };
         let Some(verdict) = verdict else {
-            report.status = Status::Interrupted;
-            return write_report(
-                request,
-                report.with_reason("interrupted while checking a candidate"),
-                started,
+            report.end(
+                Status::Interrupted,
+                "interrupted while checking a candidate",
             );
+            return Ok(());
         };
         report.counts.checked += 1;
         let accepted = verdict.accepted;
@@ -1121,14 +1137,15 @@ fn reduce(
             trace,
         });
         report.status = Status::Minimized;
-        return write_report(request, report, started);
+        return Ok(());
     }
     let reason = if report.candidates.is_empty() {
         "tmin produced no candidate smaller than the original"
     } else {
         "every candidate smaller than the original was rejected"
     };
-    write_report(request, report.with_reason(reason), started)
+    report.reason = Some(reason.to_owned());
+    Ok(())
 }
 
 /// Moves `check`'s paths from `from` to `to`, both under `out`.
@@ -1223,6 +1240,52 @@ struct Checker<'a> {
 }
 
 impl Checker<'_> {
+    /// Checks that the request's harness registers its property, as
+    /// `zakura-sim properties` lists them, logging into `<out>/logs/`. The
+    /// fuzz target's filter never panics for a property the harness doesn't
+    /// register, so without this check such a run would end
+    /// `original-rejected`. False if interrupted. A property the harness
+    /// doesn't register, and a `zakura-sim properties` that fails, fail the
+    /// wrapper.
+    fn check_property(&self) -> Result<bool, BoxError> {
+        let (harness, property) = (&self.request.harness, &self.request.property);
+        let log = self.request.out.join(LOGS_DIR).join("properties.log");
+        let mut list = Command::new(&self.tools.sim);
+        list.arg("properties").arg("--sim").arg(harness);
+        let ended = run_child(
+            &mut list,
+            &log,
+            Some(self.request.budget.child),
+            self.interrupt,
+        )?;
+        match ended {
+            ChildEnd::Interrupted => return Ok(false),
+            ChildEnd::Exited(0) => {}
+            ChildEnd::Exited(2) => {
+                return Err(format!(
+                    "zakura-sim properties refused its arguments: {}; see {}",
+                    usage_error(&read_log(&log)?),
+                    log.display()
+                )
+                .into())
+            }
+            ended => {
+                return Err(format!("zakura-sim properties {ended}; see {}", log.display()).into())
+            }
+        }
+        if !read_log(&log)?
+            .lines()
+            .any(|line| line == property.as_str())
+        {
+            return Err(format!(
+                "{harness} doesn't register property `{property}`; see {}",
+                log.display()
+            )
+            .into());
+        }
+        Ok(true)
+    }
+
     /// Checks `dir/input.bin` in three fresh processes, logging into `dir`:
     ///
     /// 1. the pinned fuzz target, with the filter set, must crash with the

@@ -138,7 +138,11 @@ main.
   refuses a build with another identity, another harness version, or other
   feedback.
 - `close` ends a run whose supervisor stopped: it saves the snapshot from
-  what the workers left and records the run as `interrupted`.
+  what the workers left and records the run as `interrupted`. It refuses
+  while a worker's fuzzer or the compaction's merge still runs. The merge
+  runs in its own process group, which the supervisor kills at the
+  compaction's time limit, so a killed supervisor leaves the merge running;
+  stop it with `kill -- -<pid>`.
 - `status` lists the runs, and `verify` checks every record in the store.
 
 Every run ends with exactly one end record, `runs/<manifest>/end.json`, with

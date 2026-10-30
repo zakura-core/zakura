@@ -760,7 +760,13 @@ fn probe_in(
         &dir.join("sim"),
     );
     command.arg("-runs=0").arg(&corpus);
-    let (exit, log) = run_logged(command, &dir.join("log.txt"), Some(PROBE_TIMEOUT), |_| {})?;
+    let (exit, log) = run_logged(
+        command,
+        &dir.join("log.txt"),
+        Some(PROBE_TIMEOUT),
+        None,
+        |_| {},
+    )?;
     let log = String::from_utf8_lossy(&log);
     if let Some(failure) = ProcessFailure::of(exit, log.as_bytes()) {
         let tail: Vec<&str> = log.lines().rev().take(20).collect();

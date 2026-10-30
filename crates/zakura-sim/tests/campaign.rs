@@ -7,7 +7,8 @@
 //! the supervisor passes, writes a corpus file every 50 ms until its
 //! `-max_total_time`, and does what the files in its control directory
 //! say: crash once or always, end at the abandonment limit, exit 0 early,
-//! log a feedback line, or hang in a merge. It exits when its parent does, as a real
+//! log a feedback line, hang in a merge, or leave a merge process behind
+//! that writes a crash file later. It exits when its parent does, as a real
 //! fuzzer does when a terminal's interrupt reaches its process group.
 #![cfg(zakura_sim)]
 
@@ -61,6 +62,10 @@ if [ -e "$control/feedback" ]; then
 fi
 if [ "$runs" = 0 ]; then exit 0; fi
 if [ "$merge" = 1 ]; then
+  if [ -e "$control/merge-orphan" ]; then
+    # libFuzzer's outer merge runs an inner process, which can outlive it.
+    ( sleep 2; printf 'late %s' "$BASHPID" > "${prefix}crash-late-$BASHPID" ) &
+  fi
   if [ -e "$control/merge-hangs" ]; then
     touch "$control/merging"
     while alive; do sleep 0.05; done
@@ -396,6 +401,22 @@ fn start_and_kill(store: &Store, args: &[&str], also: impl Fn() -> bool) -> Dige
     run
 }
 
+/// Closes `run` once its compaction's merge has stopped, waiting up to 30 s.
+fn close_after_merge(store: &Store, run: &Digest) -> End {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match campaign::close(store, run) {
+            Ok(end) => return end,
+            Err(CampaignError::Refused(reason))
+                if reason.contains("merge still runs") && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20))
+            }
+            Err(error) => panic!("closing {run}: {error}"),
+        }
+    }
+}
+
 /// Every input the run's workers added, and every failure file they left.
 fn left_behind(store: &Store, run: &Digest) -> (BTreeSet<Digest>, BTreeSet<Digest>) {
     let workers = store.run_dir(run).join("workers");
@@ -618,7 +639,7 @@ fn interrupted_compaction_keeps_every_snapshot() {
         fixture.control.join("merging").exists()
     });
     kill(&fixture.store, child, &second);
-    let closed = campaign::close(&fixture.store, &second).unwrap();
+    let closed = close_after_merge(&fixture.store, &second);
     assert_eq!(closed.status, Status::Interrupted);
     assert_eq!(closed.compaction, None);
     assert!(inputs(&fixture.store, &closed.snapshot)
@@ -658,6 +679,62 @@ fn interrupted_compaction_keeps_every_snapshot() {
             .initial_snapshot,
         snapshot
     );
+}
+
+/// No merge process writes after the end record: the supervisor kills the
+/// merge's whole process group at its time limit, and `close` refuses
+/// while a merge whose supervisor was killed still runs.
+#[test]
+fn orphaned_merge_processes_cant_write_after_the_end_record() {
+    let fixture = Fixture::new();
+    fixture.set("merge-hangs");
+    fixture.set("merge-orphan");
+    let mut options = fixture.options(1, 1);
+    options.budget.compact_secs = Some(1);
+    let (run, end) = start(&fixture.store, options);
+    assert_eq!(
+        end.compaction,
+        Some(Compaction::Failed {
+            failure: ProcessFailure::Timeout
+        })
+    );
+    // Past the time the inner process would write its crash file.
+    thread::sleep(Duration::from_millis(2500));
+    let listed: BTreeSet<Digest> = end
+        .failures
+        .iter()
+        .map(|file| file.sha256.clone())
+        .collect();
+    let compaction = fixture.store.run_dir(&run).join("compact-artifacts");
+    assert!(
+        digests_under(&compaction).is_subset(&listed),
+        "a merge process wrote after the end record: {:?}",
+        fs::read_dir(&compaction).unwrap().collect::<Vec<_>>()
+    );
+
+    // The supervisor dies while it compacts, and the inner process lives on.
+    fixture.unset("merging");
+    let child = spawn(fixture.store.root(), &["resume", "--seconds", "1"]);
+    let second = running(&fixture.store);
+    wait_for("the compaction to start", || {
+        fixture.control.join("merging").exists()
+    });
+    kill(&fixture.store, child, &second);
+    let refused = campaign::close(&fixture.store, &second).unwrap_err();
+    assert!(
+        refused.to_string().contains("merge still runs"),
+        "{refused}"
+    );
+    let closed = close_after_merge(&fixture.store, &second);
+    assert!(
+        closed
+            .failures
+            .iter()
+            .any(|file| file.path.contains("/compact-artifacts/crash-late-")),
+        "{:?}",
+        closed.failures
+    );
+    assert_store_verifies(&fixture.store);
 }
 
 /// The fuzzer runs without the supervisor's `ZAKURA_SIM_EXPECT`, which

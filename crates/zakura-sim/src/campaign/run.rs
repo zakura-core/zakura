@@ -5,6 +5,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
+    os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -62,6 +63,9 @@ const GRACE: Duration = Duration::from_secs(60);
 
 /// How often the supervisor checks a process with a deadline.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long the supervisor waits for a killed process group to go.
+const GROUP_EXIT: Duration = Duration::from_secs(10);
 
 /// How a run ended. Each status means one thing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,13 +318,19 @@ fn supervise(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
 /// writes the end record with [`Status::Interrupted`].
 ///
 /// Refuses a run that a supervisor still holds, that has an end record,
-/// or whose fuzzer process still runs.
+/// or whose fuzzer or compaction process still runs.
 pub fn close(store: &Store, digest: &Digest) -> Result<End, CampaignError> {
     let manifest = store.read_manifest(digest)?;
     let _lock = store.lock_run(digest)?;
     let dir = store.run_dir(digest);
     if dir.join(END_FILE).exists() {
         return Err(already_ended(digest));
+    }
+    // A merge whose supervisor stopped can still write crash files.
+    if let Some(pid) = processes_with(&compaction_marker(digest)).first() {
+        return Err(CampaignError::Refused(format!(
+            "the compaction's merge still runs as process {pid}; stop it, then close the run"
+        )));
     }
     let fuzzer = store.fuzzer_path(&manifest.build.binary);
     let mut workers = Vec::new();
@@ -472,7 +482,7 @@ impl Worker<'_> {
         let started = Instant::now();
         let log = self.dir.join(format!("log-{number}.txt"));
         let pid = self.dir.join(PID_FILE);
-        let (exit, output) = run_logged(command, &log, Some(deadline), |child| {
+        let (exit, output) = run_logged(command, &log, Some(deadline), None, |child| {
             // The pid file only lets `close` find a live fuzzer, so a
             // failed write costs nothing else.
             let _ = replace(&pid, format!("{child}\n").as_bytes());
@@ -572,16 +582,27 @@ pub(super) fn fuzzer_command(
 /// Runs `command` with its standard output and error in the file `log`,
 /// calls `spawned` with its process ID, and waits for it, killing it at
 /// `deadline` if one is given. Returns how it ended and the log.
+///
+/// With `group`, text that each of the command's processes has in its
+/// command line, the command runs in its own process group. At the
+/// deadline, and again once the command exits, the whole group is killed,
+/// and the call waits until no process with `group` in its command line is
+/// left. So no descendant, such as libFuzzer's inner merge process, writes
+/// after the call returns.
 pub(super) fn run_logged(
     mut command: Command,
     log: &Path,
     deadline: Option<Duration>,
+    group: Option<&str>,
     spawned: impl FnOnce(u32),
 ) -> Result<(ProcessExit, Vec<u8>), CampaignError> {
     let io = |what: &str| CampaignError::io(format!("{what} {}", log.display()));
     let file = File::create(log).map_err(io("creating"))?;
     let stderr = file.try_clone().map_err(io("opening"))?;
     command.stdin(Stdio::null()).stdout(file).stderr(stderr);
+    if group.is_some() {
+        command.process_group(0);
+    }
     let shown = format!("{:?}", command.get_program());
     let mut child = command
         .spawn()
@@ -598,6 +619,9 @@ pub(super) fn run_logged(
                     Ok(None) if Instant::now() >= deadline => {
                         // A process that exits between the check and the
                         // kill still counts as timed out.
+                        if group.is_some() {
+                            kill_group(child.id());
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         break ProcessExit::TimedOut;
@@ -608,8 +632,65 @@ pub(super) fn run_logged(
             }
         }
     };
+    if let Some(marker) = group {
+        end_group(child.id(), marker)?;
+    }
     let output = fs::read(log).map_err(io("reading"))?;
     Ok((exit, output))
+}
+
+/// Sends SIGKILL to every process in process group `group`, by running
+/// `kill`, since sending a signal from Rust needs `unsafe`. A group with no
+/// process left is no error.
+fn kill_group(group: u32) {
+    let _ = Command::new("kill")
+        .args(["-s", "KILL", "--", &format!("-{group}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills process group `group`, and waits up to [`GROUP_EXIT`] until no
+/// process with `marker` in its command line is left.
+fn end_group(group: u32, marker: &str) -> Result<(), CampaignError> {
+    kill_group(group);
+    let deadline = Instant::now() + GROUP_EXIT;
+    loop {
+        let left = processes_with(marker);
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(CampaignError::Refused(format!(
+                "processes {left:?} of process group {group} still run after SIGKILL"
+            )));
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// The IDs of the running processes whose command line holds `marker`, from
+/// `/proc`. A zombie's command line is empty, so zombies aren't listed.
+fn processes_with(marker: &str) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let marker = marker.as_bytes();
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|cmdline| cmdline.windows(marker.len()).any(|window| window == marker))
+        })
+        .collect()
+}
+
+/// Text that the command line of each process of run `digest`'s compaction
+/// holds: the end of its `-artifact_prefix`, which libFuzzer's inner merge
+/// process inherits. It doesn't depend on how the store's path is spelled.
+fn compaction_marker(digest: &Digest) -> String {
+    format!("{digest}/{COMPACT_ARTIFACTS_DIR}/")
 }
 
 /// Saves run `digest`'s snapshot, compacts it if the supervisor ends the
@@ -638,7 +719,7 @@ fn finish(
     let snapshot = store.save_snapshot(&sources)?;
     let compaction = match (recorded_by, manifest.budget.compact_secs) {
         (Recorder::Supervisor, Some(seconds)) => {
-            Some(compact(store, &dir, manifest, &snapshot.digest, seconds)?)
+            Some(compact(store, digest, manifest, &snapshot.digest, seconds)?)
         }
         _ => None,
     };
@@ -696,14 +777,16 @@ fn finish(
 /// Compacts `snapshot` with the fuzzer's `-merge=1` into a new directory,
 /// within `seconds`, and saves the result as a new snapshot. `snapshot`
 /// stays as it is whatever happens. The merge's crash files and the
-/// target's saved inputs go under the run's directory.
+/// target's saved inputs go under run `digest`'s directory, and every
+/// process of the merge has stopped when this returns.
 fn compact(
     store: &Store,
-    dir: &Path,
+    digest: &Digest,
     manifest: &Manifest,
     snapshot: &Digest,
     seconds: u64,
 ) -> Result<Compaction, CampaignError> {
+    let dir = &store.run_dir(digest);
     let out = partial_path(dir);
     let artifacts = dir.join(COMPACT_ARTIFACTS_DIR);
     for new in [&out, &artifacts] {
@@ -725,6 +808,7 @@ fn compact(
         command,
         &dir.join("compact.log"),
         Some(Duration::from_secs(seconds)),
+        Some(&compaction_marker(digest)),
         |_| {},
     )?;
     // libFuzzer's merge restarts its inner process past an input that

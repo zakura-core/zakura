@@ -13,6 +13,7 @@ mod planted;
 mod rpc_artifacts;
 mod rt_imports;
 mod sim;
+mod sim_minimize;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -125,6 +126,7 @@ fn try_main() -> Result<(), BoxError> {
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
         Some("sim-versions") => sim::run(&repo_root()?, "versions", args),
         Some("sim-seeds") => sim::run(&repo_root()?, "seeds", args),
+        Some("sim-minimize") => sim_minimize::run(&repo_root()?, args),
         Some("sim-campaign") => sim::run(&repo_root()?, "campaign", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -353,6 +355,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
+        "  cargo xtask sim-minimize <target> <input> --property <id> --out <dir> --runs <n>"
+    )?;
+    writeln!(
+        output,
+        "      --wall-secs <s> --child-secs <s> [--sanitizer address|none]"
+    )?;
+    writeln!(
+        output,
         "  cargo xtask sim-campaign (build|start|resume|close|status|verify) --store <dir> ..."
     )?;
     writeln!(output)?;
@@ -431,6 +441,15 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "with --out writes one harness's admitted seeds there as a fuzz corpus."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Minimizes a simulation fuzz crash with cargo fuzz tmin, and keeps a smaller input"
+    )?;
+    writeln!(
+        output,
+        "only if fresh processes confirm the same property, assumptions, witness and build."
     )?;
     writeln!(output)?;
     writeln!(

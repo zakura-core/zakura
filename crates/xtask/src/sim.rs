@@ -1,5 +1,6 @@
-//! `cargo xtask record`, `cargo xtask replay` and `cargo xtask shrink`: run
-//! the `zakura-sim` binary in the simulator build.
+//! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
+//! `cargo xtask sim-triage` and `cargo xtask sim-verify-archive`: run the
+//! `zakura-sim` binary in the simulator build.
 //!
 //! xtask is a normal build, so it can't link `zakura-sim`, which only exists
 //! behind `--cfg zakura_sim`. It runs the binary through `cargo run` instead,

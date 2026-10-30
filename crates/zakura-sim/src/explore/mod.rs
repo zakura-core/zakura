@@ -17,10 +17,13 @@
 //! action never hides the rest. [`classify_process`] classifies a run in a
 //! fresh process from the trace it wrote, by the same rules, and adds how
 //! the process ended. [`save_input`] and [`save_failure`] keep a failing
-//! input on disk before anything reruns it.
+//! input on disk before anything reruns it. [`triage::triage`] confirms a
+//! saved input's failure in fresh processes and archives it with its
+//! evidence.
 
 mod process;
 mod save;
+pub mod triage;
 mod worker;
 
 use serde::Serialize;
@@ -150,7 +153,8 @@ impl Bucket {
 }
 
 /// What the fuzz target does with a run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ExploreOutcome {
     /// Nothing failed: return.
     Clean,
@@ -192,7 +196,7 @@ impl ExploreOutcome {
 }
 
 /// A run's outcome and the rest of its result.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Classified {
     /// What the target does.
     pub outcome: ExploreOutcome,

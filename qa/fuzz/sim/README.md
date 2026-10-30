@@ -72,5 +72,40 @@ Reproduce a crash input as a trace with the `zakura-sim` binary:
 RUSTFLAGS="--cfg zakura_sim" cargo run -p zakura-sim -- record --sim discovery/wait-complete --input artifacts/discovery_wait_complete/crash-… --out <dir>
 ```
 
+## Triage
+
+`cargo xtask sim-triage` confirms each saved input's failure in fresh
+processes, and archives the input with its evidence:
+
+```console
+cargo xtask sim-triage --sim discovery/wait-complete --out <archive> [--child-secs 60] artifacts/discovery_wait_complete/crash-…
+cargo xtask sim-verify-archive <archive>
+```
+
+For each input, triage copies the input into a staging bundle before any
+child starts, and never changes the input itself. It then records the input
+twice, each time in a fresh `zakura-sim record` process that it kills after
+`--child-secs`, and classifies each recording from its exit, its standard
+error and its trace. If both recordings filed the input alike and wrote their
+`end` record, a third process replays the first trace Exact. Each input gets
+one status:
+
+- `confirmed`: both recordings filed the input under the same buckets and
+  signature, and that is a failure. The bundle goes to
+  `<bucket>/<signature hash>/<input sha256>/`.
+- `not-reproduced`: both recordings ran clean, and the replay matched the
+  first one Exact.
+- `nondeterministic`: the two recordings filed the input differently.
+- `replay-failed`: the recordings agreed, but the replay didn't match the
+  first one Exact.
+
+A bundle with any status but `confirmed` goes to
+`<status>/<input sha256>/`. It holds `input.bin`, `scenario.json`, each
+child's output and trace under `runs/`, `triage.json` and `SHA256SUMS`.
+Triage writes it under `.staging/` and renames it into place, and never
+changes it after that. A later triage that files the same input in the same
+place keeps the bundle that's there. `sim-verify-archive` checks every bundle against its
+`SHA256SUMS`, and counts the bundles under each signature.
+
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.

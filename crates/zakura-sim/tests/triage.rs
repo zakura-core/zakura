@@ -1,0 +1,771 @@
+//! E4a: `triage` confirms a saved input's failure in fresh processes,
+//! classifies each through `classify_process`, and archives the input with
+//! its evidence in a bundle that never changes.
+#![cfg(zakura_sim)]
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tempfile::TempDir;
+use zakura_rt::{sync::atomic::AtomicU64, task::yield_now};
+use zakura_scheduler::SchedulerConfig;
+use zakura_sim::{
+    explore::{
+        classify,
+        triage::{
+            bundles, primary_bucket, signature, signature_hash, triage, verify_bundle, Children,
+            TriageOptions, TriageStatus, Triaged, BUNDLE_INPUT_FILE, CHECKSUMS_FILE, RUNS_DIR,
+            RUN_TRACE_DIR, SCENARIO_FILE, STAGING_DIR, TRIAGE_FILE,
+        },
+        Bucket, Classified, ExploreOutcome, ProcessClassified, ProcessExit, ProcessFailure,
+        ProcessResult,
+    },
+    harness::{entry, record, HarnessEntry, RecordInput, Subsystem},
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
+    trace::{replay_with, ReplayOptions, TraceReader},
+    HarnessFailure, NullSink, RunConfig, Sim,
+};
+
+/// The [`Triage`] scenario: which case to run.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct Case {
+    case: u8,
+}
+
+/// Yields a few times and exits.
+const CLEAN: u8 = 0;
+/// [`ACTIVE`] is violated at every step.
+const ACTIVE_CASE: u8 = 1;
+/// [`KNOWN`] is violated, and the run goes on.
+const KNOWN_CASE: u8 = 2;
+/// A task's name holds `:`, a harness failure.
+const HARNESS_CASE: u8 = 3;
+/// The task aborts the process at its second step.
+const ABORT_CASE: u8 = 4;
+/// The task blocks its thread for an hour.
+const HANG_CASE: u8 = 5;
+/// [`ACTIVE`] is violated in the first process that runs the input only.
+const FIRST_ONLY_CASE: u8 = 6;
+/// [`ACTIVE`] is violated in the first two processes that run the input:
+/// both recordings, but not the replay.
+const RECORDS_ONLY_CASE: u8 = 7;
+/// The task exits the process with code 0 at its second step.
+const EXIT_CASE: u8 = 8;
+/// A task spins in cleanup, so shutdown abandons the run.
+const ABANDON_CASE: u8 = 9;
+
+const ACTIVE: &str = "test/triage/active";
+const KNOWN: &str = "test/triage/known";
+
+/// The variable that names the file counting the processes that ran
+/// [`FIRST_ONLY_CASE`] or [`RECORDS_ONLY_CASE`]: one byte per process.
+const COUNTER: &str = "ZAKURA_SIM_TRIAGE_COUNTER";
+
+/// A one-task harness whose first scenario byte picks a case.
+struct Triage {
+    case: u8,
+    /// True if [`ACTIVE`] is violated in this run.
+    active: bool,
+}
+
+impl HasView for Triage {
+    type View = (u8, bool);
+
+    /// The case, and whether [`ACTIVE`] is violated.
+    fn view(&self) -> (u8, bool) {
+        (self.case, self.active)
+    }
+}
+
+fn active_check(cx: &mut CheckCtx<'_, Triage>) -> Verdict {
+    match cx.view() {
+        (case, true) => cx.violated("no run", format!("case {case}")),
+        _ => Verdict::Holds,
+    }
+}
+
+fn known_check(cx: &mut CheckCtx<'_, Triage>) -> Verdict {
+    match cx.view() {
+        (KNOWN_CASE, _) => cx.violated("no run", "the known case".to_owned()),
+        _ => Verdict::Holds,
+    }
+}
+
+/// A property with `id` and `status`.
+fn property(
+    id: &'static str,
+    status: Status,
+    check: fn(&mut CheckCtx<'_, Triage>) -> Verdict,
+) -> Property<Triage> {
+    Property {
+        id: PropertyId::new(id),
+        claim: "no run violates it",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Schedule],
+        status,
+        check,
+        witness: None,
+    }
+}
+
+/// How many processes ran a counted case before this one, counting this
+/// one for the next.
+fn count_process() -> usize {
+    let path = std::env::var(COUNTER).expect("a counted case runs with its counter");
+    let before = fs::read(&path).map_or(0, |bytes| bytes.len());
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(&mut file, b".").unwrap();
+    before
+}
+
+impl Subsystem for Triage {
+    const NAME: &'static str = "test/triage";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 1;
+    type Scenario = Case;
+    type Prepared = ();
+
+    /// One worker, small stacks, and short limits.
+    fn config(_: &Case) -> RunConfig {
+        RunConfig {
+            scheduler: SchedulerConfig {
+                workers: 1,
+                stack_size: 64 * 1024,
+                ..SchedulerConfig::default()
+            },
+            budget: 50,
+            drain_bound: 10,
+            ..RunConfig::default()
+        }
+    }
+
+    /// Nothing to set up.
+    fn prepare(_: &Case) {}
+
+    /// Spawns the case's task.
+    fn build(sim: &mut Sim, scenario: &Case, (): ()) -> Self {
+        let case = scenario.case;
+        let active = match case {
+            ACTIVE_CASE => true,
+            FIRST_ONLY_CASE => count_process() == 0,
+            RECORDS_ONLY_CASE => count_process() < 2,
+            _ => false,
+        };
+        let scheduler = sim.scheduler();
+        match case {
+            HARNESS_CASE => scheduler.spawn_root("bad:name", async {}),
+            ABORT_CASE => scheduler.spawn_root("tick", async {
+                yield_now().await;
+                std::process::abort();
+            }),
+            HANG_CASE => scheduler.spawn_root("tick", async {
+                std::thread::sleep(Duration::from_secs(3600));
+            }),
+            EXIT_CASE => scheduler.spawn_root("tick", async {
+                yield_now().await;
+                std::process::exit(0);
+            }),
+            ABANDON_CASE => scheduler.spawn_root("spinner", async {
+                // Nothing ever stores, and every load is a point, so
+                // cleanup gets stuck and shutdown abandons the run.
+                let flag = AtomicU64::new(0);
+                while flag.load(zakura_rt::sync::atomic::Ordering::SeqCst) == 0 {}
+            }),
+            _ => scheduler.spawn_root("tick", async {
+                for _ in 0..3 {
+                    yield_now().await;
+                }
+            }),
+        };
+        Triage { case, active }
+    }
+
+    /// One `Active` and one `Known` property.
+    fn properties() -> Vec<Property<Self>> {
+        vec![
+            property(ACTIVE, Status::Active, active_check),
+            property(KNOWN, Status::Known { issue: 1 }, known_check),
+        ]
+    }
+
+    /// The first byte is the case.
+    fn draw(prefix: &[u8]) -> Case {
+        Case { case: prefix[0] }
+    }
+}
+
+static TRIAGE: HarnessEntry = entry::<Triage>();
+
+/// The variable that makes [`triage_child`] record or replay.
+const CHILD: &str = "ZAKURA_SIM_TRIAGE_CHILD";
+
+/// Records or replays when run as a child, and does nothing otherwise.
+///
+/// - `record:<input>:<dir>` records the input in the file `<input>` to
+///   `<dir>`, as `zakura-sim record --input` does.
+/// - `replay:<dir>` replays the trace in `<dir>` Exact, and fails unless
+///   it verified, as `zakura-sim replay` does.
+#[test]
+fn triage_child() {
+    let Ok(mode) = std::env::var(CHILD) else {
+        return;
+    };
+    let parts: Vec<&str> = mode.splitn(3, ':').collect();
+    match parts[..] {
+        ["record", input, dir] => {
+            let input = fs::read(input).unwrap();
+            record(&TRIAGE, RecordInput::Input(&input), Path::new(dir)).unwrap();
+        }
+        ["replay", dir] => {
+            let trace = TraceReader::open(Path::new(dir)).unwrap();
+            let report = replay_with(&trace, &TRIAGE, ReplayOptions::default()).unwrap();
+            assert!(report.verified(), "{report:?}");
+        }
+        _ => panic!("unknown {CHILD} mode {mode}"),
+    }
+}
+
+/// This test binary as [`triage_child`], without core dumps, with the
+/// counter file `counter`.
+struct TestChildren {
+    counter: PathBuf,
+}
+
+impl TestChildren {
+    fn command(&self, mode: String) -> Command {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "ulimit -c 0; exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "triage_child", "--nocapture", "--test-threads=1"])
+            .env(CHILD, mode)
+            .env(COUNTER, &self.counter);
+        command
+    }
+}
+
+impl Children for TestChildren {
+    fn record(&self, input: &Path, out: &Path) -> Command {
+        self.command(format!("record:{}:{}", input.display(), out.display()))
+    }
+
+    fn replay(&self, trace: &Path) -> Command {
+        self.command(format!("replay:{}", trace.display()))
+    }
+}
+
+/// A scratch directory with an archive under `archive/`.
+struct Scratch {
+    dir: TempDir,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Scratch {
+            dir: TempDir::new().unwrap(),
+        }
+    }
+
+    fn out(&self) -> PathBuf {
+        self.dir.path().join("archive")
+    }
+
+    /// Writes `input` to a file named `name`, as libFuzzer saves a crash.
+    fn artifact(&self, name: &str, input: &[u8]) -> PathBuf {
+        let path = self.dir.path().join(name);
+        fs::write(&path, input).unwrap();
+        path
+    }
+
+    /// Triages `input`, saved as `name`, with a counter of its own and
+    /// `timeout` per child.
+    fn triage(&self, name: &str, input: &[u8], timeout: Duration) -> Triaged {
+        let artifact = self.artifact(name, input);
+        let children = TestChildren {
+            counter: self.dir.path().join(format!("{name}.count")),
+        };
+        let options = TriageOptions {
+            child_timeout: timeout,
+        };
+        triage(&TRIAGE, &children, &artifact, &self.out(), options).unwrap()
+    }
+}
+
+/// Long enough for any case but [`HANG_CASE`] on a loaded machine.
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The SHA-256 of `bytes`, in lowercase hex.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The bundle's `triage.json`.
+fn report(bundle: &Path) -> Value {
+    serde_json::from_slice(&fs::read(bundle.join(TRIAGE_FILE)).unwrap()).unwrap()
+}
+
+/// The first recording's trace directory in `bundle`.
+fn first_trace(bundle: &Path) -> PathBuf {
+    bundle.join(RUNS_DIR).join("record-1").join(RUN_TRACE_DIR)
+}
+
+/// E4.1: an injected `Active` failure becomes a bundle that holds the
+/// input and its trace. A fresh process replayed the trace Exact, and the
+/// trace's run classifies as the in-process run does. Replaying the
+/// bundle's trace again reproduces its `end` record.
+#[test]
+fn injected_failure_bundle_replays_exact() {
+    let scratch = Scratch::new();
+    let input = [ACTIVE_CASE, 4, 2];
+    let triaged = scratch.triage("crash-active", &input, TIMEOUT);
+    assert_eq!(triaged.status, TriageStatus::Confirmed, "{triaged:?}");
+    assert_eq!(triaged.bucket, Some(Bucket::Active));
+    let expected = format!("active {ACTIVE}");
+    assert_eq!(triaged.signature.as_deref(), Some(expected.as_str()));
+    assert_eq!(triaged.replay, Some(ProcessExit::Code(0)));
+    assert!(triaged.archived);
+    assert_eq!(
+        triaged.bundle,
+        scratch
+            .out()
+            .join("active")
+            .join(signature_hash(&expected))
+            .join(sha256(&input))
+    );
+
+    // The fresh process classifies as the in-process run does.
+    let run = (TRIAGE.run_bytes)(&input, &mut NullSink, None);
+    let in_process = classify(&TRIAGE, &run);
+    for child in &triaged.records {
+        assert_eq!(child.exit, ProcessExit::Code(0));
+        assert_eq!(
+            child.classified.result,
+            ProcessResult::Ended(in_process.clone())
+        );
+    }
+
+    let bundle = &triaged.bundle;
+    assert_eq!(fs::read(bundle.join(BUNDLE_INPUT_FILE)).unwrap(), input);
+    let scenario: Value =
+        serde_json::from_slice(&fs::read(bundle.join(SCENARIO_FILE)).unwrap()).unwrap();
+    assert_eq!(scenario, serde_json::json!({ "case": ACTIVE_CASE }));
+    assert_eq!(verify_bundle(bundle).unwrap(), Vec::<String>::new());
+    let report = report(bundle);
+    assert_eq!(report["status"], "confirmed");
+    assert_eq!(report["bucket"], "active");
+    assert_eq!(report["signature"], expected.as_str());
+    assert_eq!(report["input"]["sha256"], sha256(&input).as_str());
+    assert_eq!(report["replay"]["verified"], true);
+    assert_eq!(report["records"][0]["class"]["result"], "ended");
+    assert_eq!(report["records"][1]["class"]["outcome"]["property"], ACTIVE);
+
+    let trace = TraceReader::open(&first_trace(bundle)).unwrap();
+    let replayed = replay_with(&trace, &TRIAGE, ReplayOptions::default()).unwrap();
+    assert!(replayed.verified());
+    assert_eq!(replayed.end, trace.end);
+    assert!(
+        fs::read_dir(scratch.out().join(STAGING_DIR))
+            .unwrap()
+            .next()
+            .is_none(),
+        "the bundle left staging"
+    );
+}
+
+/// Each distinct input of one signature keeps its own bundle under that
+/// signature, so the signature counts both. Triaging an archived input
+/// again keeps the bundle that's there, unchanged.
+#[test]
+fn each_input_of_a_signature_keeps_its_bundle() {
+    let scratch = Scratch::new();
+    let first = scratch.triage("crash-1", &[ACTIVE_CASE], TIMEOUT);
+    let second = scratch.triage("crash-2", &[ACTIVE_CASE, 1, 2, 3], TIMEOUT);
+    assert_eq!(first.status, TriageStatus::Confirmed);
+    assert_eq!(second.status, TriageStatus::Confirmed);
+    assert_eq!(first.signature, second.signature);
+    assert_ne!(first.bundle, second.bundle);
+    assert_eq!(first.bundle.parent(), second.bundle.parent());
+    let mut both = vec![first.bundle.clone(), second.bundle.clone()];
+    both.sort();
+    assert_eq!(bundles(&scratch.out()).unwrap(), both);
+
+    let sums = fs::read(first.bundle.join(CHECKSUMS_FILE)).unwrap();
+    let again = scratch.triage("crash-1-again", &[ACTIVE_CASE], TIMEOUT);
+    assert_eq!(again.status, TriageStatus::Confirmed);
+    assert_eq!(again.bundle, first.bundle);
+    assert!(!again.archived);
+    assert_eq!(fs::read(first.bundle.join(CHECKSUMS_FILE)).unwrap(), sums);
+    assert_eq!(
+        report(&first.bundle)["artifact"],
+        scratch.dir.path().join("crash-1").display().to_string()
+    );
+    assert_eq!(bundles(&scratch.out()).unwrap(), both);
+    assert!(fs::read_dir(scratch.out().join(STAGING_DIR))
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+/// A row of [`buckets_for_harness_crash_and_nondeterminism`]: its name, the
+/// case, and the status, bucket and signature triage gives it.
+type Row<'a> = (&'a str, u8, TriageStatus, Option<Bucket>, Option<&'a str>);
+
+/// E4.4: every class goes through `classify_process`, and each input lands
+/// where its status and bucket say. A process crash is `crash`, a run whose
+/// recordings disagree is `nondeterministic`, and a run whose replay
+/// disagrees is `replay-failed`. Neither a clean run nor a run without its
+/// `end` record is a pass.
+#[test]
+fn buckets_for_harness_crash_and_nondeterminism() {
+    let scratch = Scratch::new();
+    let known = format!("known {KNOWN}");
+    let harness = format!(
+        "harness {}",
+        HarnessFailure::TaskNameHasColon {
+            name: "bad:name.1".to_owned(),
+        }
+    );
+    let rows: [Row<'_>; 8] = [
+        (
+            "known",
+            KNOWN_CASE,
+            TriageStatus::Confirmed,
+            Some(Bucket::Known),
+            Some(&known),
+        ),
+        (
+            "harness",
+            HARNESS_CASE,
+            TriageStatus::Confirmed,
+            Some(Bucket::Harness),
+            Some(&harness),
+        ),
+        (
+            "abort",
+            ABORT_CASE,
+            TriageStatus::Confirmed,
+            Some(Bucket::Crash),
+            Some("crash abort"),
+        ),
+        (
+            "no-end",
+            EXIT_CASE,
+            TriageStatus::Confirmed,
+            Some(Bucket::NoEnd),
+            Some("no-end"),
+        ),
+        (
+            "abandoned",
+            ABANDON_CASE,
+            TriageStatus::Confirmed,
+            Some(Bucket::Abandoned),
+            Some("abandoned"),
+        ),
+        ("clean", CLEAN, TriageStatus::NotReproduced, None, None),
+        (
+            "first-only",
+            FIRST_ONLY_CASE,
+            TriageStatus::Nondeterministic,
+            None,
+            None,
+        ),
+        (
+            "records-only",
+            RECORDS_ONLY_CASE,
+            TriageStatus::ReplayFailed,
+            None,
+            None,
+        ),
+    ];
+    for (name, case, status, bucket, expected) in rows {
+        let input = [case];
+        let triaged = scratch.triage(name, &input, TIMEOUT);
+        assert_eq!(triaged.status, status, "{name}: {triaged:?}");
+        assert_eq!(triaged.bucket, bucket, "{name}");
+        assert_eq!(triaged.signature.as_deref(), expected, "{name}");
+        let place = match (bucket, expected) {
+            (Some(bucket), Some(signature)) => scratch
+                .out()
+                .join(bucket.name())
+                .join(signature_hash(signature)),
+            _ => scratch.out().join(status.name()),
+        };
+        assert_eq!(triaged.bundle, place.join(sha256(&input)), "{name}");
+        assert_eq!(
+            fs::read(triaged.bundle.join(BUNDLE_INPUT_FILE)).unwrap(),
+            input,
+            "{name}"
+        );
+        assert_eq!(
+            verify_bundle(&triaged.bundle).unwrap(),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        assert_eq!(report(&triaged.bundle)["status"], status.name(), "{name}");
+    }
+
+    // The aborted recordings left their steps, and no replay ran.
+    let abort = scratch
+        .out()
+        .join("crash")
+        .join(signature_hash("crash abort"));
+    let aborted = report(&abort.join(sha256(&[ABORT_CASE])));
+    for record in aborted["records"].as_array().unwrap() {
+        assert_eq!(record["exit"], serde_json::json!({ "signal": 6 }));
+        assert_eq!(record["class"]["failure"]["kind"], "abort");
+        assert!(record["class"]["steps"].as_u64().unwrap() >= 1, "{record}");
+    }
+    assert_eq!(aborted["replay"], Value::Null);
+
+    // The recordings that disagreed both stay in their bundle.
+    let disagreed = scratch
+        .out()
+        .join("nondeterministic")
+        .join(sha256(&[FIRST_ONLY_CASE]));
+    let nondeterministic = report(&disagreed);
+    assert_eq!(
+        nondeterministic["records"][0]["signature"],
+        format!("active {ACTIVE}")
+    );
+    assert_eq!(nondeterministic["records"][1]["signature"], Value::Null);
+    for name in ["record-1", "record-2"] {
+        let trace = disagreed.join(RUNS_DIR).join(name).join(RUN_TRACE_DIR);
+        assert!(TraceReader::open(&trace).is_ok(), "{name}");
+    }
+
+    // The replay that disagreed failed, and its output stays.
+    let replayed = scratch
+        .out()
+        .join("replay-failed")
+        .join(sha256(&[RECORDS_ONLY_CASE]));
+    let replay_failed = report(&replayed);
+    assert_eq!(replay_failed["replay"]["verified"], false);
+    assert_ne!(
+        replay_failed["replay"]["exit"],
+        serde_json::json!({ "code": 0 })
+    );
+}
+
+/// Acceptance test 3, the triage child: a recording that hangs is killed
+/// at its time limit, classifies as a timeout through `classify_process`,
+/// and the input survives whole, both in place and in the bundle.
+#[test]
+fn hung_child_times_out_and_keeps_artifact() {
+    let scratch = Scratch::new();
+    let input = [HANG_CASE, 9];
+    let started = Instant::now();
+    let triaged = scratch.triage("timeout-1", &input, Duration::from_secs(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(triaged.status, TriageStatus::Confirmed);
+    assert_eq!(triaged.bucket, Some(Bucket::Crash));
+    assert_eq!(triaged.signature.as_deref(), Some("crash timeout"));
+    for child in &triaged.records {
+        assert_eq!(child.exit, ProcessExit::TimedOut);
+        assert_eq!(
+            child.classified.result,
+            ProcessResult::Crashed {
+                failure: ProcessFailure::Timeout,
+                end: None,
+            }
+        );
+    }
+    assert_eq!(triaged.replay, None);
+    assert_eq!(
+        fs::read(scratch.dir.path().join("timeout-1")).unwrap(),
+        input
+    );
+    assert_eq!(
+        fs::read(triaged.bundle.join(BUNDLE_INPUT_FILE)).unwrap(),
+        input
+    );
+    assert_eq!(report(&triaged.bundle)["records"][0]["exit"], "timed-out");
+    assert_eq!(
+        verify_bundle(&triaged.bundle).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+/// A bundle's checksums catch a changed, a missing and an added file.
+#[test]
+fn verify_bundle_finds_changed_missing_and_added_files() {
+    let scratch = Scratch::new();
+    let bundle = scratch.triage("crash", &[KNOWN_CASE], TIMEOUT).bundle;
+    fs::write(bundle.join(BUNDLE_INPUT_FILE), [0]).unwrap();
+    fs::remove_file(bundle.join(SCENARIO_FILE)).unwrap();
+    fs::write(bundle.join("extra"), b"").unwrap();
+    let mut problems = verify_bundle(&bundle).unwrap();
+    problems.sort();
+    assert_eq!(
+        problems,
+        [
+            format!("extra isn't in {CHECKSUMS_FILE}"),
+            format!("{BUNDLE_INPUT_FILE} changed"),
+            format!("{SCENARIO_FILE} is missing"),
+        ]
+    );
+}
+
+/// A failed child's buckets keep the class of the `end` record it wrote
+/// first, beside `crash`. The signature names the primary bucket's failure,
+/// and a sanitizer report's process ID and addresses don't split it.
+#[test]
+fn process_buckets_and_signatures() {
+    let crashed = |failure: ProcessFailure, end: Option<Classified>| ProcessClassified {
+        result: ProcessResult::Crashed { failure, end },
+        steps: 3,
+    };
+    let failed_and_abandoned = Classified {
+        outcome: ExploreOutcome::Fail {
+            property: ACTIVE.to_owned(),
+        },
+        notes: vec![(KNOWN.to_owned(), Bucket::Known)],
+        leaked: 1,
+    };
+    let crash = crashed(ProcessFailure::Abort, Some(failed_and_abandoned));
+    assert_eq!(crash.bucket(), Some(Bucket::Crash));
+    assert_eq!(
+        crash.buckets(),
+        [
+            Bucket::Active,
+            Bucket::Known,
+            Bucket::Crash,
+            Bucket::Abandoned
+        ]
+    );
+    assert_eq!(primary_bucket(&crash), Some(Bucket::Crash));
+    assert_eq!(signature(&crash).as_deref(), Some("crash abort"));
+
+    let asan = |pid: u32, address: &str| {
+        crashed(
+            ProcessFailure::Sanitizer {
+                report: format!(
+                    "=={pid}==ERROR: AddressSanitizer: heap-use-after-free on address {address}"
+                ),
+            },
+            None,
+        )
+    };
+    let expected = "crash sanitizer ERROR: AddressSanitizer: heap-use-after-free on address";
+    assert_eq!(signature(&asan(7, "0x1")).as_deref(), Some(expected));
+    assert_eq!(signature(&asan(81, "0xbeef")).as_deref(), Some(expected));
+
+    let ended = |outcome: ExploreOutcome, notes: Vec<(String, Bucket)>| ProcessClassified {
+        result: ProcessResult::Ended(Classified {
+            outcome,
+            notes,
+            leaked: 0,
+        }),
+        steps: 3,
+    };
+    let clean = ended(ExploreOutcome::Clean, vec![]);
+    assert_eq!(clean.buckets(), []);
+    assert_eq!(primary_bucket(&clean), None);
+    assert_eq!(signature(&clean), None);
+    let draft = ended(
+        ExploreOutcome::Clean,
+        vec![("test/triage/draft".to_owned(), Bucket::Draft)],
+    );
+    assert_eq!(draft.bucket(), None);
+    assert_eq!(primary_bucket(&draft), Some(Bucket::Draft));
+    assert_eq!(
+        signature(&draft).as_deref(),
+        Some("draft test/triage/draft")
+    );
+    // A `Known` violation reported after a `Draft` one still names the
+    // primary bucket's property.
+    let both = ended(
+        ExploreOutcome::Clean,
+        vec![
+            ("test/triage/draft".to_owned(), Bucket::Draft),
+            (KNOWN.to_owned(), Bucket::Known),
+        ],
+    );
+    assert_eq!(primary_bucket(&both), Some(Bucket::Known));
+    assert_eq!(signature(&both), Some(format!("known {KNOWN}")));
+    let no_end = ProcessClassified {
+        result: ProcessResult::NoEnd,
+        steps: 2,
+    };
+    assert_eq!(no_end.buckets(), [Bucket::NoEnd]);
+    assert_eq!(signature(&no_end).as_deref(), Some("no-end"));
+}
+
+/// Runs the binary with `args`.
+fn zakura_sim(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .args(args)
+        .output()
+        .expect("the binary runs")
+}
+
+/// The binary's `triage` runs `zakura-sim record` and `replay` as its
+/// children on a registered harness, and `verify-archive` checks and
+/// counts what it archived.
+#[test]
+fn the_binary_triages_and_verifies_an_archive() {
+    let scratch = Scratch::new();
+    // Discovery's scenario prefix is empty, so these are all Plan bytes.
+    let input = scratch.artifact("input", &[0, 1, 7, 3, 9, 1, 4, 2]);
+    let out = scratch.out();
+    let output = zakura_sim(&[
+        "triage",
+        "--sim",
+        "discovery/wait-complete",
+        "--out",
+        out.to_str().unwrap(),
+        "--child-secs",
+        "60",
+        input.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let bundle = out
+        .join("not-reproduced")
+        .join(sha256(&fs::read(&input).unwrap()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        format!(
+            "{}: not-reproduced; archived in {}\n",
+            input.display(),
+            bundle.display()
+        )
+    );
+    let report = report(&bundle);
+    assert_eq!(report["harness"], "discovery/wait-complete");
+    assert_eq!(report["replay"]["verified"], true);
+
+    let output = zakura_sim(&["verify-archive", out.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "1 not-reproduced: not-reproduced\n1 bundles match their checksums\n"
+    );
+
+    fs::write(bundle.join(BUNDLE_INPUT_FILE), b"changed").unwrap();
+    let output = zakura_sim(&["verify-archive", out.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("input.bin changed"), "{stderr}");
+
+    let output = zakura_sim(&["triage", "--sim", "discovery/wait-complete"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}

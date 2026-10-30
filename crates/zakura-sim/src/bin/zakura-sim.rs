@@ -6,11 +6,14 @@
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
+//! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
+//! zakura-sim verify-archive <dir>
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
-//! `cargo xtask record`, `cargo xtask replay` and `cargo xtask shrink` build
-//! and run it with that flag.
+//! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
+//! `cargo xtask sim-triage` and `cargo xtask sim-verify-archive` build and
+//! run it with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -44,6 +47,7 @@ mod cli {
 
     use serde_json::{json, Value};
     use zakura_sim::{
+        explore::triage::{self, SimChildren, TriageOptions, TRIAGE_FILE},
         harness::{self, RecordInput, HARNESSES, WITNESS_FILE},
         record::{EndRecord, OutcomeKind},
         trace::{self, shrink::REPORT_FILE, ReplayOptions, ShrinkBudget, TraceReader},
@@ -66,7 +70,9 @@ mod cli {
              [--witness <property> --expect <holds|violated|applicable>]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
-             zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n\n\
+             zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
+             zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...\n  \
+             zakura-sim verify-archive <dir>\n\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
@@ -81,7 +87,14 @@ mod cli {
              `shrink` reduces a trace that ends in a violation to fewer non-default\n\
              picks, and writes the reduced trace, the original and a reduction log to\n\
              --out. It stops after --candidates candidates (default 2000) or\n\
-             --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\n\
+             --wall-secs seconds (default 600), and exits 1 if the re-record fails.\n\
+             `triage` records each input twice, each time in a fresh process killed after\n\
+             --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
+             and archives the input with its runs under --out. It exits 1 only if an input\n\
+             couldn't be archived.\n\
+             `verify-archive` checks every bundle under a triage archive against its\n\
+             SHA256SUMS, counts the bundles under each signature, and exits 1 if any\n\
+             bundle doesn't match.\n\n\
              Harnesses:\n",
         );
         for entry in HARNESSES {
@@ -102,6 +115,8 @@ mod cli {
             Some("record") => record(args.collect()),
             Some("replay") => replay(args.collect()),
             Some("shrink") => shrink(args.collect()),
+            Some("triage") => triage(args.collect()),
+            Some("verify-archive") => verify_archive(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())
@@ -406,6 +421,141 @@ mod cli {
                 "the re-record failed: {}. The original and the best plan are in {}",
                 failure.as_deref().unwrap_or("unknown"),
                 out.display()
+            ))),
+        }
+    }
+
+    /// `triage`: confirms each input's failure in fresh processes and
+    /// archives it. Fails only if an input couldn't be archived.
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
+    fn triage(args: Vec<String>) -> Result<(), Error> {
+        let mut sim = None;
+        let mut out = None;
+        let mut options = TriageOptions::default();
+        let mut inputs = Vec::new();
+        let mut seen = Vec::new();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                inputs.push(PathBuf::from(arg));
+                continue;
+            }
+            if seen.contains(&arg) {
+                return Err(Error::Usage(format!("{arg} given twice")));
+            }
+            let value = args
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{arg} needs a value")))?;
+            match arg.as_str() {
+                "--sim" => sim = Some(value),
+                "--out" => out = Some(PathBuf::from(value)),
+                "--child-secs" => {
+                    let secs = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|secs| *secs > 0)
+                        .ok_or_else(|| {
+                            Error::Usage(format!("{arg}: expected a positive whole number"))
+                        })?;
+                    options.child_timeout = Duration::from_secs(secs);
+                }
+                _ => return Err(Error::Usage(format!("unknown flag `{arg}`"))),
+            }
+            seen.push(arg);
+        }
+        let sim = sim.ok_or_else(|| Error::Usage("`triage` needs --sim".to_owned()))?;
+        let out = out.ok_or_else(|| Error::Usage("`triage` needs --out".to_owned()))?;
+        if inputs.is_empty() {
+            return Err(Error::Usage("`triage` needs at least one input".to_owned()));
+        }
+        let entry = harness::find(&sim).map_err(|error| Error::Usage(error.to_string()))?;
+        let children = SimChildren {
+            exe: std::env::current_exe()
+                .map_err(|error| Error::Failed(format!("finding this binary: {error}")))?,
+            harness: sim,
+        };
+        let mut failed = 0;
+        for input in &inputs {
+            match triage::triage(entry, &children, input, &out, options) {
+                Ok(triaged) => {
+                    let class = match (&triaged.bucket, &triaged.signature) {
+                        (Some(bucket), Some(signature)) => {
+                            format!(" in {}: {signature}", bucket.name())
+                        }
+                        _ => String::new(),
+                    };
+                    let kept = if triaged.archived {
+                        "archived in"
+                    } else {
+                        "already archived in"
+                    };
+                    println!(
+                        "{}: {}{class}; {kept} {}",
+                        input.display(),
+                        triaged.status.name(),
+                        triaged.bundle.display()
+                    );
+                }
+                Err(error) => {
+                    failed += 1;
+                    eprintln!("{}: not archived: {error}", input.display());
+                }
+            }
+        }
+        match failed {
+            0 => Ok(()),
+            failed => Err(Error::Failed(format!(
+                "{failed} of {} inputs weren't archived",
+                inputs.len()
+            ))),
+        }
+    }
+
+    /// `verify-archive`: checks every bundle under a triage archive, and
+    /// prints how many bundles each signature has. Fails if any bundle
+    /// doesn't match its checksums.
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
+    fn verify_archive(args: Vec<String>) -> Result<(), Error> {
+        let [dir] = <[String; 1]>::try_from(args)
+            .map_err(|_| Error::Usage("`verify-archive` takes one archive directory".to_owned()))?;
+        let dir = PathBuf::from(dir);
+        let read = |error: std::io::Error| {
+            Error::Failed(format!("reading the archive in {}: {error}", dir.display()))
+        };
+        let bundles = triage::bundles(&dir).map_err(read)?;
+        let mut bad = 0;
+        let mut groups: std::collections::BTreeMap<PathBuf, (usize, String)> =
+            std::collections::BTreeMap::new();
+        for bundle in &bundles {
+            let problems = triage::verify_bundle(bundle).map_err(read)?;
+            for problem in &problems {
+                eprintln!("{}: {problem}", bundle.display());
+            }
+            bad += usize::from(!problems.is_empty());
+            let report: Value = std::fs::read(bundle.join(TRIAGE_FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let name = report["signature"]
+                .as_str()
+                .or(report["status"].as_str())
+                .unwrap_or("unreadable triage.json")
+                .to_owned();
+            let group = bundle.parent().unwrap_or(&dir).to_owned();
+            groups.entry(group).or_insert((0, name)).0 += 1;
+        }
+        for (group, (count, name)) in &groups {
+            let group = group.strip_prefix(&dir).unwrap_or(group);
+            println!("{count} {}: {name}", group.display());
+        }
+        match bad {
+            0 => {
+                println!("{} bundles match their checksums", bundles.len());
+                Ok(())
+            }
+            bad => Err(Error::Failed(format!(
+                "{bad} of {} bundles don't match their checksums",
+                bundles.len()
             ))),
         }
     }

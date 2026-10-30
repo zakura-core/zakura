@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     harness::{
         coverage::{Bypass, Ci, Witness, COVERAGE},
-        HARNESSES,
+        HarnessEntry, HARNESSES,
     },
     property::Status,
     record::{CONTRACT_VERSION, FORMAT_VERSION},
@@ -203,7 +203,8 @@ pub struct Target {
     /// The target's `[[bin]]` name.
     pub name: String,
     /// Harnesses whose runs it covers through its harness, such as the race
-    /// fixtures through `fixtures/all`. Its report must account for each.
+    /// fixtures through `fixtures/all`. Its harness must check each covered
+    /// harness's properties, and its report must account for each.
     #[serde(default)]
     pub covers: Vec<String>,
     /// The smoke run's length.
@@ -1427,6 +1428,12 @@ impl Builder<'_> {
                     target.name
                 ));
             }
+            if let Some(runs) = HARNESSES
+                .iter()
+                .find(|entry| Some(entry.name) == harness.as_deref())
+            {
+                self.covered_by(&target.name, runs, &target.covers);
+            }
             let id = self.id(format!("target/{}/{}", target.package, target.name));
             let build = match target.package == SIM_FUZZ_PACKAGE {
                 true => Build::FuzzSim,
@@ -1496,6 +1503,34 @@ impl Builder<'_> {
             ));
         }
         (rows, excluded, lockfiles)
+    }
+
+    /// Records a problem for each harness in `covers` with properties that
+    /// `runs`, the harness of the target `target`, doesn't check. The
+    /// target's runs can decide only the properties its harness checks.
+    fn covered_by(&mut self, target: &str, runs: &HarnessEntry, covers: &[String]) {
+        let checks: BTreeSet<String> = (runs.properties)()
+            .into_iter()
+            .map(|property| property.id)
+            .collect();
+        for name in covers {
+            let Some(covered) = HARNESSES.iter().find(|entry| entry.name == name) else {
+                continue;
+            };
+            let unchecked: Vec<String> = (covered.properties)()
+                .into_iter()
+                .filter(|property| !checks.contains(&property.id))
+                .map(|property| format!("`{}`", property.id))
+                .collect();
+            if !unchecked.is_empty() {
+                self.problem(format!(
+                    "the target `{target}` covers the harness `{name}`, and its harness `{}` \
+                     doesn't check `{name}`'s properties {}",
+                    runs.name,
+                    unchecked.join(", ")
+                ));
+            }
+        }
     }
 
     /// One passing and one bypass row per coverage row. A reported

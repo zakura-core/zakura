@@ -250,6 +250,26 @@ fn a_harness_both_run_and_missing_fails() {
 }
 
 #[test]
+fn a_target_covering_a_harness_its_harness_doesnt_check_fails() {
+    // `fixtures/all` checks the race fixtures' properties, and none of
+    // `header-sync/wire`'s.
+    let mut suite = committed();
+    remove(&mut suite.missing_target, |row| {
+        row.harness == "header-sync/wire"
+    });
+    for target in &mut suite.target {
+        if target.name == "race_fixtures" {
+            target.covers.push("header-sync/wire".to_owned());
+        }
+    }
+    assert_problem(
+        &problems(&suite),
+        "the target `race_fixtures` covers the harness `header-sync/wire`, and its harness \
+         `fixtures/all` doesn't check `header-sync/wire`'s properties",
+    );
+}
+
+#[test]
 fn a_simulator_target_takes_its_harness_from_its_cargo_toml() {
     let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
         panic!("{problems}");

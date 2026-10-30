@@ -403,6 +403,13 @@ impl Wake for TaskWaker {
             self.thread,
             "a simulated task's waker fired from another OS thread"
         );
+        // A wake changes the ready set without reaching a runtime point, so
+        // a boundary read could otherwise change the schedule it observes.
+        #[cfg(zakura_sim)]
+        assert!(
+            !zakura_rt::sim::in_boundary_read(),
+            "a boundary read woke a simulated task"
+        );
         with_run(|s| {
             if s.gen != self.gen {
                 return;

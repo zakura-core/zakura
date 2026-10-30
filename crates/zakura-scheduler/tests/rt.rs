@@ -1798,3 +1798,80 @@ fn rt_a_start_past_the_utc_range_panics_at_construction() {
         "{message:?}"
     );
 }
+
+/// Inside a boundary read, dropping a `zakura-rt` mutex guard while a task
+/// is parked on it panics before the waiter becomes ready. A guard dropped
+/// outside one wakes the waiter as usual.
+///
+/// This fails if the guard's release doesn't check the mark.
+#[test]
+fn a_read_that_releases_a_contended_mutex_panics() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let lock = Arc::new(RtMutex::new(()));
+    let guard = lock.lock().unwrap();
+    let l = lock.clone();
+    let waiter = s.spawn_root("waiter", async move {
+        drop(l.lock().unwrap());
+    });
+    assert!(matches!(s.run(waiter.task()), Reached(_)), "at its lock");
+    assert!(
+        matches!(s.run(waiter.task()), Parked(_)),
+        "parked on the guard"
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim::boundary_read(|| drop(guard));
+    }));
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != waiter.task()),
+        "the waiter wasn't woken"
+    );
+    drop(lock.lock().unwrap());
+    assert!(
+        s.ready().iter().any(|ready| ready.task == waiter.task()),
+        "a release outside a read wakes it"
+    );
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+}
+
+/// A boundary read that calls a waiting task's captured `Waker`, with no
+/// other runtime call, panics before the task becomes ready. A wake
+/// outside one makes it ready as usual.
+///
+/// This fails if the scheduler's waker doesn't check the mark, even with
+/// every `zakura-rt` check in place.
+#[test]
+fn a_direct_wake_inside_a_read_panics() {
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let waker: Rc<RefCell<Option<std::task::Waker>>> = shared(RefCell::new(None));
+    let woken = shared(Cell::new(false));
+    let (slot, done) = (waker.clone(), woken.clone());
+    let task = s.spawn_root("waits", async move {
+        std::future::poll_fn(|cx| {
+            if done.get() {
+                return std::task::Poll::Ready(());
+            }
+            *slot.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await;
+    });
+    assert_eq!(s.run(task.task()), zakura_scheduler::RunOutcome::Waiting);
+    let waker = waker.borrow_mut().take().expect("the task left its waker");
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim::boundary_read(|| waker.wake_by_ref());
+    }));
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != task.task()),
+        "the task wasn't woken"
+    );
+    woken.set(true);
+    waker.wake();
+    assert!(s.ready().iter().any(|ready| ready.task == task.task()));
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+}

@@ -139,6 +139,8 @@ thread_local! {
     /// The last emission position handed out in the current run. See
     /// [`next_position`].
     static POSITION: Cell<u64> = const { Cell::new(0) };
+    /// Set while a [`boundary_read`] runs on this thread.
+    static BOUNDARY_READ: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The next [`RunId`]. Process-wide, so an id never repeats on any thread.
@@ -203,6 +205,57 @@ pub fn next_position() -> Option<u64> {
             next
         })
         .ok()
+}
+
+/// Runs `read` as a boundary read: harness code that looks at owners'
+/// state between steps, while every task is stopped. A read must not reach
+/// the runtime, since that would change the schedule it observes, so inside
+/// `read` a preemption point, a park, an unpark and a simulated task's
+/// waker all panic. Use the peeks ([`Peek`]) to read runtime objects.
+pub fn boundary_read<R>(read: impl FnOnce() -> R) -> R {
+    /// Clears the mark when the read returns or unwinds.
+    struct Reading(bool);
+
+    impl Drop for Reading {
+        fn drop(&mut self) {
+            let _ = BOUNDARY_READ.try_with(|cell| cell.set(self.0));
+        }
+    }
+
+    let _reading = Reading(BOUNDARY_READ.with(|cell| cell.replace(true)));
+    read()
+}
+
+/// True while a [`boundary_read`] runs on this thread. A scheduler checks it
+/// before a waker changes its ready set, since a wake doesn't go through
+/// the runtime's points.
+pub fn in_boundary_read() -> bool {
+    BOUNDARY_READ.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Panics if a [`boundary_read`] runs on this thread, naming `what` it
+/// reached.
+#[track_caller]
+pub(crate) fn refuse_in_boundary_read(what: &str) {
+    assert!(
+        !in_boundary_read(),
+        "a boundary read reached the runtime: {what}"
+    );
+}
+
+/// What a peek saw: a runtime object's value read with no preemption point,
+/// for a [`boundary_read`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Peek<R> {
+    /// The value, with nobody holding it.
+    Current(R),
+    /// A task holds the lock, so the value may be mid-change.
+    Held {
+        /// The holding task, if a sim task holds it.
+        holder: Option<TaskId>,
+    },
+    /// A holder panicked. Holds the value as it left it.
+    Poisoned(R),
 }
 
 /// The run on this thread, if any.
@@ -521,6 +574,7 @@ pub(crate) fn point(op: Op, site: &'static Location<'static>) {
 /// `send_modify` closure holds that lock, points are skipped and counted in
 /// [`suppressed_points`].
 pub(crate) fn preempt(executor: &dyn Executor, point: Point) {
+    refuse_in_boundary_read("a preemption point");
     if WATCH_LOCKS.try_with(Cell::get).unwrap_or(0) > 0 {
         let _ = SUPPRESSED.try_with(|cell| cell.set(cell.get().saturating_add(1)));
         return;

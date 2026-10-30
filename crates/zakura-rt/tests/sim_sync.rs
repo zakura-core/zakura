@@ -14,7 +14,7 @@ use std::{
 
 use support::run;
 use zakura_rt::{
-    sim::Op,
+    sim::{self, Op, Peek},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         counter, mpsc, oneshot, watch, CancellationToken, Mutex, Notify, PoisonError, Semaphore,
@@ -560,4 +560,103 @@ fn on_cancel_adds_no_point() {
     let (hooked, plain) = (cancel_with(true), cancel_with(false));
     assert_eq!(hooked.points, plain.points);
     assert_eq!(hooked.draws, plain.draws);
+}
+
+/// A task holds a `Mutex` guard and peeks it in the same poll, which reads
+/// `Held` with the task as its holder, then drops the guard and peeks again,
+/// which reads `Current`. The atomics and the semaphore peek their values.
+/// The task reaches the same points as without the peeks: its own lock and
+/// release, and nothing else.
+///
+/// This fails if a peek reaches a point.
+#[test]
+fn peeks_add_no_point() {
+    let peeked = |peek: bool| {
+        run(async move {
+            let lock = Mutex::new(1_u64);
+            let (atomic, flag, semaphore) =
+                (AtomicU64::new(2), AtomicBool::new(true), Semaphore::new(3));
+            let mut seen = Vec::new();
+            let guard = lock.lock().unwrap();
+            if peek {
+                seen.push(lock.peek(|value| *value));
+                assert_eq!(atomic.peek(), 2);
+                assert!(flag.peek());
+                assert_eq!(semaphore.peek_available(), 3);
+            }
+            drop(guard);
+            if peek {
+                seen.push(lock.peek(|value| *value));
+            }
+            seen
+        })
+    };
+    let ((seen, with), (_, without)) = (peeked(true), peeked(false));
+    assert_eq!(
+        seen,
+        [
+            Peek::Held {
+                holder: Some(sim::TaskId::new(0))
+            },
+            Peek::Current(1)
+        ]
+    );
+    assert_eq!(
+        (with.count(Op::Lock), with.count(Op::Release)),
+        (1, 1),
+        "the task's own lock and release"
+    );
+    assert_eq!(with.points, without.points);
+}
+
+/// Outside a run, a peek is std's `try_lock` with no holder to name, and a
+/// panicked holder's value reads `Poisoned`.
+#[test]
+fn peeks_outside_a_run_behave_like_std() {
+    let lock = Arc::new(Mutex::new(5));
+    assert_eq!(lock.peek(|value| *value), Peek::Current(5));
+    let guard = lock.lock().unwrap();
+    assert_eq!(lock.peek(|value| *value), Peek::Held { holder: None });
+    drop(guard);
+    let poisoner = lock.clone();
+    std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("poisons the lock");
+    })
+    .join()
+    .expect_err("the holder panicked");
+    assert_eq!(lock.peek(|value| *value), Peek::Poisoned(5));
+    assert_eq!(AtomicU64::new(7).peek(), 7);
+    assert_eq!(Semaphore::new(2).peek_available(), 2);
+}
+
+/// Inside a boundary read, a point, a `Mutex` lock and a guard's release
+/// panic, and the mark clears when the read unwinds, so the task's own
+/// points work again. A peek inside one is fine.
+///
+/// This fails if the runtime doesn't check the mark.
+#[test]
+fn a_read_that_reaches_the_runtime_panics() {
+    let ((), report) = run(async {
+        let atomic = AtomicU64::new(0);
+        let lock = Mutex::new(0);
+        let refused = |read: &dyn Fn()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim::boundary_read(read)))
+                .is_err()
+        };
+        assert!(refused(&|| {
+            atomic.load(Ordering::SeqCst);
+        }));
+        assert!(refused(&|| drop(lock.lock())));
+        let guard = std::cell::Cell::new(Some(lock.lock().unwrap()));
+        assert!(refused(&|| drop(guard.take())));
+        assert!(!sim::in_boundary_read(), "an unwound read clears its mark");
+        assert_eq!(sim::boundary_read(|| atomic.peek()), 0);
+        atomic.load(Ordering::SeqCst);
+    });
+    assert_eq!(
+        report.count(Op::AtomicLoad),
+        1,
+        "only the load outside any read reached its point"
+    );
 }

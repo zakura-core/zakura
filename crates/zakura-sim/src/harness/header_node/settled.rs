@@ -21,8 +21,12 @@
 //! before its task's first poll. After `Dropping`, only its pending calls'
 //! `dropped` call ends may follow, and once its teardown is done, when the
 //! task that reported `Dropping` exits, every call it dispatched must have
-//! ended, or the run fails as `UnendedCall`. That covers a call storage never took, whose lost end
-//! leaves no receipt to pair. A task that completes with no
+//! ended, or the run fails as `UnendedCall`. That covers a call storage
+//! never took, whose lost end leaves no receipt to pair. Every dropped
+//! call's operation must have its drop receipt by then too, unless
+//! storage's shutdown removed it, or the run fails as `UnpairedDrop`. A run
+//! that ends before the teardown is done leaves both open. A task that
+//! completes with no
 //! `Settled{last}` fails the run as `NoFinalSnapshot`, and one that panics,
 //! which reports no teardown, ends unsettled at its exit.
 //!
@@ -318,6 +322,12 @@ impl ReactorLife {
             return Err(format!(
                 "UnendedCall: the reactor's teardown ended at step {step} with call {call} \
                  dispatched and never ended"
+            ));
+        }
+        if let Some((call, op)) = self.link.waiting_drop.get().filter(|_| torn_down) {
+            return Err(format!(
+                "UnpairedDrop: the reactor's teardown ended at step {step} with call {call} \
+                 dropped and its operation {op} given no drop receipt or storage removal"
             ));
         }
         if let Some(Stop::Exited(exit)) = stop {
@@ -1419,7 +1429,27 @@ mod tests {
             ) -> futures::future::LocalBoxFuture<'static, u64>
             + 'static,
     {
-        let (mut fixture, slot) = Fixture::new(1_000);
+        scripted_teardown(1_000, |_| Box::new(States::default()), false, turn)
+    }
+
+    /// [`scripted_calls`] in a run of at most `budget` steps, checked by
+    /// the checker `checker` makes from the node's port. With `stuck`, the
+    /// reactor's teardown never finishes: after `Dropping` its task stops at
+    /// points until the run ends.
+    fn scripted_teardown<T>(
+        budget: u64,
+        checker: impl FnOnce(Arc<ControlledPort>) -> Box<dyn Checker>,
+        stuck: bool,
+        turn: T,
+    ) -> RunReport
+    where
+        T: FnOnce(
+                Arc<ControlledPort>,
+                ObserverSlot,
+            ) -> futures::future::LocalBoxFuture<'static, u64>
+            + 'static,
+    {
+        let (mut fixture, slot) = Fixture::new(budget);
         let storage = PolicySource::new(
             &mut fixture.sim,
             fixture.port.clone(),
@@ -1438,8 +1468,198 @@ mod tests {
             let turn = body.await;
             slot.emit(settled(turn, true));
             slot.emit(dropping(turn));
+            if stuck {
+                loop {
+                    point();
+                }
+            }
         });
-        fixture.run(&mut States::default()).0
+        let mut checker = checker(fixture.port.clone());
+        fixture.run(&mut *checker).0
+    }
+
+    /// Shuts the node's storage down, as the run would, at the boundary
+    /// after its first submission.
+    struct ShutsDownStorage {
+        port: Arc<ControlledPort>,
+        done: bool,
+    }
+
+    impl Checker for ShutsDownStorage {
+        fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+            let submitted = cx.log.of_step(cx.step).any(|obs| {
+                matches!(
+                    obs,
+                    Observation::Storage {
+                        fact: crate::observe::StorageFact::Submitted { .. },
+                        ..
+                    }
+                )
+            });
+            if submitted && !self.done {
+                self.done = true;
+                self.port.shut_down();
+            }
+            None
+        }
+
+        fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+            Vec::new()
+        }
+    }
+
+    /// Locator call 1, submitted, reported dropped with its future kept
+    /// alive past the turn, so no drop receipt ever comes.
+    fn dropped_without_receipt(
+        port: Arc<ControlledPort>,
+        slot: ObserverSlot,
+    ) -> futures::future::LocalBoxFuture<'static, u64> {
+        Box::pin(async move {
+            let pending = locator(&port, &slot, 1);
+            slot.emit(ReactorEvent::CallEnded {
+                call: 1,
+                end: zakura_network::zakura::observe::CallEnd::Dropped,
+            });
+            std::mem::forget(pending);
+            2
+        })
+    }
+
+    /// The failure detail of `report`'s source evidence failure, if any.
+    fn evidence_detail(report: &RunReport) -> Option<&str> {
+        match &report.end.harness {
+            Some(HarnessFailure::SourceEvidence { detail, .. }) => Some(detail),
+            _ => None,
+        }
+    }
+
+    /// A dropped call whose operation storage's shutdown removed needs no
+    /// drop receipt: storage shuts down once call 1 is submitted, the call
+    /// then ends dropped and its future drops, finding no slot, and the
+    /// reactor tears down with no failure, the call's end naming its
+    /// operation.
+    ///
+    /// This fails if the pairer ignores the shutdown's removals.
+    #[test]
+    fn a_drop_storage_removed_needs_no_receipt() {
+        let report = scripted_teardown(
+            1_000,
+            |port| Box::new(ShutsDownStorage { port, done: false }),
+            false,
+            |port, slot| {
+                Box::pin(async move {
+                    let mut turn = 2;
+                    let pending = locator(&port, &slot, 1);
+                    wait(&slot, &mut turn).await;
+                    wait(&slot, &mut turn).await;
+                    slot.emit(ReactorEvent::CallEnded {
+                        call: 1,
+                        end: zakura_network::zakura::observe::CallEnd::Dropped,
+                    });
+                    drop(pending);
+                    turn
+                })
+            },
+        );
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let storage: Vec<_> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Storage { fact, .. } => Some(fact),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            storage.iter().any(|fact| matches!(fact,
+                crate::observe::StorageFact::ShutDown { dropped, .. } if dropped == &[1])),
+            "storage's shutdown removed operation 1: {storage:?}"
+        );
+        assert!(
+            !storage.iter().any(|fact| matches!(
+                fact,
+                crate::observe::StorageFact::CallerDropped { .. }
+                    | crate::observe::StorageFact::ReplyDropped { .. }
+            )),
+            "no drop receipt came"
+        );
+        assert!(
+            reactor_facts(&report).iter().any(|(_, fact)| matches!(fact,
+                ReactorFact::CallEnded { call: 1, end, op: Some(1) } if end == "dropped")),
+            "the call ends dropped, naming its operation"
+        );
+    }
+
+    /// A dropped call whose operation never gets its drop receipt, with no
+    /// storage removal, fails the run once the reactor's teardown is done,
+    /// at its task's exit, as `UnpairedDrop`.
+    ///
+    /// This fails if a dropped call may wait for its receipt forever.
+    #[test]
+    fn a_drop_with_no_receipt_fails_at_teardown() {
+        let report = scripted_teardown(
+            1_000,
+            |_| Box::new(States::default()),
+            false,
+            dropped_without_receipt,
+        );
+        let exit = report
+            .log
+            .entries()
+            .iter()
+            .find_map(|entry| {
+                matches!(&entry.obs, Observation::TaskExited { task, .. } if task == "reactor.1")
+                    .then_some(entry.step)
+            })
+            .expect("the reactor's task exits");
+        assert_eq!(
+            evidence_detail(&report),
+            Some(
+                format!(
+                    "UnpairedDrop: the reactor's teardown ended at step {exit} with call 1 \
+                     dropped and its operation 1 given no drop receipt or storage removal"
+                )
+                .as_str()
+            ),
+            "{:?}",
+            report.end
+        );
+        assert_eq!(report.end.steps, exit);
+    }
+
+    /// A run that ends before the reactor's teardown is done leaves a
+    /// dropped call's missing receipt open, with no failure: the same
+    /// history as [`a_drop_with_no_receipt_fails_at_teardown`], but the
+    /// task stops at points after `Dropping` until the budget runs out.
+    ///
+    /// This fails if the audit runs at `Dropping`, before the teardown is
+    /// done.
+    #[test]
+    fn a_truncated_teardown_leaves_its_drops_open() {
+        let report = scripted_teardown(
+            30,
+            |_| Box::new(States::default()),
+            true,
+            dropped_without_receipt,
+        );
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        assert_eq!(
+            report.end.outcome,
+            crate::Outcome::Budget,
+            "{:?}",
+            report.end
+        );
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(facts[..], [.., (_, ReactorFact::Dropping { .. })]),
+            "the reactor reported its teardown: {facts:?}"
+        );
+        assert!(
+            !report.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::TaskExited { task, .. } if task == "reactor.1")),
+            "its task never exits"
+        );
     }
 
     /// Dispatches locator call `call` through `slot` and returns its future

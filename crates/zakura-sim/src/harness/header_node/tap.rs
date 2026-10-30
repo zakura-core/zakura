@@ -26,7 +26,9 @@
 //! other call, so the tap adds no scheduling point to the reactor.
 
 use std::{
+    cell::Cell,
     mem,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, PoisonError, Weak,
@@ -69,6 +71,9 @@ pub struct ReactorTap {
     delivered: u64,
     /// Pairs calls with the node's storage receipts.
     pairer: Pairer,
+    /// The pairer's first waiting dropped call after each drain, as
+    /// `(call, operation)`, shared with its [`ReactorLink`].
+    waiting_drop: Rc<Cell<Option<(u64, u64)>>>,
     /// The run's harness failure, set when a call panics.
     failure: Failure,
     /// The last snapshot logged, which an unchanged `Settled` doesn't
@@ -255,6 +260,7 @@ impl ReactorTap {
             node: node.to_owned(),
             delivered: 0,
             pairer: Pairer::default(),
+            waiting_drop: Rc::default(),
             failure: sim.failure(),
             snapshot: None,
         };
@@ -272,6 +278,7 @@ impl ReactorTap {
         ReactorLink {
             instance: self.id.index,
             source: self.checkpoint.kind().source(self.id.index),
+            waiting_drop: self.waiting_drop.clone(),
         }
     }
 
@@ -283,6 +290,7 @@ impl ReactorTap {
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
         self.pairer.facts(facts);
+        self.waiting_drop.set(self.pairer.waiting_drop());
     }
 }
 
@@ -292,6 +300,9 @@ pub(crate) struct ReactorLink {
     pub(crate) instance: u64,
     /// The tap's source label, for failures.
     pub(crate) source: String,
+    /// The tap's first dropped call still waiting for its drop receipt, as
+    /// of its last drain. See [`Pairer::waiting_drop`].
+    pub(crate) waiting_drop: Rc<Cell<Option<(u64, u64)>>>,
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
@@ -634,6 +645,7 @@ impl ReactorTap {
                 } => Some((*storage_seq, event)),
                 _ => None,
             }));
+        self.waiting_drop.set(self.pairer.waiting_drop());
         self.delivered = last;
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.

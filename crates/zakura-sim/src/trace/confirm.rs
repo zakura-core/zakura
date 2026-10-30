@@ -409,9 +409,15 @@ fn judge(
             confirmation.trace_id = Some(trace.id);
             Ok(confirmation)
         }
-        Err(RecordError::Nondeterministic { detail }) => {
+        Err(RecordError::Nondeterministic { detail, evidence }) => {
             confirmation.status = ConfirmStatus::Nondeterministic;
-            confirmation.detail = Some(detail);
+            confirmation.detail = Some(match evidence {
+                Some(dir) => format!(
+                    "{detail} (evidence in {})",
+                    dir.strip_prefix(out).unwrap_or(&dir).display()
+                ),
+                None => detail,
+            });
             Ok(confirmation)
         }
         Err(error) => Err(error),

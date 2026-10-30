@@ -279,6 +279,13 @@ fn saved_plans_have_no_unframed_work() {
         let (prefix, bytes) = input.split_at(HeaderWire::SCENARIO_BYTES);
         let scenario = HeaderWire::draw(prefix);
         let report = run(&scenario, Plan::from_fuzz(bytes), &mut NoChecks);
+        assert_eq!(
+            report.end.harness,
+            None,
+            "{}: {:?}",
+            plan.name(),
+            report.end
+        );
         for entry in report.log.entries() {
             match entry.obs {
                 Observation::WorkAdmitted { .. } => admitted += 1,

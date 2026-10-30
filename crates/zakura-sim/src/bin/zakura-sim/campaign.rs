@@ -94,8 +94,8 @@ fn build(store: &Store, flags: &Flags) -> Result<(), Error> {
     let target_dir = flags
         .one("--target-dir")?
         .map_or_else(|| repo.join(FUZZ_PACKAGE).join("target"), PathBuf::from);
-    let (binary, identity) = build_fuzzer(&repo, target, sanitizer, &target_dir).map_err(failed)?;
-    let build = store.save_build(&binary, identity).map_err(failed)?;
+    let (bytes, identity) = build_fuzzer(&repo, target, sanitizer, &target_dir).map_err(failed)?;
+    let build = store.save_build(&bytes, identity).map_err(failed)?;
     println!(
         "saved fuzz target {target} ({sanitizer}) from commit {}{} as build {}",
         build.identity.git,

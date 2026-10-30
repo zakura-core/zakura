@@ -126,20 +126,18 @@ pub struct FuzzBuild {
 }
 
 impl Store {
-    /// Copies the fuzzer binary at `binary` into the store with its build
-    /// record, and returns the record. Saving one binary twice with one
-    /// identity keeps the first copy. Refuses a binary the store already
-    /// holds with another identity.
+    /// Saves the fuzzer binary `bytes` in the store with its build record,
+    /// and returns the record. Saving one binary twice with one identity
+    /// keeps the first copy. Refuses a binary the store already holds with
+    /// another identity.
     pub fn save_build(
         &self,
-        binary: &Path,
+        bytes: &[u8],
         identity: BuildIdentity,
     ) -> Result<FuzzBuild, CampaignError> {
-        let bytes =
-            fs::read(binary).map_err(CampaignError::io(format!("reading {}", binary.display())))?;
         let build = FuzzBuild {
             version: STORE_VERSION,
-            binary: Digest::of(&bytes),
+            binary: Digest::of(bytes),
             identity,
         };
         let dir = self.build_dir(&build.binary);
@@ -148,7 +146,7 @@ impl Store {
         let fuzzer = dir.join(FUZZER_FILE);
         if !fuzzer.exists() {
             let partial = partial_path(&dir);
-            let copied = fs::write(&partial, &bytes)
+            let copied = fs::write(&partial, bytes)
                 .and_then(|()| fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)))
                 .and_then(|()| fs::File::open(&partial)?.sync_all())
                 .and_then(|()| fs::rename(&partial, &fuzzer))
@@ -204,15 +202,18 @@ impl Store {
 
 /// Builds fuzz target `target` of [`FUZZ_PACKAGE`] in the checkout at
 /// `repo` with `cargo +NIGHTLY fuzz build`, into `target_dir`, and returns
-/// the binary's path and its identity. `sanitizer` is cargo-fuzz's
+/// the binary's bytes and its identity. `sanitizer` is cargo-fuzz's
 /// `--sanitizer`; `none` also turns off the default features, as the fuzz
 /// package's README says.
+///
+/// Refuses if the checkout changed while cargo built and the binary was
+/// read, since the binary may then come from neither state.
 pub fn build_fuzzer(
     repo: &Path,
     target: &str,
     sanitizer: &str,
     target_dir: &Path,
-) -> Result<(PathBuf, BuildIdentity), CampaignError> {
+) -> Result<(Vec<u8>, BuildIdentity), CampaignError> {
     let package = repo.join(FUZZ_PACKAGE);
     let manifest = package.join("Cargo.toml");
     let manifest_text = fs::read_to_string(&manifest)
@@ -228,33 +229,30 @@ pub fn build_fuzzer(
         cargo_args.push("--no-default-features".to_owned());
     }
     let rustflags = SIM_RUSTFLAGS.to_owned();
-    let status = toolchain_command("cargo")
-        .args(["fuzz", "build", "--fuzz-dir"])
-        .arg(&package)
-        .arg("--target-dir")
-        .arg(target_dir)
-        .args(&cargo_args)
-        .arg(target)
-        .current_dir(&package)
-        .env("RUSTFLAGS", &rustflags)
-        .status()
-        .map_err(CampaignError::io("running cargo fuzz build"))?;
-    if !status.success() {
-        return Err(CampaignError::Refused(format!(
-            "cargo fuzz build of {target} failed with {status}"
-        )));
-    }
-    let host = output(toolchain_command("rustc").arg("-vV"))?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
-        .ok_or_else(|| CampaignError::Refused("`rustc -vV` names no host".to_owned()))?;
-    let binary = target_dir.join(host).join("release").join(target);
-    let mut paths = provenance::SOURCE_PATHS.to_vec();
-    paths.push(FUZZ_PACKAGE);
-    let checkout = provenance::Provenance::read(repo, &paths);
-    let digest = |path: PathBuf| {
-        provenance::file_digest(&path).unwrap_or_else(|| provenance::UNKNOWN.to_owned())
-    };
+    let (bytes, checkout) = while_unchanged(repo, || {
+        let status = toolchain_command("cargo")
+            .args(["fuzz", "build", "--fuzz-dir"])
+            .arg(&package)
+            .arg("--target-dir")
+            .arg(target_dir)
+            .args(&cargo_args)
+            .arg(target)
+            .current_dir(&package)
+            .env("RUSTFLAGS", &rustflags)
+            .status()
+            .map_err(CampaignError::io("running cargo fuzz build"))?;
+        if !status.success() {
+            return Err(CampaignError::Refused(format!(
+                "cargo fuzz build of {target} failed with {status}"
+            )));
+        }
+        let host = output(toolchain_command("rustc").arg("-vV"))?
+            .lines()
+            .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+            .ok_or_else(|| CampaignError::Refused("`rustc -vV` names no host".to_owned()))?;
+        let binary = target_dir.join(host).join("release").join(target);
+        fs::read(&binary).map_err(CampaignError::io(format!("reading {}", binary.display())))
+    })?;
     let fuzz_lock = package.join("Cargo.lock");
     let lock_text = fs::read_to_string(&fuzz_lock).map_err(CampaignError::io(format!(
         "reading {}",
@@ -267,8 +265,8 @@ pub fn build_fuzzer(
         git: checkout.git,
         dirty: checkout.dirty,
         source: checkout.source,
-        lockfile: digest(repo.join("Cargo.lock")),
-        fuzz_lockfile: digest(fuzz_lock.clone()),
+        lockfile: checkout.lockfile,
+        fuzz_lockfile: checkout.fuzz_lockfile,
         rustc: output(toolchain_command("rustc").arg("--version"))?
             .trim()
             .to_owned(),
@@ -281,7 +279,61 @@ pub fn build_fuzzer(
         rustflags,
         cargo_args,
     };
-    Ok((binary, identity))
+    Ok((bytes, identity))
+}
+
+/// The state of a checkout that a build record names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Checkout {
+    /// `HEAD`'s commit.
+    git: String,
+    /// True if the tree had changes under the source paths or the fuzz
+    /// package, or if git couldn't say.
+    dirty: bool,
+    /// The digest of the source paths and the fuzz package.
+    source: String,
+    /// The digest of the workspace's `Cargo.lock`.
+    lockfile: String,
+    /// The digest of the fuzz package's `Cargo.lock`.
+    fuzz_lockfile: String,
+}
+
+impl Checkout {
+    /// The checkout at `repo` as it is now.
+    fn read(repo: &Path) -> Checkout {
+        let mut paths = provenance::SOURCE_PATHS.to_vec();
+        paths.push(FUZZ_PACKAGE);
+        let provenance = provenance::Provenance::read(repo, &paths);
+        let digest = |path: PathBuf| {
+            provenance::file_digest(&path).unwrap_or_else(|| provenance::UNKNOWN.to_owned())
+        };
+        Checkout {
+            git: provenance.git,
+            dirty: provenance.dirty,
+            source: provenance.source,
+            lockfile: digest(repo.join("Cargo.lock")),
+            fuzz_lockfile: digest(repo.join(FUZZ_PACKAGE).join("Cargo.lock")),
+        }
+    }
+}
+
+/// Runs `build` in the checkout at `repo`, and returns its result with the
+/// checkout's state. Refuses if the state changed while `build` ran.
+fn while_unchanged<T>(
+    repo: &Path,
+    build: impl FnOnce() -> Result<T, CampaignError>,
+) -> Result<(T, Checkout), CampaignError> {
+    let before = Checkout::read(repo);
+    let built = build()?;
+    let after = Checkout::read(repo);
+    if before != after {
+        return Err(CampaignError::Refused(format!(
+            "the checkout at {} changed during the build, from {before:?} to {after:?}; build \
+             again from a tree that doesn't change",
+            repo.display()
+        )));
+    }
+    Ok((built, after))
 }
 
 /// `program` run with [`NIGHTLY`], with the variables of an enclosing
@@ -353,6 +405,37 @@ mod tests {
         let version = locked_version(lock, "libfuzzer-sys").expect("the fuzz package locks it");
         assert!(version.starts_with("0."), "{version}");
         assert_eq!(locked_version(lock, "no-such-package"), None);
+    }
+
+    /// A build records the checkout's state only if the state didn't change
+    /// while it built.
+    #[test]
+    fn a_checkout_that_changes_during_the_build_is_refused() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let source = repo.path().join("crates/a.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn a() {}").unwrap();
+        let (built, checkout) = while_unchanged(repo.path(), || Ok(1)).unwrap();
+        assert_eq!(built, 1);
+        assert_eq!(checkout, Checkout::read(repo.path()));
+        let refused = while_unchanged(repo.path(), || {
+            fs::write(&source, "fn b() {}").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("changed during the build"),
+            "{refused}"
+        );
     }
 
     /// The fuzz package maps each of its targets to a registered harness.

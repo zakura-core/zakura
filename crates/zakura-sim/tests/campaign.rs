@@ -141,7 +141,10 @@ impl Fixture {
         .unwrap();
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
         let store = Store::open(&dir.path().join("store")).unwrap();
-        let build = store.save_build(&stub, identity()).unwrap().binary;
+        let build = store
+            .save_build(&fs::read(&stub).unwrap(), identity())
+            .unwrap()
+            .binary;
         Fixture {
             dir,
             store,
@@ -756,7 +759,11 @@ fn incompatible_runs_start_a_new_segment() {
     .unwrap();
     let mut changed = identity();
     changed.cargo_args = vec!["--sanitizer".to_owned(), "none".to_owned()];
-    let other_build = fixture.store.save_build(&other, changed).unwrap().binary;
+    let other_build = fixture
+        .store
+        .save_build(&fs::read(&other).unwrap(), changed)
+        .unwrap()
+        .binary;
     fixture.unset("ran");
     let refused = campaign::prepare_resume(
         &fixture.store,
@@ -843,7 +850,7 @@ fn a_run_names_the_harness_its_fuzzer_runs() {
     let mut options = fixture.options(1, 1);
     options.build = fixture
         .store
-        .save_build(&fixture.variant("fixtures"), fixtures)
+        .save_build(&fs::read(fixture.variant("fixtures")).unwrap(), fixtures)
         .unwrap()
         .binary;
     let refused = campaign::prepare_start(&fixture.store, options).unwrap_err();
@@ -867,7 +874,7 @@ fn dirty_builds_resume_only_on_their_own_binary() {
     let save = |tag: &str, identity: BuildIdentity| {
         fixture
             .store
-            .save_build(&fixture.variant(tag), identity)
+            .save_build(&fs::read(fixture.variant(tag)).unwrap(), identity)
             .unwrap()
             .binary
     };

@@ -200,7 +200,6 @@ async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
                     }
                 },
                 |_| async { Ok(()) },
-                None,
             )
             .await;
         assert_eq!(result.is_ok(), encodes);

@@ -218,7 +218,6 @@ async fn the_writer_ends_each_output_with_its_outcome() {
                     }
                     Ok(())
                 },
-                Some(&life),
             );
             let mut write = pin!(write);
             match poll_once(write.as_mut()) {

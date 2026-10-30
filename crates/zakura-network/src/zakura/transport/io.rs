@@ -449,6 +449,7 @@ impl GuardedFrameSlot<'_> {
             guard: None,
             claim: Some(claim),
             life,
+            handle: None,
         };
         let handle = queued.handle();
         self.permit.send(queued);
@@ -517,6 +518,10 @@ pub(crate) struct QueuedFrame {
     /// until the writer takes it out at dequeue.
     #[cfg(any(test, zakura_sim))]
     life: Option<OutputLife>,
+    /// A handle on the life once the writer took it out, so the write
+    /// records its outcome there (see [`Self::take_life`]).
+    #[cfg(any(test, zakura_sim))]
+    handle: Option<OutputHandle>,
 }
 
 impl QueuedFrame {
@@ -538,6 +543,8 @@ impl QueuedFrame {
             claim: None,
             #[cfg(any(test, zakura_sim))]
             life: None,
+            #[cfg(any(test, zakura_sim))]
+            handle: None,
         }
     }
 
@@ -548,6 +555,8 @@ impl QueuedFrame {
             claim: None,
             #[cfg(any(test, zakura_sim))]
             life: None,
+            #[cfg(any(test, zakura_sim))]
+            handle: None,
         }
     }
 
@@ -566,10 +575,13 @@ impl QueuedFrame {
     }
 
     /// Takes the frame's output life out, for the writer at dequeue, so it
-    /// outlives the cancellable write.
+    /// outlives the cancellable write. The frame keeps a handle, so
+    /// [`Self::encode_and_write_with`] records the write's outcome on it.
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn take_life(&mut self) -> Option<OutputLife> {
-        self.life.take()
+        let life = self.life.take();
+        self.handle = life.as_ref().map(OutputLife::handle);
+        life
     }
 
     /// Split the frame from its guard while retaining both in the caller.
@@ -584,7 +596,7 @@ impl QueuedFrame {
         F: FnOnce(Frame) -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
-        self.encode_and_write_with(Ok, write, None).await
+        self.encode_and_write_with(Ok, write).await
     }
 
     /// Encode the frame, then claim it and run the transport write while
@@ -621,14 +633,17 @@ impl QueuedFrame {
     }
 
     /// [`Self::encode_and_write_with`] as the release build runs it, setting
-    /// the phase of `life`, the frame's output life the writer took out at
-    /// dequeue, at each outcome. `write` marks the write started.
+    /// the phase of the frame's output life at each outcome, through the
+    /// handle [`Self::take_life`] left, or on the life itself if the writer
+    /// didn't take it out. `write` marks the write started.
+    ///
+    /// The signature matches the release build's, so the writer's call site
+    /// is the same in both.
     #[cfg(any(test, zakura_sim))]
     pub(crate) async fn encode_and_write_with<P, E, Enc, F, Fut>(
         self,
         encode: Enc,
         write: F,
-        life: Option<&OutputLife>,
     ) -> Result<(), E>
     where
         Enc: FnOnce(Frame) -> Result<P, E>,
@@ -639,13 +654,14 @@ impl QueuedFrame {
             frame,
             guard: _guard,
             claim,
-            life: unowned,
+            life,
+            handle,
         } = self;
-        debug_assert!(unowned.is_none(), "the writer takes the life out first");
-        drop(unowned);
+        // A life still here drops when this returns, after its outcome.
+        let handle = handle.or_else(|| life.as_ref().map(OutputLife::handle));
         let set = |phase| {
-            if let Some(life) = life {
-                life.set(phase);
+            if let Some(handle) = &handle {
+                handle.0.phase.set(phase);
             }
         };
         let encoded = match encode(frame) {

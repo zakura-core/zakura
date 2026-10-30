@@ -5145,7 +5145,8 @@ async fn persistent_stream_worker_with_policy(
                 match outbound {
                     Some(queued_frame) => {
                         // The frame's output life leaves the frame here, so it
-                        // outlives the cancellable write below (M6a-6).
+                        // outlives the cancellable write below (M6a-6). The
+                        // frame keeps a handle that records the write's outcome.
                         #[cfg(any(test, zakura_sim))]
                         let (queued_frame, life) = {
                             let mut queued_frame = queued_frame;
@@ -5171,7 +5172,7 @@ async fn persistent_stream_worker_with_policy(
                             // Encode before the request claim, so a frame that
                             // doesn't fit starts no exchange and its session can
                             // retire without closing the connection.
-                            result = sim_arg!(queued_frame.encode_and_write_with(
+                            result = queued_frame.encode_and_write_with(
                                 |frame| encode_ordered_frame(
                                     frame, context.limits, context.outbound_frame_cap,
                                 ),
@@ -5191,7 +5192,7 @@ async fn persistent_stream_worker_with_policy(
                                     }
                                 }
                                 result
-                            }); life.as_ref()) => result,
+                            }) => result,
                         };
                         if let Err(error) = result {
                             if error.is::<OrderedFrameWriteTimeout>() {

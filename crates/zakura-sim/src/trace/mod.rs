@@ -38,6 +38,7 @@ pub use replay::{
     ReplayReport, OBSERVATIONS_FILE,
 };
 pub use shrink::{shrink, shrink_with, Candidate, ShrinkBudget, ShrinkError, ShrinkReport};
+pub(crate) use verify::trace_difference;
 pub use write::{BlobStore, FileSink};
 
 /// The records, one JSON object per line.

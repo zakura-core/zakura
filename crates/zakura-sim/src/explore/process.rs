@@ -19,7 +19,8 @@ use crate::{
 };
 
 /// How a child process ended, as its supervisor saw it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProcessExit {
     /// It exited with this code.
     Code(i32),
@@ -125,7 +126,8 @@ impl ProcessFailure {
 }
 
 /// What a child process's run came to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "kebab-case")]
 pub enum ProcessResult {
     /// The child wrote its `end` record and didn't fail.
     Ended(Classified),
@@ -142,9 +144,10 @@ pub enum ProcessResult {
 }
 
 /// A child process's run, classified.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProcessClassified {
     /// What the run came to.
+    #[serde(flatten)]
     pub result: ProcessResult,
     /// The last step the trace holds, 0 if it holds none or doesn't read
     /// as a valid prefix.
@@ -160,6 +163,27 @@ impl ProcessClassified {
             ProcessResult::Ended(classified) => classified.outcome.bucket(),
             ProcessResult::Crashed { .. } => Some(Bucket::Crash),
             ProcessResult::NoEnd => Some(Bucket::NoEnd),
+        }
+    }
+
+    /// Every bucket the result files under, without repeats, in [`Bucket`]
+    /// order: `crash` for a failed child, with each bucket of the `end`
+    /// record it wrote first; `no-end` for a run without its `end` record;
+    /// and else [`Classified::buckets`]. Empty only for a clean run.
+    pub fn buckets(&self) -> Vec<Bucket> {
+        match &self.result {
+            ProcessResult::Ended(classified) => classified.buckets(),
+            ProcessResult::Crashed { end, .. } => {
+                let mut buckets: Vec<Bucket> = end
+                    .iter()
+                    .flat_map(Classified::buckets)
+                    .chain([Bucket::Crash])
+                    .collect();
+                buckets.sort();
+                buckets.dedup();
+                buckets
+            }
+            ProcessResult::NoEnd => vec![Bucket::NoEnd],
         }
     }
 }

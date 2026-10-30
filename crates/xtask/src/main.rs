@@ -137,6 +137,8 @@ fn try_main() -> Result<(), BoxError> {
             sim_feedback::run(&repo_root()?)
         }
         Some("sim-minimize") => sim_minimize::run(&repo_root()?, args),
+        Some("sim-triage") => sim::run(&repo_root()?, "triage", args),
+        Some("sim-verify-archive") => sim::run(&repo_root()?, "verify-archive", args),
         Some("sim-campaign") => sim::run(&repo_root()?, "campaign", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -375,6 +377,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
+        "  cargo xtask sim-triage --sim <name> --out <dir> [--child-secs <s>] <input>..."
+    )?;
+    writeln!(output, "  cargo xtask sim-verify-archive <dir>")?;
+    writeln!(
+        output,
         "  cargo xtask sim-campaign (build|start|resume|close|status|verify) --store <dir> ..."
     )?;
     writeln!(output)?;
@@ -480,6 +487,24 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "only if fresh processes confirm the same property, assumptions, witness and build."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Records each fuzz input twice in fresh zakura-sim processes, each killed at its time"
+    )?;
+    writeln!(
+        output,
+        "limit, replays the first trace Exact, and archives the input with its runs."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Checks every bundle in a triage archive against its checksums, and counts the"
+    )?;
+    writeln!(
+        output,
+        "bundles under each harness, provenance and signature."
     )?;
     writeln!(output)?;
     writeln!(

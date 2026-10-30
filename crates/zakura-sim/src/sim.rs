@@ -333,7 +333,10 @@ impl Sim {
         self.choices.borrow_mut().set_owner(Owner::Harness);
         // Read once, so a run never emits only some of its steps.
         let record_steps = sink.wants_steps();
-        if let Err(failure) = self.observe_sources(st) {
+        if let Err(failure) = self
+            .observe_sources(st)
+            .and_then(|()| self.settle_sources(st))
+        {
             return st.end_harness(failure);
         }
         let mut ready = match self.ready(st) {
@@ -456,7 +459,8 @@ impl Sim {
                 // has run since.
                 Action::RunTask(_) => executed,
                 _ => executed.and_then(|()| self.observe_sources(st)),
-            };
+            }
+            .and_then(|()| self.settle_sources(st));
 
             let next = self.ready(st);
             if record_steps {
@@ -578,6 +582,18 @@ impl Sim {
             Some(failure) => Err(failure),
             None => self.check_evidence(st),
         }
+    }
+
+    /// Lets every source settle the step, now that its rows, the task's
+    /// outcome included, are logged. The first failure is returned.
+    fn settle_sources(&mut self, st: &State) -> Result<(), HarnessFailure> {
+        let mut failed = None;
+        for source in &mut self.sources {
+            if let Err(failure) = source.settle(&st.log) {
+                failed.get_or_insert(failure);
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 
     /// The evidence failure that ends a run which `end` didn't already end

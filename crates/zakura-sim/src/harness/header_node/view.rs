@@ -2,27 +2,34 @@
 //! the tier's [`SourceManifest`], folded by the evidence hub at each step
 //! boundary.
 //!
-//! No component has a read yet. Each one that M6a-3 onward adds registers
-//! it, gives [`Reading`] its state, and wires its existence evidence. Until
-//! then every component stays `Initializing`, so a property that needs one
-//! ends `Inconclusive`, never `Held`.
+//! Only the reactor has a read so far (M6a-3), folded from its own settled
+//! snapshots. Each component that M6a-4 onward adds registers its read,
+//! gives [`Reading`] its state, and wires its existence evidence. Until
+//! then the others stay `Initializing`, so a property that needs one ends
+//! `Inconclusive`, never `Held`.
 
 use std::collections::BTreeMap;
 
 use crate::{
     harness::header_sync::SourceManifest,
+    observe::ReactorSnapshot,
     property::{Capture, Component, ComponentKind, Read, TagPhase, Tagged},
 };
 
-/// A header component's read state. It has no variant yet: each read M6a-3
-/// onward adds gives it one.
+/// A header component's read state: one variant per component that has a
+/// read.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Reading {}
+pub enum Reading {
+    /// The reactor's last settled snapshot.
+    Reactor(ReactorSnapshot),
+}
 
 impl Tagged for Reading {
-    /// Never called, since no reading exists.
+    /// None: the reactor's snapshot lists no tagged objects yet.
     fn in_flux(&self) -> Option<TagPhase> {
-        match *self {}
+        match self {
+            Reading::Reactor(_) => None,
+        }
     }
 }
 
@@ -89,6 +96,11 @@ impl<R: Clone + PartialEq> HeaderSyncView<R> {
     /// Folds `kind`'s read at `step`'s boundary.
     pub fn read(&mut self, kind: ComponentKind, step: u64, read: Read<R>) {
         self.fold(kind, |component| component.read(step, read));
+    }
+
+    /// Ends `kind` at `step`'s boundary, seen with `state` or unsettled.
+    pub fn end(&mut self, kind: ComponentKind, step: u64, state: Option<R>) {
+        self.fold(kind, |component| component.end(step, state));
     }
 
     /// Runs `fold` on `kind`'s component, keeping the first failure. A
@@ -365,25 +377,33 @@ mod tests {
 
     /// `Storage`'s view holds the storage tier's components, each
     /// `Initializing` before any source observes, and the hub closes its
-    /// boundaries, so after a run the view shows the last step's.
+    /// boundaries, so after a run the view shows the last step's: the
+    /// reactor, which reports its own state, has started, and the rest,
+    /// which have no read yet, are still `Initializing`.
     #[test]
     fn the_storage_tier_has_the_composite_view() {
         let scenario = StorageScenario::default();
         let mut sim = Sim::new(Storage::config(&scenario), Plan::from_fuzz(&[]));
         let storage = Storage::build(&mut sim, &scenario, Storage::prepare(&scenario));
         assert_eq!(storage.captured(), Capture::Missing, "no boundary yet");
-        let kinds = |view: &HeaderSyncView| {
+        let kinds = |view: &HeaderSyncView, started: bool| {
             view.manifest()
                 .rows()
                 .iter()
                 .map(|row| {
                     let component = view.component(row.kind).expect("a row has a component");
-                    assert_eq!(component.state(), State::Initializing);
+                    let reactor = started && row.kind == ComponentKind::Reactor;
+                    assert_eq!(
+                        component.state() == State::Initializing,
+                        !reactor,
+                        "{:?}",
+                        row.kind
+                    );
                     row.kind
                 })
                 .collect::<Vec<_>>()
         };
-        let before = kinds(&storage.view().owners.borrow());
+        let before = kinds(&storage.view().owners.borrow(), false);
         assert_eq!(
             before,
             [
@@ -398,7 +418,7 @@ mod tests {
         assert_eq!(report.end.harness, None);
         assert!(report.end.steps > 0, "the run takes steps");
         assert_eq!(storage.captured(), Capture::AfterStep(report.end.steps));
-        assert_eq!(kinds(&storage.view().owners.borrow()), before);
+        assert_eq!(kinds(&storage.view().owners.borrow(), true), before);
     }
 
     /// A property that holds at several boundaries, then needs a component

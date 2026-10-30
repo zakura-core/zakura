@@ -1377,6 +1377,119 @@ pub enum ReactorFact {
         /// The peer's current session then, if it had one.
         current: Option<u64>,
     },
+    /// The reactor settled before a wait, or, with `last`, as its loop
+    /// ended (M6a-3). Every one is logged, but its snapshot only when it
+    /// differs from the reactor's previous one.
+    Settled {
+        /// The turn that ends here, 0 at build.
+        turn: u64,
+        /// Whether the loop ended.
+        last: bool,
+        /// The reactor's state, or `None` when it equals the previous
+        /// `Settled`'s.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot: Option<Box<ReactorSnapshot>>,
+    },
+    /// The reactor resumed from a wait, or started, and its state is in
+    /// transition until the next `Settled` (M6a-3).
+    Resumed {
+        /// The turn that starts here.
+        turn: u64,
+        /// Where: `start`, `fatal-wait`, or the loop arm, such as `event`.
+        arm: String,
+    },
+}
+
+/// The header-sync reactor's settled state in plain fields (M6a-3). Every
+/// list is in the reactor's peer order.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReactorSnapshot {
+    /// The committed snapshot it last adopted, if any.
+    pub adopted: Option<ReactorAdopted>,
+    /// Each admitted peer's current session.
+    pub sessions: Vec<ReactorSession>,
+    /// Peers with a readmission cooldown.
+    pub cooldowns: Vec<String>,
+    /// Peers with a continuation-locator read in flight.
+    pub pending_locators: Vec<String>,
+    /// Port calls dispatched and not yet handled.
+    pub unhandled_calls: Vec<u64>,
+    /// Each peer's queued work.
+    pub work: Vec<ReactorWork>,
+}
+
+/// The committed snapshot fields the reactor schedules from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorAdopted {
+    /// The selected-header generation.
+    pub header_generation: u64,
+    /// The finalized anchor.
+    pub finalized: StoragePoint,
+    /// The selected header tip.
+    pub header_best: StoragePoint,
+}
+
+/// An admitted peer's current session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorSession {
+    /// The peer.
+    pub peer: String,
+    /// Its session.
+    pub session_id: u64,
+    /// `inbound` or `outbound`.
+    pub direction: String,
+}
+
+/// One peer's queued work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorWork {
+    /// The peer.
+    pub peer: String,
+    /// The owning session.
+    pub session_id: u64,
+    /// The advertised target.
+    pub target: String,
+    /// Where it stands.
+    pub state: ReactorWorkState,
+}
+
+/// Where one peer's work stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "phase", rename_all = "kebab-case")]
+pub enum ReactorWorkState {
+    /// Staged, waiting for its locator.
+    AwaitingLocator {
+        /// The header authority it was staged under.
+        scope: WorkScope,
+    },
+    /// An active request.
+    Active {
+        /// Its correlation ID.
+        request_id: u64,
+        /// Its work owner.
+        owner: WorkOwner,
+        /// Why it started.
+        purpose: ReactorPurpose,
+        /// `receiving`, `preparing` or `applying`.
+        target_phase: String,
+        /// The staged headers it holds.
+        held: u64,
+        /// The cursor of its last staged page.
+        cursor: Option<ReactorCursor>,
+    },
+}
+
+/// A subscription cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorCursor {
+    /// The last accepted header's height.
+    pub height: u32,
+    /// Its hash.
+    pub hash: String,
+    /// Header credit consumed through it.
+    pub headers: u64,
+    /// Byte credit consumed through it.
+    pub bytes: u64,
 }
 
 /// What a dispatched port call asks storage for.

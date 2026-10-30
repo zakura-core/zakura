@@ -19,13 +19,22 @@
 //! by the identity map after the record that let it resolve, naming the
 //! peer record's own position as its origin. After writing, the hub feeds
 //! the step to the storage policy's predicates in the same order.
+//!
+//! Once the step's task outcome is logged too, the hub's
+//! [`settle`](ActionSource::settle) folds each tapped reactor's settled
+//! state (see [`ReactorLife`]) and closes the owners' boundary.
 
 use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc};
 
-use super::header_node::{view::Owners, PredicateFeed};
+use super::header_node::{
+    settled::ReactorLife,
+    tap::ReactorLink,
+    view::{HeaderSyncView, Owners},
+    PredicateFeed,
+};
 use crate::{
     peer::{PeerRecord, PeerRecords, WireEvidence},
-    ActionSource, Boundary, Identity, Observation, ObservationLog,
+    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog,
 };
 
 /// The position a record the run's tasks emit now takes, from
@@ -108,6 +117,8 @@ pub struct EvidenceHub {
     predicates: Option<Rc<RefCell<PredicateFeed>>>,
     /// The owner view the hub closes each boundary of.
     owners: Option<Rc<RefCell<dyn Owners>>>,
+    /// Each tapped reactor's settled-state fold (M6a-3).
+    reactors: Vec<Rc<RefCell<ReactorLife>>>,
     /// Built under [`without_capture`], so it writes nothing.
     #[cfg(test)]
     off: bool,
@@ -185,6 +196,18 @@ impl EvidenceHub {
     /// Closes each boundary of `owners` after writing its step.
     pub(crate) fn owners(&mut self, owners: Rc<RefCell<dyn Owners>>) {
         self.owners = Some(owners);
+    }
+
+    /// Folds `link`'s reactor into a component at each boundary, and into
+    /// `view`'s reactor component too, if it's given. Returns the fold.
+    pub(crate) fn reactor(
+        &mut self,
+        link: ReactorLink,
+        view: Option<Rc<RefCell<HeaderSyncView>>>,
+    ) -> Rc<RefCell<ReactorLife>> {
+        let life = Rc::new(RefCell::new(ReactorLife::new(link, view)));
+        self.reactors.push(life.clone());
+        life
     }
 
     /// Closes the owners' boundary after `step`, if the hub has owners.
@@ -357,13 +380,13 @@ impl ActionSource for EvidenceHub {
         unreachable!("the evidence hub offers no actions");
     }
 
-    /// Writes this step's rows in key order, feeds them to the predicates,
-    /// then closes the owners' boundary. Every row is written even when one
-    /// fails, so a failure a source's record explains is logged with it.
+    /// Writes this step's rows in key order and feeds them to the
+    /// predicates. Every row is written even when one fails, so a failure a
+    /// source's record explains is logged with it.
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         #[cfg(test)]
         if self.off {
-            return self.close_owners(log.step());
+            return Ok(());
         }
         let (rows, ordered) = self.order(log);
         let start = log.entries().len();
@@ -379,10 +402,22 @@ impl ActionSource for EvidenceHub {
                 .feed(log.entries()[start..].iter().map(|entry| &entry.obs)),
             None => Ok(()),
         };
-        ordered
-            .and(written)
-            .and(fed)
-            .and(self.close_owners(log.step()))
+        ordered.and(written).and(fed)
+    }
+
+    /// Folds each reactor's rows and its task's outcome, now that the step
+    /// is logged, then closes the owners' boundary.
+    fn settle(&mut self, log: &ObservationLog) -> Result<(), HarnessFailure> {
+        let mut settled = Ok(());
+        for life in &self.reactors {
+            settled = settled.and(life.borrow_mut().settle(log));
+        }
+        settled?;
+        self.close_owners(log.step())
+            .map_err(|detail| HarnessFailure::SourceEvidence {
+                source: "evidence hub".to_owned(),
+                detail,
+            })
     }
 }
 

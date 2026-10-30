@@ -6,7 +6,7 @@
 
 use zakura_scheduler::{SimInstant, TaskId};
 
-use crate::{check::Phase, Identity, ObservationLog};
+use crate::{check::Phase, HarnessFailure, Identity, ObservationLog};
 
 /// A source's index in its run, from [`Sim::add_source`](crate::Sim::add_source).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,6 +70,16 @@ pub trait ActionSource {
     /// incomplete, which ends the run as a harness failure before that
     /// step's checker runs. The default appends nothing.
     fn observe(&mut self, _log: &mut ObservationLog) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Runs once the step's own rows, its task's outcome included, are in
+    /// `log`: after every source observed and before the step's checker.
+    /// It's how a source that folds a task's own reports learns where the
+    /// task stopped, or that it exited, in the same step. The run calls it
+    /// after setup and after every step. An `Err` ends the run as that
+    /// harness failure before the checker runs. The default does nothing.
+    fn settle(&mut self, _log: &ObservationLog) -> Result<(), HarnessFailure> {
         Ok(())
     }
 }

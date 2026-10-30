@@ -1060,7 +1060,8 @@ fn pick_after(report: &RunReport, after: u64, pred: impl Fn(&str) -> bool) -> Op
 }
 
 /// The node's reactor task, the first one spawned. Each step that logged one
-/// of its reactor's events picked it, which the test checks.
+/// of its reactor's events picked it, which the test checks, except the
+/// setup, where its build reports its first snapshot.
 const NODE_REACTOR: &str = "task:header_sync_reactor.1:";
 
 /// `mirror-0`'s link closes as soon as the node's apply has committed.
@@ -1097,7 +1098,15 @@ fn apply_committed_before_close_stays_committed() {
         let report = run_on(&scenario, &ports, input, &mut checker);
         drop(checker);
         let history = History::new(&report, initial_generation(&ports));
-        for (_, line, ..) in history.events() {
+        for (_, line, _, event) in history.events() {
+            if line.step == 0 {
+                // The reactor's build, at setup, reports its first snapshot.
+                assert!(
+                    matches!(event, ReactorFact::Settled { turn: 0, .. }),
+                    "{event:?}"
+                );
+                continue;
+            }
             let pick = report
                 .picks
                 .iter()

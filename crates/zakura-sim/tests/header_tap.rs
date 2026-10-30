@@ -816,6 +816,12 @@ fn an_event_after_the_port_is_gone_fails_port_gone() {
 /// The node at genesis syncing from `mirror-0` at A5 under the converging
 /// policy, with the node's reactor tapped if `tapped`.
 fn node_run(input: PlanInput, tapped: bool) -> RunReport {
+    node_run_losing(input, tapped, None)
+}
+
+/// [`node_run`], with the tapped observer losing the `lose`-th event its
+/// slot counts, if given.
+fn node_run_losing(input: PlanInput, tapped: bool, lose: Option<u64>) -> RunReport {
     let fixture = HeaderFixture::regtest();
     let node = Arc::new(ControlledPort::new(&fixture));
     let mirror = Arc::new(EnginePort::new(&fixture));
@@ -831,6 +837,16 @@ fn node_run(input: PlanInput, tapped: bool) -> RunReport {
                 PolicySource::new(sim, node.clone(), Policy::converging(), effects.clone());
             let (observer, storage) = if tapped {
                 let (observer, tap) = ReactorTap::new(sim, &node, "node");
+                let observer = match lose {
+                    Some(nth) => observer.wrapped(|inner| {
+                        Arc::new(LosesNth {
+                            inner,
+                            nth,
+                            seen: std::sync::atomic::AtomicU64::new(0),
+                        })
+                    }),
+                    None => observer,
+                };
                 (Some(observer), storage.with_tap(tap))
             } else {
                 (None, storage)
@@ -868,6 +884,87 @@ fn node_run(input: PlanInput, tapped: bool) -> RunReport {
     report
 }
 
+/// An observer that forwards every event to `inner` but the `nth`, from 1.
+#[derive(Debug)]
+struct LosesNth {
+    inner: Arc<dyn HeaderSyncObserver>,
+    nth: u64,
+    seen: std::sync::atomic::AtomicU64,
+}
+
+impl HeaderSyncObserver for LosesNth {
+    /// Forwards `event` unless it's the `nth`.
+    fn observe(&self, event: ReactorEvent) {
+        let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if seen != self.nth {
+            self.inner.observe(event);
+        }
+    }
+}
+
+/// A real reactor whose observer drops one event fails the run at the
+/// step that emitted it: its first `Settled`, at setup, a `Resumed`
+/// mid-run, and the last event before the run ends with `Unobserved`, and
+/// its last `CallEnded` with the storage receipt it leaves unpaired. The
+/// faithful run passes, and dropping changes no pick.
+///
+/// This fails if the tap checks only what its observer recorded.
+#[test]
+fn suppression_is_caught_at_the_first_middle_and_last_event() {
+    let input = PlanInput::Bytes(Vec::new());
+    let whole = node_run(input.clone(), true);
+    assert_eq!(whole.end.harness, None, "{:?}", whole.end);
+    let events: Vec<(u64, u64, &ReactorFact)> = whole
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor { seq, event, .. } => Some((*seq, entry.step, event)),
+            _ => None,
+        })
+        .collect();
+    let first = events[0];
+    assert!(
+        matches!(first.2, ReactorFact::Settled { turn: 0, .. }) && first.1 == 0,
+        "the first event is the build's Settled, at setup: {first:?}"
+    );
+    let resumes: Vec<_> = events
+        .iter()
+        .filter(|(_, _, event)| matches!(event, ReactorFact::Resumed { .. }))
+        .collect();
+    let middle = *resumes[resumes.len() / 2];
+    let call_end = *events
+        .iter()
+        .rev()
+        .find(|(_, _, event)| matches!(event, ReactorFact::CallEnded { .. }))
+        .expect("the run ends a call");
+    let last = *events.last().expect("the run has events");
+    assert!(
+        middle.1 > 0 && middle.1 < last.1,
+        "the middle Resumed is mid-run: {middle:?}"
+    );
+    // A lost call end leaves its storage receipt unpaired, which the
+    // storage source reports first, in the same step.
+    let tap = ("reactor:node#0", "Unobserved");
+    for ((seq, step, event), (failed_source, failure)) in [
+        (first, tap),
+        (middle, tap),
+        (call_end, ("source 0", "Unpaired")),
+        (last, tap),
+    ] {
+        let lost = node_run_losing(input.clone(), true, Some(seq));
+        let (source, detail) = evidence_failure(&lost);
+        assert_eq!(source, failed_source, "losing {event:?}: {detail}");
+        assert!(detail.starts_with(failure), "losing {event:?}: {detail}");
+        assert_eq!(lost.end.steps, step, "losing {event:?}");
+        assert_eq!(
+            support::picks(&lost),
+            support::picks(&whole)[..support::picks(&lost).len()],
+            "losing {event:?} changes no pick"
+        );
+    }
+}
+
 /// The storage entries of `report`'s log, in order, with their steps.
 fn storage_entries(report: &RunReport) -> Vec<(u64, &Observation)> {
     report
@@ -899,6 +996,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Retired { .. } => "retired",
                 ReactorFact::OfferWaiting { .. } => "offer-waiting",
                 ReactorFact::Misbehavior { .. } => "misbehavior",
+                ReactorFact::Settled { .. } => "settled",
+                ReactorFact::Resumed { .. } => "resumed",
             }),
             _ => None,
         })
@@ -908,7 +1007,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
 /// Tapping the node's reactor adds no scheduling point: under every plan, the
 /// run with the tap makes the same picks and logs the same storage entries
 /// as the run without it, and the node's dispatches, call ends, completions,
-/// starts and retirements all reach the log, in sequence.
+/// starts, retirements and settled markers all reach the log, in sequence.
 #[test]
 fn tap_adds_no_scheduling_point() {
     for input in inputs(16, 256) {
@@ -920,7 +1019,15 @@ fn tap_adds_no_scheduling_point() {
         assert!(event_kinds(&bare).is_empty());
         assert_eq!(
             event_kinds(&tapped),
-            BTreeSet::from(["dispatched", "call-ended", "handled", "started", "retired"])
+            BTreeSet::from([
+                "dispatched",
+                "call-ended",
+                "handled",
+                "started",
+                "retired",
+                "settled",
+                "resumed"
+            ])
         );
         let seqs: Vec<u64> = tapped
             .log

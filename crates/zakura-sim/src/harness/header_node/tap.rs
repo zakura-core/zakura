@@ -16,7 +16,11 @@
 //!
 //! The tap builds the reactor's [`ObserverSlot`] and keeps its delivery
 //! count, so an event the slot sent that the observer never recorded fails
-//! the run as `Unobserved`.
+//! the run as `Unobserved` (M6a-3). It logs every `Settled` and `Resumed`
+//! marker, but a snapshot only when it differs from the last one logged.
+//! Once an evidence hub audits the reactor's lifecycle, through
+//! `ReactorTap::link`, the tap leaves an observer dropped without a final
+//! `Settled` to the hub, which explains it by the reactor task's outcome.
 //!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
@@ -32,9 +36,9 @@ use std::{
 use zakura_network::zakura::{
     observe::{
         CallEnd, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, PortCall, ReactorEvent,
-        RequestRef, WaitCause,
+        ReactorSnapshot as Snapshot, RequestRef, ResumeArm, WaitCause, WorkPhase,
     },
-    HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
+    HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
 use zakura_scheduler::SimInstant;
@@ -45,7 +49,10 @@ use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     harness::evidence_hub::{position, Row},
-    observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
+    observe::{
+        ReactorAdopted, ReactorCall, ReactorCursor, ReactorFact, ReactorPurpose, ReactorRequest,
+        ReactorSession, ReactorSnapshot, ReactorWork, ReactorWorkState, StorageFact,
+    },
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
 };
@@ -64,6 +71,9 @@ pub struct ReactorTap {
     pairer: Pairer,
     /// The run's harness failure, set when a call panics.
     failure: Failure,
+    /// The last snapshot logged, which an unchanged `Settled` doesn't
+    /// repeat.
+    snapshot: Option<ReactorSnapshot>,
 }
 
 /// What the observer and the reader share.
@@ -84,6 +94,13 @@ struct TapState {
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
+    /// Set once the reactor reported its final `Settled`, after which its
+    /// observer may go.
+    finished: AtomicBool,
+    /// Set once an evidence hub audits the reactor's lifecycle, which then
+    /// explains an observer dropped without a final `Settled` by its task's
+    /// outcome (M6a-3).
+    audited: AtomicBool,
     buffer: Mutex<Buffer>,
 }
 
@@ -123,15 +140,28 @@ impl LiveEvidence for TapState {
     }
 
     /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is.
+    /// `ReactorGone` once the observer is, unless the reactor reported its
+    /// final `Settled` first or a hub audits its lifecycle, which reports
+    /// the drop itself once the reactor's task outcome explains it.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
-        } else if self.observer.strong_count() == 0 {
-            Some("ReactorGone: the tapped reactor dropped its observer during the run")
+        } else if self.unfinished_drop() && !self.audited.load(Ordering::Relaxed) {
+            Some(REACTOR_GONE)
         } else {
             None
         }
+    }
+}
+
+/// The failure for a reactor that dropped its observer with no final
+/// `Settled`.
+const REACTOR_GONE: &str = "ReactorGone: the tapped reactor dropped its observer during the run";
+
+impl TapState {
+    /// Whether the observer is gone with no final `Settled` before it.
+    fn unfinished_drop(&self) -> bool {
+        self.observer.strong_count() == 0 && !self.finished.load(Ordering::Relaxed)
     }
 }
 
@@ -161,6 +191,9 @@ impl HeaderSyncObserver for TapObserver {
                 0
             }
         };
+        if matches!(event, ReactorEvent::Settled { last: true, .. }) {
+            state.finished.store(true, Ordering::Relaxed);
+        }
         // Taken before the lock, which nothing else takes in between.
         let pos = position();
         let mut buffer = state.buffer();
@@ -199,6 +232,8 @@ impl ReactorTap {
                 emitted: Arc::clone(&emitted),
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
+                audited: AtomicBool::new(false),
                 buffer: Mutex::default(),
             }))
         });
@@ -219,6 +254,7 @@ impl ReactorTap {
             delivered: 0,
             pairer: Pairer::default(),
             failure: sim.failure(),
+            snapshot: None,
         };
         (ObserverSlot::counting(observer, emitted), tap)
     }
@@ -226,6 +262,18 @@ impl ReactorTap {
     /// The tap's registration index among the run's taps.
     pub(crate) fn instance(&self) -> u64 {
         self.id.index
+    }
+
+    /// What a hub needs to audit this reactor's lifecycle. From now on the
+    /// tap leaves an observer dropped without a final `Settled` to the hub,
+    /// which explains it by the reactor task's outcome.
+    pub(crate) fn link(&self) -> ReactorLink {
+        self.state.audited.store(true, Ordering::Relaxed);
+        ReactorLink {
+            instance: self.id.index,
+            source: self.checkpoint.kind().source(self.id.index),
+            state: self.state.clone(),
+        }
     }
 
     /// Reads the node's storage facts that this step's drain logged, as
@@ -236,6 +284,22 @@ impl ReactorTap {
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
         self.pairer.facts(facts);
+    }
+}
+
+/// One tapped reactor, as the evidence hub's lifecycle audit sees it.
+pub(crate) struct ReactorLink {
+    /// The tap's index, which its rows carry.
+    pub(crate) instance: u64,
+    /// The tap's source label, for failures.
+    pub(crate) source: String,
+    state: Arc<TapState>,
+}
+
+impl ReactorLink {
+    /// Whether the reactor dropped its observer with no final `Settled`.
+    pub(crate) fn unfinished_drop(&self) -> bool {
+        self.state.unfinished_drop()
     }
 }
 
@@ -344,6 +408,93 @@ fn misbehavior(reason: HeaderSyncMisbehavior) -> &'static str {
     }
 }
 
+/// `at`'s name.
+fn arm(at: ResumeArm) -> &'static str {
+    match at {
+        ResumeArm::Start => "start",
+        ResumeArm::FatalWait => "fatal-wait",
+        ResumeArm::Shutdown => "shutdown",
+        ResumeArm::PortCompletion => "port-completion",
+        ResumeArm::LocatorPermit => "locator-permit",
+        ResumeArm::CapacityReleased => "capacity-released",
+        ResumeArm::Maintenance => "maintenance",
+        ResumeArm::Lifecycle => "lifecycle",
+        ResumeArm::Event => "event",
+        ResumeArm::Yield => "yield",
+        ResumeArm::CommittedSnapshot => "committed-snapshot",
+        ResumeArm::VctRepairs => "vct-repairs",
+    }
+}
+
+/// `direction`'s name.
+fn direction(direction: ServicePeerDirection) -> &'static str {
+    match direction {
+        ServicePeerDirection::Inbound => "inbound",
+        ServicePeerDirection::Outbound => "outbound",
+    }
+}
+
+/// `settled` in plain fields.
+fn snapshot(settled: Snapshot) -> ReactorSnapshot {
+    let peers = |peers: Vec<ZakuraPeerId>| peers.iter().map(peer).collect();
+    ReactorSnapshot {
+        adopted: settled.adopted.map(|adopted| ReactorAdopted {
+            header_generation: adopted.header_generation,
+            finalized: point(adopted.finalized),
+            header_best: point(adopted.header_best),
+        }),
+        sessions: settled
+            .sessions
+            .into_iter()
+            .map(|session| ReactorSession {
+                peer: peer(&session.peer),
+                session_id: session.session_id,
+                direction: direction(session.direction).to_owned(),
+            })
+            .collect(),
+        cooldowns: peers(settled.cooldowns),
+        pending_locators: peers(settled.pending_locators),
+        unhandled_calls: settled.unhandled_calls,
+        work: settled
+            .work
+            .into_iter()
+            .map(|work| ReactorWork {
+                peer: peer(&work.peer),
+                session_id: work.session_id,
+                target: hash(work.target_tip_hash),
+                state: match work.phase {
+                    WorkPhase::AwaitingLocator { scope: authority } => {
+                        ReactorWorkState::AwaitingLocator {
+                            scope: scope(authority),
+                        }
+                    }
+                    WorkPhase::Active {
+                        request_id,
+                        owner,
+                        purpose: why,
+                        phase: at,
+                        held,
+                        cursor,
+                    } => ReactorWorkState::Active {
+                        request_id,
+                        owner: work_owner(owner),
+                        purpose: purpose(why),
+                        target_phase: phase(at).to_owned(),
+                        // A queue holds at most a few thousand headers.
+                        held: held as u64,
+                        cursor: cursor.map(|cursor| ReactorCursor {
+                            height: cursor.height.0,
+                            hash: hash(cursor.hash),
+                            headers: cursor.headers,
+                            bytes: cursor.bytes,
+                        }),
+                    },
+                },
+            })
+            .collect(),
+    }
+}
+
 /// `event` in plain fields, or an error for an event this build can't
 /// encode.
 fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
@@ -398,6 +549,19 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             origin,
             current,
         },
+        ReactorEvent::Settled {
+            turn,
+            last,
+            snapshot: settled,
+        } => ReactorFact::Settled {
+            turn,
+            last,
+            snapshot: Some(Box::new(snapshot(*settled))),
+        },
+        ReactorEvent::Resumed { turn, arm: at } => ReactorFact::Resumed {
+            turn,
+            arm: arm(at).to_owned(),
+        },
         // The enum is non-exhaustive, and an event the log can't hold would
         // leave the evidence silently incomplete.
         unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
@@ -451,12 +615,21 @@ impl ReactorTap {
         let mut sent = Vec::with_capacity(events.len());
         let mut positions = Vec::with_capacity(events.len());
         for (seq, storage_seq, pos, event) in events {
+            let mut event = fact(event)?;
+            // Every marker is logged, but an unchanged snapshot only once.
+            if let ReactorFact::Settled { snapshot, .. } = &mut event {
+                let settled = snapshot.take().map(|settled| *settled);
+                if settled != self.snapshot {
+                    self.snapshot.clone_from(&settled);
+                    *snapshot = settled.map(Box::new);
+                }
+            }
             sent.push(Observation::Reactor {
                 instance: self.id.index,
                 seq,
                 storage_seq,
                 node: self.node.clone(),
-                event: fact(event)?,
+                event,
             });
             positions.push(pos);
         }
@@ -483,7 +656,11 @@ impl ReactorTap {
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or
             // `PortGone`, so the crash isn't read as a pairing bug.
-            Err(PairError::Evidence(_)) if self.state.health().is_some() => Ok(()),
+            Err(PairError::Evidence(_))
+                if self.state.health().is_some() || self.state.unfinished_drop() =>
+            {
+                Ok(())
+            }
             Err(PairError::Evidence(detail)) => Err(detail),
             Err(PairError::PortPanicked { call }) => {
                 // The run checks this after the step, ahead of any evidence

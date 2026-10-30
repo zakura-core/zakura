@@ -208,16 +208,7 @@ impl<T: Clone + PartialEq> Component<T> {
     /// Folds the read at `step`'s boundary. Fails on an unregistered read,
     /// a second read at one boundary, and a read after the component ended.
     pub fn read(&mut self, step: u64, read: Read<T>) -> Result<(), String> {
-        let kind = self.kind;
-        if !self.registered {
-            return Err(format!("{kind:?} was read at step {step} unregistered"));
-        }
-        if self.fresh_through.is_some_and(|at| at >= step) {
-            return Err(format!("{kind:?} was read twice at step {step}"));
-        }
-        if matches!(self.read, State::Ended(_)) {
-            return Err(format!("{kind:?} was read at step {step} after it ended"));
-        }
+        self.readable(step)?;
         let next = match (read, &self.read) {
             (Read::Current(state), _) => {
                 self.last_current = Some(step);
@@ -243,12 +234,53 @@ impl<T: Clone + PartialEq> Component<T> {
             }),
             (Read::Gone, _) => State::Ended(Ended::Unsettled),
         };
+        self.settle(step, next);
+        Ok(())
+    }
+
+    /// Ends it at `step`'s boundary, as that boundary's read, for an owner
+    /// whose end its own report shows, such as a loop's final snapshot:
+    /// seen at `step` with `state` if it's `Some`, or unsettled, as for a
+    /// loop cancelled mid-turn. Fails as [`read`](Self::read) does.
+    pub fn end(&mut self, step: u64, state: Option<T>) -> Result<(), String> {
+        self.readable(step)?;
+        let ended = match state {
+            Some(state) => {
+                self.last_current = Some(step);
+                Ended::Seen {
+                    last_seen: step,
+                    state,
+                }
+            }
+            None => Ended::Unsettled,
+        };
+        self.settle(step, State::Ended(ended));
+        Ok(())
+    }
+
+    /// Fails unless `step`'s boundary may read it: registered, not read at
+    /// `step` or later already, and not ended.
+    fn readable(&self, step: u64) -> Result<(), String> {
+        let kind = self.kind;
+        if !self.registered {
+            return Err(format!("{kind:?} was read at step {step} unregistered"));
+        }
+        if self.fresh_through.is_some_and(|at| at >= step) {
+            return Err(format!("{kind:?} was read twice at step {step}"));
+        }
+        if matches!(self.read, State::Ended(_)) {
+            return Err(format!("{kind:?} was read at step {step} after it ended"));
+        }
+        Ok(())
+    }
+
+    /// Records `next` as `step`'s state, counting it if it changed.
+    fn settle(&mut self, step: u64, next: State<T>) {
         if next != self.read {
             self.seq += 1;
             self.read = next;
         }
         self.fresh_through = Some(step);
-        Ok(())
     }
 }
 

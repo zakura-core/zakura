@@ -12,6 +12,7 @@
 
 mod pair;
 pub mod policy;
+pub mod settled;
 pub mod tap;
 pub mod view;
 
@@ -472,23 +473,7 @@ impl HeaderNode {
         dispatch: DispatchFlag,
         observer: Option<ObserverSlot>,
     ) -> Self {
-        let anchor = fixture.anchor();
-        let mut startup = HeaderSyncStartup::new(
-            fixture.network().clone(),
-            (anchor.height, anchor.hash),
-            FullStateFrontiers {
-                finalized_height: anchor.height,
-                verified_block_tip: anchor.height,
-                verified_block_hash: anchor.hash,
-            },
-            Some((tip.height, tip.hash)),
-            ZakuraHeaderSyncConfig::default(),
-            LOCAL_MAX_MESSAGE_BYTES,
-        );
-        let (vct_repairs, repairs) = watch::channel(VctRootRepairStatus::default());
-        startup.committed_snapshots = Some(port.selected_chain());
-        startup.vct_root_repairs = Some(repairs);
-        startup.header_chain_port = port.clone();
+        let (mut startup, vct_repairs) = startup(&port, fixture, tip);
         if let Some(observer) = observer {
             startup.observer = observer;
         }
@@ -515,6 +500,35 @@ impl HeaderNode {
             startup: facts,
         }
     }
+}
+
+/// A reactor's startup on `port`, whose selected chain ends at `tip`, as
+/// `zakurad` wires it: production config and timers and the port's own
+/// watch as the committed snapshots. Returns the VCT repair watch's sender
+/// too, which must outlive the reactor.
+pub(crate) fn startup(
+    port: &Arc<dyn Port>,
+    fixture: &HeaderFixture,
+    tip: Frontier,
+) -> (HeaderSyncStartup, watch::Sender<VctRootRepairStatus>) {
+    let anchor = fixture.anchor();
+    let mut startup = HeaderSyncStartup::new(
+        fixture.network().clone(),
+        (anchor.height, anchor.hash),
+        FullStateFrontiers {
+            finalized_height: anchor.height,
+            verified_block_tip: anchor.height,
+            verified_block_hash: anchor.hash,
+        },
+        Some((tip.height, tip.hash)),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    let (vct_repairs, repairs) = watch::channel(VctRootRepairStatus::default());
+    startup.committed_snapshots = Some(port.selected_chain());
+    startup.vct_root_repairs = Some(repairs);
+    startup.header_chain_port = port.clone();
+    (startup, vct_repairs)
 }
 
 /// One connection between two nodes, by their index in a [`Topology`].

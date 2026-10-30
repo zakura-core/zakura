@@ -886,3 +886,169 @@ fn a_refused_open_keeps_its_end() {
         "the connection lives"
     );
 }
+
+/// Records the node reactor's component state after every step.
+struct ReactorStates {
+    owners: Rc<RefCell<zakura_sim::harness::header_node::view::HeaderSyncView>>,
+    seen: Vec<&'static str>,
+}
+
+impl ReactorStates {
+    /// The reactor component's state, by name.
+    fn state(&self) -> &'static str {
+        use zakura_sim::property::{ComponentKind, Ended, State};
+        let owners = self.owners.borrow();
+        let state = owners
+            .component(ComponentKind::Reactor)
+            .expect("the wire tier has the reactor")
+            .state();
+        match state {
+            State::Initializing => "initializing",
+            State::Current { .. } => "current",
+            State::InTransition { .. } => "in-transition",
+            State::Ended(Ended::Seen { .. }) => "ended-seen",
+            State::Ended(Ended::Unsettled) => "ended-unsettled",
+        }
+    }
+}
+
+impl Checker for ReactorStates {
+    fn after_step(&mut self, _: &StepCtx<'_>) -> Option<Violation> {
+        let state = self.state();
+        self.seen.push(state);
+        None
+    }
+
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+}
+
+/// Runs the wire tier's `scenario` under `config`, recording the reactor's
+/// state after every step, indexed by step from 1.
+fn reactor_run(
+    scenario: &WireScenario,
+    config: zakura_sim::RunConfig,
+) -> (RunReport, Vec<&'static str>) {
+    use zakura_sim::property::HasView;
+    let mut sim = Sim::new(config, Plan::from_fuzz(&[]));
+    let node = HeaderWire::build(&mut sim, scenario, HeaderWire::prepare(scenario));
+    let mut states = ReactorStates {
+        owners: node.view().owners,
+        seen: Vec::new(),
+    };
+    let report = sim.run(&mut states, &mut MemorySink::default());
+    drop(node);
+    (report, states.seen)
+}
+
+/// Whether `obs` is the node reactor's task outcome.
+fn reactor_stop(obs: &Observation) -> bool {
+    obs.ran_task()
+        .is_some_and(|task| task.starts_with("header_sync_reactor"))
+}
+
+/// While the reactor handles a page that arrived through its `events` arm,
+/// it stops at the chunk budget's lock, mid-turn. At each such boundary the
+/// reactor is in transition, though its last snapshot is still the parked
+/// one, and it's current where it parks. Unchanged snapshots are logged as
+/// markers alone.
+///
+/// This fails if the reactor reports `Settled` at the top of the arm.
+#[test]
+fn a_mid_turn_boundary_is_in_transition() {
+    let mut scenario = honest(Vec::new());
+    scenario.peers[0]
+        .honest
+        .as_mut()
+        .expect("the peer is honest")
+        .chain = 1_200;
+    let (report, seen) = reactor_run(&scenario, HeaderWire::config(&scenario));
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let mut in_event_turn = false;
+    let mut mid_turn = Vec::new();
+    for entry in report.log.entries() {
+        match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Resumed { arm, .. },
+                ..
+            } => in_event_turn = arm == "event",
+            Observation::Reactor {
+                event: ReactorFact::Settled { .. },
+                ..
+            } => in_event_turn = false,
+            Observation::TaskReached {
+                site: Some(site), ..
+            } if reactor_stop(&entry.obs)
+                && in_event_turn
+                && site.contains("scheduler/peer_work.rs") =>
+            {
+                mid_turn.push(entry.step)
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !mid_turn.is_empty(),
+        "the reactor stops at the budget's lock while it handles an event"
+    );
+    for step in &mid_turn {
+        assert_eq!(seen[(step - 1) as usize], "in-transition", "at step {step}");
+        // a run's steps fit usize
+    }
+    assert!(seen.contains(&"current"), "the reactor parks too");
+    let snapshots: Vec<bool> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::Settled { snapshot, .. },
+                ..
+            } => Some(snapshot.is_some()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        snapshots.contains(&true) && snapshots.contains(&false),
+        "some settled turns change the snapshot and some don't"
+    );
+}
+
+/// A run cut off by its budget while the reactor runs leaves it pending: no
+/// harness failure, no final snapshot, and its task never exits.
+///
+/// This fails if every run end requires the reactor's final `Settled`.
+#[test]
+fn a_truncated_run_is_pending() {
+    let mut scenario = honest(Vec::new());
+    scenario.peers[0]
+        .honest
+        .as_mut()
+        .expect("the peer is honest")
+        .chain = 1_200;
+    let config = zakura_sim::RunConfig {
+        budget: 2_000,
+        drain_bound: 0,
+        ..HeaderWire::config(&scenario)
+    };
+    let (report, seen) = reactor_run(&scenario, config);
+    assert_eq!(
+        report.end.outcome,
+        zakura_sim::Outcome::Budget,
+        "{:?}",
+        report.end
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert!(
+        !report.log.entries().iter().any(|entry| {
+            matches!(&entry.obs, Observation::TaskExited { .. }) && reactor_stop(&entry.obs)
+        }),
+        "the reactor still runs"
+    );
+    assert!(
+        matches!(seen.last(), Some(&"current" | &"in-transition")),
+        "{:?}",
+        seen.last()
+    );
+}

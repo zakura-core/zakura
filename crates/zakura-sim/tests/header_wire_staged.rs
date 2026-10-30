@@ -10,14 +10,13 @@ mod support;
 
 use std::rc::Rc;
 
-use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Policy,
         },
-        header_sync::{HeaderWire, WireScenario, FAMILY},
+        header_sync::{staged_work_properties, HeaderWire, WireScenario, FAMILY},
         run_prepared,
         wire_plans::SavedPlan,
         HarnessError, Subsystem,
@@ -25,7 +24,6 @@ use zakura_sim::{
     observe::{ReactorCall, ReactorFact, ReactorWorkState},
     peer::{honest::HonestSpec, PeerSpec},
     property::{Assumptions, HasView, Registry, RegistryChecker},
-    table::{downstream_properties, Effect, StreamIdentity},
     Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -38,21 +36,12 @@ impl HasView for Nothing {
     fn view(&self) {}
 }
 
-/// The header family's `receiver-work-authorized` properties, one per
-/// response row. The other downstream templates need peer-side credit rows
-/// that `header-sync/wire` doesn't log yet.
+/// The header family's `receiver-work-authorized` properties on the wire
+/// tier's sources. The other downstream templates need peer-side credit
+/// rows that `header-sync/wire` doesn't log yet.
 fn work_checker() -> RegistryChecker<Nothing> {
-    let properties = downstream_properties::<Nothing>(
-        FAMILY,
-        &RegtestMessage::LAYOUT,
-        &[Effect::Work],
-        StreamIdentity::Exact,
-    )
-    .into_iter()
-    .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
-    .collect();
     RegistryChecker::new(
-        Registry::new(properties).expect("one per row"),
+        Registry::new(staged_work_properties()).expect("one per row"),
         Rc::new(Nothing),
         Assumptions::none(),
         &HeaderWire::sources(),
@@ -283,6 +272,13 @@ fn saved_plans_have_no_unframed_work() {
         let (prefix, bytes) = input.split_at(HeaderWire::SCENARIO_BYTES);
         let scenario = HeaderWire::draw(prefix);
         let report = run(&scenario, Plan::from_fuzz(bytes), &mut NoChecks);
+        assert_eq!(
+            report.end.harness,
+            None,
+            "{}: {:?}",
+            plan.name(),
+            report.end
+        );
         for entry in report.log.entries() {
             match entry.obs {
                 Observation::WorkAdmitted { .. } => admitted += 1,
@@ -294,4 +290,59 @@ fn saved_plans_have_no_unframed_work() {
         }
     }
     assert!(admitted > 0, "the saved Plans stage pages");
+}
+
+/// Each outcome the node handles names the frame it came in: the peer's
+/// outcome frame on the session's connection and QUIC stream, by its read
+/// seq. Today's honest runs handle only outcomes for work already gone,
+/// which is enough to follow the tag from the session reader.
+///
+/// This fails if the reader drops an outcome's frame tag.
+#[test]
+fn a_handled_outcome_names_its_frame() {
+    let report = run(&honest(1_200), Plan::from_fuzz(&[]), &mut NoChecks);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let mut named = 0;
+    for (at, entry) in entries.iter().enumerate() {
+        let Observation::Reactor {
+            event: ReactorFact::Outcome {
+                session_id, frame, ..
+            },
+            ..
+        } = &entry.obs
+        else {
+            continue;
+        };
+        let frame = frame.expect("a wire outcome names its frame");
+        let (connection, quic_stream) = entries[..at]
+            .iter()
+            .find_map(|before| match &before.obs {
+                Observation::Session {
+                    connection,
+                    quic_stream,
+                    session_id: s,
+                    ..
+                } if s == session_id => Some((*connection, *quic_stream)),
+                _ => None,
+            })
+            .expect("the outcome's session was admitted");
+        assert_eq!(frame.quic_stream, quic_stream);
+        assert!(
+            entries[..at].iter().any(|before| matches!(
+                &before.obs,
+                Observation::PeerFrame {
+                    connection: c,
+                    quic_stream: Some(q),
+                    seq,
+                    row: Some(row),
+                    ..
+                } if *c == connection && *q == quic_stream && *seq == frame.seq
+                    && row == "headers-outcome"
+            )),
+            "outcome frame {frame:?} is a peer outcome frame"
+        );
+        named += 1;
+    }
+    assert!(named > 0, "the node handled an outcome");
 }

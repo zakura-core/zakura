@@ -19,9 +19,23 @@
 //! also reports its own teardown, `Dropping`, from its `Drop`, so it ends
 //! there unsettled if no `Settled{last}` came first: cancelled, or aborted
 //! before its task's first poll. After `Dropping`, only its pending calls'
-//! `dropped` call ends, and their transfers' `dropped` ends, may follow. A task that completes with no
+//! `dropped` call ends, and their transfers' `dropped` ends, may follow,
+//! and once its teardown is done, when the task that reported `Dropping`
+//! exits, every call it dispatched must have ended, or the run fails as
+//! `UnendedCall`. That covers a call storage never took, whose lost end
+//! leaves no receipt to pair. Every dropped call's operation must have its
+//! drop receipt by then too, unless storage's shutdown removed it, or the
+//! run fails as `UnpairedDrop`. A run that ends before the teardown is done
+//! leaves both open. A task that completes with no
 //! `Settled{last}` fails the run as `NoFinalSnapshot`, and one that panics,
 //! which reports no teardown, ends unsettled at its exit.
+//!
+//! A wait is trusted to follow a `Settled`, since the reactor's only
+//! awaits are the two its `Settled` precedes, and `Resumed` leads every turn
+//! (`resume_markers_lead_each_turn` drives all twelve). A turn that skipped
+//! its `Resumed` and then awaited inside its arm with no `Settled` would
+//! look settled: that takes both faults, and its points and waits look
+//! like a `select!` polling its branch futures.
 //!
 //! The reactor is bound to the task that ran when it reported
 //! `Resumed{arm: start}`, by that task's scheduler name, which is unique
@@ -85,6 +99,11 @@ pub struct ReactorLife {
     in_transition: bool,
     /// Its work identities.
     work: WorkLedger,
+    /// The calls it dispatched that haven't ended.
+    open_calls: std::collections::BTreeSet<u64>,
+    /// Once it reported `Dropping`, the task that ran its teardown, or
+    /// `None` for one outside any task.
+    teardown_task: Option<Option<String>>,
 }
 
 impl ReactorLife {
@@ -103,6 +122,8 @@ impl ReactorLife {
             dropping: false,
             in_transition: false,
             work: WorkLedger::default(),
+            open_calls: std::collections::BTreeSet::new(),
+            teardown_task: None,
         }
     }
 
@@ -175,6 +196,15 @@ impl ReactorLife {
                     fact,
                     ReactorFact::TransferEnded { disposition, .. } if disposition == "dropped"
                 );
+            match fact {
+                ReactorFact::Dispatched { call, .. } => {
+                    self.open_calls.insert(*call);
+                }
+                ReactorFact::CallEnded { call, .. } => {
+                    self.open_calls.remove(call);
+                }
+                _ => {}
+            }
             if self.dropping && !dropped_call {
                 return Err(format!(
                     "AfterDropping: the reactor reported {fact:?} at step {step} after its \
@@ -272,6 +302,7 @@ impl ReactorLife {
                         ));
                     }
                     self.dropping = true;
+                    self.teardown_task = Some(ran.map(str::to_owned));
                 }
                 // The build's own effects, such as a startup repair's
                 // dispatch, come before its snapshot.
@@ -302,6 +333,28 @@ impl ReactorLife {
             },
             _ => None,
         };
+        // Its teardown can reach scheduling points, so it's done only once
+        // the task running it exits, or at once outside any task.
+        let torn_down = match &self.teardown_task {
+            Some(Some(task)) => {
+                ran == Some(task.as_str())
+                    && matches!(outcome, Some(Observation::TaskExited { .. }))
+            }
+            Some(None) => true,
+            None => false,
+        };
+        if let Some(call) = self.open_calls.first().filter(|_| torn_down) {
+            return Err(format!(
+                "UnendedCall: the reactor's teardown ended at step {step} with call {call} \
+                 dispatched and never ended"
+            ));
+        }
+        if let Some((call, op)) = self.link.waiting_drop.get().filter(|_| torn_down) {
+            return Err(format!(
+                "UnpairedDrop: the reactor's teardown ended at step {step} with call {call} \
+                 dropped and its operation {op} given no drop receipt or storage removal"
+            ));
+        }
         if let Some(Stop::Exited(exit)) = stop {
             self.exited = true;
             if !self.finished && *exit == Exit::Completed {
@@ -980,19 +1033,55 @@ mod tests {
         /// Aborts its task, while the test keeps another clone of its
         /// observer.
         Abort,
+        /// Aborts its task at setup, before its first poll.
+        Unpolled,
     }
 
     /// The real reactor, tapped and audited, starting at A5 with the VCT
     /// root at height 1 unavailable, so its build dispatches a context
     /// read, which storage holds. A task stops it as `stopping` says.
     fn repairing_run(stopping: Stopping) -> (RunReport, Rc<RefCell<ReactorLife>>) {
-        use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = repairing_storage(&mut fixture.sim, &fixture.port);
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let kept = (stopping == Stopping::Abort).then(|| slot.clone());
+        let held = spawn_repairing(&mut fixture.sim, &fixture.port, slot, stopping);
+        let (report, life) = fixture.run(&mut States::default());
+        drop((held, kept));
+        (report, life)
+    }
 
+    /// [`repairing_run`]'s shutdown with no observer, tap or audit, under
+    /// the same choices.
+    fn unobserved_repairing_run() -> RunReport {
+        let mut sim = Sim::new(
+            RunConfig {
+                budget: 1_000,
+                drain_bound: 0,
+                ..RunConfig::default()
+            },
+            Plan::from_fuzz(&[]),
+        );
+        let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+        let storage = repairing_storage(&mut sim, &port);
+        sim.add_source(Box::new(storage));
+        let held = spawn_repairing(&mut sim, &port, ObserverSlot::default(), Stopping::Shutdown);
+        let report = sim.run(&mut crate::NoChecks, &mut MemorySink::default());
+        drop((held, port));
+        report
+    }
+
+    /// Storage for [`repairing_run`], preloaded at A5, holding the VCT
+    /// context read.
+    fn repairing_storage(sim: &mut Sim, port: &Arc<ControlledPort>) -> PolicySource {
         use crate::harness::header_node::policy::{Allow, Hold, OpKind, Select, Trigger};
 
-        let (mut fixture, slot) = Fixture::new(1_000);
-        let header = HeaderFixture::regtest();
-        crate::harness::header_node::preload(fixture.port.engine(), &header, &Chain::main(5));
+        crate::harness::header_node::preload(
+            port.engine(),
+            &HeaderFixture::regtest(),
+            &Chain::main(5),
+        );
         let held = Policy {
             bound_ms: None,
             holds: vec![Hold {
@@ -1007,15 +1096,22 @@ mod tests {
             }],
             ..Policy::converging()
         };
-        let storage = PolicySource::new(
-            &mut fixture.sim,
-            fixture.port.clone(),
-            held,
-            Effects::default(),
-        );
-        let tap = fixture.tap.take().expect("the fixture has its tap");
-        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
-        let port: Arc<dyn Port> = fixture.port.clone();
+        PolicySource::new(sim, port.clone(), held, Effects::default())
+    }
+
+    /// Spawns [`repairing_run`]'s reactor on `port`, reporting through
+    /// `slot`, and its stopper. Returns what the run must keep until it
+    /// ends.
+    fn spawn_repairing(
+        sim: &mut Sim,
+        port: &Arc<ControlledPort>,
+        slot: ObserverSlot,
+        stopping: Stopping,
+    ) -> Box<dyn std::any::Any> {
+        use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+
+        let header = HeaderFixture::regtest();
+        let port: Arc<dyn Port> = port.clone();
         let (mut startup, _) = startup(&port, &header, Chain::main(5).tip(&header));
         let (repairs, repairs_rx) = zakura_rt::sync::watch::channel(VctRootRepairStatus {
             state: VctRootRepairState::Unavailable {
@@ -1025,22 +1121,77 @@ mod tests {
         });
         startup.vct_root_repairs = Some(repairs_rx);
         let shutdown = startup.shutdown.clone();
-        let kept = (stopping == Stopping::Abort).then(|| slot.clone());
         startup.observer = slot;
         let (handle, actions, reactor) =
             spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
-        fixture.sim.scheduler().spawn_root("stopper", async move {
+        if stopping == Stopping::Unpolled {
+            reactor.abort();
+            return Box::new((handle, actions, repairs));
+        }
+        sim.scheduler().spawn_root("stopper", async move {
             for _ in 0..8 {
                 zakura_rt::task::yield_now().await;
             }
             match stopping {
                 Stopping::Shutdown => shutdown.cancel(),
-                Stopping::Abort => reactor.abort(),
+                Stopping::Abort | Stopping::Unpolled => reactor.abort(),
             }
         });
-        let (report, life) = fixture.run(&mut States::default());
-        drop((handle, actions, repairs, kept));
-        (report, life)
+        Box::new((handle, actions, repairs))
+    }
+
+    /// Each step's pick, each task stop the log records, and the run's
+    /// choices.
+    fn schedule(report: &RunReport) -> (Vec<String>, Vec<String>, Plan) {
+        let picks = report
+            .picks
+            .iter()
+            .map(|pick| format!("{} {}", pick.step, pick.identity))
+            .collect();
+        let stops = report
+            .log
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::TaskSpawned { .. }
+                        | Observation::TaskReached { .. }
+                        | Observation::TaskWaiting { .. }
+                        | Observation::TaskParked { .. }
+                        | Observation::TaskExited { .. }
+                )
+            })
+            .map(|entry| format!("{} {:?}", entry.step, entry.obs))
+            .collect();
+        (picks, stops, report.resolved.clone())
+    }
+
+    /// Reporting a pending call dropped at teardown adds no scheduling
+    /// point: the reactor's startup read, still held at shutdown, ends
+    /// dropped in the observed and audited run, which takes the same
+    /// picks, task stops and choices as the same run unobserved.
+    ///
+    /// This fails if the dropped call's report reaches a scheduling point.
+    #[test]
+    fn a_dropped_call_adds_no_scheduling_point() {
+        let (observed, _) = repairing_run(Stopping::Shutdown);
+        assert_eq!(observed.end.harness, None, "{:?}", observed.end);
+        assert!(
+            reactor_facts(&observed)
+                .iter()
+                .any(|(_, fact)| matches!(fact,
+                ReactorFact::CallEnded { end, op: Some(_), .. } if end == "dropped")),
+            "the held read ends dropped"
+        );
+        let unobserved = unobserved_repairing_run();
+        assert_eq!(unobserved.end.harness, None, "{:?}", unobserved.end);
+        let (picks, stops, choices) = schedule(&observed);
+        assert!(
+            stops.iter().any(|stop| stop.contains("TaskReached")),
+            "the run records where tasks stopped"
+        );
+        assert_eq!((picks, stops, choices), schedule(&unobserved));
     }
 
     /// The facts of `report`'s node reactor, with their steps.
@@ -1183,6 +1334,56 @@ mod tests {
         }
     }
 
+    /// A reactor aborted before its task's first poll, with its build's
+    /// startup repair read never polled, reports `Dropping` and then, past
+    /// the release points of its earlier fields, the read's dropped end,
+    /// naming no operation since storage never took it. The run passes and
+    /// the reactor ends unsettled, since the call audit waits for the
+    /// cancelled task's exit.
+    ///
+    /// This fails if the audit runs at the first stop after `Dropping`.
+    #[test]
+    fn a_startup_repair_aborted_before_its_first_poll_ends_its_call() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = repairing_storage(&mut fixture.sim, &fixture.port);
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let (life, held) = {
+            let life = fixture.life.clone();
+            let held = spawn_repairing(&mut fixture.sim, &fixture.port, slot, Stopping::Unpolled);
+            (life, held)
+        };
+        fixture
+            .sim
+            .scheduler()
+            .spawn_root("idle", async { zakura_rt::task::yield_now().await });
+        let (report, _) = fixture.run(&mut States::default());
+        drop(held);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let facts = reactor_facts(&report);
+        let dropping = facts
+            .iter()
+            .position(|(_, fact)| matches!(fact, ReactorFact::Dropping { turn: 0 }))
+            .expect("the reactor tears down");
+        assert!(
+            matches!(facts[0].1, ReactorFact::Dispatched { call: 1, .. }),
+            "the build dispatches the read: {facts:?}"
+        );
+        let step = facts[dropping].0;
+        assert!(
+            report.log.entries().iter().any(|entry| entry.step == step
+                && matches!(&entry.obs, Observation::TaskReached { at, .. } if at.starts_with("release"))),
+            "the teardown reaches a release point in its first step"
+        );
+        assert!(
+            matches!(&facts[dropping + 1..], [(after, ReactorFact::CallEnded { call: 1, end, op: None })]
+                if end == "dropped" && *after > step),
+            "the read ends dropped at a later step: {facts:?}"
+        );
+        assert_eq!(life.borrow().task(), None, "it never started");
+        assert_eq!(name(life.borrow().component().state()), "ended-unsettled");
+    }
+
     /// A pairing failure that isn't a dropped call's receipt fails the run
     /// even in the step that ends the reactor: a call end with no dispatch,
     /// right before the final `Settled`, is `Mispaired`.
@@ -1253,7 +1454,27 @@ mod tests {
             ) -> futures::future::LocalBoxFuture<'static, u64>
             + 'static,
     {
-        let (mut fixture, slot) = Fixture::new(1_000);
+        scripted_teardown(1_000, |_| Box::new(States::default()), false, turn)
+    }
+
+    /// [`scripted_calls`] in a run of at most `budget` steps, checked by
+    /// the checker `checker` makes from the node's port. With `stuck`, the
+    /// reactor's teardown never finishes: after `Dropping` its task stops at
+    /// points until the run ends.
+    fn scripted_teardown<T>(
+        budget: u64,
+        checker: impl FnOnce(Arc<ControlledPort>) -> Box<dyn Checker>,
+        stuck: bool,
+        turn: T,
+    ) -> RunReport
+    where
+        T: FnOnce(
+                Arc<ControlledPort>,
+                ObserverSlot,
+            ) -> futures::future::LocalBoxFuture<'static, u64>
+            + 'static,
+    {
+        let (mut fixture, slot) = Fixture::new(budget);
         let storage = PolicySource::new(
             &mut fixture.sim,
             fixture.port.clone(),
@@ -1272,8 +1493,198 @@ mod tests {
             let turn = body.await;
             slot.emit(settled(turn, true));
             slot.emit(dropping(turn));
+            if stuck {
+                loop {
+                    point();
+                }
+            }
         });
-        fixture.run(&mut States::default()).0
+        let mut checker = checker(fixture.port.clone());
+        fixture.run(&mut *checker).0
+    }
+
+    /// Shuts the node's storage down, as the run would, at the boundary
+    /// after its first submission.
+    struct ShutsDownStorage {
+        port: Arc<ControlledPort>,
+        done: bool,
+    }
+
+    impl Checker for ShutsDownStorage {
+        fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+            let submitted = cx.log.of_step(cx.step).any(|obs| {
+                matches!(
+                    obs,
+                    Observation::Storage {
+                        fact: crate::observe::StorageFact::Submitted { .. },
+                        ..
+                    }
+                )
+            });
+            if submitted && !self.done {
+                self.done = true;
+                self.port.shut_down();
+            }
+            None
+        }
+
+        fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+            Vec::new()
+        }
+    }
+
+    /// Locator call 1, submitted, reported dropped with its future kept
+    /// alive past the turn, so no drop receipt ever comes.
+    fn dropped_without_receipt(
+        port: Arc<ControlledPort>,
+        slot: ObserverSlot,
+    ) -> futures::future::LocalBoxFuture<'static, u64> {
+        Box::pin(async move {
+            let pending = locator(&port, &slot, 1);
+            slot.emit(ReactorEvent::CallEnded {
+                call: 1,
+                end: zakura_network::zakura::observe::CallEnd::Dropped,
+            });
+            std::mem::forget(pending);
+            2
+        })
+    }
+
+    /// The failure detail of `report`'s source evidence failure, if any.
+    fn evidence_detail(report: &RunReport) -> Option<&str> {
+        match &report.end.harness {
+            Some(HarnessFailure::SourceEvidence { detail, .. }) => Some(detail),
+            _ => None,
+        }
+    }
+
+    /// A dropped call whose operation storage's shutdown removed needs no
+    /// drop receipt: storage shuts down once call 1 is submitted, the call
+    /// then ends dropped and its future drops, finding no slot, and the
+    /// reactor tears down with no failure, the call's end naming its
+    /// operation.
+    ///
+    /// This fails if the pairer ignores the shutdown's removals.
+    #[test]
+    fn a_drop_storage_removed_needs_no_receipt() {
+        let report = scripted_teardown(
+            1_000,
+            |port| Box::new(ShutsDownStorage { port, done: false }),
+            false,
+            |port, slot| {
+                Box::pin(async move {
+                    let mut turn = 2;
+                    let pending = locator(&port, &slot, 1);
+                    wait(&slot, &mut turn).await;
+                    wait(&slot, &mut turn).await;
+                    slot.emit(ReactorEvent::CallEnded {
+                        call: 1,
+                        end: zakura_network::zakura::observe::CallEnd::Dropped,
+                    });
+                    drop(pending);
+                    turn
+                })
+            },
+        );
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let storage: Vec<_> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::Storage { fact, .. } => Some(fact),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            storage.iter().any(|fact| matches!(fact,
+                crate::observe::StorageFact::ShutDown { dropped, .. } if dropped == &[1])),
+            "storage's shutdown removed operation 1: {storage:?}"
+        );
+        assert!(
+            !storage.iter().any(|fact| matches!(
+                fact,
+                crate::observe::StorageFact::CallerDropped { .. }
+                    | crate::observe::StorageFact::ReplyDropped { .. }
+            )),
+            "no drop receipt came"
+        );
+        assert!(
+            reactor_facts(&report).iter().any(|(_, fact)| matches!(fact,
+                ReactorFact::CallEnded { call: 1, end, op: Some(1) } if end == "dropped")),
+            "the call ends dropped, naming its operation"
+        );
+    }
+
+    /// A dropped call whose operation never gets its drop receipt, with no
+    /// storage removal, fails the run once the reactor's teardown is done,
+    /// at its task's exit, as `UnpairedDrop`.
+    ///
+    /// This fails if a dropped call may wait for its receipt forever.
+    #[test]
+    fn a_drop_with_no_receipt_fails_at_teardown() {
+        let report = scripted_teardown(
+            1_000,
+            |_| Box::new(States::default()),
+            false,
+            dropped_without_receipt,
+        );
+        let exit = report
+            .log
+            .entries()
+            .iter()
+            .find_map(|entry| {
+                matches!(&entry.obs, Observation::TaskExited { task, .. } if task == "reactor.1")
+                    .then_some(entry.step)
+            })
+            .expect("the reactor's task exits");
+        assert_eq!(
+            evidence_detail(&report),
+            Some(
+                format!(
+                    "UnpairedDrop: the reactor's teardown ended at step {exit} with call 1 \
+                     dropped and its operation 1 given no drop receipt or storage removal"
+                )
+                .as_str()
+            ),
+            "{:?}",
+            report.end
+        );
+        assert_eq!(report.end.steps, exit);
+    }
+
+    /// A run that ends before the reactor's teardown is done leaves a
+    /// dropped call's missing receipt open, with no failure: the same
+    /// history as [`a_drop_with_no_receipt_fails_at_teardown`], but the
+    /// task stops at points after `Dropping` until the budget runs out.
+    ///
+    /// This fails if the audit runs at `Dropping`, before the teardown is
+    /// done.
+    #[test]
+    fn a_truncated_teardown_leaves_its_drops_open() {
+        let report = scripted_teardown(
+            30,
+            |_| Box::new(States::default()),
+            true,
+            dropped_without_receipt,
+        );
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        assert_eq!(
+            report.end.outcome,
+            crate::Outcome::Budget,
+            "{:?}",
+            report.end
+        );
+        let facts = reactor_facts(&report);
+        assert!(
+            matches!(facts[..], [.., (_, ReactorFact::Dropping { .. })]),
+            "the reactor reported its teardown: {facts:?}"
+        );
+        assert!(
+            !report.log.entries().iter().any(|entry| matches!(&entry.obs,
+                Observation::TaskExited { task, .. } if task == "reactor.1")),
+            "its task never exits"
+        );
     }
 
     /// Dispatches locator call `call` through `slot` and returns its future
@@ -1292,6 +1703,25 @@ mod tests {
         use futures::FutureExt;
         use zakura_node_services::header_chain::LocatorReadPermit;
 
+        dispatch_locator(slot, call);
+        let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a fresh semaphore has a permit");
+        let port: Arc<dyn Port> = port.clone();
+        let mut future = Box::pin(async move {
+            port.continuation_locator(LocatorReadPermit::new(permit))
+                .await
+        });
+        assert!(
+            zakura_network::zakura::observe::as_call(call, || (&mut future).now_or_never())
+                .is_none(),
+            "storage holds the call"
+        );
+        future
+    }
+
+    /// Reports locator call `call` dispatched through `slot`.
+    fn dispatch_locator(slot: &ObserverSlot, call: u64) {
         let hash = zakura_chain::block::Hash([7; 32]);
         slot.emit(ReactorEvent::Dispatched {
             call,
@@ -1309,20 +1739,53 @@ mod tests {
                 },
             },
         });
-        let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
-            .try_acquire_owned()
-            .expect("a fresh semaphore has a permit");
-        let port: Arc<dyn Port> = port.clone();
-        let mut future = Box::pin(async move {
-            port.continuation_locator(LocatorReadPermit::new(permit))
-                .await
-        });
-        assert!(
-            zakura_network::zakura::observe::as_call(call, || (&mut future).now_or_never())
-                .is_none(),
-            "storage holds the call"
-        );
-        future
+    }
+
+    /// A call storage never took still needs its end by the teardown. A
+    /// scripted reactor dispatches call 1 and never polls it, then settles
+    /// for the last time, tears down and exits with no end for it. With no
+    /// receipt, pairing can't see the lost end, and the run fails at the
+    /// exit as `UnendedCall`. The same history with call 1's dropped end
+    /// passes.
+    ///
+    /// This fails if only a storage receipt exposes a lost call end.
+    #[test]
+    fn an_unpolled_call_needs_its_end_by_teardown() {
+        for ended in [false, true] {
+            let report = scripted_calls(move |_, slot| {
+                Box::pin(async move {
+                    dispatch_locator(&slot, 1);
+                    if ended {
+                        slot.emit(ReactorEvent::CallEnded {
+                            call: 1,
+                            end: zakura_network::zakura::observe::CallEnd::Dropped,
+                        });
+                    }
+                    2
+                })
+            });
+            let ended_at = reactor_facts(&report)
+                .iter()
+                .find_map(|(step, fact)| {
+                    matches!(fact, ReactorFact::Dropping { .. }).then_some(*step)
+                })
+                .expect("the reactor tears down");
+            if ended {
+                assert_eq!(report.end.harness, None, "{:?}", report.end);
+                continue;
+            }
+            assert!(
+                matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                    if detail.starts_with("UnendedCall: the reactor's teardown ended at step")
+                        && detail.ends_with("with call 1 dispatched and never ended")),
+                "{:?}",
+                report.end
+            );
+            assert_eq!(
+                report.end.steps, ended_at,
+                "it fails at the teardown's exit"
+            );
+        }
     }
 
     /// The step at which `report` logged its first unpaired `fact` for an

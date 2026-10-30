@@ -46,7 +46,7 @@ use crate::{
         Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
-    table::{sender_properties, table_properties},
+    table::{downstream_properties, sender_properties, table_properties, Effect, StreamIdentity},
     Observation, RunConfig, Sim,
 };
 
@@ -771,6 +771,36 @@ where
     properties
 }
 
+/// What [`staged_work_properties`] read: staged work's effect rows, first,
+/// and what the downstream work template reads.
+const STAGED_WORK_NEEDS: &[Source] = &[
+    Source::Component(ComponentKind::StagedWork),
+    Source::Frames,
+    Source::Closes,
+    Source::Storage,
+];
+
+/// The header family's `receiver-work-authorized` properties, one per
+/// response row, each needing staged work's effect rows (M6a-5a), so
+/// `header-sync/storage` reports them `NotApplicable` with that reason.
+/// Neither header harness registers them yet. P3d does, with the
+/// peer-side credit rows `receiver-credit-conserved` needs.
+pub fn staged_work_properties<S: HasView>() -> Vec<Property<S>> {
+    downstream_properties(
+        FAMILY,
+        &RegtestMessage::LAYOUT,
+        &[Effect::Work],
+        StreamIdentity::Exact,
+    )
+    .into_iter()
+    .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
+    .map(|property| Property {
+        needs: STAGED_WORK_NEEDS,
+        ..property
+    })
+    .collect()
+}
+
 /// The storage harness's properties, [`OPERATION_IDS`] then
 /// [`DIRECT_DISPATCH`], both active. A test harness that wraps
 /// [`Storage`] with its view registers them too.
@@ -805,13 +835,14 @@ where
 
 /// What [`storage_properties`] read: the node's storage facts and the
 /// harness's view, plus the step loop's task observations, with the
-/// storage tier's components.
+/// storage tier's components. It has no peers and no transport, so it
+/// excludes their frames and closes.
 pub fn storage_sources() -> Sources {
-    SourceManifest::storage().sources(Sources::observed(&[
-        Source::Schedule,
-        Source::Storage,
-        Source::View,
-    ]))
+    SourceManifest::storage().sources(
+        Sources::observed(&[Source::Schedule, Source::Storage, Source::View])
+            .excluding(Source::Frames, "no scripted peers")
+            .excluding(Source::Closes, "no transport"),
+    )
 }
 
 /// What shows that a component exists, because it acted (M6a, rule 7).
@@ -1268,23 +1299,14 @@ mod tests {
 
     /// Staged work's effect rows are a source `header-sync/wire` observes
     /// and `header-sync/storage` excludes, since its in-memory links have
-    /// no read seqs, so a property that needs them is `NotApplicable` there
+    /// no read seqs, so the header family's `receiver-work-authorized`
+    /// properties run on the wire tier and are `NotApplicable` on storage
     /// with that reason (M6a-5a).
     #[test]
     fn storage_excludes_staged_work() {
         let property = |sources: &Sources| {
             RegistryChecker::new(
-                Registry::new(vec![Property {
-                    id: PropertyId::new("test/staged-work"),
-                    claim: "a test claim on staged work",
-                    kind: Kind::Safety,
-                    assumes: &[],
-                    needs: &[Source::Component(ComponentKind::StagedWork)],
-                    status: Status::Active,
-                    check: check_publisher,
-                    witness: None,
-                }])
-                .expect("one property"),
+                Registry::new(staged_work_properties()).expect("one per response row"),
                 Rc::new(Nothing),
                 Assumptions::none(),
                 sources,
@@ -1303,11 +1325,15 @@ mod tests {
             harness: None,
         };
         let reports = storage.at_end(&end, &ObservationLog::default());
-        assert_eq!(reports[0].outcome, PropertyOutcome::NotApplicable);
-        assert_eq!(
-            reports[0].excluded.as_deref(),
-            Some("Component(StagedWork): in-memory links have no read seqs")
-        );
+        assert_eq!(reports.len(), 2, "the page and outcome rows: {reports:?}");
+        for report in reports {
+            assert!(report.property.ends_with("/receiver-work-authorized"));
+            assert_eq!(report.outcome, PropertyOutcome::NotApplicable);
+            assert_eq!(
+                report.excluded.as_deref(),
+                Some("Component(StagedWork): in-memory links have no read seqs")
+            );
+        }
     }
 
     /// The same property on a harness that neither observes nor excludes

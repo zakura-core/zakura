@@ -3,7 +3,11 @@
 //! The reactor's work queue reports each header capacity reservation as it
 //! places it, `Placed`, and the work incarnation it then belongs to,
 //! `Bound`: at once for an active request's continuation, or when the
-//! request it was reserved for starts. A request's `Started` and
+//! request it was reserved for starts. The queue says which, so every
+//! claim about a peer's round is checked against what the queue's own
+//! counter allows: a start makes the next incarnation, which its `Started`
+//! follows at once, and a continuation, like each settled snapshot's
+//! active work, names the peer's latest started, unretired incarnation. A request's `Started` and
 //! `Retired` name their incarnation, and each prepare or apply call's
 //! `LeasesCaptured` joins the call to the incarnation and the lease IDs it
 //! holds. A prepare takes its incarnation's staged headers as a transfer,
@@ -11,8 +15,9 @@
 //! drops. A page's `Staged` names a live round, and a matched outcome's
 //! `Outcome` a started one (M6a-5a). [`WorkLedger`] folds those records in
 //! log order and checks them against each settled snapshot, whose holdings
-//! it reads from the queue's own maps. Any break is a structural failure of the tap's evidence. A
-//! transfer still live when the log freezes is pending, not a failure.
+//! it reads from the queue's own maps. Any break is a structural failure of
+//! the tap's evidence. A transfer still live when the log freezes is
+//! pending, not a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +79,9 @@ pub struct WorkLedger {
     captured: BTreeSet<u64>,
     /// Each peer's most recently started incarnation.
     latest: BTreeMap<String, u64>,
+    /// The incarnation a start just bound, which its `Started` must follow
+    /// before anything else.
+    starting: Option<u64>,
 }
 
 impl WorkLedger {
@@ -109,6 +117,15 @@ impl WorkLedger {
     /// Folds `fact`, failing with a detail if it breaks the identities
     /// before it.
     pub(crate) fn fold(&mut self, fact: &ReactorFact) -> Result<(), String> {
+        if let Some(starting) = self.starting.take() {
+            if !matches!(fact, ReactorFact::Started { request, .. } if request.incarnation == starting)
+            {
+                return Err(format!(
+                    "UnstartedIncarnation: incarnation {starting}'s start binding was followed \
+                     by {fact:?}, not its Started"
+                ));
+            }
+        }
         match fact {
             ReactorFact::Placed {
                 reservation,
@@ -131,6 +148,7 @@ impl WorkLedger {
             ReactorFact::Bound {
                 reservation,
                 incarnation,
+                via,
             } => {
                 let Some(placed) = self.reservations.get_mut(reservation) else {
                     return Err(format!(
@@ -145,6 +163,44 @@ impl WorkLedger {
                     ));
                 }
                 placed.incarnation = Some(*incarnation);
+                let current = self.latest.get(&placed.peer).copied();
+                match via.as_str() {
+                    // IDs come from one counter per queue, so a start names
+                    // the next one.
+                    "start" => {
+                        let next = self
+                            .incarnations
+                            .keys()
+                            .next_back()
+                            .map_or(1, |last| last + 1);
+                        if *incarnation != next {
+                            return Err(format!(
+                                "StaleBinding: a start bound reservation {reservation} to \
+                                 incarnation {incarnation}, not the next one, {next}"
+                            ));
+                        }
+                        self.starting = Some(*incarnation);
+                    }
+                    "continuation" => {
+                        let retired = self
+                            .incarnations
+                            .get(incarnation)
+                            .is_none_or(|work| work.retired);
+                        if current != Some(*incarnation) || retired {
+                            return Err(format!(
+                                "StaleBinding: a continuation bound reservation {reservation} \
+                                 to {}'s incarnation {incarnation}, but its current round is \
+                                 {current:?}",
+                                placed.peer
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "UnknownBinding: reservation {reservation} was bound via {other}"
+                        ))
+                    }
+                }
                 let work = self
                     .incarnations
                     .entry(*incarnation)
@@ -155,24 +211,8 @@ impl WorkLedger {
                         retired: false,
                         calls: Vec::new(),
                     });
-                // A continuation binds to work that already started, which
-                // must be its peer's current round.
-                if work.started.is_some()
-                    && (work.retired || self.latest.get(&placed.peer) != Some(incarnation))
-                {
-                    return Err(format!(
-                        "StaleBinding: reservation {reservation} was bound to {}'s incarnation \
-                         {incarnation}, which isn't its current round",
-                        placed.peer
-                    ));
-                }
-                if work.peer != placed.peer {
-                    return Err(format!(
-                        "ForeignBinding: reservation {reservation}, placed for {}, was bound to \
-                         incarnation {incarnation} of {}",
-                        placed.peer, work.peer
-                    ));
-                }
+                // A start's incarnation is new, and a continuation's is its
+                // peer's current round, so the incarnation is the peer's.
                 work.reservations.push(*reservation);
             }
             ReactorFact::Started { request, .. } => {
@@ -332,11 +372,14 @@ impl WorkLedger {
                 continue;
             };
             match self.incarnations.get(&incarnation) {
-                Some(known) if known.started.is_some() && known.peer == work.peer => {}
+                Some(known)
+                    if known.started.is_some()
+                        && !known.retired
+                        && self.latest.get(&work.peer) == Some(&incarnation) => {}
                 _ => {
                     return Err(format!(
                         "UnknownIncarnation: {}'s active work is incarnation {incarnation}, \
-                         which never started for it",
+                         which isn't its latest started, unretired round",
                         work.peer
                     ))
                 }
@@ -447,10 +490,22 @@ mod tests {
         }
     }
 
-    fn bound(reservation: u64, incarnation: u64) -> ReactorFact {
+    /// A start's binding of `reservation` to new incarnation `incarnation`.
+    fn start(reservation: u64, incarnation: u64) -> ReactorFact {
         ReactorFact::Bound {
             reservation,
             incarnation,
+            via: "start".into(),
+        }
+    }
+
+    /// A continuation's binding of `reservation` to incarnation
+    /// `incarnation`.
+    fn cont(reservation: u64, incarnation: u64) -> ReactorFact {
+        ReactorFact::Bound {
+            reservation,
+            incarnation,
+            via: "continuation".into(),
         }
     }
 
@@ -509,10 +564,10 @@ mod tests {
     fn the_ledger_refuses_each_broken_identity() {
         let good = [
             placed(1, "01"),
-            bound(1, 1),
+            start(1, 1),
             started("01", 1),
             placed(2, "01"),
-            bound(2, 1),
+            cont(2, 1),
         ];
         let mut ledger = WorkLedger::default();
         assert_eq!(fold(&mut ledger, &good), None);
@@ -525,55 +580,45 @@ mod tests {
             purpose: ReactorPurpose::Normal,
             reason: "local_error".into(),
         };
-        let broken: [(&[ReactorFact], &str); 8] = [
-            (&[placed(1, "01"), placed(1, "01")], "DuplicateResource"),
-            (&[bound(1, 1)], "UnplacedBinding"),
+        let first = [placed(1, "01"), start(1, 1), started("01", 1)];
+        let then = |more: &[ReactorFact]| -> Vec<ReactorFact> {
+            first.iter().chain(more).cloned().collect()
+        };
+        let broken: [(Vec<ReactorFact>, &str); 11] = [
+            (vec![placed(1, "01"), placed(1, "01")], "DuplicateResource"),
+            (vec![start(1, 1)], "UnplacedBinding"),
+            (then(&[cont(1, 1)]), "ReboundReservation"),
+            (vec![started("01", 1)], "UnboundIncarnation"),
+            (then(&[started("01", 1)]), "DuplicateIncarnation"),
+            // A start names the queue's next incarnation, and its Started
+            // comes next.
+            (then(&[placed(2, "01"), start(2, 5)]), "StaleBinding"),
             (
-                &[placed(1, "01"), bound(1, 1), bound(1, 2)],
-                "ReboundReservation",
+                vec![placed(1, "01"), start(1, 1), placed(2, "01")],
+                "UnstartedIncarnation",
             ),
+            // A continuation names the peer's current round: not a retired
+            // one, a superseded one, a new one, or another peer's.
             (
-                &[placed(1, "01"), bound(1, 1), placed(2, "02"), bound(2, 1)],
-                "ForeignBinding",
-            ),
-            (&[started("01", 1)], "UnboundIncarnation"),
-            (
-                &[
-                    placed(1, "01"),
-                    bound(1, 1),
-                    started("01", 1),
-                    started("01", 1),
-                ],
-                "DuplicateIncarnation",
-            ),
-            (
-                &[
-                    placed(1, "01"),
-                    bound(1, 1),
-                    started("01", 1),
-                    retired.clone(),
-                    placed(2, "01"),
-                    bound(2, 1),
-                ],
+                then(&[retired.clone(), placed(2, "01"), cont(2, 1)]),
                 "StaleBinding",
             ),
             (
-                &[
-                    placed(1, "01"),
-                    bound(1, 1),
-                    started("01", 1),
+                then(&[
                     placed(2, "01"),
-                    bound(2, 2),
+                    start(2, 2),
                     started("01", 2),
                     placed(3, "01"),
-                    bound(3, 1),
-                ],
+                    cont(3, 1),
+                ]),
                 "StaleBinding",
             ),
+            (then(&[placed(2, "01"), cont(2, 2)]), "StaleBinding"),
+            (then(&[placed(2, "02"), cont(2, 1)]), "StaleBinding"),
         ];
         for (facts, name) in broken {
             assert_eq!(
-                fold(&mut WorkLedger::default(), facts).as_deref(),
+                fold(&mut WorkLedger::default(), &facts).as_deref(),
                 Some(name),
                 "{facts:?}"
             );
@@ -593,8 +638,6 @@ mod tests {
                 .err()
                 .map(|detail| detail.split(':').next().unwrap_or_default().to_owned())
         };
-        // The continuation's reservation 2 isn't the incarnation's in this
-        // snapshot's world: 3 was never placed, and 1 is bound but 2 runs.
         assert_eq!(
             named(ledger.settled(&snapshot("01", 1, 3))).as_deref(),
             Some("UnplacedResource")
@@ -603,20 +646,31 @@ mod tests {
             named(ledger.settled(&snapshot("01", 2, 2))).as_deref(),
             Some("UnknownIncarnation")
         );
-        let mut misbound = WorkLedger::default();
-        fold(
-            &mut misbound,
-            &[
-                placed(1, "01"),
-                bound(1, 1),
-                started("01", 1),
-                placed(2, "01"),
-                bound(2, 7),
-            ],
+        // After round 2 starts, round 1 is no longer the peer's active work,
+        // retired or not, even once round 2's reservation is spent, and a
+        // reservation still bound to round 1 is misbound.
+        let mut later = WorkLedger::default();
+        let rounds = then(&[retired, placed(2, "01"), start(2, 2), started("01", 2)]);
+        assert_eq!(fold(&mut later, &rounds), None);
+        let mut spent = snapshot("01", 1, 2);
+        spent.holdings[0].reservation = None;
+        assert_eq!(
+            named(later.settled(&spent)).as_deref(),
+            Some("UnknownIncarnation")
         );
         assert_eq!(
-            named(misbound.settled(&snapshot("01", 1, 2))).as_deref(),
+            named(later.settled(&snapshot("01", 2, 1))).as_deref(),
             Some("MisboundReservation")
+        );
+        assert_eq!(later.settled(&snapshot("01", 2, 2)), Ok(()));
+        // A round superseded with no `Retired`, as a removal that reports
+        // none leaves it, isn't the peer's active work either.
+        let mut superseded = WorkLedger::default();
+        let rounds = then(&[placed(2, "01"), start(2, 2), started("01", 2)]);
+        assert_eq!(fold(&mut superseded, &rounds), None);
+        assert_eq!(
+            named(superseded.settled(&spent)).as_deref(),
+            Some("UnknownIncarnation")
         );
     }
 
@@ -661,9 +715,9 @@ mod tests {
                 owner: request("01", 1).owner,
             },
         };
-        let start = [placed(1, "01"), bound(1, 1), started("01", 1)];
+        let opened = [placed(1, "01"), start(1, 1), started("01", 1)];
         let mut ledger = WorkLedger::default();
-        let good: Vec<ReactorFact> = start
+        let good: Vec<ReactorFact> = opened
             .iter()
             .cloned()
             .chain([
@@ -713,7 +767,7 @@ mod tests {
             let facts: Vec<ReactorFact> = if name == "UnknownIncarnation" {
                 facts
             } else {
-                start.iter().cloned().chain(facts).collect()
+                opened.iter().cloned().chain(facts).collect()
             };
             assert_eq!(
                 fold(&mut WorkLedger::default(), &facts).as_deref(),

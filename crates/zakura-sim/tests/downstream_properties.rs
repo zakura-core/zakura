@@ -15,7 +15,7 @@ use zakura_network::zakura::{testkit::regulation::TEST_FAMILY, Stream};
 use zakura_sim::{
     model::Label,
     observe::{RowAt, StreamId, UnframedCause},
-    property::{Property, Source},
+    property::{ComponentKind, Property, Source},
     table::{
         downstream_properties, table_properties, Effect, GeneratedId, StreamIdentity, Template,
     },
@@ -932,5 +932,104 @@ fn wire_records_require_stream_identity() {
         // On its own tier's terms, the row is judged, not refused.
         let kept = run_wire(vec![vec![on(4, obs.clone())]]);
         assert_ne!(kept.end.outcome, Outcome::Harness, "{:?}", kept.end);
+    }
+}
+
+/// Header sync's stream, kind 5 at version 9.
+const HEADERS: StreamId = StreamId {
+    kind: 5,
+    version: 9,
+};
+
+/// The header family's generated `receiver-work-authorized` on `row`.
+fn header_work(row: &str) -> String {
+    format!("header-sync/s5v9/{row}/receiver-work-authorized")
+}
+
+/// A conformant, judged page of subscription 8, then the work the node
+/// staged from it, and then, if `unframed`, held work no frame explains.
+fn staged_script(unframed: bool) -> Vec<Vec<Observation>> {
+    let at = |row: &str| RowAt::new(HEADERS, row);
+    let mut script = vec![
+        vec![
+            Observation::PeerFrame {
+                connection: 1,
+                stream: HEADERS,
+                quic_stream: Some(4),
+                seq: 0,
+                row: Some("headers".to_owned()),
+                rule_stream: HEADERS,
+                label: Label::Conformant,
+                exhausted: false,
+                exchange: Some(8),
+                payload: 300,
+            },
+            Observation::FrameJudged {
+                connection: 1,
+                stream: HEADERS,
+                quic_stream: Some(4),
+                seq: 0,
+            },
+        ],
+        vec![Observation::WorkAdmitted {
+            connection: 1,
+            quic_stream: Some(4),
+            frame: at("headers"),
+            seq: 0,
+            request: at("subscribe-headers"),
+            exchange: 8,
+            objects: 2,
+            bytes: 300,
+            ends: false,
+        }],
+    ];
+    if unframed {
+        script.push(vec![Observation::UnframedWork {
+            connection: 1,
+            quic_stream: Some(4),
+            request: at("subscribe-headers"),
+            exchange: 8,
+            objects: 1,
+            bytes: 0,
+            cause: UnframedCause::Extra,
+        }]);
+    }
+    script
+}
+
+/// The header family's generated work properties hold on framed staged
+/// work, with work to judge, and unframed held work fails both of the
+/// subscription's response rows: its pages and its outcome (M6a-5a).
+///
+/// This fails if unframed work fails only one row.
+#[test]
+fn unframed_work_fails_both_header_rows() {
+    let observed: Vec<Source> = OBSERVED
+        .iter()
+        .copied()
+        .chain([Source::Component(ComponentKind::StagedWork)])
+        .collect();
+    let run = |unframed| {
+        run_under(
+            zakura_sim::harness::header_sync::staged_work_properties(),
+            &observed,
+            staged_script(unframed),
+        )
+    };
+    let framed = run(false);
+    assert_eq!(framed.end.harness, None, "{:?}", framed.end);
+    assert!(
+        held(&framed, &header_work("headers")),
+        "{:?}",
+        outcome(&framed, &header_work("headers"))
+    );
+    let unframed = run(true);
+    assert_eq!(unframed.end.harness, None, "{:?}", unframed.end);
+    for row in ["headers", "headers-outcome"] {
+        assert!(
+            violated(&unframed, &header_work(row)),
+            "{row}: {:?}",
+            outcome(&unframed, &header_work(row))
+        );
     }
 }

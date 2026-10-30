@@ -71,6 +71,27 @@ impl HeaderChunkBudget {
         self.0.last_resource.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// The budget's boundary read: its counters, peeked under its lock
+    /// with no scheduling point, through a std `Weak`, so it reads `Gone`
+    /// once the last object holding the budget drops.
+    #[cfg(any(test, zakura_sim))]
+    fn read(&self) -> crate::zakura::diag::ComponentRead {
+        use crate::zakura::diag::{self, BudgetCounters, OwnerState};
+
+        let budget = diag::weak(&self.0);
+        Box::new(move || {
+            diag::upgrade(&budget, |inner| {
+                diag::peek(&inner.usage, |usage| {
+                    OwnerState::Budget(BudgetCounters {
+                        capacity: inner.capacity,
+                        reserved: usage.reserved,
+                        owned: usage.owned,
+                    })
+                })
+            })
+        })
+    }
+
     fn usage(&self) -> HeaderChunkUsage {
         *self.0.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1085,12 +1106,15 @@ impl PeerWorkQueue {
             .collect()
     }
 
-    /// This queue, reporting its placements and bindings to `observer`.
+    /// This queue, reporting its placements and bindings to `observer`,
+    /// which takes its budget's boundary read now, before anything
+    /// reserves.
     #[cfg(any(test, zakura_sim))]
     pub(in crate::zakura::header_sync) fn observe_with(
         &mut self,
         observer: crate::zakura::header_sync::observe::ObserverSlot,
     ) {
+        observer.register_read(crate::zakura::diag::ReadKey::Budget, self.budget.read());
         self.observer = observer;
     }
 
@@ -1684,6 +1708,53 @@ mod tests {
 
         queue.remove(&peer(1));
         assert_eq!(queue.unowned_chunk_capacity(), first_count);
+    }
+
+    /// The budget's boundary read peeks its counters themselves: a writer
+    /// that changes them under the lock without `publish` or any event is
+    /// seen, a holder on another thread reads `Held` without blocking, and
+    /// the read is `Gone` once the last object holding the budget drops.
+    ///
+    /// This fails if the read returns the last published values.
+    #[test]
+    fn the_budgets_read_sees_a_writer_that_skips_publish() {
+        use crate::zakura::diag::{BudgetCounters, OwnerState, Read};
+
+        let counters = |reserved, owned| {
+            Read::Current(OwnerState::Budget(BudgetCounters {
+                capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
+                reserved,
+                owned,
+            }))
+        };
+        let budget = HeaderChunkBudget::default();
+        let read = budget.read();
+        let reservation = budget.reserve(5).expect("an empty budget has room");
+        assert_eq!(read(), counters(5, 0));
+        budget.0.usage.lock().expect("never poisoned").owned = 3;
+        assert_eq!(read(), counters(5, 3), "the unpublished write is read");
+        budget.0.usage.lock().expect("never poisoned").owned = 0;
+
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = {
+            let budget = budget.clone();
+            std::thread::spawn(move || {
+                let usage = budget.0.usage.lock().expect("never poisoned");
+                held.0.send(()).expect("the test waits");
+                release.1.recv().expect("the test releases");
+                drop(usage);
+            })
+        };
+        held.1.recv().expect("the holder locks");
+        assert!(matches!(read(), Read::Held { .. }), "{:?}", read());
+        release.0.send(()).expect("the holder waits");
+        holder.join().expect("the holder ends");
+        assert_eq!(read(), counters(5, 0));
+
+        drop(budget);
+        assert_eq!(read(), counters(5, 0), "the reservation holds the budget");
+        drop(reservation);
+        assert_eq!(read(), Read::Gone);
     }
 
     #[test]

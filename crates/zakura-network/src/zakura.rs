@@ -18,6 +18,8 @@ use crate::{
 };
 
 mod block_sync;
+#[cfg(any(test, zakura_sim))]
+pub mod diag;
 mod discovery;
 #[cfg(test)]
 mod example_reactor;

@@ -36,6 +36,17 @@ use crate::zakura::{FrameRejection, ZakuraConnId, ZakuraConnectionLimits};
 pub trait TransportObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: TransportEvent);
+
+    /// Takes the boundary read of a shared component the transport owns, as
+    /// its owner builds it (rule 1 of the M6a observation contract). An
+    /// observer that runs no reads drops it, which is the default.
+    fn register_read(
+        &self,
+        key: crate::zakura::diag::ReadKey,
+        read: crate::zakura::diag::ComponentRead,
+    ) {
+        let _ = (key, read);
+    }
 }
 
 /// One transport event.

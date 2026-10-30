@@ -130,7 +130,7 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 29] = [
+const ALLOWED: [(&str, &str, &str); 33] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -257,6 +257,26 @@ const ALLOWED: [(&str, &str, &str); 29] = [
         TRANSPORT_TAP,
     ),
     (
+        "crates/zakura-network/src/zakura/diag.rs",
+        "std::sync::Mutex",
+        DIAG_READS,
+    ),
+    (
+        "crates/zakura-network/src/zakura/diag.rs",
+        "std::sync::Weak",
+        DIAG_READS,
+    ),
+    (
+        "crates/zakura-network/src/zakura/diag.rs",
+        "std::sync::Arc::downgrade",
+        DIAG_READS,
+    ),
+    (
+        "crates/zakura-network/src/zakura/diag.rs",
+        "Arc::downgrade",
+        DIAG_READS,
+    ),
+    (
         "crates/zakura-quic/src/congestion.rs",
         "std::time::Instant",
         QUINN_INSTANT,
@@ -302,6 +322,13 @@ const SIM_HARNESS: &str = "harness infrastructure for simulated runs: the fake \
 /// would add preemption points inside the regulation locks it reports from.
 const TRANSPORT_TAP: &str = "the transport observer's own state, which must add no \
      scheduling point to a simulated run, not code under test";
+
+/// Why `zakura-network`'s boundary reads may use std's mutex and `Weak`.
+/// The module compiles only under `cfg(any(test, zakura_sim))`, and its
+/// reads run between steps, where a `zakura_rt` lock or `Weak` would reach
+/// a scheduling point the run must not see.
+const DIAG_READS: &str = "the simulator's boundary reads and tag registries, which must add \
+     no scheduling point to a simulated run, not code under test";
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 
@@ -349,11 +376,21 @@ pub fn check(repo_root: &Path) -> Result<(), BoxError> {
     .into())
 }
 
-#[derive(Default)]
 struct Findings {
     files: usize,
     violations: Vec<Violation>,
     allowances_used: [bool; ALLOWED.len()],
+}
+
+// By hand, since `Default` stops at arrays of 32.
+impl Default for Findings {
+    fn default() -> Self {
+        Findings {
+            files: 0,
+            violations: Vec::new(),
+            allowances_used: [false; ALLOWED.len()],
+        }
+    }
 }
 
 fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {

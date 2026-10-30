@@ -20,7 +20,10 @@ use super::{
     HeaderTargetPurpose,
 };
 pub use super::{reactor::HeaderRequestTerminal, scheduler::peer_work::HeaderTargetPhase};
-use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
+use crate::zakura::{
+    diag::{ComponentRead, ReadKey},
+    ServicePeerDirection, ZakuraPeerId,
+};
 
 /// Receives reactor events as they happen.
 ///
@@ -45,6 +48,15 @@ use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
 pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: ReactorEvent);
+
+    /// Takes the boundary read of a shared component the reactor owns, as
+    /// the reactor builds the component (rule 1 of the M6a observation
+    /// contract). [`ObserverSlot::register_read`] reports
+    /// [`ReactorEvent::ReadRegistered`] right after. An observer that runs
+    /// no reads drops it, which is the default.
+    fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        let _ = (key, read);
+    }
 }
 
 /// The optional observer installed on a reactor's startup, with its
@@ -110,6 +122,17 @@ impl ObserverSlot {
     /// The events emitted so far, through any clone.
     pub fn emitted(&self) -> u64 {
         self.emitted.load(counter::Ordering::Relaxed)
+    }
+
+    /// Hands `read`, the boundary read of the component `key` names, to
+    /// the observer, if one is installed, then reports its registration as
+    /// [`ReactorEvent::ReadRegistered`] through [`emit`](Self::emit). An
+    /// owner calls it once, as it builds the component.
+    pub fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        if let Some(observer) = &self.observer {
+            observer.register_read(key.clone(), read);
+            self.emit(ReactorEvent::ReadRegistered { key });
+        }
     }
 
     /// Delivers `event` to the observer, if one is installed, counting it
@@ -211,6 +234,14 @@ pub enum ReactorEvent {
     Dropping {
         /// Its turn when it was dropped.
         turn: u64,
+    },
+    /// The reactor registered the boundary read of a shared component it
+    /// owns, as it built it. Reported only through
+    /// [`ObserverSlot::register_read`], right after the observer took the
+    /// read.
+    ReadRegistered {
+        /// The component.
+        key: ReadKey,
     },
     /// The reactor resumed from a wait, or started. It's the first thing
     /// the turn reports, and the reactor's state is in transition until

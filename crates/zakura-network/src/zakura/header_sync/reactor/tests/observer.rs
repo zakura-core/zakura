@@ -52,11 +52,13 @@ impl Recorder {
 
 /// Whether `event` reports a work identity: a reservation's placement or
 /// binding, a call's captured leases, or a transfer's start or end
-/// (M6a-4), or a page's staging or an outcome's handling (M6a-5a).
+/// (M6a-4), a page's staging or an outcome's handling (M6a-5a), or a
+/// boundary read's registration (M6a-7a).
 fn is_identity(event: &ReactorEvent) -> bool {
     matches!(
         event,
-        ReactorEvent::Placed { .. }
+        ReactorEvent::ReadRegistered { .. }
+            | ReactorEvent::Placed { .. }
             | ReactorEvent::Bound { .. }
             | ReactorEvent::LeasesCaptured { .. }
             | ReactorEvent::EntriesTaken { .. }
@@ -591,6 +593,81 @@ impl HeaderSyncObserver for DropsCallEnds {
             self.recorder.observe(event);
         }
     }
+}
+
+/// Records every event and keeps the budget's boundary read.
+#[derive(Default)]
+struct KeepsReads {
+    recorder: Recorder,
+    budget: StdMutex<Option<crate::zakura::diag::ComponentRead>>,
+}
+
+impl std::fmt::Debug for KeepsReads {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KeepsReads")
+    }
+}
+
+impl HeaderSyncObserver for KeepsReads {
+    fn observe(&self, event: ReactorEvent) {
+        self.recorder.observe(event);
+    }
+
+    fn register_read(
+        &self,
+        key: crate::zakura::diag::ReadKey,
+        read: crate::zakura::diag::ComponentRead,
+    ) {
+        assert_eq!(key, crate::zakura::diag::ReadKey::Budget);
+        let previous = self.budget.lock().expect("never poisoned").replace(read);
+        assert!(previous.is_none(), "the budget registers its read once");
+    }
+}
+
+/// The reactor registers its budget's read as it builds the budget, before
+/// its first snapshot and before anything reserves. The read peeks the
+/// budget's counters, and reads `Gone` once the reactor and its queue are.
+///
+/// This fails if the build skips the registration.
+#[test]
+fn the_budget_registers_its_read() {
+    use crate::zakura::diag::{BudgetCounters, OwnerState, Read, ReadKey};
+
+    let observer = Arc::new(KeepsReads::default());
+    let mut startup = startup(CancellationToken::new());
+    startup.observer = ObserverSlot::new(observer.clone());
+    let (_handle, _actions, reactor) =
+        build_header_sync_reactor(startup).expect("the observed reactor builds");
+    let events = observer.recorder.take_all();
+    assert!(
+        matches!(
+            events[..],
+            [
+                ReactorEvent::ReadRegistered {
+                    key: ReadKey::Budget
+                },
+                ..,
+                ReactorEvent::Settled { turn: 0, .. }
+            ]
+        ),
+        "the read is registered first, before the build's snapshot: {events:?}"
+    );
+    let read = observer
+        .budget
+        .lock()
+        .expect("never poisoned")
+        .take()
+        .expect("the observer took the budget's read");
+    assert_eq!(
+        read(),
+        Read::Current(OwnerState::Budget(BudgetCounters {
+            capacity: crate::zakura::header_sync::MAX_HS_RANGE as usize, // 4,000
+            reserved: 0,
+            owned: 0,
+        }))
+    );
+    drop(reactor);
+    assert_eq!(read(), Read::Gone, "nothing holds the budget any more");
 }
 
 /// The slot counts each event before the observer sees it, from the
@@ -1262,6 +1339,7 @@ async fn observer_does_not_change_behaviour() {
         matches!(
             events.as_slice(),
             [
+                ReactorEvent::ReadRegistered { .. },
                 ReactorEvent::Settled {
                     turn: 0,
                     last: false,

@@ -1283,10 +1283,62 @@ mod tests {
             .collect()
     }
 
+    thread_local! {
+        /// What [`check_budget`] got at each step: the budget's owned count
+        /// from `require`, then from `require_every`, or `None`.
+        static BUDGET_SEEN: RefCell<Vec<(u64, Option<usize>, Option<usize>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records what `require` and `require_every` hand out for the budget.
+    fn check_budget(cx: &mut CheckCtx<'_, Owned>) -> Verdict {
+        use crate::property::{require_every, Available};
+
+        let view = cx.view();
+        let view = view.borrow();
+        let budget = view
+            .component(ComponentKind::Budget)
+            .expect("the tier has the budget");
+        let owned = |available: Option<Available<'_, Reading>>| match available {
+            Some(Available::Current(Reading::Budget(counters))) => Some(counters.owned),
+            Some(other) => panic!("the budget hands out its counters, not {other:?}"),
+            None => None,
+        };
+        let current = owned(crate::property::require(cx, budget));
+        let every = owned(require_every(cx, budget));
+        BUDGET_SEEN.with(|seen| seen.borrow_mut().push((cx.step, current, every)));
+        Verdict::Holds
+    }
+
+    /// A checker running one property that needs the budget, through
+    /// [`check_budget`].
+    fn requiring_budget(view: &Rc<RefCell<HeaderSyncView>>) -> RegistryChecker<Owned> {
+        let property = Property {
+            id: PropertyId::new("test/budget"),
+            claim: "a test claim on the budget",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Component(ComponentKind::Budget)],
+            status: Status::Active,
+            check: check_budget,
+            witness: None,
+        };
+        let sources = SourceManifest::storage().sources(Sources::default());
+        RegistryChecker::new(
+            Registry::new(vec![property]).expect("one property"),
+            Rc::new(Owned(view.clone())),
+            Assumptions::none(),
+            &sources,
+        )
+    }
+
     /// A writer that raises the count under the lock, reaches a point with
     /// the lock held, restores it and unlocks, is read held at every
     /// boundary in between, never current with the raised value, and the
-    /// next boundary reads the restored value.
+    /// next boundary reads the restored value. A property sees the same:
+    /// `require` and `require_every` hand out nothing at the held
+    /// boundaries and the restored value after, and the every-boundary
+    /// claim ends `state-unobserved`.
     ///
     /// This fails if a held read reports the last current value.
     #[test]
@@ -1307,7 +1359,9 @@ mod tests {
             *guard = 0;
             drop(guard);
         });
-        let (report, _) = fixture.run(&mut States::default());
+        BUDGET_SEEN.with(|seen| seen.borrow_mut().clear());
+        let mut checker = requiring_budget(&fixture.view);
+        let (report, _) = fixture.run(&mut checker);
         assert_eq!(report.end.harness, None, "{:?}", report.end);
         let reads = owned_reads(&report);
         let held = reads
@@ -1325,6 +1379,27 @@ mod tests {
             reads.iter().map(|(_, read)| *read).collect::<Vec<_>>(),
             [Some(0), None, Some(0)],
             "current, held, then the restored value, never 9"
+        );
+        let released = reads[held + 1].0;
+        let seen = BUDGET_SEEN.with(|seen| seen.take());
+        for (at, current, every) in &seen {
+            let expected = (*at < step || *at >= released).then_some(0);
+            assert_eq!(
+                (*current, *every),
+                (expected, expected),
+                "at step {at}: {seen:?}"
+            );
+        }
+        assert!(
+            seen.iter().any(|(at, _, _)| *at == step)
+                && seen.iter().any(|(at, _, _)| *at >= released),
+            "the property ran while it was held and after: {seen:?}"
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            crate::check::PropertyOutcome::Inconclusive {
+                reason: "state-unobserved".to_owned()
+            }
         );
     }
 

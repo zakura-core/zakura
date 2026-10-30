@@ -164,6 +164,15 @@ name = "discovery_wait_complete"
 smoke-secs = 60
 timeout-secs = 1800
 
+# The action grammar is built for 4,096-byte inputs, as qa/fuzz/sim's README
+# says.
+[[target]]
+package = "sim"
+name = "header_sync_storage"
+smoke-secs = 60
+args = ["-max_len=4096"]
+timeout-secs = 1800
+
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
 # cover each fixture's own harness and the fixed variants. Its report must
 # account for each fixture and variant.
@@ -225,11 +234,6 @@ reason = "JSON-RPC parsing isn't a P2P DoS property; rpc-fuzz.yml keeps fuzzing 
 harness = "header-sync/smoke"
 owner = "E5a"
 reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
-
-[[missing-target]]
-harness = "header-sync/storage"
-owner = "E5a"
-reason = "the target waits for G1's action grammar (#1830) and E5a's readiness contract"
 
 [[missing-target]]
 harness = "block-sync/storage"

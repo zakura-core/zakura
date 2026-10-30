@@ -313,6 +313,10 @@ def aligned(base_text, head_text, extra=None):
         repo = Path(tmp)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
+        # User settings that drop the a/ and b/ prefixes or merge nearby
+        # hunks mustn't matter.
+        subprocess.run(git + ["config", "diff.noprefix", "true"], check=True)
+        subprocess.run(git + ["config", "diff.interHunkContext", "3"], check=True)
         for name, text in (extra or {}).items():
             (repo / name).write_text(text)
         revs = []
@@ -323,10 +327,11 @@ def aligned(base_text, head_text, extra=None):
             revs.append(subprocess.run(git + ["rev-parse", "HEAD"], stdout=subprocess.PIPE,
                                        text=True, check=True).stdout.strip())
         hunks = asm_diff.rust_hunks(repo, revs[0], revs[1])
+        probes = asm_diff.embed_probes(repo, revs[0], revs[1], hunks)
         padded, made = [], []
         for side, text in (("base", base_text), ("head", head_text)):
             (repo / "lib.rs").write_text(text)
-            made.append(asm_diff.align_tree(repo, hunks, side))
+            made.append(asm_diff.align_tree(repo, hunks, side, probes))
             padded.append((repo / "lib.rs").read_text().split("\n"))
     return padded, made
 
@@ -349,12 +354,56 @@ class AlignmentTests(unittest.TestCase):
         for line in ("    x.expect(\"bad peer\")", "    tracing::info!(\"done\");", "fn log() {"):
             self.assertEqual(where(base, line), where(head, line), line)
 
+    def test_hunks_split_by_unchanged_lines_stay_apart(self):
+        """A cfg-only statement moved past two unchanged lines still lines those lines up."""
+        base = ["fn f() {", "    #[cfg(zakura_sim)]", "    let () = ();", "    a();", "    b();", "}", ""]
+        head = ["fn f() {", "    a();", "    b();", "    #[cfg(zakura_sim)]", "    let () = ();", "}", ""]
+        (base, head), _ = aligned("\n".join(base), "\n".join(head))
+        for line in ("    a();", "    b();", "}"):
+            self.assertEqual(where(base, line), where(head, line), line)
+
     def test_a_moved_release_line_stays_apart(self):
         """Release code that moved doesn't line up, so its location still differs and the bytes fail."""
         head = SOURCE[:2] + SOURCE[3:6] + [SOURCE[2]] + SOURCE[6:]
         (base, head), _ = aligned("\n".join(SOURCE), "\n".join(head))
         self.assertNotEqual(where(base, SOURCE[2]), where(head, SOURCE[2]))
         self.assertEqual(where(base, "fn check(x: Option<u8>) -> u8 {"), where(head, "fn check(x: Option<u8>) -> u8 {"))
+
+    def test_an_empty_file_is_not_padded(self):
+        """A file that was empty has no unchanged line to align, so it's left as committed, without a probe."""
+        (base, head), made = aligned("", "#[cfg(test)]\nmod tests {}\n")
+        self.assertEqual(made, [[], []])
+        self.assertEqual((base, head), ([""], ["#[cfg(test)]", "mod tests {}", ""]))
+
+    def test_both_sides_get_the_same_probe(self):
+        """A file padded on one side ends with the same probe comment on both sides."""
+        head = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+        (base, head), _ = aligned("\n".join(SOURCE), "\n".join(head))
+        self.assertEqual(base[-1], "")
+        self.assertRegex(base[-2], r"^// zakura-release-gate embed probe [0-9a-f]{32}$")
+        self.assertEqual(base[-2:], head[-2:])
+        self.assertEqual(len(base), len(head))
+
+    def test_a_probe_after_a_missing_final_newline_gets_its_own_line(self):
+        """A file that doesn't end in a newline gets one before its probe, so its last line stays code."""
+        (base, head), made = aligned("fn a() {}\nfn b() {}", "fn a() {}\n#[cfg(test)]\nfn t() {}\nfn b() {}")
+        self.assertEqual(made, [[("lib.rs", 1, 2)], []])
+        self.assertEqual(base[-3], "fn b() {}")
+        self.assertEqual(base[-2:], head[-2:])
+        self.assertTrue(base[-2].startswith("// zakura-release-gate embed probe "), base)
+
+    def test_a_probe_after_a_closed_comment_at_the_end_is_allowed(self):
+        """A file that ends with a closed block comment and no final newline takes its probe on a new line."""
+        (base, head), _ = aligned("fn a() {}\nfn b() {}\n/* done */", "fn a() {}\n#[cfg(test)]\nfn t() {}\nfn b() {}\n/* done */")
+        self.assertEqual(base[-3], "/* done */")
+        self.assertEqual(base[-2:], head[-2:])
+        self.assertTrue(base[-2].startswith("// zakura-release-gate embed probe "), base)
+
+    def test_a_probe_inside_a_literal_is_refused(self):
+        """A file that ends inside a raw string or block comment can't take a probe."""
+        for tail in ('r#"open', "/* open"):
+            with self.assertRaises(asm_diff.PaddingError, msg=tail):
+                aligned("fn a() {}\nfn b() {}\n" + tail, "fn a() {}\n#[cfg(test)]\nfn t() {}\nfn b() {}\n" + tail)
 
     def test_padding_inside_a_literal_is_refused(self):
         """A hunk that ends inside a string, raw string or block comment can't be padded."""
@@ -488,8 +537,13 @@ if stamp.exists() and stamp.stat().st_mtime >= source.stat().st_mtime:
 stamp.write_text("")
 lines = struct.pack("<I", source.read_text().count("\\n"))
 mode = os.environ["FAKE_LINES_IN"]
-code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", source.read_bytes()),
-              "debug": (b"same", b"same")}[mode]
+text = source.read_bytes()
+# The embed modes store the file whole at a place in data. `newlines`
+# stands for line-number data that holds newline bytes.
+code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", text),
+              "embed-start": (b"same", text + b"tail"), "embed-middle": (b"same", b"lead" + text + b"tail"),
+              "embed-end": (b"same", b"lead" + text), "embed-newline": (b"same", b"\\n" + text),
+              "newlines": (b"same", b"\\n" * text.count(b"\\n")), "debug": (b"same", b"same")}[mode]
 debug = [] if "debuginfo=0" in sys.argv else [("__DWARF", "__debug_line", b"d" * len(source.read_bytes()), 0)]
 sections = debug + [("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]
 member = macho(sections)
@@ -501,7 +555,7 @@ archive = b"!<arch>\\n" + header + name + member + (b"\\n" if (len(name) + len(m
 
 
 class LineCheckTests(unittest.TestCase):
-    def run_gate(self, lines_in, head=None):
+    def run_gate(self, lines_in, head=None, base=SOURCE):
         """Runs the gate on a change to `crates/x/lib.rs`, a cfg-only hook by default, with the fake object cargo."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -511,7 +565,7 @@ class LineCheckTests(unittest.TestCase):
             git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
             subprocess.run(git + ["init", "-q"], check=True)
             hook = head or SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
-            for lines in (SOURCE, hook):
+            for lines in (base, hook):
                 (repo / "crates" / "x" / "lib.rs").write_text("\n".join(lines))
                 subprocess.run(git + ["add", "."], check=True)
                 subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
@@ -556,6 +610,29 @@ class LineCheckTests(unittest.TestCase):
         """A padded file whose text appears in no data section passes."""
         status, output = self.run_gate("data")
         self.assertEqual(status, 0, output)
+        self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
+
+    def test_an_embed_at_any_place_in_data_fails(self):
+        """A padded file embedded at the start, middle or end of a data section exits 1."""
+        for mode in ("embed-start", "embed-middle", "embed-end"):
+            with self.subTest(mode):
+                status, output = self.run_gate(mode, head=SOURCE[:2] + ["", ""] + SOURCE[2:])
+                self.assertEqual(status, 1, output)
+                self.assertIn("x codegen-units=4: 1 files: identical", output)
+                self.assertIn("embed check base x codegen-units=4: padded files embedded: crates/x/lib.rs", output)
+
+    def test_an_embed_padded_at_its_start_next_to_a_newline_fails(self):
+        """A file padded at its start and embedded after a newline byte, so its padded text appears in both builds, exits 1."""
+        status, output = self.run_gate("embed-newline", head=[""] + SOURCE)
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("embed check base x codegen-units=4: padded files embedded: crates/x/lib.rs", output)
+
+    def test_a_whitespace_only_file_that_is_not_embedded_passes(self):
+        """A padded file of blank lines isn't reported because data that line numbers change holds newline bytes."""
+        status, output = self.run_gate("newlines", base=["", ""], head=["#[cfg(test)]", "mod t {}", "", ""])
+        self.assertEqual(status, 0, output)
+        self.assertIn("padded base: 2 blank lines after crates/x/lib.rs:0", output)
         self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
 
     def test_debug_info_size_alone_passes(self):

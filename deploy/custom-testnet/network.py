@@ -105,19 +105,23 @@ def restore_archive(archive, destination, network_name):
                         shutil.copyfileobj(source, output)
         if decompressor.wait(timeout=30):
             raise RuntimeError('seed decompression failed')
-    for category in ('state', 'non_finalized_state'):
-        base = destination / category
-        if not base.exists():
-            continue
-        for version in base.iterdir():
-            if not version.is_dir() or not re.fullmatch(r'v[0-9]+', version.name):
-                raise ValueError('unexpected state layout')
-            networks = list(version.iterdir())
-            if len(networks) != 1 or not networks[0].is_dir():
-                raise ValueError('seed must contain one network per state version')
-            networks[0].rename(version / network_name.lower())
-    if not (destination / 'state').exists():
+    finalized = destination / 'state'
+    if not finalized.exists():
         raise ValueError('seed has no finalized state')
+    for version in finalized.iterdir():
+        if not version.is_dir() or not re.fullmatch(r'v[0-9]+', version.name):
+            raise ValueError('unexpected finalized state layout')
+        networks = list(version.iterdir())
+        if len(networks) != 1 or not networks[0].is_dir():
+            raise ValueError('seed must contain one network per state version')
+        networks[0].rename(version / network_name.lower())
+    backup = destination / 'non_finalized_state'
+    if backup.exists():
+        # Non-finalized backups are grouped by network, without a version directory.
+        networks = list(backup.iterdir())
+        if len(networks) != 1 or not networks[0].is_dir():
+            raise ValueError('seed must contain one non-finalized network backup')
+        networks[0].rename(backup / network_name.lower())
 
 
 def node_config(config, run, index, mining=False):
@@ -223,10 +227,12 @@ def reset(config, delay):
         for expired in sorted(history.glob('*.json'), key=lambda p: p.stat().st_mtime)[:-20]:
             expired.unlink()
     run = new_run(config)
+    command('systemctl', 'stop', f'{config["service_prefix"]}-controller.service')
     atomic_json(root / 'run.json', run)
     try:
-        for suffix in ('controller', 'node0', 'node1'):
+        for suffix in ('node0', 'node1'):
             command('systemctl', 'stop', f'{config["service_prefix"]}-{suffix}.service')
+        command('systemctl', 'start', f'{config["service_prefix"]}-controller.service')
         for index in range(2):
             node = root / f'node{index}'
             if node.is_symlink():

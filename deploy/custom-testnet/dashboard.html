@@ -13,7 +13,7 @@
 <div class="card"><h2>Latest observation</h2><div class="value" id="age">—</div><small id="updated"></small></div></div>
 <h2>Independent validators</h2><table><thead><tr><th>Node</th><th>Height</th><th>Block hash</th></tr></thead><tbody id="nodes"></tbody></table>
 <h2>Activation block</h2><pre id="activation-hash">Not yet observed</pre>
-<h2>Join this run</h2><p>Use a separate cache for every run. Download the seed and verify its checksum. Extract it, then rename the network directory under both state directories to the lowercase network name shown below. The node performs the supported database format upgrade when it opens the restored state.</p>
+<h2>Join this run</h2><p>Use a separate cache for every run. Download the seed and verify its checksum. Extract it, then rename the network directory under state/v*/ and directly under non_finalized_state/ to the lowercase network name shown below. The node performs the supported database format upgrade when it opens the restored state.</p>
 <p><a href="/snapshots/seed.tar.zst">Download preserved seed</a> · <a href="/v1/config">Download this run’s configuration</a> · <a href="/v1/network">Network manifest</a></p>
 <pre id="join"></pre><pre id="config"></pre>
 <p>Build the pinned source revision with features <code>pq,internal-miner</code>. Participant validators need <code>pq</code>; leave mining disabled unless you deliberately join as a miner.</p>

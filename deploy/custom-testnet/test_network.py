@@ -172,6 +172,24 @@ class NetworkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not permitted'):
             network.check_node(self.config, 0)
 
+    def test_restore_renames_versioned_state_and_unversioned_backup(self):
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode='w') as archive:
+            for name in ('state/v29/oldnet/', 'non_finalized_state/oldnet/'):
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member)
+        process = unittest.mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(payload.getvalue())
+        process.wait.return_value = 0
+        destination = self.root / 'restored'
+        with patch.object(network.subprocess, 'Popen', return_value=process):
+            network.restore_archive('unused', destination, 'NewFork')
+        self.assertTrue((destination / 'state/v29/newfork').is_dir())
+        self.assertTrue((destination / 'non_finalized_state/newfork').is_dir())
+        self.assertFalse((destination / 'non_finalized_state/oldnet').exists())
+
     def test_activation_delay_is_bounded(self):
         self.assertEqual(network.activation_delay('5m'), 300)
         for invalid in ('0m', '-1s', '1h', '999999m'):

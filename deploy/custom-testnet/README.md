@@ -58,8 +58,8 @@ fake a pre-NU7 seed. Snapshot restoration and node startup must pass before mini
 Use `/v1/network` and `/v1/config` from the dashboard origin together. Build the
 manifest's revision with the `pq` feature, download and checksum the seed,
 extract into the participant cache directory, and rename its network directory
-under both `state/v*/` and `non_finalized_state/v*/` to the new lowercase network
-name. Keep JSON-RPC on localhost. A participant must refresh its configuration
+under `state/v*/` and directly under `non_finalized_state/` to the new
+lowercase network name. Keep JSON-RPC on localhost. A participant must refresh its configuration
 and state after every operator reset.
 
 `/v1/status` reports the current generation, node heights/hashes and agreement,

@@ -254,6 +254,9 @@ pub enum ReactorEvent {
         reservation: ResourceId,
         /// The incarnation it belongs to.
         incarnation: IncarnationId,
+        /// Whether a start made the incarnation, or a continuation of the
+        /// peer's active request took more capacity for it.
+        via: Binding,
     },
     /// A prepare or apply call captured clones of its peer's staged
     /// capacity leases, which its future holds until its completion or
@@ -359,6 +362,18 @@ pub struct LeaseEntry {
     pub lease: ResourceId,
     /// The headers it owns.
     pub count: usize,
+}
+
+/// Which queue path bound a reservation, for [`ReactorEvent::Bound`]. The
+/// queue knows it directly, so a reader never infers it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Binding {
+    /// `PeerWorkQueue::start` made a new incarnation, the next from the
+    /// queue's counter, and bound the peer's reservation to it.
+    Start,
+    /// A reserve for a peer whose request is active bound the new
+    /// reservation to that request's incarnation.
+    Continuation,
 }
 
 /// The work the queue held for a peer when it placed a reservation.

@@ -1428,6 +1428,9 @@ pub enum ReactorFact {
         reservation: u64,
         /// The incarnation, from 1 per work queue.
         incarnation: u64,
+        /// The queue path that bound it: `start`, which made the
+        /// incarnation, or `continuation` of the peer's active request.
+        via: String,
     },
     /// A prepare or apply call captured its peer's staged capacity leases
     /// (M6a-4). It follows the call's `dispatched`.

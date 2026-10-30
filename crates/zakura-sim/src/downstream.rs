@@ -16,6 +16,15 @@
 //! each a violation of their own. Serving owners are also checked whenever
 //! no task is running: an owner whose request ended must have retired by
 //! then.
+//!
+//! Every join keys on the rows' QUIC stream as well as their connection
+//! (M6a-Q8): a header stream that retires and reopens on the same
+//! connection numbers its frames and subscriptions from the start again,
+//! so a frame, judgment, request, credit or output of one stream
+//! incarnation never stands for another's. The tier declares whether its
+//! rows name a QUIC stream ([`StreamIdentity`]), and a row that breaks the
+//! declaration is a harness failure, so a missing stream can't join every
+//! incarnation at once.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -28,14 +37,28 @@ use crate::{
     model::Label,
     observe::{Entry, RowAt},
     property::{CheckCtx, HasView, Verdict},
-    table::GeneratedId,
+    table::{GeneratedId, StreamIdentity},
     Observation,
 };
 
-/// Checks the per-row template `id` names with `effect`, its check of one
-/// log entry, over every entry this step appended. The sender templates
-/// share it.
+/// Checks the downstream template `id` names with `effect`, its check of
+/// one log entry, over every entry this step appended, once every
+/// downstream row this step appended keeps the tier's `identity`.
 pub(crate) fn check<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    id: &GeneratedId<'_>,
+    identity: StreamIdentity,
+    effect: impl Fn(&[Entry], usize, &RowAt) -> Found,
+) -> Verdict {
+    if !keeps_identity(cx, identity) {
+        return Verdict::NotApplicable;
+    }
+    check_with(cx, id, effect, None)
+}
+
+/// [`check`] without the identity rule, for the sender templates, whose
+/// rows are frames the peers labelled.
+pub(crate) fn check_rows<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
     effect: impl Fn(&[Entry], usize, &RowAt) -> Found,
@@ -44,10 +67,92 @@ pub(crate) fn check<S: HasView>(
 }
 
 /// Checks `receiver-serving-bounded`: [`serving_bounded`] on each entry,
-/// and [`owners_retired`] at each step that leaves no task running.
-pub(crate) fn check_serving<S: HasView>(cx: &mut CheckCtx<'_, S>, id: &GeneratedId<'_>) -> Verdict {
+/// and [`owners_retired`] at each step that leaves no task running, as
+/// [`check`] does.
+pub(crate) fn check_serving<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    id: &GeneratedId<'_>,
+    identity: StreamIdentity,
+) -> Verdict {
+    if !keeps_identity(cx, identity) {
+        return Verdict::NotApplicable;
+    }
     let at_rest = cx.status != SchedulerStatus::Running;
     check_with(cx, id, serving_bounded, at_rest.then_some(owners_retired))
+}
+
+/// True if every downstream row this step appended names a QUIC stream
+/// exactly when `identity` says the tier's rows do. Otherwise records the
+/// first that doesn't as missing evidence, which fails the run as a
+/// harness failure.
+fn keeps_identity<S: HasView>(cx: &mut CheckCtx<'_, S>, identity: StreamIdentity) -> bool {
+    let entries = cx.log.entries();
+    let start = entries.partition_point(|e| e.step < cx.step);
+    let broken = entries[start..].iter().find_map(|entry| {
+        let (name, connection, quic_stream) = stream_of(&entry.obs)?;
+        match (identity, quic_stream) {
+            (StreamIdentity::Exact, None) => Some(format!(
+                "connection {connection}'s {name} row names no QUIC stream, on a tier whose \
+                 rows must"
+            )),
+            (StreamIdentity::PerKind, Some(quic)) => Some(format!(
+                "connection {connection}'s {name} row names QUIC stream {quic}, on a tier with \
+                 one stream of each kind"
+            )),
+            _ => None,
+        }
+    });
+    match broken {
+        Some(detail) => {
+            cx.missing_evidence(detail);
+            false
+        }
+        None => true,
+    }
+}
+
+/// A downstream row's name, connection and QUIC stream, or `None` for any
+/// other observation.
+fn stream_of(obs: &Observation) -> Option<(&'static str, u64, Option<u64>)> {
+    let (name, connection, quic_stream) = match obs {
+        Observation::CreditGranted {
+            connection,
+            quic_stream,
+            ..
+        } => ("credit-granted", connection, quic_stream),
+        Observation::ExchangeOwed {
+            connection,
+            quic_stream,
+            ..
+        } => ("exchange-owed", connection, quic_stream),
+        Observation::WorkAdmitted {
+            connection,
+            quic_stream,
+            ..
+        } => ("work-admitted", connection, quic_stream),
+        Observation::UnframedWork {
+            connection,
+            quic_stream,
+            ..
+        } => ("unframed-work", connection, quic_stream),
+        Observation::Serving {
+            connection,
+            quic_stream,
+            ..
+        } => ("serving", connection, quic_stream),
+        Observation::ServingEnded {
+            connection,
+            quic_stream,
+            ..
+        } => ("serving-ended", connection, quic_stream),
+        Observation::NodeOutput {
+            connection,
+            quic_stream,
+            ..
+        } => ("node-output", connection, quic_stream),
+        _ => return None,
+    };
+    Some((name, *connection, *quic_stream))
 }
 
 /// [`check`], also folding in `at_rest`'s verdict on the whole log.
@@ -120,10 +225,11 @@ impl Quantity {
 }
 
 /// `receiver-work-authorized`: work the node admits from a frame of `row`
-/// must come from a frame of `row` with the work's exchange key that the
-/// peer's models labelled `Conformant` and the node's reader judged, on a
-/// connection still open. The work from each frame stays within that
-/// frame's bytes: one frame's unused bytes never cover another's work.
+/// must come from a frame of `row` on the work's QUIC stream with the
+/// work's exchange key that the peer's models labelled `Conformant` and the
+/// node's reader judged, on a connection still open. The work from each
+/// frame stays within that frame's bytes: one frame's unused bytes never
+/// cover another's work.
 ///
 /// Held work no frame explains, [`Observation::UnframedWork`], fails every
 /// row of its stream directly, since no frame of any row delivered it.
@@ -149,6 +255,7 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
     }
     let Observation::WorkAdmitted {
         connection,
+        quic_stream,
         frame,
         seq,
         exchange,
@@ -161,14 +268,17 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
         return None;
     }
     let before = &entries[..at];
-    let what = format!("connection {connection}'s work from {row} frame {seq}");
+    let what = format!(
+        "connection {connection}'s work from {row}{} frame {seq}",
+        on(*quic_stream)
+    );
     if closed(before, *connection) {
         return Some(Err(Failure::new(
             format!("{what} stops when the connection closes"),
             "the node admitted it after the close",
         )));
     }
-    let delivered = match source_frame(before, *connection, row, *seq) {
+    let delivered = match source_frame(before, *connection, *quic_stream, row, *seq) {
         Some(Source {
             label: Label::Conformant,
             exchange: Some(e),
@@ -190,11 +300,14 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
         .filter_map(|entry| match &entry.obs {
             Observation::WorkAdmitted {
                 connection: c,
+                quic_stream: q,
                 frame: f,
                 seq: s,
                 bytes,
                 ..
-            } if (c, f, s) == (connection, frame, seq) => Some(*bytes),
+            } if (c, f, s) == (connection, frame, seq) && same_stream(*q, *quic_stream) => {
+                Some(*bytes)
+            }
             _ => None,
         })
         .fold(0u64, u64::saturating_add);
@@ -210,11 +323,12 @@ pub(crate) fn work_authorized(entries: &[Entry], at: usize, row: &RowAt) -> Foun
 
 /// `receiver-credit-conserved`: work the node admits for a subscription of
 /// `row`, from all its page rows, stays within the credit the node granted
-/// since the subscription opened, in objects and in bytes. A terminal
-/// outcome spends no credit, so its work isn't counted.
+/// on its QUIC stream since the subscription opened, in objects and in
+/// bytes. A terminal outcome spends no credit, so its work isn't counted.
 pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Found {
     let Observation::WorkAdmitted {
         connection,
+        quic_stream,
         request,
         exchange,
         ends: false,
@@ -232,12 +346,15 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
         match &entry.obs {
             Observation::CreditGranted {
                 connection: c,
+                quic_stream: q,
                 subscription,
                 exchange: e,
                 objects,
                 bytes,
                 opens,
-            } if (c, subscription, e) == (connection, request, exchange) => {
+            } if (c, subscription, e) == (connection, request, exchange)
+                && same_stream(*q, *quic_stream) =>
+            {
                 if *opens {
                     granted = Quantity::default();
                     admitted = Quantity::default();
@@ -246,13 +363,16 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
             }
             Observation::WorkAdmitted {
                 connection: c,
+                quic_stream: q,
                 request: r,
                 exchange: e,
                 objects,
                 bytes,
                 ends: false,
                 ..
-            } if (c, r, e) == (connection, request, exchange) => admitted.add(*objects, *bytes),
+            } if (c, r, e) == (connection, request, exchange) && same_stream(*q, *quic_stream) => {
+                admitted.add(*objects, *bytes)
+            }
             _ => {}
         }
     }
@@ -261,9 +381,11 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
     } else {
         Err(Failure::new(
             format!(
-                "connection {connection}'s work from {row} subscription {exchange} stays within \
-                 the {} objects and {} bytes granted",
-                granted.objects, granted.bytes
+                "connection {connection}'s work from {row}{} subscription {exchange} stays \
+                 within the {} objects and {} bytes granted",
+                on(*quic_stream),
+                granted.objects,
+                granted.bytes
             ),
             format!(
                 "the node admitted {} objects and {} bytes",
@@ -274,40 +396,46 @@ pub(crate) fn credit_conserved(entries: &[Entry], at: usize, row: &RowAt) -> Fou
 }
 
 /// `receiver-serving-bounded`: the node starts serving a request of `row`
-/// only for a request frame with its key that the peer's models labelled
-/// `Conformant` and the reader judged, while the request is open: before
-/// the node writes its ending, on a connection still open. Each such
-/// request gets at most one owner. The node's output answers only such an
-/// open request too, whether or not an owner wrote it. Conformant requests
-/// stay within the receiver's margin, so its serving owners and outputs do
-/// too.
+/// only for a request frame on the owner's QUIC stream with its key that
+/// the peer's models labelled `Conformant` and the reader judged, while the
+/// request is open: before the node writes its ending, on a connection
+/// still open. Each such request gets at most one owner. The node's output
+/// answers only such an open request too, whether or not an owner wrote
+/// it. Conformant requests stay within the receiver's margin, so its
+/// serving owners and outputs do too.
 pub(crate) fn serving_bounded(entries: &[Entry], at: usize, row: &RowAt) -> Found {
-    let (connection, request, exchange) = match &entries[at].obs {
+    let (connection, quic_stream, request, exchange) = match &entries[at].obs {
         Observation::Serving {
             connection,
+            quic_stream,
             request,
             exchange,
-        } => (connection, request, exchange),
+        } => (connection, quic_stream, request, exchange),
         Observation::NodeOutput {
             connection,
+            quic_stream,
             request,
             exchange,
             ..
-        } => return answered(&entries[..at], *connection, request, *exchange, row),
+        } => {
+            let at_key = Key::new(*connection, *quic_stream, *exchange);
+            return answered(&entries[..at], at_key, request, row);
+        }
         _ => return None,
     };
     if request != row {
         return None;
     }
+    let key = Key::new(*connection, *quic_stream, *exchange);
     let before = &entries[..at];
-    let what = format!("connection {connection}'s {row} request {exchange}");
+    let what = format!("{key}'s {row} request {exchange}");
     if closed(before, *connection) {
         return Some(Err(Failure::new(
             format!("{what} is served only while the connection is open"),
             "the node started serving it after the close",
         )));
     }
-    let requests = requests(before, *connection, row, *exchange);
+    let requests = requests(before, key, row);
     Some(if requests.unserved > 0 {
         Ok(())
     } else if requests.open > 0 {
@@ -324,25 +452,19 @@ pub(crate) fn serving_bounded(entries: &[Entry], at: usize, row: &RowAt) -> Foun
 }
 
 /// The output part of `receiver-serving-bounded`: the node's output for a
-/// request of `row` with key `exchange` on `connection` answers a
-/// conformant, judged request still open in `before`.
-fn answered(
-    before: &[Entry],
-    connection: u64,
-    request: &RowAt,
-    exchange: u64,
-    row: &RowAt,
-) -> Found {
+/// request of `row` with `key` answers a conformant, judged request still
+/// open in `before`.
+fn answered(before: &[Entry], key: Key, request: &RowAt, row: &RowAt) -> Found {
     if request != row {
         return None;
     }
-    Some(if requests(before, connection, row, exchange).open > 0 {
+    Some(if requests(before, key, row).open > 0 {
         Ok(())
     } else {
         Err(Failure::new(
             format!(
-                "connection {connection}'s {row} request {exchange} is answered only while a \
-                 conformant request is open"
+                "{key}'s {row} request {} is answered only while a conformant request is open",
+                key.exchange
             ),
             "the node answered it with no request open",
         ))
@@ -354,21 +476,28 @@ fn answered(
 /// or its connection's close, has retired. `None` if the node never served
 /// one.
 pub(crate) fn owners_retired(entries: &[Entry], row: &RowAt) -> Found {
-    // Live owners and open requests per (connection, exchange).
-    let mut owners: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    // Live owners per request key.
+    let mut owners: BTreeMap<Key, u64> = BTreeMap::new();
     for entry in entries {
         match &entry.obs {
             Observation::Serving {
                 connection,
-                request,
-                exchange,
-            } if request == row => *owners.entry((*connection, *exchange)).or_default() += 1,
-            Observation::ServingEnded {
-                connection,
+                quic_stream,
                 request,
                 exchange,
             } if request == row => {
-                if let Some(live) = owners.get_mut(&(*connection, *exchange)) {
+                *owners
+                    .entry(Key::new(*connection, *quic_stream, *exchange))
+                    .or_default() += 1;
+            }
+            Observation::ServingEnded {
+                connection,
+                quic_stream,
+                request,
+                exchange,
+            } if request == row => {
+                if let Some(live) = owners.get_mut(&Key::new(*connection, *quic_stream, *exchange))
+                {
                     *live = live.saturating_sub(1);
                 }
             }
@@ -378,13 +507,13 @@ pub(crate) fn owners_retired(entries: &[Entry], row: &RowAt) -> Found {
     if owners.is_empty() {
         return None;
     }
-    for (&(connection, exchange), &live) in &owners {
-        let open = requests(entries, connection, row, exchange).open;
+    for (&key, &live) in &owners {
+        let open = requests(entries, key, row).open;
         if live > open {
             return Some(Err(Failure::new(
                 format!(
-                    "connection {connection}'s owners for {row} request {exchange} retire \
-                     once their requests end"
+                    "{key}'s owners for {row} request {} retire once their requests end",
+                    key.exchange
                 ),
                 format!("{live} owners are live for {open} open requests"),
             )));
@@ -402,6 +531,7 @@ pub(crate) fn owners_retired(entries: &[Entry], row: &RowAt) -> Found {
 pub(crate) fn within_response_quantity(entries: &[Entry], at: usize, row: &RowAt) -> Found {
     let Observation::NodeOutput {
         connection,
+        quic_stream,
         frame,
         request,
         exchange,
@@ -413,7 +543,10 @@ pub(crate) fn within_response_quantity(entries: &[Entry], at: usize, row: &RowAt
     if frame != row {
         return None;
     }
-    let what = format!("connection {connection}'s {request} exchange {exchange}");
+    let what = format!(
+        "connection {connection}'s {request}{} exchange {exchange}",
+        on(*quic_stream)
+    );
     // The exchange as it stood before this frame: what it owes, and what
     // the node wrote since it opened. An ending closes it.
     let mut open: Option<(u32, u64)> = None;
@@ -422,22 +555,24 @@ pub(crate) fn within_response_quantity(entries: &[Entry], at: usize, row: &RowAt
         match &entry.obs {
             Observation::ExchangeOwed {
                 connection: c,
+                quic_stream: q,
                 request: r,
                 exchange: e,
                 frames,
                 bytes,
-            } if (c, r, e) == (connection, request, exchange) => {
+            } if (c, r, e) == (connection, request, exchange) && same_stream(*q, *quic_stream) => {
                 open = Some((*frames, *bytes));
                 written = (0, 0);
             }
             Observation::NodeOutput {
                 connection: c,
+                quic_stream: q,
                 request: r,
                 exchange: e,
                 payload,
                 ends,
                 ..
-            } if (c, r, e) == (connection, request, exchange) => {
+            } if (c, r, e) == (connection, request, exchange) && same_stream(*q, *quic_stream) => {
                 if *ends {
                     open = None;
                 } else {
@@ -500,22 +635,32 @@ impl fmt::Display for Source {
     }
 }
 
-/// Frame `seq` of `row` on `connection` in `entries`, or `None` if the peer
-/// sent no such frame.
-fn source_frame(entries: &[Entry], connection: u64, row: &RowAt, seq: u64) -> Option<Source> {
+/// Frame `seq` of `row` on `connection` and `quic_stream` in `entries`, or
+/// `None` if the peer sent no such frame.
+fn source_frame(
+    entries: &[Entry],
+    connection: u64,
+    quic_stream: Option<u64>,
+    row: &RowAt,
+    seq: u64,
+) -> Option<Source> {
     let mut source = None;
     for entry in entries {
         match &entry.obs {
             Observation::PeerFrame {
                 connection: c,
                 stream,
+                quic_stream: q,
                 seq: s,
                 row: Some(r),
                 label,
                 exchange,
                 payload,
                 ..
-            } if (*c, *stream, *s) == (connection, row.stream, seq) && *r == row.row => {
+            } if (*c, *stream, *s) == (connection, row.stream, seq)
+                && same_stream(*q, quic_stream)
+                && *r == row.row =>
+            {
                 source = Some(Source {
                     label: *label,
                     exchange: *exchange,
@@ -526,9 +671,11 @@ fn source_frame(entries: &[Entry], connection: u64, row: &RowAt, seq: u64) -> Op
             Observation::FrameJudged {
                 connection: c,
                 stream,
+                quic_stream: q,
                 seq: s,
-                ..
-            } if (*c, *stream, *s) == (connection, row.stream, seq) => {
+            } if (*c, *stream, *s) == (connection, row.stream, seq)
+                && same_stream(*q, quic_stream) =>
+            {
                 if let Some(source) = &mut source {
                     source.judged = true;
                 }
@@ -548,56 +695,113 @@ struct Requests {
     unserved: u64,
 }
 
-/// The requests of `row` with key `exchange` on `connection` in `entries`
-/// that the peer's models labelled `Conformant` and the node's reader then
-/// judged, with the node's endings and serving owners applied in order.
-fn requests(entries: &[Entry], connection: u64, row: &RowAt, exchange: u64) -> Requests {
+/// The requests of `row` with `key` in `entries` that the peer's models
+/// labelled `Conformant` and the node's reader then judged, with the node's
+/// endings and serving owners applied in order.
+fn requests(entries: &[Entry], key: Key, row: &RowAt) -> Requests {
     let mut sent = BTreeSet::new();
     let mut found = Requests::default();
     for entry in entries {
         match &entry.obs {
             Observation::PeerFrame {
-                connection: c,
+                connection,
                 stream,
+                quic_stream,
                 seq,
                 row: Some(r),
                 label: Label::Conformant,
-                exchange: Some(e),
+                exchange: Some(exchange),
                 ..
-            } if *c == connection && *stream == row.stream && *r == row.row && *e == exchange => {
+            } if key.names(*connection, *quic_stream, *exchange)
+                && *stream == row.stream
+                && *r == row.row =>
+            {
                 sent.insert(*seq);
             }
             Observation::FrameJudged {
-                connection: c,
+                connection,
                 stream,
+                quic_stream,
                 seq,
-                ..
-            } if *c == connection && *stream == row.stream && sent.remove(seq) => {
+            } if *connection == key.connection
+                && same_stream(*quic_stream, key.quic_stream)
+                && *stream == row.stream
+                && sent.remove(seq) =>
+            {
                 found.open += 1;
                 found.unserved += 1;
             }
             Observation::Serving {
-                connection: c,
-                request: r,
-                exchange: e,
-            } if (*c, r, *e) == (connection, row, exchange) => {
+                connection,
+                quic_stream,
+                request,
+                exchange,
+            } if key.names(*connection, *quic_stream, *exchange) && request == row => {
                 found.unserved = found.unserved.saturating_sub(1);
             }
             Observation::NodeOutput {
-                connection: c,
-                request: r,
-                exchange: e,
+                connection,
+                quic_stream,
+                request,
+                exchange,
                 ends: true,
                 ..
-            } if (*c, r, *e) == (connection, row, exchange) => {
+            } if key.names(*connection, *quic_stream, *exchange) && request == row => {
                 found.open = found.open.saturating_sub(1);
                 found.unserved = found.unserved.min(found.open);
             }
-            Observation::ConnectionClosed { connection: c, .. } if *c == connection => {
+            Observation::ConnectionClosed { connection, .. } if *connection == key.connection => {
                 found = Requests::default();
             }
             _ => {}
         }
     }
     found
+}
+
+/// A request's key on one stream incarnation: its connection, its QUIC
+/// stream, and its exchange key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Key {
+    connection: u64,
+    quic_stream: Option<u64>,
+    exchange: u64,
+}
+
+impl Key {
+    /// The key of `exchange` on `connection` and `quic_stream`.
+    fn new(connection: u64, quic_stream: Option<u64>, exchange: u64) -> Self {
+        Key {
+            connection,
+            quic_stream,
+            exchange,
+        }
+    }
+
+    /// True if a row on `connection` and `quic_stream` with key `exchange`
+    /// has this key.
+    fn names(self, connection: u64, quic_stream: Option<u64>, exchange: u64) -> bool {
+        (connection, exchange) == (self.connection, self.exchange)
+            && same_stream(quic_stream, self.quic_stream)
+    }
+}
+
+/// True if two rows on one connection are on the same stream incarnation:
+/// both on one QUIC stream, or both on a tier whose rows name none. Every
+/// join checks it.
+fn same_stream(a: Option<u64>, b: Option<u64>) -> bool {
+    a == b
+}
+
+impl fmt::Display for Key {
+    /// Writes its stream incarnation, as `connection 1 (QUIC stream 4)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "connection {}{}", self.connection, on(self.quic_stream))
+    }
+}
+
+/// ` (QUIC stream 4)` for a row on QUIC stream 4, or nothing for a row with
+/// none.
+fn on(quic_stream: Option<u64>) -> String {
+    quic_stream.map_or(String::new(), |quic| format!(" (QUIC stream {quic})"))
 }

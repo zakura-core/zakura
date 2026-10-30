@@ -1,27 +1,63 @@
 //! M6a-5b: stream-exact downstream rows on `header-sync/wire`. A header
 //! stream that retires and reopens on the same connection numbers its
-//! frames and subscriptions from the start again. This pins a history
-//! where the node stages work on both stream incarnations. A history a
-//! test needs that never happened fails it.
+//! frames and subscriptions from the start again, so the node's staged
+//! work on each QUIC stream must join that stream's frames only. A history
+//! a test needs that never happened fails it.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
+use zakura_network::zakura::v9::RegtestMessage;
 use zakura_sim::{
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Chain, Policy,
         },
-        header_sync::{HeaderWire, WireScenario},
+        header_sync::{HeaderWire, WireScenario, FAMILY},
         run_prepared, HarnessError, Subsystem,
     },
     observe::ReactorFact,
     peer::{honest::HonestSpec, PeerAction, PeerSpec},
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, RunReport,
+    property::{Assumptions, HasView, Registry, RegistryChecker},
+    table::{downstream_properties, Effect, StreamIdentity},
+    Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
+
+/// Nothing to view: the downstream checks read the log alone.
+struct Nothing;
+
+impl HasView for Nothing {
+    type View = ();
+
+    fn view(&self) {}
+}
+
+/// The header family's `receiver-work-authorized` properties on the wire
+/// tier, one per response row. The other downstream templates need
+/// peer-side credit rows that `header-sync/wire` doesn't log yet.
+fn work_checker() -> RegistryChecker<Nothing> {
+    let properties = downstream_properties::<Nothing>(
+        FAMILY,
+        &RegtestMessage::LAYOUT,
+        &[Effect::Work],
+        StreamIdentity::Exact,
+    )
+    .into_iter()
+    .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
+    .collect();
+    RegistryChecker::new(
+        Registry::new(properties).expect("one per row"),
+        Rc::new(Nothing),
+        Assumptions::none(),
+        &HeaderWire::sources(),
+    )
+}
 
 /// Runs `scenario` under `plan` with `extra` beside the harness's checker,
 /// and returns the report, even of a run that ended in a harness failure.
@@ -92,18 +128,24 @@ fn staged(report: &RunReport) -> BTreeMap<u64, BTreeSet<u64>> {
 }
 
 /// A header stream retires and reopens on one connection, and the node
-/// stages pages on both QUIC streams, with frame seqs the reopened stream
-/// counts from the start again.
+/// stages pages on both QUIC streams, with frame seqs and the subscription
+/// ID the reopened stream counts from the start again. Each `WorkAdmitted`
+/// names its frame's QUIC stream and joins exactly one page frame there,
+/// though the other stream has a frame with the same connection, row, seq
+/// and subscription, and `receiver-work-authorized` holds with work to
+/// judge on both streams.
 ///
-/// This fails if the peer finishes its stream before the node's first
-/// round staged a page, or if the node takes no page after the reopen.
+/// This fails if the joins ignore the QUIC stream: frame 1's work on the
+/// reopened stream then adds up with the retired stream's frame 1, past
+/// the bytes either frame delivered.
 #[test]
 fn two_stream_incarnations_keep_their_work_apart() {
     let scenario = reopen();
     let mut plans = vec![Plan::from_fuzz(&[])];
     plans.extend(support::inputs(2, 16_384));
     for plan in plans {
-        let report = run(&scenario, plan, &mut NoChecks);
+        let mut checker = work_checker();
+        let report = run(&scenario, plan, &mut checker);
         assert_eq!(report.end.harness, None, "{:?}", report.end);
         assert_eq!(report.end.violation, None, "{:?}", report.end);
         let entries = report.log.entries();
@@ -132,5 +174,73 @@ fn two_stream_incarnations_keep_their_work_apart() {
             .copied()
             .collect();
         assert!(!overlap.is_empty(), "the seqs overlap: {staged:?}");
+
+        // The joins: each page's work names its QUIC stream and joins one
+        // frame there, though an overlapping seq has a frame on both.
+        let mut admitted: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
+        for (at, entry) in entries.iter().enumerate() {
+            let Observation::WorkAdmitted {
+                connection,
+                quic_stream,
+                frame,
+                seq,
+                exchange,
+                ends: false,
+                ..
+            } = &entry.obs
+            else {
+                continue;
+            };
+            let quic_stream = quic_stream.expect("wire work names its QUIC stream");
+            let frames = |on: Option<u64>| {
+                entries[..at]
+                    .iter()
+                    .filter(|before| {
+                        matches!(
+                            &before.obs,
+                            Observation::PeerFrame {
+                                connection: c,
+                                stream,
+                                quic_stream: q,
+                                seq: s,
+                                row: Some(row),
+                                exchange: Some(e),
+                                ..
+                            } if c == connection && s == seq && e == exchange
+                                && *stream == frame.stream && *row == frame.row
+                                && on.is_none_or(|on| *q == Some(on))
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(frames(Some(quic_stream)), 1, "{:?}", entry.obs);
+            if quic_stream == quic[1] && overlap.contains(seq) {
+                assert_eq!(frames(None), 2, "both streams have the frame");
+            }
+            admitted
+                .entry(quic_stream)
+                .or_default()
+                .insert((*seq, *exchange));
+        }
+        assert_eq!(
+            admitted.keys().copied().collect::<Vec<_>>(),
+            quic,
+            "work on both streams"
+        );
+        let shared: Vec<_> = admitted[&quic[0]]
+            .intersection(&admitted[&quic[1]])
+            .collect();
+        assert!(!shared.is_empty(), "a seq and subscription on both");
+        let id = format!("{FAMILY}/s5v9/headers/receiver-work-authorized");
+        let outcome = &report
+            .properties
+            .iter()
+            .find(|property| property.property == id)
+            .unwrap_or_else(|| panic!("{id} ran: {:?}", report.properties))
+            .outcome;
+        assert!(
+            matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+            "{outcome:?}"
+        );
     }
 }

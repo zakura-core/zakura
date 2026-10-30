@@ -234,6 +234,12 @@ pub enum Observation {
     CreditGranted {
         /// The connection.
         connection: u64,
+        /// The QUIC stream its frames came on or went out on, which
+        /// [`crate::table::StreamIdentity::Exact`] tiers require and joins key
+        /// on, since a reopened stream numbers its frames and keys from the
+        /// start (M6a-Q8). `None` on a tier with one stream of each kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The subscription row.
         subscription: RowAt,
         /// The subscription's key.
@@ -252,6 +258,9 @@ pub enum Observation {
     ExchangeOwed {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The request row.
         request: RowAt,
         /// The exchange's key.
@@ -270,10 +279,14 @@ pub enum Observation {
     WorkAdmitted {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The row of the frame the work came from.
         frame: RowAt,
         /// That frame, as its [`Observation::PeerFrame`] numbers it on
-        /// `frame`'s stream: the frame whose body the work holds.
+        /// `frame`'s stream and `quic_stream`: the frame whose body the work
+        /// holds.
         seq: u64,
         /// The request or subscription row those frames answer.
         request: RowAt,
@@ -296,6 +309,9 @@ pub enum Observation {
     UnframedWork {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The request or subscription row the work answers.
         request: RowAt,
         /// The exchange or subscription key.
@@ -315,6 +331,9 @@ pub enum Observation {
     Serving {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The request row.
         request: RowAt,
         /// The request's key.
@@ -325,6 +344,9 @@ pub enum Observation {
     ServingEnded {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The request row.
         request: RowAt,
         /// The request's key.
@@ -335,6 +357,9 @@ pub enum Observation {
     NodeOutput {
         /// The connection.
         connection: u64,
+        /// Its QUIC stream, as for [`Observation::CreditGranted`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_stream: Option<u64>,
         /// The frame's row.
         frame: RowAt,
         /// The request row it answers.

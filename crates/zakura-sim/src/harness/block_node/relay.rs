@@ -914,6 +914,7 @@ impl Wire {
         for (request, exchange, owed) in extra.opened {
             let obs = Observation::ExchangeOwed {
                 connection,
+                quic_stream: None,
                 request: row(row_name(u16::from(MSG_BS_GET_BLOCKS))),
                 exchange,
                 frames: owed.frames,
@@ -1116,6 +1117,7 @@ fn node_output(
     });
     Some(Observation::NodeOutput {
         connection,
+        quic_stream: None,
         frame: row(rule.name),
         request: row(row_name(u16::from(MSG_BS_GET_BLOCKS))),
         exchange: exchange.unwrap_or(u64::MAX),

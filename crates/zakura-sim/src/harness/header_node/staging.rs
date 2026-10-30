@@ -12,7 +12,9 @@
 //!
 //! * `WorkAdmitted` for each `Staged`, naming its page frame, and for each
 //!   outcome that retired or retried its matching incarnation, with
-//!   `ends: true`. Its connection comes from the session's `Session` row.
+//!   `ends: true`. Its connection and QUIC stream come from the session's
+//!   `Session` row, so work on a reopened stream never joins the retired
+//!   one's frames (M6a-5b).
 //! * `UnframedWork` for held work no frame explains. The fold keeps its own
 //!   expected digest per incarnation, empty at first and after each
 //!   `EntriesTaken`, and extends it at each `Staged` by the frame's decoded
@@ -166,6 +168,7 @@ impl StagedWork {
                 work.expected = work.expected.then(frame.received);
                 derived.push(Observation::WorkAdmitted {
                     connection,
+                    quic_stream: Some(frame.quic_stream),
                     frame: rows.page,
                     seq: frame.seq,
                     request: rows.request.clone(),
@@ -175,7 +178,8 @@ impl StagedWork {
                     ends: false,
                 });
                 if *after != work.expected {
-                    derived.push(unframed(connection, rows.request, work, *after));
+                    let at = (connection, frame.quic_stream, rows.request);
+                    derived.push(unframed(at, work, *after));
                 }
             }
             ReactorFact::EntriesTaken {
@@ -185,8 +189,8 @@ impl StagedWork {
                     return Ok(derived);
                 };
                 if *chain != work.expected {
-                    let (connection, request) = session_rows(evidence, work.session_id)?;
-                    derived.push(unframed(connection, request, work, *chain));
+                    let at = session_rows(evidence, work.session_id)?;
+                    derived.push(unframed(at, work, *chain));
                 }
                 work.expected = HeldDigest::default();
                 work.reported = None;
@@ -213,8 +217,8 @@ impl StagedWork {
                     if *held_digest == work.expected {
                         work.reported = None;
                     } else if work.reported != Some(*held_digest) {
-                        let (connection, request) = session_rows(evidence, work.session_id)?;
-                        derived.push(unframed(connection, request, work, *held_digest));
+                        let at = session_rows(evidence, work.session_id)?;
+                        derived.push(unframed(at, work, *held_digest));
                     }
                 }
             }
@@ -234,6 +238,7 @@ impl StagedWork {
                 let (connection, rows) = joined(evidence, *session_id, &frame)?;
                 derived.push(Observation::WorkAdmitted {
                     connection,
+                    quic_stream: Some(frame.quic_stream),
                     frame: rows.outcome,
                     seq: frame.seq,
                     request: rows.request,
@@ -267,10 +272,10 @@ fn joined(
     Ok((connection, Rows::of(stream)?))
 }
 
-/// Session `session_id`'s connection and subscription row.
-fn session_rows(evidence: &WireEvidence, session_id: u64) -> Result<(u64, RowAt), String> {
-    let (connection, _, stream) = mapped(evidence, session_id)?;
-    Ok((connection, Rows::of(stream)?.request))
+/// Session `session_id`'s connection, QUIC stream and subscription row.
+fn session_rows(evidence: &WireEvidence, session_id: u64) -> Result<(u64, u64, RowAt), String> {
+    let (connection, quic_stream, stream) = mapped(evidence, session_id)?;
+    Ok((connection, quic_stream, Rows::of(stream)?.request))
 }
 
 /// Session `session_id`'s connection, QUIC stream and stream.
@@ -282,9 +287,11 @@ fn mapped(evidence: &WireEvidence, session_id: u64) -> Result<(u64, u64, StreamI
     })
 }
 
-/// `UnframedWork` for `work`, whose entries digest to `held` where its
-/// frames explain only its expected digest, and notes it reported.
-fn unframed(connection: u64, request: RowAt, work: &mut Work, held: HeldDigest) -> Observation {
+/// `UnframedWork` for `work` on `at`, its session's connection, QUIC stream
+/// and subscription row, whose entries digest to `held` where its frames
+/// explain only its expected digest, and notes it reported.
+fn unframed(at: (u64, u64, RowAt), work: &mut Work, held: HeldDigest) -> Observation {
+    let (connection, quic_stream, request) = at;
     work.reported = Some(held);
     let (cause, objects) = if held.len > work.expected.len {
         (UnframedCause::Extra, held.len - work.expected.len)
@@ -293,6 +300,7 @@ fn unframed(connection: u64, request: RowAt, work: &mut Work, held: HeldDigest) 
     };
     Observation::UnframedWork {
         connection,
+        quic_stream: Some(quic_stream),
         request,
         exchange: work.subscription,
         objects,

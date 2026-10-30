@@ -41,6 +41,10 @@
 //! payload-mismatch or consensus-invalid verdict for a body a peer
 //! supplied, the adapter writes no `Misbehavior` or close for that peer's
 //! connections: the scenario's verifier, not the wire, judged that peer.
+//!
+//! Its relays are in-memory links with one stream of each kind, so no row
+//! it writes names a QUIC stream, and stream 6's downstream properties
+//! declare [`StreamIdentity::PerKind`](crate::table::StreamIdentity).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -435,6 +439,7 @@ impl Adapter {
                 );
                 log.push(Observation::WorkAdmitted {
                     connection,
+                    quic_stream: None,
                     frame: row(row_name(u16::from(MSG_BS_BLOCK))),
                     seq: delivered.map_or(u64::MAX, |delivered| delivered.seq),
                     request: get_blocks(),
@@ -456,11 +461,13 @@ impl Adapter {
                 log.push(match step {
                     LeaseStep::Acquired => Observation::Serving {
                         connection,
+                        quic_stream: None,
                         request,
                         exchange,
                     },
                     LeaseStep::Released => Observation::ServingEnded {
                         connection,
+                        quic_stream: None,
                         request,
                         exchange,
                     },

@@ -25,7 +25,7 @@ use zakura_sim::{
     observe::{ReactorCall, ReactorFact, ReactorWorkState},
     peer::{honest::HonestSpec, PeerSpec},
     property::{Assumptions, HasView, Registry, RegistryChecker},
-    table::{downstream_properties, Effect},
+    table::{downstream_properties, Effect, StreamIdentity},
     Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -42,11 +42,15 @@ impl HasView for Nothing {
 /// response row. The other downstream templates need peer-side credit rows
 /// that `header-sync/wire` doesn't log yet.
 fn work_checker() -> RegistryChecker<Nothing> {
-    let properties =
-        downstream_properties::<Nothing>(FAMILY, &RegtestMessage::LAYOUT, &[Effect::Work])
-            .into_iter()
-            .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
-            .collect();
+    let properties = downstream_properties::<Nothing>(
+        FAMILY,
+        &RegtestMessage::LAYOUT,
+        &[Effect::Work],
+        StreamIdentity::Exact,
+    )
+    .into_iter()
+    .filter(|property| property.id.as_str().ends_with("/receiver-work-authorized"))
+    .collect();
     RegistryChecker::new(
         Registry::new(properties).expect("one per row"),
         Rc::new(Nothing),

@@ -4,7 +4,8 @@
 //! A generated property's ID names everything its check needs:
 //! `<family>/s<kind>v<version>[/<row>]/<claim>`. The check parses its own ID
 //! back, so the ID is the one record of the stream, row and template a
-//! property covers.
+//! property covers. A downstream property's check also names its tier's
+//! [`StreamIdentity`], which is the tier's, not the row's.
 //!
 //! [`downstream_properties`] adds the templates that compare the node's
 //! actual effects with the role models, which `downstream.rs` checks, and
@@ -302,13 +303,31 @@ pub enum Effect {
     Output,
 }
 
+/// Whether a tier's downstream rows name their QUIC stream (M6a-Q8). A
+/// wire link reopens a stream of one kind on a new QUIC stream whose frame
+/// seqs and exchange keys start over, so only the QUIC stream tells two
+/// such incarnations apart. The tier declares it when it registers its
+/// downstream properties, and their checks key every frame, judgment,
+/// request, credit and output join on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamIdentity {
+    /// Every downstream row names its QUIC stream, as `header-sync/wire`'s
+    /// do. A row without one is a harness failure.
+    Exact,
+    /// The tier's links carry one stream of each kind, as in-memory links
+    /// do, so no downstream row names a QUIC stream. A row that names one
+    /// is a harness failure.
+    PerKind,
+}
+
 /// The downstream properties of `family`'s tabled `streams` whose effects
 /// the adapter observes: per response row, `receiver-work-authorized` with
 /// [`Effect::Work`] and `sender-within-response-quantity` with
 /// [`Effect::Output`]; per subscription row, `receiver-credit-conserved`
 /// with [`Effect::Work`]; per request row, `receiver-serving-bounded` with
 /// both [`Effect::Serving`] and [`Effect::Output`], since the node's
-/// endings close its requests. A stream with no table yields none.
+/// endings close its requests. A stream with no table yields none. Their
+/// checks hold the tier's rows to `identity`.
 ///
 /// # Panics
 ///
@@ -317,6 +336,7 @@ pub fn downstream_properties<S: HasView>(
     family: &'static str,
     streams: &[Stream],
     effects: &[Effect],
+    identity: StreamIdentity,
 ) -> Vec<Property<S>> {
     let mut properties = Vec::new();
     for stream in streams {
@@ -341,7 +361,7 @@ pub fn downstream_properties<S: HasView>(
             };
             for &(needed, template) in templates {
                 if needed.iter().all(|effect| effects.contains(effect)) {
-                    properties.push(generated(GeneratedId {
+                    let mut property = generated(GeneratedId {
                         family,
                         stream: StreamId {
                             kind: stream.kind,
@@ -349,7 +369,12 @@ pub fn downstream_properties<S: HasView>(
                         },
                         row: Some(rule.name),
                         template,
-                    }));
+                    });
+                    property.check = match identity {
+                        StreamIdentity::Exact => check_stream_exact::<S>,
+                        StreamIdentity::PerKind => check_per_kind::<S>,
+                    };
+                    properties.push(property);
                 }
             }
         }
@@ -497,10 +522,34 @@ pub fn rule_row<'a>(
     (frame_stream, frame_row)
 }
 
-/// Checks a generated property, from the template its ID names.
+/// Checks a generated property, from the template its ID names. A
+/// downstream template's check is [`check_stream_exact`] or
+/// [`check_per_kind`] instead, which name the tier's [`StreamIdentity`].
 fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    check_template(cx, None)
+}
+
+/// Checks a downstream property on a [`StreamIdentity::Exact`] tier.
+fn check_stream_exact<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    check_template(cx, Some(StreamIdentity::Exact))
+}
+
+/// Checks a downstream property on a [`StreamIdentity::PerKind`] tier.
+fn check_per_kind<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    check_template(cx, Some(StreamIdentity::PerKind))
+}
+
+/// Checks the template the property's ID names. `identity` is the tier's,
+/// which only a downstream template has.
+fn check_template<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    identity: Option<StreamIdentity>,
+) -> Verdict {
     let id = cx.id().clone();
     let id = GeneratedId::parse(id.as_str()).expect("table_properties wrote this ID");
+    let tier = |identity: Option<StreamIdentity>| {
+        identity.expect("downstream_properties names the tier's stream identity")
+    };
     match id.template {
         Template::Closes(label) => check_closes(cx, &id, label),
         Template::ConformantNeverCloses => {
@@ -513,12 +562,19 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         Template::CadenceNeverCloses => {
             check_never_closes(cx, &id, |frame| frame.exhausted && frame.row == id.row)
         }
-        Template::WorkAuthorized => downstream::check(cx, &id, downstream::work_authorized),
-        Template::CreditConserved => downstream::check(cx, &id, downstream::credit_conserved),
-        Template::ServingBounded => downstream::check_serving(cx, &id),
-        Template::SenderWithinResponseQuantity => {
-            downstream::check(cx, &id, downstream::within_response_quantity)
+        Template::WorkAuthorized => {
+            downstream::check(cx, &id, tier(identity), downstream::work_authorized)
         }
+        Template::CreditConserved => {
+            downstream::check(cx, &id, tier(identity), downstream::credit_conserved)
+        }
+        Template::ServingBounded => downstream::check_serving(cx, &id, tier(identity)),
+        Template::SenderWithinResponseQuantity => downstream::check(
+            cx,
+            &id,
+            tier(identity),
+            downstream::within_response_quantity,
+        ),
         Template::SenderWithinLimit
         | Template::SenderAnswersOpen
         | Template::SenderEndsOnce
@@ -526,7 +582,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         | Template::SenderWithinCredit
         | Template::SenderCadence => {
             let template = id.template;
-            downstream::check(cx, &id, |entries, at, row| {
+            downstream::check_rows(cx, &id, |entries, at, row| {
                 sender::frame(template, &entries[at].obs, row)
             })
         }

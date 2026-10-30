@@ -287,6 +287,49 @@ fn honest_runs_hold_every_generated_id_they_reach() {
     }
 }
 
+/// Block sync's relays are in-memory links with one stream of each kind,
+/// so its downstream rows name no QUIC stream and encode as they did before
+/// M6a-5b, and its downstream properties, declared
+/// [`StreamIdentity::PerKind`](zakura_sim::table::StreamIdentity::PerKind),
+/// judge them. The honest runs first show
+/// each kind of row the adapter writes.
+///
+/// This fails if a block-sync row names a QUIC stream: the per-kind tier
+/// refuses it as a harness failure.
+#[test]
+fn block_sync_records_are_unchanged() {
+    let mut seen = std::collections::BTreeSet::new();
+    for scenario in [honest_sync(), honest_serving()] {
+        for report in runs(&scenario, 2) {
+            assert_eq!(report.end.violation, None, "{:?}", report.end);
+            for entry in report.log.entries() {
+                let (name, quic_stream) = match &entry.obs {
+                    Observation::ExchangeOwed { quic_stream, .. } => ("exchange-owed", quic_stream),
+                    Observation::WorkAdmitted { quic_stream, .. } => ("work-admitted", quic_stream),
+                    Observation::Serving { quic_stream, .. } => ("serving", quic_stream),
+                    Observation::ServingEnded { quic_stream, .. } => ("serving-ended", quic_stream),
+                    Observation::NodeOutput { quic_stream, .. } => ("node-output", quic_stream),
+                    _ => continue,
+                };
+                assert_eq!(*quic_stream, None, "{:?}", entry.obs);
+                let encoded = serde_json::to_string(&entry.obs).expect("rows encode");
+                assert!(!encoded.contains("quic_stream"), "{encoded}");
+                seen.insert(name);
+            }
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            "exchange-owed",
+            "node-output",
+            "serving",
+            "serving-ended",
+            "work-admitted"
+        ]
+    );
+}
+
 /// Each probe fault the node judges outside any exchange of its own, by the
 /// ID it reaches: undeclared types, flags, short and long payloads on every
 /// row, bad content on the rows the codec checks, unsolicited responses,
@@ -745,6 +788,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         }
         Template::WorkAuthorized => vec![vec![Observation::WorkAdmitted {
             connection: 1,
+            quic_stream: None,
             frame: frame(),
             seq: 0,
             request: row("get-blocks"),
@@ -755,6 +799,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         }]],
         Template::SenderWithinResponseQuantity => vec![vec![Observation::NodeOutput {
             connection: 1,
+            quic_stream: None,
             frame: frame(),
             request: row("get-blocks"),
             exchange: 1,
@@ -763,6 +808,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         }]],
         Template::ServingBounded => vec![vec![Observation::Serving {
             connection: 1,
+            quic_stream: None,
             request: frame(),
             exchange: 1,
         }]],

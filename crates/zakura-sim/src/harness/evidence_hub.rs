@@ -568,6 +568,7 @@ mod tests {
         });
         let work = Observation::WorkAdmitted {
             connection: 1,
+            quic_stream: Some(4),
             frame: row.clone(),
             seq: 0,
             request: RowAt::new(S5V9, "subscribe-headers"),
@@ -1306,6 +1307,7 @@ mod tests {
         fn unframed(cause: UnframedCause, objects: u64) -> Observation {
             Observation::UnframedWork {
                 connection: 1,
+                quic_stream: Some(4),
                 request: RowAt::new(S5V9, "subscribe-headers"),
                 exchange: 8,
                 objects,
@@ -1318,6 +1320,7 @@ mod tests {
         fn admitted(seq: u64, objects: u64) -> Observation {
             Observation::WorkAdmitted {
                 connection: 1,
+                quic_stream: Some(4),
                 frame: RowAt::new(S5V9, "headers"),
                 seq,
                 request: RowAt::new(S5V9, "subscribe-headers"),
@@ -1513,6 +1516,7 @@ mod tests {
             };
             let ending = Observation::WorkAdmitted {
                 connection: 1,
+                quic_stream: Some(4),
                 frame: RowAt::new(S5V9, "headers-outcome"),
                 seq: 4,
                 request: RowAt::new(S5V9, "subscribe-headers"),

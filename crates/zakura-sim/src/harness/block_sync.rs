@@ -60,7 +60,7 @@ use crate::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::BLOCK_SERVICE,
-    table::{downstream_properties, sender_properties, table_properties, Effect},
+    table::{downstream_properties, sender_properties, table_properties, Effect, StreamIdentity},
     RunConfig, Sim, TaskHold,
 };
 
@@ -945,6 +945,7 @@ pub fn table_wiring_properties<S: HasView>() -> Vec<Property<S>> {
         FAMILY,
         streams,
         &[Effect::Work, Effect::Serving, Effect::Output],
+        StreamIdentity::PerKind,
     ));
     properties.extend(sender_properties(FAMILY, streams));
     properties

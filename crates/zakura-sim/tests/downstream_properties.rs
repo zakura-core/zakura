@@ -14,9 +14,11 @@ use support::{
 use zakura_network::zakura::{testkit::regulation::TEST_FAMILY, Stream};
 use zakura_sim::{
     model::Label,
-    observe::{RowAt, StreamId},
+    observe::{RowAt, StreamId, UnframedCause},
     property::{Property, Source},
-    table::{downstream_properties, table_properties, Effect, GeneratedId, Template},
+    table::{
+        downstream_properties, table_properties, Effect, GeneratedId, StreamIdentity, Template,
+    },
     HarnessFailure, Observation, Outcome, PropertyOutcome, RunReport,
 };
 
@@ -44,6 +46,10 @@ const TEST_STREAM: Stream = Stream {
 
 const ALL: &[Effect] = &[Effect::Work, Effect::Serving, Effect::Output];
 
+/// The scripted rows' tier: an in-memory link's, with one stream of each
+/// kind, so no row names a QUIC stream.
+const PER_KIND: StreamIdentity = StreamIdentity::PerKind;
+
 /// The ID of `stream`.
 fn id(stream: Stream) -> StreamId {
     StreamId {
@@ -61,8 +67,8 @@ fn row(stream: Stream, row: &str) -> RowAt {
 fn properties() -> Vec<Property<Node>> {
     let mut properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
     properties.extend(table_properties("test", &[TEST_STREAM]));
-    properties.extend(downstream_properties("feed", &[FEED_STREAM], ALL));
-    properties.extend(downstream_properties("test", &[TEST_STREAM], ALL));
+    properties.extend(downstream_properties("feed", &[FEED_STREAM], ALL, PER_KIND));
+    properties.extend(downstream_properties("test", &[TEST_STREAM], ALL, PER_KIND));
     properties
 }
 
@@ -125,6 +131,7 @@ fn work(
 ) -> Observation {
     Observation::WorkAdmitted {
         connection: 1,
+        quic_stream: None,
         frame,
         seq,
         request,
@@ -175,7 +182,7 @@ const QUANTITY_DONE: &str = "test/s65v2/done/sender-within-response-quantity";
 
 #[test]
 fn every_row_yields_its_downstream_templates() {
-    let ids: Vec<String> = downstream_properties::<Node>("test", &[TEST_STREAM], ALL)
+    let ids: Vec<String> = downstream_properties::<Node>("test", &[TEST_STREAM], ALL, PER_KIND)
         .into_iter()
         .map(|p| p.id.to_string())
         .collect();
@@ -190,7 +197,7 @@ fn every_row_yields_its_downstream_templates() {
     assert!(ids.iter().any(|id| id == SERVING));
     assert!(ids.iter().any(|id| id == QUANTITY));
 
-    let feed: Vec<String> = downstream_properties::<Node>("feed", &[FEED_STREAM], ALL)
+    let feed: Vec<String> = downstream_properties::<Node>("feed", &[FEED_STREAM], ALL, PER_KIND)
         .into_iter()
         .map(|p| p.id.to_string())
         .collect();
@@ -215,9 +222,9 @@ fn every_row_yields_its_downstream_templates() {
 /// so a missing adapter shows as a missing ID, not as a pass.
 #[test]
 fn unobserved_effects_register_nothing() {
-    assert!(downstream_properties::<Node>("test", &[TEST_STREAM], &[]).is_empty());
+    assert!(downstream_properties::<Node>("test", &[TEST_STREAM], &[], PER_KIND).is_empty());
     let work_only: Vec<String> =
-        downstream_properties::<Node>("test", &[TEST_STREAM], &[Effect::Work])
+        downstream_properties::<Node>("test", &[TEST_STREAM], &[Effect::Work], PER_KIND)
             .into_iter()
             .map(|p| p.id.to_string())
             .collect();
@@ -355,7 +362,7 @@ fn stale_owner_work_after_close_fails() {
 #[test]
 fn missing_storage_observations_fail_the_run() {
     let report = run_under(
-        downstream_properties("test", &[TEST_STREAM], &[Effect::Work]),
+        downstream_properties("test", &[TEST_STREAM], &[Effect::Work], PER_KIND),
         &[Source::Frames, Source::Closes, Source::Schedule],
         vec![vec![part_work(0, 1)]],
     );
@@ -397,6 +404,7 @@ fn opened(objects: u64, bytes: u64) -> Observation {
 fn credit(objects: u64, bytes: u64, opens: bool) -> Observation {
     Observation::CreditGranted {
         connection: 1,
+        quic_stream: None,
         subscription: row(FEED_STREAM, "watch"),
         exchange: 3,
         objects,
@@ -492,6 +500,7 @@ fn a_reopened_key_starts_from_its_new_grant() {
 fn serving(exchange: u64) -> Observation {
     Observation::Serving {
         connection: 1,
+        quic_stream: None,
         request: row(TEST_STREAM, "get"),
         exchange,
     }
@@ -501,6 +510,7 @@ fn serving(exchange: u64) -> Observation {
 fn serving_ended(exchange: u64) -> Observation {
     Observation::ServingEnded {
         connection: 1,
+        quic_stream: None,
         request: row(TEST_STREAM, "get"),
         exchange,
     }
@@ -610,6 +620,7 @@ fn requested(frames: u32, bytes: u64) -> Vec<Observation> {
 fn owed(frames: u32, bytes: u64) -> Observation {
     Observation::ExchangeOwed {
         connection: 1,
+        quic_stream: None,
         request: row(TEST_STREAM, "get"),
         exchange: 1,
         frames,
@@ -621,6 +632,7 @@ fn owed(frames: u32, bytes: u64) -> Observation {
 fn output(response: &str, payload: u64) -> Observation {
     Observation::NodeOutput {
         connection: 1,
+        quic_stream: None,
         frame: row(TEST_STREAM, response),
         request: row(TEST_STREAM, "get"),
         exchange: 1,
@@ -732,7 +744,7 @@ fn answering_an_over_margin_request_fails() {
 #[test]
 fn serving_needs_outputs_too() {
     let ids = |effects| {
-        downstream_properties::<Node>("test", &[TEST_STREAM], effects)
+        downstream_properties::<Node>("test", &[TEST_STREAM], effects, PER_KIND)
             .into_iter()
             .map(|p| p.id.as_str().to_owned())
             .collect::<Vec<_>>()
@@ -741,4 +753,184 @@ fn serving_needs_outputs_too() {
     assert!(ids(&[Effect::Serving, Effect::Output])
         .iter()
         .any(|id| id == SERVING));
+}
+
+/// The close and downstream properties of both fixture streams on a wire
+/// tier, whose rows name their QUIC stream.
+fn wire_properties() -> Vec<Property<Node>> {
+    let mut properties: Vec<Property<Node>> = table_properties("feed", &[FEED_STREAM]);
+    properties.extend(table_properties("test", &[TEST_STREAM]));
+    let exact = StreamIdentity::Exact;
+    properties.extend(downstream_properties("feed", &[FEED_STREAM], ALL, exact));
+    properties.extend(downstream_properties("test", &[TEST_STREAM], ALL, exact));
+    properties
+}
+
+/// Runs `script` under [`wire_properties`].
+fn run_wire(script: Vec<Vec<Observation>>) -> RunReport {
+    run_under(wire_properties(), OBSERVED, script)
+}
+
+/// `obs`, a frame, judgment or downstream row, moved onto QUIC stream
+/// `quic` of connection 1.
+fn on(quic: u64, mut obs: Observation) -> Observation {
+    match &mut obs {
+        Observation::PeerFrame { quic_stream, .. }
+        | Observation::FrameJudged { quic_stream, .. }
+        | Observation::CreditGranted { quic_stream, .. }
+        | Observation::ExchangeOwed { quic_stream, .. }
+        | Observation::WorkAdmitted { quic_stream, .. }
+        | Observation::UnframedWork { quic_stream, .. }
+        | Observation::Serving { quic_stream, .. }
+        | Observation::ServingEnded { quic_stream, .. }
+        | Observation::NodeOutput { quic_stream, .. } => *quic_stream = Some(quic),
+        other => panic!("{other:?} has no QUIC stream"),
+    }
+    obs
+}
+
+/// Each of `batch`'s observations moved onto QUIC stream `quic`.
+fn all_on(quic: u64, batch: Vec<Observation>) -> Vec<Observation> {
+    batch.into_iter().map(|obs| on(quic, obs)).collect()
+}
+
+/// Two incarnations of one stream kind on connection 1, QUIC streams 4 and
+/// 8, reuse frame seqs and exchange keys, as a reopened header stream does.
+/// Each join picks the rows of its own QUIC stream: work its own frame and
+/// bytes, credit its own grants, serving and output their own requests.
+/// This is unit evidence for the join logic only. A real reopen is
+/// `two_stream_incarnations_keep_their_work_apart`.
+///
+/// This fails if the joins ignore the QUIC stream: each script below then
+/// reads the other stream's rows, so a holding run fails and a failing one
+/// holds.
+#[test]
+fn overlapping_ids_on_two_streams_stay_apart() {
+    // Part 0 is exchange 7's on stream 4 and exchange 9's on stream 8, each
+    // with 20 bytes. Each stream's work joins its own frame and spends only
+    // its own bytes.
+    let parts = vec![
+        all_on(
+            4,
+            vec![
+                frame(TEST_STREAM, 0, "part", Label::Conformant, 7, 20),
+                judged(TEST_STREAM, 0),
+            ],
+        ),
+        all_on(
+            8,
+            vec![
+                frame(TEST_STREAM, 0, "part", Label::Conformant, 9, 20),
+                judged(TEST_STREAM, 0),
+            ],
+        ),
+    ];
+    let get = row(TEST_STREAM, "get");
+    let mut script = parts.clone();
+    script.push(vec![
+        on(4, work(row(TEST_STREAM, "part"), 0, get.clone(), 7, 1, 12)),
+        on(8, work(row(TEST_STREAM, "part"), 0, get.clone(), 9, 1, 12)),
+    ]);
+    let apart = run_wire(script);
+    assert_eq!(apart.end.harness, None, "{:?}", apart.end);
+    assert_eq!(apart.end.violation, None, "{:?}", apart.end);
+    assert!(held(&apart, WORK), "{:?}", apart.properties);
+
+    // Stream 4 opened subscription 3 with 1 object, and stream 8 opened its
+    // own subscription 3 with 4. Two objects on stream 4 overspend its
+    // credit, and on stream 8 they don't.
+    let credit = |quic| {
+        let mut script = vec![vec![on(4, opened(1, 64)), on(8, opened(4, 64))]];
+        for stream in [4, 8] {
+            script.push(all_on(
+                stream,
+                vec![
+                    frame(FEED_STREAM, 0, "item", Label::Conformant, 3, 32),
+                    judged(FEED_STREAM, 0),
+                ],
+            ));
+        }
+        script.push(vec![on(quic, item_work(2, 32))]);
+        run_wire(script)
+    };
+    let within = credit(8);
+    assert_eq!(within.end.violation, None, "{:?}", within.end);
+    assert!(held(&within, CREDIT), "{:?}", within.properties);
+    assert!(violated(&credit(4), CREDIT));
+
+    // Only stream 4 has an open `get` request 1, owed two parts. An owner
+    // or an output for request 1 on stream 8 answers nothing.
+    let request = |then: Vec<Observation>| {
+        let mut script = vec![all_on(4, requested(2, 40))];
+        script.push(then);
+        run_wire(script)
+    };
+    let served = request(vec![on(4, serving(1)), on(4, output("part", 8))]);
+    assert_eq!(served.end.harness, None, "{:?}", served.end);
+    assert!(held(&served, SERVING), "{:?}", served.properties);
+    assert!(held(&served, QUANTITY), "{:?}", served.properties);
+    let stray = request(vec![on(8, serving(1))]);
+    let violation = stray.end.violation.expect("stream 8 has no request open");
+    assert_eq!(violation.property, SERVING);
+    assert!(
+        violation.expected.contains("QUIC stream 8"),
+        "{violation:?}"
+    );
+    let answered = request(vec![on(8, output("part", 8))]);
+    assert!(violated(&answered, QUANTITY), "{:?}", answered.properties);
+    assert!(violated(&answered, SERVING), "{:?}", answered.properties);
+}
+
+/// Held work no frame explains, on connection 1.
+fn unframed_work() -> Observation {
+    Observation::UnframedWork {
+        connection: 1,
+        quic_stream: None,
+        request: row(FEED_STREAM, "watch"),
+        exchange: 3,
+        objects: 1,
+        bytes: 0,
+        cause: UnframedCause::Extra,
+    }
+}
+
+/// A wire tier's downstream rows name their QUIC stream: each kind of row
+/// without one fails the run as a harness failure, whatever the property
+/// would have said. A tier with one stream of each kind refuses a row that
+/// names one the same way.
+///
+/// This fails if a wire tier accepts a row with no QUIC stream: it would
+/// join every incarnation of its stream kind at once.
+#[test]
+fn wire_records_require_stream_identity() {
+    let rows = [
+        granted(1, 1),
+        owed(1, 1),
+        part_work(0, 1),
+        unframed_work(),
+        serving(1),
+        serving_ended(1),
+        output("done", 4),
+    ];
+    let refused = |report: &RunReport, says: &str| {
+        assert_eq!(report.end.outcome, Outcome::Harness, "{:?}", report.end);
+        assert!(
+            matches!(
+                report.end.harness,
+                Some(HarnessFailure::MissingEvidence { ref detail, .. }) if detail.contains(says)
+            ),
+            "{:?}",
+            report.end.harness
+        );
+    };
+    for obs in &rows {
+        refused(&run_wire(vec![vec![obs.clone()]]), "names no QUIC stream");
+        refused(
+            &run_script(vec![vec![on(4, obs.clone())]]),
+            "names QUIC stream 4",
+        );
+        // On its own tier's terms, the row is judged, not refused.
+        let kept = run_wire(vec![vec![on(4, obs.clone())]]);
+        assert_ne!(kept.end.outcome, Outcome::Harness, "{:?}", kept.end);
+    }
 }

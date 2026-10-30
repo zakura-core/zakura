@@ -658,6 +658,13 @@ mod cli {
             }
         }
         let root = seed::repo_root();
+        let dir = std::env::current_dir()
+            .map_err(|error| Error::Failed(format!("reading the working directory: {error}")))?;
+        if let Some(why) = suite::other_checkout(&root, &dir) {
+            return Err(Error::Failed(format!(
+                "{why}; build it in this checkout, or run `cargo xtask sim-suite`"
+            )));
+        }
         let manifest = suite::manifest(&root).map_err(|problems| {
             Error::Failed(format!(
                 "{} problems keep the manifest from covering the suite:\n{problems}",

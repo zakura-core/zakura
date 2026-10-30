@@ -603,6 +603,49 @@ fn suite_writes_the_manifest() {
 }
 
 #[test]
+fn suite_refuses_to_run_in_another_checkout() {
+    // A directory outside this checkout stands in for another checkout,
+    // which a relative `--out` would write into.
+    let dir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .args(["suite", "--out", "manifest.json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("the binary runs");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("this zakura-sim was built in the checkout"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("manifest.json").exists());
+}
+
+#[test]
+fn another_checkout_is_one_with_another_worktree() {
+    // `inner` is a git worktree nested in `outer`'s, and `outside` lies in
+    // neither.
+    let outer = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let inner = outer.path().join("inner");
+    let plain = outer.path().join("plain");
+    fs::create_dir(&inner).unwrap();
+    fs::create_dir(&plain).unwrap();
+    for dir in [outer.path(), inner.as_path()] {
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+    }
+    assert_eq!(suite::other_checkout(outer.path(), outer.path()), None);
+    assert_eq!(suite::other_checkout(outer.path(), &plain), None);
+    assert!(suite::other_checkout(outer.path(), &inner).is_some());
+    assert!(suite::other_checkout(outer.path(), outside.path()).is_some());
+}
+
+#[test]
 fn the_manifest_doesnt_depend_on_the_executable() {
     // A copy with a byte appended runs the same, and has another digest.
     let dir = TempDir::new().unwrap();

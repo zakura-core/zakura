@@ -1784,19 +1784,42 @@ impl Builder<'_> {
 /// they are on disk, so the checkout itself must be clean and at the
 /// build's commit.
 pub fn unfrozen(root: &Path, build: &ManifestBuild) -> Option<String> {
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-    };
-    let head = git(&["rev-parse", "HEAD"]);
-    let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let status = git(root, &["status", "--porcelain", "--untracked-files=all"]);
     unfrozen_by(build, head.as_deref(), status.as_deref())
+}
+
+/// Why `suite` refuses to run in `dir`, if it does. The binary reads the
+/// checkout at `root`, the one it was built in, so `dir` must lie in that
+/// checkout's worktree. Otherwise a binary built in another checkout would
+/// describe that checkout from this one.
+pub fn other_checkout(root: &Path, dir: &Path) -> Option<String> {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let root = canonical(root);
+    let dir = canonical(dir);
+    let inside = match git(&dir, &["rev-parse", "--show-toplevel"]) {
+        Some(top) => canonical(Path::new(top.trim_end())) == root,
+        None => dir.starts_with(&root),
+    };
+    (!inside).then(|| {
+        format!(
+            "this zakura-sim was built in the checkout {}, and runs in {}",
+            root.display(),
+            dir.display()
+        )
+    })
+}
+
+/// `git -C dir <args>`'s output, or `None` if git couldn't say.
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
 }
 
 /// [`unfrozen`], given `HEAD`'s commit and `git status --porcelain`'s

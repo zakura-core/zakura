@@ -1236,6 +1236,166 @@ mod tests {
         }
     }
 
+    /// Registers, as the fake reactor on `slot` builds it, a budget read of
+    /// `owned` that peeks it the way the real budget's read peeks its
+    /// counters, through a std `Weak` and `diag::peek`.
+    fn register_owned(slot: &ObserverSlot, owned: &Arc<zakura_rt::sync::Mutex<usize>>) {
+        use zakura_network::zakura::diag::{self, BudgetCounters, OwnerState, ReadKey};
+
+        let owned = diag::weak(owned);
+        slot.register_read(
+            ReadKey::Budget,
+            Box::new(move || {
+                diag::upgrade(&owned, |owned| {
+                    diag::peek(owned, |owned| {
+                        OwnerState::Budget(BudgetCounters {
+                            capacity: 4_000,
+                            reserved: 0,
+                            owned: *owned,
+                        })
+                    })
+                })
+            }),
+        );
+    }
+
+    /// The budget's logged reads in `report`, with their steps, as the
+    /// owned count when current or `None` when held.
+    fn owned_reads(report: &RunReport) -> Vec<(u64, Option<u64>)> {
+        use crate::observe::{ComponentReading, ComponentValue};
+
+        report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::ComponentRead { read, .. } => Some((
+                    entry.step,
+                    match read {
+                        ComponentReading::Current(ComponentValue::Budget { owned, .. }) => {
+                            Some(*owned)
+                        }
+                        _ => None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A writer that raises the count under the lock, reaches a point with
+    /// the lock held, restores it and unlocks, is read held at every
+    /// boundary in between, never current with the raised value, and the
+    /// next boundary reads the restored value.
+    ///
+    /// This fails if a held read reports the last current value.
+    #[test]
+    fn a_lock_held_write_and_restore_is_in_transition() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let owned = Arc::new(zakura_rt::sync::Mutex::new(0));
+        register_owned(&slot, &owned);
+        slot.emit(settled(0, false));
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            start(&slot);
+            std::future::pending::<()>().await;
+        });
+        let writer = owned.clone();
+        fixture.sim.scheduler().spawn_root("writer", async move {
+            let mut guard = writer.lock().expect("never poisoned");
+            *guard = 9;
+            point();
+            *guard = 0;
+            drop(guard);
+        });
+        let (report, _) = fixture.run(&mut States::default());
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let reads = owned_reads(&report);
+        let held = reads
+            .iter()
+            .position(|(_, read)| read.is_none())
+            .expect("a boundary saw the writer hold the lock");
+        let step = reads[held].0;
+        assert!(
+            report.log.entries().iter().any(|entry| entry.step == step
+                && matches!(&entry.obs, Observation::TaskReached { task, at, .. }
+                    if task.starts_with("writer") && at.starts_with("load#"))),
+            "the writer stopped at its point with the lock held at step {step}"
+        );
+        assert_eq!(
+            reads.iter().map(|(_, read)| *read).collect::<Vec<_>>(),
+            [Some(0), None, Some(0)],
+            "current, held, then the restored value, never 9"
+        );
+    }
+
+    /// A writer that changes the count with no event, on the run's last
+    /// live step, long after the reactor's last `Settled`, is seen at that
+    /// last boundary.
+    ///
+    /// This fails if reads run only at boundaries where the reactor
+    /// settled.
+    #[test]
+    fn a_write_that_lasts_past_the_final_boundary_is_seen() {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let owned = Arc::new(zakura_rt::sync::Mutex::new(0));
+        register_owned(&slot, &owned);
+        slot.emit(settled(0, false));
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            start(&slot);
+            std::future::pending::<()>().await;
+        });
+        let writer = owned.clone();
+        fixture.sim.scheduler().spawn_root("writer", async move {
+            for _ in 0..4 {
+                zakura_rt::task::yield_now().await;
+            }
+            *writer.lock().expect("never poisoned") = 5;
+        });
+        let view = fixture.view.clone();
+        let (report, _) = fixture.run(&mut States::default());
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let settled = report
+            .log
+            .entries()
+            .iter()
+            .rfind(|entry| {
+                matches!(
+                    &entry.obs,
+                    Observation::Reactor {
+                        event: ReactorFact::Settled { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("the reactor settled")
+            .step;
+        let (written, value) = owned_reads(&report)
+            .last()
+            .copied()
+            .expect("the budget is read");
+        assert_eq!(value, Some(5), "the write is read");
+        assert!(
+            settled + 4 < written,
+            "the write comes well after the last Settled"
+        );
+        let view = view.borrow();
+        let budget = view
+            .component(ComponentKind::Budget)
+            .expect("the tier has the budget");
+        assert_eq!(
+            budget.fresh_through(),
+            Some(report.end.steps),
+            "the last boundary read it"
+        );
+        assert!(
+            matches!(budget.state(), crate::property::State::Current {
+                state: Reading::Budget(counters)
+            } if counters.owned == 5),
+            "{:?}",
+            budget.state()
+        );
+    }
+
     /// A read that reaches the runtime fails the run as a harness failure
     /// that names it, with the property reports written and the read's
     /// mark cleared, rather than unwinding through `Sim`.

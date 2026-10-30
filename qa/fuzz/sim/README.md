@@ -141,8 +141,8 @@ main.
   what the workers left and records the run as `interrupted`. It refuses
   while a worker's fuzzer or the compaction's merge still runs. The merge
   runs in its own process group, which the supervisor kills at the
-  compaction's time limit, so a killed supervisor leaves the merge running;
-  stop it with `kill -- -<pid>`.
+  compaction's time limit. A supervisor killed first leaves the merge
+  running; stop it with `kill -- -<pid>`.
 - `status` lists the runs, and `verify` checks every record in the store.
 
 Every run ends with exactly one end record, `runs/<manifest>/end.json`, with

@@ -344,6 +344,10 @@ fn build_header_sync_reactor(
         port: startup.header_chain_port.clone(),
         serving: v9::serving_capacity(),
         page_limits,
+        #[cfg(any(test, zakura_sim))]
+        observer: startup.observer.downgrade(),
+        #[cfg(any(test, zakura_sim))]
+        services: std::sync::Arc::default(),
     };
     let header_bytes = header_sync_header_bytes_for_network(&startup.network);
     let mut reactor = HeaderSyncReactor {

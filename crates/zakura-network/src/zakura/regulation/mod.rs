@@ -52,6 +52,8 @@ pub(crate) use session_capacity::SessionCapacity;
 
 mod session_table;
 pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};
+#[cfg(any(test, zakura_sim))]
+pub(crate) use session_table::{Install, Removal, TableChange};
 
 pub(crate) mod sizing;
 

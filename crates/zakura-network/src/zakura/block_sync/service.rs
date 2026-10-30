@@ -292,13 +292,13 @@ impl BlockSyncServiceInner {
             return;
         }
 
-        self.requester_sessions.remove(
+        crate::zakura::transport::sim_arg!(self.requester_sessions.remove(
             peer,
             crate::zakura::regulation::SessionKey {
                 conn_id,
                 session_id,
-            },
-        );
+            }
+        ); crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::Teardown, None));
         let removed = active_peers
             .remove(peer)
             .expect("record exists because the ownership check just matched it");
@@ -783,6 +783,8 @@ impl Service for BlockSyncService {
                             cancel: service_cancel_token.clone(),
                             fence: fence.clone(),
                             session: (),
+                            #[cfg(any(test, zakura_sim))]
+                            installed: None,
                         }
                     ),
                     Replacement::Refused
@@ -994,13 +996,13 @@ impl Service for BlockSyncService {
             .remove(&(peer.clone(), conn_id));
         let removed = match active_peers.get(peer) {
             Some(record) if record.conn_id == conn_id => {
-                self.inner.requester_sessions.remove(
+                crate::zakura::transport::sim_arg!(self.inner.requester_sessions.remove(
                     peer,
                     crate::zakura::regulation::SessionKey {
                         conn_id,
                         session_id: record.session_id,
-                    },
-                );
+                    }
+                ); crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::RemovePeer, None));
                 active_peers.remove(peer)
             }
             Some(_) | None => None,
@@ -1170,6 +1172,8 @@ mod requester_session_tests {
                 cancel: cancel.clone(),
                 fence: fence.clone(),
                 session: (),
+                #[cfg(any(test, zakura_sim))]
+                installed: None,
             },
         );
         service.inner.active_peers.lock().unwrap().insert(
@@ -1291,6 +1295,8 @@ mod requester_session_tests {
                 cancel: cancel.clone(),
                 fence,
                 session: (),
+                #[cfg(any(test, zakura_sim))]
+                installed: None,
             },
         );
         service.inner.active_peers.lock().unwrap().insert(

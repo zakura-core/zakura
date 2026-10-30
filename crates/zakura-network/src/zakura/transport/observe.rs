@@ -384,6 +384,66 @@ pub enum TransportEvent {
         /// The services' capability mask.
         admitted_mask: u64,
     },
+    /// A header-sync service put a session in its table (M6a-7b). It's
+    /// reported from inside `SessionTable::replace`, under the table's
+    /// lock, right after the insert.
+    Installed {
+        /// The service's allocation ID.
+        service: u64,
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The service session's ID.
+        session_id: u64,
+        /// The header stream's QUIC stream.
+        quic_stream: Option<u64>,
+    },
+    /// A header-sync service's `add_peer` installed nothing (M6a-7b).
+    InstallRefused {
+        /// The service's allocation ID.
+        service: u64,
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// Why, as a short label.
+        reason: &'static str,
+    },
+    /// A session left a header-sync service's table (M6a-7b). It's
+    /// reported from inside the table's `replace` or `remove`, under its
+    /// lock, right after the entry is taken out.
+    Removed {
+        /// The service's allocation ID.
+        service: u64,
+        /// The removed session's connection.
+        conn_id: ZakuraConnId,
+        /// The removed session's ID.
+        session_id: u64,
+        /// What removed it.
+        cause: RemoveCause,
+    },
+    /// A header-sync session's teardown found the table holding another
+    /// session, so its `remove` removed nothing (M6a-7b).
+    RemoveIgnored {
+        /// The service's allocation ID.
+        service: u64,
+        /// The stale session's connection.
+        conn_id: ZakuraConnId,
+        /// The stale session's ID.
+        session_id: u64,
+        /// What tried to remove it.
+        cause: RemoveCause,
+    },
+}
+
+/// What took a session out of a session table, in
+/// [`TransportEvent::Removed`] and [`TransportEvent::RemoveIgnored`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RemoveCause {
+    /// A newer session for the same peer replaced it.
+    Replaced,
+    /// Its own pipe tore down.
+    Teardown,
+    /// The registry's `remove_peer` for its connection.
+    RemovePeer,
 }
 
 /// A regulation table's state change.

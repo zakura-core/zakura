@@ -742,6 +742,8 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             cancel,
             fence,
             session: session.clone(),
+            #[cfg(any(test, zakura_sim))]
+            installed: None,
         };
         if matches!(
             shared.table.replace(peer.id.clone(), current),
@@ -755,7 +757,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         if let Some((key, _)) = self.shared.table.get(peer) {
             if key.conn_id == conn_id {
-                self.shared.table.remove(peer, key);
+                crate::zakura::transport::sim_arg!(self.shared.table.remove(peer, key); crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::RemovePeer, None));
             }
         }
     }
@@ -889,5 +891,5 @@ async fn run_session<A: StreamConformance>(
             break;
         }
     }
-    shared.table.remove(&session.peer, session.key);
+    crate::zakura::transport::sim_arg!(shared.table.remove(&session.peer, session.key); crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::Teardown, None));
 }

@@ -13,6 +13,7 @@
 //! `check-rt-imports` allowances. Owners call only these helpers.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     net::IpAddr,
     sync::{Arc, Mutex, Weak},
@@ -20,7 +21,7 @@ use std::{
 
 use zakura_rt::sync::PoisonError;
 
-use crate::zakura::{ZakuraConnId, ZakuraPeerId};
+use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// One boundary read's result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub enum OwnerState {
     Budget(BudgetCounters),
     /// The supervisor's map of registered connections, by `conn_id`.
     SupervisorMap(Vec<MapEntry>),
+    /// A header-sync service's session table, by `conn_id`.
+    HeaderSessions(Vec<SessionEntry>),
 }
 
 /// One registered connection in the supervisor's map (M6a-7b).
@@ -67,6 +70,37 @@ pub struct MapEntry {
     pub peer: ZakuraPeerId,
     /// The remote IP it was admitted from, if the transport knew it.
     pub remote_ip: Option<IpAddr>,
+}
+
+/// One peer's current session in a header-sync service's session table
+/// (M6a-7b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEntry {
+    /// The peer.
+    pub peer: ZakuraPeerId,
+    /// The session's connection.
+    pub conn_id: ZakuraConnId,
+    /// The service session's ID.
+    pub session_id: u64,
+    /// The connection's direction, as the table holds it.
+    pub direction: ServicePeerDirection,
+    /// What the service installed the session from, or `None` for an entry
+    /// put in the table some other way.
+    pub installed: Option<InstallFacts>,
+}
+
+/// What a header-sync service installed a session from: its `Peer` and its
+/// stream's tap (M6a-7b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallFacts {
+    /// The capability mask the connection negotiated.
+    pub negotiated: u64,
+    /// The header stream's version.
+    pub stream_version: u16,
+    /// The header stream's QUIC stream ID, if a transport tap names it.
+    pub quic_stream: Option<u64>,
+    /// The connection's direction, from the `Peer`.
+    pub direction: ServicePeerDirection,
 }
 
 /// The header chunk budget's counters, read under its lock.
@@ -88,6 +122,12 @@ pub enum ReadKey {
     Budget,
     /// A handler's supervisor map.
     SupervisorMap,
+    /// The session table of the header-sync service with allocation ID
+    /// `service`, counted from 1 per reactor handle.
+    HeaderSessions {
+        /// The service's allocation ID.
+        service: u64,
+    },
 }
 
 /// A registered boundary read. It must take no scheduling point, never wait
@@ -97,6 +137,35 @@ pub type ComponentRead = Box<dyn Fn() -> Read<OwnerState> + Send + Sync>;
 /// A std `Weak` to `owner`, the only reference a read may keep.
 pub fn weak<T: ?Sized>(owner: &Arc<T>) -> Weak<T> {
     Arc::downgrade(owner)
+}
+
+/// A std `Weak` to an observer, which a holder that mustn't keep the
+/// observer alive keeps instead, such as a reactor handle whose services
+/// register reads after the reactor may be gone.
+pub struct WeakObserver<T: ?Sized>(Weak<T>);
+
+impl<T: ?Sized> WeakObserver<T> {
+    /// A weak reference to `observer`.
+    pub fn new(observer: &Arc<T>) -> Self {
+        WeakObserver(weak(observer))
+    }
+
+    /// The observer, if it's still alive.
+    pub fn upgrade(&self) -> Option<Arc<T>> {
+        self.0.upgrade()
+    }
+}
+
+impl<T: ?Sized> Clone for WeakObserver<T> {
+    fn clone(&self) -> Self {
+        WeakObserver(self.0.clone())
+    }
+}
+
+impl<T: ?Sized> std::fmt::Debug for WeakObserver<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WeakObserver")
+    }
 }
 
 /// Runs `read` on the owner behind `owner`, or reads [`Read::Gone`] once it
@@ -179,6 +248,41 @@ pub fn peek_permits(semaphore: &zakura_rt::sync::Semaphore) -> usize {
     #[cfg(not(zakura_sim))]
     {
         semaphore.available_permits()
+    }
+}
+
+thread_local! {
+    /// The owner callback this thread is running, if any.
+    static CALLBACK: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// Runs `report`, an observer callback an owner makes while it holds its
+/// own lock, marked so that [`refuse_reentry`] panics instead of
+/// deadlocking if the callback reaches an observed owner.
+pub fn owner_callback<R>(owner: &'static str, report: impl FnOnce() -> R) -> R {
+    /// Clears the mark when `report` returns or unwinds.
+    struct Clear(Option<&'static str>);
+
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            CALLBACK.with(|callback| callback.set(self.0));
+        }
+    }
+
+    let _clear = Clear(CALLBACK.with(|callback| callback.replace(Some(owner))));
+    report()
+}
+
+/// Panics if this thread is inside an [`owner_callback`]. An observed
+/// owner calls it before it takes its lock, since a callback that reached
+/// it would deadlock or read it mid-change.
+///
+/// # Panics
+///
+/// Inside an owner callback.
+pub fn refuse_reentry(owner: &'static str) {
+    if let Some(callback) = CALLBACK.with(Cell::get) {
+        panic!("ReentrantObserver: {callback}'s observer callback reached {owner}");
     }
 }
 

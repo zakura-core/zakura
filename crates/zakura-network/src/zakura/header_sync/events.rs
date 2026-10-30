@@ -235,9 +235,28 @@ pub struct HeaderSyncHandle {
     pub(super) serving: ServeCapacity,
     /// The serving limits this node advertises in its `Status`.
     pub(super) page_limits: PageLimits,
+    /// The reactor's observer, which each service built on this handle
+    /// registers its session table's boundary read with (M6a-7b). It's
+    /// weak, so a handle that outlives the reactor doesn't keep it alive.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::observe::WeakObserverSlot,
+    /// The services built on this handle, which number their allocations
+    /// from 1.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) services: Arc<zakura_rt::sync::counter::AtomicU64>,
 }
 
 impl HeaderSyncHandle {
+    /// The next service allocation ID on this handle and its clones, from
+    /// 1 (M6a-7b).
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn next_service(&self) -> u64 {
+        self.services
+            .fetch_add(1, zakura_rt::sync::counter::Ordering::Relaxed)
+            .checked_add(1)
+            .expect("a reactor handle builds fewer than 2^64 services")
+    }
+
     /// Send an event to the reactor.
     pub async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
         self.events.send(event).await

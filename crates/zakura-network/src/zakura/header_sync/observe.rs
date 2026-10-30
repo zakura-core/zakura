@@ -59,6 +59,32 @@ pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     }
 }
 
+/// An [`ObserverSlot`] that doesn't keep its observer alive (M6a-7b). It
+/// shares the slot's count.
+#[derive(Clone, Debug, Default)]
+pub struct WeakObserverSlot {
+    observer: Option<crate::zakura::diag::WeakObserver<dyn HeaderSyncObserver>>,
+    emitted: Arc<counter::AtomicU64>,
+}
+
+impl WeakObserverSlot {
+    /// [`ObserverSlot::register_read`], if the observer is still alive.
+    /// Its strong reference drops before this returns.
+    pub fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        if let Some(observer) = self
+            .observer
+            .as_ref()
+            .and_then(|observer| observer.upgrade())
+        {
+            ObserverSlot {
+                observer: Some(observer),
+                emitted: self.emitted.clone(),
+            }
+            .register_read(key, read);
+        }
+    }
+}
+
 /// The optional observer installed on a reactor's startup, with its
 /// delivery count.
 ///
@@ -122,6 +148,19 @@ impl ObserverSlot {
     /// The events emitted so far, through any clone.
     pub fn emitted(&self) -> u64 {
         self.emitted.load(counter::Ordering::Relaxed)
+    }
+
+    /// This slot without keeping its observer alive, for a holder that
+    /// outlives the reactor, such as its handle, so a tap still sees the
+    /// observer drop with the reactor (M6a-7b).
+    pub fn downgrade(&self) -> WeakObserverSlot {
+        WeakObserverSlot {
+            observer: self
+                .observer
+                .as_ref()
+                .map(crate::zakura::diag::WeakObserver::new),
+            emitted: self.emitted.clone(),
+        }
     }
 
     /// Hands `read`, the boundary read of the component `key` names, to

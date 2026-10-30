@@ -37,6 +37,8 @@ pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget, Head
 pub use scheduler::retry::{
     BodyRetryEpisode, BodyRetryQueue, RetryJitter, RetryUpdate, SeededRetryJitter,
 };
+#[cfg(any(test, zakura_sim))]
+pub use service::bypass as header_stream_bypass;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use service::drive_header_sync_actions;
 pub(crate) use service::HeaderSyncPassthroughService;

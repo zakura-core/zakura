@@ -1,6 +1,8 @@
 //! Session table: #945's churn and stale-key tests, #978's fencing scenarios
 //! on the table, and an operation-sequence proptest.
 
+use std::sync::{Arc, Mutex as StdMutex};
+
 use proptest::prelude::*;
 
 use super::*;
@@ -45,6 +47,7 @@ impl Connection {
                 cancel: self.cancel.child_token(),
                 fence: WriterFence::new(self.cancel.clone(), self.cause.clone()),
                 session: session_id,
+                installed: None,
             },
             send,
             recv,
@@ -81,7 +84,11 @@ async fn churn_coalesces_and_changes_during_reconciliation_stay_visible() {
         !changed.has_changed().unwrap(),
         "one observation consumes the coalesced change"
     );
-    table.remove(&peer, snapshot[0].1);
+    table.remove(
+        &peer,
+        snapshot[0].1,
+        Removal::new(RemoveCause::Teardown, None),
+    );
     assert!(
         changed.has_changed().unwrap(),
         "a change after the snapshot schedules another pass"
@@ -99,7 +106,9 @@ fn a_stale_key_cannot_remove_a_newer_session() {
     let new_cancel = new.cancel.clone();
     table.replace(peer.clone(), old);
     table.replace(peer.clone(), new);
-    assert!(table.remove(&peer, old_key).is_none());
+    assert!(table
+        .remove(&peer, old_key, Removal::new(RemoveCause::Teardown, None))
+        .is_none());
     assert!(!new_cancel.is_cancelled());
     assert_eq!(table.get(&peer).map(|(_, session)| session), Some(2));
 }
@@ -241,7 +250,9 @@ async fn removing_a_session_fences_its_writers_before_erasing_it() {
         if started {
             assert_eq!(output.recv().await, Some(request()));
         }
-        let removed = table.remove(&peer, key).unwrap();
+        let removed = table
+            .remove(&peer, key, Removal::new(RemoveCause::Teardown, None))
+            .unwrap();
         assert!(removed.cancel.is_cancelled());
         assert!(table.get(&peer).is_none());
         assert!(fence.open().is_none());
@@ -346,7 +357,7 @@ proptest! {
                         current[peer].as_ref().map(|session| session.key)
                     };
                     let Some(key) = key else { continue };
-                    let removed = table.remove(&peers[peer], key);
+                    let removed = table.remove(&peers[peer], key, Removal::new(RemoveCause::Teardown, None));
                     prop_assert_eq!(removed.is_some(), !stale);
                     if !stale {
                         let old = current[peer].take().expect("the key named the current session");
@@ -385,4 +396,176 @@ proptest! {
             }
         }
     }
+}
+
+/// A header-sync session on its own connection, installed from `facts`
+/// with no connection tap, as the header service's table holds it.
+fn header_session(
+    conn_id: ZakuraConnId,
+    facts: Option<diag::InstallFacts>,
+) -> Current<ServicePeerDirection> {
+    let connection = Connection::new();
+    Current {
+        key: SessionKey {
+            conn_id,
+            session_id: conn_id,
+        },
+        cancel: connection.cancel.child_token(),
+        fence: WriterFence::new(connection.cancel.clone(), connection.cause.clone()),
+        session: ServicePeerDirection::Inbound,
+        installed: facts.map(|facts| Install { facts, tap: None }),
+    }
+}
+
+/// What a header stream installed from.
+fn facts() -> diag::InstallFacts {
+    diag::InstallFacts {
+        negotiated: 1 << 10,
+        stream_version: 9,
+        quic_stream: Some(4),
+        direction: ServicePeerDirection::Inbound,
+    }
+}
+
+/// A table read's sessions as `(conn_id, installed)`, if it's current.
+fn read_sessions(
+    read: &diag::ComponentRead,
+) -> Option<Vec<(ZakuraConnId, Option<diag::InstallFacts>)>> {
+    match read() {
+        diag::Read::Current(diag::OwnerState::HeaderSessions(entries)) => Some(
+            entries
+                .into_iter()
+                .map(|entry| (entry.conn_id, entry.installed))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A session put in the table directly, with no service, no registry
+/// fanout and no reporter, is in the read, with what it was installed from.
+///
+/// This fails if the read is built from install records instead of the
+/// table.
+#[test]
+fn a_direct_install_is_seen() {
+    let table = Arc::new(SessionTable::default());
+    let read = SessionTable::read(&table);
+    assert_eq!(read_sessions(&read), Some(Vec::new()));
+    table.replace(peer(1), header_session(3, Some(facts())));
+    table.replace(peer(2), header_session(4, None));
+    assert_eq!(
+        read_sessions(&read),
+        Some(vec![(3, Some(facts())), (4, None)])
+    );
+    drop(table);
+    assert_eq!(read(), diag::Read::Gone);
+}
+
+/// A change the table reports while it holds its lock, as `TableChange`
+/// in plain fields.
+#[derive(Debug, PartialEq, Eq)]
+enum Heard {
+    Installed(ZakuraConnId),
+    Removed(ZakuraConnId, RemoveCause),
+    Ignored(ZakuraConnId, RemoveCause),
+}
+
+/// The reporter hears each change inside `replace` or `remove`, with the
+/// table's lock still held: an install; a replacement, as the old
+/// session's removal and then the new one's install, inside one `replace`;
+/// a stale key's `remove`, which removes nothing; and a removal.
+///
+/// This fails if a change is reported after the table's lock is released.
+#[test]
+fn changes_are_reported_inside_the_table_lock() {
+    let table = Arc::new(SessionTable::default());
+    let heard = Arc::new(StdMutex::new(Vec::new()));
+    let weak = diag::weak(&table);
+    table.report_with(1, {
+        let heard = heard.clone();
+        move |change| {
+            let table = weak.upgrade().expect("the test keeps the table");
+            assert!(
+                matches!(diag::peek(&table.current, |_| ()), diag::Read::Held { .. }),
+                "{change:?} is reported under the table's lock"
+            );
+            heard.lock().expect("never poisoned").push(match change {
+                TableChange::Installed { key, .. } => Heard::Installed(key.conn_id),
+                TableChange::Removed { key, cause, .. } => Heard::Removed(key.conn_id, cause),
+                TableChange::RemoveIgnored { key, removal } => {
+                    Heard::Ignored(key.conn_id, removal.cause)
+                }
+            });
+        }
+    });
+    let take = || std::mem::take(&mut *heard.lock().expect("never poisoned"));
+    table.replace(peer(1), header_session(3, Some(facts())));
+    assert_eq!(take(), [Heard::Installed(3)]);
+    table.replace(peer(1), header_session(4, Some(facts())));
+    assert_eq!(
+        take(),
+        [
+            Heard::Removed(3, RemoveCause::Replaced),
+            Heard::Installed(4)
+        ]
+    );
+    let stale = SessionKey {
+        conn_id: 3,
+        session_id: 3,
+    };
+    assert!(table
+        .remove(&peer(1), stale, Removal::new(RemoveCause::Teardown, None))
+        .is_none());
+    assert_eq!(take(), [Heard::Ignored(3, RemoveCause::Teardown)]);
+    let current = SessionKey {
+        conn_id: 4,
+        session_id: 4,
+    };
+    assert!(table
+        .remove(
+            &peer(1),
+            current,
+            Removal::new(RemoveCause::RemovePeer, None)
+        )
+        .is_some());
+    assert_eq!(take(), [Heard::Removed(4, RemoveCause::RemovePeer)]);
+}
+
+/// A reporter that reaches the table from inside its callback, as by
+/// reading a peer's session, panics with the re-entry guard's message
+/// instead of deadlocking on the table's lock.
+///
+/// This fails if the guard is removed: the callback then waits on the lock
+/// its own `replace` holds.
+#[test]
+fn a_reentrant_install_observer_is_refused() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let table = Arc::new(SessionTable::<ServicePeerDirection>::default());
+        let weak = diag::weak(&table);
+        table.report_with(1, move |_| {
+            let table = weak.upgrade().expect("the thread keeps the table");
+            let _ = table.get(&peer(1));
+        });
+        let replaced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.replace(peer(1), header_session(3, None));
+        }));
+        let message = replaced.err().and_then(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        });
+        let _ = done.send(message);
+    });
+    let message = finished
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the reentrant callback returns instead of deadlocking");
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("ReentrantObserver")),
+        "{message:?}"
+    );
 }

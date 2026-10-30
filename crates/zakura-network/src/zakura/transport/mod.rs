@@ -48,7 +48,7 @@ pub use message_rule::{
 };
 #[cfg(any(test, zakura_sim))]
 pub use observe::{
-    frame_fingerprint, FrameSummary, HeaderCheck, OutputOutcome, Producer, Summarizer,
+    frame_fingerprint, FrameSummary, HeaderCheck, OutputOutcome, Producer, RemoveCause, Summarizer,
     SummaryCursor, Transition, TransportEvent, TransportObserver, TransportSlot, Unwritten,
 };
 #[cfg(any(test, zakura_sim))]

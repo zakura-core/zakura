@@ -548,13 +548,16 @@ impl HeaderSyncService {
     /// Builds the service that admits header-sync sessions for the reactor
     /// behind `header_sync`, with no sync-lifecycle gate.
     pub fn new(header_sync: HeaderSyncHandle) -> Self {
-        Self {
+        let service = Self {
             header_sync,
             sessions: Arc::default(),
             admission: StdMutex::new(()),
             status_cadences: StdMutex::new(HashMap::new()),
             service_demand: None,
-        }
+        };
+        #[cfg(any(test, zakura_sim))]
+        service.observe_sessions();
+        service
     }
 
     pub(crate) fn with_service_demand(
@@ -676,12 +679,14 @@ impl Service for HeaderSyncService {
             return;
         };
         // The publisher needs room for a page and for control.
-        if stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION
+        if sim_chain!(stream_version => bypassed()) != ZAKURA_HEADER_SYNC_STREAM_VERSION
             || peer.negotiated & ZAKURA_CAP_HEADER_SYNC == 0
             || send.max_capacity() < 2
         {
             peer.close_cause().record("header_sync_regulation_contract");
             peer.cancel_token().cancel();
+            #[cfg(any(test, zakura_sim))]
+            self.refused(&peer.close_cause(), peer.conn_id, "regulation_contract");
             return;
         }
 
@@ -706,6 +711,8 @@ impl Service for HeaderSyncService {
                 .is_some_and(|(current, _)| current.conn_id > conn_id)
             {
                 service_cancel_token.cancel();
+                #[cfg(any(test, zakura_sim))]
+                self.refused(&close_cause, conn_id, "newer_connection");
                 return;
             }
             let current = Current {
@@ -713,11 +720,15 @@ impl Service for HeaderSyncService {
                 cancel: service_cancel_token.clone(),
                 fence: fence.clone(),
                 session: peer.direction,
+                #[cfg(any(test, zakura_sim))]
+                installed: install(&peer, stream_version, &recv, &close_cause),
             };
             if matches!(
                 self.sessions.replace(peer_id.clone(), current),
                 Replacement::Refused
             ) {
+                #[cfg(any(test, zakura_sim))]
+                self.refused(&close_cause, conn_id, "replace_refused");
                 return;
             }
         }
@@ -815,7 +826,7 @@ impl Service for HeaderSyncService {
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
         let on_teardown = move || {
-            teardown_sessions.remove(&teardown_peer, key);
+            sim_arg!(teardown_sessions.remove(&teardown_peer, key); torn_down(&teardown_close_cause));
             // Replaced sessions still own a reserved teardown slot. The reactor checks generations.
             let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
                 peer: teardown_peer,
@@ -867,7 +878,8 @@ impl Service for HeaderSyncService {
         let Some((key, _)) = self.sessions.get(peer) else {
             return;
         };
-        if key.conn_id != conn_id || self.sessions.remove(peer, key).is_none() {
+        if key.conn_id != conn_id || sim_arg!(self.sessions.remove(peer, key); by_peer()).is_none()
+        {
             return;
         }
         let _ = self.header_sync.send_lifecycle(Event::PeerDisconnected {
@@ -1025,4 +1037,168 @@ impl Sink for HeaderSyncPassthroughSink {
 fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<zakura_quic::NodeId> {
     let bytes = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
     zakura_quic::NodeId::from_bytes(&bytes).ok()
+}
+
+/// The header service's M6a-7b observation (`cfg(any(test, zakura_sim))`):
+/// its allocation ID, its session table's boundary read and change
+/// reports, and its install refusals. It sits at the end of the file so
+/// the cfg-only lines move no release log line's number across a power of
+/// ten, which the release gate can't vouch for.
+#[cfg(any(test, zakura_sim))]
+impl HeaderSyncService {
+    /// Its allocation ID among the services built on its reactor handle,
+    /// from 1, which its table's read and change records carry.
+    pub fn diag_id(&self) -> u64 {
+        self.sessions
+            .service()
+            .expect("the service numbers its table as it's built")
+    }
+
+    /// Takes the next allocation ID on the reactor handle, registers the
+    /// session table's boundary read under it with the reactor's observer,
+    /// and has the table report each install and removal through the
+    /// session's connection tap, with that ID.
+    fn observe_sessions(&self) {
+        use crate::zakura::{regulation::TableChange, TransportEvent};
+
+        let service = self.header_sync.next_service();
+        self.header_sync.observer.register_read(
+            crate::zakura::diag::ReadKey::HeaderSessions { service },
+            SessionTable::read(&self.sessions),
+        );
+        self.sessions.report_with(service, move |change| {
+            let (tap, event) = match change {
+                TableChange::Installed { key, install } => (
+                    install.and_then(|install| install.tap.as_ref()),
+                    TransportEvent::Installed {
+                        service,
+                        conn_id: key.conn_id,
+                        session_id: key.session_id,
+                        quic_stream: install.and_then(|install| install.facts.quic_stream),
+                    },
+                ),
+                TableChange::Removed {
+                    key,
+                    install,
+                    cause,
+                } => (
+                    install.and_then(|install| install.tap.as_ref()),
+                    TransportEvent::Removed {
+                        service,
+                        conn_id: key.conn_id,
+                        session_id: key.session_id,
+                        cause,
+                    },
+                ),
+                TableChange::RemoveIgnored { key, removal } => (
+                    removal.tap.as_ref(),
+                    TransportEvent::RemoveIgnored {
+                        service,
+                        conn_id: key.conn_id,
+                        session_id: key.session_id,
+                        cause: removal.cause,
+                    },
+                ),
+            };
+            if let Some(tap) = tap {
+                tap.emit(event);
+            }
+        });
+    }
+
+    /// Reports through `close_cause`'s connection tap that `add_peer` for
+    /// connection `conn_id` installed nothing, for `reason`.
+    fn refused(&self, close_cause: &CloseCause, conn_id: ZakuraConnId, reason: &'static str) {
+        if let Some(tap) = close_cause.tap() {
+            tap.emit(crate::zakura::TransportEvent::InstallRefused {
+                service: self.diag_id(),
+                conn_id,
+                reason,
+            });
+        }
+    }
+}
+
+/// What `add_peer` installs a session from: the `Peer`'s negotiated mask
+/// and direction, the stream's version and QUIC stream, and the
+/// connection's tap its table changes are reported through.
+#[cfg(any(test, zakura_sim))]
+fn install(
+    peer: &Peer,
+    stream_version: u16,
+    recv: &FramedRecv,
+    close_cause: &CloseCause,
+) -> Option<crate::zakura::regulation::Install> {
+    Some(crate::zakura::regulation::Install {
+        facts: crate::zakura::diag::InstallFacts {
+            negotiated: peer.negotiated,
+            stream_version,
+            quic_stream: recv.stream_tap().map(|tap| tap.quic_stream()),
+            direction: peer.direction,
+        },
+        tap: close_cause.tap().cloned(),
+    })
+}
+
+/// A session pipe's teardown removing its own session, reported through
+/// its connection's tap.
+#[cfg(any(test, zakura_sim))]
+fn torn_down(close_cause: &CloseCause) -> crate::zakura::regulation::Removal {
+    crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::Teardown, close_cause.tap())
+}
+
+/// The registry's `remove_peer` removing a connection's session. It has no
+/// tap of the connection's, and removes only a session its key matches.
+#[cfg(any(test, zakura_sim))]
+fn by_peer() -> crate::zakura::regulation::Removal {
+    crate::zakura::regulation::Removal::new(crate::zakura::RemoveCause::RemovePeer, None)
+}
+
+/// The stream version `add_peer` checks, through the test bypass.
+#[cfg(any(test, zakura_sim))]
+trait Bypassed {
+    /// This version, or the bypass's if one is set.
+    fn bypassed(self) -> u16;
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Bypassed for u16 {
+    fn bypassed(self) -> u16 {
+        bypass::stream_version(self)
+    }
+}
+
+/// A test bypass of `HeaderSyncService::add_peer`'s stream check (M6a-7b),
+/// for histories that need a refused install the transport never makes.
+#[cfg(any(test, zakura_sim))]
+pub mod bypass {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The version every header stream's `Peer` reads as, if set.
+        static VERSION: Cell<Option<u16>> = const { Cell::new(None) };
+    }
+
+    /// Runs `run` with every header-sync `add_peer` on this thread reading
+    /// its stream's version as `version`, after the registry selected the
+    /// service, so a `version` other than 9 is refused.
+    pub fn with_stream_version<T>(version: u16, run: impl FnOnce() -> T) -> T {
+        /// Clears the version when `run` returns or unwinds.
+        struct Clear;
+
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                VERSION.with(|set| set.set(None));
+            }
+        }
+
+        VERSION.with(|set| set.set(Some(version)));
+        let _clear = Clear;
+        run()
+    }
+
+    /// `version`, or the bypass's version if one is set.
+    pub(super) fn stream_version(version: u16) -> u16 {
+        VERSION.with(Cell::get).unwrap_or(version)
+    }
 }

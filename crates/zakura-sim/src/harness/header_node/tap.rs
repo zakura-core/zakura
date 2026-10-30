@@ -101,8 +101,8 @@ struct TapState {
     /// explains an observer dropped without a final `Settled` by its task's
     /// outcome (M6a-3).
     audited: AtomicBool,
-    /// A drain's pairing failure that the hub's audit decides, the first
-    /// one not yet decided. See [`ReactorLink::take_unpaired`].
+    /// A drain's unpaired drop receipt that the hub's audit decides, the
+    /// first one not yet decided. See [`ReactorLink::take_unpaired`].
     unpaired: Mutex<Option<String>>,
     buffer: Mutex<Buffer>,
 }
@@ -307,8 +307,8 @@ impl ReactorLink {
     }
 
     /// Takes the drain pairing failure the tap left to the hub, if any: a
-    /// storage receipt no call end paired with, which is a failure unless
-    /// the reactor is tearing down.
+    /// drop receipt no call end paired with, which is a failure unless the
+    /// reactor is tearing down.
     pub(crate) fn take_unpaired(&self) -> Option<String> {
         self.state
             .unpaired
@@ -680,15 +680,15 @@ impl ReactorTap {
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or
             // `PortGone`, so the crash isn't read as a pairing bug.
-            Err(PairError::Evidence(_))
+            Err(PairError::Evidence(_) | PairError::Dropped(_))
                 if self.state.health().is_some() || self.state.unfinished_drop() =>
             {
                 Ok(())
             }
-            // A receipt with no call end is also what a reactor's teardown
-            // leaves, when it drops a pending call's future. Once a hub
-            // audits the reactor, it decides by the reactor's lifecycle.
-            Err(PairError::Evidence(detail)) if self.state.audited.load(Ordering::Relaxed) => {
+            // A drop receipt with no call end is also what a reactor's
+            // teardown leaves, when it drops a pending call's future. Once a
+            // hub audits the reactor, it decides by the reactor's lifecycle.
+            Err(PairError::Dropped(detail)) if self.state.audited.load(Ordering::Relaxed) => {
                 self.state
                     .unpaired
                     .lock()
@@ -696,7 +696,7 @@ impl ReactorTap {
                     .get_or_insert(detail);
                 Ok(())
             }
-            Err(PairError::Evidence(detail)) => Err(detail),
+            Err(PairError::Evidence(detail) | PairError::Dropped(detail)) => Err(detail),
             Err(PairError::PortPanicked { call }) => {
                 // The run checks this after the step, ahead of any evidence
                 // failure the same step reports.

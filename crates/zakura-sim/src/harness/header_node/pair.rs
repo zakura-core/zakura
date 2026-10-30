@@ -92,6 +92,12 @@ pub(crate) enum PairError {
     },
     /// The drain's evidence doesn't pair, led by the failure's name.
     Evidence(String),
+    /// Nothing failed but a `CallerDropped` or `ReplyDropped` receipt that
+    /// no call end paired with, led by the failure's name. That's also what
+    /// a reactor's teardown leaves, when it drops a pending call's future,
+    /// so the tap's caller can tell the two apart by the reactor's
+    /// lifecycle.
+    Dropped(String),
 }
 
 /// One reactor's calls and its storage's operations, paired drain by drain.
@@ -163,11 +169,17 @@ impl Pairer {
             }
         }
         let fresh = std::mem::take(&mut self.fresh);
+        let mut dropped = false;
         if failure.is_none() {
-            failure = fresh.into_iter().find_map(|seq| self.unpaired(seq));
+            failure = fresh.into_iter().find_map(|seq| {
+                let (detail, receipt) = self.unpaired(seq)?;
+                dropped = receipt != Receipt::ReplyTaken;
+                Some(detail)
+            });
         }
         match (panicked, failure) {
             (Some(call), _) => Err(PairError::PortPanicked { call }),
+            (None, Some(detail)) if dropped => Err(PairError::Dropped(detail)),
             (None, Some(detail)) => Err(PairError::Evidence(detail)),
             (None, None) => Ok(()),
         }
@@ -225,9 +237,9 @@ impl Pairer {
         Ok(Some(id))
     }
 
-    /// The failure for the receipt at `seq`, if a call must have taken it
-    /// and none is paired with its operation.
-    fn unpaired(&self, seq: u64) -> Option<String> {
+    /// The failure for the receipt at `seq`, with the receipt, if a call
+    /// must have taken it and none is paired with its operation.
+    fn unpaired(&self, seq: u64) -> Option<(String, Receipt)> {
         let (receipt, id) = self.receipts[&seq];
         if self.paired.contains(&id) {
             return None;
@@ -242,10 +254,11 @@ impl Pairer {
             _ => false,
         };
         reactors.then(|| {
-            format!(
+            let detail = format!(
                 "Unpaired: operation {id}'s {receipt:?} at storage fact {seq} has no call ending \
                  at it in its step"
-            )
+            );
+            (detail, receipt)
         })
     }
 }
@@ -352,7 +365,7 @@ mod tests {
     /// The failure name leading `result`'s evidence failure.
     fn evidence(result: Result<(), PairError>) -> String {
         match result {
-            Err(PairError::Evidence(detail)) => detail,
+            Err(PairError::Evidence(detail) | PairError::Dropped(detail)) => detail,
             other => panic!("expected an evidence failure, got {other:?}"),
         }
     }

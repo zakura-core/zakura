@@ -1073,4 +1073,47 @@ mod tests {
             );
         }
     }
+
+    /// A pairing failure that isn't a dropped call's receipt fails the run
+    /// even in the step that ends the reactor: a call end with no dispatch,
+    /// right before the final `Settled`, is `Mispaired`.
+    ///
+    /// This fails if teardown excuses every pairing failure.
+    #[test]
+    fn a_final_snapshot_never_hides_a_mispaired_call() {
+        use zakura_network::zakura::observe::CallEnd;
+
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = PolicySource::new(
+            &mut fixture.sim,
+            fixture.port.clone(),
+            Policy::converging(),
+            Effects::default(),
+        );
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        slot.emit(settled(0, false));
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            slot.emit(resumed(1, ResumeArm::Start));
+            slot.emit(ReactorEvent::CallEnded {
+                call: 99,
+                end: CallEnd::Replied,
+            });
+            slot.emit(settled(1, true));
+        });
+        let (report, _) = fixture.run(&mut States::default());
+        assert!(
+            matches!(&report.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail.starts_with("Mispaired: call 99 ended before its dispatch")),
+            "{:?}",
+            report.end
+        );
+        assert!(
+            matches!(
+                reactor_facts(&report).last(),
+                Some((_, ReactorFact::Settled { last: true, .. }))
+            ),
+            "the call end and the final Settled share the failing step"
+        );
+    }
 }

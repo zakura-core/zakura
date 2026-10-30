@@ -14,6 +14,7 @@ mod rpc_artifacts;
 mod rt_imports;
 mod sim;
 mod sim_feedback;
+mod sim_minimize;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -132,6 +133,7 @@ fn try_main() -> Result<(), BoxError> {
             }
             sim_feedback::run(&repo_root()?)
         }
+        Some("sim-minimize") => sim_minimize::run(&repo_root()?, args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -353,6 +355,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         "  cargo xtask shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]"
     )?;
     writeln!(output, "  cargo xtask sim-feedback")?;
+    writeln!(
+        output,
+        "  cargo xtask sim-minimize <target> <input> --property <id> --out <dir> --runs <n>"
+    )?;
+    writeln!(
+        output,
+        "      --wall-secs <s> --child-secs <s> [--sanitizer address|none]"
+    )?;
     writeln!(output)?;
     writeln!(
         output,
@@ -424,5 +434,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "checks that libFuzzer keeps an input for a semantic feature alone."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Minimizes a simulation fuzz crash with cargo fuzz tmin, and keeps a smaller input"
+    )?;
+    writeln!(
+        output,
+        "only if fresh processes confirm the same property, assumptions, witness and build."
     )
 }

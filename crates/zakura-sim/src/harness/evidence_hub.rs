@@ -1353,17 +1353,23 @@ mod tests {
             assert_eq!(entries[at].origin, Some(entries[at - 1].pos));
         }
 
-        /// A second writer appends an entry no `Staged` reports. The next
-        /// settled boundary holds more than the frames explain, which is
-        /// `UnframedWork{Extra}`, and `receiver-work-authorized` fails on it
-        /// while the framed page still passes.
+        /// A second staging site consumes capacity for an entry and
+        /// appends it, with no `Staged`. The next settled boundary holds
+        /// more than the frames explain, which is `UnframedWork{Extra}`, and
+        /// `receiver-work-authorized` fails on it while the framed page
+        /// still passes. Its leases cover what it holds, so the reactor's
+        /// work ledger accepts the boundary and the property, not a harness
+        /// failure, judges it. An append with no lease is a budget break
+        /// instead, which the ledger fails as `Unaccounted` (M6a-4).
         ///
         /// This fails if the check passes unframed work.
         #[test]
         fn staging_by_another_writer_reaches_the_downstream_check() {
+            use crate::harness::header_node::work::WorkLedger;
+
             let page = of(&[entry(1), entry(2)]);
             let extra = page.then(entry(9));
-            let log = write(vec![staged(0, page, page), settled(1, extra, 2)])
+            let log = write(vec![staged(0, page, page), settled(1, extra, 3)])
                 .expect("the step is whole");
             assert_eq!(
                 derived(&log),
@@ -1371,6 +1377,46 @@ mod tests {
                     (admitted(0, 2), true),
                     (unframed(UnframedCause::Extra, 1), false)
                 ]
+            );
+
+            // The ledger's view of the same boundary, after the round's
+            // placement and binding.
+            let ledger = |leased| {
+                let mut ledger = WorkLedger::default();
+                let facts = [
+                    ReactorFact::Placed {
+                        reservation: 1,
+                        peer: "01".into(),
+                        count: 3,
+                        placement: None,
+                    },
+                    ReactorFact::Bound {
+                        reservation: 1,
+                        incarnation: 1,
+                    },
+                ];
+                let rows = [started(), staged(0, page, page), settled(1, extra, leased)];
+                let rows = rows.into_iter().map(|row| match row {
+                    Observation::Reactor { event, .. } => event,
+                    _ => unreachable!("reactor rows"),
+                });
+                let mut last = Ok(());
+                for fact in facts.into_iter().chain(rows) {
+                    ledger.fold(&fact).expect("each identity holds");
+                    if let ReactorFact::Settled {
+                        snapshot: Some(snapshot),
+                        ..
+                    } = &fact
+                    {
+                        last = ledger.settled(snapshot);
+                    }
+                }
+                last
+            };
+            assert_eq!(ledger(3), Ok(()), "leased work reaches the property");
+            assert!(
+                ledger(2).is_err_and(|why| why.starts_with("Unaccounted")),
+                "an unleased append is the budget's break"
             );
         }
 

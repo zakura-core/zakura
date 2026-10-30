@@ -295,3 +295,38 @@ fn a_second_writer_changes_the_held_digest() {
         "the changed entry shows in `after`"
     );
 }
+
+/// Capacity a page's response consumes, with nothing appended, reports no
+/// `Staged`: only the append does, so the simulator never admits work from
+/// the budget alone. The snapshot shows the lease and nothing held.
+///
+/// This fails if the consumption reports staged work.
+#[test]
+fn consumed_capacity_alone_reports_no_stage() {
+    let snapshot = genesis();
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, mut actions) = observed(&snapshot, &recorder, false);
+    let (peer, _send, mut outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x53; 32]);
+    let mut status = pruned_status(&snapshot, target);
+    status.work_anchor_height = snapshot.frontiers.finalized.height;
+    status.selected_tip_height = block::Height(100);
+    status.max_headers_per_response = 2;
+    reactor.handle_status(peer.clone(), 0, status);
+    reactor.schedule_cached_statuses();
+    answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    recorder.take();
+
+    assert!(reactor.peer_work_queue.consume_response_capacity(&peer, 2));
+    let events = recorder.take();
+    assert!(staged(&events).is_empty(), "{events:?}");
+    let settled = settle(&reactor, &recorder);
+    assert_eq!(held(&settled), (0, HeldDigest::default()));
+    let leased: usize = settled
+        .holdings
+        .iter()
+        .flat_map(|holding| &holding.leases)
+        .map(|lease| lease.count)
+        .sum();
+    assert_eq!(leased, 2, "the consumption took a lease");
+}

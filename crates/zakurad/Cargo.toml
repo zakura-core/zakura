@@ -75,7 +75,7 @@ default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc
 # Local builds use the compiler's target features for Pasta arithmetic.
 default = ["default-release-binaries"]
 
-# Local regtest PQ validation and admission; public networks remain unchanged.
+# Local PQ validation on Regtest and isolated custom Testnets; public networks stay unchanged.
 pq = ["zakura-consensus/pq", "zakura-network/pq", "dep:zcash_transparent", "zcash_transparent/pq"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.

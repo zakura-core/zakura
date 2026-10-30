@@ -504,6 +504,8 @@ mod tests {
             let mut hub = EvidenceHub::new();
             hub.owners(view.clone());
             let life = hub.reactor(tap.link(), Some(view.clone()));
+            // As the header harnesses do, so the node's chain is read.
+            hub.selected_chain(&port);
             let fixture = Fixture {
                 sim,
                 hub,
@@ -1269,7 +1271,9 @@ mod tests {
             .entries()
             .iter()
             .filter_map(|entry| match &entry.obs {
-                Observation::ComponentRead { read, .. } => Some((
+                Observation::ComponentRead {
+                    component, read, ..
+                } if component == "Budget" => Some((
                     entry.step,
                     match read {
                         ComponentReading::Current(ComponentValue::Budget { owned, .. }) => {

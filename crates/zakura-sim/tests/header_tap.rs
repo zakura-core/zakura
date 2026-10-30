@@ -984,11 +984,11 @@ impl HeaderSyncObserver for LosesNth {
     }
 }
 
-/// A real reactor whose observer drops one event fails the run at the
-/// step that emitted it: its first `Settled`, at setup, a `Resumed`
-/// mid-run, and the last event before the run ends with `Unobserved`, and
-/// its last `CallEnded` with the storage receipt it leaves unpaired. The
-/// faithful run passes, and dropping changes no pick.
+/// A real reactor whose observer drops one event fails the run with
+/// `Unobserved` at the step that emitted it: its first `Settled`, at setup,
+/// a `Resumed` mid-run, its last `CallEnded`, whose storage receipt the
+/// tap then leaves to its own failure, and the last event before the run
+/// ends. The faithful run passes, and dropping changes no pick.
 ///
 /// This fails if the tap checks only what its observer recorded.
 #[test]
@@ -1025,19 +1025,14 @@ fn suppression_is_caught_at_the_first_middle_and_last_event() {
         middle.1 > 0 && middle.1 < last.1,
         "the middle Resumed is mid-run: {middle:?}"
     );
-    // A lost call end leaves its storage receipt unpaired, which the
-    // storage source reports first, in the same step.
-    let tap = ("reactor:node#0", "Unobserved");
-    for ((seq, step, event), (failed_source, failure)) in [
-        (first, tap),
-        (middle, tap),
-        (call_end, ("source 0", "Unpaired")),
-        (last, tap),
-    ] {
+    for (seq, step, event) in [first, middle, call_end, last] {
         let lost = node_run_losing(input.clone(), true, Some(seq));
         let (source, detail) = evidence_failure(&lost);
-        assert_eq!(source, failed_source, "losing {event:?}: {detail}");
-        assert!(detail.starts_with(failure), "losing {event:?}: {detail}");
+        assert_eq!(source, "reactor:node#0", "losing {event:?}: {detail}");
+        assert!(
+            detail.starts_with("Unobserved"),
+            "losing {event:?}: {detail}"
+        );
         assert_eq!(lost.end.steps, step, "losing {event:?}");
         assert_eq!(
             support::picks(&lost),

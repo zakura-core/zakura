@@ -22,7 +22,7 @@ use super::{
     },
 };
 use crate::{
-    explore::{ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR},
+    explore::{ProcessExit, ProcessFailure, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, EXPECT_VAR},
     trace::ARTIFACTS_VAR,
 };
 
@@ -525,7 +525,9 @@ impl Worker<'_> {
 /// The fuzzer command for `budget`, before its corpus and per-process
 /// flags: the binary, under `taskset -c <cpus>` if `cpus` is set, with the
 /// budget's libFuzzer flags, its sanitizer variables and the target's
-/// variables. The target saves its inputs and traces under `sim`.
+/// variables. The target saves its inputs and traces under `sim`, and runs
+/// without [`EXPECT_VAR`], which would make it ignore every failure but one
+/// property's.
 pub(super) fn fuzzer_command(
     fuzzer: &Path,
     cpus: Option<&str>,
@@ -546,7 +548,8 @@ pub(super) fn fuzzer_command(
         .arg(format!("-rss_limit_mb={}", budget.rss_limit_mb))
         .args(&budget.libfuzzer_args)
         .env(ARTIFACTS_VAR, sim)
-        .env(ABANDON_LIMIT_VAR, budget.abandon_limit.to_string());
+        .env(ABANDON_LIMIT_VAR, budget.abandon_limit.to_string())
+        .env_remove(EXPECT_VAR);
     match &budget.feedback_mode {
         Some(mode) => command.env(FEEDBACK_VAR, mode),
         None => command.env_remove(FEEDBACK_VAR),

@@ -34,6 +34,10 @@ pub use worker::{
     abandon_limit, Worker, ABANDON_LIMIT_PANIC, ABANDON_LIMIT_VAR, DEFAULT_ABANDON_LIMIT,
 };
 
+/// The variable that makes a fuzz target panic only on one property's
+/// violation, for `cargo fuzz tmin`.
+pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
+
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport},
     harness::{run_harness, HarnessEntry, HarnessError, Subsystem},

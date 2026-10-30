@@ -9,6 +9,7 @@ use std::{
     time::Instant,
 };
 
+pub use zakura_sim::explore::EXPECT_VAR;
 use zakura_sim::{
     explore::{
         input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
@@ -18,10 +19,6 @@ use zakura_sim::{
     property::PropertyId,
     trace::{artifacts_root, TRACES_DIR},
 };
-
-/// The variable that makes a target panic only on one property's
-/// violation, for `cargo fuzz tmin`.
-pub const EXPECT_VAR: &str = "ZAKURA_SIM_EXPECT";
 
 /// A fuzz target over harness `$harness`: `sim_target!(discovery::WaitComplete)`
 /// for a harness under `zakura_sim::harness`.

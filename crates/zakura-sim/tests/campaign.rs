@@ -28,7 +28,7 @@ use zakura_sim::{
         Recorder, ResumeOptions, RunState, StartOptions, Status, Store, WorkerOutcome, WorkerPlan,
         ATTEMPTS_FILE, FUZZ_PACKAGE,
     },
-    explore::{ProcessFailure, ABANDON_LIMIT_PANIC},
+    explore::{ProcessFailure, ABANDON_LIMIT_PANIC, EXPECT_VAR},
     harness,
     trace::BuildInfo,
 };
@@ -53,6 +53,7 @@ for arg in "$@"; do
 done
 parent=$PPID
 echo "asan=$ASAN_OPTIONS" >&2
+echo "expect=$ZAKURA_SIM_EXPECT" >&2
 alive() { kill -0 "$parent" 2>/dev/null; }
 if [ -e "$control/feedback" ]; then
   echo "zakura-sim feedback: backend=stub version=7 features=1 mode=on" >&2
@@ -609,6 +610,40 @@ fn interrupted_compaction_keeps_every_snapshot() {
             .initial_snapshot,
         snapshot
     );
+}
+
+/// The fuzzer runs without the supervisor's `ZAKURA_SIM_EXPECT`, which
+/// would make the target ignore every failure but one property's, and
+/// which the manifest doesn't record.
+#[test]
+fn fuzzers_run_without_the_supervisors_expected_property() {
+    let fixture = Fixture::new();
+    let build = fixture.build.as_str();
+    let args = [
+        "start",
+        "--campaign",
+        "test",
+        "--sim",
+        SIM,
+        "--build",
+        build,
+        "--seconds",
+        "1",
+        "--fixtures",
+        FIXTURES,
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+        .arg("campaign")
+        .args(args)
+        .arg("--store")
+        .arg(fixture.store.root())
+        .env(EXPECT_VAR, "sim/no-task-panic")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let run = leaf(&fixture.store);
+    let log = fs::read_to_string(fixture.store.run_dir(&run).join("workers/0/log-0.txt")).unwrap();
+    assert!(log.contains("expect=\n"), "{log}");
 }
 
 /// A merge that crashes on an input finishes all the same, as libFuzzer's

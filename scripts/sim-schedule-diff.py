@@ -10,8 +10,8 @@ step's pick, key, option count, `by`, offset and draws. Observation digests
 (`obs`), the `meta` record and the `end` record aren't compared.
 
 The fixture glob is matched in the head worktree, and both sides record
-the same fixture files, so a fixture the change re-records still runs the
-same input on both.
+the same fixture files. When the change re-records a fixture, both sides
+record base's version of it too (see `find_fixtures`).
 
 Usage:
   sim-schedule-diff.py --base <rev> --head <rev>
@@ -87,16 +87,24 @@ def compare_traces(base_lines, head_lines):
 
 
 def find_fixtures(base_tree, head_tree, pattern):
-    """The head's fixtures matching `pattern`, and the names of base fixtures head lacks.
+    """The inputs to record, and the names of base fixtures head lacks.
 
+    Returns `(inputs, missing)`. `inputs` lists `(label, path)`: each head
+    fixture, and, when base has a different file of the same name, base's
+    too, so re-recording a fixture can't drop the input it replaced.
     Removing a fixture would quietly shrink what the gate checks, so a
     fixture only base has is reported as missing.
     """
-    head = sorted(head_tree.glob(pattern))
-    names = {path.relative_to(head_tree) for path in head}
+    inputs = []
+    for path in sorted(head_tree.glob(pattern)):
+        inputs.append((path.name, path))
+        old = base_tree / path.relative_to(head_tree)
+        if old.is_file() and old.read_bytes() != path.read_bytes():
+            inputs.append((path.name + " (base's input)", old))
+    names = {path.relative_to(head_tree) for path in head_tree.glob(pattern)}
     missing = sorted(str(path.relative_to(base_tree)) for path in base_tree.glob(pattern)
                      if path.relative_to(base_tree) not in names)
-    return head, missing
+    return inputs, missing
 
 
 def build_sim(cargo, tree, target):
@@ -149,15 +157,15 @@ def main(argv=None):
                 status = EXIT_DIFFERS
             binaries = {side: build_sim(args.cargo, trees.tree(side), trees.target(side))
                         for side in ("base", "head")}
-            for fixture in fixtures:
+            for index, (label, fixture) in enumerate(fixtures):
                 traces = {
                     side: record(binaries[side], trees.tree(side), args.sim, fixture,
-                                 trees.work / "traces" / side / fixture.stem)
+                                 trees.work / "traces" / side / ("%d-%s" % (index, fixture.stem)))
                     for side in ("base", "head")
                 }
                 difference = compare_traces(traces["base"], traces["head"])
                 steps = sum(1 for line in traces["head"] if line.startswith('{"step"'))
-                print("%s: %s" % (fixture.name, difference or "identical (%d steps)" % steps), flush=True)
+                print("%s: %s" % (label, difference or "identical (%d steps)" % steps), flush=True)
                 if difference:
                     status = EXIT_DIFFERS
     except rw.CommandFailed as error:

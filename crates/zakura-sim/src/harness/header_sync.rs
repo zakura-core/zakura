@@ -629,6 +629,7 @@ impl Subsystem for HeaderWire {
             .collect();
         let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
         let dials = tap.dials();
+        let reads = tap.reads();
         sim.add_source(Box::new(tap.writing_to(hub.out())));
         let node = WireNode::spawn(
             sim,
@@ -639,6 +640,7 @@ impl Subsystem for HeaderWire {
             observer,
             dials,
         );
+        hub.transport_reads(reads);
         let failure = PeerFailure::default();
         let mut control = PeerControl::new(failure.clone());
         hub.place_peers(ports.records.clone());

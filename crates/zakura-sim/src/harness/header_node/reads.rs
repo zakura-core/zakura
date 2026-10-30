@@ -17,6 +17,10 @@
 //! the reactor builds the budget before it. The harness registers the
 //! selected chain's read itself, as it builds the node's port, so that
 //! read's existence evidence is the harness's construction.
+//!
+//! On `header-sync/wire` the handler registers the supervisor map's read
+//! through the transport observer (M6a-7b), and the map exists from the
+//! first `Registered`.
 
 use std::{
     cell::{Cell, RefCell},
@@ -33,9 +37,9 @@ use super::{
     view::{HeaderSyncView, Reading},
 };
 use crate::{
-    observe::{ComponentReading, ComponentValue, ReactorFact},
+    observe::{ComponentReading, ComponentValue, MapRow, ReactorFact, TransportFact},
     property::{ComponentKind, Read},
-    storage::point,
+    storage::{hex, point},
     Observation, ObservationLog,
 };
 
@@ -108,6 +112,10 @@ pub(crate) struct BoundaryReads {
     live: Vec<Live>,
     generations: BTreeMap<ReadKey, u64>,
     budget_exists: bool,
+    /// The node transport tap's reads and its instance, on a tier with a
+    /// transport.
+    transport: Option<(ReadSink, u64)>,
+    map_exists: bool,
     /// Built under [`without_reads`].
     off: bool,
 }
@@ -129,64 +137,100 @@ impl BoundaryReads {
             live: Vec::new(),
             generations: BTreeMap::new(),
             budget_exists: false,
+            transport: None,
+            map_exists: false,
             off: off || READS_OFF.with(Cell::get),
         }
+    }
+
+    /// Takes the reads the node's transport tap, instance `instance`,
+    /// keeps in `sink`, with their registrations in its rows.
+    pub(crate) fn transport(&mut self, sink: ReadSink, instance: u64) {
+        self.transport = Some((sink, instance));
+    }
+
+    /// Starts running `read`, registered under `key`.
+    fn adopt(
+        &mut self,
+        view: &mut HeaderSyncView,
+        key: ReadKey,
+        read: ComponentRead,
+    ) -> Result<(), String> {
+        let kind = kind(&key)?;
+        let generation = self.generations.entry(key.clone()).or_default();
+        *generation += 1;
+        view.register(kind);
+        self.live.push(Live {
+            kind,
+            generation: *generation,
+            read: Box::new(move || reading(&key, read())),
+            last: None,
+            seq: 0,
+        });
+        Ok(())
     }
 
     /// Takes this step's registrations and existence evidence, then runs
     /// every live read at the boundary, logging each that changed. Call it
     /// once the step's other records are in `log`.
     pub(crate) fn boundary(&mut self, log: &mut ObservationLog) -> Result<(), String> {
-        let registered =
-            std::mem::take(&mut *self.sink.lock().unwrap_or_else(PoisonError::into_inner));
+        let take = |sink: &ReadSink| {
+            std::mem::take(&mut *sink.lock().unwrap_or_else(PoisonError::into_inner))
+        };
+        let registered = take(&self.sink);
+        let transported = self.transport.as_ref().map(|(sink, _)| take(sink));
         if self.off {
             return Ok(());
         }
         let step = log.step();
-        let mut view = self.view.borrow_mut();
-        // In the order the reactor reported them, so a budget that settles
-        // before it registers its read fails, even within one step. The
-        // slot hands each read over right before its `ReadRegistered`, so
-        // the next one handed over is that row's, unless the observer
-        // dropped it.
+        let view = self.view.clone();
+        let mut view = view.borrow_mut();
+        let transport = self.transport.as_ref().map(|(_, instance)| *instance);
+        // In the order the owners reported them, so a component that shows
+        // it exists before its read is registered fails, even within one
+        // step. The observer is handed each read right before its
+        // `ReadRegistered`, so the next one handed over is that row's,
+        // unless the observer dropped it.
         let mut handed = registered.into_iter().peekable();
+        let mut handed_transport = transported.unwrap_or_default().into_iter().peekable();
         for obs in log.of_step(step) {
-            let Observation::Reactor {
-                instance, event, ..
-            } = obs
-            else {
-                continue;
-            };
-            if *instance != self.reactor {
-                continue;
-            }
-            match event {
-                ReactorFact::ReadRegistered { key: name, .. } => {
-                    let Some((key, read)) =
-                        handed.next_if(|(key, _)| read_key(key).is_ok_and(|key| key == name))
-                    else {
-                        continue;
-                    };
-                    let kind = kind(&key)?;
-                    let generation = self.generations.entry(key).or_default();
-                    *generation += 1;
-                    view.register(kind);
-                    self.live.push(Live {
-                        kind,
-                        generation: *generation,
-                        read: Box::new(move || reading(read())),
-                        last: None,
-                        seq: 0,
-                    });
-                }
-                ReactorFact::Settled { .. } if !self.budget_exists => {
-                    self.budget_exists = true;
-                    view.exists(ComponentKind::Budget, step);
-                }
+            match obs {
+                Observation::Reactor {
+                    instance, event, ..
+                } if *instance == self.reactor => match event {
+                    ReactorFact::ReadRegistered { key: name, .. } => {
+                        if let Some((key, read)) =
+                            handed.next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
+                        {
+                            self.adopt(&mut view, key, read)?;
+                        }
+                    }
+                    ReactorFact::Settled { .. } if !self.budget_exists => {
+                        self.budget_exists = true;
+                        view.exists(ComponentKind::Budget, step);
+                    }
+                    _ => {}
+                },
+                Observation::Transport {
+                    instance, event, ..
+                } if Some(*instance) == transport => match event {
+                    TransportFact::ReadRegistered { key: name, .. } => {
+                        if let Some((key, read)) = handed_transport
+                            .next_if(|(key, _)| read_key(key).is_ok_and(|key| key == *name))
+                        {
+                            self.adopt(&mut view, key, read)?;
+                        }
+                    }
+                    TransportFact::Registered if !self.map_exists => {
+                        self.map_exists = true;
+                        view.exists(ComponentKind::SupervisorMap, step);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
-        if let Some((key, _)) = handed.next() {
+        if let Some((key, _)) = handed.next().or_else(|| handed_transport.next()) {
             return Err(format!(
                 "UnloggedRead: {key:?}'s read was handed over with no ReadRegistered row at \
                  step {step}"
@@ -284,21 +328,27 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 fn kind(key: &ReadKey) -> Result<ComponentKind, String> {
     match key {
         ReadKey::Budget => Ok(ComponentKind::Budget),
+        ReadKey::SupervisorMap => Ok(ComponentKind::SupervisorMap),
         unknown => Err(format!("UnknownRead: no component reads {unknown:?}")),
     }
 }
 
-/// `read` as the view folds it.
-fn reading(read: diag::Read<OwnerState>) -> Result<Read<Reading>, String> {
-    Ok(match read {
-        diag::Read::Current(OwnerState::Budget(counters)) => {
+/// `read`, of the component `key` names, as the view folds it.
+fn reading(key: &ReadKey, read: diag::Read<OwnerState>) -> Result<Read<Reading>, String> {
+    Ok(match (key, read) {
+        (ReadKey::Budget, diag::Read::Current(OwnerState::Budget(counters))) => {
             Read::Current(Reading::Budget(counters))
         }
-        diag::Read::Current(unknown) => {
-            return Err(format!("UnknownRead: no component holds {unknown:?}"))
+        (ReadKey::SupervisorMap, diag::Read::Current(OwnerState::SupervisorMap(entries))) => {
+            Read::Current(Reading::SupervisorMap(entries))
         }
-        diag::Read::Held { holder } => Read::Held { holder },
-        diag::Read::Gone => Read::Gone,
+        (key, diag::Read::Current(unknown)) => {
+            return Err(format!(
+                "UnknownRead: {key:?}'s read holds {unknown:?}, which no component reads"
+            ))
+        }
+        (_, diag::Read::Held { holder }) => Read::Held { holder },
+        (_, diag::Read::Gone) => Read::Gone,
     })
 }
 
@@ -319,6 +369,18 @@ fn record(read: &Read<Reading>) -> ComponentReading {
                 finalized: point(chain.frontiers.finalized),
                 header_best: point(chain.frontiers.header_best),
                 verified_best: point(chain.frontiers.verified_best),
+            })
+        }
+        Read::Current(Reading::SupervisorMap(entries)) => {
+            ComponentReading::Current(ComponentValue::SupervisorMap {
+                entries: entries
+                    .iter()
+                    .map(|entry| MapRow {
+                        connection: entry.conn_id,
+                        peer: hex(&entry.peer.digest()),
+                        remote_ip: entry.remote_ip.map(|ip| ip.to_string()),
+                    })
+                    .collect(),
             })
         }
         Read::Current(Reading::Reactor(_)) => {

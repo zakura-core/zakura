@@ -564,6 +564,23 @@ pub enum ComponentValue {
         /// The best body-verified frontier on the selected path.
         verified_best: StoragePoint,
     },
+    /// The supervisor's map of registered connections (M6a-7b).
+    SupervisorMap {
+        /// Each registered connection, by connection.
+        entries: Vec<MapRow>,
+    },
+}
+
+/// One registered connection in [`ComponentValue::SupervisorMap`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MapRow {
+    /// The connection's registration ID, as `Registered` names it.
+    pub connection: u64,
+    /// The peer's ID, as hex.
+    pub peer: String,
+    /// The remote IP it was admitted from, if the transport knew it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
 }
 
 impl Observation {
@@ -2483,6 +2500,29 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+    /// The handler registered the boundary read of a component it owns,
+    /// its supervisor map, as it built it (M6a-7b). It's the node's, not a
+    /// connection's, so its row has no connection and the node's own
+    /// address.
+    ReadRegistered {
+        /// The component's key, such as `supervisor-map`.
+        key: String,
+        /// How many reads this tap has seen registered under `key`, from 1.
+        generation: u64,
+    },
+    /// The registry's escalated fanout returned for the connection
+    /// (M6a-7b). Each service it reached ran `add_peer` inside it.
+    RegistryFanout {
+        /// The capability mask the fanout's peer carried.
+        negotiated: u64,
+        /// The mask of the services that got streams.
+        admitted_mask: u64,
+    },
+    /// The registry's `remove_peer` returned for the connection (M6a-7b).
+    RegistryRemoved {
+        /// The services' capability mask.
+        admitted_mask: u64,
+    },
 }
 
 /// What a header-sync frame says, in [`TransportFact::OutputAttempt`] and

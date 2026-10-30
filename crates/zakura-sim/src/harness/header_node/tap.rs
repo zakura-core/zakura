@@ -307,9 +307,10 @@ pub(crate) struct ReactorLink {
 }
 
 /// `key`'s name, or an error for a key this build can't encode.
-pub(crate) fn read_key(key: &ReadKey) -> Result<&'static str, String> {
+pub(crate) fn read_key(key: &ReadKey) -> Result<String, String> {
     match key {
-        ReadKey::Budget => Ok("budget"),
+        ReadKey::Budget => Ok("budget".to_owned()),
+        ReadKey::SupervisorMap => Ok("supervisor-map".to_owned()),
         unknown => Err(format!(
             "UnknownEvent: the tap can't encode the read key {unknown:?}"
         )),
@@ -790,7 +791,7 @@ impl ReactorTap {
         for (seq, storage_seq, pos, event) in events {
             let mut event = match event {
                 ReactorEvent::ReadRegistered { key } => {
-                    let key = read_key(&key)?.to_owned();
+                    let key = read_key(&key)?;
                     let generation = self.generations.entry(key.clone()).or_default();
                     *generation += 1;
                     ReactorFact::ReadRegistered {

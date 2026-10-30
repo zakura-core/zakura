@@ -4,14 +4,16 @@
 //!
 //! The reactor reports its own state (M6a-3), folded from its settled
 //! snapshots. The budget's counters and the selected chain come from their
-//! boundary reads (M6a-7a, see [`super::reads`]). Each later component registers its read, gives
-//! [`Reading`] its state, and wires its existence evidence. Until then the
+//! boundary reads (M6a-7a), and the supervisor map from its own (M6a-7b,
+//! see [`super::reads`]). Each later component
+//! registers its read, gives [`Reading`] its state, and wires its
+//! existence evidence. Until then the
 //! others stay `Initializing`, so a property that needs one never ends
 //! `Held`.
 
 use std::collections::BTreeMap;
 
-use zakura_network::zakura::diag::BudgetCounters;
+use zakura_network::zakura::diag::{BudgetCounters, MapEntry};
 use zakura_storage::header::adapter::SelectedChain;
 
 use crate::{
@@ -30,13 +32,18 @@ pub enum Reading {
     Budget(BudgetCounters),
     /// The engine's committed snapshot's generation and frontiers.
     SelectedChain(SelectedChain),
+    /// The supervisor's registered connections, by `conn_id`.
+    SupervisorMap(Vec<MapEntry>),
 }
 
 impl Tagged for Reading {
     /// None: no component lists tagged objects yet.
     fn in_flux(&self) -> Option<TagPhase> {
         match self {
-            Reading::Reactor(_) | Reading::Budget(_) | Reading::SelectedChain(_) => None,
+            Reading::Reactor(_)
+            | Reading::Budget(_)
+            | Reading::SelectedChain(_)
+            | Reading::SupervisorMap(_) => None,
         }
     }
 }

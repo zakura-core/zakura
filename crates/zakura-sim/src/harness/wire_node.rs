@@ -33,6 +33,7 @@ use std::{
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
+        diag::{ComponentRead, ReadKey},
         FrameSummary, HeaderCheck, HeaderSyncService, OutputOutcome, Producer, Service,
         ServiceRegistry, Transition, TransportEvent, TransportObserver, Unwritten,
         ZakuraConnectionLimits, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
@@ -49,7 +50,7 @@ use zakura_scheduler::SimInstant;
 
 use super::{
     evidence_hub::{position, Out, Row},
-    header_node::HeaderNode,
+    header_node::{reads::ReadSink, tap::read_key, HeaderNode},
 };
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
@@ -197,6 +198,9 @@ pub struct TransportTap {
     remotes: BTreeMap<u64, SocketAddr>,
     /// Where its rows go.
     out: Out,
+    /// How many reads were registered under each key, for their
+    /// `ReadRegistered` facts.
+    generations: BTreeMap<String, u64>,
 }
 
 /// What the observer and the reader share.
@@ -209,6 +213,8 @@ struct TapState {
     /// Set when something reported an event outside `run`.
     refused: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// The boundary reads the handler registered, for the evidence hub.
+    reads: ReadSink,
 }
 
 /// Events reported and not yet drained.
@@ -288,6 +294,17 @@ impl TransportObserver for TapObserver {
     fn observe(&self, event: TransportEvent) {
         self.0.push(Reported::Event(event));
     }
+
+    /// Keeps `read` for the evidence hub. The handler reports its
+    /// `ReadRegistered` next. Only a std lock, never held across anything
+    /// else.
+    fn register_read(&self, key: ReadKey, read: ComponentRead) {
+        self.0
+            .reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((key, read));
+    }
 }
 
 impl TransportTap {
@@ -313,6 +330,7 @@ impl TransportTap {
                 observer: observer.clone(),
                 refused: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                reads: ReadSink::default(),
             }))
         });
         let state = observer.0.clone();
@@ -337,6 +355,7 @@ impl TransportTap {
             peers,
             remotes: BTreeMap::new(),
             out: Out::default(),
+            generations: BTreeMap::new(),
         };
         (observer, tap)
     }
@@ -345,6 +364,12 @@ impl TransportTap {
     pub(crate) fn writing_to(mut self, out: Out) -> Self {
         self.out = out;
         self
+    }
+
+    /// The boundary reads the handler registers, and the tap's instance,
+    /// whose rows report their registration, for the evidence hub.
+    pub(crate) fn reads(&self) -> (ReadSink, u64) {
+        (self.state.reads.clone(), self.id.index)
     }
 
     /// The reporter the wire node's dials fail into.
@@ -603,6 +628,39 @@ impl TransportTap {
                 Some(conn_id),
                 self.remote(conn_id)?,
                 TransportFact::TornDown,
+            ),
+            TransportEvent::ReadRegistered { key } => {
+                let key = read_key(&key)?;
+                let generation = self.generations.entry(key.clone()).or_default();
+                *generation += 1;
+                (
+                    None,
+                    NODE_ADDR,
+                    TransportFact::ReadRegistered {
+                        key,
+                        generation: *generation,
+                    },
+                )
+            }
+            TransportEvent::RegistryFanout {
+                conn_id,
+                negotiated,
+                admitted_mask,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::RegistryFanout {
+                    negotiated,
+                    admitted_mask,
+                },
+            ),
+            TransportEvent::RegistryRemoved {
+                conn_id,
+                admitted_mask,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::RegistryRemoved { admitted_mask },
             ),
             // The enum is non-exhaustive, and an event the log can't hold would
             // leave the evidence silently incomplete.

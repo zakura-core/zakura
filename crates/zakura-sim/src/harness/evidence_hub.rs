@@ -241,6 +241,22 @@ impl EvidenceHub {
         life
     }
 
+    /// Runs the boundary reads the node's transport tap keeps in `sink`,
+    /// whose rows, as tap `instance`, report their registration (M6a-7b).
+    ///
+    /// # Panics
+    ///
+    /// Before [`reactor`](Self::reactor) gave the hub its view.
+    pub(crate) fn transport_reads(
+        &mut self,
+        (sink, instance): (super::header_node::reads::ReadSink, u64),
+    ) {
+        self.reads
+            .as_mut()
+            .expect("the node's reactor gives the hub its view first")
+            .transport(sink, instance);
+    }
+
     /// Reads the node's selected chain from `port` at each boundary.
     ///
     /// # Panics

@@ -462,6 +462,8 @@ exit 7
 # `data`, the way a line number reaches code or only data. When it's
 # `embed`, the data section holds the source file itself, as
 # `use std::include_str as embed; static S: &str = embed!("lib.rs");` would.
+# When it's `debug`, only a debug section varies, sized by the source file,
+# and only when the build asks for debug info, as rustc's does by default.
 # Like cargo, it skips a crate whose source is older than its last build.
 FAKE_OBJECT_CARGO = """#!/usr/bin/env python3
 import json, os, struct, sys
@@ -480,8 +482,11 @@ if stamp.exists() and stamp.stat().st_mtime >= source.stat().st_mtime:
 stamp.write_text("")
 lines = struct.pack("<I", source.read_text().count("\\n"))
 mode = os.environ["FAKE_LINES_IN"]
-code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", source.read_bytes())}[mode]
-(deps / (crate + "-0.o")).write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
+code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", source.read_bytes()),
+              "debug": (b"same", b"same")}[mode]
+debug = [] if "debuginfo=0" in sys.argv else [("__DWARF", "__debug_line", b"d" * len(source.read_bytes()), 0)]
+sections = debug + [("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]
+(deps / (crate + "-0.o")).write_bytes(macho(sections))
 """ % inspect.getsource(macho)
 
 
@@ -542,6 +547,12 @@ class LineCheckTests(unittest.TestCase):
         status, output = self.run_gate("data")
         self.assertEqual(status, 0, output)
         self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
+
+    def test_debug_info_size_alone_passes(self):
+        """A change that only resizes debug info, which moves later sections' addresses, passes."""
+        status, output = self.run_gate("debug")
+        self.assertEqual(status, 0, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
 
     def test_unpadded_crates_rebuild_for_the_line_check(self):
         """A crate with no padded file still rebuilds for the committed tree, so its line check has objects."""

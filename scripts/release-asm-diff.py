@@ -7,8 +7,8 @@ each package's release library at each codegen-units setting, and builds the
 release `zakurad` with every workspace crate at each setting. It passes only
 when the two sides' objects and binaries match byte for byte:
 
-  * each library object's sections (debug info and embedded bitcode aside),
-    relocations and symbols, with relocations naming their symbols and
+  * each library object's sections, relocations and symbols, built
+    without debug info and with embedded bitcode skipped, with relocations naming their symbols and
     symbol names without LLVM's `.llvm.<hash>` promotion suffix, whose hash
     covers the source files' checksums in debug info;
   * the binary's sections in every segment but `__LINKEDIT`, its chained
@@ -624,7 +624,10 @@ def emit_lib(cargo, tree, target, inputs, package, crate, cgu, out_dir, asm):
 
     The release profile's thin LTO makes cargo build a library as bitcode for
     the final link, so this asks for machine code instead, as `--emit=asm`
-    does. The binary's own comparison covers what LTO does.
+    does. The binary's own comparison covers what LTO does. Debug info,
+    which the comparison skips, is turned off too: its size changes with
+    any source edit and would move every section after it in the object.
+    `zakurad` builds exactly as it ships.
     """
     deps = target / "release" / "deps"
     for suffix in (".o", ".s"):
@@ -634,7 +637,7 @@ def emit_lib(cargo, tree, target, inputs, package, crate, cgu, out_dir, asm):
     emit = "obj,asm,link" if asm else "obj,link"
     rw.run(
         [cargo, "rustc", "--release", "--locked", "-p", package, "--lib", "--",
-         "--emit=" + emit, "-C", "codegen-units=%d" % cgu, "-C", "linker-plugin-lto=no"],
+         "--emit=" + emit, "-C", "codegen-units=%d" % cgu, "-C", "linker-plugin-lto=no", "-C", "debuginfo=0"],
         cwd=tree, env=build_env(target, inputs),
     )
     found = collect(deps, crate + "-", (".o", ".s"), out_dir)

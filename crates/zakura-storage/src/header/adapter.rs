@@ -61,6 +61,17 @@ use crate::full_state::{
 mod full_state;
 pub use full_state::{Applied, Installed};
 
+/// The selected chain as [`EnginePort::peek_snapshot`] reads it: the
+/// committed snapshot's header generation and frontiers.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedChain {
+    /// The selected-header work generation.
+    pub header_generation: HeaderGeneration,
+    /// The finalized, selected-header and verified frontiers.
+    pub frontiers: FrontierSet,
+}
+
 use super::{
     evidence::{LeaseFact, LeaseKey, ResultIdentity, SignalClass},
     fixture::{HeaderFixture, ScenarioClock},
@@ -201,6 +212,43 @@ impl EnginePort {
     /// The latest committed snapshot.
     pub fn snapshot(&self) -> EngineSnapshot {
         self.engine().snapshot()
+    }
+
+    /// The committed snapshot's header generation and frontiers, read with
+    /// no scheduling point and without waiting for the engine's lock, for
+    /// the simulator's boundary read of the selected chain (M6a-7a).
+    /// `None` while a task holds the lock, since the engine may be mid-change
+    /// then. A poisoned lock reads as current, as [`Self::engine`] reads it.
+    #[cfg(any(test, zakura_sim))]
+    pub fn peek_snapshot(&self) -> Option<SelectedChain> {
+        // The metadata's fields, which `snapshot()` copies, without that
+        // copy's alarm set, since this runs at every step boundary.
+        let selected = |engine: &HeaderChainEngine| {
+            let metadata = engine.metadata();
+            SelectedChain {
+                header_generation: metadata.header_generation,
+                frontiers: metadata.frontiers,
+            }
+        };
+        #[cfg(zakura_sim)]
+        {
+            use zakura_rt::sim::Peek;
+
+            match self.engine.peek(selected) {
+                Peek::Current(chain) | Peek::Poisoned(chain) => Some(chain),
+                Peek::Held { .. } => None,
+            }
+        }
+        #[cfg(not(zakura_sim))]
+        {
+            use std::sync::TryLockError;
+
+            match self.engine.try_lock() {
+                Ok(engine) => Some(selected(&engine)),
+                Err(TryLockError::Poisoned(poisoned)) => Some(selected(&poisoned.into_inner())),
+                Err(TryLockError::WouldBlock) => None,
+            }
+        }
     }
 
     /// Locks the engine. A panic while it was held can't leave it half
@@ -1372,4 +1420,40 @@ struct Lease {
     id: u64,
     peer: SourceId,
     session_id: u64,
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use std::sync::{mpsc, Arc};
+
+    use super::*;
+
+    /// `peek_snapshot` reads the committed snapshot's generation and
+    /// frontiers, and reads `None` without blocking while another thread
+    /// holds the engine's lock.
+    #[test]
+    fn peek_snapshot_reads_the_engine_without_waiting() {
+        let port = Arc::new(EnginePort::new(&HeaderFixture::regtest()));
+        let snapshot = port.snapshot();
+        let expected = SelectedChain {
+            header_generation: snapshot.header_generation,
+            frontiers: snapshot.frontiers,
+        };
+        assert_eq!(port.peek_snapshot(), Some(expected));
+        let (held, release) = (mpsc::channel(), mpsc::channel::<()>());
+        let holder = {
+            let port = port.clone();
+            std::thread::spawn(move || {
+                let engine = port.engine();
+                held.0.send(()).expect("the test waits");
+                release.1.recv().expect("the test releases");
+                drop(engine);
+            })
+        };
+        held.1.recv().expect("the holder locks");
+        assert_eq!(port.peek_snapshot(), None, "a held engine isn't read");
+        release.0.send(()).expect("the holder waits");
+        holder.join().expect("the holder ends");
+        assert_eq!(port.peek_snapshot(), Some(expected));
+    }
 }

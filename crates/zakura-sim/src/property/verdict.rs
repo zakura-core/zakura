@@ -132,6 +132,10 @@ pub enum Inconclusive {
     /// ([`require_every`](super::require_every)). Sticky: a later current
     /// boundary doesn't clear it. An open obligation at run end outranks it.
     Unobserved,
+    /// The step budget cut the run while the property's check would have
+    /// ended `Unsettled` or `Unobserved`, so the run didn't finish showing
+    /// whether it holds.
+    BudgetCut,
 }
 
 impl Inconclusive {
@@ -139,6 +143,12 @@ impl Inconclusive {
     /// evaluations find.
     pub(crate) fn is_sticky(self) -> bool {
         self == Inconclusive::Unobserved
+    }
+
+    /// True for a reason about a component's state, which a budget cut
+    /// replaces with [`Inconclusive::BudgetCut`].
+    pub(crate) fn is_state(self) -> bool {
+        matches!(self, Inconclusive::Unsettled | Inconclusive::Unobserved)
     }
 }
 
@@ -153,6 +163,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::TeardownOpen => "teardown-open",
             Inconclusive::Unsettled => "state-unsettled",
             Inconclusive::Unobserved => "state-unobserved",
+            Inconclusive::BudgetCut => "budget-cut",
         })
     }
 }

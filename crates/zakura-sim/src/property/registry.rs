@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     check::{Checker, Gap, PropertyOutcome, PropertyReport, StepCtx, Violation},
-    end::{HarnessFailure, RunEnd},
+    end::{HarnessFailure, Outcome, RunEnd},
     model::LabelledFrame,
     Observation, ObservationLog,
 };
@@ -459,7 +459,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             .zip(&self.state)
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
-                outcome: outcome(property, state),
+                outcome: outcome(property, state, end.outcome == Outcome::Budget),
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
@@ -740,7 +740,13 @@ fn expiry<S: HasView>(
 
 /// A property's run outcome, from strongest to weakest: violated,
 /// inconclusive, held, then not applicable.
-fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> PropertyOutcome {
+/// A run its budget cut is unfinished, which the state reasons never mean,
+/// so `budget_cut` turns them into `budget-cut`.
+fn outcome<S: HasView>(
+    property: &Property<S>,
+    state: &PropertyState,
+    budget_cut: bool,
+) -> PropertyOutcome {
     if let Some(violation) = state.violations.first() {
         return PropertyOutcome::Violated {
             witness: violation.witness.clone(),
@@ -757,8 +763,13 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
             // A run that ends with an obligation open is unfinished, which
             // the state reasons never mean, so they come after it.
-            .or(state.sticky)
-            .or(state.unsettled)
+            .or(state.sticky.or(state.unsettled).map(|reason| {
+                if budget_cut && reason.is_state() {
+                    Inconclusive::BudgetCut
+                } else {
+                    reason
+                }
+            }))
     };
     match reason {
         Some(reason) => PropertyOutcome::Inconclusive {

@@ -589,9 +589,11 @@ mod tests {
 
     /// An unfinished run never ends `state-unsettled` or `state-unobserved`.
     /// A run cut by its budget before the component exists leaves its
-    /// property `NotApplicable`. A run that ends with an obligation open
-    /// is `obligation-open`, even after a boundary the property couldn't
-    /// read.
+    /// property `NotApplicable`. One cut while the component is in
+    /// transition, or after a restored transition an every-boundary claim
+    /// missed, is `budget-cut`, with its gap listed. A run that ends with an
+    /// obligation open is `obligation-open`, even after a boundary the
+    /// property couldn't read.
     #[test]
     fn an_unfinished_run_is_never_state_unsettled() {
         let (cut, view) = run_assuming(
@@ -611,6 +613,52 @@ mod tests {
             report(&cut, "test/require").outcome,
             PropertyOutcome::NotApplicable
         );
+
+        // Cut in transition, and cut after a restored transition.
+        let gap = [Gap {
+            component: "Budget".to_owned(),
+            from: 2,
+            through: 2,
+        }];
+        let held_last = reads(current(0..=1, 1).into_iter().chain(held([2])));
+        let (cut, view) = run_assuming(
+            held_last,
+            5,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            2,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert!(matches!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::InTransition { since: 2, .. })
+        ));
+        let report_ = report(&cut, "test/require");
+        assert_eq!(report_.gaps, gap);
+        assert_eq!(report_.outcome, inconclusive("budget-cut"));
+        let restored = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (cut, view) = run_assuming(
+            restored,
+            5,
+            vec![requiring_every()],
+            &wire(),
+            Assumptions::none(),
+            3,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::Current { state: &1 })
+        );
+        let report_ = report(&cut, "test/require-every");
+        assert_eq!(report_.gaps, gap);
+        assert_eq!(report_.outcome, inconclusive("budget-cut"));
 
         let mut obliged = needing("test/obliged", check_obliged);
         obliged.kind = Kind::Liveness {

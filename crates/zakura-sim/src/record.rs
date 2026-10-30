@@ -40,8 +40,8 @@ use crate::{
 /// `pos` and `sub`, with a derived row's `origin`, in each step's `obs`
 /// digest. Version 21 added scripted peers' `peer-emitted` records and
 /// their `peer-conn-ended` and `peer-stream-ended` rows. Version 22 added
-/// the `state-unsettled` and `state-unobserved` inconclusive outcomes and
-/// each property's component `gaps`.
+/// the `state-unsettled`, `state-unobserved` and `budget-cut` inconclusive
+/// outcomes and each property's component `gaps`.
 pub const FORMAT_VERSION: u32 = 22;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
@@ -402,8 +402,17 @@ mod tests {
         let bump = "a property report's encoding changed, so bump FORMAT_VERSION and update \
             this test";
         assert_eq!(FORMAT_VERSION, 22, "{bump}");
-        let reasons = [Inconclusive::Unsettled, Inconclusive::Unobserved].map(|r| r.to_string());
-        assert_eq!(reasons, ["state-unsettled", "state-unobserved"], "{bump}");
+        let reasons = [
+            Inconclusive::Unsettled,
+            Inconclusive::Unobserved,
+            Inconclusive::BudgetCut,
+        ]
+        .map(|r| r.to_string());
+        assert_eq!(
+            reasons,
+            ["state-unsettled", "state-unobserved", "budget-cut"],
+            "{bump}"
+        );
         let report = PropertyReport {
             gaps: vec![Gap {
                 component: "Budget".into(),

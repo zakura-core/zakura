@@ -7,6 +7,7 @@ mod identities;
 mod observer;
 mod peer_faults;
 mod port_panics;
+mod sessions;
 mod staging;
 mod status_offers;
 mod terminal_trace;

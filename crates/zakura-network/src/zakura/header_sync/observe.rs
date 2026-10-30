@@ -232,6 +232,40 @@ pub enum ReactorEvent {
         /// `peer`'s current session when the violation was dispatched.
         current: Option<u64>,
     },
+    /// The work queue reserved header capacity for `peer`'s work (M6a-4).
+    /// Reported by the queue itself, so no reservation goes unplaced. When
+    /// the peer's work is already active, a [`Bound`](Self::Bound) to its
+    /// incarnation follows at once. Otherwise `Bound` comes when its
+    /// request starts, or never, if the open fails.
+    Placed {
+        /// The reservation's ID.
+        reservation: ResourceId,
+        /// The peer whose work it's for.
+        peer: ZakuraPeerId,
+        /// The headers it reserves.
+        count: usize,
+        /// The work the queue held for `peer` then, if any.
+        placement: Option<Placement>,
+    },
+    /// A placed reservation now belongs to a work incarnation, which spends
+    /// it on its pages (M6a-4).
+    Bound {
+        /// The reservation's ID.
+        reservation: ResourceId,
+        /// The incarnation it belongs to.
+        incarnation: IncarnationId,
+    },
+    /// A prepare or apply call captured clones of its peer's staged
+    /// capacity leases, which its future holds until its completion or
+    /// drop (M6a-4). Reported right after the call's `Dispatched`.
+    LeasesCaptured {
+        /// The call.
+        call: CallId,
+        /// The incarnation the peer's active work had at dispatch.
+        incarnation: Option<IncarnationId>,
+        /// The leases' IDs, in the queue's order.
+        leases: Vec<ResourceId>,
+    },
 }
 
 impl ReactorEvent {
@@ -302,7 +336,51 @@ pub struct ReactorSnapshot {
     pub unhandled_calls: Vec<u64>,
     /// Each peer's queued work.
     pub work: Vec<WorkEntry>,
+    /// The reservation and leases the queue holds for each peer, read from
+    /// its own maps, apart from the peer's work (M6a-4).
+    pub holdings: Vec<HoldingEntry>,
 }
+
+/// The header capacity the work queue holds for one peer (M6a-4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoldingEntry {
+    /// The peer.
+    pub peer: ZakuraPeerId,
+    /// Its reservation for pages still to come, if any.
+    pub reservation: Option<ResourceId>,
+    /// The leases of its staged pages, in staging order.
+    pub leases: Vec<LeaseEntry>,
+}
+
+/// One staged page's capacity lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseEntry {
+    /// The lease's ID.
+    pub lease: ResourceId,
+    /// The headers it owns.
+    pub count: usize,
+}
+
+/// The work the queue held for a peer when it placed a reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Placement {
+    /// The session that offered the work.
+    pub session_id: u64,
+    /// The header authority the work runs under.
+    pub scope: HeaderWorkAuthority,
+    /// The advertised target it pursues.
+    pub target_tip_hash: block::Hash,
+}
+
+/// A work incarnation's number, from 1 per work queue (M6a-4). `PeerWorkQueue::start`
+/// hands one out each time a request starts, so it names one round of work
+/// apart from its subscription and request IDs, which a resumed
+/// subscription reuses.
+pub type IncarnationId = u64;
+
+/// A reservation's or a lease's number, from 1 per chunk budget, taken
+/// under the budget's lock (M6a-4).
+pub type ResourceId = u64;
 
 /// The committed snapshot fields the reactor schedules from.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -349,9 +427,12 @@ pub enum WorkPhase {
     },
     /// An active request.
     Active {
+        /// The request's work incarnation.
+        incarnation: IncarnationId,
         /// The request's correlation ID.
         request_id: u64,
-        /// The request's work owner, with its authority.
+        /// The request's work owner, with its current authority, which a
+        /// bounded prefix rebinds.
         owner: HeaderSyncWorkOwner,
         /// Why it was started.
         purpose: HeaderTargetPurpose,
@@ -489,6 +570,8 @@ pub struct RequestRef {
     pub session_id: u64,
     /// The request's correlation ID.
     pub request_id: u64,
+    /// The request's work incarnation.
+    pub incarnation: IncarnationId,
     /// The request's work owner.
     pub owner: HeaderSyncWorkOwner,
     /// The advertised target the request pursues.
@@ -501,6 +584,7 @@ impl RequestRef {
         Self {
             peer: active.peer.clone(),
             session_id: active.owner.session_id(),
+            incarnation: active.incarnation,
             request_id: active.request_id.get(),
             owner: active.owner,
             target_tip_hash: active.target.status.selected_tip_hash,
@@ -557,9 +641,8 @@ impl PortTap {
 /// A port call's number, from 1, as [`ReactorEvent::Dispatched`] hands it
 /// out. In a simulator build, storage tags each operation a call's poll
 /// submits with it (see [`as_call`]), so each storage receipt pairs with exactly the call that
-/// submitted it. M6a-4 is expected to build its work identities on it,
-/// joining a call to its work incarnation and the reservation and lease IDs
-/// its dispatch captures.
+/// submitted it. [`ReactorEvent::LeasesCaptured`] joins a prepare or apply
+/// call to its work incarnation and the lease IDs its dispatch captures.
 pub type CallId = u64;
 
 /// Runs `poll` as call `call`'s poll, so in a simulator build

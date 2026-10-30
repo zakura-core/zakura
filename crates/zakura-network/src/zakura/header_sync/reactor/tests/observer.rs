@@ -34,10 +34,31 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call.
+    /// The events recorded since the last call, without the work identity
+    /// events (see [`is_identity`]), which the tests that need them read
+    /// through [`take_all`](Self::take_all).
     fn take(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| !is_identity(event))
+            .collect()
+    }
+
+    /// Every event recorded since the last call.
+    fn take_all(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
+}
+
+/// Whether `event` reports a work identity: a reservation's placement or
+/// binding, or a call's captured leases (M6a-4).
+fn is_identity(event: &ReactorEvent) -> bool {
+    matches!(
+        event,
+        ReactorEvent::Placed { .. }
+            | ReactorEvent::Bound { .. }
+            | ReactorEvent::LeasesCaptured { .. }
+    )
 }
 
 /// Where a [`ScriptedPort`] call panics.
@@ -241,6 +262,7 @@ fn request_ref(active: &ActiveHeaderRequest) -> RequestRef {
         peer: active.peer.clone(),
         session_id: active.owner.session_id(),
         request_id: active.request_id.get(),
+        incarnation: active.incarnation,
         owner: active.owner,
         target_tip_hash: active.target.status.selected_tip_hash,
     }
@@ -412,6 +434,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
                     peer: peer.clone(),
                     session_id: 7,
                     request_id: 9,
+                    incarnation: seeded.incarnation,
                     owner: seeded.owner,
                     target_tip_hash: seeded.target.status.selected_tip_hash,
                 },
@@ -570,16 +593,17 @@ async fn the_slot_counts_events_the_observer_drops() {
     );
     let slot = ObserverSlot::new(observer.clone());
     reactor.startup.observer = slot.clone();
+    reactor.peer_work_queue.observe_with(slot.clone());
     let peer = peer();
     let _outbound = connect(&mut reactor, &peer, 7);
     seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     let before = slot.emitted();
-    observer.recorder.take();
+    observer.recorder.take_all();
 
     assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
     complete_next(&mut reactor).await;
 
-    let recorded = observer.recorder.take();
+    let recorded = observer.recorder.take_all();
     assert!(
         matches!(
             recorded.first(),
@@ -1183,6 +1207,10 @@ async fn scripted_history(recorder: Option<Arc<Recorder>>) -> Transcript {
     while let Ok(frame) = outbound.try_recv() {
         frames.push(frame);
     }
+    // The queue's state, apart from its observer.
+    reactor
+        .peer_work_queue
+        .observe_with(ObserverSlot::default());
     let queue = format!("{:?}", reactor.peer_work_queue);
     drop(reactor);
     capture.flush().await;
@@ -1211,7 +1239,7 @@ async fn observer_does_not_change_behaviour() {
         observed.port_calls,
         ["continuation_locator", "prepare_header_target"]
     );
-    let events = recorder.take();
+    let events = recorder.take_all();
     assert!(
         matches!(
             events.as_slice(),
@@ -1229,6 +1257,8 @@ async fn observer_does_not_change_behaviour() {
                     call: 1,
                     end: CallEnd::Replied
                 },
+                ReactorEvent::Placed { .. },
+                ReactorEvent::Bound { .. },
                 ReactorEvent::Started { .. },
                 ReactorEvent::Handled {
                     call: 1,
@@ -1238,6 +1268,7 @@ async fn observer_does_not_change_behaviour() {
                     call: 2,
                     op: PortCall::Prepare { .. }
                 },
+                ReactorEvent::LeasesCaptured { call: 2, .. },
                 ReactorEvent::CallEnded {
                     call: 2,
                     end: CallEnd::Replied
@@ -1560,6 +1591,7 @@ fn the_snapshot_lists_awaiting_and_active_work() {
                 session_id: 7,
                 target_tip_hash: seeded.target.status.selected_tip_hash,
                 phase: observe::WorkPhase::Active {
+                    incarnation: seeded.incarnation,
                     request_id: 9,
                     owner,
                     purpose: HeaderTargetPurpose::Normal,
@@ -1896,7 +1928,7 @@ async fn resume_markers_lead_each_turn() {
     idle().await;
     shutdown.cancel();
     running.await.expect("the reactor stops");
-    let mut arms = assert_turns(&recorder.take());
+    let mut arms = assert_turns(&recorder.take_all());
 
     // A fatal storage operation parks the loop on shutdown alone.
     let shutdown = CancellationToken::new();
@@ -1917,11 +1949,14 @@ async fn resume_markers_lead_each_turn() {
         deadline: now,
         fatal_sent: true,
     });
+    // The seed's placement and binding ran outside any turn.
+    recorder.take_all();
+    reactor.settled(false);
     let running = tokio::spawn(reactor.run());
     idle().await;
     shutdown.cancel();
     running.await.expect("the reactor stops");
-    arms.extend(assert_turns(&recorder.take()));
+    arms.extend(assert_turns(&recorder.take_all()));
 
     for arm in [
         Arm::Start,

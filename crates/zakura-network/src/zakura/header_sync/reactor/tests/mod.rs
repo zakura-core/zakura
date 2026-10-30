@@ -3,6 +3,7 @@ mod aux_fallback;
 mod closing;
 mod completion;
 mod eviction;
+mod identities;
 mod observer;
 mod peer_faults;
 mod port_panics;
@@ -301,6 +302,7 @@ fn seed_applying_request(
         cursor: None,
         max_header_count: 1,
         tree_aux_schema: AuxSchema::None,
+        incarnation: 0,
     }));
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
     (source, owner, owner.header_authority().branch)

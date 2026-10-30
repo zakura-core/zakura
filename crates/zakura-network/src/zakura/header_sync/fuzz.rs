@@ -1045,6 +1045,8 @@ fn request(
         cursor: None,
         max_header_count: 1_000,
         tree_aux_schema: AuxSchema::None,
+        #[cfg(any(test, zakura_sim))]
+        incarnation: 0,
     }
 }
 

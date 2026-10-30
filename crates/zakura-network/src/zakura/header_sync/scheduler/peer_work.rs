@@ -36,6 +36,10 @@ struct HeaderChunkBudgetInner {
     capacity: usize,
     usage: Mutex<HeaderChunkUsage>,
     released: watch::Sender<u64>,
+    /// The last reservation or lease ID handed out (M6a-4). A plain std
+    /// atomic, so taking an ID adds no scheduling point.
+    #[cfg(any(test, zakura_sim))]
+    last_resource: zakura_rt::sync::counter::AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -47,11 +51,26 @@ impl Default for HeaderChunkBudget {
             capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
             usage: Mutex::new(HeaderChunkUsage::default()),
             released: watch::channel(0).0,
+            #[cfg(any(test, zakura_sim))]
+            last_resource: Default::default(),
         }))
     }
 }
 
 impl HeaderChunkBudget {
+    /// The budget's next reservation or lease ID, from 1. It takes the
+    /// locked usage, so only a holder of the budget's lock can call it, and
+    /// IDs follow the order of the changes they belong to.
+    #[cfg(any(test, zakura_sim))]
+    fn next_resource(
+        &self,
+        _locked: &mut HeaderChunkUsage,
+    ) -> crate::zakura::header_sync::observe::ResourceId {
+        use zakura_rt::sync::counter::Ordering;
+
+        self.0.last_resource.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     fn usage(&self) -> HeaderChunkUsage {
         *self.0.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -83,11 +102,15 @@ impl HeaderChunkBudget {
         }
         usage.reserved = usage.reserved.checked_add(count)?;
         self.publish(*usage);
+        #[cfg(any(test, zakura_sim))]
+        let id = self.next_resource(&mut usage);
         drop(usage);
         Some(HeaderCountReservation(Arc::new(
             HeaderCountReservationInner {
                 budget: self.clone(),
                 remaining: AtomicUsize::new(count),
+                #[cfg(any(test, zakura_sim))]
+                id,
             },
         )))
     }
@@ -104,11 +127,19 @@ impl HeaderChunkBudget {
         usage.reserved -= reserved;
         usage.owned = new_owned;
         self.publish(*usage);
+        #[cfg(any(test, zakura_sim))]
+        let id = if owned != 0 {
+            self.next_resource(&mut usage)
+        } else {
+            0
+        };
         drop(usage);
         Ok((owned != 0).then(|| {
             HeaderCapacityLease(Arc::new(HeaderCapacityLeaseInner {
                 budget: self.clone(),
                 count: owned,
+                #[cfg(any(test, zakura_sim))]
+                id,
             }))
         }))
     }
@@ -154,6 +185,9 @@ struct HeaderCountReservation(Arc<HeaderCountReservationInner>);
 struct HeaderCountReservationInner {
     budget: HeaderChunkBudget,
     remaining: AtomicUsize,
+    /// Its ID, taken under the budget's lock (M6a-4).
+    #[cfg(any(test, zakura_sim))]
+    id: crate::zakura::header_sync::observe::ResourceId,
 }
 
 impl HeaderCountReservation {
@@ -199,6 +233,19 @@ pub(in crate::zakura::header_sync) struct HeaderCapacityLease(Arc<HeaderCapacity
 struct HeaderCapacityLeaseInner {
     budget: HeaderChunkBudget,
     count: usize,
+    /// Its ID, taken under the budget's lock (M6a-4).
+    #[cfg(any(test, zakura_sim))]
+    id: crate::zakura::header_sync::observe::ResourceId,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl HeaderCapacityLease {
+    /// The lease's ID. Every clone shares it.
+    pub(in crate::zakura::header_sync) fn id(
+        &self,
+    ) -> crate::zakura::header_sync::observe::ResourceId {
+        self.0.id
+    }
 }
 
 impl PartialEq for HeaderCapacityLease {
@@ -290,6 +337,10 @@ pub struct ActiveHeaderRequest {
     pub max_header_count: u32,
     /// Requested auxiliary schema preserved across continuation requests.
     pub tree_aux_schema: AuxSchema,
+    /// The work incarnation [`PeerWorkQueue::start`] assigned it, from 1,
+    /// or 0 before it started (M6a-4).
+    #[cfg(any(test, zakura_sim))]
+    pub incarnation: crate::zakura::header_sync::observe::IncarnationId,
 }
 
 /// Policy that distinguishes ordinary branch pursuit from exact auxiliary repair.
@@ -418,6 +469,12 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
+    /// Receives the queue's placements and bindings (M6a-4).
+    #[cfg(any(test, zakura_sim))]
+    observer: crate::zakura::header_sync::observe::ObserverSlot,
+    /// The last work incarnation handed out.
+    #[cfg(any(test, zakura_sim))]
+    last_incarnation: crate::zakura::header_sync::observe::IncarnationId,
 }
 
 impl PeerWorkQueue {
@@ -668,6 +725,8 @@ impl PeerWorkQueue {
         ) == Some(&request.target);
         if matches && self.request_reservations.contains_key(&peer) {
             self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+            #[cfg(any(test, zakura_sim))]
+            let request = self.incarnate(request);
             self.work_by_peer
                 .insert(peer, PeerWorkState::Active(Box::new(request)));
             true
@@ -840,6 +899,8 @@ impl PeerWorkQueue {
             return false;
         };
         self.request_reservations.insert(peer.clone(), reservation);
+        #[cfg(any(test, zakura_sim))]
+        self.placed(peer, count);
         true
     }
 
@@ -857,6 +918,8 @@ impl PeerWorkQueue {
             return false;
         };
         self.request_reservations.insert(peer.clone(), reservation);
+        #[cfg(any(test, zakura_sim))]
+        self.placed(peer, count);
         true
     }
 
@@ -961,6 +1024,7 @@ impl PeerWorkQueue {
                     session_id: request.owner.session_id(),
                     target_tip_hash: request.target.status.selected_tip_hash,
                     phase: WorkPhase::Active {
+                        incarnation: request.incarnation,
                         request_id: request.request_id.get(),
                         owner: request.owner,
                         purpose: request.purpose.clone(),
@@ -973,6 +1037,122 @@ impl PeerWorkQueue {
             .collect();
         work.sort_by(|a, b| a.peer.as_bytes().cmp(b.peer.as_bytes()));
         work
+    }
+
+    /// The reservation and leases the queue holds for each peer, in peer
+    /// order, as the reactor's settled snapshot lists them (M6a-4). It reads
+    /// the queue's own maps, so a holding no work explains still shows. It
+    /// reads no reservation's rest, which lives in a simulator atomic.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn holdings_snapshot(
+        &self,
+    ) -> Vec<crate::zakura::header_sync::observe::HoldingEntry> {
+        use crate::zakura::header_sync::observe::{HoldingEntry, LeaseEntry};
+
+        let mut peers: Vec<&ZakuraPeerId> = self
+            .request_reservations
+            .keys()
+            .chain(self.staged_capacity.keys())
+            .collect();
+        peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        peers.dedup();
+        peers
+            .into_iter()
+            .map(|peer| HoldingEntry {
+                peer: peer.clone(),
+                reservation: self
+                    .request_reservations
+                    .get(peer)
+                    .map(|reservation| reservation.0.id),
+                leases: self
+                    .staged_capacity
+                    .get(peer)
+                    .into_iter()
+                    .flatten()
+                    .map(|lease| LeaseEntry {
+                        lease: lease.0.id,
+                        count: lease.0.count,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// This queue, reporting its placements and bindings to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn observe_with(
+        &mut self,
+        observer: crate::zakura::header_sync::observe::ObserverSlot,
+    ) {
+        self.observer = observer;
+    }
+
+    /// Reports the reservation just placed for `peer`, with the work the
+    /// queue holds for it, and binds it at once to that work's incarnation
+    /// if it's active, since an active request's pages spend its peer's
+    /// reservation.
+    #[cfg(any(test, zakura_sim))]
+    fn placed(&self, peer: &ZakuraPeerId, count: usize) {
+        use crate::zakura::header_sync::observe::{Placement, ReactorEvent};
+
+        let reservation = self
+            .request_reservations
+            .get(peer)
+            .expect("the reservation was just inserted")
+            .0
+            .id;
+        let (placement, incarnation) = match self.work_by_peer.get(peer) {
+            Some(PeerWorkState::AwaitingLocator { target, .. }) => (
+                Some(Placement {
+                    session_id: target.session_id,
+                    scope: target.scope,
+                    target_tip_hash: target.status.selected_tip_hash,
+                }),
+                None,
+            ),
+            Some(PeerWorkState::Active(request)) => (
+                Some(Placement {
+                    session_id: request.owner.session_id(),
+                    scope: request.owner.header_authority(),
+                    target_tip_hash: request.target.status.selected_tip_hash,
+                }),
+                Some(request.incarnation),
+            ),
+            None => (None, None),
+        };
+        self.observer.emit(ReactorEvent::Placed {
+            reservation,
+            peer: peer.clone(),
+            count,
+            placement,
+        });
+        if let Some(incarnation) = incarnation {
+            self.observer.emit(ReactorEvent::Bound {
+                reservation,
+                incarnation,
+            });
+        }
+    }
+
+    /// `request` as the queue's next work incarnation, with its peer's
+    /// reservation bound to it.
+    #[cfg(any(test, zakura_sim))]
+    fn incarnate(&mut self, mut request: ActiveHeaderRequest) -> ActiveHeaderRequest {
+        use crate::zakura::header_sync::observe::ReactorEvent;
+
+        self.last_incarnation += 1;
+        request.incarnation = self.last_incarnation;
+        let reservation = self
+            .request_reservations
+            .get(&request.peer)
+            .expect("a request starts only with its peer's reservation")
+            .0
+            .id;
+        self.observer.emit(ReactorEvent::Bound {
+            reservation,
+            incarnation: request.incarnation,
+        });
+        request
     }
 
     #[cfg(any(test, feature = "header-fuzz"))]
@@ -1118,6 +1298,7 @@ mod tests {
             cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
+            incarnation: 0,
         }
     }
 
@@ -1250,9 +1431,15 @@ mod tests {
             cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
+            incarnation: 0,
         };
         assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(request.clone()));
+        // `start` gives it the queue's first incarnation.
+        let request = ActiveHeaderRequest {
+            incarnation: 1,
+            ..request
+        };
         assert_eq!(queue.active(&peer(1)), Some(&request));
         assert_eq!(
             queue.stage(

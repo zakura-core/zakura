@@ -372,6 +372,11 @@ fn build_header_sync_reactor(
         #[cfg(any(test, zakura_sim))]
         unhandled_calls: std::collections::BTreeSet::new(),
     };
+    // Before anything can reserve, a startup repair included.
+    #[cfg(any(test, zakura_sim))]
+    reactor
+        .peer_work_queue
+        .observe_with(reactor.startup.observer.clone());
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
     }
@@ -1163,6 +1168,7 @@ impl HeaderSyncReactor {
             pending_locators,
             unhandled_calls: self.unhandled_calls.iter().copied().collect(),
             work: self.peer_work_queue.owner_snapshot(),
+            holdings: self.peer_work_queue.holdings_snapshot(),
         }
     }
 
@@ -3168,6 +3174,9 @@ impl HeaderSyncReactor {
                     cursor: None,
                     max_header_count: negotiated_header_count,
                     tree_aux_schema,
+                    // `start` assigns it.
+                    #[cfg(any(test, zakura_sim))]
+                    incarnation: 0,
                 });
                 debug_assert!(
                     started,
@@ -3776,6 +3785,9 @@ impl HeaderSyncReactor {
                         cursor: None,
                         max_header_count: request_count,
                         tree_aux_schema: AuxSchema::V1,
+                        // `start_repair` assigns it.
+                        #[cfg(any(test, zakura_sim))]
+                        incarnation: 0,
                     },
                     selected_context.episode,
                 )
@@ -4461,6 +4473,8 @@ impl HeaderSyncReactor {
         };
         let panic_context = self.port_panic_context(&action);
         #[cfg(any(test, zakura_sim))]
+        let captured = self.captured_leases(&action, &capacity);
+        #[cfg(any(test, zakura_sim))]
         let (tap, dispatched) = self.begin_port_call(&action);
         #[cfg(any(test, zakura_sim))]
         let (call, panic_tap, pending_tap) = (tap.call, tap.clone(), tap.clone());
@@ -4737,9 +4751,47 @@ impl HeaderSyncReactor {
             observe!(self, ReactorEvent::Dispatched { call, op });
         }
         #[cfg(any(test, zakura_sim))]
+        if let Some((incarnation, leases)) = captured {
+            observe!(
+                self,
+                ReactorEvent::LeasesCaptured {
+                    call,
+                    incarnation,
+                    leases,
+                }
+            );
+        }
+        #[cfg(any(test, zakura_sim))]
         let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         true
+    }
+
+    /// The incarnation of the peer whose staged leases `action` captured as
+    /// `capacity`, with their IDs, for a prepare or an apply, when an
+    /// observer is installed. See [`ReactorEvent::LeasesCaptured`].
+    #[cfg(any(test, zakura_sim))]
+    fn captured_leases(
+        &self,
+        action: &HeaderPortOperation,
+        capacity: &[super::scheduler::peer_work::HeaderCapacityLease],
+    ) -> Option<(Option<observe::IncarnationId>, Vec<observe::ResourceId>)> {
+        let (HeaderPortOperation::PrepareHeaderTarget { peer, .. }
+        | HeaderPortOperation::ApplyHeaderTarget { peer, .. }) = action
+        else {
+            return None;
+        };
+        self.startup.observer.is_installed().then(|| {
+            (
+                self.peer_work_queue
+                    .active(peer)
+                    .map(|active| active.incarnation),
+                capacity
+                    .iter()
+                    .map(super::scheduler::peer_work::HeaderCapacityLease::id)
+                    .collect(),
+            )
+        })
     }
 
     /// Numbers `action` as the next port call. Returns the tap its future

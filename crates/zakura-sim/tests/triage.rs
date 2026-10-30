@@ -19,16 +19,16 @@ use zakura_sim::{
     explore::{
         classify,
         triage::{
-            bundles, primary_bucket, signature, signature_hash, triage, verify_bundle, Children,
-            TriageOptions, TriageStatus, Triaged, BUNDLE_INPUT_FILE, CHECKSUMS_FILE, RUNS_DIR,
-            RUN_TRACE_DIR, SCENARIO_FILE, STAGING_DIR, TRIAGE_FILE,
+            bundles, primary_bucket, provenance_hash, signature, signature_hash, triage,
+            verify_bundle, Children, TriageOptions, TriageStatus, Triaged, BUNDLE_INPUT_FILE,
+            CHECKSUMS_FILE, RUNS_DIR, RUN_TRACE_DIR, SCENARIO_FILE, STAGING_DIR, TRIAGE_FILE,
         },
         Bucket, Classified, ExploreOutcome, ProcessClassified, ProcessExit, ProcessFailure,
         ProcessResult,
     },
     harness::{entry, record, HarnessEntry, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
-    trace::{replay_with, ReplayOptions, TraceReader},
+    trace::{meta::BuildInfo, replay_with, ReplayOptions, TraceReader},
     HarnessFailure, NullSink, RunConfig, Sim,
 };
 
@@ -220,6 +220,12 @@ impl Subsystem for Triage {
 
 static TRIAGE: HarnessEntry = entry::<Triage>();
 
+/// [`TRIAGE`] with the next generator.
+static NEXT_GENERATOR: HarnessEntry = HarnessEntry {
+    generator: Triage::GENERATOR + 1,
+    ..entry::<Triage>()
+};
+
 /// The variable that makes [`triage_child`] record or replay.
 const CHILD: &str = "ZAKURA_SIM_TRIAGE_CHILD";
 
@@ -294,6 +300,20 @@ impl Scratch {
         self.dir.path().join("archive")
     }
 
+    /// Where this build's bundles on `entry`'s harness go.
+    fn root_of(&self, entry: &HarnessEntry) -> PathBuf {
+        entry
+            .name
+            .split('/')
+            .fold(self.out(), |dir, segment| dir.join(segment))
+            .join(provenance_hash(entry, &BuildInfo::current()))
+    }
+
+    /// Where this build's bundles on [`TRIAGE`] go.
+    fn root(&self) -> PathBuf {
+        self.root_of(&TRIAGE)
+    }
+
     /// Writes `input` to a file named `name`, as libFuzzer saves a crash.
     fn artifact(&self, name: &str, input: &[u8]) -> PathBuf {
         let path = self.dir.path().join(name);
@@ -304,6 +324,18 @@ impl Scratch {
     /// Triages `input`, saved as `name`, with a counter of its own and
     /// `timeout` per child.
     fn triage(&self, name: &str, input: &[u8], timeout: Duration) -> Triaged {
+        self.triage_on(&TRIAGE, name, input, timeout)
+    }
+
+    /// [`Scratch::triage`] on `entry`'s harness. The children always run
+    /// [`TRIAGE`].
+    fn triage_on(
+        &self,
+        entry: &HarnessEntry,
+        name: &str,
+        input: &[u8],
+        timeout: Duration,
+    ) -> Triaged {
         let artifact = self.artifact(name, input);
         let children = TestChildren {
             counter: self.dir.path().join(format!("{name}.count")),
@@ -311,7 +343,7 @@ impl Scratch {
         let options = TriageOptions {
             child_timeout: timeout,
         };
-        triage(&TRIAGE, &children, &artifact, &self.out(), options).unwrap()
+        triage(entry, &children, &artifact, &self.out(), options).unwrap()
     }
 }
 
@@ -355,7 +387,7 @@ fn injected_failure_bundle_replays_exact() {
     assert_eq!(
         triaged.bundle,
         scratch
-            .out()
+            .root()
             .join("active")
             .join(signature_hash(&expected))
             .join(sha256(&input))
@@ -432,6 +464,86 @@ fn each_input_of_a_signature_keeps_its_bundle() {
         .unwrap()
         .next()
         .is_none());
+}
+
+/// The same bytes on the same harness after a generator change are another
+/// run, so each status keeps their bundle beside the first one's. Triaging
+/// them again on that generator keeps the bundle that's there.
+#[test]
+fn a_changed_generator_keeps_its_own_bundle() {
+    let scratch = Scratch::new();
+    let rows = [
+        (CLEAN, TriageStatus::NotReproduced),
+        (ACTIVE_CASE, TriageStatus::Confirmed),
+        (ABORT_CASE, TriageStatus::Confirmed),
+        (FIRST_ONLY_CASE, TriageStatus::Nondeterministic),
+    ];
+    let mut all = Vec::new();
+    for (case, status) in rows {
+        let input = [case];
+        let first = scratch.triage_on(&TRIAGE, &format!("{case}-first"), &input, TIMEOUT);
+        let next = scratch.triage_on(&NEXT_GENERATOR, &format!("{case}-next"), &input, TIMEOUT);
+        for (triaged, entry) in [(&first, &TRIAGE), (&next, &NEXT_GENERATOR)] {
+            assert_eq!(triaged.status, status, "case {case}: {triaged:?}");
+            assert!(triaged.archived, "case {case}: {triaged:?}");
+            assert!(
+                triaged.bundle.starts_with(scratch.root_of(entry)),
+                "case {case}: {triaged:?}"
+            );
+            assert_eq!(
+                verify_bundle(&triaged.bundle).unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(report(&triaged.bundle)["generator"], entry.generator);
+        }
+        assert_ne!(first.bundle, next.bundle, "case {case}");
+
+        let again = scratch.triage_on(&NEXT_GENERATOR, &format!("{case}-again"), &input, TIMEOUT);
+        assert_eq!(again.bundle, next.bundle, "case {case}");
+        assert!(!again.archived, "case {case}");
+        all.extend([first.bundle, next.bundle]);
+    }
+    all.sort();
+    assert_eq!(bundles(&scratch.out()).unwrap(), all);
+}
+
+/// A bundle's provenance changes with the generator and with the build. Two
+/// clean builds of one source share it, whatever their executables; two
+/// dirty builds share it only with the same executable.
+#[test]
+fn provenance_names_the_generator_and_build() {
+    let clean = BuildInfo {
+        git: "1".repeat(40),
+        dirty: false,
+        source: "2".repeat(64),
+        lockfile: "3".repeat(64),
+        rustc: "rustc 1.98.0".to_owned(),
+        binary: "4".repeat(64),
+        ..BuildInfo::current()
+    };
+    let hash = |entry: &HarnessEntry, build: &BuildInfo| provenance_hash(entry, build);
+    let base = hash(&TRIAGE, &clean);
+    assert_ne!(hash(&NEXT_GENERATOR, &clean), base);
+    let other_commit = BuildInfo {
+        git: "5".repeat(40),
+        ..clean.clone()
+    };
+    assert_ne!(hash(&TRIAGE, &other_commit), base);
+    let other_binary = BuildInfo {
+        binary: "6".repeat(64),
+        ..clean.clone()
+    };
+    assert_eq!(hash(&TRIAGE, &other_binary), base);
+    let dirty = BuildInfo {
+        dirty: true,
+        ..clean.clone()
+    };
+    let dirty_other_binary = BuildInfo {
+        binary: "6".repeat(64),
+        ..dirty.clone()
+    };
+    assert_ne!(hash(&TRIAGE, &dirty), base);
+    assert_ne!(hash(&TRIAGE, &dirty_other_binary), hash(&TRIAGE, &dirty));
 }
 
 /// A row of [`buckets_for_harness_crash_and_nondeterminism`]: its name, the
@@ -513,10 +625,10 @@ fn buckets_for_harness_crash_and_nondeterminism() {
         assert_eq!(triaged.signature.as_deref(), expected, "{name}");
         let place = match (bucket, expected) {
             (Some(bucket), Some(signature)) => scratch
-                .out()
+                .root()
                 .join(bucket.name())
                 .join(signature_hash(signature)),
-            _ => scratch.out().join(status.name()),
+            _ => scratch.root().join(status.name()),
         };
         assert_eq!(triaged.bundle, place.join(sha256(&input)), "{name}");
         assert_eq!(
@@ -534,7 +646,7 @@ fn buckets_for_harness_crash_and_nondeterminism() {
 
     // The aborted recordings left their steps, and no replay ran.
     let abort = scratch
-        .out()
+        .root()
         .join("crash")
         .join(signature_hash("crash abort"));
     let aborted = report(&abort.join(sha256(&[ABORT_CASE])));
@@ -547,7 +659,7 @@ fn buckets_for_harness_crash_and_nondeterminism() {
 
     // The recordings that disagreed both stay in their bundle.
     let disagreed = scratch
-        .out()
+        .root()
         .join("nondeterministic")
         .join(sha256(&[FIRST_ONLY_CASE]));
     let nondeterministic = report(&disagreed);
@@ -563,7 +675,7 @@ fn buckets_for_harness_crash_and_nondeterminism() {
 
     // The replay that disagreed failed, and its output stays.
     let replayed = scratch
-        .out()
+        .root()
         .join("replay-failed")
         .join(sha256(&[RECORDS_ONLY_CASE]));
     let replay_failed = report(&replayed);
@@ -656,7 +768,7 @@ fn recordings_whose_traces_differ_are_nondeterministic() {
     );
     assert_eq!(
         triaged.bundle,
-        scratch.out().join("nondeterministic").join(sha256(&input))
+        scratch.root().join("nondeterministic").join(sha256(&input))
     );
     let difference = &report(&triaged.bundle)["difference"];
     assert!(difference["field"].as_str().is_some(), "{difference}");
@@ -816,9 +928,18 @@ fn the_binary_triages_and_verifies_an_archive() {
         input.to_str().unwrap(),
     ]);
     assert!(output.status.success(), "{output:?}");
-    let bundle = out
-        .join("not-reproduced")
-        .join(sha256(&fs::read(&input).unwrap()));
+    let [bundle] = <[PathBuf; 1]>::try_from(bundles(&out).unwrap()).unwrap();
+    let report = report(&bundle);
+    let place = out
+        .join("discovery")
+        .join("wait-complete")
+        .join(report["provenance"].as_str().unwrap());
+    assert_eq!(
+        bundle,
+        place
+            .join("not-reproduced")
+            .join(sha256(&fs::read(&input).unwrap()))
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         stdout,
@@ -828,7 +949,6 @@ fn the_binary_triages_and_verifies_an_archive() {
             bundle.display()
         )
     );
-    let report = report(&bundle);
     assert_eq!(report["harness"], "discovery/wait-complete");
     assert_eq!(report["replay"]["verified"], true);
 
@@ -836,7 +956,14 @@ fn the_binary_triages_and_verifies_an_archive() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "1 not-reproduced: not-reproduced\n1 bundles match their checksums\n"
+        format!(
+            "1 {}: not-reproduced\n1 bundles match their checksums\n",
+            place
+                .join("not-reproduced")
+                .strip_prefix(&out)
+                .unwrap()
+                .display()
+        )
     );
 
     fs::write(bundle.join(BUNDLE_INPUT_FILE), b"changed").unwrap();
@@ -847,4 +974,50 @@ fn the_binary_triages_and_verifies_an_archive() {
 
     let output = zakura_sim(&["triage", "--sim", "discovery/wait-complete"]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+/// The same bytes on two harnesses are two runs, so the binary keeps a
+/// bundle for each in one archive, and both verify. Triaging them again on
+/// the first harness keeps the bundle that's there.
+#[test]
+fn the_binary_keeps_each_harness_bundle_of_the_same_bytes() {
+    let scratch = Scratch::new();
+    let input = scratch.artifact("input", &[]);
+    let out = scratch.out();
+    let run = |harness: &str| {
+        let output = zakura_sim(&[
+            "triage",
+            "--sim",
+            harness,
+            "--out",
+            out.to_str().unwrap(),
+            "--child-secs",
+            "60",
+            input.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "{harness}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    for harness in ["discovery/wait-complete", "fixtures/fixed"] {
+        let stdout = run(harness);
+        assert!(stdout.contains("; archived in "), "{harness}: {stdout}");
+    }
+    let found = bundles(&out).unwrap();
+    let harnesses: Vec<Value> = found
+        .iter()
+        .map(|bundle| report(bundle)["harness"].clone())
+        .collect();
+    assert_eq!(harnesses, ["discovery/wait-complete", "fixtures/fixed"]);
+
+    let stdout = run("discovery/wait-complete");
+    assert!(stdout.contains("; already archived in "), "{stdout}");
+    assert_eq!(bundles(&out).unwrap(), found);
+
+    let output = zakura_sim(&["verify-archive", out.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.ends_with("2 bundles match their checksums\n"),
+        "{stdout}"
+    );
 }

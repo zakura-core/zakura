@@ -22,11 +22,14 @@
 //! only read, so a triage killed at any point leaves it whole, and leaves
 //! its copy in the staging bundle.
 //!
-//! Bundles go under `<out>/<bucket>/<signature hash>/<input sha256>/` for a
-//! [`TriageStatus::Confirmed`] failure, and under
-//! `<out>/<status>/<input sha256>/` for every other status. Each distinct
-//! input keeps its own bundle, so a signature's first bundle never stops a
-//! later input from being kept.
+//! Bundles go under `<out>/<harness>/<provenance>/`, where `<harness>` is
+//! the harness's name and `<provenance>` is [`provenance_hash`] of its
+//! generator and this build. Below that, a [`TriageStatus::Confirmed`]
+//! failure goes under `<bucket>/<signature hash>/<input sha256>/`, and every
+//! other status under `<status>/<input sha256>/`. The same bytes on another
+//! harness, generator or build are another run, so they keep their own
+//! bundle. Each distinct input keeps its own bundle too, so a signature's
+//! first bundle never stops a later input from being kept.
 
 use std::{
     collections::BTreeMap,
@@ -51,7 +54,7 @@ use super::{
 use crate::{
     harness::HarnessEntry,
     trace::{
-        meta::{hex, BuildInfo},
+        meta::{hex, BuildInfo, UNKNOWN},
         trace_difference, TraceReader, MAX_INPUT_BYTES,
     },
 };
@@ -293,6 +296,23 @@ pub fn signature_hash(signature: &str) -> String {
     hex(&Sha256::digest(signature.as_bytes()))[..16].to_owned()
 }
 
+/// The directory name of the provenance of a run on `entry`'s harness and
+/// `build`: the first 16 hex digits of the SHA-256 of the harness's
+/// generator and the build.
+///
+/// A clean build leaves its executable's hash out, so equivalent clean
+/// builds of one source share it (see [`BuildInfo::equivalent`]). Any other
+/// build keeps its executable's hash, since its recorded source may be
+/// stale.
+pub fn provenance_hash(entry: &HarnessEntry, build: &BuildInfo) -> String {
+    let mut build = build.clone();
+    if build.clean() {
+        build.binary = UNKNOWN.to_owned();
+    }
+    let key = json!({ "generator": entry.generator, "build": build });
+    hex(&Sha256::digest(key.to_string().as_bytes()))[..16].to_owned()
+}
+
 /// Triages the input in the file `artifact` on `entry`'s harness, with
 /// children from `children`, and archives it under `out`.
 ///
@@ -405,6 +425,8 @@ pub fn triage(
             "signature": signature,
         })
     };
+    let build = BuildInfo::current();
+    let provenance = provenance_hash(entry, &build);
     let report = json!({
         "format": TRIAGE_FORMAT,
         "status": status,
@@ -412,6 +434,7 @@ pub fn triage(
         "signature": signature,
         "harness": entry.name,
         "generator": entry.generator,
+        "provenance": provenance,
         "artifact": artifact.display().to_string(),
         "input": { "sha256": digest, "len": input.len() },
         "records": [
@@ -428,7 +451,7 @@ pub fn triage(
             "verified": exit == ProcessExit::Code(0),
         })),
         "child_timeout_ms": u64::try_from(options.child_timeout.as_millis()).unwrap_or(u64::MAX),
-        "build": BuildInfo::current(),
+        "build": build,
     });
     write_synced(
         &staging.join(TRIAGE_FILE),
@@ -437,12 +460,17 @@ pub fn triage(
     let sums = checksums(&staging)?;
     write_synced(&staging.join(CHECKSUMS_FILE), sums.as_bytes())?;
 
+    let root = entry
+        .name
+        .split('/')
+        .fold(out.to_owned(), |dir, segment| dir.join(segment))
+        .join(&provenance);
     let bundle = match (&bucket, &signature) {
-        (Some(bucket), Some(signature)) => out
+        (Some(bucket), Some(signature)) => root
             .join(bucket.name())
             .join(signature_hash(signature))
             .join(&digest),
-        _ => out.join(status.name()).join(&digest),
+        _ => root.join(status.name()).join(&digest),
     };
     let archived = place(&staging, &bundle)?;
     Ok(Triaged {

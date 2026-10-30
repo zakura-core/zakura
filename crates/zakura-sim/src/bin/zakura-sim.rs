@@ -91,10 +91,11 @@ mod cli {
              `triage` records each input twice, each time in a fresh process killed after\n\
              --child-secs seconds (default 60), replays the first trace Exact in a third,\n\
              and archives the input with its runs under --out. It exits 1 only if an input\n\
-             couldn't be archived.\n\
+             couldn't be archived. Each harness, generator and build gets its own\n\
+             directory under --out.\n\
              `verify-archive` checks every bundle under a triage archive against its\n\
-             SHA256SUMS, counts the bundles under each signature, and exits 1 if any\n\
-             bundle doesn't match.\n\n\
+             SHA256SUMS, counts the bundles under each harness, provenance and\n\
+             signature, and exits 1 if any bundle doesn't match.\n\n\
              Harnesses:\n",
         );
         for entry in HARNESSES {
@@ -512,8 +513,8 @@ mod cli {
     }
 
     /// `verify-archive`: checks every bundle under a triage archive, and
-    /// prints how many bundles each signature has. Fails if any bundle
-    /// doesn't match its checksums.
+    /// prints how many bundles each harness, provenance and signature has.
+    /// Fails if any bundle doesn't match its checksums.
     #[allow(clippy::print_stdout, clippy::print_stderr)]
     fn verify_archive(args: Vec<String>) -> Result<(), Error> {
         let [dir] = <[String; 1]>::try_from(args)

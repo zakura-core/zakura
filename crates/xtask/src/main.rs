@@ -427,5 +427,8 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "Checks every bundle in a triage archive against its checksums, and counts the"
     )?;
-    writeln!(output, "bundles under each signature.")
+    writeln!(
+        output,
+        "bundles under each harness, provenance and signature."
+    )
 }

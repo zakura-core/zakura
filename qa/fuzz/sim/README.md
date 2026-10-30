@@ -92,8 +92,7 @@ ended without failing, a third process replays the first trace Exact. Each
 input gets one status:
 
 - `confirmed`: both recordings filed the input under the same buckets and
-  signature, their traces match, and that is a failure. The bundle goes to
-  `<bucket>/<signature hash>/<input sha256>/`.
+  signature, their traces match, and that is a failure.
 - `not-reproduced`: both recordings ran clean, and the replay matched the
   first one Exact.
 - `nondeterministic`: the two recordings filed the input differently, or
@@ -102,13 +101,21 @@ input gets one status:
 - `replay-failed`: the recordings agreed, but the replay didn't match the
   first one Exact.
 
-A bundle with any status but `confirmed` goes to
-`<status>/<input sha256>/`. It holds `input.bin`, `scenario.json`, each
-child's output and trace under `runs/`, `triage.json` and `SHA256SUMS`.
-Triage writes it under `.staging/` and renames it into place, and never
-changes it after that. A later triage that files the same input in the same
-place keeps the bundle that's there. `sim-verify-archive` checks every bundle
-against its `SHA256SUMS`, and counts the bundles under each signature.
+Each bundle goes under `<harness>/<provenance>/`, where `<harness>` is the
+harness's name and `<provenance>` is a hash of its generator and the
+`zakura-sim` build that triaged it. A clean build's hash leaves out its
+executable's hash, so equivalent clean builds of one source share it. Below
+that, a `confirmed` bundle goes to `<bucket>/<signature hash>/<input sha256>/`,
+and a bundle with any other status goes to `<status>/<input sha256>/`. So the
+same bytes on another harness, generator or build keep their own bundle. A
+bundle holds `input.bin`, `scenario.json`, each child's output and trace
+under `runs/`, `triage.json` and `SHA256SUMS`. `triage.json` names the
+harness, the generator, the provenance hash and the build. Triage writes the
+bundle under `.staging/` and renames it into place, and never changes it
+after that. A later triage of the same input on the same harness, generator
+and build files it in the same place, and keeps the bundle that's there.
+`sim-verify-archive` checks every bundle against its `SHA256SUMS`, and counts
+the bundles under each harness, provenance and signature.
 
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.

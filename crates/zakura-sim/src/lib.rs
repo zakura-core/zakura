@@ -28,6 +28,7 @@ pub mod peer;
 pub mod plan;
 pub mod property;
 pub mod record;
+pub mod seed;
 mod sender;
 pub mod sim;
 pub mod storage;

@@ -124,6 +124,8 @@ fn try_main() -> Result<(), BoxError> {
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
+        Some("sim-versions") => sim::run(&repo_root()?, "versions", args),
+        Some("sim-seeds") => sim::run(&repo_root()?, "seeds", args),
         Some("sim-minimize") => sim_minimize::run(&repo_root()?, args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -345,6 +347,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "  cargo xtask shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]"
     )?;
+    writeln!(output, "  cargo xtask sim-versions --sim <name>")?;
+    writeln!(
+        output,
+        "  cargo xtask sim-seeds [--sim <name>] [--fixtures <dir>]... [--out <dir>] [--quarantine <dir>] [--report <file>]"
+    )?;
     writeln!(
         output,
         "  cargo xtask sim-minimize <target> <input> --property <id> --out <dir> --runs <n>"
@@ -415,6 +422,20 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Shrinks a zakura-sim trace that ends in a violation to fewer non-default picks."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Prints the versions that fix what a zakura-sim harness's fuzz input means."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Validates the committed zakura-sim fuzz seeds against the current generators, and"
+    )?;
+    writeln!(
+        output,
+        "with --out writes one harness's admitted seeds there as a fuzz corpus."
     )?;
     writeln!(output)?;
     writeln!(

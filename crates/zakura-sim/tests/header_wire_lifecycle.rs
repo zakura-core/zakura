@@ -10,7 +10,6 @@ mod support;
 
 use std::{cell::Cell, fs, path::PathBuf, time::Duration};
 
-use sha2::{Digest, Sha256};
 use support::{
     inputs,
     steer::{before, steer, Steer},
@@ -33,7 +32,7 @@ use zakura_sim::{
         StorageResult, TransportFact,
     },
     peer::{honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
-    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    seed, Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
 
@@ -886,10 +885,7 @@ fn regenerate_saved_plans() {
         let (_, end, _) = replay(&input);
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let digest: String = Sha256::digest(&input)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
         let sidecar = format!(
             "# The committed fuzz input `header-wire-{name}.bin`: the harness that\n\
              # runs it, the generator version it was built for, and its SHA-256. Its\n\
@@ -897,10 +893,14 @@ fn regenerate_saved_plans() {
              # `header-wire-{name}.end.json` is its pinned end record.\n\
              harness = \"{harness}\"\n\
              generator = {generator}\n\
-             sha256 = \"{digest}\"\n",
+             sha256 = \"{digest}\"\n\
+             scenario_sha256 = \"{scenario}\"\n\
+             source = \"crates/zakura-sim/tests/header_wire_lifecycle.rs\"\n",
             name = plan.name(),
             harness = HeaderWire::NAME,
             generator = HeaderWire::GENERATOR,
+            digest = seed::sha256(&input),
+            scenario = seed::scenario_sha256(&scenario),
         );
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
         fs::write(base.with_extension("end.json"), format!("{end}\n"))

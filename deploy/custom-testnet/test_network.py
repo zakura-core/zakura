@@ -17,10 +17,11 @@ class NetworkTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.config = dict(root=str(self.root), service_prefix='pq-testnet',
-                           revision='a' * 40, seed_height=4420648,
-                           seed_hash='b' * 64, seed_finalized_height=4419648,
+                           revision='a' * 40, seed_height=4559785,
+                           seed_hash='b' * 64, seed_finalized_height=4558785,
                            seed_finalized_hash='d' * 64, miner_address='tmTestMiner',
                            public_peer='pq.valargroup.dev', seed_sha256='c' * 64,
+                           seed_archive='/preserved/archive-seed.tar.zst', seed_storage_mode='archive',
                            seed_network_directory='nu7stagingv3', binary='/opt/zakurad')
         self.run = network.new_run(self.config)
 
@@ -29,10 +30,10 @@ class NetworkTests(unittest.TestCase):
         for index in (0, 1):
             config = tomllib.loads(network.node_config(self.config, self.run, index))
             params = config['network']['network']
-            self.assertEqual(params['activation_heights']['NU7'], 4420649)
-            self.assertEqual(params['pq_p2sh_activation_height'], 4420649)
-            self.assertEqual(params['max_block_time_start_height'], 4420655)
-            self.assertEqual(params['checkpoints'][1], [4419648, list(bytes.fromhex(self.config['seed_finalized_hash'])[::-1])])
+            self.assertEqual(params['activation_heights']['NU7'], 4465026)
+            self.assertEqual(params['pq_p2sh_activation_height'], 4559786)
+            self.assertNotIn('max_block_time_start_height', params)
+            self.assertEqual(params['checkpoints'][1], [4558785, list(bytes.fromhex(self.config['seed_finalized_hash'])[::-1])])
             self.assertEqual(len(params['checkpoints'][0][1]), 32)
             self.assertFalse(config['mining']['internal_miner'])
         participant = tomllib.loads(network.participant_config(self.config, self.run))
@@ -82,7 +83,7 @@ class NetworkTests(unittest.TestCase):
 
     def test_activation_requires_two_validators_at_the_boundary(self):
         controller = self.controller('mining')
-        for heights, expected in [((4420649, 4420648), 'mining'), ((4420649, 4420649), 'active')]:
+        for heights, expected in [((4559786, 4559785), 'mining'), ((4559786, 4559786), 'active')]:
             rows = [dict(height=h) for h in heights]
             with patch.object(network, 'verify_nodes', return_value=rows), patch.object(network, 'rpc', return_value='d' * 64):
                 sample = controller.sample(advance=True)
@@ -119,17 +120,17 @@ class NetworkTests(unittest.TestCase):
         binary.write_bytes(b'compiled node')
         self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), seed_archive='preserved')
         network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
-        def restore(archive, destination, name):
+        def restore(archive, destination, name, state_version=None):
             destination.mkdir()
             (destination / 'identity').write_text(name)
-        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command:
+        with patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network, 'command') as command:
             first = network.reset(self.config, 300)
             second = network.reset(self.config, 300)
         self.assertNotEqual(first['network'], second['network'])
         self.assertEqual(second['phase'], 'countdown')
         self.assertTrue((self.root / 'history' / (first['id'] + '.json')).exists())
         self.assertEqual((self.root / 'node1/cache/identity').read_text(), second['network']['name'])
-        self.assertFalse(any(call.args[:2] == ('systemctl', 'restart') for call in command.call_args_list))
+        self.assertFalse(any(call.args[:2] == ('systemctl', 'restart') and call.args[2].endswith(('node0.service', 'node1.service')) for call in command.call_args_list))
 
     def test_failed_restore_stops_both_nodes_without_starting_mining(self):
         import hashlib
@@ -137,7 +138,7 @@ class NetworkTests(unittest.TestCase):
         binary.write_bytes(b'compiled node')
         self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), seed_archive='preserved')
         network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
-        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=ValueError('corrupt archive')), patch.object(network, 'command') as command:
+        with patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=ValueError('corrupt archive')), patch.object(network, 'command') as command:
             with self.assertRaisesRegex(ValueError, 'corrupt archive'):
                 network.reset(self.config, 300)
         self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
@@ -145,15 +146,76 @@ class NetworkTests(unittest.TestCase):
             command.assert_any_call('systemctl', 'stop', f'pq-testnet-node{index}.service')
         self.assertFalse(any(call.args[:2] == ('systemctl', 'restart') for call in command.call_args_list))
 
+    def test_cancelled_reset_with_saved_countdown_stops_both_nodes(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+
+        def restore(archive, destination, name, state_version=None):
+            destination.mkdir()
+
+        def command(*args):
+            if args == ('systemctl', 'restart', 'pq-testnet-controller.service'):
+                self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'countdown')
+                network.archive_seed.interrupt_operation(15, None)
+
+        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', return_value=[]), patch.object(network.archive_seed, 'verify_archive_history'), patch.object(network, 'command', side_effect=command) as commands:
+            with self.assertRaises(network.archive_seed.OperationCancelled):
+                network.reset(self.config, 600)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
+        for index in (0, 1):
+            self.assertIn(unittest.mock.call('systemctl', 'stop', f'pq-testnet-node{index}.service'), commands.call_args_list)
+
+    def test_service_failure_cleanup_withdraws_countdown_and_stops_preparation(self):
+        self.controller()
+        with patch.dict(network.os.environ, {'SERVICE_RESULT': 'signal'}), patch.object(network, 'command') as command:
+            network.cleanup_failed_reset(self.config)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
+        command.assert_any_call('systemctl', 'stop', 'pq-testnet-preparation.service')
+
+    def test_new_reset_does_not_report_the_previous_preparation_failure(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), refresh_seed=True)
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+        network.atomic_json(self.root / 'seed-progress.json', {'phase': 'failed'})
+        def refresh(config, restore):
+            self.assertEqual(json.loads((self.root / 'seed-progress.json').read_text())['phase'], 'verifying')
+            raise RuntimeError('preparation unavailable')
+        with patch.object(network, 'verify_archive'), patch.object(network.archive_seed, 'refresh_seed', side_effect=refresh), patch.object(network, 'command'):
+            with self.assertRaisesRegex(RuntimeError, 'preparation unavailable'):
+                network.reset(self.config, 600, self.root / 'config.json')
+
+    def test_cancellation_is_not_retried_by_miner_readiness(self):
+        with patch.object(network, 'rpc', side_effect=network.archive_seed.OperationCancelled):
+            with self.assertRaises(network.archive_seed.OperationCancelled):
+                network.wait_for_primary(self.run)
+
+    def test_cancellation_during_validator_readiness_fails_reset(self):
+        import hashlib
+        binary = self.root / 'zakurad'
+        binary.write_bytes(b'compiled node')
+        self.config.update(binary=str(binary), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+        network.atomic_json(self.root / 'owner.json', {'root': str(self.root), 'service_prefix': 'pq-testnet'})
+        def restore(archive, destination, name, state_version=None):
+            destination.mkdir()
+        with patch.object(network, 'verify_archive'), patch.object(network, 'restore_archive', side_effect=restore), patch.object(network, 'verify_nodes', side_effect=network.archive_seed.OperationCancelled), patch.object(network, 'command'):
+            with self.assertRaises(network.archive_seed.OperationCancelled):
+                network.reset(self.config, 600)
+        self.assertEqual(json.loads((self.root / 'run.json').read_text())['phase'], 'failed')
+
     def test_reorg_withdraws_activation_and_refreshes_its_hash(self):
         controller = self.controller('active')
         self.run['activation_hash'] = 'old hash'
         network.atomic_json(self.root / 'run.json', self.run)
-        with patch.object(network, 'verify_nodes', return_value=[dict(height=4420648)]):
+        with patch.object(network, 'verify_nodes', return_value=[dict(height=4559785)]):
             sample = controller.sample(advance=True)
         self.assertEqual(sample['phase'], 'mining')
         self.assertNotIn('activation_hash', sample)
-        with patch.object(network, 'verify_nodes', return_value=[dict(height=4420649)]), patch.object(network, 'rpc', return_value='replacement hash'):
+        with patch.object(network, 'verify_nodes', return_value=[dict(height=4559786)]), patch.object(network, 'rpc', return_value='replacement hash'):
             sample = controller.sample(advance=True)
         self.assertEqual(sample['activation_hash'], 'replacement hash')
 
@@ -194,23 +256,47 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue((destination / 'non_finalized_state/newfork').is_dir())
         self.assertFalse((destination / 'non_finalized_state/oldnet').exists())
 
+    def test_restore_ignores_obsolete_formats_but_rejects_links_in_the_active_format(self):
+        for version, accepted in [('v28', True), ('v30', False)]:
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode='w') as archive:
+                directory = tarfile.TarInfo('state/v30/testnet/')
+                directory.type = tarfile.DIRTYPE
+                archive.addfile(directory)
+                link = tarfile.TarInfo(f'state/{version}/testnet/table.sst')
+                link.type = tarfile.LNKTYPE
+                link.linkname = 'state/v30/testnet/other.sst'
+                archive.addfile(link)
+            process = unittest.mock.MagicMock()
+            process.__enter__.return_value = process
+            process.stdout = io.BytesIO(payload.getvalue())
+            process.wait.return_value = 0
+            destination = self.root / version
+            with patch.object(network.subprocess, 'Popen', return_value=process):
+                if accepted:
+                    network.restore_archive('unused', destination, 'Fork', 'v30')
+                    self.assertFalse((destination / 'state/v28').exists())
+                else:
+                    with self.assertRaisesRegex(ValueError, 'link'):
+                        network.restore_archive('unused', destination, 'Fork', 'v30')
+
     def test_intervals_exclude_the_historical_seed_time_jump(self):
         controller = self.controller('mining')
         def response(port, method, params):
             if method == 'getblockhash':
                 return str(params[0])
             height = int(params[0])
-            return {'time': 100 if height < 4420649 else 2000000 + (height - 4420649) * 451, 'previousblockhash': str(height - 1)}
+            return {'time': 100 if height < 4559786 else 2000000 + (height - 4559786) * 451, 'previousblockhash': str(height - 1)}
         with patch.object(network, 'rpc', side_effect=response):
-            blocks, interval = controller.recent_blocks({'height': 4420650, 'hash': '4420650'}, 4420649)
+            blocks, interval = controller.recent_blocks({'height': 4559787, 'hash': '4559787'}, 4559786)
         self.assertEqual(len(blocks), 6)
         self.assertEqual(interval, 451)
 
     def test_miner_readiness_requires_matching_activation_parameters(self):
-        params = dict(network=self.run['network']['name'], pqP2shActivationHeight=4420649, nu7ActivationHeight=4420649)
+        params = dict(network=self.run['network']['name'], pqP2shActivationHeight=4559786, nu7ActivationHeight=4465026)
         with patch.object(network, 'rpc', return_value=params):
             network.wait_for_primary(self.run)
-        params['nu7ActivationHeight'] = 4465026
+        params['nu7ActivationHeight'] = 4559786
         with patch.object(network, 'rpc', return_value=params):
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 network.wait_for_primary(self.run)

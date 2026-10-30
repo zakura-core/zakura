@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import shutil
 import statistics
 import subprocess
@@ -24,6 +25,8 @@ import time
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
+
+import archive_seed
 
 
 def command(*args, timeout=120):
@@ -51,8 +54,12 @@ def load_config(path):
         raise ValueError('invalid service prefix')
     if not re.fullmatch(r'[0-9a-f]{40}', config['revision']):
         raise ValueError('revision must identify the deployed source commit')
-    if config['seed_height'] >= 4465026 or config['seed_height'] < 4134000:
-        raise ValueError('seed must be after NU6.3 and before public Testnet NU7')
+    if config['seed_height'] < archive_seed.NU7_HEIGHT:
+        raise ValueError('archive seed must include public Testnet NU7 history')
+    if config.get('seed_storage_mode') != 'archive':
+        raise ValueError('deployment requires an archive seed')
+    if config.get('seed_state_version') is not None and not re.fullmatch(r'v[0-9]+', config['seed_state_version']):
+        raise ValueError('seed state version must name a version directory such as v30')
     if not 0 < config['seed_finalized_height'] < config['seed_height']:
         raise ValueError('finalized checkpoint must precede the full seed tip so its last block is replayed')
     for field in ('seed_hash', 'seed_finalized_hash', 'seed_sha256', 'binary_sha256'):
@@ -85,11 +92,12 @@ def verify_archive(config):
             raise ValueError('refusing a symlinked disposable node directory')
         if node.exists():
             reclaimable += sum(p.stat().st_size for p in node.rglob('*') if p.is_file() and not p.is_symlink())
-    if shutil.disk_usage(root).free + reclaimable < config.get('minimum_free_bytes', 45 * 1024**3):
+    required = config.get('seed_unpacked_bytes', 20 * 1024**3) * 2 + 2 * 1024**3
+    if shutil.disk_usage(root).free + reclaimable < required:
         raise ValueError('insufficient free disk space for two restored databases')
 
 
-def restore_archive(archive, destination, network_name):
+def restore_archive(archive, destination, network_name, state_version=None):
     """Extract state files without trusting archive paths, links, or special files."""
     destination.mkdir()
     with subprocess.Popen(['zstd', '-dc', str(archive)], stdout=subprocess.PIPE) as decompressor:
@@ -100,6 +108,11 @@ def restore_archive(archive, destination, network_name):
                     raise ValueError('unsafe seed archive path')
                 if not parts or parts[0] not in ('state', 'non_finalized_state'):
                     raise ValueError('seed archive contains files outside chain state')
+                # Source caches can retain obsolete repair databases with hard-linked
+                # tables. Only the explicitly pinned active format belongs to this seed.
+                if (state_version is not None and parts[0] == 'state' and len(parts) > 1
+                        and parts[1] != state_version):
+                    continue
                 if not member.isdir() and not member.isfile():
                     raise ValueError('seed archive contains a link or special file')
                 target = destination.joinpath(*parts)
@@ -114,6 +127,8 @@ def restore_archive(archive, destination, network_name):
     finalized = destination / 'state'
     if not finalized.exists():
         raise ValueError('seed has no finalized state')
+    if state_version is not None and not (finalized / state_version).is_dir():
+        raise ValueError('seed does not contain the pinned state version')
     for version in finalized.iterdir():
         if not version.is_dir() or not re.fullmatch(r'v[0-9]+', version.name):
             raise ValueError('unexpected finalized state layout')
@@ -151,12 +166,11 @@ network_magic = {magic}
 checkpoints = {checkpoints}
 inherit_activation_heights = true
 pq_p2sh_activation_height = {run['activation_height']}
-max_block_time_start_height = {config['seed_height'] + 7}
 [network.network.activation_heights]
-NU7 = {run['activation_height']}
+NU7 = {archive_seed.NU7_HEIGHT}
 [state]
 cache_dir = "{root}/node{index}/cache"
-storage_mode = "pruned"
+storage_mode = "archive"
 [rpc]
 listen_addr = "127.0.0.1:{rpc_port}"
 enable_cookie_auth = false
@@ -178,8 +192,8 @@ def participant_config(config, run):
     for key, value in params.items():
         if key != 'activation_heights':
             lines.append(f'{key} = {json.dumps(value)}')
-    lines += ['[network.network.activation_heights]', f'NU7 = {run["activation_height"]}',
-              '[state]', f'cache_dir = "./{run["id"]}-state"', 'storage_mode = "pruned"',
+    lines += ['[network.network.activation_heights]', f'NU7 = {archive_seed.NU7_HEIGHT}',
+              '[state]', f'cache_dir = "./{run["id"]}-state"', 'storage_mode = "archive"',
               '[rpc]', 'listen_addr = "127.0.0.1:18232"']
     return '\n'.join(lines) + '\n'
 
@@ -191,9 +205,13 @@ def new_run(config):
         magic = list(secrets.token_bytes(4))
     return {'id': identity, 'phase': 'preparing', 'magic_bytes': magic,
             'activation_height': config['seed_height'] + 1,
+            'nu7_activation_height': archive_seed.NU7_HEIGHT,
+            'storage_mode': 'archive',
             'network': {'name': 'PqNu7' + identity, 'magic': bytes(magic).hex()},
             'revision': config['revision'], 'seed_height': config['seed_height'],
-            'seed_hash': config['seed_hash']}
+            'binary_revision': config.get('binary_source_revision', config['revision']),
+            'seed_hash': config['seed_hash'], 'seed_sha256': config['seed_sha256'],
+            'seed_snapshot_url': '/snapshots/' + Path(config['seed_archive']).name}
 
 
 def verify_nodes(config, run, require_seed=False):
@@ -202,9 +220,11 @@ def verify_nodes(config, run, require_seed=False):
         params = rpc(port, 'getnetworkparameters')
         if (params['network'] != run['network']['name']
                 or params['pqP2shActivationHeight'] != run['activation_height']
-                or params['nu7ActivationHeight'] != run['activation_height']):
+                or params['nu7ActivationHeight'] != archive_seed.NU7_HEIGHT):
             raise ValueError('running node activation parameters do not match this run')
         info = rpc(port, 'getblockchaininfo')
+        if info.get('pruned') is not False:
+            raise ValueError('running validator does not report archive storage')
         height = info['blocks']
         block_hash = rpc(port, 'getblockhash', [height])
         if require_seed and (height != config['seed_height'] or block_hash != config['seed_hash']):
@@ -216,7 +236,7 @@ def verify_nodes(config, run, require_seed=False):
     return rows
 
 
-def reset(config, delay):
+def reset(config, delay, config_path=None):
     root = Path(config['root'])
     owner = json.loads((root / 'owner.json').read_text())
     if owner != {'service_prefix': config['service_prefix'], 'root': str(root)}:
@@ -236,11 +256,30 @@ def reset(config, delay):
             expired.unlink()
     run = new_run(config)
     command('systemctl', 'stop', f'{config["service_prefix"]}-controller.service')
+    if config.get('refresh_seed'):
+        atomic_json(root / 'seed-progress.json', {'phase': 'verifying', 'observed_at': int(time.time())})
     atomic_json(root / 'run.json', run)
     try:
         for suffix in ('node0', 'node1'):
             command('systemctl', 'stop', f'{config["service_prefix"]}-{suffix}.service')
         command('systemctl', 'start', f'{config["service_prefix"]}-controller.service')
+        if config.get('refresh_seed'):
+            # Working forks are disposable; release their disk before archive preparation.
+            for index in range(2):
+                node = root / f'node{index}'
+                if node.is_symlink():
+                    raise ValueError('refusing to replace a symlinked disposable node directory')
+                if node.exists():
+                    shutil.rmtree(node)
+            previous_config = config
+            config = archive_seed.refresh_seed(config, restore_archive)
+            if config_path is None:
+                raise ValueError('seed refresh requires the persistent deployment config path')
+            atomic_json(config_path, config)
+            archive_seed.retire_old_seed(previous_config, Path(config['seed_archive']))
+            # The running controller is restarted below to read the refreshed seed metadata.
+            run = new_run(config)
+            atomic_json(root / 'run.json', run)
         for index in range(2):
             node = root / f'node{index}'
             if node.is_symlink():
@@ -248,7 +287,7 @@ def reset(config, delay):
             if node.exists():
                 shutil.rmtree(node)
             node.mkdir()
-            restore_archive(config['seed_archive'], node / 'cache', run['network']['name'])
+            restore_archive(config['seed_archive'], node / 'cache', run['network']['name'], config.get('seed_state_version'))
             if config.get('node_user'):
                 for path in [node, *node.rglob('*')]:
                     shutil.chown(path, user=config['node_user'], group=config['node_user'])
@@ -264,10 +303,12 @@ def reset(config, delay):
                 if time.monotonic() >= deadline:
                     raise RuntimeError('restored nodes did not become ready within four minutes')
                 time.sleep(2)
+        for port in (18232, 18332):
+            archive_seed.verify_archive_history(port)
         run.update(phase='countdown', ready_at=int(time.time()), mining_at=int(time.time()) + delay)
         atomic_json(root / 'run.json', run)
         (root / 'participant.toml').write_text(participant_config(config, run))
-        command('systemctl', 'start', f'{config["service_prefix"]}-controller.service')
+        command('systemctl', 'restart', f'{config["service_prefix"]}-controller.service')
     except Exception as error:
         run.update(phase='failed', error=str(error))
         atomic_json(root / 'run.json', run)
@@ -289,9 +330,25 @@ def wait_for_primary(run):
                 raise TimeoutError('mining node did not become ready after restart')
             time.sleep(1)
             continue
-        if parameters['network'] != run['network']['name'] or parameters['pqP2shActivationHeight'] != run['activation_height'] or parameters['nu7ActivationHeight'] != run['activation_height']:
+        if parameters['network'] != run['network']['name'] or parameters['pqP2shActivationHeight'] != run['activation_height'] or parameters['nu7ActivationHeight'] != archive_seed.NU7_HEIGHT:
             raise ValueError('restarted mining node does not match this run')
         return
+
+
+def cleanup_failed_reset(config):
+    """Systemd failure cleanup also runs after a forced reset-process termination."""
+    if os.environ.get('SERVICE_RESULT') == 'success':
+        return
+    root = Path(config['root'])
+    with (root / 'reset.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        run = json.loads((root / 'run.json').read_text())
+        if run['phase'] != 'failed':
+            run.update(phase='failed', error='reset service ended without completing')
+        atomic_json(root / 'run.json', run)
+        for suffix in ('preparation', 'node0', 'node1'):
+            command('systemctl', 'stop', f'{config["service_prefix"]}-{suffix}.service')
+        command('systemctl', 'restart', f'{config["service_prefix"]}-controller.service')
 
 
 class Controller:
@@ -321,6 +378,9 @@ class Controller:
         with self.lock:
             run = json.loads((self.root / 'run.json').read_text())
             result = dict(run, observed_at=int(time.time()), nodes=[])
+            progress = self.root / 'seed-progress.json'
+            if run['phase'] == 'preparing' and progress.exists():
+                result['preparation'] = json.loads(progress.read_text())
             result.pop('activation_hash', None)
             try:
                 if run['phase'] not in ('preparing', 'failed'):
@@ -358,8 +418,10 @@ class Controller:
             result['countdown_seconds'] = max(0, run.get('mining_at', 0) - int(time.time()))
             result['config'] = participant_config(self.config, run)
             result['build_features'] = ['pq', 'internal-miner']
-            result['snapshot'] = {'url': '/snapshots/seed.tar.zst', 'sha256': self.config['seed_sha256'],
-                                  'height': self.config['seed_height'], 'network_directory': self.config['seed_network_directory']}
+            result['snapshot'] = {'url': '/snapshots/' + Path(self.config['seed_archive']).name, 'sha256': self.config['seed_sha256'],
+                                  'height': self.config['seed_height'], 'network_directory': self.config['seed_network_directory'],
+                                  'storage_mode': 'archive', 'synced_at': self.config.get('seed_synced_at'),
+                                  'source_url': self.config.get('source_snapshot_url')}
             return result
 
 
@@ -377,7 +439,20 @@ def serve(config):
             time.sleep(2)
 
     class Handler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            if self.path == '/snapshots/seed.tar.zst':
+                self.do_GET()
+            else:
+                self.send_error(405, 'Use GET for this endpoint')
+
         def do_GET(self):
+            if self.path == '/snapshots/seed.tar.zst':
+                self.send_response(307)
+                self.send_header('Location', '/snapshots/' + Path(controller.config['seed_archive']).name)
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             if self.path in ('/v1/network', '/v1/status', '/healthz'):
                 with status_lock:
                     body = json.dumps(status).encode()
@@ -437,12 +512,14 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=Path('/etc/zakura-custom-testnet.json'))
     commands = parser.add_subparsers(dest='action', required=True)
     reset_parser = commands.add_parser('reset')
-    reset_parser.add_argument('--activation-delay', type=activation_delay, default=300)
+    reset_parser.add_argument('--activation-delay', type=activation_delay, default=600)
     commands.add_parser('serve')
     commands.add_parser('status')
+    commands.add_parser('cleanup-reset')
     gate = commands.add_parser('check-node')
     gate.add_argument('--index', type=int, choices=(0, 1), required=True)
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, archive_seed.interrupt_operation)
     config = load_config(args.config)
     root = Path(config['root'])
     root.mkdir(parents=True, exist_ok=True)
@@ -450,12 +527,14 @@ def main(argv=None):
         serve(config)
     elif args.action == 'check-node':
         check_node(config, args.index)
+    elif args.action == 'cleanup-reset':
+        cleanup_failed_reset(config)
     elif args.action == 'status':
         print(json.dumps(Controller(config).sample(), indent=2))
     else:
         with (root / 'reset.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            print(json.dumps(reset(config, args.activation_delay), indent=2))
+            print(json.dumps(reset(config, args.activation_delay, args.config), indent=2))
 
 
 if __name__ == '__main__':

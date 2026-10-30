@@ -30,7 +30,7 @@ def install(config):
     network.atomic_json(marker, owner)
     directory = Path('/opt/zakura-custom-testnet')
     directory.mkdir(exist_ok=True)
-    for name in ('network.py', 'dashboard.html'):
+    for name in ('network.py', 'archive_seed.py', 'dashboard.html'):
         source = Path(__file__).with_name(name)
         if source.resolve() != (directory / name).resolve():
             shutil.copy2(source, directory / name)
@@ -45,6 +45,31 @@ def install(config):
     Path('/usr/local/bin/zakura-testnet').chmod(0o755)
     network.atomic_json(Path('/etc/zakura-custom-testnet.json'), config)
     prefix = config['service_prefix']
+    Path(f'/etc/systemd/system/{prefix}-preparation.service').write_text(f'''[Unit]
+Description=Prepare an archive seed from public Testnet
+After=network-online.target
+RequiresMountsFor={root}
+[Service]
+User={user}
+ExecStart={config['binary']} -c {root}/preparation.toml start
+TimeoutStopSec=90
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={root}/preparation /var/lib/zakura-testnet
+''')
+    Path(f'/etc/systemd/system/{prefix}-reset.service').write_text(f'''[Unit]
+Description=Refresh archive state and regenerate the custom Testnet
+After=network-online.target
+RequiresMountsFor={root}
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zakura-testnet reset --activation-delay 10m
+ExecStopPost=/usr/local/bin/zakura-testnet cleanup-reset
+TimeoutStartSec=3600
+TimeoutStopSec=120
+''')
     for index in range(2):
         unit = f'''[Unit]
 Description=Zakura custom Testnet validator {index}
@@ -82,8 +107,10 @@ WantedBy=multi-user.target
     Path('/etc/caddy/Caddyfile').write_text(f'''{domain} {{
     encode gzip zstd
     handle /snapshots/seed.tar.zst {{
+        reverse_proxy 127.0.0.1:8093
+    }}
+    handle_path /snapshots/* {{
         root * {Path(config['seed_archive']).parent}
-        rewrite * /{Path(config['seed_archive']).name}
         file_server
     }}
     handle {{
@@ -95,7 +122,7 @@ WantedBy=multi-user.target
     network.command('systemctl', 'daemon-reload')
     network.command('systemctl', 'enable', f'{prefix}-controller.service', f'{prefix}-node0.service', f'{prefix}-node1.service', 'caddy.service')
     network.command('systemctl', 'restart', 'caddy.service')
-    print('Installed. Start a fresh run with: zakura-testnet reset --activation-delay 5m')
+    print(f'Installed. Start a fresh run with: systemctl start --no-block {prefix}-reset.service')
 
 
 def main(argv=None):

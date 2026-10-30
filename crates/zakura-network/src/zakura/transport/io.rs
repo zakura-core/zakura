@@ -436,11 +436,31 @@ impl GuardedFrameSlot<'_> {
 
     /// Publish a request whose ownership must be claimed before its first
     /// byte, as the release build does, with a new [`OutputLife`] if the
-    /// queue is tapped. The life is `Enqueued` right after the insert, so a
-    /// false result after a real enqueue still ends it from that phase.
+    /// queue is tapped (see [`Self::send_request_with_life`]).
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn send_request(self, frame: Frame, claim: Arc<dyn FrameWriteClaim>) -> bool {
-        let life = self.tap.map(|tap| OutputLife::new(tap, &frame));
+        let life = self.allocate(&frame);
+        self.send_request_with_life(frame, claim, life)
+    }
+
+    /// The life of `frame`, an output about to be sent through this slot, if
+    /// the queue is tapped. It reports `OutputAllocated` now.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn allocate(&self, frame: &Frame) -> Option<OutputLife> {
+        self.tap.map(|tap| OutputLife::new(tap, frame))
+    }
+
+    /// [`Self::send_request`] with the `life` its caller made before it
+    /// could wait or be refused. The life is `Enqueued` right after the
+    /// insert, so a false result after a real enqueue still ends it from
+    /// that phase.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_request_with_life(
+        self,
+        frame: Frame,
+        claim: Arc<dyn FrameWriteClaim>,
+        life: Option<OutputLife>,
+    ) -> bool {
         if self.sender.is_closed() {
             return false;
         }
@@ -873,7 +893,7 @@ fn map_queued_try_send_error(
 }
 
 #[cfg(test)]
-mod output_tests;
+pub(crate) mod output_tests;
 
 #[cfg(test)]
 mod tests {

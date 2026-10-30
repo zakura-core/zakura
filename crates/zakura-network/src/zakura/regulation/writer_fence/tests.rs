@@ -401,3 +401,59 @@ proptest! {
         }
     }
 }
+
+/// A fenced send makes its output's life before publication can refuse it
+/// or the async form can wait, so a refused `Open`, a fenced send dropped
+/// before its first poll, and one cancelled while it waits for queue space
+/// each end their output `not-queued` (M6a-6).
+///
+/// This fails if the life is made in `send_request`, after publication.
+#[test]
+fn a_refused_or_dropped_fenced_send_ends_not_queued() {
+    use crate::zakura::{
+        transport::output_tests::{frame, poll_once, tapped, Life},
+        OutputOutcome,
+    };
+
+    let (retired, _connection, _) = fence();
+    let (send, _recv, recorder) = tapped(2);
+    let exchange = retired.open().unwrap();
+    assert!(retired.retire());
+    let slot = send.try_reserve_guarded().expect("the queue has a slot");
+    assert_eq!(
+        slot.send_fenced(frame(1), &exchange.writer()),
+        Err(FencedSendError::Fenced)
+    );
+    assert_eq!(
+        recorder.lives(),
+        [
+            (0, Life::Allocated),
+            (0, Life::Ended(OutputOutcome::NotQueued))
+        ]
+    );
+
+    let (open, _connection, _) = fence();
+    let (send, _recv, recorder) = tapped(1);
+    let exchange = open.open().unwrap();
+    let writer = exchange.writer();
+    drop(send.send_fenced(frame(1), &writer));
+    send.try_send(frame(2)).expect("the queue has a slot");
+    {
+        let mut waiting = std::pin::pin!(send.send_following(frame(3), &writer));
+        assert!(
+            poll_once(waiting.as_mut()).is_pending(),
+            "the queue is full"
+        );
+    }
+    assert_eq!(
+        recorder.lives(),
+        [
+            (0, Life::Allocated),
+            (0, Life::Ended(OutputOutcome::NotQueued)),
+            (1, Life::Allocated),
+            (1, Life::Enqueued(0)),
+            (2, Life::Allocated),
+            (2, Life::Ended(OutputOutcome::NotQueued)),
+        ]
+    );
+}

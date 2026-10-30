@@ -28,6 +28,8 @@ pub(crate) use guard::BudgetObserver;
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 #[cfg(any(test, zakura_sim))]
 pub use guard::{BudgetChange, BudgetChangeKind};
+#[cfg(test)]
+pub(crate) use io::output_tests;
 #[cfg(any(test, zakura_sim))]
 pub(crate) use io::OutputLife;
 pub use io::{framed_channel, FramedRecv, FramedSend};

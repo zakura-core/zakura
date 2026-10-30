@@ -310,6 +310,7 @@ impl FramedSend {
     ///
     /// If the fence retires before the first byte, the transport skips the
     /// frame.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) async fn send_fenced(
         &self,
         frame: Frame,
@@ -330,6 +331,7 @@ impl FramedSend {
     /// The transport writes `frame` only if the request's first byte was
     /// written first and the fence has not retired since, so retirement skips
     /// `frame` whether or not it skipped the request.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) async fn send_following(
         &self,
         frame: Frame,
@@ -341,11 +343,49 @@ impl FramedSend {
             .map_err(|_| FencedSendError::Closed)?;
         slot.send_following(frame, writer)
     }
+
+    /// [`Self::send_fenced`] as the release build runs it, with the frame's
+    /// output life made before the wait for a slot, so a send cancelled or
+    /// refused before publication still ends its output (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_fenced<'a>(
+        &'a self,
+        frame: Frame,
+        writer: &'a ExchangeWriter,
+    ) -> impl std::future::Future<Output = Result<(), FencedSendError>> + 'a {
+        let life = self.allocate(&frame);
+        async move {
+            let slot = self
+                .reserve_guarded()
+                .await
+                .map_err(|_| FencedSendError::Closed)?;
+            slot.send_fenced_with_life(frame, writer, life)
+        }
+    }
+
+    /// [`Self::send_following`] as the release build runs it, with the
+    /// frame's output life made before the wait for a slot.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_following<'a>(
+        &'a self,
+        frame: Frame,
+        writer: &'a ExchangeWriter,
+    ) -> impl std::future::Future<Output = Result<(), FencedSendError>> + 'a {
+        let life = self.allocate(&frame);
+        async move {
+            let slot = self
+                .reserve_guarded()
+                .await
+                .map_err(|_| FencedSendError::Closed)?;
+            slot.send_following_with_life(frame, writer, life)
+        }
+    }
 }
 
 impl GuardedFrameSlot<'_> {
     /// Publish `frame` into this reserved slot under `writer`'s fence, as
     /// [`FramedSend::send_fenced`] does without waiting.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn send_fenced(
         self,
         frame: Frame,
@@ -368,12 +408,78 @@ impl GuardedFrameSlot<'_> {
     /// Queue `frame` into this reserved slot to follow the request of
     /// `writer`'s exchange, as [`FramedSend::send_following`] does without
     /// waiting.
+    #[cfg(not(any(test, zakura_sim)))]
     pub(crate) fn send_following(
         self,
         frame: Frame,
         writer: &ExchangeWriter,
     ) -> Result<(), FencedSendError> {
         if self.send_request(frame, Arc::new(FollowingWrite(writer.clone()))) {
+            Ok(())
+        } else {
+            Err(FencedSendError::Closed)
+        }
+    }
+
+    /// Publish `frame` into this reserved slot under `writer`'s fence, as
+    /// the release build does. Its output life is made first, so a fence
+    /// that refuses publication still ends it `not-queued` (M6a-6).
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_fenced(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        let life = self.allocate(&frame);
+        self.send_fenced_with_life(frame, writer, life)
+    }
+
+    /// [`Self::send_fenced`] with the `life` its caller made.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_fenced_with_life(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+        life: Option<crate::zakura::transport::OutputLife>,
+    ) -> Result<(), FencedSendError> {
+        let slot = self;
+        let mut queued = false;
+        // A refused publication drops the closure, and the life with it.
+        if !writer.publish(|| {
+            queued =
+                slot.send_request_with_life(frame, Arc::new(FencedWrite(writer.clone())), life);
+        }) {
+            return Err(FencedSendError::Fenced);
+        }
+        if queued {
+            Ok(())
+        } else {
+            Err(FencedSendError::Closed)
+        }
+    }
+
+    /// Queue `frame` into this reserved slot to follow the request of
+    /// `writer`'s exchange, as the release build does, with its output life
+    /// made first.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_following(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        let life = self.allocate(&frame);
+        self.send_following_with_life(frame, writer, life)
+    }
+
+    /// [`Self::send_following`] with the `life` its caller made.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn send_following_with_life(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+        life: Option<crate::zakura::transport::OutputLife>,
+    ) -> Result<(), FencedSendError> {
+        if self.send_request_with_life(frame, Arc::new(FollowingWrite(writer.clone())), life) {
             Ok(())
         } else {
             Err(FencedSendError::Closed)

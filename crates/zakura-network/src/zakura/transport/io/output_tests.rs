@@ -25,7 +25,7 @@ const STREAM: u64 = 4;
 
 /// Records every event in order.
 #[derive(Debug, Default)]
-struct Recorder(Mutex<Vec<TransportEvent>>);
+pub(crate) struct Recorder(Mutex<Vec<TransportEvent>>);
 
 impl TransportObserver for Recorder {
     fn observe(&self, event: TransportEvent) {
@@ -38,7 +38,7 @@ impl TransportObserver for Recorder {
 
 impl Recorder {
     /// The output events recorded so far, as `(output, what)`.
-    fn lives(&self) -> Vec<(u64, Life)> {
+    pub(crate) fn lives(&self) -> Vec<(u64, Life)> {
         self.0
             .lock()
             .expect("no test panics holding it")
@@ -60,7 +60,7 @@ impl Recorder {
 
 /// One output event, in [`Recorder::lives`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Life {
+pub(crate) enum Life {
     Allocated,
     Enqueued(u64),
     Dequeued,
@@ -69,7 +69,7 @@ enum Life {
 
 /// A tapped worker queue of `depth` frames, as `spawn_service_session`
 /// builds it, and what its tap records.
-fn tapped(depth: usize) -> (FramedSend, FramedWorkerRecv, Arc<Recorder>) {
+pub(crate) fn tapped(depth: usize) -> (FramedSend, FramedWorkerRecv, Arc<Recorder>) {
     let recorder = Arc::new(Recorder::default());
     let conn = Arc::new(ConnTap::new(
         recorder.clone(),
@@ -81,7 +81,7 @@ fn tapped(depth: usize) -> (FramedSend, FramedWorkerRecv, Arc<Recorder>) {
     (send.observed(Some(tap)), recv, recorder)
 }
 
-fn frame(payload: u8) -> Frame {
+pub(crate) fn frame(payload: u8) -> Frame {
     Frame {
         message_type: 3,
         flags: 0,
@@ -90,7 +90,7 @@ fn frame(payload: u8) -> Frame {
 }
 
 /// Polls `future` once with a no-op waker.
-fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+pub(crate) fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(std::task::Waker::noop()))
 }
 

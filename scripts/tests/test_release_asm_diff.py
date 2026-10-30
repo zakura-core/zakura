@@ -371,27 +371,6 @@ class AlignmentTests(unittest.TestCase):
         _, made = aligned("\n".join(SOURCE), "\n".join(head), other)
         self.assertEqual(made, [[("lib.rs", 2, 2)], []])
 
-    def test_padding_an_embedded_file_with_only_blank_lines_is_refused(self):
-        """A blank-line change to a file another embeds would pad to the same text, so it's refused."""
-        blank = "\n".join(SOURCE[:2] + ["", ""] + SOURCE[2:])
-        for embed in ("include_str!(\"lib.rs\")", "include_str!(r\"lib.rs\")", "include_str! [r#\"lib.rs\"#]",
-                      "include_str!(\"li\\x62.rs\")", "include_str!(\"lib\\q.rs\")"):
-            with self.assertRaises(asm_diff.PaddingError, msg=embed):
-                aligned("\n".join(SOURCE), blank, {"main.rs": "const S: &str = %s;\n" % embed})
-        embeds = {"main.rs": "const SOURCE: &str = include_str!(\"lib.rs\");\n"}
-        _, made = aligned("\n".join(SOURCE), "\n".join(SOURCE[:2] + ["    let b = 2;"] + SOURCE[2:]), embeds)
-        self.assertEqual(made, [[("lib.rs", 2, 1)], []])
-
-    def test_padding_with_an_unresolved_embed_is_refused(self):
-        """An embed whose path isn't a literal could name a padded file, so it refuses padding."""
-        head = "\n".join(SOURCE[:2] + ["    let b = 2;"] + SOURCE[2:])
-        unresolved = {"main.rs": "const S: &str = include_str!(concat!(\"lib\", \".rs\"));\n"}
-        with self.assertRaises(asm_diff.PaddingError):
-            aligned("\n".join(SOURCE), head, unresolved)
-        generated = {"main.rs": "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n"}
-        _, made = aligned("\n".join(SOURCE), head, generated)
-        self.assertEqual(made, [[("lib.rs", 2, 1)], []])
-
     def test_literals_and_lifetimes_are_told_apart(self):
         """Char literals, lifetimes, nested comments, escaped newlines and raw strings are lexed right."""
         text = "\n".join([
@@ -480,8 +459,10 @@ exit 7
 # A fake `cargo` that "builds" the crate `-p` names, `x` or `y`, as a Mach-O
 # file holding the line count of `crates/<crate>/lib.rs`, in an instruction
 # section when `FAKE_LINES_IN` is `code` and in a data section when it's
-# `data`, the way a line number reaches code or only data. Like cargo, it
-# skips a crate whose source is older than its last build.
+# `data`, the way a line number reaches code or only data. When it's
+# `embed`, the data section holds the source file itself, as
+# `use std::include_str as embed; static S: &str = embed!("lib.rs");` would.
+# Like cargo, it skips a crate whose source is older than its last build.
 FAKE_OBJECT_CARGO = """#!/usr/bin/env python3
 import json, os, struct, sys
 from pathlib import Path
@@ -498,14 +479,15 @@ if stamp.exists() and stamp.stat().st_mtime >= source.stat().st_mtime:
     sys.exit(0)
 stamp.write_text("")
 lines = struct.pack("<I", source.read_text().count("\\n"))
-code, data = (lines, b"same") if os.environ["FAKE_LINES_IN"] == "code" else (b"same", lines)
+mode = os.environ["FAKE_LINES_IN"]
+code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", source.read_bytes())}[mode]
 (deps / (crate + "-0.o")).write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
 """ % inspect.getsource(macho)
 
 
 class LineCheckTests(unittest.TestCase):
-    def run_gate(self, lines_in):
-        """Runs the gate on a cfg-only hook above `crates/x/lib.rs` code, with the fake object cargo."""
+    def run_gate(self, lines_in, head=None):
+        """Runs the gate on a change to `crates/x/lib.rs`, a cfg-only hook by default, with the fake object cargo."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             for crate in "xy":
@@ -513,7 +495,7 @@ class LineCheckTests(unittest.TestCase):
             (repo / "crates" / "y" / "lib.rs").write_text("\n".join(SOURCE))
             git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
             subprocess.run(git + ["init", "-q"], check=True)
-            hook = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+            hook = head or SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
             for lines in (SOURCE, hook):
                 (repo / "crates" / "x" / "lib.rs").write_text("\n".join(lines))
                 subprocess.run(git + ["add", "."], check=True)
@@ -547,6 +529,19 @@ class LineCheckTests(unittest.TestCase):
         status, output = self.run_gate("data")
         self.assertEqual(status, 0, output)
         self.assertIn("line check base x codegen-units=4: code unchanged by padding", output)
+
+    def test_an_aliased_embed_of_a_padded_file_fails(self):
+        """A padded file embedded in release data, under any macro name, exits 1, though padding made the builds equal."""
+        status, output = self.run_gate("embed", head=SOURCE[:2] + ["", ""] + SOURCE[2:])
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("embed check base x codegen-units=4: padded files embedded: crates/x/lib.rs", output)
+
+    def test_a_padded_file_that_is_not_embedded_passes_the_embed_check(self):
+        """A padded file whose text appears in no data section passes."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
 
     def test_unpadded_crates_rebuild_for_the_line_check(self):
         """A crate with no padded file still rebuilds for the committed tree, so its line check has objects."""

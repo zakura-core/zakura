@@ -15,9 +15,9 @@ when the two sides' objects and binaries match byte for byte:
     fixups or rebase and bind data, its exports and its dylibs on macOS, or
     every allocated section, relocations included, on Linux.
 
-The contract is "identical apart from source line numbers". Nothing is
-masked. Two things are made the same on both sides first, so that only
-real changes differ:
+The contract is "identical apart from source line numbers and the layout
+of padded source files". Nothing is masked. Two things are made the same on
+both sides first, so that only real changes differ:
 
   * Line numbers. A line added or removed in a `.rs` file moves every line
     below it, and line numbers live in release data, in panic locations and
@@ -26,19 +26,25 @@ real changes differ:
     Every unchanged line then has the same number on both sides. A blank
     line changes no token, so each side still builds the same code. Every
     padding is printed. Padding is refused inside a string literal or block
-    comment, and when a file another embeds changes only by blank lines or
-    an embed can't be resolved (see `align_tree`).
+    comment (see `pad_text`).
 
-    A padded side is also built as committed, and its instruction sections
-    must match the padded build byte for byte (see `run_line_checks`). So a
-    line number that reaches code, by any route, such as `line!` forwarded
-    through a macro, fails. A line number that reaches only data, such as a
-    panic location, a `tracing` callsite, or a `Location::caller().line()`
-    read at run time, is outside the contract.
+    A padded side is also built as committed. Its instruction sections must
+    match the padded build byte for byte (see `run_line_checks`), so a line
+    number that reaches code, by any route, such as `line!` forwarded
+    through a macro, fails. And no padded file's committed bytes may appear
+    in its data sections (see `run_embed_checks`), so a padded file that
+    `include_str!` or `include_bytes!` embeds, under any name, fails.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
     metadata (see `metadata_env`).
+
+Threat model: the gate catches accidental release changes from honest
+edits, such as cfg-only hooks that should compile to nothing. It doesn't
+defend against an author deliberately evading it. Out of scope: line
+numbers that reach only data (a panic location, a `tracing` callsite, a
+`Location::caller().line()` read at run time), values derived from an
+embedded file (a checksum, one byte), and deliberate evasion routes.
 
 `--explain` also emits assembly and, for each comparison that differs, says
 which functions and data blocks differ (see `lib/asm_explain.py`). It never
@@ -99,18 +105,9 @@ def parse_hunks(diff_text):
     ]
 
 
-class FileHunks(dict):
-    """`{path: hunks}` for the files both sides have, and in `blank_only` the ones whose every changed line is blank."""
-
-    def __init__(self):
-        """Starts empty."""
-        super().__init__()
-        self.blank_only = set()
-
-
 def parse_file_hunks(diff_text):
-    """Splits a `-U0` diff into a `FileHunks` for files that both sides have."""
-    files, path = FileHunks(), None
+    """Splits a `-U0` diff into `{path: hunks}` for files that both sides have."""
+    files, path = {}, None
     old = None
     for line in diff_text.splitlines():
         if line.startswith("--- "):
@@ -120,11 +117,8 @@ def parse_file_hunks(diff_text):
             path = new[2:] if old != "/dev/null" and new != "/dev/null" else None
             if path is not None:
                 files[path] = []
-                files.blank_only.add(path)
         elif line.startswith("@@") and path is not None:
             files[path].extend(parse_hunks(line))
-        elif line.startswith(("+", "-")) and path is not None and line[1:].strip():
-            files.blank_only.discard(path)
     return files
 
 
@@ -231,90 +225,6 @@ def pad_text(text, inserts, path="<text>"):
     return "\n".join(lines)
 
 
-INCLUDE_MACRO = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*")
-# A string placeholder in `code_text`'s output.
-PLACEHOLDER = re.compile(r"\x01(\d+)\x02")
-LITERAL_ARGUMENT = re.compile(r"\x01(\d+)\x02\s*[)\]}]")
-OUT_DIR_ARGUMENT = re.compile(r"concat\s*!\s*[(\[{]\s*env\s*!\s*[(\[{]\s*\x01(\d+)\x02")
-
-
-STRING_ESCAPE = re.compile(r"\\(?:x([0-7][0-9a-fA-F])|u\{([0-9a-fA-F_]{1,6})\}|\n\s*|(.))", re.S)
-SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", "'": "'", '"': '"'}
-
-
-def string_value(kind, body):
-    """The value of a string literal's body: a raw one as is, a plain one with its escapes decoded.
-
-    Returns None for an escape Rust doesn't accept, so a caller can refuse
-    rather than guess.
-    """
-    if kind == "raw":
-        return body
-    bad = []
-
-    def one(match):
-        """One escape's value."""
-        hex_code, unicode, simple = match.groups()
-        if hex_code:
-            return chr(int(hex_code, 16))
-        if unicode:
-            return chr(int(unicode.replace("_", ""), 16))
-        if simple is None:
-            return ""  # a line continuation
-        if simple not in SIMPLE_ESCAPES:
-            bad.append(simple)
-        return SIMPLE_ESCAPES.get(simple, "")
-
-    value = STRING_ESCAPE.sub(one, body)
-    return None if bad else value
-
-
-def code_text(text):
-    """Source text with comments dropped and each string literal replaced by a numbered placeholder.
-
-    Returns the text and the strings' values (see `string_value`), so token
-    patterns can't match inside a comment or a string.
-    """
-    out, strings = [], []
-    for kind, part in lex(text):
-        if kind == "code":
-            out.append(part)
-        elif kind in ("string", "raw"):
-            out.append("\x01%d\x02" % len(strings))
-            strings.append(string_value(kind, part))
-        else:
-            out.append(" ")
-    return "".join(out), strings
-
-
-def check_includes(tree, files, padded):
-    """Refuses padding when an embedded file's only change is blank lines, or an embed can't be resolved.
-
-    `include!`, `include_str!` and `include_bytes!` make a file's text part
-    of the program. A real change to that text still differs after padding,
-    so the bytes catch it, but a change of only blank lines would pad to the
-    same text on both sides. An argument other than a string literal, or
-    `concat!(env!("OUT_DIR"), ...)` for a generated file, could name a
-    padded file, so it refuses too.
-    """
-    for source in files:
-        code, strings = code_text(source.read_bytes().decode(errors="replace"))
-        for found in INCLUDE_MACRO.finditer(code):
-            literal = LITERAL_ARGUMENT.match(code, found.end())
-            generated = OUT_DIR_ARGUMENT.match(code, found.end())
-            path = strings[int(literal.group(1))] if literal else None
-            if literal and path is None:
-                raise PaddingError("%s embeds a path with an escape padding can't read" % source.relative_to(tree))
-            if literal:
-                target = (source.parent / path).resolve()
-                if target in padded:
-                    raise PaddingError("%s embeds %s, whose only change is blank lines"
-                                       % (source.relative_to(tree), target.relative_to(tree)))
-            elif not (generated and strings[int(generated.group(1))] == "OUT_DIR"):
-                raise PaddingError("%s embeds a file padding can't rule out: %s"
-                                   % (source.relative_to(tree), code[found.start():found.end() + 40].strip()))
-
-
 def rust_sources(tree):
     """Every `.rs` file in `tree` outside `target`."""
     return [path for path in sorted(tree.rglob("*.rs")) if path.relative_to(tree).parts[0] != "target"]
@@ -323,14 +233,11 @@ def rust_sources(tree):
 def align_tree(tree, file_hunks, side):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Refuses padding inside a literal (see `pad_text`), or when the
-    workspace embeds a file padding could make equal (see
-    `check_includes`). Returns the `(path, after_line, count)` paddings it
-    made.
+    Refuses padding inside a literal (see `pad_text`). Returns the
+    `(path, after_line, count)` paddings it made.
     """
     tree = Path(tree).resolve()
-    made, blank_padded = [], set()
-    blank_only = getattr(file_hunks, "blank_only", set())
+    made = []
     for path, hunks in sorted(file_hunks.items()):
         inserts = paddings(hunks)[0 if side == "base" else 1]
         if not inserts:
@@ -339,10 +246,6 @@ def align_tree(tree, file_hunks, side):
         text = file.read_bytes().decode(errors="surrogateescape")
         file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
-        if path in blank_only:
-            blank_padded.add(file.resolve())
-    if made:
-        check_includes(tree, rust_sources(tree), blank_padded)
     return made
 
 
@@ -557,6 +460,38 @@ def elf_image(data, code_only=False):
             applies = labels[info].encode() if relocates else b""
             image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + applies + b"\n" + contents
     return image
+
+
+def data_sections(path):
+    """The contents of every section of a Mach-O or ELF file that holds data, not instructions or debug info."""
+    data = Path(path).read_bytes()
+    out = []
+    if data[:4] == MACHO_MAGIC:
+        ncmds = struct.unpack_from("<I", data, 16)[0]
+        offset = 32
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from("<II", data, offset)
+            if cmd == LC_SEGMENT_64:
+                for j in range(struct.unpack_from("<I", data, offset + 64)[0]):
+                    sect = data[offset + 72 + 80 * j:offset + 152 + 80 * j]
+                    segname = sect[16:32].rstrip(b"\0")
+                    length = struct.unpack_from("<Q", sect, 40)[0]
+                    start, _, _, _, flags = struct.unpack_from("<IIIII", sect, 48)
+                    if segname in (b"__DWARF", b"__LLVM", b"__LINKEDIT") or flags & S_ATTR_INSTRUCTIONS:
+                        continue
+                    if flags & 0xFF not in S_ZEROFILL:
+                        out.append(data[start:start + length])
+            offset += size
+    elif data[:6] == ELF_MAGIC:
+        shoff = struct.unpack_from("<Q", data, 0x28)[0]
+        entsize, count, _ = struct.unpack_from("<HHH", data, 0x3A)
+        for i in range(count):
+            _, stype, flags, _, start, length, _, _, _, _ = struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * entsize)
+            if flags & SHF_ALLOC and not flags & SHF_EXECINSTR and stype != SHT_NOBITS:
+                out.append(data[start:start + length])
+    else:
+        raise ValueError("%s isn't a 64-bit little-endian Mach-O or ELF file" % path)
+    return out
 
 
 def runtime_image(path, code_only=False):
@@ -803,6 +738,25 @@ def run_line_checks(items):
     return status
 
 
+def run_embed_checks(items):
+    """Checks that no padded file is embedded in its side's release data, returning the worst exit status.
+
+    Each item is `(title, committed files, {path: committed bytes})`.
+    `include_str!` and `include_bytes!` store a file whole, whatever name
+    they're called by, so finding a padded file's committed bytes in a data
+    section means padding changed embedded data, which the padded
+    comparison can't vouch for.
+    """
+    status = EXIT_SAME
+    for title, files, padded in items:
+        sections = [section for path in files for section in data_sections(path)]
+        found = sorted(path for path, text in padded.items() if any(text in section for section in sections))
+        print("%s: %s" % (title, "padded files embedded: " + ", ".join(found) if found else "no padded file embedded"))
+        if found:
+            status = max(status, EXIT_DIFFERS)
+    return status
+
+
 def parse_args(argv):
     """Parses the command line."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -833,7 +787,7 @@ def main(argv=None):
         file_hunks = rust_hunks(repo, base, head)
         with rw.work_dir(args.work_dir) as work:
             inputs = metadata_env(work, repo, base)
-            built, checks = {}, []
+            built, checks, embeds = {}, [], []
             names = list(packages) + ([] if args.no_binary else [BINARY])
             for side, rev in (("base", base), ("head", head)):
                 with rw.worktree(repo, rev, work / "src") as tree:
@@ -847,6 +801,7 @@ def main(argv=None):
                         for variant in (("padded", "unpadded") if padded else ("padded",)):
                             if variant == "unpadded":
                                 rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
+                                committed = {path: (tree / path).read_bytes() for path, _, _ in padded}
                                 # Every crate rebuilds, so each emits its objects again.
                                 for source in rust_sources(tree):
                                     os.utime(source)
@@ -861,13 +816,15 @@ def main(argv=None):
                                         result = emit_lib(args.cargo, tree, target, inputs, name, crate, cgu, out, asm)
                                     built[variant, side, name, cgu] = result
                     if padded:
-                        checks.extend(
-                            ("line check %s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu),
-                             built["unpadded", side, name, cgu][0], built["padded", side, name, cgu][0])
-                            for name in names for cgu in cgus)
+                        for name in names:
+                            for cgu in cgus:
+                                label = "%s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu)
+                                unpadded = built["unpadded", side, name, cgu][0]
+                                checks.append(("line check " + label, unpadded, built["padded", side, name, cgu][0]))
+                                embeds.append(("embed check " + label, unpadded, committed))
             padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
             status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
-            return max(status, run_line_checks(checks))
+            return max(status, run_line_checks(checks), run_embed_checks(embeds))
     except PaddingError as error:
         print("error: %s" % error, file=sys.stderr)
         return rw.EXIT_COMMAND_FAILED

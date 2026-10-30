@@ -44,6 +44,9 @@ pub struct BuildIdentity {
     pub package: String,
     /// The fuzz target.
     pub target: String,
+    /// The registered harness the target runs, from the fuzz package's
+    /// `[package.metadata.zakura-sim.targets]` table.
+    pub harness: String,
     /// `HEAD`'s commit.
     pub git: String,
     /// True if the checkout had any change under the source paths or the
@@ -73,9 +76,10 @@ pub struct BuildIdentity {
 impl BuildIdentity {
     /// The names of the fields in which `self` and `other` differ.
     pub fn differences(&self, other: &BuildIdentity) -> Vec<&'static str> {
-        let fields: [(&'static str, bool); 12] = [
+        let fields: [(&'static str, bool); 13] = [
             ("package", self.package == other.package),
             ("target", self.target == other.target),
+            ("harness", self.harness == other.harness),
             ("git", self.git == other.git),
             ("dirty", self.dirty == other.dirty),
             ("source", self.source == other.source),
@@ -210,6 +214,15 @@ pub fn build_fuzzer(
     target_dir: &Path,
 ) -> Result<(PathBuf, BuildIdentity), CampaignError> {
     let package = repo.join(FUZZ_PACKAGE);
+    let manifest = package.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest)
+        .map_err(CampaignError::io(format!("reading {}", manifest.display())))?;
+    let harness = target_harness(&manifest_text, target).ok_or_else(|| {
+        CampaignError::Refused(format!(
+            "{} maps no harness to fuzz target {target} in [package.metadata.zakura-sim.targets]",
+            manifest.display()
+        ))
+    })?;
     let mut cargo_args: Vec<String> = vec!["--sanitizer".to_owned(), sanitizer.to_owned()];
     if sanitizer == "none" {
         cargo_args.push("--no-default-features".to_owned());
@@ -250,6 +263,7 @@ pub fn build_fuzzer(
     let identity = BuildIdentity {
         package: FUZZ_PACKAGE.to_owned(),
         target: target.to_owned(),
+        harness,
         git: checkout.git,
         dirty: checkout.dirty,
         source: checkout.source,
@@ -301,6 +315,21 @@ fn output(command: &mut Command) -> Result<String, CampaignError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The harness that fuzz target `target` runs, from the
+/// `[package.metadata.zakura-sim.targets]` table of the fuzz package's
+/// manifest `manifest`, if the table maps one.
+fn target_harness(manifest: &str, target: &str) -> Option<String> {
+    let manifest: toml::Value = toml::from_str(manifest).ok()?;
+    manifest
+        .get("package")?
+        .get("metadata")?
+        .get("zakura-sim")?
+        .get("targets")?
+        .get(target)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// The version of package `name` in the lockfile `lock`, if it locks one.
 fn locked_version(lock: &str, name: &str) -> Option<String> {
     let lock: toml::Value = toml::from_str(lock).ok()?;
@@ -324,5 +353,21 @@ mod tests {
         let version = locked_version(lock, "libfuzzer-sys").expect("the fuzz package locks it");
         assert!(version.starts_with("0."), "{version}");
         assert_eq!(locked_version(lock, "no-such-package"), None);
+    }
+
+    /// The fuzz package maps each of its targets to a registered harness.
+    #[test]
+    fn every_fuzz_target_runs_a_registered_harness() {
+        let text = include_str!("../../../../qa/fuzz/sim/Cargo.toml");
+        let manifest: toml::Value = toml::from_str(text).unwrap();
+        let targets = manifest["bin"].as_array().unwrap();
+        assert!(!targets.is_empty());
+        for target in targets {
+            let name = target["name"].as_str().unwrap();
+            let harness = target_harness(text, name)
+                .unwrap_or_else(|| panic!("fuzz target {name} maps no harness"));
+            crate::harness::find(&harness).unwrap();
+        }
+        assert_eq!(target_harness(text, "no_such_target"), None);
     }
 }

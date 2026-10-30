@@ -490,6 +490,7 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
     let build = store.read_build(&options.build)?;
     let runner = BuildInfo::current();
     check_runner(&runner, &build)?;
+    check_harness(&build, options.harness.name)?;
     let harness = HarnessRecord::of(options.harness)?;
     let (segment, previous) = match &options.parent {
         None => {
@@ -629,6 +630,7 @@ pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared,
     }
     let runner = BuildInfo::current();
     check_runner(&runner, &build)?;
+    check_harness(&build, &parent.harness.name)?;
     let entry = crate::harness::find(&parent.harness.name)
         .map_err(|error| CampaignError::Refused(error.to_string()))?;
     let harness = HarnessRecord::of(entry)?;
@@ -703,6 +705,18 @@ fn check_runner(runner: &BuildInfo, build: &FuzzBuild) -> Result<(), CampaignErr
             "this zakura-sim comes from commit {}, and fuzzer {} from commit {}; build both \
              from one checkout",
             runner.git, build.binary, build.identity.git
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a fuzzer whose target runs another harness than `harness`, so a
+/// manifest never names a harness its fuzzer doesn't run.
+fn check_harness(build: &FuzzBuild, harness: &str) -> Result<(), CampaignError> {
+    if build.identity.harness != harness {
+        return Err(CampaignError::Refused(format!(
+            "fuzzer {} is target {}, which runs harness {}, not {harness}",
+            build.binary, build.identity.target, build.identity.harness
         )));
     }
     Ok(())

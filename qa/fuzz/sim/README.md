@@ -112,11 +112,13 @@ main.
 `cargo xtask sim-campaign` runs `zakura-sim campaign`. Its subcommands:
 
 - `build` builds a target with the pinned nightly and cargo-fuzz, and saves
-  the binary in the store with a build record: the commit, whether the tree
-  was dirty, the source and lockfile digests, `rustc`, cargo-fuzz and
+  the binary in the store with a build record: the harness the target runs,
+  from `[package.metadata.zakura-sim.targets]` in `Cargo.toml`, the commit,
+  whether the tree was dirty, the source and lockfile digests, `rustc`, cargo-fuzz and
   `libfuzzer-sys` versions, `RUSTFLAGS` and the sanitizer. The build is named
   by the binary's SHA-256.
-- `start` writes a run manifest and runs it. The manifest records the build,
+- `start` writes a run manifest and runs it. It refuses a build whose target
+  runs another harness than `--sim`. The manifest records the build,
   the `zakura-sim` binary that wrote it, the harness's versions, properties
   and simulator limits, the feedback line the target logs at startup (none
   for a target without a collector), the suite manifest's digest, each

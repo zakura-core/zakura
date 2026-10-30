@@ -257,6 +257,7 @@ fn identity() -> BuildIdentity {
     BuildIdentity {
         package: FUZZ_PACKAGE.to_owned(),
         target: "stub".to_owned(),
+        harness: SIM.to_owned(),
         git: BuildInfo::current().git,
         dirty: false,
         source: "stub-source".to_owned(),
@@ -822,6 +823,30 @@ fn incompatible_runs_start_a_new_segment() {
         "the seeds are already in the carried snapshot"
     );
     assert!(inputs(&fixture.store, &end.snapshot).len() > 1);
+}
+
+/// A run's manifest names the harness its fuzzer runs: `start` refuses a
+/// build whose target runs another harness than `--sim`.
+#[test]
+fn a_run_names_the_harness_its_fuzzer_runs() {
+    let fixture = Fixture::new();
+    let mut fixtures = identity();
+    fixtures.target = "race_fixtures".to_owned();
+    fixtures.harness = "fixtures/all".to_owned();
+    let mut options = fixture.options(1, 1);
+    options.build = fixture
+        .store
+        .save_build(&fixture.variant("fixtures"), fixtures)
+        .unwrap()
+        .binary;
+    let refused = campaign::prepare_start(&fixture.store, options).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("runs harness fixtures/all, not"),
+        "{refused}"
+    );
+    assert!(fixture.store.manifests().unwrap().is_empty());
 }
 
 /// A dirty build, or one with unknown provenance, resumes only on its own

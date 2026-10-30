@@ -392,6 +392,13 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(base[-2:], head[-2:])
         self.assertTrue(base[-2].startswith("// zakura-release-gate embed probe "), base)
 
+    def test_a_probe_after_a_closed_comment_at_the_end_is_allowed(self):
+        """A file that ends with a closed block comment and no final newline takes its probe on a new line."""
+        (base, head), _ = aligned("fn a() {}\nfn b() {}\n/* done */", "fn a() {}\n#[cfg(test)]\nfn t() {}\nfn b() {}\n/* done */")
+        self.assertEqual(base[-3], "/* done */")
+        self.assertEqual(base[-2:], head[-2:])
+        self.assertTrue(base[-2].startswith("// zakura-release-gate embed probe "), base)
+
     def test_a_probe_inside_a_literal_is_refused(self):
         """A file that ends inside a raw string or block comment can't take a probe."""
         for tail in ('r#"open', "/* open"):

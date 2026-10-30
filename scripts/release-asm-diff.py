@@ -153,9 +153,10 @@ def lex(text):
 
     A `string` or `raw` segment is a string or raw string literal's body,
     without its quotes, prefix or hashes. Char literals stay in `code`, and lifetimes too. An
-    unterminated literal or block comment runs to the end of the text.
+    unterminated literal or block comment runs to the end of the text, and
+    a closed one at the very end is followed by an empty `code` segment.
     """
-    segments, i, start, n = [], 0, 0, len(text)
+    segments, i, start, n, closed = [], 0, 0, len(text), False
     while i < n:
         stop = CODE_STOP.search(text, i)
         if not stop:
@@ -180,20 +181,23 @@ def lex(text):
                     break
             else:
                 j = n
+            closed = depth == 0
             segments.append(("block", text[i:j]))
         elif mark.endswith('"') and "r" in mark:
             close = '"' + mark[mark.index("r") + 1:-1]
             k = text.find(close, stop.end())
+            closed = k >= 0
             k = n if k < 0 else k
             segments.append(("raw", text[stop.end():k]))
             j = min(n, k + len(close))
         else:
             body = STRING_END.match(text, stop.end())
+            closed = bool(body)
             k = body.end() - 1 if body else n
             segments.append(("string", text[stop.end():k]))
             j = min(n, k + 1)
         i = start = j
-    if start < n:
+    if start < n or (segments and closed):
         segments.append(("code", text[start:]))
     return segments
 

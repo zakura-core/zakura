@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import io
 import os
 import struct
@@ -83,21 +84,36 @@ def macho_object(symbols, relocations, bitcode=b"bc"):
     return header + segment + symtab + text + bitcode + relocs + entries + strings
 
 
-def elf(sections):
-    """A minimal 64-bit ELF file. `sections` lists `(name, type, flags, contents, info)`."""
-    names = b"\0" + b"".join(name.encode() + b"\0" for name, *_ in sections) + b".shstrtab\0"
-    payload, headers, offset, name_at = b"", [b"\0" * 64], 64, 1
-    for name, stype, flags, contents, info in sections:
+def elf(sections, elf_type=2, program_headers=()):
+    """A minimal 64-bit ELF file.
+
+    `sections` lists `(name, type, flags, contents, info, link)`, and
+    `program_headers` lists `(type, flags)`.
+    """
+    names = b"\0" + b"".join(section[0].encode() + b"\0" for section in sections) + b".shstrtab\0"
+    phdrs = b"".join(struct.pack("<IIQQQQQQ", ptype, flags, 0, 0, 0, 0, 0, 16) for ptype, flags in program_headers)
+    offset = 64 + len(phdrs)
+    payload, headers, name_at = b"", [b"\0" * 64], 1
+    for name, stype, flags, contents, info, link in sections:
         headers.append(struct.pack("<IIQQQQIIQQ", name_at, stype, flags, 0, offset + len(payload),
-                                   len(contents), 0, info, 1, 0))
+                                   len(contents), link, info, 1, 24 if stype == 2 else 0))
         name_at += len(name) + 1
         payload += contents
     headers.append(struct.pack("<IIQQQQIIQQ", name_at, 3, 0, 0, offset + len(payload), len(names), 0, 0, 1, 0))
     payload += names
     header = (b"\x7fELF\x02\x01\x01" + b"\0" * 9
-              + struct.pack("<HHIQQQIHHHHHH", 2, 0xB7, 1, 0x400000, 0, offset + len(payload), 0, 64, 0, 0, 64,
-                            len(headers), len(headers) - 1))
-    return header + payload + b"".join(headers)
+              + struct.pack("<HHIQQQIHHHHHH", elf_type, 0xB7, 1, 0x400000, 64 if phdrs else 0, offset + len(payload),
+                            0, 64, 56, len(program_headers), 64, len(headers), len(headers) - 1))
+    return header + phdrs + payload + b"".join(headers)
+
+
+def elf_object(target):
+    """A minimal ELF object whose one `.text` relocation targets section symbol 1 (`.data.x`) or 2 (`.data.y`)."""
+    symbols = (b"\0" * 24 + struct.pack("<IBBHQQ", 0, 3, 0, 2, 0, 0) + struct.pack("<IBBHQQ", 0, 3, 0, 3, 0, 0))
+    rela = struct.pack("<QQq", 0, (target << 32) | 257, 0)
+    return elf([(".text", 1, 6, b"code", 0, 0), (".data.x", 1, 3, b"xxxxxxxx", 0, 0), (".data.y", 1, 3, b"yyyyyyyy", 0, 0),
+                (".rela.text", 4, 0x40, rela, 1, 5), (".symtab", 2, 0, symbols, 3, 6), (".strtab", 3, 0, b"\0", 0, 0)],
+               elf_type=1)
 
 
 TEXT = ("__TEXT", "__text", b"\x1f\x20\x03\xd5" * 4, 0x80000400)
@@ -210,15 +226,62 @@ class ImageTests(unittest.TestCase):
 
         def build(rela=b"r1", debug=b"d1", build_id=b"b1"):
             """A crafted ELF file with one changeable section of each kind, `.rela.text` applying to `.text`."""
-            return elf([(".text", 1, 6, b"code", 0), (".data.rel.ro", 1, 3, b"vtable", 0),
-                        (".rela.text", 4, 0x40, rela, 1), (".debug_info", 1, 0, debug, 0),
-                        (".note.gnu.build-id", 7, 2, build_id, 0)])
+            return elf([(".text", 1, 6, b"code", 0, 0), (".data.rel.ro", 1, 3, b"vtable", 0, 0),
+                        (".rela.text", 4, 0x40, rela, 1, 0), (".debug_info", 1, 0, debug, 0, 0),
+                        (".note.gnu.build-id", 7, 2, build_id, 0, 0)])
 
         status, out = image_status(build(), build(debug=b"d2", build_id=b"b2"))
         self.assertEqual(status, 0, out)
         status, out = image_status(build(), build(rela=b"r2"))
         self.assertEqual(status, 1, out)
         self.assertIn("section .rela.text", out)
+
+    def test_elf_section_symbol_targets_stay_apart(self):
+        """An ELF object relocation that moves between two unnamed section symbols fails."""
+        status, out = image_status(elf_object(1), elf_object(1))
+        self.assertEqual(status, 0, out)
+        status, out = image_status(elf_object(1), elf_object(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.text", out)
+
+    def test_elf_sections_that_share_a_name_are_each_compared(self):
+        """Two `.text` sections, as COMDAT groups give, are compared one by one."""
+
+        def build(first):
+            """An ELF file with two `.text` sections."""
+            return elf([(".text", 1, 6, first, 0, 0), (".text", 1, 6, b"two", 0, 0)])
+
+        status, out = image_status(build(b"one"), build(b"One"))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .text:", out)
+
+    def test_elf_relocations_keep_the_section_they_apply_to(self):
+        """A relocation section that moves to another target section fails, though its entries are the same."""
+
+        def build(target):
+            """An ELF executable whose `.rela.text` applies to section `target`."""
+            return elf([(".text", 1, 6, b"code", 0, 0), (".data", 1, 3, b"data", 0, 0),
+                        (".rela.text", 4, 0x40, b"r1", target, 0)])
+
+        status, out = image_status(build(1), build(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.text", out)
+
+        def twins(target):
+            """An ELF executable with two `.data` sections, whose `.rela.data` applies to one of them."""
+            return elf([(".data", 1, 3, b"one", 0, 0), (".data", 1, 3, b"two", 0, 0),
+                        (".rela.data", 4, 0x40, b"r1", target, 0)])
+
+        status, out = image_status(twins(1), twins(2))
+        self.assertEqual(status, 1, out)
+        self.assertIn("section .rela.data", out)
+
+    def test_elf_program_headers_count(self):
+        """An executable stack, which only a program header records, fails."""
+        stack = 0x6474E551
+        status, out = image_status(elf([], program_headers=[(stack, 6)]), elf([], program_headers=[(stack, 7)]))
+        self.assertEqual(status, 1, out)
+        self.assertIn("program header 0", out)
 
     def test_a_generic_change_shows_in_the_binary(self):
         """A change that only the binary holds fails there, though every library matches."""
@@ -240,15 +303,18 @@ class ImageTests(unittest.TestCase):
         self.assertIn("binary zakurad codegen-units=4: 1 files: differs", out.getvalue())
 
 
-def aligned(base_text, head_text):
+def aligned(base_text, head_text, extra=None):
     """Pads two versions of one `.rs` file as the gate does, through a real `git diff`.
 
-    Returns each side's padded lines and the paddings each side made.
+    `extra` maps other file names to text both versions share. Returns each
+    side's padded lines and the paddings each side made.
     """
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(git + ["init", "-q"], check=True)
+        for name, text in (extra or {}).items():
+            (repo / name).write_text(text)
         revs = []
         for text in (base_text, head_text):
             (repo / "lib.rs").write_text(text)
@@ -297,6 +363,13 @@ class AlignmentTests(unittest.TestCase):
             head = "fn f() {\n    let s = %sone\nthree\nfour\ntwo%s;\n}\n" % (opener, closer)
             with self.assertRaises(asm_diff.PaddingError, msg=opener):
                 aligned(base, head)
+
+    def test_a_forwarded_line_macro_is_left_to_the_line_check(self):
+        """Padding doesn't scan for `line!`; a line number that reaches code fails the build-level line check."""
+        head = SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+        other = {"other.rs": "macro_rules! forward { ($m:ident) => { $m!() } }\nfn here() -> u32 { forward!(line) }\n"}
+        _, made = aligned("\n".join(SOURCE), "\n".join(head), other)
+        self.assertEqual(made, [[("lib.rs", 2, 2)], []])
 
     def test_literals_and_lifetimes_are_told_apart(self):
         """Char literals, lifetimes, nested comments, escaped newlines and raw strings are lexed right."""
@@ -381,6 +454,100 @@ echo "$(git rev-parse HEAD) $(git describe --always --tags --match 'v*.*.*') $SO
 [ "$(wc -l < "$FAKE_CARGO_LOG")" -le "${FAKE_CARGO_PASSES:-0}" ] && exit 0
 exit 7
 """
+
+
+# A fake `cargo` that "builds" the crate `-p` names, `x` or `y`, as a Mach-O
+# file holding the line count of `crates/<crate>/lib.rs`, in an instruction
+# section when `FAKE_LINES_IN` is `code` and in a data section when it's
+# `data`, the way a line number reaches code or only data. When it's
+# `embed`, the data section holds the source file itself, as
+# `use std::include_str as embed; static S: &str = embed!("lib.rs");` would.
+# Like cargo, it skips a crate whose source is older than its last build.
+FAKE_OBJECT_CARGO = """#!/usr/bin/env python3
+import json, os, struct, sys
+from pathlib import Path
+%s
+if sys.argv[1] == "metadata":
+    print(json.dumps({"packages": [{"name": name, "targets": [{"name": name, "kind": ["lib"]}]} for name in "xy"]}))
+    sys.exit(0)
+crate = sys.argv[sys.argv.index("-p") + 1]
+source = Path("crates") / crate / "lib.rs"
+deps = Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "deps"
+deps.mkdir(parents=True, exist_ok=True)
+stamp = deps / (crate + ".stamp")
+if stamp.exists() and stamp.stat().st_mtime >= source.stat().st_mtime:
+    sys.exit(0)
+stamp.write_text("")
+lines = struct.pack("<I", source.read_text().count("\\n"))
+mode = os.environ["FAKE_LINES_IN"]
+code, data = {"code": (lines, b"same"), "data": (b"same", lines), "embed": (b"same", source.read_bytes())}[mode]
+(deps / (crate + "-0.o")).write_bytes(macho([("__TEXT", "__text", code, 0x80000400), ("__DATA_CONST", "__const", data, 0)]))
+""" % inspect.getsource(macho)
+
+
+class LineCheckTests(unittest.TestCase):
+    def run_gate(self, lines_in, head=None):
+        """Runs the gate on a change to `crates/x/lib.rs`, a cfg-only hook by default, with the fake object cargo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            for crate in "xy":
+                (repo / "crates" / crate).mkdir(parents=True)
+            (repo / "crates" / "y" / "lib.rs").write_text("\n".join(SOURCE))
+            git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run(git + ["init", "-q"], check=True)
+            hook = head or SOURCE[:2] + ["    #[cfg(zakura_sim)]", "    let () = ();"] + SOURCE[2:]
+            for lines in (SOURCE, hook):
+                (repo / "crates" / "x" / "lib.rs").write_text("\n".join(lines))
+                subprocess.run(git + ["add", "."], check=True)
+                subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+            cargo = Path(tmp) / "cargo"
+            cargo.write_text(FAKE_OBJECT_CARGO)
+            os.chmod(cargo, 0o755)
+            out, err = io.StringIO(), io.StringIO()
+            os.environ["FAKE_LINES_IN"] = lines_in
+            try:
+                with redirect_stdout(out), redirect_stderr(err):
+                    status = asm_diff.main([
+                        "--repo", str(repo), "--base", "HEAD~1", "--head", "HEAD", "--cargo", str(cargo),
+                        "--package", "x", "--package", "y", "--cgu", "4", "--no-binary",
+                        "--work-dir", str(Path(tmp) / "work"),
+                    ])
+            finally:
+                del os.environ["FAKE_LINES_IN"]
+        return status, out.getvalue() + err.getvalue()
+
+    def test_a_line_number_that_reaches_code_fails(self):
+        """A line number that padding moves into an instruction, as a forwarded `line!` would, exits 1."""
+        status, output = self.run_gate("code")
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("line check base x codegen-units=4: line numbers reach code", output)
+        self.assertIn("section __TEXT,__text", output)
+
+    def test_a_line_number_that_reaches_only_data_passes(self):
+        """A line number in data only, as a panic location's is, is outside the contract."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("line check base x codegen-units=4: code unchanged by padding", output)
+
+    def test_an_aliased_embed_of_a_padded_file_fails(self):
+        """A padded file embedded in release data, under any macro name, exits 1, though padding made the builds equal."""
+        status, output = self.run_gate("embed", head=SOURCE[:2] + ["", ""] + SOURCE[2:])
+        self.assertEqual(status, 1, output)
+        self.assertIn("x codegen-units=4: 1 files: identical", output)
+        self.assertIn("embed check base x codegen-units=4: padded files embedded: crates/x/lib.rs", output)
+
+    def test_a_padded_file_that_is_not_embedded_passes_the_embed_check(self):
+        """A padded file whose text appears in no data section passes."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("embed check base x codegen-units=4: no padded file embedded", output)
+
+    def test_unpadded_crates_rebuild_for_the_line_check(self):
+        """A crate with no padded file still rebuilds for the committed tree, so its line check has objects."""
+        status, output = self.run_gate("data")
+        self.assertEqual(status, 0, output)
+        self.assertIn("line check base y codegen-units=4: code unchanged by padding", output)
 
 
 class CommandTests(unittest.TestCase):

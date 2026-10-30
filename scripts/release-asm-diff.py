@@ -15,21 +15,36 @@ when the two sides' objects and binaries match byte for byte:
     fixups or rebase and bind data, its exports and its dylibs on macOS, or
     every allocated section, relocations included, on Linux.
 
-Nothing is masked. Two things are made the same on both sides first, so
-that only real changes differ:
+The contract is "identical apart from source line numbers and the layout
+of padded source files". Nothing is masked. Two things are made the same on
+both sides first, so that only real changes differ:
 
   * Line numbers. A line added or removed in a `.rs` file moves every line
     below it, and line numbers live in release data, in panic locations and
     `tracing` callsites. So for each hunk of `git diff base head`, the
     shorter side is padded with blank lines to the longer side's length.
     Every unchanged line then has the same number on both sides. A blank
-    line changes no token, so each side still builds the same code. Padding
-    inside a string literal or block comment would change a token, so the
-    tool refuses then (see `safe_boundaries`). Every padding is printed.
+    line changes no token, so each side still builds the same code. Every
+    padding is printed. Padding is refused inside a string literal or block
+    comment (see `pad_text`).
+
+    A padded side is also built as committed. Its instruction sections must
+    match the padded build byte for byte (see `run_line_checks`), so a line
+    number that reaches code, by any route, such as `line!` forwarded
+    through a macro, fails. And no padded file's committed bytes may appear
+    in its data sections (see `run_embed_checks`), so a padded file that
+    `include_str!` or `include_bytes!` embeds, under any name, fails.
   * Paths and build metadata. Both sides build at `<work>/src` with the
     target directory at `<work>/target`, one side at a time, each with its
     own cache (see `side_target`), and both get the base revision's Git
     metadata (see `metadata_env`).
+
+Threat model: the gate catches accidental release changes from honest
+edits, such as cfg-only hooks that should compile to nothing. It doesn't
+defend against an author deliberately evading it. Out of scope: line
+numbers that reach only data (a panic location, a `tracing` callsite, a
+`Location::caller().line()` read at run time), values derived from an
+embedded file (a checksum, one byte), and deliberate evasion routes.
 
 `--explain` also emits assembly and, for each comparison that differs, says
 which functions and data blocks differ (see `lib/asm_explain.py`). It never
@@ -41,11 +56,12 @@ Usage:
       [--no-binary] [--explain] [--work-dir <dir>] [--cargo <cargo>]
 
 Exit status: 0 when everything matches; 1 when anything differs or is on
-one side only; 2 when a side built no objects; 3 when a command fails or
-padding would land inside a literal.
+one side only, or a line number reaches code; 2 when a side built no
+objects; 3 when a command fails or padding is refused.
 """
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -74,7 +90,6 @@ MAX_PRINTED = 20
 # ---------------------------------------------------------------------------
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
-RAW_START = re.compile(r'(?:b|c)?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'\n])'")
 
 
@@ -124,6 +139,63 @@ def paddings(hunks):
     return base, head
 
 
+# Where code can stop being code: a comment, a string or raw string, or a
+# quote that may start a char literal.
+CODE_STOP = re.compile(r"//|/\*|(?<![\w])(?:b|c)?r#*\"|\"|'")
+STRING_END = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
+BLOCK_MARK = re.compile(r"/\*|\*/")
+
+
+def lex(text):
+    """Splits Rust source into `(kind, text)` segments: `code`, `comment`, `block`, `string` or `raw`.
+
+    A `string` or `raw` segment is a string or raw string literal's body,
+    without its quotes, prefix or hashes. Char literals stay in `code`, and lifetimes too. An
+    unterminated literal or block comment runs to the end of the text.
+    """
+    segments, i, start, n = [], 0, 0, len(text)
+    while i < n:
+        stop = CODE_STOP.search(text, i)
+        if not stop:
+            break
+        i, mark = stop.start(), stop.group()
+        if mark == "'":
+            char = CHAR_LITERAL.match(text, i)
+            i = char.end() if char else i + 1
+            continue
+        if i > start:
+            segments.append(("code", text[start:i]))
+        if mark == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            segments.append(("comment", text[i:j]))
+        elif mark == "/*":
+            depth, j = 0, i
+            for block in BLOCK_MARK.finditer(text, i):
+                depth += 1 if block.group() == "/*" else -1
+                j = block.end()
+                if depth == 0:
+                    break
+            else:
+                j = n
+            segments.append(("block", text[i:j]))
+        elif mark.endswith('"') and "r" in mark:
+            close = '"' + mark[mark.index("r") + 1:-1]
+            k = text.find(close, stop.end())
+            k = n if k < 0 else k
+            segments.append(("raw", text[stop.end():k]))
+            j = min(n, k + len(close))
+        else:
+            body = STRING_END.match(text, stop.end())
+            k = body.end() - 1 if body else n
+            segments.append(("string", text[stop.end():k]))
+            j = min(n, k + 1)
+        i = start = j
+    if start < n:
+        segments.append(("code", text[start:]))
+    return segments
+
+
 def safe_boundaries(text):
     """The lines whose end lies in code or a line comment, so a blank line can follow them.
 
@@ -131,56 +203,13 @@ def safe_boundaries(text):
     that ends inside a string, raw string or block comment isn't safe, since
     a blank line there would change a token.
     """
-    safe, line, i, n = {0}, 1, 0, len(text)
-    state = None  # None for code, "line", "str", ("raw", hashes) or ("block", depth)
-    while i < n:
-        c = text[i]
-        if c == "\n":
-            if state in (None, "line"):
+    safe, line, kind = {0}, 1, "code"
+    for kind, part in lex(text):
+        for _ in range(part.count("\n")):
+            if kind in ("code", "comment"):
                 safe.add(line)
-                state = None
             line += 1
-            i += 1
-        elif state is None:
-            raw = RAW_START.match(text, i)
-            if text.startswith("//", i):
-                state, i = "line", i + 2
-            elif text.startswith("/*", i):
-                state, i = ("block", 1), i + 2
-            elif raw and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-                state, i = ("raw", raw.group(1)), raw.end()
-            elif c == '"':
-                state, i = "str", i + 1
-            elif c == "'":
-                char = CHAR_LITERAL.match(text, i)
-                i = char.end() if char else i + 1
-            else:
-                i += 1
-        elif state == "line":
-            i += 1
-        elif state == "str":
-            if c == "\\" and i + 1 < n:
-                if text[i + 1] == "\n":
-                    line += 1
-                i += 2
-            else:
-                state = None if c == '"' else state
-                i += 1
-        elif state[0] == "raw":
-            close = '"' + state[1]
-            if text.startswith(close, i):
-                state, i = None, i + len(close)
-            else:
-                i += 1
-        else:
-            depth = state[1]
-            if text.startswith("/*", i):
-                state, i = ("block", depth + 1), i + 2
-            elif text.startswith("*/", i):
-                state, i = (("block", depth - 1) if depth > 1 else None), i + 2
-            else:
-                i += 1
-    if state in (None, "line"):
+    if kind in ("code", "comment") or not text:
         safe.add(line)
     return safe
 
@@ -196,19 +225,26 @@ def pad_text(text, inserts, path="<text>"):
     return "\n".join(lines)
 
 
+def rust_sources(tree):
+    """Every `.rs` file in `tree` outside `target`."""
+    return [path for path in sorted(tree.rglob("*.rs")) if path.relative_to(tree).parts[0] != "target"]
+
+
 def align_tree(tree, file_hunks, side):
     """Pads `side`'s `.rs` files in `tree` so unchanged lines line up with the other side's.
 
-    Returns the `(path, after_line, count)` paddings it made.
+    Refuses padding inside a literal (see `pad_text`). Returns the
+    `(path, after_line, count)` paddings it made.
     """
+    tree = Path(tree).resolve()
     made = []
     for path, hunks in sorted(file_hunks.items()):
         inserts = paddings(hunks)[0 if side == "base" else 1]
         if not inserts:
             continue
         file = tree / path
-        file.write_bytes(pad_text(file.read_bytes().decode(errors="surrogateescape"), inserts, path)
-                         .encode(errors="surrogateescape"))
+        text = file.read_bytes().decode(errors="surrogateescape")
+        file.write_bytes(pad_text(text, inserts, path).encode(errors="surrogateescape"))
         made.extend((path, after, count) for after, count in inserts)
     return made
 
@@ -261,18 +297,27 @@ def macho_symbols(data, commands):
 
 
 def macho_relocations(data, reloff, nreloc, symbols, cputype):
-    """A section's relocations, with each external one naming its symbol rather than its index."""
+    """A section's relocations, each external one naming its symbol rather than its index.
+
+    A symbol is named by its name, type, section and value, so two symbols
+    that drop to the same name (see `LLVM_SUFFIX`) stay apart unless they
+    are the same address.
+    """
     out = []
     for k in range(nreloc):
         address, packed = struct.unpack_from("<iI", data, reloff + 8 * k)
         target, extern, rtype = packed & 0xFFFFFF, packed >> 27 & 1, packed >> 28
         if extern and not (cputype == CPU_ARM64 and rtype == ARM64_RELOC_ADDEND) and target < len(symbols):
-            target = symbols[target][0]
+            target = symbols[target]
         out.append(b"%d %d %r" % (address, packed >> 24, target))
     return b"\n".join(out)
 
 
-def macho_image(data):
+S_ATTR_INSTRUCTIONS = 0x80000400
+SHF_EXECINSTR = 0x4
+
+
+def macho_image(data, code_only=False):
     """The runtime parts of a 64-bit little-endian Mach-O file, as `{name: bytes}`.
 
     Skips `__DWARF` debug info, `__LLVM` embedded bitcode, `__LINKEDIT`
@@ -281,7 +326,8 @@ def macho_image(data):
     and export data, the linkedit blobs above, every other load command as
     is, and, in an object file, its non-debug symbols. In an object file,
     relocations name their symbols, and symbol names drop LLVM's promotion
-    suffix (see `LLVM_SUFFIX`).
+    suffix (see `LLVM_SUFFIX`). With `code_only`, keeps only the sections
+    that hold instructions, with their relocations.
     """
     image = {}
     cputype = struct.unpack_from("<I", data, 4)[0]
@@ -297,7 +343,7 @@ def macho_image(data):
         if cmd == LC_SEGMENT_64:
             segname = body[8:24].rstrip(b"\0").decode()
             nsects = struct.unpack_from("<I", body, 64)[0]
-            if segname != "__LINKEDIT":
+            if segname != "__LINKEDIT" and not code_only:
                 image["segment %s" % segname] = body[8:24] + body[24:40] + body[56:72]
             for j in range(nsects):
                 sect = body[72 + 80 * j:152 + 80 * j]
@@ -306,6 +352,8 @@ def macho_image(data):
                     continue
                 addr, length = struct.unpack_from("<QQ", sect, 32)
                 start, align, reloff, nreloc, flags = struct.unpack_from("<IIIII", sect, 48)
+                if code_only and not flags & S_ATTR_INSTRUCTIONS:
+                    continue
                 header = struct.pack("<QQIII", addr, length, align, flags, nreloc) + sect[68:80]
                 contents = b"" if flags & 0xFF in S_ZEROFILL else data[start:start + length]
                 image["section %s" % names] = header + contents
@@ -313,6 +361,8 @@ def macho_image(data):
                     image["relocations %s" % names] = (
                         data[reloff:reloff + 8 * nreloc] if executable
                         else macho_relocations(data, reloff, nreloc, symbols, cputype))
+        elif code_only:
+            continue
         elif cmd in LC_LINKEDIT_DATA:
             start, length = struct.unpack_from("<II", body, 8)
             image["linkedit 0x%x" % cmd] = data[start:start + length]
@@ -327,7 +377,8 @@ def macho_image(data):
                     b"%s %d %d %d %d" % symbol for symbol in symbols if not symbol[1] & 0xE0))
         elif cmd not in (LC_DYSYMTAB, LC_UUID, LC_CODE_SIGNATURE):
             image["load command %d (0x%x)" % (index, cmd)] = body
-    image["header"] = data[4:16] + data[24:32]
+    if not code_only:
+        image["header"] = data[4:16] + data[24:32]
     return image
 
 
@@ -335,18 +386,22 @@ ELF_MAGIC = b"\x7fELF\x02\x01"
 SHF_ALLOC = 0x2
 SHT_NOBITS, SHT_SYMTAB, SHT_RELA, SHT_REL = 8, 2, 4, 9
 ET_REL = 1
+STT_SECTION = 3
 
 
-def elf_image(data):
+def elf_image(data, code_only=False):
     """The runtime parts of a 64-bit little-endian ELF file, as `{name: bytes}`.
 
-    Keeps every allocated section's header and contents except the build
-    ID, and every relocation section that applies to one. In an object file,
-    relocations name their symbols, and its symbols are kept, their names
-    without LLVM's promotion suffix (see `LLVM_SUFFIX`). Debug and other
-    unallocated sections, embedded bitcode among them, are skipped.
+    Keeps every program header, every allocated section's header and
+    contents except the build ID, and every relocation section that applies
+    to one. In an object file, relocations name their symbols by name, type,
+    section and value, a section symbol by its section, and the symbols are
+    kept with their names without LLVM's promotion suffix (see
+    `LLVM_SUFFIX`). Debug and other unallocated sections, embedded bitcode
+    among them, are skipped. With `code_only`, keeps only executable
+    sections and the relocations that apply to them.
     """
-    image = {"header": data[16:24] + data[24:32]}
+    image = {} if code_only else {"header": data[16:24] + data[24:32]}
     obj = struct.unpack_from("<H", data, 16)[0] == ET_REL
     shoff = struct.unpack_from("<Q", data, 0x28)[0]
     entsize, count, strndx = struct.unpack_from("<HHH", data, 0x3A)
@@ -358,18 +413,37 @@ def elf_image(data):
         start = names_at + header[0]
         return data[start:data.index(b"\0", start)].decode()
 
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    for k in range(0 if code_only else phnum):
+        # Every program header: type, permissions, mapping and alignment.
+        image["program header %d" % k] = data[phoff + k * phentsize:phoff + (k + 1) * phentsize]
     symbols = []
     for header in headers:
         if header[1] == SHT_SYMTAB and obj:
             strings = headers[header[6]][4]
             for k in range(header[5] // 24):
                 strx, info, other, shndx, value, size = struct.unpack_from("<IBBHQQ", data, header[4] + 24 * k)
-                symbols.append((symbol_name(data, strings, strx), info, other, shndx, value, size))
-            image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
+                sym = symbol_name(data, strings, strx)
+                if info & 0xF == STT_SECTION and shndx < count:
+                    # A section symbol has no name of its own.
+                    sym = b"section " + name(headers[shndx]).encode()
+                symbols.append((sym, info, other, shndx, value, size))
+            if not code_only:
+                image["symbols"] = b"\n".join(sorted(b"%s %d %d %d %d %d" % symbol for symbol in symbols))
+    # ELF allows several sections with one name, such as COMDAT groups'
+    # `.text`, so each is known by its name and occurrence.
+    seen, labels = collections.Counter(), []
     for header in headers:
+        seen[name(header)] += 1
+        labels.append(name(header) + ("" if seen[name(header)] == 1 else "#%d" % seen[name(header)]))
+    for header, label in zip(headers, labels):
         sname, stype, flags, addr, start, length, link, info, align, _ = header
+        key = "section " + label
         keep = flags & SHF_ALLOC and sname and name(header) != ".note.gnu.build-id"
         relocates = stype in (SHT_RELA, SHT_REL) and 0 < info < count and headers[info][2] & SHF_ALLOC
+        if code_only and not (flags & SHF_EXECINSTR or relocates and headers[info][2] & SHF_EXECINSTR):
+            continue
         if relocates and obj:
             width = 24 if stype == SHT_RELA else 16
             entries = []
@@ -377,22 +451,56 @@ def elf_image(data):
                 offset, rinfo = struct.unpack_from("<QQ", data, start + width * k)
                 addend = struct.unpack_from("<q", data, start + width * k + 16)[0] if width == 24 else 0
                 index = rinfo >> 32
-                target = symbols[index][0] if index < len(symbols) else index
+                target = symbols[index] if index < len(symbols) else index
                 entries.append(b"%d %d %r %d" % (offset, rinfo & 0xFFFFFFFF, target, addend))
-            image["section %s" % name(header)] = struct.pack("<IQ", stype, flags) + b"\n".join(entries)
+            image[key] = struct.pack("<IQ", stype, flags) + labels[info].encode() + b"\n" + b"\n".join(entries)
         elif keep or relocates:
             contents = b"" if stype == SHT_NOBITS else data[start:start + length]
-            image["section %s" % name(header)] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + contents
+            # A relocation section's `sh_info` names the section it relocates.
+            applies = labels[info].encode() if relocates else b""
+            image[key] = struct.pack("<IQQQQ", stype, flags, addr, length, align) + applies + b"\n" + contents
     return image
 
 
-def runtime_image(path):
+def data_sections(path):
+    """The contents of every section of a Mach-O or ELF file that holds data, not instructions or debug info."""
+    data = Path(path).read_bytes()
+    out = []
+    if data[:4] == MACHO_MAGIC:
+        ncmds = struct.unpack_from("<I", data, 16)[0]
+        offset = 32
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from("<II", data, offset)
+            if cmd == LC_SEGMENT_64:
+                for j in range(struct.unpack_from("<I", data, offset + 64)[0]):
+                    sect = data[offset + 72 + 80 * j:offset + 152 + 80 * j]
+                    segname = sect[16:32].rstrip(b"\0")
+                    length = struct.unpack_from("<Q", sect, 40)[0]
+                    start, _, _, _, flags = struct.unpack_from("<IIIII", sect, 48)
+                    if segname in (b"__DWARF", b"__LLVM", b"__LINKEDIT") or flags & S_ATTR_INSTRUCTIONS:
+                        continue
+                    if flags & 0xFF not in S_ZEROFILL:
+                        out.append(data[start:start + length])
+            offset += size
+    elif data[:6] == ELF_MAGIC:
+        shoff = struct.unpack_from("<Q", data, 0x28)[0]
+        entsize, count, _ = struct.unpack_from("<HHH", data, 0x3A)
+        for i in range(count):
+            _, stype, flags, _, start, length, _, _, _, _ = struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * entsize)
+            if flags & SHF_ALLOC and not flags & SHF_EXECINSTR and stype != SHT_NOBITS:
+                out.append(data[start:start + length])
+    else:
+        raise ValueError("%s isn't a 64-bit little-endian Mach-O or ELF file" % path)
+    return out
+
+
+def runtime_image(path, code_only=False):
     """The runtime parts of a Mach-O or ELF object or binary at `path` (see `macho_image`, `elf_image`)."""
     data = Path(path).read_bytes()
     if data[:4] == MACHO_MAGIC:
-        return macho_image(data)
+        return macho_image(data, code_only)
     if data[:6] == ELF_MAGIC:
-        return elf_image(data)
+        return elf_image(data, code_only)
     raise ValueError("%s isn't a 64-bit little-endian Mach-O or ELF file" % path)
 
 
@@ -411,16 +519,19 @@ def compare_images(base, head):
     return out
 
 
-def compare_files(bfiles, hfiles):
-    """How two sides' sets of object files or binaries differ, matched by file name."""
+def compare_files(bfiles, hfiles, code_only=False):
+    """How two sides' sets of object files or binaries differ, matched by file name.
+
+    With `code_only`, compares only the sections that hold instructions.
+    """
     bnames, hnames = {path.name: path for path in bfiles}, {path.name: path for path in hfiles}
     out = []
     for file in sorted(set(bnames) | set(hnames)):
         if file not in hnames or file not in bnames:
             out.append("%s: only in %s" % (file, "base" if file in bnames else "head"))
             continue
-        out.extend("%s %s" % (file, line) for line in compare_images(runtime_image(bnames[file]),
-                                                                     runtime_image(hnames[file])))
+        out.extend("%s %s" % (file, line) for line in compare_images(runtime_image(bnames[file], code_only),
+                                                                     runtime_image(hnames[file], code_only)))
     return out
 
 
@@ -602,6 +713,50 @@ def run_comparisons(items, explain=False):
     return status
 
 
+def run_line_checks(items):
+    """Checks that padding a side changed none of its instructions, returning the worst exit status.
+
+    Each item is `(title, unpadded files, padded files)`. The gate's contract
+    is "identical apart from source line numbers": a line number may move
+    where it only labels a panic or a log line, which lives in data. If one
+    reaches an instruction, by any route, such as `line!` forwarded through
+    a macro, padding changed what the program computes, and the padded
+    comparison can't vouch for it.
+    """
+    status = EXIT_SAME
+    for title, unpadded, padded in items:
+        if not unpadded or not padded:
+            print("%s: nothing built (unpadded %d files, padded %d)" % (title, len(unpadded), len(padded)))
+            status = max(status, EXIT_EMPTY)
+            continue
+        differences = compare_files(unpadded, padded, code_only=True)
+        print("%s: %s" % (title, "line numbers reach code" if differences else "code unchanged by padding"))
+        for line in differences[:MAX_PRINTED]:
+            print("  " + line)
+        if differences:
+            status = max(status, EXIT_DIFFERS)
+    return status
+
+
+def run_embed_checks(items):
+    """Checks that no padded file is embedded in its side's release data, returning the worst exit status.
+
+    Each item is `(title, committed files, {path: committed bytes})`.
+    `include_str!` and `include_bytes!` store a file whole, whatever name
+    they're called by, so finding a padded file's committed bytes in a data
+    section means padding changed embedded data, which the padded
+    comparison can't vouch for.
+    """
+    status = EXIT_SAME
+    for title, files, padded in items:
+        sections = [section for path in files for section in data_sections(path)]
+        found = sorted(path for path, text in padded.items() if any(text in section for section in sections))
+        print("%s: %s" % (title, "padded files embedded: " + ", ".join(found) if found else "no padded file embedded"))
+        if found:
+            status = max(status, EXIT_DIFFERS)
+    return status
+
+
 def parse_args(argv):
     """Parses the command line."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -632,25 +787,44 @@ def main(argv=None):
         file_hunks = rust_hunks(repo, base, head)
         with rw.work_dir(args.work_dir) as work:
             inputs = metadata_env(work, repo, base)
-            built = {}
+            built, checks, embeds = {}, [], []
+            names = list(packages) + ([] if args.no_binary else [BINARY])
             for side, rev in (("base", base), ("head", head)):
                 with rw.worktree(repo, rev, work / "src") as tree:
-                    for path, after, count in align_tree(tree, file_hunks, side):
+                    padded = align_tree(tree, file_hunks, side)
+                    for path, after, count in padded:
                         print("padded %s: %d blank lines after %s:%d" % (side, count, path, after))
                     crates = lib_crates(read_metadata(args.cargo, tree))
                     with side_target(work, side) as target:
-                        for package in packages:
-                            crate = crates.get(package, package.replace("-", "_"))
+                        # The padded tree first, then, when this side was
+                        # padded, the tree as committed, for the line check.
+                        for variant in (("padded", "unpadded") if padded else ("padded",)):
+                            if variant == "unpadded":
+                                rw.run(["git", "-C", tree, "checkout", "--quiet", "--", "."])
+                                committed = {path: (tree / path).read_bytes() for path, _, _ in padded}
+                                # Every crate rebuilds, so each emits its objects again.
+                                for source in rust_sources(tree):
+                                    os.utime(source)
+                            for name in names:
+                                for cgu in cgus:
+                                    out = work / "out" / variant / side / ("%s-cgu%d" % (name, cgu))
+                                    asm = args.explain and variant == "padded"
+                                    if name == BINARY:
+                                        result = emit_binary(args.cargo, tree, target, inputs, cgu, out, asm)
+                                    else:
+                                        crate = crates.get(name, name.replace("-", "_"))
+                                        result = emit_lib(args.cargo, tree, target, inputs, name, crate, cgu, out, asm)
+                                    built[variant, side, name, cgu] = result
+                    if padded:
+                        for name in names:
                             for cgu in cgus:
-                                out = work / "out" / side / ("%s-cgu%d" % (package, cgu))
-                                built[side, package, cgu] = emit_lib(
-                                    args.cargo, tree, target, inputs, package, crate, cgu, out, args.explain)
-                        if not args.no_binary:
-                            for cgu in cgus:
-                                out = work / "out" / side / ("%s-cgu%d" % (BINARY, cgu))
-                                built[side, BINARY, cgu] = emit_binary(
-                                    args.cargo, tree, target, inputs, cgu, out, args.explain)
-            return run_comparisons(comparisons(built, packages, cgus, not args.no_binary), args.explain)
+                                label = "%s %s%s codegen-units=%d" % (side, "binary " if name == BINARY else "", name, cgu)
+                                unpadded = built["unpadded", side, name, cgu][0]
+                                checks.append(("line check " + label, unpadded, built["padded", side, name, cgu][0]))
+                                embeds.append(("embed check " + label, unpadded, committed))
+            padded_built = {key[1:]: value for key, value in built.items() if key[0] == "padded"}
+            status = run_comparisons(comparisons(padded_built, packages, cgus, not args.no_binary), args.explain)
+            return max(status, run_line_checks(checks), run_embed_checks(embeds))
     except PaddingError as error:
         print("error: %s" % error, file=sys.stderr)
         return rw.EXIT_COMMAND_FAILED

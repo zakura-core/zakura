@@ -419,6 +419,7 @@ async fn isolated_custom_testnet_enforces_pq_activation() {
         .with_activation_heights(ConfiguredActivationHeights {
             nu5: Some(1), ..Default::default()
         }).unwrap()
+        .with_funding_streams(Vec::new())
         .with_pq_p2sh_activation_height(ACTIVATION)
         .to_network().unwrap();
     assert!(matches!(verify_block(&SPEND, &custom, Height(9)).await,

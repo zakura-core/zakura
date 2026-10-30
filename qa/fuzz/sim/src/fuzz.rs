@@ -11,8 +11,8 @@ use std::{
 
 use zakura_sim::{
     explore::{
-        input_path, save_failure, save_input, Bucket, Classified, ExploreOutcome, ExploreRun,
-        Worker, ABANDON_LIMIT_VAR,
+        input_path, save_failure, save_input, traces_root, Bucket, Classified, ExploreOutcome,
+        ExploreRun, Worker, ABANDON_LIMIT_VAR,
     },
     harness::{fixtures, HarnessEntry, RecordError},
     property::PropertyId,
@@ -250,13 +250,13 @@ impl Kept {
     }
 }
 
-/// Saves the input of the `Known` or `Draft` violation of `property` under
-/// `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by digest, up to
-/// [`MAX_KEPT_INPUTS`] distinct inputs per process. The first such input in
-/// a process also records a trace under `<bucket>/traces/`, unless an
-/// earlier process already saved one: a property's ID is its signature, so
-/// one trace per property is enough. A rerun that disagrees panics with
-/// `nondeterministic:`.
+/// Saves the input of a violation of `property` that [`Classified::notes`]
+/// lists, under `$ZAKURA_SIM_ARTIFACTS/inputs/<bucket>/<property-id>/`, by
+/// digest, up to [`MAX_KEPT_INPUTS`] distinct inputs per process. The first
+/// such input in a process also records a trace under the bucket's
+/// [`traces_root`], unless an earlier process already saved one: a
+/// property's ID is its signature, so one trace per property is enough. A
+/// rerun that disagrees panics with `nondeterministic:`.
 fn save_once(
     entry: &'static HarnessEntry,
     input: &[u8],
@@ -274,7 +274,7 @@ fn save_once(
         .or_default()
         .admit(input_path(&root, bucket, Some(&id), input));
     match keep {
-        Keep::First if !has_trace(&root.join(bucket.name()), property) => {
+        Keep::First if !has_trace(&traces_root(&root, bucket), property) => {
             let saved = save_failure(entry, input, run, &id, bucket, &root)
                 .unwrap_or_else(|error| panic!("harness: saving the input failed: {error}"));
             if let Err(error) = saved.trace {

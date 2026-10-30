@@ -545,9 +545,12 @@ fn classify_reads_every_report() {
             leaked: 0,
         }
     );
+}
 
-    // A harness failure after a Known violation ranks first, and keeps the
-    // note.
+/// A harness failure after a Known and an Active violation ranks first, and
+/// keeps both violations as notes, the Active one under `active`.
+#[test]
+fn a_harness_failure_keeps_its_active_violation() {
     let run = run_of(Err(harness_error(synthetic(
         Outcome::Harness,
         None,
@@ -560,7 +563,17 @@ fn classify_reads_every_report() {
         matches!(classified.outcome, ExploreOutcome::HarnessFailure { .. }),
         "{classified:?}"
     );
-    assert_eq!(classified.notes, [(KNOWN.to_owned(), Bucket::Known)]);
+    assert_eq!(
+        classified.notes,
+        [
+            (KNOWN.to_owned(), Bucket::Known),
+            (ACTIVE.to_owned(), Bucket::Active),
+        ]
+    );
+    assert_eq!(
+        classified.buckets(),
+        [Bucket::Active, Bucket::Known, Bucket::Harness]
+    );
 }
 
 #[test]

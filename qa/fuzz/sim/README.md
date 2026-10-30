@@ -33,10 +33,12 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
   `inputs/active/<property-id>/<sha256>.bin` before anything reruns it, then
   records the run and panics with the property ID and the trace's directory.
   A rerun that disagrees with the run panics with `nondeterministic:`
-  instead, keeps both compared records and their first difference under
-  `nondeterministic/<property-id>/<12 hex>/`, and moves the input to
-  `inputs/nondeterministic/<property-id>/`.
-- A harness failure panics with `harness:`.
+  instead, keeps the compared runs' records and property reports and their
+  first difference under `nondeterministic/<property-id>/<12 hex>/`, and
+  moves the input to `inputs/nondeterministic/<property-id>/`.
+- A harness failure panics with `harness:`. If the run also violated an
+  `Active` property, the target first saves that violation's input and
+  trace as it does for a `Known` one, under `inputs/active/` and `traces/`.
 - A task's panic violates `sim/no-task-panic`, which is `Active`. Each target
   swaps libFuzzer's panic hook, which aborts at any panic, for the default one
   at startup, so the task's panic reaches the scheduler.

@@ -256,7 +256,8 @@ fn a_parked_holder_reads_in_transition() {
 /// The honest sync's selected chain reads current from setup, at the
 /// node's preloaded 50-header tip, and the boundary right after the
 /// commit that adopts the peer's chain shows the new 120-header tip, which
-/// is the tip the engine ends with. No read is held: the controlled port
+/// is the tip the engine ends with. The harness's registration of the read
+/// is logged at setup, before its first read. No read is held: the controlled port
 /// runs engine operations as storage actions, outside any task, so no
 /// task holds the engine's lock at a boundary.
 ///
@@ -287,6 +288,19 @@ fn the_selected_chain_is_read_live() {
         "{tips:?}"
     );
     assert_eq!(ports.selected_tip().height.0, 120);
+    let registered = report.log.entries().iter().position(|entry| {
+        matches!(&entry.obs, Observation::ReadRegistered { component, generation: 1 }
+            if component == "SelectedChain")
+    });
+    let first_read = report.log.entries().iter().position(|entry| {
+        matches!(&entry.obs, Observation::ComponentRead { component, .. }
+            if component == "SelectedChain")
+    });
+    assert!(
+        registered.is_some_and(|registered| report.log.entries()[registered].step == 0)
+            && registered < first_read,
+        "the harness's registration is logged at setup, before the first read"
+    );
 }
 
 /// The commit that moves the selected chain completes as a storage

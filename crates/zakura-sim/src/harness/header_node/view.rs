@@ -526,11 +526,117 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// The selected chain's header tip that [`check_chain`] got from
+        /// `require` at each step, or `None`.
+        static CHAIN_SEEN: RefCell<Vec<(u64, Option<u32>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records the selected chain's tip height `require` hands out.
+    fn check_chain(cx: &mut CheckCtx<'_, Storage>) -> Verdict {
+        use crate::property::Available;
+
+        let view = cx.view();
+        let owners = view.owners.borrow();
+        let chain = owners
+            .component(ComponentKind::SelectedChain)
+            .expect("the storage tier has the selected chain");
+        let tip = match require(cx, chain) {
+            Some(Available::Current(Reading::SelectedChain(chain))) => {
+                Some(chain.frontiers.header_best.height.0)
+            }
+            Some(other) => panic!("the chain hands out its snapshot, not {other:?}"),
+            None => None,
+        };
+        CHAIN_SEEN.with(|seen| seen.borrow_mut().push((cx.step, tip)));
+        Verdict::Holds
+    }
+
+    /// A task that holds the node's engine lock across a scheduling point,
+    /// as `EnginePort::state_digest` does when it takes the lease lock
+    /// after the engine's, leaves the selected chain in transition at that
+    /// boundary: its read is held, and `require` hands out nothing. Once
+    /// the task releases the lock, the chain is current again with the
+    /// same tip.
+    ///
+    /// This fails if a held engine reads as anything but held.
+    #[test]
+    fn a_held_engine_leaves_the_selected_chain_in_transition() {
+        use crate::{observe::ComponentReading, Observation};
+
+        let scenario = StorageScenario {
+            mirrors: Vec::new(),
+            ..StorageScenario::default()
+        };
+        let mut sim = Sim::new(Storage::config(&scenario), Plan::from_fuzz(&[]));
+        let ports = Storage::prepare(&scenario);
+        let port = ports.node.clone();
+        let storage = Rc::new(Storage::build(&mut sim, &scenario, ports));
+        sim.scheduler().spawn_root("digest", async move {
+            let _ = port.engine().state_digest();
+        });
+        let property = Property {
+            id: PropertyId::new("test/selected-chain"),
+            claim: "a test claim on the selected chain",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Component(ComponentKind::SelectedChain)],
+            status: Status::Active,
+            check: check_chain,
+            witness: None,
+        };
+        let mut checker = RegistryChecker::new(
+            Registry::new(vec![property]).expect("the IDs are unique"),
+            storage.clone(),
+            Assumptions::none(),
+            &Storage::sources(),
+        );
+        CHAIN_SEEN.with(|seen| seen.borrow_mut().clear());
+        let report = sim.run(&mut checker, &mut NullSink);
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let reads: Vec<(u64, bool)> = report
+            .log
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::ComponentRead {
+                    component, read, ..
+                } if component == "SelectedChain" => {
+                    Some((entry.step, matches!(read, ComponentReading::Held { .. })))
+                }
+                _ => None,
+            })
+            .collect();
+        let held = reads
+            .iter()
+            .find(|(_, held)| *held)
+            .map(|(step, _)| *step)
+            .expect("a boundary saw the engine held");
+        assert!(
+            report.log.entries().iter().any(|entry| entry.step == held
+                && matches!(&entry.obs, Observation::TaskReached { task, at, .. }
+                    if task.starts_with("digest") && at.starts_with("lock#"))),
+            "the digest task stopped at the lease lock with the engine held, at step {held}"
+        );
+        assert_eq!(
+            reads.iter().map(|(_, held)| *held).collect::<Vec<_>>(),
+            [false, true, false],
+            "current, held, current: {reads:?}"
+        );
+        let seen = CHAIN_SEEN.with(|seen| seen.take());
+        let released = reads[2].0;
+        for (at, tip) in &seen {
+            let expected = (*at < held || *at >= released).then_some(0);
+            assert_eq!(*tip, expected, "at step {at}: {seen:?}");
+        }
+        assert!(seen.iter().any(|(at, _)| *at == held), "{seen:?}");
+    }
+
     /// A harness that builds the node's port, the selected chain's
-    /// existence evidence, without registering its read fails the run at
+    /// existence evidence, but never registers its read fails the run at
     /// the first boundary, in a run with no peers.
     ///
-    /// This fails if the chain's existence needs no read.
+    /// This fails if the chain's existence depends on its registration.
     #[test]
     fn an_unregistered_selected_chain_fails() {
         let scenario = StorageScenario {

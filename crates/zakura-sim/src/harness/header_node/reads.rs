@@ -15,8 +15,11 @@
 //!
 //! The budget's existence evidence is its reactor's first `Settled`, since
 //! the reactor builds the budget before it. The harness registers the
-//! selected chain's read itself, as it builds the node's port, so that
-//! read's existence evidence is the harness's construction.
+//! selected chain's read itself, as it builds the node's port, and the
+//! hub logs that registration as [`Observation::ReadRegistered`] at the
+//! next boundary. The chain's existence evidence is the node's
+//! construction, which giving the hub its view records, so a harness that
+//! never registers the chain's read fails at the first boundary.
 
 use std::{
     cell::{Cell, RefCell},
@@ -77,8 +80,8 @@ thread_local! {
     static NO_CHAIN_READ: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Runs `run` with every harness built inside it skipping the selected
-/// chain's read registration, though the chain still exists.
+/// Runs `run` with every harness built inside it skipping its call that
+/// registers the selected chain's read, as a harness that forgot it would.
 #[cfg(test)]
 pub(crate) fn without_selected_chain_read<T>(run: impl FnOnce() -> T) -> T {
     NO_CHAIN_READ.with(|skip| skip.set(true));
@@ -107,7 +110,14 @@ pub(crate) struct BoundaryReads {
     reactor: u64,
     live: Vec<Live>,
     generations: BTreeMap<ReadKey, u64>,
+    /// How many reads the harness registered for each component.
+    generations_by_harness: BTreeMap<ComponentKind, u64>,
     budget_exists: bool,
+    /// Whether the node's selected chain was shown to exist yet, at the
+    /// first boundary after its construction.
+    chain_exists: bool,
+    /// Registrations the harness made, logged at the next boundary.
+    registered: Vec<Observation>,
     /// Built under [`without_reads`].
     off: bool,
 }
@@ -128,7 +138,10 @@ impl BoundaryReads {
             reactor,
             live: Vec::new(),
             generations: BTreeMap::new(),
+            generations_by_harness: BTreeMap::new(),
             budget_exists: false,
+            chain_exists: false,
+            registered: Vec::new(),
             off: off || READS_OFF.with(Cell::get),
         }
     }
@@ -186,6 +199,15 @@ impl BoundaryReads {
                 _ => {}
             }
         }
+        if !self.chain_exists {
+            // The node and its port were built with the view, so its chain
+            // exists from the first boundary.
+            self.chain_exists = true;
+            view.exists(ComponentKind::SelectedChain, step);
+        }
+        for row in self.registered.drain(..) {
+            log.push(row);
+        }
         if let Some((key, _)) = handed.next() {
             return Err(format!(
                 "UnloggedRead: {key:?}'s read was handed over with no ReadRegistered row at \
@@ -237,19 +259,23 @@ impl BoundaryReads {
         if self.off {
             return;
         }
-        let kind = ComponentKind::SelectedChain;
-        let mut view = self.view.borrow_mut();
         #[cfg(test)]
         if NO_CHAIN_READ.with(Cell::get) {
-            view.exists(kind, 0);
             return;
         }
-        view.register(kind);
-        view.exists(kind, 0);
+        let kind = ComponentKind::SelectedChain;
+        self.view.borrow_mut().register(kind);
+        let generation = self.generations_by_harness.entry(kind).or_default();
+        *generation += 1;
+        let generation = *generation;
+        self.registered.push(Observation::ReadRegistered {
+            component: format!("{kind:?}"),
+            generation,
+        });
         let port = Arc::downgrade(port);
         self.live.push(Live {
             kind,
-            generation: 1,
+            generation,
             read: Box::new(move || {
                 // Dropped before the read returns, and never the last one,
                 // since the harness keeps the port.

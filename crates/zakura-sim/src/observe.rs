@@ -387,6 +387,18 @@ pub enum Observation {
         /// What the read showed.
         read: ComponentReading,
     },
+    /// The harness registered a boundary read itself, such as the node's
+    /// selected chain's as it built the node's port (M6a-7a). Logged at the
+    /// next boundary, before that boundary's reads. An owner's read is
+    /// logged as its own `read-registered` event instead, through its
+    /// observer's counted path, which a harness read has no need of, since
+    /// no observer stands between the harness and the hub.
+    ReadRegistered {
+        /// The component, such as `SelectedChain`.
+        component: String,
+        /// How many reads the harness registered for it, from 1.
+        generation: u64,
+    },
     /// A datagram on the simulated network was sent, or left it. Each
     /// datagram logs `sent`, then at most one of the others.
     Datagram {

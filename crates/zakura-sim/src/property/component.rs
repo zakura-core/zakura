@@ -299,12 +299,16 @@ pub enum Available<'a, T> {
 }
 
 /// `component`'s value at this boundary, for a claim about current
-/// boundaries (rule 8). `InTransition`, `Initializing` and `Ended(Unsettled)`
-/// record `Inconclusive::Unsettled` and return `None`, so the check skips
-/// the boundary. A later current boundary can still end the property `Held`,
-/// with the transition gaps listed in its report. A `Current` state whose
-/// read isn't from this boundary is broken capture, so it records missing
-/// evidence, a harness failure.
+/// boundaries (rule 8). `InTransition` and `Ended(Unsettled)` record
+/// `Inconclusive::Unsettled` and return `None`, so the check skips the
+/// boundary. A later current boundary can still end the property `Held`,
+/// with the transition gaps listed in its report. `Initializing` returns
+/// `None` and records nothing: a component that doesn't exist yet isn't
+/// mid-change, so a check that only ever skips it ends `NotApplicable`, as
+/// a property whose source never appears does, or `obligation-open` if the
+/// run ends with its obligation pending. Each `Inconclusive` reason means
+/// one thing. A `Current` state whose read isn't from this boundary is
+/// broken capture, so it records missing evidence, a harness failure.
 pub fn require<'c, S: HasView, T: Clone + PartialEq>(
     cx: &mut CheckCtx<'_, S>,
     component: &'c Component<T>,
@@ -315,8 +319,8 @@ pub fn require<'c, S: HasView, T: Clone + PartialEq>(
 /// As [`require`], for a claim that must hold at every boundary. A boundary
 /// in transition records the sticky `Inconclusive::Unobserved`, so the
 /// property can't end `Held` over a boundary it never saw. `Initializing`
-/// records `Unsettled`, since nothing exists to judge before the component
-/// does.
+/// records nothing, as in [`require`], since no boundary is missed before
+/// the component exists.
 pub fn require_every<'c, S: HasView, T: Clone + PartialEq>(
     cx: &mut CheckCtx<'_, S>,
     component: &'c Component<T>,
@@ -342,10 +346,7 @@ fn available<'c, S: HasView, T: Clone + PartialEq>(
         State::Ended(Ended::Seen { last_seen, state }) => {
             Some(Available::Ended { last_seen, state })
         }
-        State::Initializing => {
-            cx.unsettled(Inconclusive::Unsettled);
-            None
-        }
+        State::Initializing => None,
         State::InTransition { .. } | State::Ended(Ended::Unsettled) => {
             cx.gap(component.kind);
             cx.unsettled(gap);
@@ -379,7 +380,10 @@ pub enum Coherence {
     Ready,
     /// Not yet shown to exist.
     Initializing,
-    /// In transition, ended, or with a tag in flux.
+    /// Ended after a current read: its last state is known, but it isn't
+    /// current.
+    Ended,
+    /// In transition, ended in transition, or with a tag in flux.
     Unsettled,
     /// Current, but its read isn't from the boundary.
     Stale,
@@ -392,6 +396,7 @@ impl<T: Clone + PartialEq + Tagged> Part for Component<T> {
             State::Current { .. } if self.fresh_through != Some(step) => Coherence::Stale,
             State::Current { state } if state.in_flux().is_none() => Coherence::Ready,
             State::Initializing => Coherence::Initializing,
+            State::Ended(Ended::Seen { .. }) => Coherence::Ended,
             _ => Coherence::Unsettled,
         }
     }
@@ -404,11 +409,13 @@ impl<T: Clone + PartialEq + Tagged> Part for Component<T> {
 
 /// True if a check across `parts`, which change at separate points, may
 /// run at this boundary (rule 5): every part is current, with no tag
-/// `Creating` or `Releasing`. Otherwise it records `Inconclusive::Unsettled`,
-/// listing a gap for each part that exists but isn't ready, and returns
-/// false. A stale part is a harness failure, as in [`require`].
+/// `Creating` or `Releasing`. Otherwise it returns false. A part that exists
+/// but is mid-change records `Inconclusive::Unsettled` and lists a gap. A
+/// part still `Initializing`, or ended with a known state, records nothing. A stale
+/// part is a harness failure, as in [`require`].
 pub fn require_coherent<S: HasView>(cx: &mut CheckCtx<'_, S>, parts: &[&dyn Part]) -> bool {
     let mut coherent = true;
+    let mut unsettled = false;
     for part in parts {
         match part.coherence(cx.step) {
             Coherence::Ready => continue,
@@ -417,12 +424,15 @@ pub fn require_coherent<S: HasView>(cx: &mut CheckCtx<'_, S>, parts: &[&dyn Part
                 part.part_kind(),
                 cx.step
             )),
-            Coherence::Initializing => {}
-            Coherence::Unsettled => cx.gap(part.part_kind()),
+            Coherence::Initializing | Coherence::Ended => {}
+            Coherence::Unsettled => {
+                cx.gap(part.part_kind());
+                unsettled = true;
+            }
         }
         coherent = false;
     }
-    if !coherent {
+    if unsettled {
         cx.unsettled(Inconclusive::Unsettled);
     }
     coherent
@@ -549,8 +559,10 @@ mod tests {
         (coherent, parts.unsettled, parts.gaps.len())
     }
 
-    /// Reconciliation waits while one part is in transition, or another
-    /// lists an object still being created, and runs once both are ready.
+    /// Reconciliation waits while one part is in transition, another lists
+    /// an object still being created, a third doesn't exist yet, or a
+    /// fourth ended, and runs once all are ready. Only the first two record
+    /// `Unsettled`.
     #[test]
     fn reconciliation_waits_for_coherent_parts() {
         let live = || Objects(vec![TagPhase::Live]);
@@ -578,6 +590,24 @@ mod tests {
         assert_eq!(coherent(2, &[&moving, &ready]), (false, unsettled, 1));
         assert_eq!(coherent(2, &[&creating, &ready]), (false, unsettled, 1));
         assert_eq!(coherent(2, &[&ready]), (true, None, 0));
+        let initializing: Component<Objects> = Component::new(ComponentKind::Budget);
+        assert_eq!(initializing.state(), State::Initializing);
+        assert_eq!(
+            coherent(2, &[&initializing, &ready]),
+            (false, None, 0),
+            "a part that doesn't exist yet isn't mid-change"
+        );
+        let mut ended = existing();
+        ended.read(1, Read::Current(live())).expect("a first read");
+        ended
+            .read(2, Read::Gone)
+            .expect("a read at the next boundary");
+        assert!(matches!(ended.state(), State::Ended(Ended::Seen { .. })));
+        assert_eq!(
+            coherent(2, &[&ended, &ready]),
+            (false, None, 0),
+            "a part that ended with a known state isn't mid-change"
+        );
         creating
             .read(3, Read::Current(Objects(vec![TagPhase::Live; 2])))
             .expect("a read at the next boundary");
@@ -668,5 +698,51 @@ mod tests {
                 detail: "Budget is current only through step Some(1), not step 2".to_owned(),
             })
         );
+    }
+
+    /// A teardown reason and a component in transition in one evaluation
+    /// leave the teardown reason, in either order.
+    #[test]
+    fn a_state_reason_never_replaces_a_teardown_in_one_evaluation() {
+        let mut moving = existing();
+        moving.read(1, Read::Current(5_u64)).expect("a first read");
+        moving.read(2, held()).expect("a read at the next boundary");
+        assert!(matches!(moving.state(), State::InTransition { .. }));
+        let property = Property {
+            id: PropertyId::new("test/teardown"),
+            claim: "a test claim on a component",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[],
+            status: Status::Active,
+            check: check_nothing,
+            witness: None,
+        };
+        let log = ObservationLog::default();
+        let pick = Identity::peer("owner", "tick");
+        let step = StepCtx {
+            step: 2,
+            pick: &pick,
+            enabled: &[],
+            phase: Phase::Live,
+            now: zakura_scheduler::SimInstant::ZERO,
+            status: zakura_scheduler::Status::Running,
+            log: &log,
+        };
+        for teardown_first in [true, false] {
+            let mut cx = CheckCtx::new(&step, &Nothing, &property, std::slice::from_ref(&property));
+            if teardown_first {
+                cx.unsettled(Inconclusive::TeardownOpen);
+            }
+            assert_eq!(require(&mut cx, &moving), None);
+            if !teardown_first {
+                cx.unsettled(Inconclusive::TeardownOpen);
+            }
+            assert_eq!(
+                cx.into_parts().unsettled,
+                Some(Inconclusive::TeardownOpen),
+                "teardown recorded first: {teardown_first}"
+            );
+        }
     }
 }

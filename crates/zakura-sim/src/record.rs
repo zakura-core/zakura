@@ -40,12 +40,13 @@ use crate::{
 /// `pos` and `sub`, with a derived row's `origin`, in each step's `obs`
 /// digest. Version 21 added scripted peers' `peer-emitted` records and
 /// their `peer-conn-ended` and `peer-stream-ended` rows. Version 22 added
-/// the `state-unsettled` and `state-unobserved` inconclusive outcomes and
-/// each property's component `gaps`. Version 23 added the reactor's
-/// `settled` snapshots and `resumed` markers. Version 24 added work
-/// identities: the reactor's `placed`, `bound` with its `via`, and
-/// `leases-captured` events, each request's and active work's
-/// `incarnation`, and each snapshot's `holdings`.
+/// the `state-unsettled`, `state-unobserved` and `budget-cut` inconclusive
+/// outcomes and each property's `gap_boundaries`. Version 23 added the
+/// reactor's `settled` snapshots, `resumed` markers and `dropping`
+/// teardown, and the `call` that submitted a header `submitted` fact.
+/// Version 24 added work identities: the reactor's `placed`, `bound` with
+/// its `via`, and `leases-captured` events, each request's and active
+/// work's `incarnation`, and each snapshot's `holdings`.
 pub const FORMAT_VERSION: u32 = 24;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
@@ -406,14 +407,24 @@ mod tests {
         let bump = "a property report's encoding changed, so bump FORMAT_VERSION and update \
             this test";
         assert_eq!(FORMAT_VERSION, 24, "{bump}");
-        let reasons = [Inconclusive::Unsettled, Inconclusive::Unobserved].map(|r| r.to_string());
-        assert_eq!(reasons, ["state-unsettled", "state-unobserved"], "{bump}");
+        let reasons = [
+            Inconclusive::Unsettled,
+            Inconclusive::Unobserved,
+            Inconclusive::BudgetCut,
+        ]
+        .map(|r| r.to_string());
+        assert_eq!(
+            reasons,
+            ["state-unsettled", "state-unobserved", "budget-cut"],
+            "{bump}"
+        );
         let report = PropertyReport {
             gaps: vec![Gap {
                 component: "Budget".into(),
                 from: 3,
                 through: 5,
             }],
+            gap_boundaries: [("Budget".to_owned(), 3)].into(),
             ..PropertyReport::new(
                 "test/require-every",
                 PropertyOutcome::Inconclusive {
@@ -423,7 +434,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&report).unwrap(),
-            r#"{"property":"test/require-every","outcome":{"inconclusive":{"reason":"state-unobserved"}},"gaps":[{"component":"Budget","from":3,"through":5}]}"#,
+            r#"{"property":"test/require-every","outcome":{"inconclusive":{"reason":"state-unobserved"}},"gap_boundaries":{"Budget":3}}"#,
             "{bump}"
         );
     }

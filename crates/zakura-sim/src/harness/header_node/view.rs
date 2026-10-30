@@ -142,9 +142,9 @@ mod tests {
             Subsystem,
         },
         property::{
-            require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind,
-            Property, PropertyId, Registry, RegistryChecker, Source, Sources, State, Status,
-            Verdict,
+            require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView,
+            Inconclusive, Kind, LivenessBound, ObligationKey, Property, PropertyId, Registry,
+            RegistryChecker, Source, Sources, State, Status, Subject, Verdict,
         },
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NullSink, ObservationLog,
         Plan, RunConfig, RunReport, Sim,
@@ -257,19 +257,33 @@ mod tests {
         properties: Vec<Property<Owners>>,
         sources: &Sources,
     ) -> (RunReport, Owned) {
-        run_assuming(ops, steps, properties, sources, Assumptions::none())
+        let (report, view, _) = run_assuming(
+            ops,
+            steps,
+            properties,
+            sources,
+            Assumptions::none(),
+            u64::MAX,
+        );
+        (report, view)
     }
 
-    /// [`run`], with the scenario declaring `assumptions`.
+    /// [`run`], with the scenario declaring `assumptions`, under a step
+    /// `budget`. Also returns the records the run emitted.
     fn run_assuming(
         ops: Vec<(u64, Op)>,
         steps: u64,
         properties: Vec<Property<Owners>>,
         sources: &Sources,
         assumptions: Assumptions<Owners>,
-    ) -> (RunReport, Owned) {
+        budget: u64,
+    ) -> (RunReport, Owned, MemorySink) {
         let view: Owned = Rc::new(RefCell::new(HeaderSyncView::new(SourceManifest::wire())));
-        let mut sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        let config = RunConfig {
+            budget: budget.min(RunConfig::default().budget),
+            ..RunConfig::default()
+        };
+        let mut sim = Sim::new(config, Plan::from_fuzz(&[]));
         let mut hub = EvidenceHub::new();
         hub.owners(view.clone());
         sim.add_source(Box::new(Script {
@@ -285,7 +299,9 @@ mod tests {
             assumptions,
             sources,
         );
-        (sim.run(&mut checker, &mut MemorySink::default()), view)
+        let mut sink = MemorySink::default();
+        let report = sim.run(&mut checker, &mut sink);
+        (report, view, sink)
     }
 
     /// The wire tier's sources, with nothing else observed.
@@ -435,8 +451,9 @@ mod tests {
     }
 
     /// With no existence evidence, a component stays `Initializing`
-    /// through the run's end, which leaves its property inconclusive, not
-    /// failed. Evidence with no registered read fails the run.
+    /// through the run's end, which leaves its property `NotApplicable`, as
+    /// a property whose source never appears, not failed and not
+    /// `state-unsettled`. Evidence with no registered read fails the run.
     #[test]
     fn evidence_before_registration_fails_and_none_is_pending() {
         let (none, view) = run(Vec::new(), 3, vec![requiring()], &wire());
@@ -448,10 +465,9 @@ mod tests {
         assert_eq!(none.end.harness, None);
         assert_eq!(none.end.steps, 3);
         assert_eq!(view.borrow().captured(), Capture::AfterStep(3));
-        assert_eq!(
-            report(&none, "test/require").outcome,
-            inconclusive("state-unsettled")
-        );
+        let report = report(&none, "test/require");
+        assert_eq!(report.outcome, PropertyOutcome::NotApplicable);
+        assert_eq!(report.gaps, []);
         let (early, _) = run(vec![(2, Op::Exists)], 3, vec![requiring()], &wire());
         assert!(
             matches!(&early.end.harness, Some(HarnessFailure::SourceEvidence { detail, .. })
@@ -546,7 +562,7 @@ mod tests {
             params: serde_json::Value::Null,
         }])
         .holds_when(unless_two);
-        let (run, view) = run_assuming(ops, 6, vec![assuming], &wire(), declared);
+        let (run, view, _) = run_assuming(ops, 6, vec![assuming], &wire(), declared, u64::MAX);
         assert_eq!(run.end.harness, None);
         assert_eq!(view.borrow().component(BUDGET).map(Component::seq), Some(5));
         let report = report(&run, "test/require");
@@ -557,5 +573,244 @@ mod tests {
             through: at,
         };
         assert_eq!(report.gaps, [gap(3), gap(5)]);
+    }
+
+    /// Never discharged.
+    fn never(_: &ObligationKey, _: &crate::Observation) -> bool {
+        false
+    }
+
+    /// Opens one obligation at step 1 that nothing discharges, then needs
+    /// [`BUDGET`] at every boundary.
+    fn check_obliged(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        if cx.step == 1 {
+            let obligation = cx.obligation(None, Subject::Owner("budget".to_owned()), never);
+            cx.oblige(obligation);
+        }
+        check_every(cx)
+    }
+
+    /// An unfinished run never ends `state-unsettled` or `state-unobserved`.
+    /// A run cut by its budget before the component exists leaves its
+    /// property `NotApplicable`. One cut while the component is in
+    /// transition, or after a restored transition an every-boundary claim
+    /// missed, is `budget-cut`, with its gap listed. A run that ends with an
+    /// obligation open is `obligation-open`, even after a boundary the
+    /// property couldn't read.
+    #[test]
+    fn an_unfinished_run_is_never_state_unsettled() {
+        let (cut, view, _) = run_assuming(
+            Vec::new(),
+            5,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            2,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::Initializing)
+        );
+        assert_eq!(
+            report(&cut, "test/require").outcome,
+            PropertyOutcome::NotApplicable
+        );
+
+        // Cut in transition, and cut after a restored transition.
+        let gap = [Gap {
+            component: "Budget".to_owned(),
+            from: 2,
+            through: 2,
+        }];
+        let held_last = reads(current(0..=1, 1).into_iter().chain(held([2])));
+        let (cut, view, _) = run_assuming(
+            held_last,
+            5,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            2,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert!(matches!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::InTransition { since: 2, .. })
+        ));
+        let report_ = report(&cut, "test/require");
+        assert_eq!(report_.gaps, gap);
+        assert_eq!(report_.outcome, inconclusive("budget-cut"));
+        let restored = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (cut, view, _) = run_assuming(
+            restored,
+            5,
+            vec![requiring_every()],
+            &wire(),
+            Assumptions::none(),
+            3,
+        );
+        assert_eq!(cut.end.outcome, crate::Outcome::Budget, "{:?}", cut.end);
+        assert_eq!(
+            view.borrow().component(BUDGET).map(Component::state),
+            Some(State::Current { state: &1 })
+        );
+        let report_ = report(&cut, "test/require-every");
+        assert_eq!(report_.gaps, gap);
+        assert_eq!(report_.outcome, inconclusive("budget-cut"));
+
+        let mut obliged = needing("test/obliged", check_obliged);
+        obliged.kind = Kind::Liveness {
+            bound: LivenessBound::VirtualTime(std::time::Duration::from_secs(3_600)),
+        };
+        let ops = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (open, _) = run(ops, 3, vec![obliged], &wire());
+        assert_eq!(open.end.harness, None);
+        let report = report(&open, "test/obliged");
+        assert_eq!(
+            report.gaps,
+            [Gap {
+                component: "Budget".to_owned(),
+                from: 2,
+                through: 2
+            }],
+            "the check missed step 2"
+        );
+        assert_eq!(report.outcome, inconclusive("obligation-open"));
+    }
+
+    /// Needs [`BUDGET`] at every boundary, and from step 3 records that a
+    /// teardown hasn't settled.
+    fn check_teardown(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        let verdict = check_every(cx);
+        if cx.step >= 3 {
+            cx.unsettled(Inconclusive::TeardownOpen);
+        }
+        verdict
+    }
+
+    /// An every-boundary claim that missed a boundary, then records a
+    /// later unfinished cause, ends with that cause, whether the run
+    /// completes or its budget cuts it. The sticky gap doesn't hide it.
+    #[test]
+    fn a_later_unfinished_cause_outranks_a_sticky_gap() {
+        let restored = || {
+            reads(
+                current(0..=1, 1)
+                    .into_iter()
+                    .chain(held([2]))
+                    .chain(current([3], 1)),
+            )
+        };
+        let gap = [Gap {
+            component: "Budget".to_owned(),
+            from: 2,
+            through: 2,
+        }];
+        for (budget, end) in [
+            (
+                u64::MAX,
+                crate::Outcome::Idle {
+                    status: crate::IdleStatus::Quiescent,
+                },
+            ),
+            (3, crate::Outcome::Budget),
+        ] {
+            let property = needing("test/teardown", check_teardown);
+            let (run, _, _) = run_assuming(
+                restored(),
+                if budget == u64::MAX { 3 } else { 5 },
+                vec![property],
+                &wire(),
+                Assumptions::none(),
+                budget,
+            );
+            assert_eq!(run.end.outcome, end, "{:?}", run.end);
+            let report = report(&run, "test/teardown");
+            assert_eq!(report.gaps, gap, "the check missed step 2");
+            assert_eq!(report.outcome, inconclusive("teardown-open"));
+        }
+    }
+
+    /// A component that alternates between held and current opens a gap
+    /// run every other boundary. The report keeps every run, and its trace
+    /// encoding stays the same size, so a long run's end record still fits
+    /// its line.
+    #[test]
+    fn many_gap_runs_keep_the_end_record_small() {
+        const STEPS: u64 = 2_000;
+        let ops = reads((0..=STEPS).map(|at| {
+            let read = if at % 2 == 0 {
+                Read::Current(1)
+            } else {
+                Read::Held {
+                    holder: "reactor.1".to_owned(),
+                }
+            };
+            (at, read)
+        }));
+        let (run, _) = run(ops, STEPS, vec![requiring()], &wire());
+        assert_eq!(run.end.harness, None);
+        let report = report(&run, "test/require");
+        assert_eq!(report.gaps.len(), 1_000, "one run per held boundary");
+        assert_eq!(report.gap_boundaries, [("Budget".to_owned(), 1_000)].into());
+        let encoded = serde_json::to_string(report).expect("a report encodes");
+        assert!(
+            encoded.len() < 200,
+            "{} bytes: {encoded:.200}",
+            encoded.len()
+        );
+    }
+
+    /// A run with a gap writes an end record that reads back equal to the
+    /// one a replay rebuilds, as exact replay compares them, while the run's
+    /// own report keeps the gap.
+    #[test]
+    fn a_gap_survives_the_trace_round_trip() {
+        let ops = reads(
+            current(0..=1, 1)
+                .into_iter()
+                .chain(held([2]))
+                .chain(current([3], 1)),
+        );
+        let (run, _, sink) = run_assuming(
+            ops,
+            3,
+            vec![requiring()],
+            &wire(),
+            Assumptions::none(),
+            u64::MAX,
+        );
+        assert_eq!(
+            report(&run, "test/require").gaps.len(),
+            1,
+            "the run has a gap"
+        );
+        let Some(crate::Record::End(end)) = sink.records.last() else {
+            panic!("the run ends with an end record");
+        };
+        let line = crate::Record::End(end.clone()).to_line();
+        let read: serde_json::Value = serde_json::from_str(&line).expect("the line is JSON");
+        let read: crate::record::EndRecord =
+            serde_json::from_value(read["end"].clone()).expect("the end record reads back");
+        assert_eq!(
+            &read, end,
+            "a replay compares the record it rebuilds with this one"
+        );
+        let property = read
+            .properties
+            .iter()
+            .find(|report| report.property == "test/require")
+            .expect("the property is reported");
+        assert_eq!(property.gap_boundaries, [("Budget".to_owned(), 1)].into());
     }
 }

@@ -63,7 +63,11 @@ def retire_old_seed(config, current):
         return
     if previous.parent != base.parent or previous.is_symlink() or previous.suffixes != ['.tar', '.zst']:
         raise ValueError('refusing to retire a seed outside the recorded archive directory')
+    metadata = previous.with_suffix('.json')
+    if metadata.is_symlink():
+        raise ValueError('refusing to retire symlinked snapshot metadata')
     previous.unlink(missing_ok=True)
+    metadata.unlink(missing_ok=True)
 
 
 def state_bytes(cache):
@@ -289,6 +293,7 @@ def refresh_seed(config, restore_archive):
         finalized = info['header_chain']['finalized']
         command('systemctl', 'stop', service)
         size = state_bytes(preparation / 'cache')
+        version = max((p.name for p in (preparation / 'cache/state').iterdir()), key=lambda name: int(name[1:]))
         # Preparation is removed before restoring the two validators. Reserving
         # twice its size covers both the compressed seed and those final copies.
         if shutil.disk_usage(root).free < size * 2 + 2 * 1024**3:
@@ -301,8 +306,13 @@ def refresh_seed(config, restore_archive):
                        seed_height=info['blocks'], seed_hash=info['bestblockhash'],
                        seed_finalized_height=finalized['height'], seed_finalized_hash=finalized['hash'],
                        seed_network_directory=name.lower(), seed_storage_mode='archive',
+                       seed_state_version=version,
                        seed_unpacked_bytes=size, seed_synced_at=int(time.time()))
-        retire_old_seed(config, destination)
+        metadata = destination.with_suffix('.json')
+        metadata.write_text(json.dumps({key: updated[key] for key in (
+            'seed_height', 'seed_hash', 'seed_finalized_height', 'seed_finalized_hash',
+            'seed_sha256', 'seed_storage_mode', 'seed_state_version', 'seed_unpacked_bytes', 'seed_synced_at'
+        )}, indent=2) + '\n')
         stage('ready', public_tip=reference, seed_height=info['blocks'])
         return updated
     except Exception as error:

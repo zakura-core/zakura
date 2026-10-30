@@ -78,6 +78,9 @@ The active state format is pinned separately so obsolete repair databases in a
 source cache are excluded during restore. Locally retain the current and previous
 seed; a successful refresh retires only the older archive recorded in deployment
 configuration. It never scans for unrelated files to delete.
+Archive bytes never change at a URL, but older download URLs expire after two
+generations. The deployment commits the new seed record before retiring an older
+archive and its matching metadata.
 
 Set `miner_threads` in the deployment JSON to choose the primary's solver count.
 The deployed value is six; the observer does not mine. The node caps solvers at

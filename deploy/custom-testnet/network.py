@@ -58,6 +58,8 @@ def load_config(path):
         raise ValueError('archive seed must include public Testnet NU7 history')
     if config.get('seed_storage_mode') != 'archive':
         raise ValueError('deployment requires an archive seed')
+    if config.get('seed_state_version') is not None and not re.fullmatch(r'v[0-9]+', config['seed_state_version']):
+        raise ValueError('seed state version must name a version directory such as v30')
     if not 0 < config['seed_finalized_height'] < config['seed_height']:
         raise ValueError('finalized checkpoint must precede the full seed tip so its last block is replayed')
     for field in ('seed_hash', 'seed_finalized_hash', 'seed_sha256', 'binary_sha256'):
@@ -125,6 +127,8 @@ def restore_archive(archive, destination, network_name, state_version=None):
     finalized = destination / 'state'
     if not finalized.exists():
         raise ValueError('seed has no finalized state')
+    if state_version is not None and not (finalized / state_version).is_dir():
+        raise ValueError('seed does not contain the pinned state version')
     for version in finalized.iterdir():
         if not version.is_dir() or not re.fullmatch(r'v[0-9]+', version.name):
             raise ValueError('unexpected finalized state layout')
@@ -206,7 +210,8 @@ def new_run(config):
             'network': {'name': 'PqNu7' + identity, 'magic': bytes(magic).hex()},
             'revision': config['revision'], 'seed_height': config['seed_height'],
             'binary_revision': config.get('binary_source_revision', config['revision']),
-            'seed_hash': config['seed_hash']}
+            'seed_hash': config['seed_hash'], 'seed_sha256': config['seed_sha256'],
+            'seed_snapshot_url': '/snapshots/' + Path(config['seed_archive']).name}
 
 
 def verify_nodes(config, run, require_seed=False):
@@ -264,10 +269,12 @@ def reset(config, delay, config_path=None):
                     raise ValueError('refusing to replace a symlinked disposable node directory')
                 if node.exists():
                     shutil.rmtree(node)
+            previous_config = config
             config = archive_seed.refresh_seed(config, restore_archive)
             if config_path is None:
                 raise ValueError('seed refresh requires the persistent deployment config path')
             atomic_json(config_path, config)
+            archive_seed.retire_old_seed(previous_config, Path(config['seed_archive']))
             # The running controller is restarted below to read the refreshed seed metadata.
             run = new_run(config)
             atomic_json(root / 'run.json', run)

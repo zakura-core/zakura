@@ -322,8 +322,9 @@ cargo xtask replay <dir>
 
 The supervisor sets `ZAKURA_SIM_STATS` to each worker's
 `workers/<n>/stats/` directory, and each fuzzer process writes its counts to
-`stats-<pid>.json` there: every 10 seconds, before it acts on a run that
-isn't clean, and at a clean exit. The counts are runs by what the target did
+`stats-<pid>.json` there: every 10 seconds, when the target stops the
+process on a run it counted (a failure it panics on, or the abandonment
+limit), and at a clean exit. The counts are runs by what the target did
 (`clean`, `fail`, `harness-failure`, `abandoned`), runs by how they ended
 (`violation`, `budget`, `idle/<status>`, `harness`, `not-run`), drains that
 stopped at their bound, cleanup (abandoned runs and their leaked tasks, and

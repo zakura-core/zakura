@@ -3,20 +3,22 @@
 //!
 //! With `ZAKURA_SIM_STATS` set, the target counts every run in a
 //! [`Recorder`] and writes the counts to the variable's directory: every
-//! 10 seconds, before it acts on a run that isn't clean, and at a clean
-//! exit, which libFuzzer makes with `exit`, so an `atexit` handler runs.
-//! A crash or a kill skips the handler, and the file stays incomplete.
+//! 10 seconds, as a panic of the target's own unwinds out of its action on a
+//! run, before it exits at its abandonment limit, and at a clean exit, which
+//! libFuzzer makes with `exit`, so an `atexit` handler runs. A crash or a
+//! kill skips the handler, and the file stays incomplete.
 
 use std::{
     env, process,
     sync::{Mutex, OnceLock, PoisonError},
+    thread,
 };
 
 use zakura_sim::{
     explore::{
         feedback::Counters,
         stats::{Recorder, STATS_VAR},
-        Classified, ExploreOutcome, ExploreRun,
+        Classified, ExploreRun,
     },
     harness::HarnessEntry,
 };
@@ -31,35 +33,63 @@ extern "C" {
 static RECORDER: OnceLock<Option<Mutex<Recorder>>> = OnceLock::new();
 
 /// Counts `run` of `entry`'s harness, with the features `counters` hold,
-/// and writes the counts when they're due, or now if the target will act
-/// on the run. Does nothing without `ZAKURA_SIM_STATS`.
+/// and writes the counts when they're due. The returned guard writes them
+/// if the target panics while it acts on the run, so a crash the target
+/// raises leaves every run counted. Does nothing without
+/// `ZAKURA_SIM_STATS`.
 ///
 /// # Panics
 ///
-/// With `harness:`, if the stats file can't be written.
+/// With `harness:`, if a due write fails.
 pub(crate) fn record(
     entry: &'static HarnessEntry,
     run: &ExploreRun,
     classified: &Classified,
     counters: Option<&Counters>,
-) {
+) -> Acting {
     let Some(recorder) = recorder(entry) else {
-        return;
+        return Acting;
     };
     let mut recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
     let features = counters.map(Counters::hits).unwrap_or_default();
     recorder.record(run, classified, &features);
-    let written = if classified.outcome == ExploreOutcome::Clean {
-        recorder.checkpoint_if_due()
-    } else {
-        recorder.checkpoint()
-    };
-    written.unwrap_or_else(|error| {
+    recorder.checkpoint_if_due().unwrap_or_else(|error| {
         panic!(
             "harness: writing {} failed: {error}",
             recorder.path().display()
         )
     });
+    Acting
+}
+
+/// Writes the counts now, still incomplete: the process is about to stop
+/// without a clean exit. Logs a failed write instead of panicking, since
+/// it may run while a panic unwinds.
+pub(crate) fn checkpoint() {
+    let Some(Some(recorder)) = RECORDER.get() else {
+        return;
+    };
+    let mut recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err(error) = recorder.checkpoint() {
+        eprintln!(
+            "zakura-sim stats: writing {} failed: {error}",
+            recorder.path().display()
+        );
+    }
+}
+
+/// The target acting on a counted run. Dropped by a panic, it writes the
+/// counts.
+#[must_use]
+pub(crate) struct Acting;
+
+impl Drop for Acting {
+    /// Writes the counts if a panic unwinds out of the action.
+    fn drop(&mut self) {
+        if thread::panicking() {
+            checkpoint();
+        }
+    }
 }
 
 /// The process's recorder for `entry`'s harness, made on the first call.

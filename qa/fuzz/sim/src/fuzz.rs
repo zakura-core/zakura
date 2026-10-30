@@ -119,13 +119,14 @@ fn run(
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
         worker.explore_with(entry, input, feedback, move |input, run, classified| {
-            crate::stats::record(entry, run, classified, counters);
+            let _acting = crate::stats::record(entry, run, classified, counters);
             then(entry, input, run, classified)
         });
         let limit = abandon_limit();
         if expected().is_none() && worker.abandoned() >= limit {
             // The count grows only on an abandoned run, so this input is
             // the one that reached the limit.
+            crate::stats::checkpoint();
             panic!(
                 "{ABANDON_LIMIT_PANIC}: {} runs abandoned their cleanup, and {ABANDON_LIMIT_VAR} \
                  is {limit}; \

@@ -4,11 +4,11 @@
 //! A fuzz target with [`STATS_VAR`] set keeps a [`Recorder`]. The recorder
 //! counts each run's outcome, end, cleanup, property reports and features
 //! in [`Counts`], and writes them as a [`ProcessStats`] to
-//! `$ZAKURA_SIM_STATS/stats-<pid>.json`: every [`CHECKPOINT`], before the
-//! target acts on a run that isn't clean, and once more at a clean exit.
-//! Only the clean exit marks the file complete. A process that crashes, or
-//! that its supervisor kills, leaves the counts of its last checkpoint, and
-//! the file says it's incomplete.
+//! `$ZAKURA_SIM_STATS/stats-<pid>.json`: every [`CHECKPOINT`], when the
+//! target stops the process on a run it counted, and once more at a clean
+//! exit. Only the clean exit marks the file complete. A process that
+//! crashes, or that its supervisor kills, leaves the counts of its last
+//! checkpoint, and the file says it's incomplete.
 //!
 //! A campaign gives each worker its own stats directory, and
 //! `zakura-sim campaign evidence` sums a run's files.

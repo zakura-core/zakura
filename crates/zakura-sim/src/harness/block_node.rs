@@ -433,8 +433,8 @@ impl ActionSource for PolicySource {
 }
 
 /// Block sync's handle, set once its reactor starts and cleared when the
-/// node is torn down. The node's service is built first, since its range
-/// source goes into the reactor's startup.
+/// node is torn down or dropped. The node's service is built first, since
+/// its range source goes into the reactor's startup.
 #[derive(Debug, Default)]
 pub struct LateHandle(Mutex<Option<BlockSyncHandle>>);
 
@@ -885,6 +885,19 @@ impl BlockNode {
     /// Whether a teardown dropped the node's handles.
     fn torn_down(&self) -> bool {
         self.live.borrow().is_none()
+    }
+}
+
+impl Drop for BlockNode {
+    /// Clears a controlled node's replies, as a teardown does. The replies
+    /// hold the reactor's handle, the handle's routine wiring holds the
+    /// serving range source, and that source holds the service, which holds
+    /// the replies. Without a teardown step, nothing else breaks that cycle,
+    /// and the node's state outlives the run.
+    fn drop(&mut self) {
+        if let Some((_, replies)) = &self.controlled {
+            drop(replies.clear());
+        }
     }
 }
 

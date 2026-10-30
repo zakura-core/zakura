@@ -935,28 +935,34 @@ fn a_declared_and_mapped_target_resolves() {
     );
 }
 
-/// A `[[bin]]` without a harness, or a harness without a `[[bin]]`, fails
-/// every resolution with an error that names it.
+/// A `[[bin]]` without a harness fails only its own minimization, with an
+/// error that names it. Another target still resolves.
 #[test]
-fn every_target_needs_a_bin_and_a_harness() {
-    let unmapped = fuzz_package(
-        &["race_fixtures", "header_storage"],
+fn an_unmapped_bin_blocks_only_its_own_minimization() {
+    let root = fuzz_package(
+        &["race_fixtures", "feedback_probe"],
         &[("race_fixtures", "fixtures/all")],
     );
-    let manifest = fuzz_dir(unmapped.path()).join("Cargo.toml");
-    for target in ["race_fixtures", "header_storage"] {
-        assert_eq!(
-            resolve_target(unmapped.path(), target)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "{} declares fuzz target `header_storage` but maps it to no harness \
-                 in [package.metadata.zakura-sim.targets]",
-                manifest.display()
-            )
-        );
-    }
+    assert_eq!(
+        resolve_target(root.path(), "race_fixtures").unwrap(),
+        "fixtures/all"
+    );
+    assert_eq!(
+        resolve_target(root.path(), "feedback_probe")
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "{} declares fuzz target `feedback_probe` but maps it to no harness \
+             in [package.metadata.zakura-sim.targets]",
+            fuzz_dir(root.path()).join("Cargo.toml").display()
+        )
+    );
+}
 
+/// A harness without a `[[bin]]` fails every resolution with an error that
+/// names it.
+#[test]
+fn every_harness_needs_a_bin() {
     let undeclared = fuzz_package(
         &["race_fixtures"],
         &[
@@ -974,6 +980,22 @@ fn every_target_needs_a_bin_and_a_harness() {
              [package.metadata.zakura-sim.targets] but declares no such [[bin]]",
             manifest.display()
         )
+    );
+}
+
+/// A target the fuzz package doesn't declare fails, and the error lists the
+/// targets that map to a harness.
+#[test]
+fn an_undeclared_target_is_unknown() {
+    let root = fuzz_package(
+        &["race_fixtures", "feedback_probe"],
+        &[("race_fixtures", "fixtures/all")],
+    );
+    assert_eq!(
+        resolve_target(root.path(), "header_storage")
+            .unwrap_err()
+            .to_string(),
+        "unknown simulation fuzz target `header_storage`; expected one of race_fixtures"
     );
 }
 

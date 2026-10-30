@@ -50,8 +50,9 @@ code edges another input already covered adds nothing. With feedback on,
 libFuzzer adds it for its one new feature.
 
 `[package.metadata.zakura-sim.targets]` in `Cargo.toml` maps each target to
-the registered harness it runs. A new target needs both its `[[bin]]` and its
-entry there.
+the registered harness it runs. Each entry there needs a `[[bin]]`.
+`cargo xtask sim-minimize` minimizes only a target with an entry.
+`feedback_probe` runs no registered harness, so it has no entry.
 
 ## What a target does with a run
 

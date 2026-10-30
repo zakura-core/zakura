@@ -305,10 +305,12 @@ class Controller:
         key = (tip['height'], tip['hash'])
         if key != self.recent_tip:
             blocks = []
-            for height in range(max(0, tip['height'] - 5), tip['height'] + 1):
-                block_hash = rpc(18232, 'getblockhash', [height])
+            block_hash = tip['hash']
+            for height in range(tip['height'], max(-1, tip['height'] - 6), -1):
                 header = rpc(18232, 'getblockheader', [block_hash, True])
                 blocks.append({'height': height, 'hash': block_hash, 'time': header['time']})
+                block_hash = header['previousblockhash']
+            blocks.reverse()
             self.recent = blocks
             self.recent_tip = key
         intervals = [right['time'] - left['time'] for left, right in zip(self.recent, self.recent[1:]) if left['height'] >= activation]

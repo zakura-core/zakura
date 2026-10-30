@@ -200,9 +200,9 @@ class NetworkTests(unittest.TestCase):
             if method == 'getblockhash':
                 return str(params[0])
             height = int(params[0])
-            return {'time': 100 if height < 4420649 else 2000000 + (height - 4420649) * 451}
+            return {'time': 100 if height < 4420649 else 2000000 + (height - 4420649) * 451, 'previousblockhash': str(height - 1)}
         with patch.object(network, 'rpc', side_effect=response):
-            blocks, interval = controller.recent_blocks({'height': 4420650, 'hash': 'tip'}, 4420649)
+            blocks, interval = controller.recent_blocks({'height': 4420650, 'hash': '4420650'}, 4420649)
         self.assertEqual(len(blocks), 6)
         self.assertEqual(interval, 451)
 
@@ -214,6 +214,21 @@ class NetworkTests(unittest.TestCase):
         with patch.object(network, 'rpc', return_value=params):
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 network.wait_for_primary(self.run)
+
+    def test_recent_blocks_follow_the_sampled_tip_through_parent_links(self):
+        controller = self.controller('active')
+        headers = {
+            'tip': {'time': 300, 'previousblockhash': 'parent'},
+            'parent': {'time': 200, 'previousblockhash': 'genesis'},
+            'genesis': {'time': 100, 'previousblockhash': 'none'},
+        }
+        def response(port, method, params):
+            self.assertEqual(method, 'getblockheader')
+            return headers[params[0]]
+        with patch.object(network, 'rpc', side_effect=response):
+            blocks, interval = controller.recent_blocks({'height': 2, 'hash': 'tip'}, 1)
+        self.assertEqual([block['hash'] for block in blocks], ['genesis', 'parent', 'tip'])
+        self.assertEqual(interval, 100)
 
     def test_activation_delay_is_bounded(self):
         self.assertEqual(network.activation_delay('5m'), 300)

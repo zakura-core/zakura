@@ -846,8 +846,8 @@ impl SequencerTask {
     /// Reset the body pipeline and queued work above `tip` under one reset epoch.
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
-        let released = self.work.reset_above(tip);
-        self.budget.release(released);
+        self.work.reset_above(tip);
+
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
@@ -873,8 +873,8 @@ impl SequencerTask {
             .sequencer
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         if advance.changed {
-            let released = self.work.advance_floor(frontiers.verified_block_tip);
-            self.budget.release(released);
+            self.work.advance_floor(frontiers.verified_block_tip);
+
             self.release_contiguous_blocks().await;
         }
     }
@@ -1137,8 +1137,8 @@ impl SequencerTask {
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
                 let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
-                let released = self.work.reset_above(self.sequencer.floor());
-                self.budget.release(released);
+                self.work.reset_above(self.sequencer.floor());
+
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result identifies a bad body from a peer.
                 // Attribute it to the delivering peer.
@@ -1779,10 +1779,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(1_000_000);
         SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1_000_000),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1831,14 +1832,12 @@ mod tests {
             std::num::NonZeroU64::new(1).unwrap(),
         );
         let owner = taken[0].1.owner.unwrap();
-        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
-        task.budget.charge(reserved);
-        assert_eq!(
+        task.work.mark_reserved_for_owner(owner, [height]);
+        drop(
             task.work
-                .release_active_reserved_height_for_owner(owner, height),
-            Some(reserved)
+                .begin_receipt_for_owner(owner, height)
+                .expect("the test published this owner's reservation"),
         );
-        task.budget.release(reserved);
         let mut body = SequencedBody::new_queued(
             owner,
             zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -1932,10 +1931,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1977,10 +1977,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2024,7 +2025,7 @@ mod tests {
     async fn body_invalid_reselection_resets_block_pipeline() {
         let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
-        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX)));
         work.extend(
             old_authority,
             [(
@@ -2092,10 +2093,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2186,10 +2188,11 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2301,10 +2304,11 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2425,10 +2429,11 @@ mod tests {
         let registry = Arc::new(PeerRegistry::new());
         // A day ahead, so an episode or failure dated by the host clock lands a
         // day early: the deadline collapses to now, or the episode alarms.
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget)),
             registry.clone(),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2504,10 +2509,11 @@ mod tests {
         let (actions, actions_rx) = mpsc::channel(1);
         drop(actions_rx);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2577,10 +2583,11 @@ mod tests {
                 let (_control_tx, control_rx) = mpsc::unbounded_channel();
                 let (actions, mut actions_rx) = mpsc::channel(4);
                 let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                let budget = ByteBudget::new(123);
                 let mut task = SequencerTask::new(
                     Sequencer::new(block::Height(0), 1),
-                    ByteBudget::new(123),
-                    Arc::new(WorkQueue::new(block::Height(0))),
+                    budget.clone(),
+                    Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
                     ThroughputMeter::new(Instant::now()),
@@ -2679,10 +2686,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions.clone(),
             ThroughputMeter::new(Instant::now()),
@@ -2788,10 +2796,11 @@ mod tests {
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(4);
             let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let budget = ByteBudget::new(123);
             let mut task = SequencerTask::new(
                 Sequencer::new(block::Height(0), 1),
-                ByteBudget::new(123),
-                Arc::new(WorkQueue::new(block::Height(0))),
+                budget.clone(),
+                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
                 ThroughputMeter::new(Instant::now()),
@@ -2912,10 +2921,11 @@ mod tests {
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3001,10 +3011,11 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let budget = ByteBudget::new(123);
         let mut task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(123),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3058,10 +3069,11 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(30);
         let (view_tx, view_rx) = watch::channel(initial);
+        let budget = ByteBudget::new(1);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
-            ByteBudget::new(1),
-            Arc::new(WorkQueue::new(block::Height(0))),
+            budget.clone(),
+            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),

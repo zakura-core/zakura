@@ -24,10 +24,11 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions, mut actions_rx) = mpsc::channel(8);
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+    let budget = ByteBudget::new(1);
     let mut task = SequencerTask::new(
         Sequencer::new(block::Height(0), 2),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+        budget.clone(),
+        Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),
@@ -236,10 +237,11 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let (actions, _actions_rx) = mpsc::channel(8);
     let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
     let log = Arc::new(Log::default());
+    let budget = ByteBudget::new(1);
     let task = SequencerTask::new(
         Sequencer::new(block::Height(0), 2),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
+        budget.clone(),
+        Arc::new(WorkQueue::new(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),

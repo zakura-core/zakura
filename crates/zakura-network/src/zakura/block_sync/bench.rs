@@ -178,7 +178,7 @@ pub fn spawn_bench_sequencer(
     let sequencer = Sequencer::new(verified_block_tip, limit);
     let throughput = ThroughputMeter::new(Instant::now());
     let budget = ByteBudget::new(max_inflight_bytes.max(1));
-    let work = Arc::new(WorkQueue::new(verified_block_tip));
+    let work = Arc::new(WorkQueue::new(verified_block_tip, budget.clone()));
 
     let (actions_tx, actions_rx) = mpsc::channel(limit + 128);
     let (body_input_tx, body_input_rx) = mpsc::channel(limit);

@@ -270,14 +270,13 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
         routine.try_fill().await;
         next_sent(&mut outbound).await;
         if finalized {
-            let released = routine.work.advance_floor(block::Height(1));
-            routine.budget.release(released);
+            routine.work.advance_floor(block::Height(1));
+
             view_tx.send_modify(|view| view.download_floor = block::Height(1));
             routine.gc_committed_outstanding();
         } else {
             // The shared work ledger records another peer's receipt before ours.
-            let released = routine.work.claim_received(block::Height(1));
-            routine.budget.release(released);
+            routine.work.claim_received(block::Height(1));
         }
         assert_eq!(pool.held(), 1);
         deliver(&mut routine, BlockSyncMessage::Block(block)).await;
@@ -313,8 +312,8 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     assert!(routine.window.outstanding.is_empty());
     assert_eq!(pool.held(), 1);
     // A local reorg drops the height, and the peer's later Status contracts its range.
-    let released = routine.work.reset_above(block::Height(0));
-    routine.budget.release(released);
+    routine.work.reset_above(block::Height(0));
+
     routine.servable_low = block::Height(0);
     routine.servable_high = block::Height(0);
     while events.try_recv().is_ok() {}
@@ -346,8 +345,8 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
     let (mut routine, mut outbound, _pool, _connection, mut events) =
         requester_routine(block.hash());
     // Queue this 73 KB body behind the smallest estimate, far beyond tolerance.
-    let released = routine.work.reset_above(block::Height(0));
-    routine.budget.release(released);
+    routine.work.reset_above(block::Height(0));
+
     routine.work.extend(
         super::super::test_work_scope(),
         [(height, block.hash(), BlockSizeEstimate::Confirmed(500))],
@@ -401,8 +400,8 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
     for junk in [truncated, malleated] {
         let (mut routine, mut outbound, _pool, connection, mut events) =
             requester_routine(block.hash());
-        let released = routine.work.reset_above(block::Height(0));
-        routine.budget.release(released);
+        routine.work.reset_above(block::Height(0));
+
         routine.work.extend(
             super::super::test_work_scope(),
             [(height, block.hash(), BlockSizeEstimate::Confirmed(80_000))],
@@ -732,7 +731,7 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
         zakura_header_chain::BodyWorkOwner,
         block::Height,
         block::Hash,
-    ) -> u64,
+    ),
 ) {
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let height = block.coinbase_height().unwrap();
@@ -742,16 +741,15 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let owner = routine.window.outstanding.first().unwrap().request.owner;
     let released = routine
         .work
-        .release_answered_elsewhere(owner, height)
-        .expect("the request still owns its reserved height")
-        .released;
-    routine.budget.release(released);
+        .begin_competing_receipt(owner, height)
+        .expect("the request still owns its reserved height");
+    drop(released);
     assert!(routine
         .registry
         .has_outstanding_request(height, block.hash()));
 
-    let released = drop_height(&routine, owner, height, block.hash());
-    routine.budget.release(released);
+    drop_height(&routine, owner, height, block.hash());
+
     routine.gc_obsolete_outstanding();
 
     assert!(routine.window.outstanding.is_empty());
@@ -774,7 +772,6 @@ async fn a_retention_deferral_retires_a_request_another_peer_already_answered() 
         assert!(routine
             .work
             .defer_received_for_owner(owner, height, hash, 1, block::Height(0)));
-        0
     })
     .await;
 }

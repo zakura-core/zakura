@@ -1,6 +1,6 @@
 //! Ownership from provisional download reservation through the request write.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use zakura_header_chain::BodyWorkOwner;
 use zakura_rt::sync::{
@@ -8,10 +8,11 @@ use zakura_rt::sync::{
     downgrade, CancellationToken, Weak,
 };
 
+use super::super::admission::{request_priority, RequestPriority};
 use super::{block, WorkItem, WorkQueue};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
-use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
+use crate::zakura::transport::{ByteReservation, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
 const QUEUED: u8 = 1;
@@ -125,15 +126,13 @@ pub(super) struct RequestWriteRegistration {
     pub(super) status: RequestWriteStatus,
 }
 
-/// One exact attempt owns its provisional budget until publication. Afterwards
-/// the work ledger arbitrates every release, including reset and response arrival.
+/// Tracks one published request while the queue owns its funding.
+/// The work ledger arbitrates settlement by exact attempt identity.
 #[derive(Debug)]
 pub(crate) struct RequestWrite {
     owner: BodyWorkOwner,
     items: Vec<(block::Height, WorkItem)>,
-    estimated_bytes: u64,
     work: Arc<WorkQueue>,
-    budget: ByteBudget,
     cancel: CancellationToken,
     state: Arc<AtomicU8>,
     /// Reports this request's steps, in test and simulator builds.
@@ -141,76 +140,201 @@ pub(crate) struct RequestWrite {
     reporter: Arc<RequestReporter>,
 }
 
-impl RequestWrite {
-    pub(in crate::zakura::block_sync) fn new(
-        owner: BodyWorkOwner,
-        items: Vec<(block::Height, WorkItem)>,
-        work: Arc<WorkQueue>,
-        budget: ByteBudget,
-        cancel: CancellationToken,
-    ) -> Arc<Self> {
-        let estimated_bytes = items.iter().map(|(_, item)| item.estimated_bytes).sum();
-        Arc::new(Self {
-            #[cfg(any(test, zakura_sim))]
-            reporter: Arc::new(RequestReporter {
-                observer: work.observer.clone(),
-                owner,
-                heights: items.iter().map(|(height, _)| *height).collect(),
-                estimated_bytes,
-            }),
-            owner,
-            items,
-            estimated_bytes,
+/// Owns an exact provisional take until admission or rollback.
+#[derive(Debug)]
+pub(in crate::zakura::block_sync) struct TakenRequest {
+    work: Arc<WorkQueue>,
+    items: Vec<(block::Height, WorkItem)>,
+    #[cfg(any(test, zakura_sim))]
+    reporter: Option<RequestReporter>,
+}
+
+impl TakenRequest {
+    pub(super) fn new(work: Arc<WorkQueue>, items: Vec<(block::Height, WorkItem)>) -> Self {
+        Self {
             work,
-            budget,
+            items,
+            #[cfg(any(test, zakura_sim))]
+            reporter: None,
+        }
+    }
+
+    pub(in crate::zakura::block_sync) fn items(&self) -> &[(block::Height, WorkItem)] {
+        &self.items
+    }
+
+    /// Keep one contiguous retry-eligible run and quietly return the rest.
+    pub(in crate::zakura::block_sync) fn retain_range(&mut self, keep: Range<usize>) {
+        assert!(keep.start <= keep.end && keep.end <= self.items.len());
+        {
+            let mut inner = self.work.lock();
+            inner.state.return_unpublished(&self.items[..keep.start]);
+            inner.state.return_unpublished(&self.items[keep.end..]);
+        }
+        self.items.truncate(keep.end);
+        self.items.drain(..keep.start);
+    }
+
+    /// Admit the retained take against its queue's budget. Derive the charge and
+    /// floor exception from its actual items and the supplied download-floor view.
+    pub(in crate::zakura::block_sync) fn admit(
+        self,
+        download_floor: block::Height,
+        cancel: CancellationToken,
+    ) -> Option<UnpublishedRequest> {
+        let (first_height, first_item) = self.items.first()?;
+        let owner = first_item.owner?;
+        let priority = request_priority(download_floor, *first_height);
+        let bytes = self.items.iter().try_fold(0u64, |total, (_, item)| {
+            total.checked_add(item.estimated_bytes)
+        })?;
+        let funding = {
+            let inner = self.work.lock();
+            if cancel.is_cancelled() || !inner.state.is_unpublished_claim(owner, &self.items) {
+                return None;
+            }
+            match self.work.budget.reserve_owned(bytes) {
+                Some(funding) => funding,
+                None if priority == RequestPriority::Floor => {
+                    let funding = self.work.budget.charge_owned(bytes)?;
+                    metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
+                    funding
+                }
+                None => return None,
+            }
+        };
+        #[cfg(any(test, zakura_sim))]
+        let mut self_owned = self;
+        #[cfg(not(any(test, zakura_sim)))]
+        let self_owned = self;
+        #[cfg(any(test, zakura_sim))]
+        {
+            self_owned.reporter = Some(RequestReporter {
+                observer: self_owned.work.observer.clone(),
+                owner,
+                heights: self_owned.items.iter().map(|(height, _)| *height).collect(),
+                estimated_bytes: bytes,
+            });
+        }
+        Some(UnpublishedRequest {
+            taken: self_owned,
+            owner,
+            priority,
+            funding,
             cancel,
-            state: Arc::new(AtomicU8::new(UNPUBLISHED)),
         })
     }
+}
 
-    #[cfg(not(any(test, zakura_sim)))]
-    pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
-        RequestWriteStatus(self.state.clone())
-    }
-
-    #[cfg(any(test, zakura_sim))]
-    pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
-        RequestWriteStatus(self.state.clone(), Some(self.reporter.clone()))
-    }
-
-    /// Record outstanding state and enqueue into already-reserved capacity under
-    /// the same lock used by reset and writer claim. The caller retains this Arc
-    /// until return, even if a closed queue immediately discards its copy.
-    pub(in crate::zakura::block_sync) fn publish(self: &Arc<Self>, publish: impl FnOnce()) -> bool {
-        let mut inner = self.work.lock();
-        if self.cancel.is_cancelled() || !inner.state.is_unpublished_claim(self.owner, &self.items)
-        {
-            return false;
-        }
-        assert_eq!(
-            self.state.load(Ordering::Acquire),
-            UNPUBLISHED,
-            "a request is published once"
-        );
-        // The funded estimate transfers from this attempt's guard to the work ledger.
-        let transferred = inner.state.publish_claim(&self.items);
-        debug_assert_eq!(
-            transferred, self.estimated_bytes,
-            "an in-flight estimate never changes between take and publication"
-        );
-
-        inner.request_writes.insert(
-            self.owner,
-            RequestWriteRegistration {
-                claim: downgrade(self),
-                status: self.status(),
-            },
-        );
-        self.state.store(QUEUED, Ordering::Release);
+impl Drop for TakenRequest {
+    fn drop(&mut self) {
         #[cfg(any(test, zakura_sim))]
-        self.observe(RequestStep::Published);
-        publish();
-        true
+        if let Some(reporter) = &self.reporter {
+            reporter.report(RequestStep::Dropped(RequestWritePhase::Unpublished));
+        }
+        if !self.items.is_empty() {
+            self.work.return_unpublished(&self.items);
+        }
+    }
+}
+
+/// Owns provisional funding until publication consumes the request.
+#[derive(Debug)]
+pub(in crate::zakura::block_sync) struct UnpublishedRequest {
+    taken: TakenRequest,
+    owner: BodyWorkOwner,
+    priority: RequestPriority,
+    funding: ByteReservation,
+    cancel: CancellationToken,
+}
+
+impl UnpublishedRequest {
+    pub(in crate::zakura::block_sync) fn owner(&self) -> BodyWorkOwner {
+        self.owner
+    }
+
+    pub(in crate::zakura::block_sync) fn priority(&self) -> RequestPriority {
+        self.priority
+    }
+
+    pub(in crate::zakura::block_sync) fn bytes(&self) -> u64 {
+        self.funding.bytes()
+    }
+
+    pub(in crate::zakura::block_sync) fn items(&self) -> &[(block::Height, WorkItem)] {
+        self.taken.items()
+    }
+
+    /// Publish outstanding state and enqueue under the work lock. The local
+    /// claim survives the callback so a closed channel cannot drop it under the lock.
+    pub(in crate::zakura::block_sync) fn publish(
+        self,
+        publish: impl FnOnce(&Arc<RequestWrite>),
+    ) -> Option<Arc<RequestWrite>> {
+        let Self {
+            mut taken,
+            owner,
+            funding,
+            cancel,
+            ..
+        } = self;
+        let claim = Arc::new(RequestWrite {
+            #[cfg(any(test, zakura_sim))]
+            reporter: Arc::new(
+                taken
+                    .reporter
+                    .take()
+                    .expect("admission creates the request reporter"),
+            ),
+            owner,
+            items: std::mem::take(&mut taken.items),
+            work: taken.work.clone(),
+            cancel,
+            state: Arc::new(AtomicU8::new(UNPUBLISHED)),
+        });
+        {
+            let mut inner = claim.work.lock();
+            if claim.cancel.is_cancelled()
+                || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
+            {
+                return None;
+            }
+            let transferred = inner.state.publish_claim(&claim.items);
+            debug_assert_eq!(
+                transferred,
+                funding.bytes(),
+                "an in-flight estimate never changes between take and publication"
+            );
+            inner.funding.merge(funding);
+            inner.request_writes.insert(
+                claim.owner,
+                RequestWriteRegistration {
+                    claim: downgrade(&claim),
+                    status: claim.status(),
+                },
+            );
+            claim.state.store(QUEUED, Ordering::Release);
+            #[cfg(any(test, zakura_sim))]
+            claim.observe(RequestStep::Published);
+            // The queue transition is complete. Release its lock before unwinding
+            // a callback so claim cleanup can settle the published reservation.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&claim)));
+            drop(inner);
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Some(claim)
+    }
+}
+
+impl RequestWrite {
+    pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
+        RequestWriteStatus(
+            self.state.clone(),
+            #[cfg(any(test, zakura_sim))]
+            Some(self.reporter.clone()),
+        )
     }
 
     /// Reports `step` to the queue's observer, if one is installed.
@@ -234,13 +358,11 @@ impl RequestWrite {
         self.observe(RequestStep::DeliveryFailed);
         self.cancel.cancel();
         self.expire_unwritten();
-        let released = self
-            .work
+        self.work
             .release_reserved_and_return_items_detailed_for_owner(
                 self.owner,
                 self.items.iter().map(|(height, _)| *height),
             );
-        self.budget.clone().release(released.released_bytes);
     }
 
     pub(super) fn has_height_above(&self, floor: block::Height) -> bool {
@@ -302,7 +424,7 @@ impl Drop for RequestWrite {
         match self.state.load(Ordering::Acquire) {
             UNPUBLISHED => {
                 self.work.return_unpublished(&self.items);
-                self.budget.release(self.estimated_bytes);
+                // The enclosing unpublished request releases its funding.
             }
             WRITTEN => {}
             state => {
@@ -312,13 +434,11 @@ impl Drop for RequestWrite {
                 if state == STARTED {
                     self.cancel.cancel();
                 }
-                let released = self
-                    .work
+                self.work
                     .release_reserved_and_return_items_detailed_for_owner(
                         self.owner,
                         self.items.iter().map(|(height, _)| *height),
                     );
-                self.budget.release(released.released_bytes);
                 self.work.lock().request_writes.remove(&self.owner);
             }
         }

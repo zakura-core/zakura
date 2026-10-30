@@ -35,6 +35,7 @@ use zakura_rt::{
 };
 
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+use crate::zakura::transport::{ByteBudget, ByteReservation};
 
 mod request_write;
 pub(super) mod state;
@@ -42,7 +43,7 @@ pub(super) mod state;
 #[cfg(any(test, zakura_sim))]
 pub use request_write::RequestWritePhase;
 use request_write::RequestWriteRegistration;
-pub(super) use request_write::{RequestWrite, RequestWriteStatus};
+pub(super) use request_write::{RequestWrite, RequestWriteStatus, TakenRequest};
 use state::{WorkQueueState, WorkWake};
 
 /// Lower clamp on a body-size estimate.
@@ -103,13 +104,12 @@ pub struct WorkItemOwnership {
 }
 
 /// A request reservation that a received body ended.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(super) struct EndedReservation {
     /// The height's own charge: the estimate its request reserved for it.
     pub(super) charge: u64,
-    /// Every byte released: the charge, plus the unsent heights of a queued
-    /// request the release retired.
-    pub(super) released: u64,
+    /// Owns the charge and the unsent heights of a queued request that receipt retired.
+    pub(super) funding: ByteReservation,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -148,6 +148,7 @@ impl WorkReturnOutcome {
 #[derive(Debug)]
 struct WorkQueueInner {
     state: WorkQueueState,
+    funding: ByteReservation,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
     request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
@@ -187,6 +188,7 @@ impl Drop for WorkQueueGuard<'_> {
 #[derive(Debug)]
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
+    budget: ByteBudget,
     available: Notify,
     /// Counts events that take an unreceived height from its owner without that
     /// owner's routine retiring the request. Routines rescan their requests for
@@ -199,12 +201,14 @@ pub(super) struct WorkQueue {
 }
 
 impl WorkQueue {
-    pub(super) fn new(floor: block::Height) -> Self {
+    pub(super) fn new(floor: block::Height, budget: ByteBudget) -> Self {
         Self {
             inner: StdMutex::new(WorkQueueInner {
                 state: WorkQueueState::new(floor),
+                funding: budget.empty_reservation(),
                 request_writes: HashMap::new(),
             }),
+            budget,
             available: Notify::new(),
             revocations: AtomicU64::new(0),
             #[cfg(any(test, zakura_sim))]
@@ -235,6 +239,10 @@ impl WorkQueue {
             self.observer,
             super::block_sync_observe::BlockEvent::WorkQueue(Self::ownership(&inner))
         );
+    }
+
+    pub(super) fn budget(&self) -> ByteBudget {
+        self.budget.clone()
     }
 
     /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
@@ -368,6 +376,29 @@ impl WorkQueue {
     /// Give the provisional take an exact owner before releasing the queue lock.
     /// A reset followed by a new take cannot be undone by this attempt's cleanup.
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn take_request(
+        self: &Arc<Self>,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+        session_id: u64,
+        request_id: NonZeroU64,
+    ) -> TakenRequest {
+        let items = self.lock().state.take_budgeted(
+            low,
+            high,
+            max_count,
+            max_estimated_bytes,
+            Some((session_id, request_id)),
+        );
+        TakenRequest::new(self.clone(), items)
+    }
+
+    /// Give the provisional take an exact owner before releasing the queue lock.
+    /// A reset followed by a new take cannot be undone by this attempt's cleanup.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn take_for_request(
         &self,
         low: block::Height,
@@ -403,17 +434,23 @@ impl WorkQueue {
     /// freshly-registered `available` future and busy-loop the want-work arm
     /// (a self-wake spin); other peers were already woken by the original failure
     /// `return_items`, so suppressing the notify only affects the caller.
-    pub(super) fn return_unpublished(&self, items: &[(block::Height, WorkItem)]) {
+    fn return_unpublished(&self, items: &[(block::Height, WorkItem)]) {
         self.lock().state.return_unpublished(items);
     }
 
     /// Mark already-taken heights as owning an estimated byte reservation.
     ///
-    /// Returns the sum marked. The caller must have already admitted the same
-    /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
+    /// Admit the same charge into the fixture budget and return the marked total.
     #[cfg(test)]
     pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
-        self.lock().state.mark_reserved(None, heights)
+        let mut inner = self.lock();
+        let bytes = inner.state.mark_reserved(None, heights);
+        inner.funding.merge(
+            self.budget
+                .charge_owned(bytes)
+                .expect("fixture charges fit the budget counter"),
+        );
+        bytes
     }
 
     #[cfg(test)]
@@ -422,31 +459,35 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
-        self.lock().state.mark_reserved(Some(owner), heights)
+        let mut inner = self.lock();
+        let bytes = inner.state.mark_reserved(Some(owner), heights);
+        inner.funding.merge(
+            self.budget
+                .charge_owned(bytes)
+                .expect("fixture charges fit the budget counter"),
+        );
+        bytes
     }
 
     /// End an active request reservation at receipt.
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
         self.release_active_reserved_height_matching(None, height, false)
-            .map(|ended| ended.released)
+            .map(|settlement| settlement.funding.bytes())
     }
 
-    /// End the receipt reservation and retire any queued request it invalidates.
-    /// Returns all released bytes, including the request's other unsent heights.
-    pub(super) fn release_active_reserved_height_for_owner(
+    /// Transfer this owner's receipt charge into the body handoff.
+    /// The returned reservation retains its admission budget until it drops.
+    pub(super) fn begin_receipt_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> Option<u64> {
+    ) -> Option<EndedReservation> {
         self.release_active_reserved_height_matching(Some(owner), height, false)
-            .map(|ended| ended.released)
     }
 
-    /// Like [`Self::release_active_reserved_height_for_owner`], for a body that
-    /// another attempt received. Returns the height's own charge with the
-    /// released total, both read under the lock that checks `owner`.
-    pub(super) fn release_answered_elsewhere(
+    /// Transfer a competing request's charge when another attempt receives its body.
+    pub(super) fn begin_competing_receipt(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
@@ -454,6 +495,8 @@ impl WorkQueue {
         self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
+    // Overflow violates funded ownership; returning None would hide a completed transition.
+    #[allow(clippy::unwrap_in_result)]
     fn release_active_reserved_height_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
@@ -470,7 +513,12 @@ impl WorkQueue {
             (
                 EndedReservation {
                     charge: ended.released_bytes,
-                    released: ended.released_bytes.saturating_add(outcome.released_bytes),
+                    funding: inner.funding.split(
+                        ended
+                            .released_bytes
+                            .checked_add(outcome.released_bytes)
+                            .expect("receipt releases owned charges"),
+                    ),
                 },
                 claim,
             )
@@ -482,16 +530,15 @@ impl WorkQueue {
     /// Claim a received height and end any request reservation it owned.
     #[cfg(test)]
     pub(super) fn claim_received(&self, height: block::Height) -> u64 {
-        self.claim_received_matching(None, height)
+        self.claim_received_matching(None, height).bytes()
     }
 
-    /// Claim a received height and return its reservation plus any unsent bytes
-    /// released by retiring the queued request.
-    pub(super) fn claim_received_for_owner(
+    /// Claim a received height and transfer its funding into the handoff.
+    pub(super) fn claim_receipt_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> u64 {
+    ) -> ByteReservation {
         self.claim_received_matching(Some(owner), height)
     }
 
@@ -499,15 +546,17 @@ impl WorkQueue {
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
-    ) -> u64 {
+    ) -> ByteReservation {
         let (released, claim) = {
             let mut inner = self.lock();
             let Some(ended) = inner.state.claim_received(owner, height) else {
-                return 0;
+                return inner.funding.split(0);
             };
             let (outcome, claim) = self.return_items_locked(&mut inner, ended.owner, []);
             (
-                ended.released_bytes.saturating_add(outcome.released_bytes),
+                inner
+                    .funding
+                    .split(ended.released_bytes.saturating_add(outcome.released_bytes)),
                 claim,
             )
         };
@@ -521,17 +570,26 @@ impl WorkQueue {
         &self,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
-        self.lock().state.release_reserved_heights(None, heights)
+        let mut release = self.budget.deferred_release();
+        let mut inner = self.lock();
+        let bytes = inner.state.release_reserved_heights(None, heights);
+        inner.funding.settle_into(&mut release, bytes);
+        drop(inner);
+        drop(release);
+        bytes
     }
 
     pub(super) fn release_reserved_heights_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
-    ) -> u64 {
-        self.lock()
-            .state
-            .release_reserved_heights(Some(owner), heights)
+    ) {
+        let mut release = self.budget.deferred_release();
+        let mut inner = self.lock();
+        let bytes = inner.state.release_reserved_heights(Some(owner), heights);
+        inner.funding.settle_into(&mut release, bytes);
+        drop(inner);
+        drop(release);
     }
 
     /// Release and return heights, including received ones, in tests.
@@ -540,7 +598,14 @@ impl WorkQueue {
         &self,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
-        let delta = self.lock().state.release_and_return_items(heights);
+        let mut release = self.budget.deferred_release();
+        let mut inner = self.lock();
+        let delta = inner.state.release_and_return_items(heights);
+        inner
+            .funding
+            .settle_into(&mut release, delta.released_bytes);
+        drop(inner);
+        drop(release);
         self.wake(delta.wake);
         delta.released_bytes
     }
@@ -580,10 +645,16 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> WorkReturnOutcome {
+        let mut release = self.budget.deferred_release();
         let (outcome, claim) = {
             let mut inner = self.lock();
-            self.return_items_locked(&mut inner, owner, heights)
+            let result = self.return_items_locked(&mut inner, owner, heights);
+            inner
+                .funding
+                .settle_into(&mut release, result.0.released_bytes);
+            result
         };
+        drop(release);
         drop(claim);
         outcome
     }
@@ -645,22 +716,27 @@ impl WorkQueue {
     /// Garbage-collect committed heights: raise the floor to `max(self.floor,
     /// floor)` and drop every `pending`/`in_flight` entry `<= floor`.
     ///
-    /// Returns request-estimate bytes that were still reserved for unreceived
-    /// heights, so the caller returns them to the `ByteBudget`. Received bodies
-    /// carry no charge here; the Sequencer's buffers own them.
-    pub(super) fn advance_floor(&self, floor: block::Height) -> u64 {
-        let delta = self.lock().state.advance_floor(floor);
+    /// Settle request estimates for unreceived heights after unlocking.
+    /// Received bodies retain their separate payload ownership.
+    pub(super) fn advance_floor(&self, floor: block::Height) {
+        let mut release = self.budget.deferred_release();
+        let mut inner = self.lock();
+        let delta = inner.state.advance_floor(floor);
+        inner
+            .funding
+            .settle_into(&mut release, delta.released_bytes);
+        drop(inner);
+        drop(release);
         self.wake(delta.wake);
-        delta.released_bytes
     }
 
     /// Frontier reset: pin the floor and drop every `pending`/`in_flight` entry
     /// `> floor` (their buffers were dropped; the producer re-fills via the next
     /// query).
     ///
-    /// Returns request-estimate bytes still reserved for unreceived heights, as
-    /// in [`advance_floor`](Self::advance_floor).
-    pub(super) fn reset_above(&self, floor: block::Height) -> u64 {
+    /// Settle request estimates for removed heights after unlocking.
+    pub(super) fn reset_above(&self, floor: block::Height) {
+        let mut release = self.budget.deferred_release();
         let mut inner = self.lock();
         // Retain upgraded owners until after unlocking: a concurrently dropped
         // queue entry can make this the last reference, whose Drop settles work.
@@ -674,11 +750,13 @@ impl WorkQueue {
             inner.request_writes.remove(&claim.owner());
         }
         let delta = inner.state.reset_above(floor);
-
+        inner
+            .funding
+            .settle_into(&mut release, delta.released_bytes);
         drop(inner);
+        drop(release);
         drop(claims);
         self.wake(delta.wake);
-        delta.released_bytes
     }
 
     /// The "work added" notifier (per-peer routines wake source).

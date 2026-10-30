@@ -447,6 +447,13 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
+        let budget = ByteBudget::new(startup.config.max_inflight_block_bytes);
+        #[cfg(any(test, zakura_sim))]
+        let budget = budget.with_observer(startup.observer.budget_observer());
+        let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget);
+        #[cfg(any(test, zakura_sim))]
+        let work_queue = work_queue.with_observer(startup.observer.clone());
+        let work_queue = Arc::new(work_queue);
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_hash: startup.frontiers.verified_block_hash,
@@ -456,18 +463,8 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            #[cfg(not(any(test, zakura_sim)))]
-            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
-            #[cfg(not(any(test, zakura_sim)))]
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
-            #[cfg(any(test, zakura_sim))]
-            work_queue: Arc::new(
-                WorkQueue::new(startup.frontiers.verified_block_tip)
-                    .with_observer(startup.observer.clone()),
-            ),
-            #[cfg(any(test, zakura_sim))]
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes)
-                .with_observer(startup.observer.budget_observer()),
+            budget: work_queue.budget(),
+            work_queue,
             needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }

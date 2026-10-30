@@ -63,6 +63,53 @@ macro_rules! observe {
     ($reactor:expr, $event:expr) => {};
 }
 
+/// Reports that the reactor resumed at `$arm`, starting its next turn, then
+/// evaluates `$body`, if given. See [`ReactorEvent::Resumed`].
+#[cfg(any(test, zakura_sim))]
+macro_rules! resumed {
+    ($reactor:expr, $arm:ident) => {
+        $reactor.resumed(observe::ResumeArm::$arm)
+    };
+    ($reactor:expr, $arm:ident, $body:expr) => {{
+        $reactor.resumed(observe::ResumeArm::$arm);
+        $body
+    }};
+}
+
+/// Reports that the reactor resumed. Outside test and simulator builds the
+/// macro expands to `$body` alone, or to nothing.
+///
+/// The `$body` form keeps a one-line `select!` arm on one line, so a
+/// `#[track_caller]` call on it, such as `time::sleep_until`, keeps its
+/// line in the release build's panic locations.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! resumed {
+    ($reactor:expr, $arm:ident) => {};
+    ($reactor:expr, $arm:ident, $body:expr) => {
+        $body
+    };
+}
+
+/// Reports the reactor's settled state before a wait, or, with `last`, as
+/// its loop ends. See [`ReactorEvent::Settled`].
+#[cfg(any(test, zakura_sim))]
+macro_rules! settled {
+    ($reactor:expr) => {
+        $reactor.settled(false)
+    };
+    ($reactor:expr, last) => {
+        $reactor.settled(true)
+    };
+}
+
+/// Reports the reactor's settled state. Outside test and simulator builds
+/// the macro expands to nothing.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! settled {
+    ($reactor:expr) => {};
+    ($reactor:expr, last) => {};
+}
+
 /// Inputs that can make a previously blocked ordinary offer eligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SchedulingOpportunity {
@@ -320,11 +367,16 @@ fn build_header_sync_reactor(
         next_call: 0,
         #[cfg(any(test, zakura_sim))]
         completing_call: None,
+        #[cfg(any(test, zakura_sim))]
+        turn: 0,
+        #[cfg(any(test, zakura_sim))]
+        unhandled_calls: std::collections::BTreeSet::new(),
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
     }
     reactor.schedule_current_vct_repair();
+    settled!(reactor);
     Ok((handle, actions_rx, reactor))
 }
 
@@ -466,6 +518,14 @@ struct HeaderSyncReactor {
     /// [`Self::handle_port_completion`].
     #[cfg(any(test, zakura_sim))]
     completing_call: Option<u64>,
+    /// The loop's current turn: 0 at build, then one more at each
+    /// [`ReactorEvent::Resumed`].
+    #[cfg(any(test, zakura_sim))]
+    turn: u64,
+    /// Port calls dispatched and not yet handled. A call whose future is
+    /// dropped at shutdown stays here.
+    #[cfg(any(test, zakura_sim))]
+    unhandled_calls: std::collections::BTreeSet<u64>,
 }
 
 type PendingPortOperation = Pin<Box<dyn Future<Output = PortOperationResult> + Send + 'static>>;
@@ -878,6 +938,7 @@ pub(super) fn selected_port_aux_delivery(
 
 impl HeaderSyncReactor {
     async fn run(mut self) {
+        resumed!(self, Start);
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
@@ -887,7 +948,9 @@ impl HeaderSyncReactor {
                 .as_ref()
                 .is_some_and(|operation| operation.fatal_sent)
             {
+                settled!(self);
                 self.startup.shutdown.cancelled().await;
+                resumed!(self, FatalWait);
                 break HeaderRequestTerminal::Shutdown;
             }
             if self.startup.shutdown.is_cancelled() {
@@ -940,9 +1003,15 @@ impl HeaderSyncReactor {
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
+            // No branch future below changes a snapshot field, so the state
+            // holds until an arm runs.
+            settled!(self);
             zakura_rt::select! {
                 biased;
-                _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
+                _ = self.startup.shutdown.cancelled() => {
+                    resumed!(self, Shutdown);
+                    break HeaderRequestTerminal::Shutdown;
+                }
                 completion = async {
                     if self.pending_port_operations.is_empty() {
                         std::future::pending().await
@@ -950,31 +1019,42 @@ impl HeaderSyncReactor {
                         self.pending_port_operations.next().await
                     }
                 } => {
+                    resumed!(self, PortCompletion);
                     if let Some(completion) = completion {
                         self.handle_port_completion(completion);
                     }
                 }
                 permit = locator_capacity.acquire_owned(), if self.locator_capacity_waiting => {
+                    resumed!(self, LocatorPermit);
                     drop(permit.expect("the locator semaphore is never closed"));
                     self.locator_capacity_waiting = false;
                 },
-                _ = capacity_releases.changed() => {},
-                _ = time::sleep_until(maintenance) => self.refresh_statuses(),
-                event = self.lifecycle.recv() => match event {
-                    Some(event) => self.handle_lifecycle(event),
-                    None => break HeaderRequestTerminal::Shutdown,
+                _ = capacity_releases.changed() => resumed!(self, CapacityReleased, ()),
+                _ = time::sleep_until(maintenance) => resumed!(self, Maintenance, self.refresh_statuses()),
+                event = self.lifecycle.recv() => {
+                    resumed!(self, Lifecycle);
+                    match event {
+                        Some(event) => self.handle_lifecycle(event),
+                        None => break HeaderRequestTerminal::Shutdown,
+                    }
+                }
+                event = self.events.recv() => {
+                    resumed!(self, Event);
+                    match event {
+                        Some(event) => self.handle_event(event),
+                        None => break HeaderRequestTerminal::Shutdown,
+                    }
+                }
+                _ = zakura_rt::task::yield_now(), if handled_event => {
+                    resumed!(self, Yield);
                 },
-                event = self.events.recv() => match event {
-                    Some(event) => self.handle_event(event),
-                    None => break HeaderRequestTerminal::Shutdown,
-                },
-                _ = zakura_rt::task::yield_now(), if handled_event => {},
                 changed = async {
                     match committed_snapshots.as_mut() {
                         Some(snapshots) => snapshots.changed().await,
                         None => std::future::pending().await,
                     }
                 } => {
+                    resumed!(self, CommittedSnapshot);
                     if changed.is_ok() {
                         if let Some(snapshot) = committed_snapshots
                             .as_ref()
@@ -992,6 +1072,7 @@ impl HeaderSyncReactor {
                         None => std::future::pending().await,
                     }
                 } => {
+                    resumed!(self, VctRepairs);
                     if changed.is_ok() {
                         if let Some(status) =
                             vct_root_repairs.as_ref().map(|repairs| *repairs.borrow())
@@ -1006,6 +1087,70 @@ impl HeaderSyncReactor {
             self.schedule_cached_statuses();
         };
         self.retire_all_peer_work(terminal_outcome);
+        settled!(self, last);
+    }
+
+    /// Starts the next turn and reports that it resumed at `arm`.
+    #[cfg(any(test, zakura_sim))]
+    fn resumed(&mut self, arm: observe::ResumeArm) {
+        self.turn += 1;
+        observe!(
+            self,
+            ReactorEvent::Resumed {
+                turn: self.turn,
+                arm,
+            }
+        );
+    }
+
+    /// Reports the reactor's state as settled at the end of its turn, or,
+    /// with `last`, as its loop ends.
+    #[cfg(any(test, zakura_sim))]
+    fn settled(&self, last: bool) {
+        observe!(
+            self,
+            ReactorEvent::Settled {
+                turn: self.turn,
+                last,
+                snapshot: Box::new(self.owner_snapshot()),
+            }
+        );
+    }
+
+    /// The fields the reactor schedules from, read on its own task. See
+    /// [`observe::ReactorSnapshot`].
+    #[cfg(any(test, zakura_sim))]
+    fn owner_snapshot(&self) -> observe::ReactorSnapshot {
+        let by_peer = |a: &ZakuraPeerId, b: &ZakuraPeerId| a.as_bytes().cmp(b.as_bytes());
+        let mut sessions: Vec<_> = self
+            .peer_state
+            .iter()
+            .map(|(peer, state)| observe::SessionEntry {
+                peer: peer.clone(),
+                session_id: state.session.session_id(),
+                direction: state.session.direction(),
+            })
+            .collect();
+        sessions.sort_by(|a, b| by_peer(&a.peer, &b.peer));
+        let mut cooldowns: Vec<_> = self.unproductive_peer_cooldowns.keys().cloned().collect();
+        cooldowns.sort_by(by_peer);
+        let mut pending_locators: Vec<_> = self.pending_locator_queries.iter().cloned().collect();
+        pending_locators.sort_by(by_peer);
+        observe::ReactorSnapshot {
+            adopted: self
+                .committed_snapshot
+                .as_ref()
+                .map(|snapshot| observe::AdoptedSnapshot {
+                    header_generation: snapshot.header_generation.get(),
+                    finalized: snapshot.frontiers.finalized,
+                    header_best: snapshot.frontiers.header_best,
+                }),
+            sessions,
+            cooldowns,
+            pending_locators,
+            unhandled_calls: self.unhandled_calls.iter().copied().collect(),
+            work: self.peer_work_queue.owner_snapshot(),
+        }
     }
 
     /// Acknowledge admission only after the reactor has installed or refused the session.
@@ -1093,6 +1238,7 @@ impl HeaderSyncReactor {
         self.refresh_committed_snapshot();
         #[cfg(any(test, zakura_sim))]
         if let Some(call) = self.completing_call.take() {
+            self.unhandled_calls.remove(&call);
             observe!(self, ReactorEvent::Handled { call, panicked });
         }
     }
@@ -4568,6 +4714,10 @@ impl HeaderSyncReactor {
             });
         if let Some(operation) = vct_local_operation {
             self.vct_local_operation = Some(operation);
+        }
+        #[cfg(any(test, zakura_sim))]
+        if call != 0 {
+            self.unhandled_calls.insert(call);
         }
         #[cfg(any(test, zakura_sim))]
         if let Some(op) = dispatched {

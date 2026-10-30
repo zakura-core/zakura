@@ -18,7 +18,9 @@ use futures::future::BoxFuture;
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        framed_channel, header_sync_header_bytes_for_network, spawn_header_sync_reactor,
+        framed_channel, header_sync_header_bytes_for_network,
+        observe::{HeaderSyncObserver, ObserverSlot, ReactorEvent},
+        spawn_header_sync_reactor,
         v9::{
             self, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
             RegtestMessage, SubscribeHeaders,
@@ -238,6 +240,23 @@ fn peer_id(seed: u8) -> ZakuraPeerId {
 /// in-memory streams, one each way.
 #[test]
 fn two_reactors_meet_over_memory_streams() {
+    meet(None);
+}
+
+/// Records every reactor event in order, under a std lock it never holds
+/// across anything else.
+#[derive(Debug, Default)]
+struct Events(Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Events {
+    fn observe(&self, event: ReactorEvent) {
+        self.0.lock().expect("never poisoned").push(event);
+    }
+}
+
+/// [`two_reactors_meet_over_memory_streams`]'s run, with each reactor
+/// observed by its entry of `observers`, if given. Returns every step.
+fn meet(observers: Option<[Arc<Events>; 2]>) -> Vec<String> {
     let plan = Rc::new(RefCell::new(Plan(3)));
     let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
     {
@@ -248,9 +267,13 @@ fn two_reactors_meet_over_memory_streams() {
     let shutdown = CancellationToken::new();
     let exits = Rc::new(RefCell::new(Vec::new()));
     let mut nodes = Vec::new();
-    for name in ["a", "b"] {
+    for (index, name) in ["a", "b"].into_iter().enumerate() {
+        let mut startup = startup(shutdown.clone());
+        if let Some(observers) = &observers {
+            startup.observer = ObserverSlot::new(observers[index].clone());
+        }
         let (handle, actions, reactor) =
-            spawn_header_sync_reactor(startup(shutdown.clone())).expect("the reactor starts");
+            spawn_header_sync_reactor(startup).expect("the reactor starts");
         let exits = Rc::clone(&exits);
         sched.spawn_root(name, async move {
             let exit = match reactor.await {
@@ -320,6 +343,48 @@ fn two_reactors_meet_over_memory_streams() {
         !steps.iter().any(|step| step.starts_with("panicked")),
         "{steps:?}"
     );
+    steps
+}
+
+/// The reactors' settled snapshots and resume markers add no scheduling
+/// point: the meeting takes the same steps with and without observers, and
+/// the observed run reaches each reactor's build, start, a wait it resumes
+/// from, its shutdown and its final snapshot, with its session listed.
+///
+/// This fails if a snapshot reads anything through the simulator's
+/// primitives, such as the chunk budget's lock.
+#[test]
+fn reactor_snapshots_add_no_scheduling_point() {
+    let observers = [Arc::new(Events::default()), Arc::new(Events::default())];
+    let observed = meet(Some(observers.clone()));
+    for events in &observers {
+        let events = events.0.lock().expect("never poisoned");
+        let arms: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ReactorEvent::Resumed { arm, .. } => Some(format!("{arm:?}")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(events.first(), Some(ReactorEvent::Settled { turn: 0, .. }))
+                && matches!(
+                    events.last(),
+                    Some(ReactorEvent::Settled { last: true, .. })
+                ),
+            "each reactor settles at build and at its end"
+        );
+        assert!(
+            arms.contains("Start") && arms.contains("Shutdown") && arms.len() > 2,
+            "it starts, waits and resumes, and shuts down: {arms:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event,
+                ReactorEvent::Settled { snapshot, last: false, .. } if !snapshot.sessions.is_empty())),
+            "a settled snapshot lists the session"
+        );
+    }
+    assert_eq!(observed, meet(None));
 }
 
 /// Reactor `a`'s session with peer `b` is replaced while its pipe still runs. The

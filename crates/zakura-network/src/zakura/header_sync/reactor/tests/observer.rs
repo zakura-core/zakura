@@ -1209,6 +1209,11 @@ async fn observer_does_not_change_behaviour() {
         matches!(
             events.as_slice(),
             [
+                ReactorEvent::Settled {
+                    turn: 0,
+                    last: false,
+                    ..
+                },
                 ReactorEvent::Dispatched {
                     call: 1,
                     op: PortCall::Locator { .. }
@@ -1447,5 +1452,499 @@ fn dispatch_reports_distinct_origin_and_current() {
             origin: Some(1),
             current: Some(2),
         }]
+    );
+}
+
+/// Reports the reactor's state as it stands, and returns the snapshot it
+/// reported.
+fn settle(reactor: &HeaderSyncReactor, recorder: &Recorder) -> observe::ReactorSnapshot {
+    recorder.take();
+    reactor.settled(false);
+    match recorder.take().as_slice() {
+        [ReactorEvent::Settled { snapshot, .. }] => (**snapshot).clone(),
+        other => panic!("one Settled, got {other:?}"),
+    }
+}
+
+/// The test peer with ID bytes `byte`.
+fn peer_of(byte: u8) -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer ID")
+}
+
+/// `peer` offers target `target` on `session_id`, and the reactor stages it
+/// and dispatches its locator read, which a silent port never answers.
+fn offer(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    target: block::Hash,
+) {
+    reactor.handle_status(
+        peer.clone(),
+        session_id,
+        super::status_offers::status_for(snapshot, target),
+    );
+    reactor.schedule_cached_statuses();
+}
+
+/// A reactor on a port whose locator reads never answer, observed by
+/// `recorder`.
+fn silent_reactor(
+    recorder: &Arc<Recorder>,
+) -> (HeaderSyncReactor, zakura_header_chain::EngineSnapshot) {
+    observed_reactor(
+        Arc::new(ScriptedPort {
+            silent_locator: true,
+            ..ScriptedPort::default()
+        }),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    )
+}
+
+/// The awaiting entry `peer`'s offer of `target` on `session_id` makes.
+fn awaiting(
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    target: block::Hash,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+) -> observe::WorkEntry {
+    observe::WorkEntry {
+        peer: peer.clone(),
+        session_id,
+        target_tip_hash: target,
+        phase: observe::WorkPhase::AwaitingLocator {
+            scope: zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target),
+        },
+    }
+}
+
+/// A settled snapshot lists a cached offer waiting for its locator and
+/// another peer's active request, each with its identity and phase, with
+/// both peers' sessions, the locator read in flight and its unhandled call.
+///
+/// This fails if the snapshot leaves out work that waits for its locator.
+#[test]
+fn the_snapshot_lists_awaiting_and_active_work() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = silent_reactor(&recorder);
+    let (waiting, active_peer) = (peer_of(1), peer_of(2));
+    let _waiting = connect(&mut reactor, &waiting, 3);
+    let _active = connect(&mut reactor, &active_peer, 7);
+    let target = block::Hash([0x78; 32]);
+    offer(&mut reactor, &snapshot, &waiting, 3, target);
+    let (_, owner, _) = seed_applying_request(&mut reactor, &snapshot, active_peer.clone(), 7);
+    assert!(
+        reactor.peer_work_queue.awaiting_target(&waiting).is_some()
+            && reactor.peer_work_queue.active(&active_peer).is_some(),
+        "one offer waits for its locator and one request is active"
+    );
+
+    let settled = settle(&reactor, &recorder);
+    let seeded = active(&reactor, &active_peer);
+    assert_eq!(
+        settled.work,
+        vec![
+            awaiting(&waiting, 3, target, &snapshot),
+            observe::WorkEntry {
+                peer: active_peer.clone(),
+                session_id: 7,
+                target_tip_hash: seeded.target.status.selected_tip_hash,
+                phase: observe::WorkPhase::Active {
+                    request_id: 9,
+                    owner,
+                    purpose: HeaderTargetPurpose::Normal,
+                    phase: HeaderTargetPhase::Applying,
+                    held: 1,
+                    cursor: None,
+                },
+            },
+        ]
+    );
+    assert_eq!(
+        settled
+            .sessions
+            .iter()
+            .map(|session| (session.peer.clone(), session.session_id))
+            .collect::<Vec<_>>(),
+        [(waiting.clone(), 3), (active_peer, 7)]
+    );
+    assert_eq!(settled.pending_locators, [waiting]);
+    assert_eq!(settled.unhandled_calls, [1]);
+    assert_eq!(
+        settled.adopted,
+        Some(observe::AdoptedSnapshot {
+            header_generation: snapshot.header_generation.get(),
+            finalized: snapshot.frontiers.finalized,
+            header_best: snapshot.frontiers.header_best,
+        })
+    );
+}
+
+/// An obsolete committed snapshot drops a target still waiting for its
+/// locator without any retirement event, and the next snapshot shows it
+/// gone, since it reads the queue itself.
+///
+/// This fails if the snapshot follows the reactor's retirement events.
+#[test]
+fn unstarted_removal_shows_without_a_retirement_event() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = silent_reactor(&recorder);
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 3);
+    let target = block::Hash([0x78; 32]);
+    offer(&mut reactor, &snapshot, &peer, 3, target);
+    assert_eq!(
+        settle(&reactor, &recorder).work,
+        [awaiting(&peer, 3, target, &snapshot)],
+        "the target waits for its locator"
+    );
+
+    let mut obsolete = snapshot.clone();
+    obsolete.header_generation = snapshot.header_generation.checked_next().unwrap();
+    reactor.retire_obsolete_work(&obsolete);
+    assert!(
+        !recorder
+            .take()
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::Retired { .. })),
+        "nothing reports the removal"
+    );
+    assert!(reactor.peer_work_queue.awaiting_target(&peer).is_none());
+    assert_eq!(settle(&reactor, &recorder).work, []);
+}
+
+/// Each way the queue drops a peer's work leaves the next snapshot without
+/// it: `remove` through `retire_peer_work`, `remove_all` through
+/// `remove_unstarted` and `retire_obsolete_unstarted`,
+/// `retire_obsolete_active`, and `remove_owner`. Each case first shows the
+/// work listed, then that its path ran.
+///
+/// This fails if any removal path leaves the queue's entry in place.
+#[test]
+fn each_removal_path_empties_the_snapshot() {
+    let target = block::Hash([0x78; 32]);
+    /// `snapshot` at the next header generation, which obsoletes its work.
+    fn newer(
+        snapshot: &zakura_header_chain::EngineSnapshot,
+    ) -> zakura_header_chain::EngineSnapshot {
+        let mut newer = snapshot.clone();
+        newer.header_generation = snapshot.header_generation.checked_next().unwrap();
+        newer
+    }
+    type Path = fn(&mut HeaderSyncReactor, &zakura_header_chain::EngineSnapshot, &ZakuraPeerId);
+    let unstarted: [(&str, Path); 2] = [
+        ("remove_unstarted", |reactor, _, peer| {
+            reactor.defer_ordinary_target(peer)
+        }),
+        ("retire_obsolete_unstarted", |reactor, snapshot, _| {
+            reactor.retire_obsolete_work(&newer(snapshot))
+        }),
+    ];
+    for (path, remove) in unstarted {
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, snapshot) = silent_reactor(&recorder);
+        let peer = peer();
+        let _outbound = connect(&mut reactor, &peer, 3);
+        offer(&mut reactor, &snapshot, &peer, 3, target);
+        assert_eq!(settle(&reactor, &recorder).work.len(), 1, "{path}");
+        remove(&mut reactor, &snapshot, &peer);
+        assert!(
+            reactor.peer_work_queue.awaiting_target(&peer).is_none(),
+            "{path} ran"
+        );
+        assert_eq!(settle(&reactor, &recorder).work, [], "{path}");
+    }
+
+    let active: [(&str, Path); 3] = [
+        ("remove", |reactor, _, peer| {
+            reactor.retire_peer_work(peer, HeaderRequestTerminal::Disconnected)
+        }),
+        ("retire_obsolete_active", |reactor, snapshot, _| {
+            reactor.retire_obsolete_work(&newer(snapshot))
+        }),
+        ("remove_owner", |reactor, _, peer| {
+            let owner = active(reactor, peer).owner;
+            assert!(reactor.peer_work_queue.remove_owner(owner).is_some());
+        }),
+    ];
+    for (path, remove) in active {
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, snapshot) = silent_reactor(&recorder);
+        let peer = peer();
+        let _outbound = connect(&mut reactor, &peer, 7);
+        seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+        assert_eq!(settle(&reactor, &recorder).work.len(), 1, "{path}");
+        remove(&mut reactor, &snapshot, &peer);
+        assert!(
+            reactor.peer_work_queue.active(&peer).is_none(),
+            "{path} ran"
+        );
+        assert_eq!(settle(&reactor, &recorder).work, [], "{path}");
+    }
+}
+
+/// The snapshot shows the committed snapshot the reactor adopted, not the
+/// watch's latest: one published while the reactor isn't running a turn
+/// shows only once the reactor reads it.
+///
+/// This fails if the snapshot reads the watch.
+#[test]
+fn the_adopted_state_is_what_the_reactor_schedules_from() {
+    let recorder = Arc::new(Recorder::default());
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.use_direct_port();
+    startup.observer = ObserverSlot::new(recorder.clone());
+    let (_, _, mut reactor) = build_header_sync_reactor(startup).expect("the reactor builds");
+    let generation = |settled: observe::ReactorSnapshot| {
+        settled
+            .adopted
+            .expect("the reactor adopted a snapshot")
+            .header_generation
+    };
+    let g = snapshot.header_generation.get();
+    assert_eq!(generation(settle(&reactor, &recorder)), g);
+
+    let mut next = snapshot.clone();
+    next.state_version = snapshot.state_version.checked_next().unwrap();
+    next.header_generation = snapshot.header_generation.checked_next().unwrap();
+    snapshots.send(Some(next)).unwrap();
+    assert_eq!(
+        generation(settle(&reactor, &recorder)),
+        g,
+        "the published snapshot isn't the reactor's yet"
+    );
+    reactor.refresh_committed_snapshot();
+    assert_eq!(generation(settle(&reactor, &recorder)), g + 1);
+}
+
+/// Every turn's markers, in order, from a running reactor: each turn
+/// starts with its `Resumed`, numbered one past the last `Settled`, and
+/// ends with a `Settled` of its number. Only a port future's `CallEnded`,
+/// reported while the loop polls its futures, sits between a `Settled` and
+/// the next `Resumed`, which is then the completion's.
+fn assert_turns(events: &[ReactorEvent]) -> Vec<observe::ResumeArm> {
+    let mut arms = Vec::new();
+    let mut settled = None;
+    let mut resumed = None;
+    let mut call_ended = false;
+    let mut last = false;
+    for event in events {
+        assert!(!last, "nothing follows the final Settled: {event:?}");
+        match event {
+            ReactorEvent::Settled {
+                turn, last: end, ..
+            } => {
+                match (settled, resumed) {
+                    (None, None) => assert_eq!(*turn, 0, "the build settles turn 0"),
+                    (_, Some(open)) => assert_eq!(*turn, open, "a turn settles its own number"),
+                    _ => panic!("Settled{{turn: {turn}}} with no Resumed before it"),
+                }
+                settled = Some(*turn);
+                resumed = None;
+                last = *end;
+            }
+            ReactorEvent::Resumed { turn, arm } => {
+                let previous = settled.expect("a Settled comes first");
+                assert_eq!(resumed, None, "two Resumed in one turn");
+                assert_eq!(*turn, previous + 1, "Resumed starts the next turn");
+                if std::mem::take(&mut call_ended) {
+                    assert_eq!(*arm, observe::ResumeArm::PortCompletion);
+                }
+                resumed = Some(*turn);
+                arms.push(*arm);
+            }
+            ReactorEvent::CallEnded { .. } if resumed.is_none() => call_ended = true,
+            other => assert!(
+                resumed.is_some(),
+                "{other:?} came before its turn's Resumed"
+            ),
+        }
+    }
+    assert!(last, "the loop ends with its final Settled");
+    arms
+}
+
+/// Lets a spawned reactor run until it waits.
+async fn idle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A running reactor reports a `Resumed` first in every turn: its first,
+/// each of the loop's ten arms, and the wait that follows a fatal storage
+/// operation, before any other event of the turn.
+///
+/// This fails if an arm reports its `Resumed` after an event of its turn.
+#[tokio::test(start_paused = true)]
+async fn resume_markers_lead_each_turn() {
+    use observe::ResumeArm as Arm;
+
+    let recorder = Arc::new(Recorder::default());
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let (repairs, repairs_rx) = watch::channel(Default::default());
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.vct_root_repairs = Some(repairs_rx);
+    startup.header_chain_port = Arc::new(ScriptedPort {
+        gate: Some(gate.clone()),
+        ..ScriptedPort::default()
+    });
+    startup.use_direct_port();
+    startup.observer = ObserverSlot::new(recorder.clone());
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    // An apply the gate holds, and a waiter for a locator permit, which is
+    // free, so the first wait ends at the permit arm.
+    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    reactor.locator_capacity_waiting = true;
+    // The test's own setup ran outside any turn, so it settles it.
+    recorder.take();
+    reactor.settled(false);
+    let running = tokio::spawn(reactor.run());
+    idle().await;
+
+    // The apply answers, its retirement releases capacity, and two queued
+    // events leave the next turn to yield.
+    gate.add_permits(1);
+    idle().await;
+    for _ in 0..2 {
+        handle
+            .try_send(Event::Status {
+                peer: peer.clone(),
+                session_id: 7,
+                status: super::status_offers::status_for(&snapshot, block::Hash([0x78; 32])),
+            })
+            .expect("the event queue has room");
+    }
+    idle().await;
+    let (send, _second) = framed_channel(8);
+    handle
+        .send_lifecycle(Event::PeerConnected(
+            PeerSession::from_parts_with_connection(
+                peer_of(2),
+                9,
+                send,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                CloseCause::new(),
+            ),
+        ))
+        .expect("the lifecycle queue has room");
+    idle().await;
+    let mut next = snapshot.clone();
+    next.state_version = snapshot.state_version.checked_next().unwrap();
+    snapshots.send(Some(next)).unwrap();
+    idle().await;
+    repairs
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: block::Height(1),
+            },
+            generation: 7,
+        })
+        .unwrap();
+    idle().await;
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    idle().await;
+    shutdown.cancel();
+    running.await.expect("the reactor stops");
+    let mut arms = assert_turns(&recorder.take());
+
+    // A fatal storage operation parks the loop on shutdown alone.
+    let shutdown = CancellationToken::new();
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    reactor.startup.shutdown = shutdown.clone();
+    let (_, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let now = Instant::now();
+    reactor.vct_local_operation = Some(VctLocalOperation {
+        phase: HeaderTargetPhase::Applying,
+        owner,
+        repair_generation: 0,
+        target: snapshot.frontiers.header_best,
+        started_at: now,
+        deadline: now,
+        fatal_sent: true,
+    });
+    let running = tokio::spawn(reactor.run());
+    idle().await;
+    shutdown.cancel();
+    running.await.expect("the reactor stops");
+    arms.extend(assert_turns(&recorder.take()));
+
+    for arm in [
+        Arm::Start,
+        Arm::FatalWait,
+        Arm::Shutdown,
+        Arm::PortCompletion,
+        Arm::LocatorPermit,
+        Arm::CapacityReleased,
+        Arm::Maintenance,
+        Arm::Lifecycle,
+        Arm::Event,
+        Arm::Yield,
+        Arm::CommittedSnapshot,
+        Arm::VctRepairs,
+    ] {
+        assert!(arms.contains(&arm), "{arm:?} never resumed: {arms:?}");
+    }
+}
+
+/// A reactor with no work that shuts down reports its final `Settled`,
+/// though its snapshot equals the one before it.
+///
+/// This fails if an unchanged final snapshot isn't reported.
+#[tokio::test(start_paused = true)]
+async fn an_idle_shutdown_keeps_its_final_marker() {
+    let recorder = Arc::new(Recorder::default());
+    let shutdown = CancellationToken::new();
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    reactor.startup.shutdown = shutdown.clone();
+    let running = tokio::spawn(reactor.run());
+    idle().await;
+    shutdown.cancel();
+    running.await.expect("the reactor stops");
+
+    let events = recorder.take();
+    assert_turns(&events);
+    let settled: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ReactorEvent::Settled { last, snapshot, .. } => Some((*last, snapshot)),
+            _ => None,
+        })
+        .collect();
+    let [.., (false, before), (true, last)] = settled.as_slice() else {
+        panic!("a settled turn, then the final Settled: {events:?}");
+    };
+    assert_eq!(before, last, "nothing changed at shutdown");
+    assert_eq!(
+        ***last,
+        observe::ReactorSnapshot {
+            adopted: last.adopted,
+            ..Default::default()
+        },
+        "the reactor holds nothing but its adopted snapshot"
     );
 }

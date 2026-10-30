@@ -935,6 +935,46 @@ impl PeerWorkQueue {
         self.budget.remaining()
     }
 
+    /// Each peer's work as the reactor's settled snapshot lists it, in peer
+    /// order. It reads `work_by_peer` alone, so every removal path shows,
+    /// whether or not it reports a retirement.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::header_sync) fn owner_snapshot(
+        &self,
+    ) -> Vec<crate::zakura::header_sync::observe::WorkEntry> {
+        use crate::zakura::header_sync::observe::{WorkEntry, WorkPhase};
+
+        let mut work: Vec<_> = self
+            .work_by_peer
+            .iter()
+            .map(|(peer, work)| match work {
+                PeerWorkState::AwaitingLocator { target, .. } => WorkEntry {
+                    peer: peer.clone(),
+                    session_id: target.session_id,
+                    target_tip_hash: target.status.selected_tip_hash,
+                    phase: WorkPhase::AwaitingLocator {
+                        scope: target.scope,
+                    },
+                },
+                PeerWorkState::Active(request) => WorkEntry {
+                    peer: peer.clone(),
+                    session_id: request.owner.session_id(),
+                    target_tip_hash: request.target.status.selected_tip_hash,
+                    phase: WorkPhase::Active {
+                        request_id: request.request_id.get(),
+                        owner: request.owner,
+                        purpose: request.purpose.clone(),
+                        phase: request.phase,
+                        held: request.entries.len(),
+                        cursor: request.cursor,
+                    },
+                },
+            })
+            .collect();
+        work.sort_by(|a, b| a.peer.as_bytes().cmp(b.peer.as_bytes()));
+        work
+    }
+
     #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn chunk_budget_usage(&self) -> (usize, usize) {
         let usage = self.budget.usage();

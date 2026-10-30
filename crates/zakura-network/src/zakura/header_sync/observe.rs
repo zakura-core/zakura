@@ -1,7 +1,8 @@
 //! Synchronous header-sync reactor events for simulator tests.
 //!
 //! The reactor reports its port calls, active-request starts and
-//! retirements, and refused offers to an installed [`HeaderSyncObserver`].
+//! retirements, refused offers, and its settled state at each wait to an
+//! installed [`HeaderSyncObserver`].
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
@@ -10,15 +11,24 @@ use std::{any::Any, fmt, panic::AssertUnwindSafe, sync::Arc};
 use zakura_rt::sync::counter;
 
 use zakura_chain::block;
-use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
+use zakura_header_chain::{
+    BodyWorkOwner, Frontier, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
+};
 
 use super::{
-    events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
+    events::HeaderPortOperation, v9::Cursor, ActiveHeaderRequest, HeaderSyncMisbehavior,
+    HeaderTargetPurpose,
 };
 pub use super::{reactor::HeaderRequestTerminal, scheduler::peer_work::HeaderTargetPhase};
-use crate::zakura::ZakuraPeerId;
+use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
 
 /// Receives reactor events as they happen.
+///
+/// The reactor's own state is private to its task, so the reactor reports
+/// it itself (rule 3 of the M6a observation contract): a
+/// [`ReactorEvent::Settled`] snapshot right before each await that can't
+/// change it, and a [`ReactorEvent::Resumed`] marker as the first statement
+/// after that await. Between the two, its state is in transition.
 ///
 /// Every event reaches it through its slot's counted delivery path,
 /// [`ObserverSlot::emit`], which counts it first, so a reader can tell an
@@ -176,6 +186,29 @@ pub enum ReactorEvent {
         /// Which capacity refused it.
         cause: WaitCause,
     },
+    /// The reactor is about to wait at an await whose future can't change
+    /// its state, so `snapshot` holds until the next `Resumed`. Reported
+    /// once at build with turn 0, before each of the loop's waits, and,
+    /// with `last` set, after the loop retires its work on the way out.
+    /// The final one is reported even when nothing changed.
+    Settled {
+        /// The turn that ends here: 0 at build, then the turn of the
+        /// `Resumed` it follows.
+        turn: u64,
+        /// Whether the loop has ended, so no `Resumed` follows.
+        last: bool,
+        /// The reactor's state.
+        snapshot: Box<ReactorSnapshot>,
+    },
+    /// The reactor resumed from a wait, or started. It's the first thing
+    /// the turn reports, and the reactor's state is in transition until
+    /// the next `Settled`.
+    Resumed {
+        /// The turn that starts here, one more than the last `Settled`'s.
+        turn: u64,
+        /// Where it resumed.
+        arm: ResumeArm,
+    },
     /// The reactor dispatched a violation by `peer` to storage.
     Misbehavior {
         /// The violating peer.
@@ -207,6 +240,116 @@ impl ReactorEvent {
             reason,
         }
     }
+}
+
+/// Where the reactor resumed, for [`ReactorEvent::Resumed`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResumeArm {
+    /// The first statement of the loop, before its first wait.
+    Start,
+    /// After the shutdown wait that follows a fatal storage operation.
+    FatalWait,
+    /// The loop's shutdown arm.
+    Shutdown,
+    /// A port call's completion.
+    PortCompletion,
+    /// A freed locator read permit.
+    LocatorPermit,
+    /// A released chunk of header capacity.
+    CapacityReleased,
+    /// The maintenance deadline.
+    Maintenance,
+    /// A lifecycle event, or its channel's end.
+    Lifecycle,
+    /// A peer event, or its channel's end.
+    Event,
+    /// The yield after a turn that handled an event.
+    Yield,
+    /// A new committed snapshot, or its watch's end.
+    CommittedSnapshot,
+    /// A new VCT repair status, or its watch's end.
+    VctRepairs,
+}
+
+/// The reactor's state at a [`ReactorEvent::Settled`]: the fields it
+/// schedules from, read on its own task. Every list is in peer order, so
+/// equal states compare equal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReactorSnapshot {
+    /// The committed snapshot the reactor last adopted, if any. It can lag
+    /// the watch, which the reactor reads only at its own points.
+    pub adopted: Option<AdoptedSnapshot>,
+    /// Each admitted peer's current session.
+    pub sessions: Vec<SessionEntry>,
+    /// Peers with a readmission cooldown, expired or not, until maintenance
+    /// prunes it.
+    pub cooldowns: Vec<ZakuraPeerId>,
+    /// Peers with a continuation-locator read in flight.
+    pub pending_locators: Vec<ZakuraPeerId>,
+    /// Port calls dispatched and not yet handled, in call order.
+    pub unhandled_calls: Vec<u64>,
+    /// Each peer's queued work.
+    pub work: Vec<WorkEntry>,
+}
+
+/// The committed snapshot fields the reactor schedules from.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AdoptedSnapshot {
+    /// The selected-header generation.
+    pub header_generation: u64,
+    /// The finalized anchor.
+    pub finalized: Frontier,
+    /// The selected header tip.
+    pub header_best: Frontier,
+}
+
+/// One admitted peer's current session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionEntry {
+    /// The peer.
+    pub peer: ZakuraPeerId,
+    /// Its session.
+    pub session_id: u64,
+    /// Which side opened the connection.
+    pub direction: ServicePeerDirection,
+}
+
+/// One peer's queued work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkEntry {
+    /// The peer whose session owns it.
+    pub peer: ZakuraPeerId,
+    /// The owning session.
+    pub session_id: u64,
+    /// The advertised target it pursues.
+    pub target_tip_hash: block::Hash,
+    /// Whether it waits for its locator or is active.
+    pub phase: WorkPhase,
+}
+
+/// Where one peer's work stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkPhase {
+    /// Staged, waiting for its continuation locator.
+    AwaitingLocator {
+        /// The header authority it was staged under.
+        scope: HeaderWorkAuthority,
+    },
+    /// An active request.
+    Active {
+        /// The request's correlation ID.
+        request_id: u64,
+        /// The request's work owner, with its authority.
+        owner: HeaderSyncWorkOwner,
+        /// Why it was started.
+        purpose: HeaderTargetPurpose,
+        /// Its target-processing phase.
+        phase: HeaderTargetPhase,
+        /// How many staged headers it holds.
+        held: usize,
+        /// The cursor of its last staged page.
+        cursor: Option<Cursor>,
+    },
 }
 
 /// What a dispatched port call asks storage for.

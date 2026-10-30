@@ -266,6 +266,25 @@ pub enum ReactorEvent {
         /// The leases' IDs, in the queue's order.
         leases: Vec<ResourceId>,
     },
+    /// The reactor moved an incarnation's staged headers into a prepare,
+    /// as transfer `transfer` (M6a-4). Reported by [`TransferHandle::taken`],
+    /// the transfer's only constructor.
+    EntriesTaken {
+        /// The incarnation the headers left.
+        incarnation: IncarnationId,
+        /// The transfer's number.
+        transfer: TransferId,
+        /// How many headers it took.
+        count: usize,
+    },
+    /// A transfer's last handle dropped, ending it (M6a-4). Reported once
+    /// per transfer, by its tag's `Drop`, from whichever task dropped it.
+    TransferEnded {
+        /// The transfer's number.
+        transfer: TransferId,
+        /// How it ended.
+        disposition: TransferDisposition,
+    },
 }
 
 impl ReactorEvent {
@@ -382,6 +401,161 @@ pub type IncarnationId = u64;
 /// under the budget's lock (M6a-4).
 pub type ResourceId = u64;
 
+/// A transfer's number, from 1 per reactor (M6a-4). A transfer is the
+/// headers a prepare took out of their incarnation.
+pub type TransferId = u64;
+
+/// How a transfer ended (M6a-4): what last decided its staged headers'
+/// fate before its last handle dropped.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TransferDisposition {
+    /// No dispatch took the prepare: a repair returned before it, or the
+    /// dispatch refused it.
+    NotDispatched,
+    /// Its port future was dropped unfinished, as the reactor's teardown
+    /// drops its pending calls.
+    Dropped,
+    /// It was sent to the external test port, which dropped it.
+    External,
+    /// Its port future panicked, and the reactor caught it.
+    Panicked,
+    /// The completion found no matching active request.
+    Stale,
+    /// The completion's work lost its authority.
+    NoAuthority,
+    /// The prepared target names another owner or source.
+    OwnerMismatch,
+    /// The prepared repair target no longer matches its repair.
+    RepairInvalid,
+    /// The prepared target went to apply call `call`.
+    HandedToApply {
+        /// The apply call.
+        call: CallId,
+    },
+    /// The apply's dispatch refused it.
+    ApplyRefused,
+    /// The preparation failed.
+    PrepareFailed,
+}
+
+impl TransferDisposition {
+    /// Every kind but `HandedToApply`, in code order, so a code is its
+    /// index.
+    const PLAIN: [Self; 10] = [
+        Self::NotDispatched,
+        Self::Dropped,
+        Self::External,
+        Self::Panicked,
+        Self::Stale,
+        Self::NoAuthority,
+        Self::OwnerMismatch,
+        Self::RepairInvalid,
+        Self::ApplyRefused,
+        Self::PrepareFailed,
+    ];
+
+    /// The disposition as one `u64`: a plain kind's index, or one past the
+    /// last index with the apply call in the bits above the low byte.
+    fn code(self) -> u64 {
+        // Indexes below `PLAIN.len()`, 10, fit u64, and a run makes far
+        // fewer than 2^56 calls, so the shift keeps the call whole.
+        match self {
+            Self::HandedToApply { call } => (call << 8) | Self::PLAIN.len() as u64,
+            plain => Self::PLAIN
+                .iter()
+                .position(|kind| *kind == plain)
+                .expect("every other kind is listed") as u64,
+        }
+    }
+
+    /// The disposition [`code`](Self::code) encoded.
+    fn of(code: u64) -> Self {
+        // The low byte fits usize.
+        match Self::PLAIN.get((code & 0xff) as usize) {
+            Some(plain) => *plain,
+            None => Self::HandedToApply { call: code >> 8 },
+        }
+    }
+}
+
+/// One transfer, shared by every clone of the prepare that carries it, so
+/// its end is reported once (M6a-4). A cfg-only field of
+/// `HeaderPortOperation::PrepareHeaderTarget`.
+#[derive(Clone)]
+pub struct TransferHandle(Arc<TransferTag>);
+
+/// What a transfer's handles share. Its `Drop`, which runs when the last
+/// handle drops, reports the transfer's end.
+struct TransferTag {
+    transfer: TransferId,
+    /// The disposition's [`code`](TransferDisposition::code). A plain std
+    /// atomic, so setting it adds no scheduling point, from any task.
+    disposition: counter::AtomicU64,
+    slot: ObserverSlot,
+}
+
+impl TransferHandle {
+    /// A new transfer of `count` headers out of `incarnation`, numbered
+    /// one past `last`, which it advances. Reports `EntriesTaken` through
+    /// `slot`, which its end reports through too. It starts
+    /// `NotDispatched`.
+    pub(crate) fn taken(
+        last: &mut TransferId,
+        slot: &ObserverSlot,
+        incarnation: IncarnationId,
+        count: usize,
+    ) -> Self {
+        *last += 1;
+        let transfer = *last;
+        slot.emit(ReactorEvent::EntriesTaken {
+            incarnation,
+            transfer,
+            count,
+        });
+        Self(Arc::new(TransferTag {
+            transfer,
+            disposition: counter::AtomicU64::new(TransferDisposition::NotDispatched.code()),
+            slot: slot.clone(),
+        }))
+    }
+
+    /// The transfer's number.
+    pub(crate) fn id(&self) -> TransferId {
+        self.0.transfer
+    }
+
+    /// Records `disposition` as how the transfer ends, unless a later call
+    /// replaces it before its last handle drops.
+    pub(crate) fn dispose(&self, disposition: TransferDisposition) {
+        self.0
+            .disposition
+            .store(disposition.code(), counter::Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for TransferHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("TransferHandle")
+            .field(&self.0.transfer)
+            .finish()
+    }
+}
+
+impl Drop for TransferTag {
+    /// Reports the transfer's end, unless the thread is unwinding (see
+    /// [`ReactorEvent::Dropping`]).
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let code = self.disposition.load(counter::Ordering::Relaxed);
+            self.slot.emit(ReactorEvent::TransferEnded {
+                transfer: self.transfer,
+                disposition: TransferDisposition::of(code),
+            });
+        }
+    }
+}
+
 /// The committed snapshot fields the reactor schedules from.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AdoptedSnapshot {
@@ -474,6 +648,8 @@ pub enum PortCall {
         source: SourceId,
         /// The request that owns the target.
         owner: HeaderSyncWorkOwner,
+        /// The transfer that carries its staged headers (M6a-4).
+        transfer: TransferId,
     },
     /// A prepared target's application.
     Apply {
@@ -509,11 +685,13 @@ impl PortCall {
                 peer,
                 source,
                 owner,
+                transfer,
                 ..
             } => Self::Prepare {
                 peer: peer.clone(),
                 source: *source,
                 owner: *owner,
+                transfer: transfer.id(),
             },
             HeaderPortOperation::ApplyHeaderTarget {
                 peer,

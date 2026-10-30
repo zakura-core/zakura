@@ -24,6 +24,11 @@ use crate::zakura::{
     Frame, LOCAL_MAX_MESSAGE_BYTES,
 };
 
+/// An unobserved transfer for a test-built prepare of `count` headers.
+fn unobserved_transfer(count: usize) -> observe::TransferHandle {
+    observe::TransferHandle::taken(&mut 0, &observe::ObserverSlot::default(), 0, count)
+}
+
 fn peer() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
 }

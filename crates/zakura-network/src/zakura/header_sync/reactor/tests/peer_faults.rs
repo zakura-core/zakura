@@ -83,6 +83,7 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
         source,
         owner,
         HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+        None,
     );
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
 }
@@ -240,7 +241,7 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
             let failure = failure(source, owner);
             if phase == HeaderTargetPhase::Preparing {
                 let failed = HeaderTargetPreparationResult::Failed(failure);
-                reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
+                reactor.handle_header_target_prepared(peer.clone(), source, owner, failed, None);
             } else {
                 let failed = HeaderTargetAdmissionResult::Failed(failure);
                 reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);

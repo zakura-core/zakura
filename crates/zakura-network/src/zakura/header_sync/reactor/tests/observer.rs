@@ -51,13 +51,16 @@ impl Recorder {
 }
 
 /// Whether `event` reports a work identity: a reservation's placement or
-/// binding, or a call's captured leases (M6a-4).
+/// binding, a call's captured leases, or a transfer's start or end
+/// (M6a-4).
 fn is_identity(event: &ReactorEvent) -> bool {
     matches!(
         event,
         ReactorEvent::Placed { .. }
             | ReactorEvent::Bound { .. }
             | ReactorEvent::LeasesCaptured { .. }
+            | ReactorEvent::EntriesTaken { .. }
+            | ReactorEvent::TransferEnded { .. }
     )
 }
 
@@ -85,6 +88,8 @@ struct ScriptedPort {
     panic: Option<PanicAt>,
     /// Prepares the port answered.
     prepares: AtomicUsize,
+    /// When set, prepares answer with this target instead of failing.
+    prepared: StdMutex<Option<port::PreparedHeaderTarget>>,
 }
 
 impl ScriptedPort {
@@ -177,7 +182,10 @@ impl port::Port for ScriptedPort {
         Box::pin(async move {
             self.answer().await;
             self.prepares.fetch_add(1, Ordering::SeqCst);
-            Err(local_failure(request.owner))
+            match self.prepared.lock().expect("unpoisoned").take() {
+                Some(target) => Ok(target),
+                None => Err(local_failure(request.owner)),
+            }
         })
     }
 
@@ -351,6 +359,12 @@ fn prepare_operation(
             active.target.status.selected_tip_hash,
         ),
         completion: zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor },
+        transfer: observe::TransferHandle::taken(
+            &mut 0,
+            &reactor.startup.observer,
+            active.incarnation,
+            entries.len(),
+        ),
         entries,
     }
 }
@@ -690,6 +704,7 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
                 peer: peer.clone(),
                 source,
                 owner,
+                transfer: 1,
             },
         )
     };
@@ -845,6 +860,7 @@ async fn synthetic_prepare_ends_not_submitted() {
                         peer: peer.clone(),
                         source,
                         owner,
+                        transfer: 1,
                     },
                 },
                 ReactorEvent::CallEnded {
@@ -1264,9 +1280,14 @@ async fn observer_does_not_change_behaviour() {
                     call: 1,
                     panicked: false
                 },
+                ReactorEvent::EntriesTaken {
+                    incarnation: 1,
+                    transfer: 1,
+                    count: 1
+                },
                 ReactorEvent::Dispatched {
                     call: 2,
-                    op: PortCall::Prepare { .. }
+                    op: PortCall::Prepare { transfer: 1, .. }
                 },
                 ReactorEvent::LeasesCaptured { call: 2, .. },
                 ReactorEvent::CallEnded {
@@ -1276,6 +1297,10 @@ async fn observer_does_not_change_behaviour() {
                 ReactorEvent::Retired {
                     reason: HeaderRequestTerminal::TargetRejected,
                     ..
+                },
+                ReactorEvent::TransferEnded {
+                    transfer: 1,
+                    disposition: observe::TransferDisposition::PrepareFailed
                 },
                 ReactorEvent::Handled {
                     call: 2,
@@ -1415,6 +1440,7 @@ fn current_session_failures_name_their_origin() {
         source,
         owner,
         HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+        None,
     );
     assert_eq!(
         misbehaviors(recorder.take()),
@@ -1456,6 +1482,7 @@ fn stale_prepare_emits_no_misbehavior() {
         source,
         old_owner,
         HeaderTargetPreparationResult::Failed(invalid_header_failure(source, old_owner)),
+        None,
     );
     assert_eq!(misbehaviors(recorder.take()), vec![]);
     assert_eq!(active(&reactor, &peer), replacement);
@@ -2140,4 +2167,258 @@ async fn a_dropped_call_reports_before_its_future_drops() {
         finished.0.lock().expect("unpoisoned").is_empty(),
         "a finished call reports no dropped end"
     );
+}
+
+/// How each case of [`every_transfer_ends_once`] runs its prepare.
+#[derive(Copy, Clone, Debug)]
+enum TransferCase {
+    /// The request retires before its prepare answers.
+    Stale,
+    /// The prepared target names another owner.
+    OwnerMismatch,
+    /// Storage refuses the preparation.
+    PrepareFailed,
+    /// The apply's dispatch refuses the prepared target.
+    ApplyRefused,
+    /// The prepare's future panics.
+    Panicked,
+    /// The prepare's dispatch refuses it.
+    NotDispatched,
+    /// The prepared target goes to its apply.
+    HandedToApply,
+    /// The test port takes the prepare, then drops it.
+    External,
+    /// The reactor is dropped with the prepare held.
+    Dropped,
+}
+
+/// A reactor whose port actions arrive on the returned channel, with a
+/// committed genesis snapshot and `recorder` observing it.
+fn external_reactor(
+    recorder: &Arc<Recorder>,
+) -> (
+    HeaderSyncReactor,
+    mpsc::Receiver<HeaderPortOperation>,
+    zakura_header_chain::EngineSnapshot,
+) {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.observer = ObserverSlot::new(recorder.clone());
+    let (_, actions, reactor) = build_header_sync_reactor(startup).expect("the reactor builds");
+    (reactor, actions, snapshot)
+}
+
+/// Seeds `peer`'s request on session 7 in its receiving phase, holding none
+/// of its one target header, then delivers that header as the page that
+/// completes it, so the reactor takes it into a transfer and dispatches
+/// the prepare.
+fn prepare_through_a_page(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: &ZakuraPeerId,
+) {
+    let active = reactor
+        .peer_work_queue
+        .active_mut(peer)
+        .expect("the test seeded the request");
+    let owner = active.owner;
+    let entry = active
+        .entries
+        .pop()
+        .expect("the seed holds its target header");
+    active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = None;
+    reactor.peer_work_queue.set_capacity_for_test(peer, 0, 1);
+    reactor.deliver_page(
+        peer.clone(),
+        7,
+        Headers {
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            common_ancestor_height: snapshot.frontiers.finalized.height,
+            common_ancestor_hash: snapshot.frontiers.finalized.hash,
+            reaches_initial_target: true,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![entry],
+        },
+    );
+}
+
+/// The prepared target for `peer`'s seeded request, sealed for `owner`.
+fn prepared_for(
+    reactor: &mut HeaderSyncReactor,
+    peer: &ZakuraPeerId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+) -> port::PreparedHeaderTarget {
+    let seeded = std::mem::replace(
+        &mut reactor
+            .peer_work_queue
+            .active_mut(peer)
+            .expect("the test seeded the request")
+            .owner,
+        owner,
+    );
+    let HeaderPortOperation::ApplyHeaderTarget { target, .. } = apply_operation(reactor, peer)
+    else {
+        unreachable!("apply_operation builds an apply");
+    };
+    reactor
+        .peer_work_queue
+        .active_mut(peer)
+        .expect("the test seeded the request")
+        .owner = seeded;
+    target
+}
+
+/// Runs `case`'s history and returns every transfer event it reported, from
+/// the prepare's `EntriesTaken` to the end of the case.
+async fn transfer_history(case: TransferCase) -> Vec<ReactorEvent> {
+    use TransferCase::*;
+
+    let recorder = Arc::new(Recorder::default());
+    let peer = peer();
+    if matches!(case, ApplyRefused | NotDispatched | External) {
+        let (mut reactor, mut actions, snapshot) = external_reactor(&recorder);
+        let _outbound = connect(&mut reactor, &peer, 7);
+        let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+        let target = prepared_for(&mut reactor, &peer, owner);
+        if matches!(case, NotDispatched) {
+            actions.close();
+        }
+        prepare_through_a_page(&mut reactor, &snapshot, &peer);
+        match case {
+            NotDispatched => assert!(
+                reactor.peer_work_queue.active(&peer).is_none(),
+                "the refused prepare retired its work"
+            ),
+            External => drop(actions.try_recv().expect("the prepare was sent")),
+            _ => {
+                let action = actions.try_recv().expect("the prepare was sent");
+                let transfer = action.transfer().cloned();
+                drop(action);
+                actions.close();
+                reactor.handle_header_target_prepared(
+                    peer.clone(),
+                    source,
+                    owner,
+                    HeaderTargetPreparationResult::Prepared(target),
+                    transfer,
+                );
+                assert!(
+                    reactor.peer_work_queue.active(&peer).is_none(),
+                    "the refused apply retired its work"
+                );
+            }
+        }
+        return transfers(recorder.take_all());
+    }
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let port = Arc::new(ScriptedPort {
+        gate: matches!(case, Stale | Dropped).then(|| gate.clone()),
+        panic: matches!(case, Panicked).then_some(PanicAt::Future),
+        ..ScriptedPort::default()
+    });
+    let (mut reactor, snapshot) = observed_reactor(
+        port.clone(),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (_, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    match case {
+        HandedToApply => {
+            let target = prepared_for(&mut reactor, &peer, owner);
+            *port.prepared.lock().expect("unpoisoned") = Some(target);
+        }
+        OwnerMismatch => {
+            let mut other = owner.header_owner().expect("the seed has header authority");
+            other.request_id = NonZeroU64::new(10).expect("ten is nonzero");
+            let target = prepared_for(&mut reactor, &peer, other.into());
+            *port.prepared.lock().expect("unpoisoned") = Some(target);
+        }
+        _ => {}
+    }
+    prepare_through_a_page(&mut reactor, &snapshot, &peer);
+    match case {
+        Dropped => drop(reactor),
+        Stale => {
+            reactor.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
+            gate.add_permits(1);
+            complete_next(&mut reactor).await;
+        }
+        _ => complete_next(&mut reactor).await,
+    }
+    transfers(recorder.take_all())
+}
+
+/// The transfer events in `events`, with the apply calls they hand to.
+fn transfers(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::EntriesTaken { .. }
+                    | ReactorEvent::TransferEnded { .. }
+                    | ReactorEvent::Dispatched {
+                        op: PortCall::Apply { .. },
+                        ..
+                    }
+            )
+        })
+        .collect()
+}
+
+/// Each way a prepare can finish ends its transfer exactly once, with its
+/// disposition: a stale completion after retirement, an owner mismatch, a
+/// failed prepare, a refused apply dispatch, a caught panic, a refused
+/// prepare dispatch, a handoff to apply, an external dispatch, and a held
+/// prepare dropped with the reactor.
+///
+/// This fails if any path ends a transfer twice or never.
+#[tokio::test]
+async fn every_transfer_ends_once() {
+    use observe::TransferDisposition as Ends;
+    use TransferCase::*;
+
+    for (case, ends) in [
+        (Stale, Ends::Stale),
+        (OwnerMismatch, Ends::OwnerMismatch),
+        (PrepareFailed, Ends::PrepareFailed),
+        (ApplyRefused, Ends::ApplyRefused),
+        (Panicked, Ends::Panicked),
+        (NotDispatched, Ends::NotDispatched),
+        (HandedToApply, Ends::HandedToApply { call: 2 }),
+        (External, Ends::External),
+        (Dropped, Ends::Dropped),
+    ] {
+        let history = transfer_history(case).await;
+        let taken = ReactorEvent::EntriesTaken {
+            incarnation: 1,
+            transfer: 1,
+            count: 1,
+        };
+        let ended = ReactorEvent::TransferEnded {
+            transfer: 1,
+            disposition: ends,
+        };
+        let applied: Vec<_> = history
+            .iter()
+            .filter(|event| matches!(event, ReactorEvent::Dispatched { .. }))
+            .cloned()
+            .collect();
+        let history: Vec<_> = history
+            .into_iter()
+            .filter(|event| !matches!(event, ReactorEvent::Dispatched { .. }))
+            .collect();
+        assert_eq!(history, [taken, ended], "{case:?}");
+        assert_eq!(
+            applied.len(),
+            usize::from(matches!(case, HandedToApply)),
+            "only the handoff dispatches its apply, as call 2: {case:?}"
+        );
+    }
 }

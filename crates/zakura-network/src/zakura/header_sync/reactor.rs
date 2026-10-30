@@ -110,6 +110,25 @@ macro_rules! settled {
     ($reactor:expr, last) => {};
 }
 
+/// Records `$disposition` as how `$transfer`, an optional
+/// [`observe::TransferHandle`], ends. Outside test and simulator builds the
+/// macro expands to nothing.
+#[cfg(any(test, zakura_sim))]
+macro_rules! transfer_ends {
+    ($transfer:expr, $disposition:ident $({ $($field:tt)* })?) => {
+        if let Some(transfer) = &$transfer {
+            transfer.dispose(observe::TransferDisposition::$disposition $({ $($field)* })?)
+        }
+    };
+}
+
+/// Records how a transfer ends. Outside test and simulator builds the
+/// macro expands to nothing.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! transfer_ends {
+    ($transfer:expr, $disposition:ident $({ $($field:tt)* })?) => {};
+}
+
 /// Inputs that can make a previously blocked ordinary offer eligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SchedulingOpportunity {
@@ -371,6 +390,8 @@ fn build_header_sync_reactor(
         turn: 0,
         #[cfg(any(test, zakura_sim))]
         unhandled_calls: std::collections::BTreeSet::new(),
+        #[cfg(any(test, zakura_sim))]
+        last_transfer: 0,
     };
     // Before anything can reserve, a startup repair included.
     #[cfg(any(test, zakura_sim))]
@@ -531,6 +552,10 @@ struct HeaderSyncReactor {
     /// dropped at shutdown stays here.
     #[cfg(any(test, zakura_sim))]
     unhandled_calls: std::collections::BTreeSet<u64>,
+    /// The last transfer number handed out. See
+    /// [`observe::TransferHandle`].
+    #[cfg(any(test, zakura_sim))]
+    last_transfer: observe::TransferId,
 }
 
 /// Reports the reactor's teardown (see [`ReactorEvent::Dropping`]). It runs
@@ -1228,7 +1253,7 @@ impl HeaderSyncReactor {
                 source,
                 owner,
                 result,
-            } => self.handle_header_target_prepared(peer, source, owner, result),
+            } => sim_arg!(self.handle_header_target_prepared(peer, source, owner, result); None),
             #[cfg(any(test, feature = "zakura-testkit"))]
             Event::HeaderTargetAdmissionReady {
                 peer,
@@ -2093,6 +2118,13 @@ impl HeaderSyncReactor {
                 )
             });
             active.phase = HeaderTargetPhase::Preparing;
+            #[cfg(any(test, zakura_sim))]
+            let transfer = observe::TransferHandle::taken(
+                &mut self.last_transfer,
+                &self.startup.observer,
+                active.incarnation,
+                active.entries.len(),
+            );
             let action = HeaderPortOperation::PrepareHeaderTarget {
                 purpose: active.purpose.clone(),
                 peer: peer.clone(),
@@ -2102,6 +2134,8 @@ impl HeaderSyncReactor {
                 target: staged_tip,
                 completion,
                 entries: std::mem::take(&mut active.entries),
+                #[cfg(any(test, zakura_sim))]
+                transfer,
             };
             let _ = active;
             self.peer_work_queue.publish_phase_metrics();
@@ -2486,15 +2520,20 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Handles a preparation's `result`. `transfer`, in test and simulator
+    /// builds, is the prepare's transfer when its own port future answered,
+    /// and records how it ends (see [`observe::TransferDisposition`]).
     fn handle_header_target_prepared(
         &mut self,
         peer: ZakuraPeerId,
         source: zakura_header_chain::SourceId,
         owner: zakura_header_chain::HeaderSyncWorkOwner,
         result: HeaderTargetPreparationResult,
+        #[cfg(any(test, zakura_sim))] transfer: Option<observe::TransferHandle>,
     ) {
         self.finish_vct_local_operation(owner, HeaderTargetPhase::Preparing);
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
+            transfer_ends!(transfer, Stale);
             return;
         };
         let purpose = active.purpose;
@@ -2503,6 +2542,7 @@ impl HeaderSyncReactor {
             || active.source != source
             || active.owner != owner
         {
+            transfer_ends!(transfer, Stale);
             return;
         }
         if !self.preparation_has_authority(
@@ -2512,6 +2552,7 @@ impl HeaderSyncReactor {
             is_repair,
             self.peer_work_queue.owned_header_count(&peer),
         ) {
+            transfer_ends!(transfer, NoAuthority);
             if is_repair {
                 self.retry_vct_repair(
                     owner
@@ -2527,6 +2568,7 @@ impl HeaderSyncReactor {
         match result {
             HeaderTargetPreparationResult::Prepared(target) => {
                 if target.owner() != owner || target.source() != source {
+                    transfer_ends!(transfer, OwnerMismatch);
                     return;
                 }
                 if is_repair {
@@ -2541,6 +2583,7 @@ impl HeaderSyncReactor {
                             && target.auxiliary_delivery_count() == context.selected_header_count()
                     });
                     if !valid {
+                        transfer_ends!(transfer, RepairInvalid);
                         self.retry_vct_repair(
                             repair_owner,
                             VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
@@ -2562,7 +2605,15 @@ impl HeaderSyncReactor {
                     owner,
                     target,
                 }) {
+                    // The apply just took the last call number.
+                    transfer_ends!(
+                        transfer,
+                        HandedToApply {
+                            call: self.next_call
+                        }
+                    );
                 } else if is_repair {
+                    transfer_ends!(transfer, ApplyRefused);
                     self.retry_vct_repair(
                         owner
                             .body_owner()
@@ -2570,10 +2621,12 @@ impl HeaderSyncReactor {
                         VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
                     );
                 } else {
+                    transfer_ends!(transfer, ApplyRefused);
                     self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
                 }
             }
             HeaderTargetPreparationResult::Failed(error) => {
+                transfer_ends!(transfer, PrepareFailed);
                 self.emit_target_outcome(
                     hs_trace::HEADER_TARGET_REJECTED,
                     "prepare",
@@ -4441,6 +4494,12 @@ impl HeaderSyncReactor {
             );
             return false;
         }
+        // A prepare's future holds its transfer from here, so a teardown that
+        // drops it unfinished ends it `Dropped`. The panic arm keeps its own
+        // clone, since an unwinding future drops its handle silently.
+        #[cfg(any(test, zakura_sim))]
+        let panic_transfer = action.transfer().cloned();
+        transfer_ends!(panic_transfer, Dropped);
         let locator_permit = if let HeaderPortOperation::QueryHeaderLocator {
             peer,
             #[cfg(any(test, zakura_sim))]
@@ -4619,6 +4678,8 @@ impl HeaderSyncReactor {
                     target,
                     completion,
                     entries,
+                    #[cfg(any(test, zakura_sim))]
+                    transfer,
                 } => Box::pin(async move {
                     if matches!(
                         &purpose,
@@ -4650,7 +4711,7 @@ impl HeaderSyncReactor {
                         #[cfg(any(test, zakura_sim))]
                         tap.end(observe::CallEnd::NotSubmitted);
                         return Box::new(move |reactor: &mut HeaderSyncReactor| {
-                            reactor.handle_header_target_prepared(peer, source, owner, result);
+                            sim_arg!(reactor.handle_header_target_prepared(peer, source, owner, result); Some(transfer));
                         }) as HeaderSyncPortCompletion;
                     }
                     let entries = match port::TargetEntries::try_from(
@@ -4676,7 +4737,7 @@ impl HeaderSyncReactor {
                             #[cfg(any(test, zakura_sim))]
                             tap.end(observe::CallEnd::NotSubmitted);
                             return Box::new(move |reactor: &mut HeaderSyncReactor| {
-                                reactor.handle_header_target_prepared(peer, source, owner, result);
+                                sim_arg!(reactor.handle_header_target_prepared(peer, source, owner, result); Some(transfer));
                             }) as HeaderSyncPortCompletion;
                         }
                     };
@@ -4695,7 +4756,7 @@ impl HeaderSyncReactor {
                     #[cfg(any(test, zakura_sim))]
                     tap.end(observe::CallEnd::Replied);
                     Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        reactor.handle_header_target_prepared(peer, source, owner, result);
+                        sim_arg!(reactor.handle_header_target_prepared(peer, source, owner, result); Some(transfer));
                     }) as HeaderSyncPortCompletion
                 }),
                 HeaderPortOperation::ApplyHeaderTarget {
@@ -4743,6 +4804,12 @@ impl HeaderSyncReactor {
                         // whose last lease release can reach a scheduling point.
                         #[cfg(any(test, zakura_sim))]
                         panic_tap.end_after_catch(observe::CallEnd::PortPanicked);
+                        // The unwind dropped the future's handle, so this one
+                        // is the last, and its drop here ends the transfer.
+                        #[cfg(any(test, zakura_sim))]
+                        if let Some(transfer) = panic_transfer {
+                            transfer.dispose(observe::TransferDisposition::Panicked);
+                        }
                         PortOperationResult::Panicked(Box::new(panic_context))
                     }
                 }
@@ -4835,9 +4902,15 @@ impl HeaderSyncReactor {
 
     #[cfg(any(test, feature = "zakura-testkit"))]
     fn dispatch_external_port_operation(&mut self, action: HeaderPortOperation) -> bool {
+        // Set before the send, since the receiver may drop the action at
+        // once. This clone keeps a refused one's transfer alive to reset it.
+        #[cfg(any(test, zakura_sim))]
+        let transfer = action.transfer().cloned();
+        transfer_ends!(transfer, External);
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(error) => {
+                transfer_ends!(transfer, NotDispatched);
                 tracing::debug!(?error, "header-sync action queue unavailable");
                 false
             }

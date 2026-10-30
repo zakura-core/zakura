@@ -484,6 +484,10 @@ pub enum HeaderPortOperation {
         completion: zakura_header_chain::TargetCompletion,
         /// All response entries in parent-first order.
         entries: Vec<HeaderEntry>,
+        /// The entries' transfer out of their work incarnation, shared by
+        /// every clone of this action, so it ends once (M6a-4).
+        #[cfg(any(test, zakura_sim))]
+        transfer: super::observe::TransferHandle,
     },
     /// Submit sealed evidence only after the centralized completion gate accepts its owner.
     ApplyHeaderTarget {
@@ -519,6 +523,17 @@ pub enum HeaderPortOperation {
         /// Stable metrics and trace label for the session-close reason.
         reason: &'static str,
     },
+}
+
+#[cfg(any(test, zakura_sim))]
+impl HeaderPortOperation {
+    /// The transfer a prepare carries, if this is one.
+    pub(crate) fn transfer(&self) -> Option<&super::observe::TransferHandle> {
+        match self {
+            Self::PrepareHeaderTarget { transfer, .. } => Some(transfer),
+            _ => None,
+        }
+    }
 }
 
 /// Testkit observer for reactor-local port scheduling.

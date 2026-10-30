@@ -7,8 +7,8 @@ each package's release library at each codegen-units setting, and builds the
 release `zakurad` with every workspace crate at each setting. It passes only
 when the two sides' objects and binaries match byte for byte:
 
-  * each library object's sections (debug info and embedded bitcode aside),
-    relocations and symbols, with relocations naming their symbols and
+  * each library object's sections, relocations and symbols, built
+    without debug info and with embedded bitcode skipped, with relocations naming their symbols and
     symbol names without LLVM's `.llvm.<hash>` promotion suffix, whose hash
     covers the source files' checksums in debug info;
   * the binary's sections in every segment but `__LINKEDIT`, its chained
@@ -624,21 +624,58 @@ def emit_lib(cargo, tree, target, inputs, package, crate, cgu, out_dir, asm):
 
     The release profile's thin LTO makes cargo build a library as bitcode for
     the final link, so this asks for machine code instead, as `--emit=asm`
-    does. The binary's own comparison covers what LTO does.
+    does. The binary's own comparison covers what LTO does. Debug info,
+    which the comparison skips, is turned off too: its size changes with
+    any source edit and would move every section after it in the object.
+    `zakurad` builds exactly as it ships.
+
+    The objects come from the rlib cargo builds, since without debug info
+    rustc deletes a multi-unit crate's loose objects. Removing the old rlib
+    first makes cargo build it again.
     """
     deps = target / "release" / "deps"
-    for suffix in (".o", ".s"):
-        for stale in deps.glob(crate + "-*" + suffix):
-            stale.unlink()
+    for stale in list(deps.glob(crate + "-*.s")) + list(deps.glob("lib" + crate + "-*.rlib")):
+        stale.unlink()
     print("== %s: %s, codegen-units=%d" % (tree.name, package, cgu), flush=True)
-    emit = "obj,asm,link" if asm else "obj,link"
     rw.run(
         [cargo, "rustc", "--release", "--locked", "-p", package, "--lib", "--",
-         "--emit=" + emit, "-C", "codegen-units=%d" % cgu, "-C", "linker-plugin-lto=no"],
+         "--emit=asm,link" if asm else "--emit=link", "-C", "codegen-units=%d" % cgu,
+         "-C", "linker-plugin-lto=no", "-C", "debuginfo=0"],
         cwd=tree, env=build_env(target, inputs),
     )
-    found = collect(deps, crate + "-", (".o", ".s"), out_dir)
-    return found[".o"], found[".s"]
+    rlibs = sorted(deps.glob("lib" + crate + "-*.rlib"))
+    if len(rlibs) != 1:
+        raise rw.CommandFailed(["cargo", "rustc", "-p", package], "built %d rlibs for %s, not 1" % (len(rlibs), crate))
+    found = collect(deps, crate + "-", (".s",), out_dir / "asm")
+    return rlib_objects(rlibs[0], out_dir / "objects"), found[".s"]
+
+
+def rlib_objects(rlib, out_dir):
+    """Extracts the object files a BSD- or GNU-format rlib holds into a fresh `out_dir`, and lists them."""
+    data = Path(rlib).read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("%s isn't an ar archive" % rlib)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    offset, long_names = 8, b""
+    while offset + 60 <= len(data):
+        header = data[offset:offset + 60]
+        name, size = header[:16].rstrip(b" "), int(header[48:58])
+        body = data[offset + 60:offset + 60 + size]
+        if name.startswith(b"#1/"):
+            length = int(name[3:])
+            name, body = body[:length].rstrip(b"\0"), body[length:]
+        elif name == b"//":
+            long_names = body
+        elif name.startswith(b"/") and name[1:].isdigit():
+            start = int(name[1:])
+            name = long_names[start:long_names.index(b"/\n", start)]
+        else:
+            name = name.rstrip(b"/")
+        if name.endswith(b".o"):
+            (out_dir / os.path.basename(name.decode())).write_bytes(body)
+        offset += 60 + size + (size & 1)
+    return sorted(out_dir.glob("*.o"))
 
 
 def emit_binary(cargo, tree, target, inputs, cgu, out_dir, asm):
@@ -716,12 +753,18 @@ def run_comparisons(items, explain=False):
 def run_line_checks(items):
     """Checks that padding a side changed none of its instructions, returning the worst exit status.
 
-    Each item is `(title, unpadded files, padded files)`. The gate's contract
-    is "identical apart from source line numbers": a line number may move
-    where it only labels a panic or a log line, which lives in data. If one
-    reaches an instruction, by any route, such as `line!` forwarded through
-    a macro, padding changed what the program computes, and the padded
-    comparison can't vouch for it.
+    Each item is `(title, unpadded files, padded files)`. A line number may
+    move where it only labels a panic or a log line, which lives in data
+    (see the module docs' contract). If one reaches an instruction, by any
+    route, such as `line!` forwarded through a macro, padding changed what
+    the program computes, and the padded comparison can't vouch for it.
+
+    Padding that changes the size of data also changes the code, since
+    instructions and relocations address data by offset. An embedded
+    padded file does that (the embed check names it), and so, rarely, does
+    a `tracing` event whose line crosses a power of ten, since its name
+    holds the line as text. That fails closed; moving the hook a line
+    avoids it.
     """
     status = EXIT_SAME
     for title, unpadded, padded in items:
@@ -730,7 +773,8 @@ def run_line_checks(items):
             status = max(status, EXIT_EMPTY)
             continue
         differences = compare_files(unpadded, padded, code_only=True)
-        print("%s: %s" % (title, "line numbers reach code" if differences else "code unchanged by padding"))
+        print("%s: %s" % (title, "code changed by padding (a line number reaches code, or padded data changed size)"
+                              if differences else "code unchanged by padding"))
         for line in differences[:MAX_PRINTED]:
             print("  " + line)
         if differences:

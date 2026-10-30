@@ -93,6 +93,18 @@ impl BuildIdentity {
             .map(|(name, _)| name)
             .collect()
     }
+
+    /// True if the build's provenance is known and its tree was clean, so
+    /// the identity says what the binary was built from. A dirty build's
+    /// recorded source may be stale, as [`BuildInfo::equivalent`] says.
+    ///
+    /// [`BuildInfo::equivalent`]: crate::trace::BuildInfo::equivalent
+    pub fn clean(&self) -> bool {
+        !self.dirty
+            && [&self.git, &self.source, &self.lockfile, &self.fuzz_lockfile]
+                .iter()
+                .all(|field| field.as_str() != provenance::UNKNOWN)
+    }
 }
 
 /// A fuzzer binary in the store, and its identity.

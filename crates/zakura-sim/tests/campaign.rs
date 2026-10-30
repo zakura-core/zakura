@@ -149,6 +149,16 @@ impl Fixture {
         }
     }
 
+    /// A copy of the stand-in that differs in a comment, so it's another
+    /// binary.
+    fn variant(&self, tag: &str) -> PathBuf {
+        let path = self.dir.path().join(format!("stub-{tag}"));
+        let stub = fs::read_to_string(self.store.fuzzer_path(&self.build)).unwrap();
+        fs::write(&path, format!("{stub}# {tag}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Creates the control file `name`.
     fn set(&self, name: &str) {
         fs::write(self.control.join(name), b"").unwrap();
@@ -812,6 +822,45 @@ fn incompatible_runs_start_a_new_segment() {
         "the seeds are already in the carried snapshot"
     );
     assert!(inputs(&fixture.store, &end.snapshot).len() > 1);
+}
+
+/// A dirty build, or one with unknown provenance, resumes only on its own
+/// binary, since its identity may not say what the binary was built from.
+/// A build from an unknown commit can't start a run.
+#[test]
+fn dirty_builds_resume_only_on_their_own_binary() {
+    let fixture = Fixture::new();
+    let mut dirty = identity();
+    dirty.dirty = true;
+    let save = |tag: &str, identity: BuildIdentity| {
+        fixture
+            .store
+            .save_build(&fixture.variant(tag), identity)
+            .unwrap()
+            .binary
+    };
+    let mut options = fixture.options(1, 1);
+    options.build = save("dirty-a", dirty.clone());
+    start(&fixture.store, options);
+    let other = save("dirty-b", dirty);
+    let refused = campaign::prepare_resume(
+        &fixture.store,
+        ResumeOptions {
+            build: Some(other),
+            ..ResumeOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("build binary"), "{refused}");
+    let resumed = campaign::prepare_resume(&fixture.store, ResumeOptions::default()).unwrap();
+    resumed.run(&fixture.store).unwrap();
+
+    let mut unknown = identity();
+    unknown.git = "unknown".to_owned();
+    let mut options = fixture.options(1, 1);
+    options.build = save("unknown", unknown);
+    let refused = campaign::prepare_start(&fixture.store, options).unwrap_err();
+    assert!(refused.to_string().contains("unknown commit"), "{refused}");
 }
 
 /// A snapshot is named by its index's digest, the same inputs share a

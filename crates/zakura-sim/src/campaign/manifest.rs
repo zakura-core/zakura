@@ -24,7 +24,7 @@ use crate::{
     harness::HarnessEntry,
     seed,
     trace::{
-        meta::{BudgetRecord, PropertyRef, SchedulerRecord},
+        meta::{BudgetRecord, PropertyRef, SchedulerRecord, UNKNOWN},
         BuildInfo,
     },
 };
@@ -354,7 +354,7 @@ pub struct ResumeOptions {
     pub parent: Option<Digest>,
     /// The fuzzer build. `None` keeps the parent's. Another build must
     /// have the parent build's identity, such as the same commit built on
-    /// another host.
+    /// another host, and both builds must be clean.
     pub build: Option<Digest>,
     /// Each worker's budget in seconds. `None` keeps the parent's.
     pub seconds: Option<u64>,
@@ -596,7 +596,9 @@ pub fn prepare_start(store: &Store, options: StartOptions) -> Result<Prepared, C
 /// failure file the parent's end record lists. It refuses unless the
 /// fuzzer build has the parent's identity, the runner comes from the
 /// build's commit, and the harness and feedback match the parent's: a run
-/// that differs in any of them starts a new segment instead.
+/// that differs in any of them starts a new segment instead. Another binary
+/// of the same identity resumes only if both builds are
+/// [clean](super::BuildIdentity::clean).
 pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared, CampaignError> {
     let _lock = store.lock_store()?;
     let parent_digest = match options.parent {
@@ -618,6 +620,13 @@ pub fn prepare_resume(store: &Store, options: ResumeOptions) -> Result<Prepared,
         .into_iter()
         .map(|field| format!("build {field}"))
         .collect();
+    // Two binaries share a resumable identity only if both builds' identities
+    // say what they were built from.
+    if build.binary != parent.build.binary
+        && !(parent.build.identity.clean() && build.identity.clean())
+    {
+        differences.push("build binary, which a dirty or unknown build must keep".to_owned());
+    }
     let runner = BuildInfo::current();
     check_runner(&runner, &build)?;
     let entry = crate::harness::find(&parent.harness.name)
@@ -678,9 +687,17 @@ fn resumed_seed(parent: &Digest, index: usize) -> u32 {
     u32::from_str_radix(&digest.as_str()[..8], 16).expect("a digest's first 8 hex digits are a u32")
 }
 
-/// Refuses a runner from another commit than the fuzzer's build, since its
-/// harness registry might not be the one the fuzzer runs.
+/// Refuses a runner from another commit than the fuzzer's build, or a
+/// build from an unknown commit, since the runner's harness registry might
+/// not be the one the fuzzer runs.
 fn check_runner(runner: &BuildInfo, build: &FuzzBuild) -> Result<(), CampaignError> {
+    if build.identity.git == UNKNOWN {
+        return Err(CampaignError::Refused(format!(
+            "fuzzer {} comes from an unknown commit, so no zakura-sim can be shown to share \
+             its harness registry; build it in a git checkout",
+            build.binary
+        )));
+    }
     if runner.git != build.identity.git {
         return Err(CampaignError::Refused(format!(
             "this zakura-sim comes from commit {}, and fuzzer {} from commit {}; build both \

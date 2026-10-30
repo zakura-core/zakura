@@ -913,26 +913,19 @@ pub fn mempool_standard_input_scripts_for_network(
 }
 
 /// Recognizes supported PQ transport without allocating its large signature arguments.
-/// Authenticate the exact redeem bytes before selecting larger limits. Derive the supported
-/// header from Common's encoder so wire identifiers have one authoritative representation.
+/// Common authenticates the exact redeem bytes before recognizing either supported version,
+/// so policy and execution select larger limits using the same rules.
 #[cfg(feature = "pq")]
 fn authenticated_pq_body(
     unlock: &transparent::Script,
     lock: &transparent::Script,
 ) -> Option<script::Code> {
+    use zcash_transparent::pq::p2sh::{classify_spend, SpendMode};
     let lock = script::Code(lock.as_raw_bytes().to_vec());
-    if !lock.is_pay_to_script_hash() {
-        return None;
+    match classify_spend(unlock.as_raw_bytes(), &lock).ok()? {
+        SpendMode::Pq(selected) => Some(script::Code(selected.body().to_vec())),
+        SpendMode::Legacy => None,
     }
-    let input = zcash_script::pq::SpendingInput::scan(unlock.as_raw_bytes()).ok()?;
-    let redeem = input.redeem_script();
-    if zcash_transparent::util::hash160::hash(redeem) != lock.0[2..22] {
-        return None;
-    }
-    let header = zcash_transparent::pq::p2sh::redeem_script(&script::Code(Vec::new())).ok()?;
-    let body = redeem.strip_prefix(header.0.as_slice())?;
-    input.pq_arguments().ok()?;
-    Some(script::Code(body.to_vec()))
 }
 
 fn mempool_standard_input_scripts_with_pq(

@@ -1,4 +1,5 @@
-//! Local PQ activation through the real UTXO-bound transaction and script validators.
+use self::crypto::SigningKey;
+// Local PQ activation through the real UTXO-bound transaction and script validators.
 
 use std::{
     collections::HashMap,
@@ -20,7 +21,7 @@ use zakura_chain::{
 use zakura_script::{CachedFfiTransaction, Error as ScriptError};
 use zcash_script::{pq as script_pq, script::Code};
 use zcash_transparent::{
-    pq::{self, p2sh, SigningKey},
+    pq::p2sh,
     util::hash160,
 };
 
@@ -32,9 +33,9 @@ use crate::{
 
 const ACTIVATION: Height = Height(10);
 const PQ_INPUT: usize = 1;
-static KEY: LazyLock<SigningKey> = LazyLock::new(|| SigningKey::from_seed(&[7; pq::SEED_BYTES]));
+static KEY: LazyLock<SigningKey> = LazyLock::new(|| SigningKey::from_seed(&[7; crypto::SEED_BYTES]));
 static SPEND: LazyLock<Spend> =
-    LazyLock::new(|| Spend::signed(single_signer(), HashType::ALL, p2sh::SIGNING_CONTEXT, 1));
+    LazyLock::new(|| Spend::signed(single_signer(), HashType::ALL, p2sh::signing_context(PARAMETERS), 1));
 
 fn network(activation: Option<Height>) -> Network {
     Network::new_regtest(RegtestParameters {
@@ -55,13 +56,13 @@ fn push(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn single_signer() -> Code {
-    let mut bytes = vec![48];
+    let mut bytes = vec![u8::try_from(crypto::PUBLIC_KEY_BYTES).unwrap()];
     bytes.extend_from_slice(&KEY.public_key());
     bytes.push(0xac); // CHECKSIG
     Code(bytes)
 }
 
-fn multisig(required: u8, keys: &[[u8; pq::PUBLIC_KEY_BYTES]], verify: bool) -> Code {
+fn multisig(required: u8, keys: &[[u8; crypto::PUBLIC_KEY_BYTES]], verify: bool) -> Code {
     let number = |value: u8| {
         if value <= 16 {
             vec![0x50 + value]
@@ -71,7 +72,7 @@ fn multisig(required: u8, keys: &[[u8; pq::PUBLIC_KEY_BYTES]], verify: bool) -> 
     };
     let mut bytes = number(required);
     for key in keys {
-        bytes.push(48);
+        bytes.push(u8::try_from(crypto::PUBLIC_KEY_BYTES).unwrap());
         bytes.extend(key);
     }
     bytes.extend(number(u8::try_from(keys.len()).unwrap()));
@@ -118,7 +119,7 @@ impl Spend {
     }
 
     fn unsigned(body: Code, lock_time: LockTime) -> Self {
-        let redeem = p2sh::redeem_script(&body).unwrap();
+        let redeem = p2sh::redeem_script(PARAMETERS, &body).unwrap();
         let previous_outputs = vec![p2sh_output(&Code(vec![0x51])), p2sh_output(&redeem)];
         let transaction = Transaction::V5 {
             network_upgrade: NetworkUpgrade::Nu5,
@@ -282,15 +283,15 @@ async fn verify_block(
 #[tokio::test]
 async fn distinct_multisig_pairs_and_failed_matches_reach_transaction_validation() {
     let _guard = zakura_test::init();
-    let bob = SigningKey::from_seed(&[8; pq::SEED_BYTES]);
-    let carol = SigningKey::from_seed(&[9; pq::SEED_BYTES]);
+    let bob = SigningKey::from_seed(&[8; crypto::SEED_BYTES]);
+    let carol = SigningKey::from_seed(&[9; crypto::SEED_BYTES]);
     let keys = [&*KEY, &bob, &carol];
     for verify in [false, true] {
         let body = multisig(2, &keys.map(SigningKey::public_key), verify);
         let mut spend = Spend::unsigned(body, LockTime::unlocked());
         let signatures: Vec<_> = keys
             .iter()
-            .map(|key| spend.signature(key, HashType::ALL, p2sh::SIGNING_CONTEXT))
+            .map(|key| spend.signature(key, HashType::ALL, p2sh::signing_context(PARAMETERS)))
             .collect();
         // Pair [0, 1] must first skip the non-signing key at the top of the stack.
         for pair in [[0, 1], [0, 2], [1, 2]] {
@@ -348,7 +349,7 @@ async fn twenty_signature_capacity_survives_node_parsing_and_sigop_accounting() 
         multisig(20, &[KEY.public_key(); 20], false),
         LockTime::unlocked(),
     );
-    let signature = spend.signature(&KEY, HashType::ALL, p2sh::SIGNING_CONTEXT);
+    let signature = spend.signature(&KEY, HashType::ALL, p2sh::signing_context(PARAMETERS));
     let mut arguments = vec![vec![]];
     arguments.extend(vec![signature; 20]);
     spend.install_arguments(&arguments);
@@ -439,7 +440,7 @@ fn only_v5_can_use_local_pq_rules() {
     let mut spend = SPEND.clone();
     // No signature is needed: an accidentally enabled PQ path would succeed in any
     // version, so a digest mismatch cannot conceal a broken version gate.
-    spend.replace_redeem(p2sh::redeem_script(&Code(vec![0x51])).unwrap(), true);
+    spend.replace_redeem(p2sh::redeem_script(PARAMETERS, &Code(vec![0x51])).unwrap(), true);
     let input = push(&spend.redeem.0);
     *spend.input_mut() = Script::new(&input);
     assert_eq!(spend.check(), Ok(()));
@@ -569,7 +570,7 @@ async fn existing_signing_modes_use_the_node_digest() {
         HashType::NONE_ANYONECANPAY,
         HashType::SINGLE_ANYONECANPAY,
     ] {
-        let spend = Spend::signed(single_signer(), mode, p2sh::SIGNING_CONTEXT, 1);
+        let spend = Spend::signed(single_signer(), mode, p2sh::signing_context(PARAMETERS), 1);
         assert!(
             verify_block(&spend, &network(Some(ACTIVATION)), Height(11))
                 .await
@@ -590,7 +591,7 @@ async fn existing_signing_modes_use_the_node_digest() {
 fn authenticated_identifiers_and_input_bounds_are_enforced() {
     let mut changed = SPEND.clone();
     let mut redeem = changed.redeem.clone();
-    redeem.0[5] = 2;
+    redeem.0[5] = 3;
     changed.replace_redeem(redeem.clone(), false);
     assert_eq!(
         changed.check(),
@@ -599,7 +600,7 @@ fn authenticated_identifiers_and_input_bounds_are_enforced() {
     changed.previous_outputs[1] = p2sh_output(&redeem);
     assert_eq!(
         changed.check(),
-        Err(ScriptError::Pq(p2sh::Error::UnsupportedIdentifier(2)))
+        Err(ScriptError::Pq(p2sh::Error::UnsupportedIdentifier(3)))
     );
 
     let mut changed = SPEND.clone();
@@ -627,7 +628,7 @@ fn signing_context_locktime_and_multiple_checks_use_shared_rules() {
     let spend = Spend::signed_at_locktime(
         timelocked,
         HashType::ALL,
-        p2sh::SIGNING_CONTEXT,
+        p2sh::signing_context(PARAMETERS),
         1,
         LockTime::Height(Height(10)),
     );
@@ -660,7 +661,7 @@ fn signing_context_locktime_and_multiple_checks_use_shared_rules() {
     let mut twice = single_signer();
     *twice.0.last_mut().unwrap() = 0xad; // CHECKSIGVERIFY
     twice.0.extend(single_signer().0);
-    let spend = Spend::signed(twice, HashType::ALL, p2sh::SIGNING_CONTEXT, 2);
+    let spend = Spend::signed(twice, HashType::ALL, p2sh::signing_context(PARAMETERS), 2);
     assert_eq!(spend.check(), Ok(()));
     assert_eq!(
         spend
@@ -707,23 +708,23 @@ fn relay_policy_uses_authenticated_pq_and_trusted_activation() {
     assert!(policy(&changed, &active, ACTIVATION).is_err());
 
     let mut changed = SPEND.clone();
-    changed.redeem.0[5] = 2;
+    changed.redeem.0[5] = 3;
     changed.previous_outputs[PQ_INPUT] = p2sh_output(&changed.redeem);
-    changed.install_arguments(&[vec![0; pq::SIGNATURE_BYTES + 1]]);
+    changed.install_arguments(&[vec![0; crypto::SIGNATURE_BYTES + 1]]);
     assert!(policy(&changed, &active, ACTIVATION).is_err());
 
     let mut multiple = Spend::unsigned(
         multisig(2, &[KEY.public_key(); 3], false),
         LockTime::unlocked(),
     );
-    let signature = multiple.signature(&KEY, HashType::ALL, p2sh::SIGNING_CONTEXT);
+    let signature = multiple.signature(&KEY, HashType::ALL, p2sh::signing_context(PARAMETERS));
     multiple.install_arguments(&[vec![], signature.clone(), signature]);
     assert_eq!(policy(&multiple, &active, ACTIVATION), Ok(()));
     let mut too_many = Spend::unsigned(
         multisig(16, &[KEY.public_key(); 16], false),
         LockTime::unlocked(),
     );
-    too_many.install_arguments(&[vec![], vec![0; pq::SIGNATURE_BYTES + 1]]);
+    too_many.install_arguments(&[vec![], vec![0; crypto::SIGNATURE_BYTES + 1]]);
     assert_eq!(
         policy(&too_many, &active, ACTIVATION),
         Err(TransactionError::NonStandardInputs)

@@ -323,17 +323,12 @@ fn pq_p2sh_input_sigop_count(input: &transparent::Input, output: &transparent::O
         return legacy_count;
     };
     let lock_code = script::Code(output.lock_script.as_raw_bytes().to_vec());
-    if !lock_code.is_pay_to_script_hash() {
-        return legacy_count;
+    match zcash_transparent::pq::p2sh::classify_spend(unlock_script.as_raw_bytes(), &lock_code) {
+        Ok(zcash_transparent::pq::p2sh::SpendMode::Pq(selected)) => {
+            script::Code(selected.body().to_vec()).sig_op_count(true)
+        }
+        _ => legacy_count,
     }
-    let Ok(input) = zcash_script::pq::SpendingInput::scan(unlock_script.as_raw_bytes()) else {
-        return legacy_count;
-    };
-    let redeem = input.redeem_script();
-    if zcash_transparent::util::hash160::hash(redeem) != lock_code.0[2..22] {
-        return legacy_count;
-    }
-    script::Code(redeem.to_vec()).sig_op_count(true)
 }
 
 /// Trait for counting the number of transparent signature operations in the transparent inputs and

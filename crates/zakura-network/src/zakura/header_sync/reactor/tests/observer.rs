@@ -1696,7 +1696,9 @@ fn unstarted_removal_shows_without_a_retirement_event() {
 /// `retire_obsolete_active`, and `remove_owner`. Each case first shows the
 /// work listed, then that its path ran.
 ///
-/// This fails if any removal path leaves the queue's entry in place.
+/// This fails if any removal path leaves the queue's entry in place, at
+/// its `ran` check, or if the snapshot lists work from anything but the
+/// queue's own entries, such as a copy taken before the removal.
 #[test]
 fn each_removal_path_empties_the_snapshot() {
     let target = block::Hash([0x78; 32]);

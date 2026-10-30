@@ -26,7 +26,9 @@
 //! other call, so the tap adds no scheduling point to the reactor.
 
 use std::{
+    cell::Cell,
     mem,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, PoisonError, Weak,
@@ -35,8 +37,8 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot, Placement,
-        PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
+        Binding, CallEnd, FrameTag, HeaderSyncObserver, HeaderTargetPhase, ObserverSlot,
+        Placement, PortCall, ReactorEvent, ReactorSnapshot as Snapshot, RequestRef, ResumeArm,
         TransferDisposition, WaitCause, WorkPhase,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ServicePeerDirection, ZakuraPeerId,
@@ -71,6 +73,9 @@ pub struct ReactorTap {
     delivered: u64,
     /// Pairs calls with the node's storage receipts.
     pairer: Pairer,
+    /// The pairer's first waiting dropped call after each drain, as
+    /// `(call, operation)`, shared with its [`ReactorLink`].
+    waiting_drop: Rc<Cell<Option<(u64, u64)>>>,
     /// The run's harness failure, set when a call panics.
     failure: Failure,
     /// The last snapshot logged, which an unchanged `Settled` doesn't
@@ -99,6 +104,10 @@ struct TapState {
     /// Set once the reactor reported its teardown, `Dropping`, after which
     /// its observer may go.
     torn_down: AtomicBool,
+    /// Set when the observer recorded an event whose number wasn't the
+    /// slot's count as it arrived, so the observer repeated an event or lost
+    /// an earlier one. Equal totals alone would let a repeat hide a loss.
+    out_of_step: AtomicBool,
     buffer: Mutex<Buffer>,
 }
 
@@ -137,12 +146,18 @@ impl LiveEvidence for TapState {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is, unless the reactor reported a
-    /// clean teardown first.
+    /// `PortGone` once an event found the node's port dropped, `Unobserved`
+    /// once the observer recorded an event out of step with the slot's
+    /// count, and `ReactorGone` once the observer is gone, unless the
+    /// reactor reported a clean teardown first.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
+        } else if self.out_of_step.load(Ordering::Relaxed) {
+            Some(
+                "Unobserved: the tapped reactor's observer recorded an event out of step with \
+                 its slot's count, repeating it or after losing one",
+            )
         } else if self.observer.strong_count() == 0 && !self.torn_down.load(Ordering::Relaxed) {
             Some("ReactorGone: the tapped reactor dropped its observer during the run")
         } else {
@@ -188,6 +203,14 @@ impl HeaderSyncObserver for TapObserver {
             .checked_add(1)
             .expect("a run records fewer than 2^64 events");
         let seq = buffer.last;
+        // The slot counts an event before the observer sees it.
+        if seq
+            != state
+                .emitted
+                .load(zakura_rt::sync::counter::Ordering::Relaxed)
+        {
+            state.out_of_step.store(true, Ordering::Relaxed);
+        }
         buffer.events.push((seq, storage_seq, pos, event));
     }
 }
@@ -219,6 +242,7 @@ impl ReactorTap {
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
                 torn_down: AtomicBool::new(false),
+                out_of_step: AtomicBool::new(false),
                 buffer: Mutex::default(),
             }))
         });
@@ -238,6 +262,7 @@ impl ReactorTap {
             node: node.to_owned(),
             delivered: 0,
             pairer: Pairer::default(),
+            waiting_drop: Rc::default(),
             failure: sim.failure(),
             snapshot: None,
         };
@@ -255,6 +280,7 @@ impl ReactorTap {
         ReactorLink {
             instance: self.id.index,
             source: self.checkpoint.kind().source(self.id.index),
+            waiting_drop: self.waiting_drop.clone(),
         }
     }
 
@@ -266,6 +292,7 @@ impl ReactorTap {
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
         self.pairer.facts(facts);
+        self.waiting_drop.set(self.pairer.waiting_drop());
     }
 }
 
@@ -275,6 +302,9 @@ pub(crate) struct ReactorLink {
     pub(crate) instance: u64,
     /// The tap's source label, for failures.
     pub(crate) source: String,
+    /// The tap's first dropped call still waiting for its drop receipt, as
+    /// of its last drain. See [`Pairer::waiting_drop`].
+    pub(crate) waiting_drop: Rc<Cell<Option<(u64, u64)>>>,
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
@@ -622,9 +652,15 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
         ReactorEvent::Bound {
             reservation,
             incarnation,
+            via,
         } => ReactorFact::Bound {
             reservation,
             incarnation,
+            via: match via {
+                Binding::Start => "start",
+                Binding::Continuation => "continuation",
+            }
+            .to_owned(),
         },
         ReactorEvent::LeasesCaptured {
             call,
@@ -749,6 +785,7 @@ impl ReactorTap {
                 } => Some((*storage_seq, event)),
                 _ => None,
             }));
+        self.waiting_drop.set(self.pairer.waiting_drop());
         self.delivered = last;
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.

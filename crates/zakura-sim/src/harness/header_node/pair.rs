@@ -20,7 +20,10 @@
 //! points. So a `dropped` end names the operation its call submitted, if
 //! any, and that operation's `CallerDropped` or `ReplyDropped`, in its drain
 //! or a later one, pairs with it. A call that submitted nothing waits for
-//! nothing.
+//! nothing, and neither does one whose operation storage's shutdown
+//! removed (`ShutDown`'s `dropped`), which leaves no receipt. A call still
+//! waiting when the reactor's teardown is done fails the run (see
+//! [`Pairer::waiting_drop`]).
 //!
 //! Since the receipt and its `CallEnded` share a step, every receipt a
 //! reactor call must have taken pairs in its own drain: every locator's,
@@ -132,6 +135,8 @@ pub(crate) struct Pairer {
     /// Each operation whose call ended `dropped` before its receipt, with
     /// that call.
     awaiting: BTreeMap<u64, u64>,
+    /// The operations storage's shutdown removed.
+    removed: BTreeSet<u64>,
 }
 
 impl Pairer {
@@ -147,6 +152,13 @@ impl Pairer {
                     if let Some(call) = call {
                         self.submitter.insert(*id, *call);
                         self.submitted.entry(*call).or_insert(*id);
+                    }
+                    continue;
+                }
+                StorageFact::ShutDown { dropped, .. } => {
+                    for id in dropped {
+                        self.removed.insert(*id);
+                        self.awaiting.remove(id);
                     }
                     continue;
                 }
@@ -255,7 +267,9 @@ impl Pairer {
                         work.kind
                     ));
                 }
-                self.awaiting.insert(id, call);
+                if !self.removed.contains(&id) {
+                    self.awaiting.insert(id, call);
+                }
                 return Ok(Some(id));
             }
             other => return Err(format!("Mispaired: call {call} ended `{other}`")),
@@ -294,6 +308,13 @@ impl Pairer {
             ));
         }
         Ok(Some(id))
+    }
+
+    /// The first `dropped` call still waiting for its operation's drop
+    /// receipt, as `(call, operation)`: no receipt came, and storage's
+    /// shutdown didn't remove the operation.
+    pub(crate) fn waiting_drop(&self) -> Option<(u64, u64)> {
+        self.awaiting.iter().next().map(|(op, call)| (*call, *op))
     }
 
     /// Pairs the drop receipt at `seq` with the `dropped` call that

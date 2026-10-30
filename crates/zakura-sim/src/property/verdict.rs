@@ -123,13 +123,19 @@ pub enum Inconclusive {
     HarnessFailed,
     /// Every peer left, but the run ended before teardown settled.
     TeardownOpen,
-    /// The latest evaluation needed a component that was initializing or in
-    /// transition at its boundary ([`require`](super::require)).
+    /// The latest evaluation needed a component that existed and was
+    /// mid-change at its boundary: in transition, or ended in transition
+    /// ([`require`](super::require)). Never an unfinished run's reason.
     Unsettled,
-    /// An every-boundary claim couldn't read a component at some boundary
+    /// An every-boundary claim couldn't read a component that existed and
+    /// was mid-change at some boundary
     /// ([`require_every`](super::require_every)). Sticky: a later current
-    /// boundary doesn't clear it.
+    /// boundary doesn't clear it. An open obligation at run end outranks it.
     Unobserved,
+    /// The step budget cut the run while the property's check would have
+    /// ended `Unsettled` or `Unobserved`, so the run didn't finish showing
+    /// whether it holds.
+    BudgetCut,
 }
 
 impl Inconclusive {
@@ -137,6 +143,12 @@ impl Inconclusive {
     /// evaluations find.
     pub(crate) fn is_sticky(self) -> bool {
         self == Inconclusive::Unobserved
+    }
+
+    /// True for a reason about a component's state, which a budget cut
+    /// replaces with [`Inconclusive::BudgetCut`].
+    pub(crate) fn is_state(self) -> bool {
+        matches!(self, Inconclusive::Unsettled | Inconclusive::Unobserved)
     }
 }
 
@@ -151,6 +163,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::TeardownOpen => "teardown-open",
             Inconclusive::Unsettled => "state-unsettled",
             Inconclusive::Unobserved => "state-unobserved",
+            Inconclusive::BudgetCut => "budget-cut",
         })
     }
 }

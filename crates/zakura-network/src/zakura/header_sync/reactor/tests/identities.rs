@@ -215,7 +215,11 @@ fn a_reservation_is_placed_then_bound() {
             matches!(
                 &events[1..],
                 [
-                    ReactorEvent::Bound { reservation: bound, incarnation: 1 },
+                    ReactorEvent::Bound {
+                        reservation: bound,
+                        incarnation: 1,
+                        via: observe::Binding::Start,
+                    },
                     ReactorEvent::Started { request, .. },
                 ] if *bound == reservation && request.incarnation == 1
             ),
@@ -296,13 +300,20 @@ fn a_continuation_reserves_for_its_own_incarnation() {
             ReactorEvent::Bound {
                 reservation,
                 incarnation,
-            } => Some((*reservation, *incarnation)),
+                via,
+            } => Some((*reservation, *incarnation, *via)),
             _ => None,
         })
         .collect();
     assert_eq!(placed.len(), 2, "two windows: {events:?}");
     assert_ne!(placed[0], placed[1]);
-    assert_eq!(bound, [(placed[0], 1), (placed[1], 1)]);
+    assert_eq!(
+        bound,
+        [
+            (placed[0], 1, observe::Binding::Start),
+            (placed[1], 1, observe::Binding::Continuation)
+        ]
+    );
     let settled = settle(&reactor, &recorder);
     let [holding] = &settled.holdings[..] else {
         panic!("one peer's holdings: {:?}", settled.holdings);

@@ -528,6 +528,22 @@ struct HeaderSyncReactor {
     unhandled_calls: std::collections::BTreeSet<u64>,
 }
 
+/// Reports the reactor's teardown (see [`ReactorEvent::Dropping`]). It runs
+/// before any field drops, its pending calls' futures included.
+#[cfg(any(test, zakura_sim))]
+impl Drop for HeaderSyncReactor {
+    /// Reports `Dropping` with the turn it's in.
+    fn drop(&mut self) {
+        observe!(
+            self,
+            ReactorEvent::Dropping {
+                turn: self.turn,
+                unwinding: std::thread::panicking(),
+            }
+        );
+    }
+}
+
 type PendingPortOperation = Pin<Box<dyn Future<Output = PortOperationResult> + Send + 'static>>;
 
 type HeaderSyncPortCompletion = Box<dyn FnOnce(&mut HeaderSyncReactor) + Send + 'static>;
@@ -4450,7 +4466,7 @@ impl HeaderSyncReactor {
         #[cfg(any(test, zakura_sim))]
         let (tap, dispatched) = self.begin_port_call(&action);
         #[cfg(any(test, zakura_sim))]
-        let (call, panic_tap) = (tap.call, tap.clone());
+        let (call, panic_tap, pending_tap) = (tap.call, tap.clone(), tap.clone());
         #[cfg(any(test, zakura_sim))]
         let panic_context = PortPanicContext {
             call,
@@ -4723,6 +4739,8 @@ impl HeaderSyncReactor {
         if let Some(op) = dispatched {
             observe!(self, ReactorEvent::Dispatched { call, op });
         }
+        #[cfg(any(test, zakura_sim))]
+        let operation = observe::PendingCall::new(operation, pending_tap);
         self.pending_port_operations.push(Box::pin(operation));
         true
     }

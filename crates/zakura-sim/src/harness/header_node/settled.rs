@@ -13,12 +13,14 @@
 //!   current.
 //! * At a preemption point or a lock, it's current only if this step's
 //!   last report is a `Settled`. Otherwise it's in transition.
-//! * Exited, it ends: seen with its final snapshot after `Settled{last}`,
-//!   unsettled if it was cancelled or panicked, and a harness failure if it
-//!   completed without its final snapshot.
 //! * If its task didn't run, nothing it owns changed.
-//! * Dropped before it ever started, as an abort before its task's first
-//!   poll leaves it, it ends unsettled.
+//!
+//! It ends seen with its final snapshot at `Settled{last}`. The reactor
+//! also reports its own teardown, `Dropping`, from its `Drop`, so it ends
+//! there unsettled if no `Settled{last}` came first: cancelled, unwound, or
+//! aborted before its task's first poll. After `Dropping`, only its pending
+//! calls' `dropped` call ends may follow. A task that completes with no
+//! `Settled{last}` fails the run as `NoFinalSnapshot`.
 //!
 //! The reactor is bound to the task that ran when it reported
 //! `Resumed{arm: start}`, by that task's scheduler name, which is unique
@@ -72,6 +74,8 @@ pub struct ReactorLife {
     finished: bool,
     /// Whether its task's exit was logged.
     exited: bool,
+    /// Whether it reported `Dropping`.
+    dropping: bool,
     /// Whether its last read was in transition.
     in_transition: bool,
 }
@@ -89,6 +93,7 @@ impl ReactorLife {
             snapshot: None,
             finished: false,
             exited: false,
+            dropping: false,
             in_transition: false,
         }
     }
@@ -146,11 +151,18 @@ impl ReactorLife {
                 ));
             }
         }
-        let reported = !facts.is_empty();
         let mut started = false;
         let mut settled_last_in_step = false;
         for fact in facts {
             settled_last_in_step = false;
+            let dropped_call =
+                matches!(fact, ReactorFact::CallEnded { end, .. } if end == "dropped");
+            if self.dropping && !dropped_call {
+                return Err(format!(
+                    "AfterDropping: the reactor reported {fact:?} at step {step} after its \
+                     Dropping"
+                ));
+            }
             match fact {
                 ReactorFact::Settled {
                     turn,
@@ -218,10 +230,22 @@ impl ReactorLife {
                     }
                     self.marker = Some(Marker::Resumed(*turn));
                 }
+                ReactorFact::Dropping { turn, .. } => {
+                    let current = match self.marker {
+                        Some(Marker::Settled(turn) | Marker::Resumed(turn)) => turn,
+                        None => 0,
+                    };
+                    if *turn != current {
+                        return Err(format!(
+                            "TurnGap: Dropping{{turn: {turn}}} at step {step} in turn {current}"
+                        ));
+                    }
+                    self.dropping = true;
+                }
                 // The build's own effects, such as a startup repair's
                 // dispatch, come before its snapshot.
                 _ if self.marker.is_none() => {}
-                _ if self.finished => {
+                _ if self.finished && !dropped_call => {
                     return Err(format!(
                         "AfterFinal: the reactor reported {fact:?} at step {step} after its \
                          final Settled"
@@ -239,12 +263,6 @@ impl ReactorLife {
             self.task = Some(task.to_owned());
             self.exists(step)?;
         }
-        // Dropped before it ever ran, as an abort before the task's first
-        // poll leaves it: it never started, so it ends unsettled.
-        if self.task.is_none() && self.component.live() && self.link.unfinished_drop() {
-            self.exists(step)?;
-            return self.end(step, None);
-        }
         let stop = match outcome {
             Some(obs) if ran.is_some() && ran == self.task.as_deref() => match obs {
                 Observation::TaskWaiting { .. } => Some(Stop::Waiting),
@@ -253,23 +271,26 @@ impl ReactorLife {
             },
             _ => None,
         };
-        if let Some(Stop::Exited(_)) = stop {
+        if let Some(Stop::Exited(exit)) = stop {
             self.exited = true;
-        }
-        if let Some(detail) = self.link.take_unpaired() {
-            match (&stop, reported) {
-                // Teardown drops pending calls' futures, whose receipts no
-                // call end follows.
-                _ if self.finished || self.exited => {}
-                // The reactor carries on, so it lost the call's end.
-                (Some(Stop::Waiting), _) | (_, true) => return Err(detail),
-                // Mid-teardown, or not yet run: its next report decides.
-                _ => self.link.defer_unpaired(detail),
+            if !self.finished && *exit == Exit::Completed {
+                return Err(format!(
+                    "NoFinalSnapshot: the reactor's task completed at step {step} with no \
+                     Settled{{last}}"
+                ));
             }
         }
-        if let Some(Stop::Exited(exit)) = stop {
+        if self.dropping && !self.finished && self.component.live() {
+            // Torn down mid-run, or before it ever ran, so no state is
+            // known at its end.
+            self.exists(step)?;
+            return self.end(step, None);
+        }
+        if let Some(Stop::Exited(_)) = stop {
             if !self.finished {
-                return self.unfinished_exit(step, exit);
+                // Exited with no `Dropping` before it, which its `Drop`
+                // always reports, so nothing it owns is known.
+                return self.end(step, None);
             }
         }
         if !self.component.live() {
@@ -304,32 +325,12 @@ impl ReactorLife {
             Some(Stop::Point) if settled_last_in_step => current(),
             Some(Stop::Point) => held(),
             Some(Stop::Exited(_)) => unreachable!("an unfinished exit returned above"),
-            // Its observer went with no final `Settled`, which its task's
-            // outcome will explain.
-            None if self.link.unfinished_drop() => held(),
             // Its task didn't run, so nothing it owns changed.
             None if self.in_transition => held(),
             None => current(),
         };
         self.in_transition = matches!(read, Read::Held { .. });
         self.read(step, read)
-    }
-
-    /// Ends the reactor after its task exited at `step` with no final
-    /// `Settled`: unsettled if it was cancelled, or panicked with its
-    /// observer kept elsewhere, and a failure otherwise.
-    fn unfinished_exit(&mut self, step: u64, exit: &Exit) -> Result<(), String> {
-        let gone = self.link.unfinished_drop();
-        match exit {
-            Exit::Cancelled => self.end(step, None),
-            Exit::Panicked if !gone => self.end(step, None),
-            Exit::Panicked => Err(REACTOR_GONE.to_owned()),
-            Exit::Completed if gone => Err(REACTOR_GONE.to_owned()),
-            Exit::Completed => Err(format!(
-                "NoFinalSnapshot: the reactor's task completed at step {step} with no \
-                 Settled{{last}}"
-            )),
-        }
     }
 
     /// Registers its read, in its view too.
@@ -370,11 +371,6 @@ impl ReactorLife {
         }
     }
 }
-
-/// The failure for a reactor whose task exited after it dropped its
-/// observer with no final `Settled`.
-const REACTOR_GONE: &str =
-    "ReactorGone: the tapped reactor dropped its observer during the run with no final Settled";
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +503,14 @@ mod tests {
     /// `Resumed{turn, arm}`.
     fn resumed(turn: u64, arm: ResumeArm) -> ReactorEvent {
         ReactorEvent::Resumed { turn, arm }
+    }
+
+    /// A clean `Dropping{turn}`, as the reactor's `Drop` reports it.
+    fn dropping(turn: u64) -> ReactorEvent {
+        ReactorEvent::Dropping {
+            turn,
+            unwinding: false,
+        }
     }
 
     /// A preemption point, as the reactor's mid-turn locks and atomics are.
@@ -743,16 +747,18 @@ mod tests {
         }
     }
 
-    /// A completed reactor without its final `Settled` fails the run,
-    /// `ReactorGone` once its observer went with it and `NoFinalSnapshot`
-    /// while another handle keeps it. One with its final `Settled` ends
-    /// seen, with no failure.
+    /// A completed reactor without its final `Settled` fails the run:
+    /// `NoFinalSnapshot` when it reports its teardown, or while another
+    /// handle keeps its observer, and `ReactorGone` when its observer goes
+    /// with no teardown report. One with its final `Settled` and teardown
+    /// ends seen, with no failure.
     #[test]
     fn a_completed_reactor_needs_its_final_snapshot() {
-        for (finish, keep, failure) in [
-            (false, false, Some("ReactorGone")),
-            (false, true, Some("NoFinalSnapshot")),
-            (true, false, None),
+        for (finish, teardown, keep, failure) in [
+            (false, true, false, Some("NoFinalSnapshot")),
+            (false, false, true, Some("NoFinalSnapshot")),
+            (false, false, false, Some("ReactorGone")),
+            (true, true, false, None),
         ] {
             let (mut fixture, slot) = Fixture::new(1_000);
             slot.emit(settled(0, false));
@@ -763,6 +769,9 @@ mod tests {
                 slot.emit(resumed(2, ResumeArm::Shutdown));
                 if finish {
                     slot.emit(settled(2, true));
+                }
+                if teardown {
+                    slot.emit(dropping(2));
                 }
             });
             let (report, life) = fixture.run(&mut States::default());
@@ -1040,13 +1049,12 @@ mod tests {
     }
 
     /// A reactor stopped with a call still pending drops the call's future,
-    /// so storage records `CallerDropped` with no call end. That's its
-    /// teardown, not a lost event: shut down, it ends seen, and aborted
-    /// with its observer kept elsewhere, it ends unsettled, and neither run
-    /// fails.
+    /// so storage records `CallerDropped`, and the call's guard reports
+    /// `CallEnded{dropped}` right after it, which pairs with that receipt.
+    /// Shut down, the reactor ends seen, and aborted with its observer kept
+    /// elsewhere, it ends unsettled, and neither run fails.
     ///
-    /// This fails if the tap fails a teardown receipt before the reactor's
-    /// lifecycle explains it.
+    /// This fails if a dropped call's future reports no end.
     #[test]
     fn a_stop_with_a_pending_call_ends_clean() {
         for (stopping, ended) in [
@@ -1068,11 +1076,16 @@ mod tests {
                 dropped,
                 "{stopping:?}: the pending call's future is dropped"
             );
+            let ends: Vec<_> = reactor_facts(&report)
+                .into_iter()
+                .filter_map(|(_, fact)| match fact {
+                    ReactorFact::CallEnded { call, end, op } => Some((*call, end.as_str(), *op)),
+                    _ => None,
+                })
+                .collect();
             assert!(
-                !reactor_facts(&report)
-                    .iter()
-                    .any(|(_, fact)| matches!(fact, ReactorFact::CallEnded { .. })),
-                "{stopping:?}: no call end follows"
+                matches!(ends[..], [(1, "dropped", Some(_))]),
+                "{stopping:?}: the dropped call's end pairs with its receipt: {ends:?}"
             );
             assert_eq!(
                 name(life.borrow().component().state()),
@@ -1083,40 +1096,60 @@ mod tests {
     }
 
     /// The real reactor, aborted at setup, before its task's first poll,
-    /// reports only its build snapshot and never starts. Its task's
-    /// cancellation drops its observer, and it ends unsettled with no
-    /// failure.
+    /// reports only its build snapshot, never starts, and reports its
+    /// teardown when its task's cancellation drops it. It ends unsettled
+    /// with no failure, whether or not another handle keeps its observer.
     ///
-    /// This fails if a reactor that never bound its task can't end.
+    /// This fails if the fold waits for the observer's drop to end a
+    /// reactor that never bound its task.
     #[test]
     fn a_reactor_aborted_before_its_first_poll_ends_unsettled() {
-        let (mut fixture, slot) = Fixture::new(1_000);
-        let port: Arc<dyn Port> = fixture.port.clone();
-        let header = HeaderFixture::regtest();
-        let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
-        startup.observer = slot;
-        let (handle, actions, reactor) =
-            spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
-        reactor.abort();
-        fixture
-            .sim
-            .scheduler()
-            .spawn_root("idle", async { zakura_rt::task::yield_now().await });
-        let (report, life) = fixture.run(&mut States::default());
-        drop((handle, actions, repairs));
-        assert_eq!(report.end.harness, None, "{:?}", report.end);
-        let facts = reactor_facts(&report);
-        assert!(
-            matches!(facts[..], [(0, ReactorFact::Settled { turn: 0, .. })]),
-            "only the build reports: {facts:?}"
-        );
-        assert!(
-            report.log.entries().iter().any(|entry| matches!(&entry.obs,
-                Observation::TaskExited { task, exit: Exit::Cancelled } if task.starts_with("header_sync_reactor"))),
-            "the reactor's task is cancelled"
-        );
-        assert_eq!(life.borrow().task(), None, "it never started");
-        assert_eq!(name(life.borrow().component().state()), "ended-unsettled");
+        for keep in [false, true] {
+            let (mut fixture, slot) = Fixture::new(1_000);
+            let port: Arc<dyn Port> = fixture.port.clone();
+            let header = HeaderFixture::regtest();
+            let (mut startup, repairs) = startup(&port, &header, Chain::default().tip(&header));
+            let kept = keep.then(|| slot.clone());
+            startup.observer = slot;
+            let (handle, actions, reactor) =
+                spawn_header_sync_reactor(startup).expect("a fixture startup is valid");
+            reactor.abort();
+            fixture
+                .sim
+                .scheduler()
+                .spawn_root("idle", async { zakura_rt::task::yield_now().await });
+            let (report, life) = fixture.run(&mut States::default());
+            drop((handle, actions, repairs, kept));
+            assert_eq!(report.end.harness, None, "keep {keep}: {:?}", report.end);
+            let facts = reactor_facts(&report);
+            assert!(
+                matches!(
+                    facts[..],
+                    [
+                        (0, ReactorFact::Settled { turn: 0, .. }),
+                        (
+                            _,
+                            ReactorFact::Dropping {
+                                turn: 0,
+                                unwinding: false
+                            }
+                        ),
+                    ]
+                ),
+                "keep {keep}: only the build and the teardown report: {facts:?}"
+            );
+            assert!(
+                report.log.entries().iter().any(|entry| matches!(&entry.obs,
+                    Observation::TaskExited { task, exit: Exit::Cancelled } if task.starts_with("header_sync_reactor"))),
+                "keep {keep}: the reactor's task is cancelled"
+            );
+            assert_eq!(life.borrow().task(), None, "keep {keep}: it never started");
+            assert_eq!(
+                name(life.borrow().component().state()),
+                "ended-unsettled",
+                "keep {keep}"
+            );
+        }
     }
 
     /// A pairing failure that isn't a dropped call's receipt fails the run
@@ -1145,6 +1178,7 @@ mod tests {
                 end: CallEnd::Replied,
             });
             slot.emit(settled(1, true));
+            slot.emit(dropping(1));
         });
         let (report, _) = fixture.run(&mut States::default());
         assert!(
@@ -1155,10 +1189,216 @@ mod tests {
         );
         assert!(
             matches!(
-                reactor_facts(&report).last(),
-                Some((_, ReactorFact::Settled { last: true, .. }))
+                reactor_facts(&report)[..],
+                [
+                    ..,
+                    (_, ReactorFact::Settled { last: true, .. }),
+                    (_, ReactorFact::Dropping { .. })
+                ]
             ),
             "the call end and the final Settled share the failing step"
+        );
+    }
+
+    /// Settles turn `turn`, waits, and resumes the next, as the reactor's
+    /// loop does around its `select!`.
+    async fn wait(slot: &ObserverSlot, turn: &mut u64) {
+        slot.emit(settled(*turn, false));
+        zakura_rt::task::yield_now().await;
+        *turn += 1;
+        slot.emit(resumed(*turn, ResumeArm::PortCompletion));
+    }
+
+    /// A scripted reactor on `fixture`'s port, paired through its storage
+    /// policy, whose turn 2 makes real locator calls and then reports no
+    /// call end for them, as a reactor that forgot to report would. `turn`
+    /// runs from that turn and returns the turn it ends in, and the reactor
+    /// then settles for the last time and tears down.
+    fn scripted_calls<T>(turn: T) -> RunReport
+    where
+        T: FnOnce(
+                Arc<ControlledPort>,
+                ObserverSlot,
+            ) -> futures::future::LocalBoxFuture<'static, u64>
+            + 'static,
+    {
+        let (mut fixture, slot) = Fixture::new(1_000);
+        let storage = PolicySource::new(
+            &mut fixture.sim,
+            fixture.port.clone(),
+            Policy::converging(),
+            Effects::default(),
+        );
+        let tap = fixture.tap.take().expect("the fixture has its tap");
+        fixture.sim.add_source(Box::new(storage.with_tap(tap)));
+        let port = fixture.port.clone();
+        slot.emit(settled(0, false));
+        let body = turn(port, slot.clone());
+        fixture.sim.scheduler().spawn_root("reactor", async move {
+            start(&slot);
+            zakura_rt::task::yield_now().await;
+            slot.emit(resumed(2, ResumeArm::Event));
+            let turn = body.await;
+            slot.emit(settled(turn, true));
+            slot.emit(dropping(turn));
+        });
+        fixture.run(&mut States::default()).0
+    }
+
+    /// Dispatches locator call `call` through `slot` and returns its future
+    /// on `port`, polled once, so storage has taken it.
+    fn locator(
+        port: &Arc<ControlledPort>,
+        slot: &ObserverSlot,
+        call: u64,
+    ) -> zakura_node_services::header_chain::HeaderChainFuture<
+        'static,
+        Result<
+            Option<zakura_header_chain::HeaderLocator>,
+            zakura_node_services::header_chain::PortError,
+        >,
+    > {
+        use futures::FutureExt;
+        use zakura_node_services::header_chain::LocatorReadPermit;
+
+        let hash = zakura_chain::block::Hash([7; 32]);
+        slot.emit(ReactorEvent::Dispatched {
+            call,
+            op: zakura_network::zakura::observe::PortCall::Locator {
+                peer: zakura_network::zakura::ZakuraPeerId::new(vec![1; 32])
+                    .expect("32 bytes is a valid peer ID"),
+                session_id: 1,
+                target_tip_hash: hash,
+                scope: zakura_header_chain::HeaderWorkAuthority {
+                    header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                    branch: zakura_header_chain::BranchId {
+                        anchor_hash: hash,
+                        target_tip_hash: hash,
+                    },
+                },
+            },
+        });
+        let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a fresh semaphore has a permit");
+        let port: Arc<dyn Port> = port.clone();
+        let mut future = Box::pin(async move {
+            port.continuation_locator(LocatorReadPermit::new(permit))
+                .await
+        });
+        assert!(
+            (&mut future).now_or_never().is_none(),
+            "storage holds the call"
+        );
+        future
+    }
+
+    /// The step at which `report` logged its first unpaired `fact` for an
+    /// operation.
+    fn receipt_step(report: &RunReport, dropped: bool) -> u64 {
+        report
+            .log
+            .entries()
+            .iter()
+            .find(|entry| match &entry.obs {
+                Observation::Storage { fact, .. } => {
+                    use crate::observe::StorageFact as F;
+                    if dropped {
+                        matches!(fact, F::CallerDropped { .. } | F::ReplyDropped { .. })
+                    } else {
+                        matches!(fact, F::ReplyTaken { .. })
+                    }
+                }
+                _ => false,
+            })
+            .expect("storage logs the receipt")
+            .step
+    }
+
+    /// The pairing failure that ended `report`, which must have one.
+    fn unpaired(report: &RunReport) -> &str {
+        match &report.end.harness {
+            Some(HarnessFailure::SourceEvidence { detail, .. })
+                if detail.starts_with("Unpaired") =>
+            {
+                detail
+            }
+            other => panic!("expected an unpaired receipt, got {other:?}"),
+        }
+    }
+
+    /// A drop receipt and a taken reply, both with no call end, in the step
+    /// that also ends the reactor: the drop comes first, then the reply,
+    /// then the final `Settled` and teardown. The drain fails at that
+    /// step. Teardown explains nothing, since the reactor reports every
+    /// call it drops.
+    ///
+    /// This fails if a drop receipt at teardown hides the drain's failure.
+    #[test]
+    fn a_teardown_never_excuses_an_unpaired_reply() {
+        let report = scripted_calls(|port, slot| {
+            Box::pin(async move {
+                use futures::FutureExt;
+
+                let mut turn = 2;
+                let base = port.last_seq();
+                let dropped = locator(&port, &slot, 1);
+                let mut taken = locator(&port, &slot, 2);
+                // Each call takes and drops a permit, is submitted, and
+                // completes: four facts each.
+                for _ in 0..1_000 {
+                    if port.last_seq() >= base + 8 {
+                        break;
+                    }
+                    wait(&slot, &mut turn).await;
+                }
+                assert!(port.last_seq() >= base + 8, "storage completes both calls");
+                drop(dropped);
+                assert!(
+                    (&mut taken).now_or_never().is_some(),
+                    "call 2's reply is ready"
+                );
+                turn
+            })
+        });
+        let detail = unpaired(&report);
+        let step = report.end.steps;
+        assert_eq!(receipt_step(&report, true), step, "{detail}");
+        assert_eq!(receipt_step(&report, false), step, "{detail}");
+        assert!(
+            matches!(
+                reactor_facts(&report)[..],
+                [.., (s, ReactorFact::Settled { last: true, .. }), (_, ReactorFact::Dropping { .. })]
+                    if s == step
+            ),
+            "the reactor ends in the failing step"
+        );
+    }
+
+    /// A drop receipt with no call end while the reactor still runs fails
+    /// at its own step, before the reactor's later teardown can be read as
+    /// explaining it.
+    ///
+    /// This fails if an earlier unpaired drop is left for teardown.
+    #[test]
+    fn an_unpaired_receipt_before_teardown_fails_at_its_step() {
+        let report = scripted_calls(|port, slot| {
+            Box::pin(async move {
+                let mut turn = 2;
+                drop(locator(&port, &slot, 1));
+                point();
+                wait(&slot, &mut turn).await;
+                turn
+            })
+        });
+        let detail = unpaired(&report);
+        assert!(detail.contains("CallerDropped"), "{detail}");
+        assert_eq!(receipt_step(&report, true), report.end.steps, "{detail}");
+        assert!(
+            !reactor_facts(&report)
+                .iter()
+                .any(|(_, fact)| matches!(fact, ReactorFact::Settled { last: true, .. })),
+            "the run fails before the reactor's teardown"
         );
     }
 }

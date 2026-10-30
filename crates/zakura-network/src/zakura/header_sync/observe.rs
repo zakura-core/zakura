@@ -202,6 +202,16 @@ pub enum ReactorEvent {
         /// The reactor's state.
         snapshot: Box<ReactorSnapshot>,
     },
+    /// The reactor is being dropped: its loop returned, its task was
+    /// cancelled or unwound, or it was dropped before it ran. Reported from
+    /// its `Drop`, before any of its fields drop, so the only events after
+    /// it are its pending calls' `CallEnded{end: Dropped}`.
+    Dropping {
+        /// Its turn when it was dropped.
+        turn: u64,
+        /// Whether it's dropped while its task unwinds from a panic.
+        unwinding: bool,
+    },
     /// The reactor resumed from a wait, or started. It's the first thing
     /// the turn reports, and the reactor's state is in transition until
     /// the next `Settled`.
@@ -455,6 +465,9 @@ pub enum CallEnd {
     NotSubmitted,
     /// The future panicked, and the reactor caught it.
     PortPanicked,
+    /// The future was dropped unfinished, as the reactor's teardown drops
+    /// its pending calls.
+    Dropped,
 }
 
 /// Which local capacity refused an offer.
@@ -500,6 +513,9 @@ pub(crate) struct PortTap {
     /// The call's number, or 0 for an action that calls no port.
     pub(crate) call: u64,
     slot: ObserverSlot,
+    /// Set once the call's end is reported, through any clone, so a
+    /// [`PendingCall`] dropped after it reports nothing.
+    ended: Arc<counter::AtomicU64>,
 }
 
 impl PortTap {
@@ -508,6 +524,7 @@ impl PortTap {
         Self {
             call,
             slot: slot.clone(),
+            ended: Arc::default(),
         }
     }
 
@@ -528,10 +545,57 @@ impl PortTap {
     /// Reports that the call ended with `end`, from outside the port future's
     /// panic catch, where an observer panic already unwinds the reactor.
     pub(crate) fn end_after_catch(&self, end: CallEnd) {
+        self.ended.store(1, counter::Ordering::Relaxed);
         self.slot.emit(ReactorEvent::CallEnded {
             call: self.call,
             end,
         });
+    }
+}
+
+/// A port call's future, guarded so that dropping it unfinished, as the
+/// reactor's teardown drops its pending calls, reports
+/// `CallEnded{end: Dropped}` through the call's tap. The future drops
+/// first, so a storage receipt its drop leaves comes before the end.
+pub(crate) struct PendingCall<F> {
+    future: Option<F>,
+    tap: PortTap,
+}
+
+impl<F> PendingCall<F> {
+    /// Guards `future`, call `tap`'s future.
+    pub(crate) fn new(future: F, tap: PortTap) -> Self {
+        Self {
+            future: Some(future),
+            tap,
+        }
+    }
+}
+
+impl<F: std::future::Future + Unpin> std::future::Future for PendingCall<F> {
+    type Output = F::Output;
+
+    /// Polls the guarded future.
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let future = self
+            .future
+            .as_mut()
+            .expect("a pending call's future lives until its guard drops");
+        std::pin::Pin::new(future).poll(cx)
+    }
+}
+
+impl<F> Drop for PendingCall<F> {
+    /// Drops the future, then reports the call dropped unless its end was
+    /// already reported.
+    fn drop(&mut self) {
+        drop(self.future.take());
+        if self.tap.call != 0 && self.tap.ended.load(counter::Ordering::Relaxed) == 0 {
+            self.tap.end_after_catch(CallEnd::Dropped);
+        }
     }
 }
 

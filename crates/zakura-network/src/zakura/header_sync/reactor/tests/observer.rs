@@ -594,10 +594,17 @@ async fn the_slot_counts_events_the_observer_drops() {
         "the observer dropped the call's end"
     );
     drop(reactor);
+    assert!(
+        matches!(
+            observer.recorder.take()[..],
+            [ReactorEvent::Dropping { .. }]
+        ),
+        "the reactor reports its teardown"
+    );
     assert_eq!(
         slot.emitted() - before,
-        recorded.len() as u64 + 1, // a test's handful of events fits u64
-        "the count has the dropped `CallEnded` too"
+        recorded.len() as u64 + 2, // a test's handful of events fits u64
+        "the count has the dropped `CallEnded` and the teardown too"
     );
 }
 
@@ -1243,6 +1250,10 @@ async fn observer_does_not_change_behaviour() {
                     call: 2,
                     panicked: false
                 },
+                ReactorEvent::Dropping {
+                    unwinding: false,
+                    ..
+                },
             ]
         ),
         "the history exercises every hook it passes: {events:#?}"
@@ -1727,15 +1738,44 @@ fn the_adopted_state_is_what_the_reactor_schedules_from() {
 /// starts with its `Resumed`, numbered one past the last `Settled`, and
 /// ends with a `Settled` of its number. Only a port future's `CallEnded`,
 /// reported while the loop polls its futures, sits between a `Settled` and
-/// the next `Resumed`, which is then the completion's.
+/// the next `Resumed`, which is then the completion's. The final `Settled`
+/// is followed by the reactor's `Dropping` alone, then only its pending
+/// calls' dropped ends.
 fn assert_turns(events: &[ReactorEvent]) -> Vec<observe::ResumeArm> {
     let mut arms = Vec::new();
     let mut settled = None;
     let mut resumed = None;
     let mut call_ended = false;
     let mut last = false;
+    let mut dropping = false;
     for event in events {
-        assert!(!last, "nothing follows the final Settled: {event:?}");
+        if dropping {
+            assert!(
+                matches!(
+                    event,
+                    ReactorEvent::CallEnded {
+                        end: CallEnd::Dropped,
+                        ..
+                    }
+                ),
+                "only dropped calls follow the teardown: {event:?}"
+            );
+            continue;
+        }
+        if last {
+            assert!(
+                matches!(
+                    event,
+                    ReactorEvent::Dropping {
+                        unwinding: false,
+                        ..
+                    }
+                ),
+                "the teardown follows the final Settled: {event:?}"
+            );
+            dropping = true;
+            continue;
+        }
         match event {
             ReactorEvent::Settled {
                 turn, last: end, ..
@@ -1766,7 +1806,10 @@ fn assert_turns(events: &[ReactorEvent]) -> Vec<observe::ResumeArm> {
             ),
         }
     }
-    assert!(last, "the loop ends with its final Settled");
+    assert!(
+        last && dropping,
+        "the loop ends with its final Settled, then its teardown"
+    );
     arms
 }
 
@@ -1946,5 +1989,61 @@ async fn an_idle_shutdown_keeps_its_final_marker() {
             ..Default::default()
         },
         "the reactor holds nothing but its adopted snapshot"
+    );
+}
+
+/// Dropping the reactor reports its teardown first, then a
+/// `CallEnded{end: Dropped}` for each call still pending, and nothing for
+/// a call that already ended.
+///
+/// This fails if a pending call's dropped future reports no end.
+#[tokio::test]
+async fn teardown_reports_each_pending_call_dropped() {
+    let recorder = Arc::new(Recorder::default());
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort {
+            gate: Some(gate.clone()),
+            ..ScriptedPort::default()
+        }),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let (ended, pending) = (peer_of(1), peer_of(2));
+    let _ended = connect(&mut reactor, &ended, 3);
+    let _pending = connect(&mut reactor, &pending, 7);
+    seed_applying_request(&mut reactor, &snapshot, ended.clone(), 3);
+    assert!(reactor.dispatch_action(apply_operation(&reactor, &ended)));
+    gate.add_permits(1);
+    complete_next(&mut reactor).await;
+    seed_applying_request(&mut reactor, &snapshot, pending.clone(), 7);
+    assert!(reactor.dispatch_action(apply_operation(&reactor, &pending)));
+    let before = recorder.take();
+    assert!(
+        before.iter().any(|event| matches!(
+            event,
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied
+            }
+        )) && before
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::Dispatched { call: 2, .. })),
+        "call 1 ended and call 2 is pending: {before:?}"
+    );
+
+    drop(reactor);
+    assert_eq!(
+        recorder.take(),
+        vec![
+            ReactorEvent::Dropping {
+                turn: 0,
+                unwinding: false,
+            },
+            ReactorEvent::CallEnded {
+                call: 2,
+                end: CallEnd::Dropped,
+            },
+        ]
     );
 }

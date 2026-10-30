@@ -1323,7 +1323,8 @@ pub enum ReactorFact {
         /// The call's number.
         call: u64,
         /// How it ended: `replied`, `port-error`, `timed-out`,
-        /// `not-submitted` or `port-panicked`.
+        /// `not-submitted`, `port-panicked`, or `dropped` when the reactor's
+        /// teardown dropped its future.
         end: String,
         /// The storage operation the call is paired with. The tap doesn't
         /// pair calls, so it always logs `None`.
@@ -1389,6 +1390,14 @@ pub enum ReactorFact {
         /// `Settled`'s.
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot: Option<Box<ReactorSnapshot>>,
+    },
+    /// The reactor is being dropped, before any of its fields are. Only its
+    /// pending calls' `dropped` call ends follow (M6a-3).
+    Dropping {
+        /// Its turn then.
+        turn: u64,
+        /// Whether its task was unwinding from a panic.
+        unwinding: bool,
     },
     /// The reactor resumed from a wait, or started, and its state is in
     /// transition until the next `Settled` (M6a-3).

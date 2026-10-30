@@ -18,9 +18,9 @@
 //! count, so an event the slot sent that the observer never recorded fails
 //! the run as `Unobserved` (M6a-3). It logs every `Settled` and `Resumed`
 //! marker, but a snapshot only when it differs from the last one logged.
-//! Once an evidence hub audits the reactor's lifecycle, through
-//! `ReactorTap::link`, the tap leaves an observer dropped without a final
-//! `Settled` to the hub, which explains it by the reactor task's outcome.
+//! The reactor reports its own teardown, `Dropping`, so its observer's drop
+//! after a clean `Dropping` is expected. Any other drop, before one or
+//! while the reactor unwinds from a panic, is `ReactorGone`.
 //!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
@@ -94,16 +94,9 @@ struct TapState {
     refused: AtomicBool,
     /// Set when an event was recorded after the node's port was dropped.
     port_gone: AtomicBool,
-    /// Set once the reactor reported its final `Settled`, after which its
-    /// observer may go.
-    finished: AtomicBool,
-    /// Set once an evidence hub audits the reactor's lifecycle, which then
-    /// explains an observer dropped without a final `Settled` by its task's
-    /// outcome (M6a-3).
-    audited: AtomicBool,
-    /// A drain's unpaired drop receipt that the hub's audit decides, the
-    /// first one not yet decided. See [`ReactorLink::take_unpaired`].
-    unpaired: Mutex<Option<String>>,
+    /// Set once the reactor reported its teardown, `Dropping`, with no panic
+    /// unwinding, after which its observer may go.
+    torn_down: AtomicBool,
     buffer: Mutex<Buffer>,
 }
 
@@ -143,28 +136,16 @@ impl LiveEvidence for TapState {
     }
 
     /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is, unless the reactor reported its
-    /// final `Settled` first or a hub audits its lifecycle, which reports
-    /// the drop itself once the reactor's task outcome explains it.
+    /// `ReactorGone` once the observer is, unless the reactor reported a
+    /// clean teardown first.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
-        } else if self.unfinished_drop() && !self.audited.load(Ordering::Relaxed) {
-            Some(REACTOR_GONE)
+        } else if self.observer.strong_count() == 0 && !self.torn_down.load(Ordering::Relaxed) {
+            Some("ReactorGone: the tapped reactor dropped its observer during the run")
         } else {
             None
         }
-    }
-}
-
-/// The failure for a reactor that dropped its observer with no final
-/// `Settled`.
-const REACTOR_GONE: &str = "ReactorGone: the tapped reactor dropped its observer during the run";
-
-impl TapState {
-    /// Whether the observer is gone with no final `Settled` before it.
-    fn unfinished_drop(&self) -> bool {
-        self.observer.strong_count() == 0 && !self.finished.load(Ordering::Relaxed)
     }
 }
 
@@ -194,8 +175,14 @@ impl HeaderSyncObserver for TapObserver {
                 0
             }
         };
-        if matches!(event, ReactorEvent::Settled { last: true, .. }) {
-            state.finished.store(true, Ordering::Relaxed);
+        if matches!(
+            event,
+            ReactorEvent::Dropping {
+                unwinding: false,
+                ..
+            }
+        ) {
+            state.torn_down.store(true, Ordering::Relaxed);
         }
         // Taken before the lock, which nothing else takes in between.
         let pos = position();
@@ -235,9 +222,7 @@ impl ReactorTap {
                 emitted: Arc::clone(&emitted),
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
-                finished: AtomicBool::new(false),
-                audited: AtomicBool::new(false),
-                unpaired: Mutex::default(),
+                torn_down: AtomicBool::new(false),
                 buffer: Mutex::default(),
             }))
         });
@@ -268,15 +253,12 @@ impl ReactorTap {
         self.id.index
     }
 
-    /// What a hub needs to audit this reactor's lifecycle. From now on the
-    /// tap leaves an observer dropped without a final `Settled` to the hub,
-    /// which explains it by the reactor task's outcome.
+    /// What a hub needs to fold this reactor's state: which rows are its,
+    /// and its source label.
     pub(crate) fn link(&self) -> ReactorLink {
-        self.state.audited.store(true, Ordering::Relaxed);
         ReactorLink {
             instance: self.id.index,
             source: self.checkpoint.kind().source(self.id.index),
-            state: self.state.clone(),
         }
     }
 
@@ -291,40 +273,12 @@ impl ReactorTap {
     }
 }
 
-/// One tapped reactor, as the evidence hub's lifecycle audit sees it.
+/// One tapped reactor, as the evidence hub's fold sees it.
 pub(crate) struct ReactorLink {
     /// The tap's index, which its rows carry.
     pub(crate) instance: u64,
     /// The tap's source label, for failures.
     pub(crate) source: String,
-    state: Arc<TapState>,
-}
-
-impl ReactorLink {
-    /// Whether the reactor dropped its observer with no final `Settled`.
-    pub(crate) fn unfinished_drop(&self) -> bool {
-        self.state.unfinished_drop()
-    }
-
-    /// Takes the drain pairing failure the tap left to the hub, if any: a
-    /// drop receipt no call end paired with, which is a failure unless the
-    /// reactor is tearing down.
-    pub(crate) fn take_unpaired(&self) -> Option<String> {
-        self.state
-            .unpaired
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-
-    /// Leaves `detail` undecided for a later boundary.
-    pub(crate) fn defer_unpaired(&self, detail: String) {
-        self.state
-            .unpaired
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert(detail);
-    }
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
@@ -413,6 +367,7 @@ fn end(end: CallEnd) -> &'static str {
         CallEnd::TimedOut => "timed-out",
         CallEnd::NotSubmitted => "not-submitted",
         CallEnd::PortPanicked => "port-panicked",
+        CallEnd::Dropped => "dropped",
     }
 }
 
@@ -582,6 +537,7 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
             last,
             snapshot: Some(Box::new(snapshot(*settled))),
         },
+        ReactorEvent::Dropping { turn, unwinding } => ReactorFact::Dropping { turn, unwinding },
         ReactorEvent::Resumed { turn, arm: at } => ReactorFact::Resumed {
             turn,
             arm: arm(at).to_owned(),
@@ -680,23 +636,8 @@ impl ReactorTap {
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or
             // `PortGone`, so the crash isn't read as a pairing bug.
-            Err(PairError::Evidence(_) | PairError::Dropped(_))
-                if self.state.health().is_some() || self.state.unfinished_drop() =>
-            {
-                Ok(())
-            }
-            // A drop receipt with no call end is also what a reactor's
-            // teardown leaves, when it drops a pending call's future. Once a
-            // hub audits the reactor, it decides by the reactor's lifecycle.
-            Err(PairError::Dropped(detail)) if self.state.audited.load(Ordering::Relaxed) => {
-                self.state
-                    .unpaired
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get_or_insert(detail);
-                Ok(())
-            }
-            Err(PairError::Evidence(detail) | PairError::Dropped(detail)) => Err(detail),
+            Err(PairError::Evidence(_)) if self.state.health().is_some() => Ok(()),
+            Err(PairError::Evidence(detail)) => Err(detail),
             Err(PairError::PortPanicked { call }) => {
                 // The run checks this after the step, ahead of any evidence
                 // failure the same step reports.

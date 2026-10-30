@@ -23,12 +23,18 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
 
 ## Targets
 
+- `block_sync_storage` runs `block-sync/storage` with its registered storage,
+  stream-6, resource, and semantic properties. Its two-byte prefix selects
+  the scenario. Pass `-max_len=4096`.
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
   isn't the harness's generator, 2, runs the default scenario. Pass
   `-max_len=4096`, the input size the grammar is built for.
+- `header_sync_wire` runs `header-sync/wire` over simulated QUIC and scripted
+  peers. Its two-byte prefix selects a saved scenario or the default scenario.
+  Pass `-max_len=4096`.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
@@ -125,3 +131,10 @@ cargo xtask sim-seeds --sim discovery/wait-complete --out qa/fuzz/sim/corpus/dis
 `cargo xtask sim-versions --sim <name>` prints the versions that fix what the
 harness's fuzz input means, as `KEY=VALUE` lines. A corpus keyed on all of
 them starts fresh when any of them changes.
+
+## Campaigns
+
+`campaigns/full-suite-20261029/manifest.toml` maps the broader campaign's
+targets to harnesses, seeds, worker counts, and libFuzzer options. Its README
+contains the launch and resume commands. Its C1 inventory records the coverage
+that existed when the campaign started. Keep campaign outputs outside Git.

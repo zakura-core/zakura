@@ -1,0 +1,80 @@
+schema = 1
+name = "full-suite-20261029"
+status = "incomplete"
+campaign_plan = "https://valargroup.getoutline.com/doc/campaignmd-full-property-suite-execution-and-fuzz-campaigns-pVoq6yEw5j"
+artifacts_root = "/srv/zakura-fuzz/campaigns/full-suite-20261029"
+
+[integration]
+base = "4eab091b605ff7adab9f37515195d58f1362633c"
+pull_1824 = "5c8514adb6b4466c412fe7b9a9bd0f64d1b924ed"
+pull_1825 = "579f1c5986ec6ef828b100d420ef7b75d3e99245"
+pull_1826 = "8682a1f7afa1ffdc5d146b60479973aa8e630ecb"
+pull_1830 = "7a6e4e521817f8099dede07d59760d548bd13164"
+pull_1831 = "2231a540abe1478cd61402fee8859945642ed596"
+pull_1832 = "bd8431c27fe9e815a1fc62f26e41fa86f687679c"
+pull_1833 = "55aada54325e882862efb148cf17bdcc1ec2b0a6"
+
+[toolchain]
+rust = "1.97.0"
+fuzz = "nightly-2026-07-15"
+sanitizer = "address"
+
+[formats]
+trace = 21
+contract = 1
+feedback_backend = "libfuzzer-extra-counters"
+feedback = 1
+
+[completeness]
+missing = ["H1", "H2", "H4", "H5", "P8", "typed-protocol-state-collectors"]
+note = "G1 action grammar and E2a feedback transport are present. Typed G1-G3 state features are not present."
+
+[[target]]
+name = "block_sync_storage"
+harness = "block-sync/storage"
+workers = 3
+seed_harness = "block-sync/storage"
+max_len = 4096
+timeout_seconds = 600
+rss_limit_mb = 4096
+semantic_feedback = false
+
+[[target]]
+name = "header_sync_wire"
+harness = "header-sync/wire"
+workers = 2
+seed_harness = "header-sync/wire"
+max_len = 4096
+timeout_seconds = 180
+rss_limit_mb = 4096
+semantic_feedback = false
+
+[[target]]
+name = "header_sync_storage"
+harness = "header-sync/storage"
+workers = 1
+seed_harness = "header-sync/storage"
+max_len = 4096
+timeout_seconds = 120
+rss_limit_mb = 4096
+semantic_feedback = false
+
+[[target]]
+name = "discovery_wait_complete"
+harness = "discovery/wait-complete"
+workers = 1
+seed_harness = "discovery/wait-complete"
+max_len = 4096
+timeout_seconds = 60
+rss_limit_mb = 4096
+semantic_feedback = false
+
+[[target]]
+name = "race_fixtures"
+harness = "fixtures/all"
+workers = 1
+seed_harness = ""
+max_len = 4096
+timeout_seconds = 60
+rss_limit_mb = 4096
+semantic_feedback = false

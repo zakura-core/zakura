@@ -667,4 +667,50 @@ mod tests {
             })
         );
     }
+
+    /// A teardown reason and a component in transition in one evaluation
+    /// leave the teardown reason, in either order.
+    #[test]
+    fn a_state_reason_never_replaces_a_teardown_in_one_evaluation() {
+        let mut moving = existing();
+        moving.read(1, Read::Current(5_u64)).expect("a first read");
+        moving.read(2, held()).expect("a read at the next boundary");
+        assert!(matches!(moving.state(), State::InTransition { .. }));
+        let property = Property {
+            id: PropertyId::new("test/teardown"),
+            claim: "a test claim on a component",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[],
+            status: Status::Active,
+            check: check_nothing,
+            witness: None,
+        };
+        let log = ObservationLog::default();
+        let pick = Identity::peer("owner", "tick");
+        let step = StepCtx {
+            step: 2,
+            pick: &pick,
+            enabled: &[],
+            phase: Phase::Live,
+            now: zakura_scheduler::SimInstant::ZERO,
+            status: zakura_scheduler::Status::Running,
+            log: &log,
+        };
+        for teardown_first in [true, false] {
+            let mut cx = CheckCtx::new(&step, &Nothing, &property, std::slice::from_ref(&property));
+            if teardown_first {
+                cx.unsettled(Inconclusive::TeardownOpen);
+            }
+            assert_eq!(require(&mut cx, &moving), None);
+            if !teardown_first {
+                cx.unsettled(Inconclusive::TeardownOpen);
+            }
+            assert_eq!(
+                cx.into_parts().unsettled,
+                Some(Inconclusive::TeardownOpen),
+                "teardown recorded first: {teardown_first}"
+            );
+        }
+    }
 }

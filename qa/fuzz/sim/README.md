@@ -190,6 +190,58 @@ bundle `<input sha256>-<n>/` with the first free `n`.
 `sim-verify-archive` checks every bundle against its `SHA256SUMS`, and counts
 the bundles under each harness, provenance and signature.
 
+### Minimized bundles
+
+With `--target`, triage also minimizes each `confirmed` failure in the
+`active` bucket with `cargo xtask sim-minimize`, as
+[Minimizing a crash](#minimizing-a-crash) describes. It needs
+`--runs` and `--wall-secs`, takes `--sanitizer`, and passes `--child-secs`
+on:
+
+```console
+cargo xtask sim-triage --sim fixtures/all --out <archive> --target race_fixtures \
+    --runs 64 --wall-secs 300 --child-secs 30 artifacts/race_fixtures/crash-…
+```
+
+The failure's bundle is in place before the minimizer starts, and the
+minimizer reads that bundle's `input.bin`. So a minimizer that fails or is
+killed never costs the failure its bundle, and the failure's bundle never
+changes. The minimizer writes under `.staging/`, with no time limit from
+triage: its own budgets bound `tmin` and each check. If its report says
+`minimized`, triage copies its output, without the pinned binaries in
+`bin/`, into a new bundle, and holds it to the failure's bundle:
+
+- the report must name the bundle's harness, property and input;
+- the original's and the candidate's `zakura-sim confirm` records must be
+  `confirmed`, on the bundle's harness, generator and property, each on its
+  own input, and on a build equivalent to the bundle's;
+- held to the original's confirmation again, the candidate's must stay
+  `confirmed`: the same property, assumptions with their parameters, and
+  cleanup;
+- the candidate's `input.bin` must hash to its digest and be smaller than
+  the original, and its trace must read with that input;
+- a fresh `zakura-sim replay` must replay the candidate's trace Exact.
+
+If any of that fails, or the minimizer kept no candidate, triage prints why
+and leaves the minimizer's output under `.staging/`. Otherwise the new
+bundle goes beside the failure's bundle as `<bundle name>.minimized/`, or
+`<bundle name>.minimized-<n>/` with the first free `n`. It holds the
+candidate as `input.bin`, the minimizer's output under `minimizer/`, the
+minimizer's and the replay's output under `runs/`, `minimized.json` and
+`SHA256SUMS`. `minimized.json` names the failure's bundle, its input and the
+SHA-256 of its `SHA256SUMS`. A minimized bundle never changes after its
+rename. A later triage of the same input keeps the first minimized bundle
+that verifies, and doesn't run the minimizer. If none verifies, it minimizes
+again, and puts its own beside the others. Only a confirmed `active` failure
+is minimized, since the fuzz target's filter selects only an `Active`
+property.
+
+`sim-verify-archive` also holds each minimized bundle to its failure's
+bundle: its name must be that bundle's name with `.minimized`, that bundle's
+`SHA256SUMS` must be the one it was minimized from, and its files must pass
+every check above except the replay. It counts minimized bundles on their own
+line.
+
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
 

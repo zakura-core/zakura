@@ -34,13 +34,25 @@
 //! harness, generator or build are another run, so they keep their own
 //! bundle. Each distinct input keeps its own bundle too, so a signature's
 //! first bundle never stops a later input from being kept.
+//!
+//! If [`Children::minimize`] gives a minimizer, a confirmed `Active` failure
+//! also gets a minimized bundle beside its bundle, as [`minimize`]
+//! describes. The failure's bundle is in place before the minimizer starts,
+//! and never changes.
+
+mod minimize;
+
+pub use minimize::{
+    is_minimized, verify, verify_minimized, Minimization, MINIMIZED_FILE, MINIMIZED_FORMAT,
+    MINIMIZED_SUFFIX, MINIMIZER_DIR,
+};
 
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write as _},
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     process::{self, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -122,15 +134,45 @@ pub trait Children {
     /// code 0 only if every pick, draw and observation matched, as
     /// `zakura-sim replay` does.
     fn replay(&self, trace: &Path) -> Command;
+
+    /// A command that minimizes the input in the file `input`, whose run
+    /// violates the `Active` property `property`, into the directory `out`,
+    /// which doesn't exist yet, as `cargo xtask sim-minimize` does. `None`,
+    /// the default, if triage doesn't minimize.
+    fn minimize(&self, input: &Path, property: &str, out: &Path) -> Option<Command> {
+        let _ = (input, property, out);
+        None
+    }
 }
 
-/// The `zakura-sim` binary at `exe`, running harness `harness`.
+/// The `zakura-sim` binary at `exe`, running harness `harness`, and
+/// `cargo xtask sim-minimize` if `minimize` is set.
 #[derive(Clone, Debug)]
 pub struct SimChildren {
     /// The binary.
     pub exe: PathBuf,
     /// The registered harness's name.
     pub harness: String,
+    /// How to minimize a confirmed `Active` failure, if triage should.
+    pub minimize: Option<SimMinimize>,
+}
+
+/// `cargo xtask sim-minimize`'s target and budgets, as
+/// [`SimChildren::minimize`] passes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimMinimize {
+    /// The workspace that `cargo xtask` runs in.
+    pub workspace: PathBuf,
+    /// The fuzz target.
+    pub target: String,
+    /// `tmin`'s attempts per step, `--runs`.
+    pub runs: u32,
+    /// The longest `tmin` may run, `--wall-secs`.
+    pub wall: Duration,
+    /// The longest one of its checks' children may run, `--child-secs`.
+    pub child: Duration,
+    /// The fuzz build's sanitizer, `--sanitizer`, if given.
+    pub sanitizer: Option<String>,
 }
 
 impl Children for SimChildren {
@@ -150,6 +192,35 @@ impl Children for SimChildren {
         let mut command = Command::new(&self.exe);
         command.arg("replay").arg(trace);
         command
+    }
+
+    /// `cargo xtask sim-minimize <target> <input> --property <property>
+    /// --out <out>` with [`SimMinimize`]'s budgets, in its workspace.
+    /// `cargo xtask sim-triage` runs this binary in the simulator build, and
+    /// xtask is an ordinary build, so the command drops that build's
+    /// `RUSTFLAGS` and target directory.
+    fn minimize(&self, input: &Path, property: &str, out: &Path) -> Option<Command> {
+        let minimize = self.minimize.as_ref()?;
+        // The command runs in the workspace, so a relative path would name
+        // another file.
+        let absolute = |path: &Path| path::absolute(path).unwrap_or_else(|_| path.to_owned());
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut command = Command::new(cargo);
+        command
+            .current_dir(&minimize.workspace)
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_TARGET_DIR")
+            .args(["xtask", "sim-minimize", &minimize.target])
+            .arg(absolute(input))
+            .args(["--property", property, "--out"])
+            .arg(absolute(out))
+            .args(["--runs", &minimize.runs.to_string()])
+            .args(["--wall-secs", &minimize.wall.as_secs().to_string()])
+            .args(["--child-secs", &minimize.child.as_secs().to_string()]);
+        if let Some(sanitizer) = &minimize.sanitizer {
+            command.args(["--sanitizer", sanitizer]);
+        }
+        Some(command)
     }
 }
 
@@ -229,6 +300,10 @@ pub struct Triaged {
     /// False if a bundle that holds the same result was already in that
     /// place, so this triage kept it and archived nothing.
     pub archived: bool,
+    /// What minimizing the input came to. `None` unless the input is a
+    /// confirmed `Active` failure and [`Children::minimize`] gave a
+    /// minimizer.
+    pub minimization: Option<Minimization>,
 }
 
 /// The bucket a classified run is filed under: [`ProcessClassified::bucket`],
@@ -342,21 +417,7 @@ pub fn triage(
         ));
     }
     let digest = hex(&Sha256::digest(&input));
-    let staging_root = out.join(STAGING_DIR);
-    fs::create_dir_all(&staging_root)?;
-    let staging = loop {
-        let dir = staging_root.join(format!(
-            "{}-{}",
-            process::id(),
-            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
-        ));
-        match fs::create_dir(&dir) {
-            Ok(()) => break dir,
-            // A killed triage whose process had this ID left it.
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    };
+    let staging = new_staging(out)?;
     let staged_input = staging.join(BUNDLE_INPUT_FILE);
     write_synced(&staged_input, &input)?;
     if let Some(scenario) = draw(entry, &input) {
@@ -372,7 +433,7 @@ pub fn triage(
         let (exit, stderr) = run_child(
             children.record(&staged_input, &trace),
             &dir,
-            options.child_timeout,
+            Some(options.child_timeout),
         )?;
         let classified = classify_process(entry, exit, &stderr, &trace).map_err(|error| {
             io::Error::new(
@@ -401,7 +462,7 @@ pub fn triage(
         let (exit, _) = run_child(
             children.replay(&trace),
             &staging.join(RUNS_DIR).join(REPLAY_DIR),
-            options.child_timeout,
+            Some(options.child_timeout),
         )?;
         Some(exit)
     } else {
@@ -479,7 +540,21 @@ pub fn triage(
             .join(&digest),
         _ => root.join(status.name()).join(&digest),
     };
-    let (bundle, archived) = place(&staging, &bundle, &report)?;
+    let (bundle, archived) = place(&staging, &bundle, TRIAGE_FILE, &RESULT_FIELDS, &report)?;
+
+    // Only a confirmed `Active` failure has a property for the fuzz
+    // target's filter to select.
+    let minimization = match (status, bucket, &first.classified.result) {
+        (TriageStatus::Confirmed, Some(Bucket::Active), ProcessResult::Ended(run)) => {
+            match &run.outcome {
+                ExploreOutcome::Fail { property } => {
+                    minimize::minimize(children, &bundle, property, out, options)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     Ok(Triaged {
         status,
         bucket,
@@ -488,7 +563,28 @@ pub fn triage(
         replay,
         bundle,
         archived,
+        minimization,
     })
+}
+
+/// A new, empty staging directory under the archive root `out`. A name that
+/// a killed triage left is skipped, never reused.
+fn new_staging(out: &Path) -> io::Result<PathBuf> {
+    let staging_root = out.join(STAGING_DIR);
+    fs::create_dir_all(&staging_root)?;
+    loop {
+        let dir = staging_root.join(format!(
+            "{}-{}",
+            process::id(),
+            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // A killed triage whose process had this ID left it.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// How the two recordings' traces differ.
@@ -550,12 +646,12 @@ fn draw(entry: &HarnessEntry, input: &[u8]) -> Option<Value> {
 }
 
 /// Runs `command` with its standard output and error in files under `dir`,
-/// and kills it once it has run for `limit`. Returns how it ended and its
-/// standard error.
+/// and kills it once it has run for `limit`, if given. Returns how it ended
+/// and its standard error.
 fn run_child(
     mut command: Command,
     dir: &Path,
-    limit: Duration,
+    limit: Option<Duration>,
 ) -> io::Result<(ProcessExit, Vec<u8>)> {
     fs::create_dir_all(dir)?;
     let stdout = File::create(dir.join(STDOUT_FILE))?;
@@ -565,12 +661,12 @@ fn run_child(
         .stdout(stdout)
         .stderr(stderr)
         .spawn()?;
-    let deadline = Instant::now() + limit;
+    let deadline = limit.map(|limit| Instant::now() + limit);
     let exit = loop {
         if let Some(status) = child.try_wait()? {
             break ProcessExit::from(status);
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             child.kill()?;
             // A child that exited on its own just before the kill keeps its
             // own exit.
@@ -604,16 +700,22 @@ const RESULT_FIELDS: [&str; 8] = [
     "input",
 ];
 
-/// Moves the bundle at `staging`, whose [`TRIAGE_FILE`] holds `report`, to
-/// `bundle`, or beside it. Returns where the bundle is, and true if it moved
-/// the staging bundle there.
+/// Moves the bundle at `staging`, whose `file` holds `report`, to `bundle`,
+/// or beside it. Returns where the bundle is, and true if it moved the
+/// staging bundle there.
 ///
 /// It tries `bundle`, then `<bundle>-1`, `<bundle>-2` and so on. At the
 /// first name that's free, it moves the staging bundle there. At a name
 /// that holds a bundle with the same result (see [`holds_result`]), it
 /// removes the staging bundle and keeps that one. It never changes a bundle
 /// that's there.
-fn place(staging: &Path, bundle: &Path, report: &Value) -> io::Result<(PathBuf, bool)> {
+fn place(
+    staging: &Path,
+    bundle: &Path,
+    file: &str,
+    fields: &[&str],
+    report: &Value,
+) -> io::Result<(PathBuf, bool)> {
     fs::create_dir_all(
         bundle
             .parent()
@@ -640,7 +742,7 @@ fn place(staging: &Path, bundle: &Path, report: &Value) -> io::Result<(PathBuf, 
                 Err(error) => return Err(error),
             }
         }
-        if holds_result(&candidate, report) {
+        if holds_result(&candidate, file, fields, report) {
             fs::remove_dir_all(staging)?;
             return Ok((candidate, false));
         }
@@ -648,22 +750,18 @@ fn place(staging: &Path, bundle: &Path, report: &Value) -> io::Result<(PathBuf, 
     }
 }
 
-/// True if `dir` is a directory whose bundle matches its
-/// [`CHECKSUMS_FILE`], whose [`TRIAGE_FILE`] agrees with `report` on every
-/// one of [`RESULT_FIELDS`], and whose input's SHA-256 is the one `report`
-/// names. False if any of that fails to read.
-fn holds_result(dir: &Path, report: &Value) -> bool {
+/// True if `dir` is a directory whose bundle passes [`verify`], whose
+/// `file` agrees with `report` on every one of `fields`, and whose
+/// [`BUNDLE_INPUT_FILE`]'s SHA-256 is the one `report` names. False if any
+/// of that fails to read.
+fn holds_result(dir: &Path, file: &str, fields: &[&str], report: &Value) -> bool {
     let is_dir = fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir());
-    let verified = || verify_bundle(dir).is_ok_and(|problems| problems.is_empty());
+    let verified = || verify(dir).is_ok_and(|problems| problems.is_empty());
     let same_report = || {
-        fs::read(dir.join(TRIAGE_FILE))
+        fs::read(dir.join(file))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|found| {
-                RESULT_FIELDS
-                    .iter()
-                    .all(|field| found[field] == report[field])
-            })
+            .is_some_and(|found| fields.iter().all(|field| found[field] == report[field]))
     };
     let same_input = || {
         fs::read(dir.join(BUNDLE_INPUT_FILE)).is_ok_and(|input| {
@@ -751,28 +849,36 @@ pub fn verify_bundle(dir: &Path) -> io::Result<Vec<String>> {
     Ok(problems)
 }
 
+/// True if `name` names a bundle: an input's SHA-256, alone or followed by
+/// `-<n>`, then, for a minimized bundle, [`MINIMIZED_SUFFIX`], alone or
+/// followed by `-<n>`.
+fn bundle_name(name: &str) -> bool {
+    let name = minimize::original_name(name).unwrap_or(name);
+    let (digest, n) = name.split_once('-').unwrap_or((name, "0"));
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && !n.is_empty()
+        && n.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Every bundle under the archive root `out`, sorted: each directory outside
-/// [`STAGING_DIR`] that holds a [`TRIAGE_FILE`] or is named by an input's
-/// SHA-256, alone or followed by `-<n>`, as every bundle is. A bundle that
-/// lost its [`TRIAGE_FILE`] is still found, so [`verify_bundle`] reports it.
+/// [`STAGING_DIR`] that holds a [`TRIAGE_FILE`] or a [`MINIMIZED_FILE`], or
+/// whose name is a bundle's, as every bundle's is (see [`bundle_name`]). A
+/// bundle that lost its [`TRIAGE_FILE`] is still found, so
+/// [`verify_bundle`] reports it.
 pub fn bundles(out: &Path) -> io::Result<Vec<PathBuf>> {
     let digest_named = |dir: &Path| {
         dir.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                let (digest, n) = name.split_once('-').unwrap_or((name, "0"));
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-                    && !n.is_empty()
-                    && n.bytes().all(|byte| byte.is_ascii_digit())
-            })
+            .is_some_and(bundle_name)
     };
+    let holds = |dir: &Path, file: &str| fs::symlink_metadata(dir.join(file)).is_ok();
     let mut found = Vec::new();
     let mut pending = vec![out.to_owned()];
     while let Some(dir) = pending.pop() {
-        if digest_named(&dir) || fs::symlink_metadata(dir.join(TRIAGE_FILE)).is_ok() {
+        if digest_named(&dir) || holds(&dir, TRIAGE_FILE) || holds(&dir, MINIMIZED_FILE) {
             found.push(dir);
             continue;
         }

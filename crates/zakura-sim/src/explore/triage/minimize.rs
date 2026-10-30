@@ -249,12 +249,39 @@ fn archive(
         ));
     }
 
-    let triage = &checked.triage;
     let name = original
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{} has no bundle name", original.display()))?;
-    let report = json!({
+    let mut report = derived(name, &checked);
+    report["child_timeout_ms"] =
+        json!(u64::try_from(options.child_timeout.as_millis()).unwrap_or(u64::MAX));
+    report["build"] = json!(BuildInfo::current());
+    write_synced(
+        &bundle.join(MINIMIZED_FILE),
+        format!("{report:#}\n").as_bytes(),
+    )
+    .map_err(io("writing minimized.json"))?;
+    let sums = super::checksums(&bundle).map_err(io("hashing the minimized bundle"))?;
+    write_synced(&bundle.join(CHECKSUMS_FILE), sums.as_bytes())
+        .map_err(io("writing the minimized bundle's checksums"))?;
+    place(
+        &bundle,
+        &original.with_file_name(format!("{name}{MINIMIZED_SUFFIX}")),
+        MINIMIZED_FILE,
+        &RESULT_FIELDS,
+        &report,
+    )
+    .map_err(io("placing the minimized bundle"))
+}
+
+/// The [`MINIMIZED_FILE`] fields that follow from the failure's bundle,
+/// named `name`, and the minimizer's output that passed [`check`]: every
+/// field but `child_timeout_ms` and `build`. A minimized bundle exists only
+/// if its replay verified, so its replay record is always the same.
+fn derived(name: &str, checked: &Checked) -> Value {
+    let triage = &checked.triage;
+    json!({
         "format": MINIMIZED_FORMAT,
         "harness": triage["harness"],
         "generator": triage["generator"],
@@ -272,28 +299,10 @@ fn archive(
         "trace": format!("{MINIMIZER_DIR}/{}", path_text(&checked.trace)),
         "replay": {
             "dir": format!("{RUNS_DIR}/{REPLAY_DIR}"),
-            "exit": replay,
+            "exit": ProcessExit::Code(0),
             "verified": true,
         },
-        "child_timeout_ms": u64::try_from(options.child_timeout.as_millis()).unwrap_or(u64::MAX),
-        "build": BuildInfo::current(),
-    });
-    write_synced(
-        &bundle.join(MINIMIZED_FILE),
-        format!("{report:#}\n").as_bytes(),
-    )
-    .map_err(io("writing minimized.json"))?;
-    let sums = super::checksums(&bundle).map_err(io("hashing the minimized bundle"))?;
-    write_synced(&bundle.join(CHECKSUMS_FILE), sums.as_bytes())
-        .map_err(io("writing the minimized bundle's checksums"))?;
-    place(
-        &bundle,
-        &original.with_file_name(format!("{name}{MINIMIZED_SUFFIX}")),
-        MINIMIZED_FILE,
-        &RESULT_FIELDS,
-        &report,
-    )
-    .map_err(io("placing the minimized bundle"))
+    })
 }
 
 /// What [`check`] read from a minimizer's output that passed.
@@ -567,8 +576,9 @@ pub(super) fn original_name(name: &str) -> Option<&str> {
 /// `dir`, beyond its checksums. Empty if its [`MINIMIZED_FILE`] names the
 /// failure's bundle it's named after, that bundle's [`CHECKSUMS_FILE`] is
 /// the one it was minimized from, its minimizer's output passes [`check`]
-/// against that bundle, and its [`BUNDLE_INPUT_FILE`] and
-/// [`MINIMIZED_FILE`] name the minimized input.
+/// against that bundle, its [`MINIMIZED_FILE`] holds every field that
+/// follows from that bundle and that output, and its [`BUNDLE_INPUT_FILE`]
+/// is the minimized input.
 pub fn verify_minimized(dir: &Path) -> io::Result<Vec<String>> {
     let report: Value = match fs::read(dir.join(MINIMIZED_FILE)) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -611,11 +621,14 @@ pub fn verify_minimized(dir: &Path) -> io::Result<Vec<String>> {
         Err(problem) => return Ok(vec![problem]),
     };
     let mut problems = Vec::new();
-    if report["input"]["sha256"] != checked.sha256.as_str() {
-        problems.push(format!(
-            "{MINIMIZED_FILE} names input {}, not the minimizer's {}",
-            report["input"]["sha256"], checked.sha256
-        ));
+    let derived = derived(original_bundle, &checked);
+    for (field, want) in derived.as_object().into_iter().flatten() {
+        if &report[field] != want {
+            problems.push(format!(
+                "{MINIMIZED_FILE} names {field} {}, not {want}",
+                report[field]
+            ));
+        }
     }
     match fs::read(dir.join(BUNDLE_INPUT_FILE)) {
         Ok(input) if input == checked.input => {}

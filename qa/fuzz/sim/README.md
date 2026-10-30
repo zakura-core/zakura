@@ -239,8 +239,9 @@ property.
 `sim-verify-archive` also holds each minimized bundle to its failure's
 bundle: its name must be that bundle's name with `.minimized`, that bundle's
 `SHA256SUMS` must be the one it was minimized from, and its files must pass
-every check above except the replay. It counts minimized bundles on their own
-line.
+every check above except the replay. Every field of `minimized.json` but
+`child_timeout_ms` and `build` must match what those files and the failure's
+bundle give. It counts minimized bundles on their own line.
 
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.

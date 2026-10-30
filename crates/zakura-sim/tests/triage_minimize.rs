@@ -859,6 +859,27 @@ fn verify_holds_a_minimized_bundle_to_its_failure() {
         [format!("{MINIMIZED_FILE} is missing")]
     );
 
+    // `verify-archive` prints the signature from `minimized.json`, so a
+    // re-hashed edit to it fails too, as does one to the trace it names.
+    let edited = named(&triaged.bundle, ".minimized-3");
+    copy_dir(&minimized, &edited);
+    let mut report = read_json(&edited.join(MINIMIZED_FILE));
+    report["signature"] = json!(format!("active {B}"));
+    report["trace"] = json!(format!("{MINIMIZER_DIR}/original/confirm/traces"));
+    write_json(&edited.join(MINIMIZED_FILE), &report);
+    rehash(&edited);
+    assert_eq!(verify_bundle(&edited).unwrap(), Vec::<String>::new());
+    let problems = verify(&edited).unwrap();
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[0].starts_with("minimized.json names signature \"active test/triage-minimize/b\""),
+        "{problems:?}"
+    );
+    assert!(
+        problems[1].starts_with("minimized.json names trace"),
+        "{problems:?}"
+    );
+
     let mut all = vec![
         triaged.bundle.clone(),
         minimized.clone(),
@@ -866,6 +887,7 @@ fn verify_holds_a_minimized_bundle_to_its_failure() {
         stale.clone(),
         renamed.clone(),
         lost.clone(),
+        edited.clone(),
     ];
     all.sort();
     assert_eq!(bundles(&scratch.out()).unwrap(), all);

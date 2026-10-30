@@ -311,13 +311,19 @@ fn unrelated_violation_fails() {
     }
 }
 
-/// A property with no trigger-history check can't back a witness test.
+/// A property with no trigger-history check can't back a `Holds` or
+/// `Violated` witness test. An `Applicable` one claims no bug, so it
+/// passes on the property's outcome.
 #[test]
 fn no_trigger_history_fails() {
-    assert_eq!(
-        witness(probe(Behavior::Sleep), NO_HISTORY, Expect::Holds),
-        Err(WitnessError::NoTriggerHistory)
-    );
+    for expect in [Expect::Holds, Expect::Violated] {
+        assert_eq!(
+            witness(probe(Behavior::Sleep), NO_HISTORY, expect),
+            Err(WitnessError::NoTriggerHistory),
+            "{expect:?}"
+        );
+    }
+    check_witness(probe(Behavior::Sleep), NO_HISTORY, Expect::Applicable);
 }
 
 /// Recording a witness test writes the trace of the run it judged, and

@@ -761,8 +761,11 @@ fn outcome<S: HasView>(
         state
             .inconclusive
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
-            // A run that ends with an obligation open is unfinished, which
-            // the state reasons never mean, so they come after it.
+            // A run that ends with an obligation open, or whose latest
+            // evaluation names another unfinished cause such as
+            // `teardown-open`, is unfinished, which the state reasons never
+            // mean, so they come after it.
+            .or(state.unsettled.filter(|reason| !reason.is_state()))
             .or(state.sticky.or(state.unsettled).map(|reason| {
                 if budget_cut && reason.is_state() {
                     Inconclusive::BudgetCut

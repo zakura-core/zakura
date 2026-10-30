@@ -142,9 +142,9 @@ mod tests {
             Subsystem,
         },
         property::{
-            require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind,
-            LivenessBound, ObligationKey, Property, PropertyId, Registry, RegistryChecker, Source,
-            Sources, State, Status, Subject, Verdict,
+            require, require_every, Assume, AssumeRecord, Assumptions, CheckCtx, HasView,
+            Inconclusive, Kind, LivenessBound, ObligationKey, Property, PropertyId, Registry,
+            RegistryChecker, Source, Sources, State, Status, Subject, Verdict,
         },
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, NullSink, ObservationLog,
         Plan, RunConfig, RunReport, Sim,
@@ -683,5 +683,58 @@ mod tests {
             "the check missed step 2"
         );
         assert_eq!(report.outcome, inconclusive("obligation-open"));
+    }
+
+    /// Needs [`BUDGET`] at every boundary, and from step 3 records that a
+    /// teardown hasn't settled.
+    fn check_teardown(cx: &mut CheckCtx<'_, Owners>) -> Verdict {
+        let verdict = check_every(cx);
+        if cx.step >= 3 {
+            cx.unsettled(Inconclusive::TeardownOpen);
+        }
+        verdict
+    }
+
+    /// An every-boundary claim that missed a boundary, then records a
+    /// later unfinished cause, ends with that cause, whether the run
+    /// completes or its budget cuts it. The sticky gap doesn't hide it.
+    #[test]
+    fn a_later_unfinished_cause_outranks_a_sticky_gap() {
+        let restored = || {
+            reads(
+                current(0..=1, 1)
+                    .into_iter()
+                    .chain(held([2]))
+                    .chain(current([3], 1)),
+            )
+        };
+        let gap = [Gap {
+            component: "Budget".to_owned(),
+            from: 2,
+            through: 2,
+        }];
+        for (budget, end) in [
+            (
+                u64::MAX,
+                crate::Outcome::Idle {
+                    status: crate::IdleStatus::Quiescent,
+                },
+            ),
+            (3, crate::Outcome::Budget),
+        ] {
+            let property = needing("test/teardown", check_teardown);
+            let (run, _) = run_assuming(
+                restored(),
+                if budget == u64::MAX { 3 } else { 5 },
+                vec![property],
+                &wire(),
+                Assumptions::none(),
+                budget,
+            );
+            assert_eq!(run.end.outcome, end, "{:?}", run.end);
+            let report = report(&run, "test/teardown");
+            assert_eq!(report.gaps, gap, "the check missed step 2");
+            assert_eq!(report.outcome, inconclusive("teardown-open"));
+        }
     }
 }

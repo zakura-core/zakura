@@ -913,11 +913,13 @@ fn end_record(
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
         // The record holds what the trace writes, which leaves out each
-        // report's violations, so a replay compares like with like.
+        // report's violations and gap runs, so a replay compares like with
+        // like.
         properties: properties
             .iter()
             .map(|report| PropertyReport {
                 violations: Vec::new(),
+                gaps: Vec::new(),
                 ..report.clone()
             })
             .collect(),

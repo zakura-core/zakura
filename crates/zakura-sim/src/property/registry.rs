@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     check::{Checker, Gap, PropertyOutcome, PropertyReport, StepCtx, Violation},
-    end::{HarnessFailure, RunEnd},
+    end::{HarnessFailure, Outcome, RunEnd},
     model::LabelledFrame,
     Observation, ObservationLog,
 };
@@ -304,6 +304,8 @@ struct PropertyState {
     inconclusive: Option<Inconclusive>,
     /// Why the latest evaluation couldn't judge its fired trigger, if so.
     unsettled: Option<Inconclusive>,
+    /// The sticky reason an evaluation recorded, `Unobserved`, if any.
+    sticky: Option<Inconclusive>,
     /// Each quantity's largest value, as the check measured it.
     peaks: BTreeMap<String, u64>,
     /// The runs of evaluations the check couldn't read a component at.
@@ -457,11 +459,12 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             .zip(&self.state)
             .map(|(property, state)| PropertyReport {
                 property: property.id.to_string(),
-                outcome: outcome(property, state),
+                outcome: outcome(property, state, end.outcome == Outcome::Budget),
                 holds_since: state.holds_since.map(|(step, _)| step),
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
                 gaps: state.gaps.clone(),
+                gap_boundaries: gap_boundaries(&state.gaps),
                 violations: state.violations.clone(),
             })
             .collect()
@@ -565,7 +568,7 @@ fn step_property<S: HasView>(
     violations.extend(parts.recorded);
     state.unsettled = parts.unsettled;
     if let Some(sticky) = parts.sticky {
-        state.inconclusive.get_or_insert(sticky);
+        state.sticky.get_or_insert(sticky);
     }
     record_gaps(state, parts.gaps, cx.step);
     for (quantity, value) in parts.peaks {
@@ -645,6 +648,16 @@ fn step_property<S: HasView>(
         !gone
     });
     violations
+}
+
+/// How many boundaries `gaps` covers, by component.
+fn gap_boundaries(gaps: &[Gap]) -> BTreeMap<String, u64> {
+    let mut boundaries = BTreeMap::new();
+    for gap in gaps {
+        let count: &mut u64 = boundaries.entry(gap.component.clone()).or_default();
+        *count = count.saturating_add(gap.through.saturating_sub(gap.from).saturating_add(1));
+    }
+    boundaries
 }
 
 /// Extends each of `gaps`' runs that the previous evaluation left open, and
@@ -738,7 +751,13 @@ fn expiry<S: HasView>(
 
 /// A property's run outcome, from strongest to weakest: violated,
 /// inconclusive, held, then not applicable.
-fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> PropertyOutcome {
+/// A run its budget cut is unfinished, which the state reasons never mean,
+/// so `budget_cut` turns them into `budget-cut`.
+fn outcome<S: HasView>(
+    property: &Property<S>,
+    state: &PropertyState,
+    budget_cut: bool,
+) -> PropertyOutcome {
     if let Some(violation) = state.violations.first() {
         return PropertyOutcome::Violated {
             witness: violation.witness.clone(),
@@ -753,7 +772,18 @@ fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> Propert
         state
             .inconclusive
             .or((!state.open.is_empty()).then_some(Inconclusive::ObligationOpen))
-            .or(state.unsettled)
+            // A run that ends with an obligation open, or whose latest
+            // evaluation names another unfinished cause such as
+            // `teardown-open`, is unfinished, which the state reasons never
+            // mean, so they come after it.
+            .or(state.unsettled.filter(|reason| !reason.is_state()))
+            .or(state.sticky.or(state.unsettled).map(|reason| {
+                if budget_cut && reason.is_state() {
+                    Inconclusive::BudgetCut
+                } else {
+                    reason
+                }
+            }))
     };
     match reason {
         Some(reason) => PropertyOutcome::Inconclusive {

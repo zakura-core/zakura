@@ -257,11 +257,13 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// settlement. Only the latest evaluation counts: if the run ends after
     /// one that recorded `reason`, the property is `Inconclusive` with it,
     /// unless it was violated. A sticky reason, `Unobserved`, stays for the
-    /// rest of the run instead.
+    /// rest of the run instead. Within one evaluation, a reason about a
+    /// component's state never replaces one that isn't, such as
+    /// `TeardownOpen`, whichever the check recorded first.
     pub fn unsettled(&mut self, reason: Inconclusive) {
         if reason.is_sticky() {
             self.sticky.get_or_insert(reason);
-        } else {
+        } else if !(reason.is_state() && self.unsettled.is_some_and(|kept| !kept.is_state())) {
             self.unsettled = Some(reason);
         }
     }

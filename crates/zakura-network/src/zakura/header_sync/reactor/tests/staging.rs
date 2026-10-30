@@ -254,6 +254,150 @@ fn a_second_writer_changes_the_held_digest() {
             .expect("the round is active")
             .entries[1] = kept;
     }
+
+    // An older entry changes before the next page's append: that page's
+    // `after` covers the entries actually held, changed one included, not
+    // the frames' digests extended.
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the round is active")
+        .entries[1]
+        .body_size += 1;
+    let mut third = page(
+        &snapshot,
+        &open,
+        target,
+        headers(
+            zakura_header_chain::Frontier::new(block::Height(4), entries[3].header.hash()),
+            2,
+        ),
+    );
+    third.common_ancestor_height = block::Height(4);
+    third.common_ancestor_hash = entries[3].header.hash();
+    let tag2 = tag(&third, 2);
+    recorder.take();
+    deliver_tagged(&mut reactor, &peer, third, 2);
+    let held_now = HeldDigest::of(
+        &reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the round is active")
+            .entries,
+    );
+    let [(1, Some(frame), 2, after)] = staged(&recorder.take())[..] else {
+        panic!("the third page staged");
+    };
+    assert_eq!(frame, tag2);
+    assert_eq!(after, held_now, "`after` digests the entries held");
+    assert_eq!(after.len, 6);
+    assert_ne!(
+        after,
+        expected.then(tag2.received),
+        "the changed entry shows in `after`"
+    );
+}
+
+/// An entry of the page being delivered changes after its frame tag was
+/// taken, on a first page and on a later one. Each `Staged.after` digests
+/// the entries the incarnation then holds, the changed one included, so it
+/// differs from what the frames' tags compose to.
+///
+/// This fails if `after` takes the new page's digest from its frame tag.
+#[test]
+fn an_entry_changed_after_its_tag_shows_in_after() {
+    for changed_page in [0, 1] {
+        let snapshot = genesis();
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, mut actions) = observed(&snapshot, &recorder, false);
+        let (peer, _send, mut outbound) = connect(&mut reactor, 0x71);
+        let target = block::Hash([0x53; 32]);
+        let mut status = pruned_status(&snapshot, target);
+        status.work_anchor_height = snapshot.frontiers.finalized.height;
+        status.selected_tip_height = block::Height(100);
+        status.max_headers_per_response = 2;
+        reactor.handle_status(peer.clone(), 0, status);
+        reactor.schedule_cached_statuses();
+        let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+        recorder.take();
+
+        let entries = headers(snapshot.frontiers.header_best, 4);
+        let mut pages = [
+            page(&snapshot, &open, target, entries[..2].to_vec()),
+            page(&snapshot, &open, target, entries[2..].to_vec()),
+        ];
+        pages[1].common_ancestor_height = block::Height(2);
+        pages[1].common_ancestor_hash = entries[1].header.hash();
+        let tags = [tag(&pages[0], 0), tag(&pages[1], 1)];
+        let mut tagged = HeldDigest::default();
+        for (at, mut delivered) in pages.into_iter().enumerate() {
+            let frame = tags[at];
+            tagged = tagged.then(frame.received);
+            if at == changed_page {
+                // A second writer changes the page between its tag and the
+                // append, keeping its count and frame.
+                delivered.entries[1].body_size += 1;
+            }
+            let admitted = admit_page(&reactor, &peer, &delivered);
+            reactor.handle_page(peer.clone(), 0, delivered, admitted, Some(frame));
+            reactor.schedule_cached_statuses();
+            let held_now = HeldDigest::of(
+                &reactor
+                    .peer_work_queue
+                    .active(&peer)
+                    .expect("the round is active")
+                    .entries,
+            );
+            let [(1, Some(reported), 2, after)] = staged(&recorder.take())[..] else {
+                panic!("page {at} staged");
+            };
+            assert_eq!(reported, frame, "page {at}");
+            assert_eq!(
+                after, held_now,
+                "page {at}: `after` digests the entries held"
+            );
+            if at >= changed_page {
+                assert_ne!(after, tagged, "page {at}: the change shows in `after`");
+            } else {
+                assert_eq!(after, tagged, "page {at}");
+            }
+        }
+    }
+}
+
+/// Capacity a page's response consumes, with nothing appended, reports no
+/// `Staged`: only the append does, so the simulator never admits work from
+/// the budget alone. The snapshot shows the lease and nothing held.
+///
+/// This fails if the consumption reports staged work.
+#[test]
+fn consumed_capacity_alone_reports_no_stage() {
+    let snapshot = genesis();
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, mut actions) = observed(&snapshot, &recorder, false);
+    let (peer, _send, mut outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x53; 32]);
+    let mut status = pruned_status(&snapshot, target);
+    status.work_anchor_height = snapshot.frontiers.finalized.height;
+    status.selected_tip_height = block::Height(100);
+    status.max_headers_per_response = 2;
+    reactor.handle_status(peer.clone(), 0, status);
+    reactor.schedule_cached_statuses();
+    answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    recorder.take();
+
+    assert!(reactor.peer_work_queue.consume_response_capacity(&peer, 2));
+    let events = recorder.take();
+    assert!(staged(&events).is_empty(), "{events:?}");
+    let settled = settle(&reactor, &recorder);
+    assert_eq!(held(&settled), (0, HeldDigest::default()));
+    let leased: usize = settled
+        .holdings
+        .iter()
+        .flat_map(|holding| &holding.leases)
+        .map(|lease| lease.count)
+        .sum();
+    assert_eq!(leased, 2, "the consumption took a lease");
 }
 
 /// The `Outcome` events in `events`.

@@ -989,6 +989,20 @@ fn process_buckets_and_signatures() {
     );
     assert_eq!(primary_bucket(&both), Some(Bucket::Known));
     assert_eq!(signature(&both), Some(format!("known {KNOWN}")));
+    // A harness failure keeps its run's `Active` violation in `notes`, and
+    // still names the harness failure's reason.
+    let harness = ended(
+        ExploreOutcome::HarnessFailure {
+            reason: "bad task name".to_owned(),
+        },
+        vec![(ACTIVE.to_owned(), Bucket::Active)],
+    );
+    assert_eq!(harness.buckets(), [Bucket::Active, Bucket::Harness]);
+    assert_eq!(primary_bucket(&harness), Some(Bucket::Harness));
+    assert_eq!(
+        signature(&harness).as_deref(),
+        Some("harness bad task name")
+    );
     let no_end = ProcessClassified {
         result: ProcessResult::NoEnd,
         steps: 2,

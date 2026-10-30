@@ -116,6 +116,7 @@ fn run(
     then: fn(&'static HarnessEntry, &[u8], &ExploreRun, &Classified),
 ) {
     let counters = feedback.as_ref().map(Feedback::counters);
+    crate::stats::begin(entry);
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
         worker.explore_with(entry, input, feedback, move |input, run, classified| {

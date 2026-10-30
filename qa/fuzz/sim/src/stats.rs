@@ -28,9 +28,26 @@ extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
 }
 
-/// The process's recorder, made at its first run. `None` without
+/// The process's recorder, made as its first run begins. `None` without
 /// `ZAKURA_SIM_STATS`.
 static RECORDER: OnceLock<Option<Mutex<Recorder>>> = OnceLock::new();
+
+/// Marks a run of `entry`'s harness in progress, so an exit inside it
+/// leaves the file incomplete. The first call makes the recorder, so a
+/// process that crashes in its first run still leaves a file. Does nothing
+/// without `ZAKURA_SIM_STATS`.
+///
+/// # Panics
+///
+/// With `harness:`, if the stats file can't be written.
+pub(crate) fn begin(entry: &'static HarnessEntry) {
+    if let Some(recorder) = recorder(entry) {
+        recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .begin();
+    }
+}
 
 /// Counts `run` of `entry`'s harness, with the features `counters` hold,
 /// and writes the counts when they're due. The returned guard writes them
@@ -109,8 +126,9 @@ fn recorder(entry: &'static HarnessEntry) -> Option<&'static Mutex<Recorder>> {
         .as_ref()
 }
 
-/// Writes the final counts as the process exits cleanly. A run in progress
-/// holds the lock, and then the file stays incomplete.
+/// Writes the final counts as the process exits cleanly. If the exit comes
+/// from inside a run, which holds the lock or has begun, the file stays
+/// incomplete.
 extern "C" fn finish() {
     let Some(Some(recorder)) = RECORDER.get() else {
         return;

@@ -825,7 +825,7 @@ fn stats_count_property_outcomes_cleanup_and_features() {
 /// E4b-min: a recorder writes its file at once, with every registered
 /// property and no runs; a checkpoint writes the counts so far, still
 /// incomplete; a checkpoint that isn't due writes nothing; and `finish`
-/// marks the file complete.
+/// marks the file complete, unless it comes inside a run.
 #[test]
 fn a_recorder_marks_its_file_complete_only_at_finish() {
     let dir = TempDir::new().unwrap();
@@ -853,11 +853,17 @@ fn a_recorder_marks_its_file_complete_only_at_finish() {
     recorder.record(&run, &classified, &[]);
     recorder.checkpoint_if_due().unwrap();
     assert_eq!(read().counts.runs, 1, "{CHECKPOINT:?} hasn't passed");
+    // An exit inside a run leaves that run uncounted, so the file stays
+    // incomplete.
+    recorder.begin();
+    recorder.finish().unwrap();
+    assert!(!read().complete);
+    recorder.record(&run, &classified, &[]);
     recorder.finish().unwrap();
     let last = read();
     assert!(last.complete);
     assert_eq!(&last.counts, recorder.counts());
-    assert_eq!(last.counts.runs, 2);
+    assert_eq!(last.counts.runs, 3);
 
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, text.replace("\"version\": 1", "\"version\": 0")).unwrap();

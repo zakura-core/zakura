@@ -335,6 +335,8 @@ pub struct Recorder {
     stats: ProcessStats,
     /// When the recorder last wrote the file.
     written: Instant,
+    /// True from [`Recorder::begin`] until the run is counted.
+    running: bool,
 }
 
 impl Recorder {
@@ -356,6 +358,7 @@ impl Recorder {
                 counts: Counts::for_harness(entry),
             },
             written: Instant::now(),
+            running: false,
         };
         recorder.write()?;
         Ok(recorder)
@@ -371,9 +374,15 @@ impl Recorder {
         &self.stats.counts
     }
 
+    /// Marks a run in progress until [`Recorder::record`] counts it.
+    pub fn begin(&mut self) {
+        self.running = true;
+    }
+
     /// Counts one run, as [`Counts::record`] does.
     pub fn record(&mut self, run: &ExploreRun, classified: &Classified, features: &[Feature]) {
         self.stats.counts.record(run, classified, features);
+        self.running = false;
     }
 
     /// Writes the counts if [`CHECKPOINT`] has passed since the last write.
@@ -389,10 +398,11 @@ impl Recorder {
         self.write()
     }
 
-    /// Writes the final counts, marked complete. A process calls it once,
-    /// as it exits cleanly.
+    /// Writes the final counts, marked complete unless a run is in
+    /// progress: a process that exits inside a run leaves that run
+    /// uncounted. A process calls it once, as it exits.
     pub fn finish(&mut self) -> io::Result<()> {
-        self.stats.complete = true;
+        self.stats.complete = !self.running;
         self.write()
     }
 

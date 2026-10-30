@@ -331,7 +331,8 @@ stopped at their bound, cleanup (abandoned runs and their leaked tasks, and
 runs with unwound, panicked or unwind-failed tasks), each property's runs by
 outcome with its applicable evaluations, and the runs that reached each
 feature. Only the clean exit marks a file `complete`, since libFuzzer exits
-there with `exit` and the target's `atexit` handler runs. A crash, a timeout
+there with `exit` between runs and the target's `atexit` handler runs. An
+`exit` from inside a run leaves the file incomplete. A crash, a timeout
 or a kill leaves the counts of the last write, and the file stays incomplete.
 The compaction's merge writes no stats.
 

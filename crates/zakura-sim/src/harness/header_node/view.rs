@@ -737,4 +737,34 @@ mod tests {
             assert_eq!(report.outcome, inconclusive("teardown-open"));
         }
     }
+
+    /// A component that alternates between held and current opens a gap
+    /// run every other boundary. The report keeps every run, and its trace
+    /// encoding stays the same size, so a long run's end record still fits
+    /// its line.
+    #[test]
+    fn many_gap_runs_keep_the_end_record_small() {
+        const STEPS: u64 = 2_000;
+        let ops = reads((0..=STEPS).map(|at| {
+            let read = if at % 2 == 0 {
+                Read::Current(1)
+            } else {
+                Read::Held {
+                    holder: "reactor.1".to_owned(),
+                }
+            };
+            (at, read)
+        }));
+        let (run, _) = run(ops, STEPS, vec![requiring()], &wire());
+        assert_eq!(run.end.harness, None);
+        let report = report(&run, "test/require");
+        assert_eq!(report.gaps.len(), 1_000, "one run per held boundary");
+        assert_eq!(report.gap_boundaries, [("Budget".to_owned(), 1_000)].into());
+        let encoded = serde_json::to_string(report).expect("a report encodes");
+        assert!(
+            encoded.len() < 200,
+            "{} bytes: {encoded:.200}",
+            encoded.len()
+        );
+    }
 }

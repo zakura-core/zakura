@@ -41,7 +41,7 @@ use crate::{
 /// digest. Version 21 added scripted peers' `peer-emitted` records and
 /// their `peer-conn-ended` and `peer-stream-ended` rows. Version 22 added
 /// the `state-unsettled`, `state-unobserved` and `budget-cut` inconclusive
-/// outcomes and each property's component `gaps`.
+/// outcomes and each property's `gap_boundaries`.
 pub const FORMAT_VERSION: u32 = 22;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
@@ -419,6 +419,7 @@ mod tests {
                 from: 3,
                 through: 5,
             }],
+            gap_boundaries: [("Budget".to_owned(), 3)].into(),
             ..PropertyReport::new(
                 "test/require-every",
                 PropertyOutcome::Inconclusive {
@@ -428,7 +429,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&report).unwrap(),
-            r#"{"property":"test/require-every","outcome":{"inconclusive":{"reason":"state-unobserved"}},"gaps":[{"component":"Budget","from":3,"through":5}]}"#,
+            r#"{"property":"test/require-every","outcome":{"inconclusive":{"reason":"state-unobserved"}},"gap_boundaries":{"Budget":3}}"#,
             "{bump}"
         );
     }

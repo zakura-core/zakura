@@ -464,6 +464,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
                 gaps: state.gaps.clone(),
+                gap_boundaries: gap_boundaries(&state.gaps),
                 violations: state.violations.clone(),
             })
             .collect()
@@ -647,6 +648,16 @@ fn step_property<S: HasView>(
         !gone
     });
     violations
+}
+
+/// How many boundaries `gaps` covers, by component.
+fn gap_boundaries(gaps: &[Gap]) -> BTreeMap<String, u64> {
+    let mut boundaries = BTreeMap::new();
+    for gap in gaps {
+        let count: &mut u64 = boundaries.entry(gap.component.clone()).or_default();
+        *count = count.saturating_add(gap.through.saturating_sub(gap.from).saturating_add(1));
+    }
+    boundaries
 }
 
 /// Extends each of `gaps`' runs that the previous evaluation left open, and

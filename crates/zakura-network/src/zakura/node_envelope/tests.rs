@@ -236,9 +236,7 @@ fn retiring_generations_count_against_the_node_across_reconnects() {
 fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     let node = NodeResources::new(transport());
     let connection = node.connection();
-    let streams: Vec<_> = (0..bound().streams + 1)
-        .map(|_| connection.stream())
-        .collect();
+    let streams: Vec<_> = (0..=bound().streams).map(|_| connection.stream()).collect();
 
     let usage = node.report_usage(bound());
 

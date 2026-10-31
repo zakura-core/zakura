@@ -13,6 +13,7 @@ use zakura_header_chain::{
     NoChangeReceipt, StaleReceipt, StoreError, TransitionContext, TransitionEffect,
     TransitionEvent, TransitionFailure, TransitionInput, TransitionRequest, VerifiedChangeCause,
 };
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_rt::sync::watch;
 
 use super::EnginePort;
@@ -96,16 +97,17 @@ impl EnginePort {
     /// non-finalized window. See [`VerifiedChain::with`].
     pub(crate) fn commit_block(
         &self,
-        block: Arc<block::Block>,
+        block: impl Into<BlockHandle>,
         receipt: u64,
     ) -> Result<Applied, StateError> {
+        let block = block.into();
         let height = block.coinbase_height().ok_or(StoreError::Incoherent(
             "a committed block encodes its height",
         ))?;
         let accepted = zakura_header_chain::Frontier::new(height, block.hash());
         let mut engine = self.engine();
         let before = self.full_state().clone();
-        if before.contains(accepted.hash) || !before.contains(block.header.previous_block_hash) {
+        if before.contains(accepted.hash) || !before.contains(block.header().previous_block_hash) {
             return Err(StoreError::Incoherent(
                 "full state commits each block once, after its parent",
             )
@@ -229,7 +231,7 @@ impl EnginePort {
     #[cfg(feature = "driver-fidelity")]
     pub fn commit_block_for_driver_test(
         &self,
-        block: Arc<block::Block>,
+        block: impl Into<BlockHandle>,
         receipt: u64,
     ) -> Result<Applied, StateError> {
         self.commit_block(block, receipt)

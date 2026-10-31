@@ -742,12 +742,12 @@ impl Codec {
 
     fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
         let result = self.deserialize_block_spawning(reader);
-        let block = result?.into();
+        let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(block))
+        Ok(Message::Block(block.into()))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {

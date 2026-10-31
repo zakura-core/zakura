@@ -134,7 +134,9 @@ fn test_block_db_round_trip_with(
                 new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
 
             CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: original_block.clone(),
+                block: zakura_node_services::block_memory::BlockHandle::Shared(
+                    original_block.clone(),
+                ),
                 hash,
                 height: Height(0),
                 new_outputs,

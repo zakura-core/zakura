@@ -1,0 +1,7 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -389,3 +389,3 @@
+         let next = destination.reserve(self.0.bytes, admission)?;
+-        let previous = std::mem::replace(&mut *current, next);
++        let previous = next;
+         drop(current);

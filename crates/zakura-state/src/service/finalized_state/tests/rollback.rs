@@ -146,7 +146,7 @@ fn assert_equivalent(
 
     // Transparent indexes and shielded nullifiers in the retained range must match a fresh sync.
     for block in retained {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             let tx_hash = transaction.hash();
 
             for (index, output) in transaction.outputs().iter().enumerate() {
@@ -195,7 +195,7 @@ fn assert_equivalent(
             block.hash
         );
 
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             for nullifier in transaction.sprout_nullifiers() {
                 assert!(
                     !rolled.contains_sprout_nullifier(nullifier),
@@ -226,7 +226,7 @@ fn count_reversible_features(blocks: &[SemanticallyVerifiedBlock]) -> (usize, us
     let mut shielded_nullifiers = 0;
 
     for block in blocks {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             transparent_spends += transaction
                 .inputs()
                 .iter()
@@ -537,10 +537,14 @@ pub(super) fn spend_tx(
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block<'a>(
+    parent: impl Into<zakura_chain::block::BlockView<'a>>,
+    transactions: Vec<Arc<Transaction>>,
+) -> Arc<Block> {
+    let parent = parent.into();
     let header = block::Header {
         previous_block_hash: parent.hash(),
-        ..*parent.header
+        ..*parent.header()
     };
     Arc::new(Block {
         header: Arc::new(header),
@@ -634,8 +638,8 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
     )
 }
 
-pub(super) fn child_block_with_history_commitment(
-    parent: &Block,
+pub(super) fn child_block_with_history_commitment<'a>(
+    parent: impl Into<zakura_chain::block::BlockView<'a>>,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
     previous_history_tree: &zakura_chain::history_tree::HistoryTree,
@@ -1011,7 +1015,7 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
             prop_assert!(
                 !synced[target_index + 1..]
                     .iter()
-                    .any(|block| block.block.sprout_note_commitments().next().is_some()),
+                    .any(|block| block.block.view().sprout_note_commitments().next().is_some()),
                 "V5 blocks in the removed range must not contain Sprout commitments"
             );
 

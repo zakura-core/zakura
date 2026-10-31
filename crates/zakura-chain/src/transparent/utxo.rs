@@ -193,10 +193,11 @@ pub fn new_outputs_with_height(
 
 /// Compute an index of newly created [`OrderedUtxo`]s, given a block and a
 /// list of precomputed transaction hashes.
-pub fn new_ordered_outputs(
-    block: &Block,
+pub fn new_ordered_outputs<'a>(
+    block: impl Into<crate::block::BlockView<'a>>,
     transaction_hashes: &[transaction::Hash],
 ) -> HashMap<transparent::OutPoint, OrderedUtxo> {
+    let block = block.into();
     let height = block.coinbase_height().expect("block has coinbase height");
 
     new_ordered_outputs_with_height(block, height, transaction_hashes)
@@ -207,16 +208,16 @@ pub fn new_ordered_outputs(
 ///
 /// This function is intended for use in this module, and in tests.
 /// Prefer [`new_ordered_outputs`].
-pub fn new_ordered_outputs_with_height(
-    block: &Block,
+pub fn new_ordered_outputs_with_height<'a>(
+    block: impl Into<crate::block::BlockView<'a>>,
     height: Height,
     transaction_hashes: &[transaction::Hash],
 ) -> HashMap<transparent::OutPoint, OrderedUtxo> {
     let mut new_ordered_outputs = HashMap::new();
 
     for (tx_index_in_block, (transaction, hash)) in block
-        .transactions
-        .iter()
+        .into()
+        .transactions()
         .zip(transaction_hashes.iter().cloned())
         .enumerate()
     {

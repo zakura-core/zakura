@@ -1126,7 +1126,7 @@ where
     let parent = block.header.previous_block_hash;
     let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: block.clone(),
+        block: block.clone().into(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
@@ -1805,7 +1805,7 @@ where
         };
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
+            block: block.clone().into(),
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -2387,9 +2387,12 @@ where
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => {
-                    Ok(GetBlockResponse::Raw(block.into()))
-                }
+                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
+                    block
+                        .zcash_serialize_to_vec()
+                        .expect("serialization to memory cannot fail")
+                        .into(),
+                )),
                 zakura_state::ReadResponse::Block(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
@@ -2477,14 +2480,14 @@ where
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
-                    let block_time = block.header.time;
+                    let block_time = block.header().time;
                     let transactions = block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .map(|tx| {
                             GetBlockTransaction::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.clone(),
+                                    tx,
                                     Some(height),
                                     Some(confirmations),
                                     &network,
@@ -2955,7 +2958,8 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: Arc<Transaction> = tx.into();
+                            let raw_tx: zakura_node_services::block_memory::TransactionHandle =
+                                tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3019,7 +3023,7 @@ where
                     }
                 }
             } else {
-                let tx: Arc<Transaction> = tx.into();
+                let tx: zakura_node_services::block_memory::TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),

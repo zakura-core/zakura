@@ -53,10 +53,17 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
     let mut body = BufferedBlockBody::from_decoded_block(decoded, Some(raw));
     body.retain_for_backlog_in_place();
     assert!(!body.is_decoded());
-    let replayed = body.decoded_block();
-    assert_eq!(replayed, expected);
+    let replayed = body
+        .decoded_block(&zakura_node_services::block_memory::DecodedBlockPool::new(
+            u64::MAX,
+        ))
+        .unwrap();
     assert_eq!(
-        replayed.transactions.capacity(),
-        replayed.transactions.len()
+        replayed.view().zcash_serialize_to_vec().unwrap(),
+        expected.zcash_serialize_to_vec().unwrap()
+    );
+    assert_eq!(
+        replayed.view().transaction_capacity(),
+        replayed.view().transactions().len()
     );
 }

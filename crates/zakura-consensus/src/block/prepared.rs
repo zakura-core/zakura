@@ -7,9 +7,9 @@ use std::{
 use blake2b_simd::Params;
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::{Block, Header},
+    block::{BlockView, Header},
     parameters::Network,
-    serialization::ZcashSerialize,
+    serialization::{CompactSizeMessage, ZcashSerialize},
     work::equihash::Solution,
 };
 use zakura_state::SemanticallyVerifiedBlock;
@@ -31,19 +31,27 @@ pub(super) struct CandidateId([u8; 32]);
 
 impl CandidateId {
     /// Blake2b-256 of `block` with the header fields a solution sets normalized to fixed values.
-    pub(super) fn of(block: &Block, network: &Network) -> Self {
-        let mut header: Header = *block.header;
+    pub(super) fn of<'a>(block: impl Into<BlockView<'a>>, network: &Network) -> Self {
+        let block = block.into();
+        let mut header: Header = *block.header();
         header.time =
             DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
         header.nonce = [0; 32].into();
         header.solution = Solution::for_proposal_for_network(network);
 
-        let bytes = Block {
-            header: Arc::new(header),
-            transactions: block.transactions.clone(),
+        let mut bytes = Vec::new();
+        header
+            .zcash_serialize(&mut bytes)
+            .expect("serialization to memory cannot fail");
+        CompactSizeMessage::try_from(block.transactions().len())
+            .expect("validated blocks have a representable transaction count")
+            .zcash_serialize(&mut bytes)
+            .expect("serialization to memory cannot fail");
+        for transaction in block.transactions() {
+            transaction
+                .zcash_serialize(&mut bytes)
+                .expect("serialization to memory cannot fail");
         }
-        .zcash_serialize_to_vec()
-        .expect("serialization to memory cannot fail");
 
         let hash = Params::new().hash_length(32).hash(&bytes);
         let mut id = [0; 32];
@@ -128,7 +136,11 @@ impl PreparedCandidateCache {
     }
 
     /// Returns the prepared verification for `block`'s content, if some source prepared it.
-    pub(super) fn lookup(&self, block: &Block, network: &Network) -> Option<CacheHit> {
+    pub(super) fn lookup<'a>(
+        &self,
+        block: impl Into<zakura_chain::block::BlockView<'a>>,
+        network: &Network,
+    ) -> Option<CacheHit> {
         // Deriving the candidate id costs a full block serialization, so skip it when the cache
         // holds no entry that could match.
         if self.lock().iter().all(|partition| partition.is_empty()) {
@@ -156,7 +168,11 @@ impl PreparedCandidateCache {
     }
 
     /// Reuses and refreshes a server candidate with identical immutable content.
-    pub(super) fn reuse_server_candidate(&self, block: &Block, network: &Network) -> bool {
+    pub(super) fn reuse_server_candidate<'a>(
+        &self,
+        block: impl Into<zakura_chain::block::BlockView<'a>>,
+        network: &Network,
+    ) -> bool {
         if self.lock()[PreparedCandidateSource::ServerTemplate.index()].is_empty() {
             return false;
         }
@@ -316,7 +332,9 @@ fn retained_size(prepared: &SemanticallyVerifiedBlock) -> usize {
 mod tests {
     use super::*;
     use zakura_chain::{
-        block::Hash, serialization::ZcashDeserialize, work::difficulty::INVALID_COMPACT_DIFFICULTY,
+        block::{Block, Hash},
+        serialization::ZcashDeserialize,
+        work::difficulty::INVALID_COMPACT_DIFFICULTY,
     };
 
     fn test_block() -> Block {
@@ -341,6 +359,44 @@ mod tests {
             source,
             SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
         )
+    }
+
+    #[test]
+    fn candidate_identity_matches_normalized_block_serialization() {
+        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+
+        let network = Network::Mainnet;
+        for bytes in [
+            &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..],
+            &zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..],
+        ] {
+            let block = Block::zcash_deserialize(bytes).unwrap();
+            let mut normalized = block.clone();
+            let header = Arc::make_mut(&mut normalized.header);
+            header.time = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+            header.nonce = [0; 32].into();
+            header.solution = Solution::for_proposal_for_network(&network);
+            let expected = Params::new()
+                .hash_length(32)
+                .hash(&normalized.zcash_serialize_to_vec().unwrap());
+            assert_eq!(
+                CandidateId::of(&block, &network).0.as_slice(),
+                expected.as_bytes()
+            );
+            drop(normalized);
+
+            let charge = block.attributed_memory_size_bytes();
+            let pool = DecodedBlockPool::new(charge);
+            let owned = pool.try_admit(block, Admission::WithinLimit).unwrap();
+            assert_eq!(
+                CandidateId::of(&owned, &network).0.as_slice(),
+                expected.as_bytes()
+            );
+            assert_eq!(pool.reserved_bytes(), charge);
+            drop(owned);
+            assert_eq!(pool.reserved_bytes(), 0);
+        }
     }
 
     #[test]

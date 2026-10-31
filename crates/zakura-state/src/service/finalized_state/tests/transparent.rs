@@ -123,7 +123,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     let new_outputs = new_ordered_outputs_with_height(&block, height, &transaction_hashes);
 
     let semantically_verified = SemanticallyVerifiedBlock {
-        block: block.clone(),
+        block: zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
         hash: block::Hash([0x00; 32]),
         height,
         new_outputs,

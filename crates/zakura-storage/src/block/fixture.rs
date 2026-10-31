@@ -206,7 +206,7 @@ impl BlockFixture {
             history
                 .push(
                     network,
-                    block.block.clone(),
+                    &block.block,
                     &sapling::tree::NoteCommitmentTree::default().root(),
                     &orchard::tree::NoteCommitmentTree::default().root(),
                     &ironwood::tree::NoteCommitmentTree::default().root(),

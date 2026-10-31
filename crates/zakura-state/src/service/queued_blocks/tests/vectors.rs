@@ -74,7 +74,10 @@ fn dequeue_gives_right_children() -> Result<()> {
     // Dequeueing the first block removes 1 block from each list
     let children = queue.dequeue_children(parent);
     assert_eq!(1, children.len());
-    assert_eq!(block1, children[0].0.block);
+    assert_eq!(
+        zakura_node_services::block_memory::BlockHandle::from(block1),
+        children[0].0.block
+    );
     assert_eq!(2, queue.blocks.len());
     assert_eq!(1, queue.by_parent.len());
     assert_eq!(1, queue.by_height.len());
@@ -121,9 +124,13 @@ fn same_hash_replacement_preserves_receipts_only_for_identical_bodies() -> Resul
         let mut replacement = replacement_block.clone().into_queued();
         replacement.0.receipt_order = Some(9);
         let old = queue.replace(block.hash(), replacement);
-        assert!(Arc::ptr_eq(&old.0.block, &block));
+        assert!(
+            matches!(&old.0.block, zakura_node_services::block_memory::BlockHandle::Shared(retained) if Arc::ptr_eq(retained, &block))
+        );
         let retained = queue.get_mut(&block.hash()).unwrap();
-        assert!(Arc::ptr_eq(&retained.0.block, &replacement_block));
+        assert!(
+            matches!(&retained.0.block, zakura_node_services::block_memory::BlockHandle::Shared(retained) if Arc::ptr_eq(retained, &replacement_block))
+        );
         assert_eq!(
             retained.0.receipt_order,
             if different_body {

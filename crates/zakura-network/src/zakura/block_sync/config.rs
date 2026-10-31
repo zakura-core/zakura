@@ -415,6 +415,31 @@ impl ZakuraBlockSyncConfig {
             .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
     }
 
+    /// Fund decoded allocations through the pipeline and the caller's backend allowance.
+    /// Four submission windows cover input, applying, driver overlap, and replacement
+    /// headroom. Peer slots cover synchronous handoffs outside those collections.
+    /// Retiring holders keep their slots; this is a count contract, not a byte bound.
+    pub fn decoded_block_pool(
+        &self,
+        backend_blocks: u64,
+    ) -> Result<zakura_node_services::block_memory::DecodedBlockPool, &'static str> {
+        let windows = u64::try_from(self.submitted_apply_limit())
+            .ok()
+            .and_then(|count| count.checked_mul(4));
+        let peers = self
+            .peer_limits
+            .max_inbound_peers
+            .checked_add(self.peer_limits.max_outbound_peers)
+            .and_then(|count| u64::try_from(count).ok());
+        let limit = windows
+            .zip(peers)
+            .and_then(|(windows, peers)| windows.checked_add(peers))
+            .and_then(|count| count.checked_add(backend_blocks))
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or("decoded block-count allowance overflow")?;
+        Ok(zakura_node_services::block_memory::DecodedBlockPool::for_block_count(limit))
+    }
+
     /// Return the resident look-ahead byte cap.
     ///
     /// Currently the raw configured value; kept as an accessor for the semantic

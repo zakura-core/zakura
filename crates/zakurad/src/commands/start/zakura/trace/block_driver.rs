@@ -136,7 +136,7 @@ pub(crate) trait BlockDriverTraceExt {
         &self,
         token: BlockApplyToken,
         class: BlockApplyClass,
-        block: &block::Block,
+        block: block::BlockView<'_>,
         queue_len: usize,
         in_flight_count: usize,
     );
@@ -257,7 +257,7 @@ impl BlockDriverTraceExt for ZakuraTrace {
         &self,
         token: BlockApplyToken,
         class: BlockApplyClass,
-        block: &block::Block,
+        block: block::BlockView<'_>,
         queue_len: usize,
         in_flight_count: usize,
     ) {

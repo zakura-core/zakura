@@ -27,7 +27,9 @@ async fn block_and_headers_messages_round_trip_on_every_network() {
                 Message::Headers(vec![block::CountedHeader {
                     header: block.header.clone(),
                 }]),
-                Message::Block(block.clone()),
+                Message::Block(zakura_node_services::block_memory::BlockHandle::Shared(
+                    block.clone(),
+                )),
             ] {
                 let mut codec = Codec::builder()
                     .for_network(configured_network)

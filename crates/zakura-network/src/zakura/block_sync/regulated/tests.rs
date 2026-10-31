@@ -591,8 +591,13 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     let cancel = CancellationToken::new();
     let close_cause = crate::zakura::CloseCause::default();
     let session_cancel = cancel.child_token();
-    let mut startup =
-        super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
+    let mut startup = super::super::BlockSyncStartup::inert(
+        config
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config.clone(),
+    )
+    .with_range_source(source);
     startup.shutdown = cancel.clone();
     let (handle, _actions, _task) =
         super::super::spawn_block_sync_reactor(startup).expect("valid block-sync config");

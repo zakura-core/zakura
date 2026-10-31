@@ -82,6 +82,36 @@ impl FakeChainHelper for Arc<Block> {
     }
 }
 
+/// Copies fixture data so a test can mutate it before submitting a new block.
+pub fn copy_block_fixture<'a>(block: impl Into<zakura_chain::block::BlockView<'a>>) -> Arc<Block> {
+    let block = block.into();
+    Arc::new(Block {
+        header: Arc::new(*block.header()),
+        transactions: block
+            .transactions()
+            .map(|tx| Arc::new(tx.clone()))
+            .collect(),
+    })
+}
+
+impl FakeChainHelper for zakura_node_services::block_memory::BlockHandle {
+    fn make_fake_child(&self) -> Arc<Block> {
+        copy_block_fixture(self).make_fake_child()
+    }
+
+    fn make_fake_siblings(&self, count: usize) -> Vec<Arc<Block>> {
+        copy_block_fixture(self).make_fake_siblings(count)
+    }
+
+    fn set_work(self, work: u128) -> Arc<Block> {
+        copy_block_fixture(&self).set_work(work)
+    }
+
+    fn set_block_commitment(self, commitment: [u8; 32]) -> Arc<Block> {
+        copy_block_fixture(&self).set_block_commitment(commitment)
+    }
+}
+
 fn work_to_expanded(work: U256) -> ExpandedDifficulty {
     // Work is calculated from expanded difficulty with the equation `work = 2^256 / (expanded + 1)`
     // By balancing the equation we get `expanded = (2^256 / work) - 1`

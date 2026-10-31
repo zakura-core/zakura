@@ -1,0 +1,7 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -391,3 +391,3 @@
+         drop(current);
+-        drop(previous);
++        std::mem::forget(previous);
+         Ok(())

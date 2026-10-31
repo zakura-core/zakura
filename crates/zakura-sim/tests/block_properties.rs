@@ -814,7 +814,13 @@ fn a_teardown_returns_the_node_to_zero() {
                     reorder,
                     applying,
                     submissions,
-                } => Some(reorder.is_empty() && applying.is_empty() && submissions.is_empty()),
+                    payloads,
+                } => Some(
+                    payloads.is_empty()
+                        && reorder.is_empty()
+                        && applying.is_empty()
+                        && submissions.is_empty(),
+                ),
                 _ => None,
             })
             .expect("the sequencer publishes a final snapshot");

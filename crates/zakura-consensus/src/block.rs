@@ -349,11 +349,11 @@ where
 
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
-        let hash = match zakura_header_chain::validate_encoding_version_hash(&block.header) {
+        let hash = match zakura_header_chain::validate_encoding_version_hash(block.header()) {
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.clone()));
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.view()));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -422,16 +422,16 @@ where
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
             let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
             if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
-                check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
+                check::difficulty_threshold_is_valid(block.header(), &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for
                 // attacks that use any other fields.
-                check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                check::equihash_solution_is_valid(&block.header, &network)?;
+                check::difficulty_is_valid(block.header(), &network, &height, &hash)?;
+                check::equihash_solution_is_valid(block.header(), &network)?;
             }
 
             if let Some(admission) = &mined {
-                let parent = block.header.previous_block_hash;
+                let parent = block.header().previous_block_hash;
                 match state_service
                     .ready()
                     .await
@@ -478,7 +478,7 @@ where
 
             // Precomputing this avoids duplicating transaction hash computations.
             let transaction_hashes: Arc<[_]> =
-                block.transactions.iter().map(|t| t.hash()).collect();
+                block.view().transactions().map(|t| t.hash()).collect();
 
             check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
@@ -487,11 +487,11 @@ where
 
             // Quick field validity and structure checks
             let now = Utc::now();
-            check::time_is_valid_at(&block.header, now, &height, &hash)
+            check::time_is_valid_at(block.header(), now, &height, &hash)
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
+            check::shielded_action_limits_are_valid(block.view().transactions(), height, &network)?;
 
             // ZIP 234 derives the block subsidy from the NSM value balance after the parent
             // block, so a block at or above the start height needs its parent's chain
@@ -501,7 +501,7 @@ where
             // a proposal whose parent has not committed is rejected immediately.
             let nsm_value_balance =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
-                    let parent_hash = block.header.previous_block_hash;
+                    let parent_hash = block.header().previous_block_hash;
                     let parent_request = if request.is_proposal() {
                         zs::Request::BlockInfo(parent_hash)
                     } else {
@@ -549,7 +549,7 @@ where
             // Now do the slower checks
 
             // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
-            tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+            tx::check::coinbase_outputs_are_decryptable(coinbase_tx, &network, height)?;
 
             // Send transactions to the transaction verifier to be checked
             let mut async_checks = FuturesUnordered::new();
@@ -560,13 +560,13 @@ where
             ));
 
             let external_inputs: Arc<[transparent::OutPoint]> = block
-                .transactions
-                .iter()
+                .view()
+                .transactions()
                 .flat_map(|transaction| transaction.inputs())
                 .filter_map(transparent::Input::outpoint)
                 .filter(|outpoint| !known_utxos.contains_key(outpoint))
                 .collect();
-            let parent = block.header.previous_block_hash;
+            let parent = block.header().previous_block_hash;
             if !external_inputs.is_empty() {
                 if let zs::ParentInputs::Missing(outpoint) =
                     check_parent_inputs(state_service.clone(), parent, external_inputs.clone())
@@ -582,11 +582,11 @@ where
             // pointer-keyed registration before the `Arc` address can be reused.
             let _block_batch_flush = primitives::register_block_verifier_batch_flush(
                 &known_outpoint_hashes,
-                block.transactions.len(),
+                block.view().transactions().len(),
             );
 
             for (&transaction_hash, transaction) in
-                transaction_hashes.iter().zip(block.transactions.iter())
+                transaction_hashes.iter().zip(block.transactions())
             {
                 let rsp = transaction_verifier
                     .ready()
@@ -594,11 +594,11 @@ where
                     .expect("transaction verifier is always ready")
                     .call(tx::Request::Block {
                         transaction_hash,
-                        transaction: transaction.clone(),
+                        transaction,
                         known_outpoint_hashes: known_outpoint_hashes.clone(),
                         known_utxos: known_utxos.clone(),
                         height,
-                        time: block.header.time,
+                        time: block.header().time,
                     });
                 async_checks.push(rsp);
             }
@@ -708,7 +708,7 @@ where
                 })?;
 
             check::miner_fees_are_valid(
-                &coinbase_tx,
+                coinbase_tx,
                 height,
                 block_transaction_fees,
                 expected_block_subsidy,
@@ -761,7 +761,7 @@ async fn try_prepared_fast_path<S>(
     prepared_candidates: &prepared::PreparedCandidateCache,
     state_service: &mut S,
     network: &Network,
-    block: Arc<block::Block>,
+    block: zakura_node_services::block_memory::BlockHandle,
     hash: block::Hash,
     (height, receipt_order): (block::Height, Option<u64>),
     admission: &zs::BlockAdmission,
@@ -781,10 +781,10 @@ where
         return Ok(None);
     };
 
-    check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
+    check::time_is_valid_at(block.header(), Utc::now(), &height, &hash)
         .map_err(VerifyBlockError::Time)?;
-    for transaction in &block.transactions {
-        tx::check::lock_time_has_passed(transaction, height, block.header.time)
+    for transaction in block.view().transactions() {
+        tx::check::lock_time_has_passed(transaction, height, block.header().time)
             .map_err(VerifyBlockError::Transaction)?;
     }
     check::merkle_root_validity(network, &block, &cached_prepared_block.transaction_hashes)?;

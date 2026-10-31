@@ -1260,7 +1260,7 @@ impl FinalizedState {
                         history_tree_mut
                             .push(
                                 &network,
-                                block.clone(),
+                                &block,
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
@@ -1317,7 +1317,8 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.db.is_empty() {
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
             );
             assert_eq!(
@@ -1333,7 +1334,8 @@ impl FinalizedState {
             );
 
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {source}",
             );
         }

@@ -192,10 +192,16 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(block1, finalized);
+    assert_eq!(
+        zakura_node_services::block_memory::BlockHandle::from(block1),
+        finalized
+    );
 
     let finalized = state.finalize().inner_block();
-    assert_eq!(block2, finalized);
+    assert_eq!(
+        zakura_node_services::block_memory::BlockHandle::from(block2),
+        finalized
+    );
 
     assert!(state.best_chain().is_none());
 
@@ -240,7 +246,10 @@ fn finalize_drops_empty_side_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(root, finalized);
+    assert_eq!(
+        zakura_node_services::block_memory::BlockHandle::from(root),
+        finalized
+    );
     assert_eq!(state.chain_count(), 1);
     assert_eq!(state.best_chain_len(), Some(1));
     assert_eq!(

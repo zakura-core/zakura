@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use zakura_chain::{block::Block, serialization::ZcashSerialize};
+use zakura_chain::{block::BlockView, serialization::ZcashSerialize};
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 
@@ -46,7 +46,8 @@ pub(super) struct ReceiptGuard {
 
 impl ReceiptRegistry {
     /// Called synchronously by the verifier before returning its request future.
-    pub(super) fn register(&self, block: Arc<Block>) -> ReceiptGuard {
+    pub(super) fn register<'a>(&self, block: impl Into<BlockView<'a>>) -> ReceiptGuard {
+        let block = block.into();
         // Hash the complete serialized body before locking. ZIP-244 permits
         // unequal authorizing data under the same header and transaction IDs.
         let mut digest = blake2b_simd::Params::new().hash_length(32).to_state();
@@ -137,11 +138,12 @@ mod tests {
     #[test]
     fn receipts_retain_identity_without_retaining_full_bodies() {
         let registry = ReceiptRegistry::default();
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
         let weak = Arc::downgrade(&block);
-        let receipt = registry.register(block);
+        let receipt = registry.register(&block);
+        drop(block);
         assert!(weak.upgrade().is_none());
         assert_eq!(registry.0.lock().unwrap().len(), 1);
         drop(receipt);
@@ -151,10 +153,11 @@ mod tests {
     #[test]
     fn authorizing_variants_share_a_header_but_not_a_receipt() {
         let registry = ReceiptRegistry::default();
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-        let original = registry.register(block.clone());
+        let block: Arc<zakura_chain::block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+        let original = registry.register(&block);
         let mut receipts = Vec::new();
         let mut orders = std::collections::HashSet::from([original.order]);
         for tag in 0..32 {
@@ -169,14 +172,14 @@ mod tests {
             assert_eq!(block.hash(), changed.hash());
             assert_eq!(block.transactions[0].hash(), changed.transactions[0].hash());
             assert_ne!(block.auth_data_root(), changed.auth_data_root());
-            let receipt = registry.register(changed.clone());
+            let receipt = registry.register(&changed);
             assert!(orders.insert(receipt.order));
-            let duplicate = registry.register(changed);
+            let duplicate = registry.register(&changed);
             assert_eq!(duplicate.order, receipt.order);
             receipts.push((receipt, duplicate));
         }
         drop(receipts);
-        assert_eq!(registry.register(block).order, original.order);
+        assert_eq!(registry.register(&block).order, original.order);
         drop(original);
         assert!(registry.0.lock().unwrap().is_empty());
     }
@@ -184,7 +187,7 @@ mod tests {
     #[test]
     fn concurrent_identical_bodies_share_receipt_lifetime() {
         let registry = ReceiptRegistry::default();
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
         let barrier = std::sync::Barrier::new(8);
@@ -193,7 +196,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        registry.register(Arc::new(block.as_ref().clone()))
+                        registry.register(&Arc::new(block.as_ref().clone()))
                     })
                 })
                 .collect();
@@ -206,31 +209,31 @@ mod tests {
         assert!(receipts.iter().all(|receipt| receipt.order == order));
         drop(receipts);
         assert!(registry.0.lock().unwrap().is_empty());
-        assert!(registry.register(block).order > order);
+        assert!(registry.register(&block).order > order);
     }
 
     #[test]
     fn overlapping_receipts_keep_priority_until_the_last_caller_finishes() {
         let registry = ReceiptRegistry::default();
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        let block: Arc<zakura_chain::block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
-        let first = registry.register(block.clone());
+        let first = registry.register(&block);
         let original_order = first.order;
-        let duplicate = registry.register(Arc::new(block.as_ref().clone()));
+        let duplicate = registry.register(&Arc::new(block.as_ref().clone()));
         assert_eq!(duplicate.order, original_order);
 
         let mut malformed = block.as_ref().clone();
         malformed.transactions.clear();
         assert_eq!(malformed.hash(), block.hash());
-        let malformed = registry.register(Arc::new(malformed));
+        let malformed = registry.register(&Arc::new(malformed));
         assert!(malformed.order > original_order);
 
         drop((first, malformed));
-        assert_eq!(registry.register(block.clone()).order, original_order);
+        assert_eq!(registry.register(&block).order, original_order);
         drop(duplicate);
         assert!(registry.0.lock().unwrap().is_empty());
         assert_eq!(Arc::strong_count(&block), 1);
-        assert!(registry.register(block).order > original_order);
+        assert!(registry.register(&block).order > original_order);
     }
 }

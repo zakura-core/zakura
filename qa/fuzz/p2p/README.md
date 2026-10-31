@@ -28,3 +28,26 @@ correction remains intact. Decoder 1 keeps the original byte interpretation.
 The request-lifecycle target follows the B4 pure-state port. Other machine
 targets follow their owning delivery packets. Shared replay integration and
 campaign scheduling remain open. No fuzz campaign blocks PR CI.
+
+## Sequencer targets
+
+| Target | Property | Decoder |
+| --- | --- | --- |
+| `block_sequencer_order` | `block/contiguous-submission` | 1 |
+| `block_sequencer_reset` | `block/retired-apply-isolation` | 1 |
+| `block_sequencer_evidence` | `block/required-evidence` | 1 |
+
+These targets preserve PR #1680 at
+`3bc8261c6d1a0c1ec1daf55d361f5a33e34b5a8d`. Each target uses the independent
+model from its proptest driver. Ordering and evidence consume three-byte
+operations. Reset consumes one byte for the retired-apply count, then three-byte
+operations. Each decoder reads at most 512 bytes. Empty input reports zero
+applicability. Setup transitions do not count as generated coverage.
+
+The ordering witness retries a refused contiguous submission. The reset witness
+completes a retired apply while current work remains. The evidence witness holds
+required evidence through modeled backpressure, then delivers it. Planted state
+corruption must fail the intended model check. These checks do not establish
+production-mutation detection, decoded-memory retention, actual channel delivery,
+or fresh-process semantic replay. The block fixture copies public mainnet block
+1 from `zakura-test/src/vectors/block-main-0-000-001.txt`.

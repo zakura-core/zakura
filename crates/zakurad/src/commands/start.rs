@@ -932,7 +932,9 @@ impl StartCmd {
         {
             let genesis_hash = block_verifier_router
                 .clone()
-                .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+                .oneshot(zakura_consensus::Request::Commit(
+                    regtest_genesis_block().into(),
+                ))
                 .await
                 .expect("should validate Regtest genesis block");
 
@@ -2342,6 +2344,9 @@ mod zakura_header_sync_driver_tests {
             frontiers,
             best_header_tip,
             header_tip,
+            (config)
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             config,
         );
         startup.committed_views = Some(test_committed_views(frontiers, best_header_tip));
@@ -2863,7 +2868,7 @@ mod zakura_header_sync_driver_tests {
             unavailable,
             owner,
             source,
-            block.clone(),
+            block.clone().into(),
             BlockApplyClass::Full,
         )
         .await;
@@ -2890,7 +2895,8 @@ mod zakura_header_sync_driver_tests {
             }
         });
         let invalid_outcome =
-            commit_block_sync_body(invalid, owner, source, block, BlockApplyClass::Full).await;
+            commit_block_sync_body(invalid, owner, source, block.into(), BlockApplyClass::Full)
+                .await;
         assert!(matches!(
             invalid_outcome.verification(),
             zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(
@@ -3063,11 +3069,11 @@ mod zakura_header_sync_driver_tests {
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
 
         assert_eq!(
-            block_apply_class(&block1, block::Height(1)),
+            block_apply_class((&block1).into(), block::Height(1)),
             BlockApplyClass::Checkpoint
         );
         assert_eq!(
-            block_apply_class(&block2, block::Height(1)),
+            block_apply_class((&block2).into(), block::Height(1)),
             BlockApplyClass::Full
         );
     }
@@ -3166,7 +3172,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 7,
-                block,
+                block: block.into(),
             })
             .await
             .expect("submit action queues");
@@ -3634,7 +3640,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -3893,7 +3899,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -3902,7 +3908,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -3986,7 +3992,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -3995,7 +4001,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4049,7 +4055,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4065,7 +4071,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4113,7 +4119,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4129,7 +4135,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4180,7 +4186,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4196,7 +4202,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4266,7 +4272,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 77,
-                block: block.clone(),
+                block: block.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4346,7 +4352,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4364,7 +4370,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("second block queues behind the full apply limit");
@@ -4466,7 +4472,7 @@ mod zakura_header_sync_driver_tests {
                     owner: test_block_work_owner(),
                     source: test_block_source(),
                     token,
-                    block,
+                    block: block.into(),
                 })
                 .await
                 .expect("driver action channel stays open during submit storm");
@@ -4535,7 +4541,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1.clone(),
+                block: block1.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -4551,7 +4557,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2.clone(),
+                block: block2.clone().into(),
             })
             .await
             .expect("queued block can be submitted before shutdown");
@@ -4654,7 +4660,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block1,
+                block: block1.into(),
             })
             .await
             .unwrap();
@@ -4669,7 +4675,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block2,
+                block: block2.into(),
             })
             .await
             .unwrap();
@@ -4737,7 +4743,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block,
+                block: block.into(),
             })
             .unwrap();
         let closure_count = Arc::new(AtomicUsize::new(0));
@@ -4787,7 +4793,7 @@ mod zakura_header_sync_driver_tests {
         let source = test_block_source();
 
         let Some((height, hash, result, event)) =
-            abandoned_block_apply_finished_event(owner, source, 99, block.as_ref())
+            abandoned_block_apply_finished_event(owner, source, 99, block.as_ref().into())
         else {
             panic!("test block has a coinbase height");
         };
@@ -4850,7 +4856,7 @@ mod zakura_header_sync_driver_tests {
                     verifier,
                     test_block_work_owner(),
                     test_block_source(),
-                    block.clone(),
+                    block.clone().into(),
                     class,
                 ),
             )
@@ -4932,7 +4938,7 @@ mod zakura_header_sync_driver_tests {
             test_block_work_owner(),
             test_block_source(),
             1,
-            block,
+            block.into(),
             BlockApplyClass::Checkpoint,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
@@ -4992,7 +4998,7 @@ mod zakura_header_sync_driver_tests {
             test_block_work_owner(),
             test_block_source(),
             77,
-            block,
+            block.into(),
             BlockApplyClass::Full,
             trace,
             None,
@@ -5073,7 +5079,7 @@ mod zakura_header_sync_driver_tests {
             test_block_work_owner(),
             test_block_source(),
             88,
-            block,
+            block.into(),
             BlockApplyClass::Full,
             trace,
             None,
@@ -5159,7 +5165,7 @@ mod zakura_header_sync_driver_tests {
                 test_block_work_owner(),
                 test_block_source(),
                 89,
-                block,
+                block.into(),
                 BlockApplyClass::Full,
                 zakura_network::zakura::ZakuraTrace::noop(),
                 None,
@@ -5290,7 +5296,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block,
+                block: block.into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -5384,7 +5390,7 @@ mod zakura_header_sync_driver_tests {
                     owner: test_block_work_owner(),
                     source: test_block_source(),
                     token: u64::try_from(token).expect("test token fits in u64"),
-                    block: block.clone(),
+                    block: block.clone().into(),
                 })
                 .await
                 .expect("driver action channel stays open");
@@ -5485,7 +5491,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block: block.clone(),
+                block: block.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -5494,7 +5500,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 2,
-                block: block.clone(),
+                block: block.clone().into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -5645,7 +5651,7 @@ mod zakura_header_sync_driver_tests {
                     owner: test_block_work_owner(),
                     source: test_block_source(),
                     token: u64::from(height.0),
-                    block: block.clone(),
+                    block: block.clone().into(),
                 })
                 .await
                 .expect("driver action channel stays open");
@@ -5686,7 +5692,9 @@ mod zakura_header_sync_driver_tests {
             .find(|(height, _)| height.0 == WITHHELD)
             .expect("withheld block is part of the test chain");
         legacy_verifier
-            .oneshot(withheld_block.clone())
+            .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
+                withheld_block.clone(),
+            ))
             .await
             .expect("legacy verifier submission completes the checkpoint range");
 
@@ -5772,7 +5780,7 @@ mod zakura_header_sync_driver_tests {
                 owner: test_block_work_owner(),
                 source: test_block_source(),
                 token: 1,
-                block,
+                block: block.into(),
             })
             .await
             .expect("driver action channel stays open");
@@ -5897,7 +5905,7 @@ mod zakura_header_sync_driver_tests {
                     owner: test_block_work_owner(),
                     source: test_block_source(),
                     token: u64::from(height.0),
-                    block: block.clone(),
+                    block: block.clone().into(),
                 })
                 .await
                 .expect("driver action channel stays open");
@@ -6011,7 +6019,13 @@ mod zakura_header_sync_driver_tests {
         let mut commits = FuturesUnordered::new();
         for (_height, block) in chain {
             let checkpoint_verifier = checkpoint_verifier.clone();
-            commits.push(async move { checkpoint_verifier.oneshot(block).await });
+            commits.push(async move {
+                checkpoint_verifier
+                    .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
+                        block,
+                    ))
+                    .await
+            });
         }
         while let Some(result) = commits.next().await {
             result.expect("checkpoint verifier commits the contiguous range");

@@ -230,7 +230,7 @@ pub fn spawn_block_sync_reactor(
     let mut retry_jitter_seed = [0u8; 32];
     zakura_rt::rand::rng().fill_bytes(&mut retry_jitter_seed);
 
-    let sequencer_task = SequencerTask::new(
+    let sequencer_task = SequencerIO::new(
         sequencer,
         state.work_queue.clone(),
         registry.clone(),
@@ -247,6 +247,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
+        startup.decoded_pool.clone(),
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
@@ -265,6 +266,7 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        decoded_pool: startup.decoded_pool.clone(),
         request_pool: crate::zakura::regulation::ReservationPool::new(BS_REQUEST_POOL_ENTRIES)
             .expect("the protocol request ceiling is positive and representable"),
         serving: Arc::new(super::regulated::session::Serving::new(

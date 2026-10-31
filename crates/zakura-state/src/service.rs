@@ -683,7 +683,7 @@ impl StateService {
         // This method must not block, access the database, or perform CPU-intensive tasks,
         // because it is called directly from the tokio executor's Future threads.
 
-        let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
+        let queued_prev_hash = checkpoint_verified.block.header().previous_block_hash;
         let queued_height = checkpoint_verified.height;
 
         // If we're close to the final checkpoint, make the block's UTXOs available for
@@ -1039,7 +1039,7 @@ impl StateService {
         admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
-        let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let parent_hash = semantically_verified.block.header().previous_block_hash;
         let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
@@ -1272,7 +1272,7 @@ impl StateService {
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
-                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let candidate_parent = queued_child.0.block.header().previous_block_hash;
                     let optimistic_relay_still_authorized = self
                         .optimistic_relay_still_authorized(admission.as_ref(), candidate_parent);
                     let send_result =
@@ -2742,9 +2742,9 @@ where
                         .block(height.into())
                         .map(|block| {
                             (
-                                block.block.sapling_transactions_count(),
-                                block.block.orchard_transactions_count(),
-                                block.block.ironwood_transactions_count(),
+                                block.block.view().sapling_transactions_count(),
+                                block.block.view().orchard_transactions_count(),
+                                block.block.view().ironwood_transactions_count(),
                                 block.block.auth_data_root(),
                             )
                         })
@@ -3106,7 +3106,9 @@ impl Service<ReadRequest> for ReadStateService {
                     MAX_FIND_BLOCK_HEADERS_RESULTS,
                 )
                 .into_iter()
-                .map(|header| CountedHeader { header })
+                .map(|header| CountedHeader {
+                    header: Arc::new(*header),
+                })
                 .collect(),
             )),
 
@@ -3626,7 +3628,7 @@ impl Service<ReadRequest> for ReadStateService {
                     );
                 };
 
-                if semantically_verified.block.header.previous_block_hash != best_tip_hash {
+                if semantically_verified.block.header().previous_block_hash != best_tip_hash {
                     return Err("proposal is not based on the current best chain tip: \
                                     previous block hash must be the best chain tip"
                         .into());
@@ -3721,14 +3723,14 @@ fn check_prepared_mined_relay_eligibility_for_state(
     db: &ZakuraDb,
     commitment: BlockCommitmentData,
 ) -> Result<PreparedMinedRelayEligibility, BoxError> {
-    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_hash = commitment.block.header().previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
     let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());
     let history_tree = match history_tree {
         Some(history_tree) => history_tree,
         None if matches!(
-            commitment.block.commitment(network)?,
+            commitment.block.view().commitment(network)?,
             block::Commitment::PreSaplingReserved(_)
                 | block::Commitment::FinalSaplingRoot(_)
                 | block::Commitment::ChainHistoryActivationReserved

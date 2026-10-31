@@ -1443,6 +1443,8 @@ pub enum BlockSyncFact {
     },
     /// The sequencer's retained bodies.
     Sequencer {
+        /// Every runtime payload, independently of policy membership.
+        payloads: Vec<BlockSyncPayload>,
         /// Each reorder-buffer body.
         reorder: Vec<BlockSyncRetained>,
         /// Each `applying` body.
@@ -1559,9 +1561,22 @@ pub struct BlockSyncWorkItem {
     pub reserved_bytes: u64,
 }
 
+/// A payload read directly from sequencer runtime storage.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct BlockSyncPayload {
+    /// Runtime identity assigned before policy acceptance.
+    pub id: u64,
+    /// Attributed decoded size measured from the actual payload.
+    pub decoded_attributed_memory_bytes: u64,
+}
+
 /// A reorder-buffer or `applying` body in the sequencer's snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BlockSyncRetained {
+    /// Runtime payload identity.
+    pub payload_id: u64,
+    /// Decoded size recorded in sequencing policy.
+    pub policy_decoded_bytes: u64,
     /// The body.
     #[serde(flatten)]
     pub body: BlockSyncBody,

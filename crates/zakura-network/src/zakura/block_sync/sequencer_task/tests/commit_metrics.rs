@@ -105,7 +105,7 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                     let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
                     let meter_start = Instant::now();
                     let budget = ByteBudget::new(123);
-                    let mut task = SequencerTask::new(
+                    let mut task = SequencerIO::new(
                         Sequencer::new(block::Height(0), 1),
                         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                         Arc::new(PeerRegistry::new()),
@@ -122,6 +122,9 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         view_tx,
                         Duration::from_secs(1),
                         ZakuraTrace::noop(),
+                        ZakuraBlockSyncConfig::default()
+                            .decoded_block_pool(10_000)
+                            .expect("fixture decoded allowance fits"),
                     );
                     let mut body = queued_test_body(input_bytes, input_decoded_bytes);
                     body.leave_queue();
@@ -139,18 +142,18 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                     let height = block.coinbase_height().expect("test block has a height");
                     let hash = block.hash();
                     if frontier_first {
-                        task.handle_frontier_advance(
-                            BlockSyncFrontiers {
+                        task.handle_control_input(SequencerControlInput::FrontierAdvance {
+                            frontiers: BlockSyncFrontiers {
                                 finalized_height: height,
                                 verified_block_tip: height,
                                 verified_block_hash: hash,
                             },
-                            true,
-                        )
+                            release_applied: true,
+                        })
                         .await;
-                        assert_eq!(task.sequencer.applying_len(), 0);
+                        assert_eq!(task.state.sequencer().applying_len(), 0);
                     }
-                    assert_eq!(task.sequencer.in_flight_submission_count(), 1);
+                    assert_eq!(task.state.sequencer().in_flight_submission_count(), 1);
 
                     // A mismatched completion must leave the real submission
                     // available to its later exact completion.
@@ -165,15 +168,16 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         (owner, source, token, block::Height(99), hash),
                         (owner, source, token, height, wrong_hash),
                     ] {
-                        let mut outcome =
+                        let outcome =
                             super::super::test_block_apply_outcome(BlockApplyResult::Committed);
-                        task.handle_apply_finished(
+                        finish_apply(
+                            &mut task,
                             identity.0,
                             identity.1,
                             identity.2,
                             identity.3,
                             identity.4,
-                            &mut outcome,
+                            outcome,
                             BTreeSet::new(),
                             None,
                             None,
@@ -181,27 +185,28 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                         )
                         .await;
                         assert_eq!(recorder.bytes.load(Ordering::Relaxed), 0);
-                        assert_eq!(task.sequencer.in_flight_submission_count(), 1);
+                        assert_eq!(task.state.sequencer().in_flight_submission_count(), 1);
                     }
 
                     let semantic = semantic_current
                         .then_some((owner, zakura_header_chain::StateVersion::new(1)));
                     for _ in 0..2 {
-                        let mut outcome = super::super::test_block_apply_outcome(result);
-                        task.handle_apply_finished(
+                        let outcome = super::super::test_block_apply_outcome(result);
+                        finish_apply(
+                            &mut task,
                             owner,
                             source,
                             token,
                             height,
                             hash,
-                            &mut outcome,
+                            outcome,
                             BTreeSet::new(),
                             None,
                             semantic,
                             Some(owner.authority.body_work_epoch),
                         )
                         .await;
-                        assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+                        assert_eq!(task.state.sequencer().in_flight_submission_count(), 0);
                     }
                     let counted = cfg!(feature = "sync-metrics")
                         && matches!(result, BlockApplyResult::Committed);

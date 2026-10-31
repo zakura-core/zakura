@@ -764,7 +764,7 @@ impl HeaderChainWriter {
                         "checkpoint full-state height does not extend the verified header frontier",
                     )
                 })?
-            || block.block.header.previous_block_hash != snapshot.frontiers.verified_best.hash
+            || block.block.header().previous_block_hash != snapshot.frontiers.verified_best.hash
         {
             return Err(HeaderChainStoreError::Incoherent(
                 "checkpoint full state does not extend the verified header frontier",
@@ -774,7 +774,7 @@ impl HeaderChainWriter {
         let path = vec![VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: Arc::new(*block.block.header()),
         }];
         let evidence = checkpoint_finality_evidence(snapshot.state_version, accepted);
         let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
@@ -1053,7 +1053,7 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: Arc::new(*block.block.header()),
         })
         .collect()
 }
@@ -1065,7 +1065,7 @@ fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: Arc::new(*block.block.header()),
         })
         .collect::<Vec<_>>();
     headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
@@ -1097,7 +1097,7 @@ fn verified_side_paths(
                 .map(|block| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: Arc::new(*block.block.header()),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1179,7 +1179,7 @@ fn verified_path_through(
                 .map(|(_, block)| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: Arc::new(*block.block.header()),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1607,7 +1607,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         initial_checks_start.elapsed(),
     );
     let result = initial_checks.and_then(|()| {
-        let parent_hash = prepared.block.header.previous_block_hash;
+        let parent_hash = prepared.block.header().previous_block_hash;
 
         if finalized_state.finalized_tip_hash() == parent_hash {
             non_finalized_state.commit_new_chain_with_metrics(
@@ -3189,7 +3189,7 @@ impl WriteBlockWorkerTask {
                     .record(writer_queue_duration);
             }
             let child_hash = queued_child.hash;
-            let parent_hash = queued_child.block.header.previous_block_hash;
+            let parent_hash = queued_child.block.header().previous_block_hash;
             let child_height = queued_child.height;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
 

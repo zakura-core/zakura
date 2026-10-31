@@ -20,6 +20,9 @@
 //! matched-body path, and unmatched-body paths run in the same task.
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
+use zakura_node_services::block_memory::{
+    Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock,
+};
 
 use zakura_rt::{
     collections::HashSet,
@@ -196,10 +199,12 @@ fn liveness_grace_allowed(
             .is_some_and(|since| now.saturating_duration_since(since) < request_timeout)
 }
 
-/// Records decoded-memory metrics for an accepted block and returns its attributed size.
+/// Record the admission attempt's measured decoded-memory size.
 /// The decoded-to-serialized ratio is omitted when the wire size is missing or zero.
-fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>) -> u64 {
-    let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+fn record_decoded_memory_size(
+    decoded_attributed_memory_size_bytes: u64,
+    body_wire_bytes: Option<u64>,
+) {
     // Metrics accepts f64 samples; these lossy conversions are observability-only.
     metrics::histogram!(
         "sync.block.body.decoded.attributed_memory_size_bytes",
@@ -213,7 +218,6 @@ fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>
         )
         .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
     }
-    decoded_attributed_memory_size_bytes
 }
 
 /// Whether a body's transactions are the ones its header commits to: their
@@ -334,7 +338,9 @@ enum Disposition {
 }
 
 /// Keeps a receipt charge live until the synchronous send finishes or unwinds.
-struct ReceiptSettlement {
+/// Other peers can serve the floor while this peer transfers and settles its body.
+struct ReceiptSettlement<'a> {
+    _blocked: HandoffBlocked<'a>,
     funding: Option<crate::zakura::transport::ByteReservation>,
     #[cfg(any(test, zakura_sim))]
     observer: super::block_sync_observe::ObserverSlot,
@@ -346,18 +352,23 @@ struct ReceiptSettlement {
     height: block::Height,
 }
 
-impl ReceiptSettlement {
+impl<'a> ReceiptSettlement<'a> {
     fn new(
-        routine: &PeerRoutine,
+        routine: &'a PeerRoutine,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         funding: crate::zakura::transport::ByteReservation,
     ) -> Self {
+        // A concurrent ranker must skip this peer if the transfer is preempted.
+        // The synchronous transfer does not need to wake parked rankers.
+        routine.handoff_blocked.store(true, Ordering::Relaxed);
+        let blocked = HandoffBlocked(&routine.handoff_blocked);
         #[cfg(any(test, zakura_sim))]
         routine.observe_handoff_started(owner, height, funding.bytes());
         #[cfg(not(any(test, zakura_sim)))]
         let _ = (routine, owner, height);
         Self {
+            _blocked: blocked,
             funding: Some(funding),
             #[cfg(any(test, zakura_sim))]
             observer: routine.observer.clone(),
@@ -371,7 +382,7 @@ impl ReceiptSettlement {
     }
 }
 
-impl Drop for ReceiptSettlement {
+impl Drop for ReceiptSettlement<'_> {
     fn drop(&mut self) {
         let funding = self
             .funding
@@ -516,6 +527,7 @@ pub(super) struct PeerRoutine {
     /// This generation's registry flag, set while the routine is blocked on
     /// its sequencer handoff (see [`HandoffBlocked`]).
     handoff_blocked: Arc<AtomicBool>,
+    decoded_pool: DecodedBlockPool,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -572,6 +584,7 @@ impl PeerRoutine {
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
+        decoded_pool: DecodedBlockPool,
     ) -> Self {
         let source_digest: [u8; 32] = peer.as_bytes().try_into().expect(
             "block-sync peers have 32-byte identities because they are authenticated Iroh nodes",
@@ -593,6 +606,7 @@ impl PeerRoutine {
         );
         let handoff_blocked = registry.handoff_blocked_flag(&peer, generation);
         PeerRoutine {
+            decoded_pool,
             requester,
             request_pool_waiting: false,
             serving,
@@ -2066,10 +2080,10 @@ impl PeerRoutine {
                 .accept_unmatched_queued_body(
                     height,
                     hash,
-                    block.clone(),
+                    block,
                     body_wire_bytes,
                     body_permit,
-                    raw_block_payload.clone(),
+                    raw_block_payload,
                 )
                 .await
             {
@@ -2226,8 +2240,12 @@ impl PeerRoutine {
             self.accept_already_settled_height(key, height);
             return;
         };
-        let decoded_attributed_memory_size_bytes =
-            record_decoded_memory_size(&block, body_wire_bytes);
+        let previous_block_hash = block.header.previous_block_hash;
+        let Ok((block, decoded_attributed_memory_size_bytes)) = self.admit_decoded_body(block)
+        else {
+            return;
+        };
+        record_decoded_memory_size(decoded_attributed_memory_size_bytes, body_wire_bytes);
         self.trace_body_received(
             height,
             serialized_bytes,
@@ -2280,9 +2298,9 @@ impl PeerRoutine {
             outstanding_owner,
             height,
             hash,
+            previous_block_hash,
             block,
             raw_block_payload,
-            decoded_attributed_memory_size_bytes,
             serialized_bytes,
             Some(estimated_bytes),
             body_permit,
@@ -2321,34 +2339,66 @@ impl PeerRoutine {
 
     // ===================== unmatched fallthroughs (ported) ==================
 
+    /// Adopt the parser's exclusive payloads before retaining a decoded body.
+    /// Refusal keeps only the raw frame for a later admission attempt.
+    fn admit_decoded_body(
+        &self,
+        block: Arc<block::Block>,
+    ) -> Result<(Option<OwnedBlock>, u64), AdmissionFailure> {
+        if self.decoded_pool.is_closed() {
+            self.cancel.cancel();
+            return Err(AdmissionFailure::Closed);
+        }
+        let block = match Arc::try_unwrap(block) {
+            Ok(block) => block,
+            Err(block) => return Ok((None, block.attributed_memory_size_bytes())),
+        };
+        match self.decoded_pool.try_admit(block, Admission::WithinLimit) {
+            Ok(block) => {
+                let bytes = block.decoded_bytes();
+                Ok((Some(block), bytes))
+            }
+            Err(rejected) => {
+                if !matches!(
+                    rejected.reason,
+                    AdmissionFailure::Capacity | AdmissionFailure::AliasedPayload
+                ) {
+                    self.decoded_pool.close();
+                    self.cancel.cancel();
+                    return Err(rejected.reason);
+                }
+                Ok((None, rejected.decoded_bytes))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_body_to_sequencer(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         hash: block::Hash,
-        block: Arc<block::Block>,
+        previous_block_hash: block::Hash,
+        block: Option<OwnedBlock>,
         raw_block_payload: Arc<[u8]>,
-        decoded_attributed_memory_size_bytes: u64,
         serialized_bytes: u64,
         admitted_estimate_bytes: Option<u64>,
         body_permit: mpsc::OwnedPermit<SequencedBody>,
     ) {
         let received_at = Instant::now();
         let sequencer_send_started = time::Instant::now();
-        let previous_block_hash = block.header.previous_block_hash;
         // The body owns the decoded charge from here, with no await between.
-        let charged = charge_decoded_handoff(
-            &self.sequencer_input_decoded_attributed_memory_bytes,
-            &self.sequencer_view,
-            decoded_attributed_memory_size_bytes,
-        );
-        let body = BufferedBlockBody::for_handoff(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-            charged,
-        );
+        let charged = block.as_ref().is_some_and(|block| {
+            charge_decoded_handoff(
+                &self.sequencer_input_decoded_attributed_memory_bytes,
+                &self.sequencer_view,
+                block.decoded_bytes(),
+            )
+        });
+        let body = match block {
+            Some(block) => BufferedBlockBody::for_handoff(block, raw_block_payload, charged),
+            None => BufferedBlockBody::RawFramePayload(raw_block_payload),
+        };
         let body = SequencedBody::new_handed_off(
             owner,
             self.source,
@@ -2518,8 +2568,12 @@ impl PeerRoutine {
             (settlement.funding, Some(settlement.charge))
         };
 
-        let decoded_attributed_memory_size_bytes =
-            record_decoded_memory_size(&block, body_wire_bytes);
+        let previous_block_hash = block.header.previous_block_hash;
+        let Ok((block, decoded_attributed_memory_size_bytes)) = self.admit_decoded_body(block)
+        else {
+            return true;
+        };
+        record_decoded_memory_size(decoded_attributed_memory_size_bytes, body_wire_bytes);
         self.record_received(serialized_bytes);
         self.trace_body_received(
             height,
@@ -2550,9 +2604,9 @@ impl PeerRoutine {
             owner,
             height,
             hash,
+            previous_block_hash,
             block,
             raw_block_payload,
-            decoded_attributed_memory_size_bytes,
             serialized_bytes,
             admitted_estimate_bytes,
             body_permit,
@@ -3073,6 +3127,9 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         (routine, out_recv, routine_to_reactor_rx)
     }
@@ -3636,6 +3693,9 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -3742,6 +3802,9 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         // The routine learns these from a `Status` frame in production; set them directly
         // so a single `try_fill` pass exercises the floor arm.
@@ -3854,6 +3917,9 @@ mod tests {
             view,
             cancel,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4084,6 +4150,9 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4346,6 +4415,9 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.handle_status(super::BlockSyncStatus {
             servable_low: block::Height(1),
@@ -4533,6 +4605,9 @@ mod tests {
             view_rx,
             cancel,
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.received_status = true;
         routine.servable_low = block::Height(1);
@@ -4856,6 +4931,9 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         if unanswered {
             routine.handle_status(super::BlockSyncStatus {
@@ -5123,6 +5201,9 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
@@ -5189,6 +5270,26 @@ mod tests {
         applying_decoded_bytes: u64,
         queued_decoded_bytes: u64,
     ) -> (u64, SequencedBody, u64) {
+        hand_off_mainnet_block_1_with_pool(
+            applying_decoded_bytes,
+            queued_decoded_bytes,
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .unwrap(),
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn hand_off_mainnet_block_1_with_pool(
+        applying_decoded_bytes: u64,
+        queued_decoded_bytes: u64,
+        pool: zakura_node_services::block_memory::DecodedBlockPool,
+        late: bool,
+        close_decoded_pool: bool,
+    ) -> Option<(u64, SequencedBody, u64)> {
         use zakura_chain::serialization::ZcashDeserializeInto;
 
         use crate::zakura::ServicePeerDirection;
@@ -5254,6 +5355,7 @@ mod tests {
             view_rx,
             cancel.clone(),
             ZakuraTrace::noop(),
+            pool.clone(),
         );
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),
@@ -5269,6 +5371,40 @@ mod tests {
             .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
             .await
             .unwrap();
+        let competing_claim = if late {
+            let key = routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .unwrap();
+            routine.finish_outstanding_at(key, super::Disposition::RetryOriginal);
+            assert!(routine
+                .window
+                .outstanding_key_for_height(block::Height(1))
+                .is_none());
+            Some(
+                routine
+                    .work
+                    .take_request(
+                        block::Height(1),
+                        block::Height(1),
+                        1,
+                        1_000_000,
+                        9_001,
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    )
+                    .admit(block::Height(0), CancellationToken::new())
+                    .unwrap()
+                    .publish(|_| {})
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let receipt_owner = routine.work.owner_for_height(block::Height(1)).unwrap();
+        let request_budget = routine.work.budget();
+        if close_decoded_pool {
+            pool.close();
+        }
         in_send
             .send(
                 BlockSyncMessage::Block(body.clone())
@@ -5281,14 +5417,112 @@ mod tests {
         let mut running = Box::pin(routine.run());
         let sequenced = tokio::select! {
             sequenced = sequencer_recv.recv() => sequenced,
-            _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
+            result = &mut running => {
+                assert!(close_decoded_pool && cancel.is_cancelled(), "the routine must stay alive until the body is sequenced: {result:?}");
+                assert!(result.is_ok(), "local accounting closure cancels the routine");
+                assert!(sequencer_recv.try_recv().is_err(), "closed decoded admission must not publish a raw fallback");
+                assert_eq!(input_decoded_bytes.load(std::sync::atomic::Ordering::Relaxed), queued_decoded_bytes);
+                drop(competing_claim);
+                assert_eq!(request_budget.reserved(), 0, "closure settles the accepted receipt's request funding");
+                return None;
+            },
         }
         .expect("the routine sequences the requested body");
+        assert!(
+            !close_decoded_pool,
+            "closed decoded admission must not publish a raw fallback"
+        );
+        assert_eq!(
+            sequenced.owner, receipt_owner,
+            "the receipt settles the current request owner"
+        );
+        drop(competing_claim);
         let queued = input_decoded_bytes.load(std::sync::atomic::Ordering::Relaxed);
         cancel.cancel();
         let result = timeout(Duration::from_secs(1), running).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
-        (body.attributed_memory_size_bytes(), sequenced, queued)
+        Some((body.attributed_memory_size_bytes(), sequenced, queued))
+    }
+
+    /// Measure one native framed receipt per peer connection. Run manually in release mode.
+    #[test]
+    #[ignore = "manual release performance measurement"]
+    #[allow(
+        clippy::print_stdout,
+        reason = "manual benchmark emits JSON measurements"
+    )]
+    fn native_decoded_handoff_performance() {
+        const TEST_NAME: &str =
+            "zakura::block_sync::peer_routine::tests::native_decoded_handoff_performance";
+        zakura_test::allocations::in_isolated_process(TEST_NAME, || {
+            async fn receipt(runtime: &tokio::runtime::Runtime, applying: u64, queued: u64) {
+                drop(std::hint::black_box(
+                    hand_off_mainnet_block_1(applying, queued).await,
+                ));
+                for _ in 0..100 {
+                    if runtime.metrics().num_alive_tasks() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    runtime.metrics().num_alive_tasks(),
+                    0,
+                    "connection teardown must finish its tasks"
+                );
+            }
+            let iterations: usize = std::env::var("NATIVE_HANDOFF_ITERATIONS")
+                .map_or(10_000, |value| {
+                    value.parse().expect("iteration count is numeric")
+                });
+            assert!(iterations > 0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let cap = super::super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES;
+            for (scenario, applying, queued) in [
+                ("decoded", 0, 0),
+                ("applying-saturated", cap, 0),
+                ("queue-saturated", 0, cap),
+            ] {
+                runtime.block_on(async {
+                    for _ in 0..64 {
+                        receipt(&runtime, applying, queued).await;
+                    }
+                });
+                let mut latency = Vec::with_capacity(iterations);
+                let started = std::time::Instant::now();
+                runtime.block_on(async {
+                    for _ in 0..iterations {
+                        let started = std::time::Instant::now();
+                        receipt(&runtime, applying, queued).await;
+                        latency.push(started.elapsed().as_nanos());
+                    }
+                });
+                let elapsed_ns = started.elapsed().as_nanos();
+                latency.sort_unstable();
+                let p50_ns = latency[iterations / 2];
+                let p95_ns = latency[(iterations - 1) * 95 / 100];
+                let p99_ns = latency[(iterations - 1) * 99 / 100];
+                println!("{{\"scenario\":\"{scenario}\",\"iterations\":{iterations},\"elapsed_ns\":{elapsed_ns},\"p50_ns\":{p50_ns},\"p95_ns\":{p95_ns},\"p99_ns\":{p99_ns}}}");
+                let allocation_iterations = 100;
+                let measurement = zakura_test::allocations::ProcessMeasurement::start();
+                runtime.block_on(async {
+                    for _ in 0..allocation_iterations {
+                        receipt(&runtime, applying, queued).await;
+                    }
+                });
+                let allocations = measurement.snapshot();
+                drop(measurement);
+                assert_eq!(
+                    allocations.retained_bytes, 0,
+                    "every measured connection releases its allocations"
+                );
+                println!("{{\"scenario\":\"{scenario}\",\"allocation_iterations\":{allocation_iterations},\"requests\":{},\"requested_bytes\":{},\"peak_live_bytes\":{},\"retained_bytes\":{}}}",
+                allocations.requests, allocations.requested_bytes, allocations.peak_live_bytes, allocations.retained_bytes);
+            }
+        });
     }
 
     /// With room in the decoded budget, the routine hands its decoded copy
@@ -5299,6 +5533,87 @@ mod tests {
         assert!(sequenced.body.is_decoded());
         assert_eq!(sequenced.body.decoded_attributed_memory_size_bytes(), size);
         assert_eq!(queued, size);
+    }
+
+    #[tokio::test]
+    async fn native_frame_handoff_keeps_final_holder_charged_and_refuses_when_full() {
+        use zakura_node_services::block_memory::{BlockHandle, DecodedBlockPool};
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(1).unwrap());
+            let (bytes, mut sequenced, queued) =
+                hand_off_mainnet_block_1_with_pool(0, 0, pool.clone(), late, false)
+                    .await
+                    .unwrap();
+            assert_eq!(queued, bytes);
+            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(pool.reserved_bytes(), bytes);
+            let block = sequenced.body.decoded_block(&pool).unwrap();
+            assert!(
+                matches!(block, BlockHandle::Owned(_)),
+                "the real frame decoder must retain an admitted owner"
+            );
+            assert_eq!(
+                block.view().attributed_memory_size_bytes(),
+                pool.reserved_bytes()
+            );
+            let retained = block.transaction(0).unwrap();
+            let hash = retained.hash();
+            drop(block);
+            drop(sequenced);
+            assert_eq!(retained.hash(), hash);
+            assert_eq!(
+                pool.reserved_bytes(),
+                bytes,
+                "downstream retention outlives the input queue"
+            );
+            let (_, refused, queued) =
+                hand_off_mainnet_block_1_with_pool(0, 0, pool.clone(), late, false)
+                    .await
+                    .unwrap();
+            assert!(
+                !refused.body.is_decoded(),
+                "a full pool retains only the original frame bytes"
+            );
+            assert_eq!(queued, 0);
+            assert_eq!(pool.reserved_blocks(), Some(1));
+            drop(refused);
+            drop(retained);
+            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_decoded_admission_stops_native_receipt_publication() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+        use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+        for late in [false, true] {
+            let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(2).unwrap());
+            let retained = pool
+                .try_admit(
+                    zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                        .zcash_deserialize_into()
+                        .unwrap(),
+                    Admission::WithinLimit,
+                )
+                .unwrap();
+            let bytes = retained.decoded_bytes();
+            assert!(
+                hand_off_mainnet_block_1_with_pool(0, 0, pool.clone(), late, true)
+                    .await
+                    .is_none()
+            );
+            assert!(pool.is_closed());
+            assert_eq!(pool.reserved_blocks(), Some(1));
+            assert_eq!(
+                pool.reserved_bytes(),
+                bytes,
+                "closure preserves earlier holders"
+            );
+            drop(retained);
+            assert_eq!(pool.reserved_blocks(), Some(0));
+            assert_eq!(pool.reserved_bytes(), 0);
+        }
     }
 
     /// The witness for #1522 under a slow verifier: once `applying`'s and the
@@ -5331,13 +5646,20 @@ mod tests {
     #[tokio::test]
     async fn a_tip_body_is_decoded_once() {
         use super::super::sequencer::Sequencer;
-        use super::super::sequencer_task::SequencerTask;
+        use super::super::sequencer_task::SequencerIO;
         use super::super::BlockSyncAction;
 
         let (_, mut sequenced, _) = hand_off_mainnet_block_1(0, 0).await;
         assert!(sequenced.body.is_decoded());
         // The body holds the routine's decode, so this reads it back.
-        let routine_decode = sequenced.body.decoded_block();
+        let routine_decode = sequenced
+            .body
+            .decoded_block(
+                &ZakuraBlockSyncConfig::default()
+                    .decoded_block_pool(10_000)
+                    .unwrap(),
+            )
+            .unwrap();
 
         let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
@@ -5345,7 +5667,7 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let budget = ByteBudget::new(1_000_000);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
@@ -5362,6 +5684,9 @@ mod tests {
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
+            ZakuraBlockSyncConfig::default()
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
         );
         body_tx
             .try_send(sequenced)
@@ -5376,7 +5701,19 @@ mod tests {
         let BlockSyncAction::SubmitBlock { block, .. } = action else {
             panic!("expected a body submission, got {action:?}");
         };
-        assert!(Arc::ptr_eq(&block, &routine_decode));
+        assert!(matches!(
+            block,
+            zakura_node_services::block_memory::BlockHandle::Owned(_)
+        ));
+        assert_eq!(block, routine_decode);
+        assert!(std::ptr::eq(block.header(), routine_decode.header()));
+        for (submitted, received) in block
+            .view()
+            .transactions()
+            .zip(routine_decode.view().transactions())
+        {
+            assert!(std::ptr::eq(submitted, received));
+        }
     }
 
     #[test]

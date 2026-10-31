@@ -12,7 +12,8 @@
 //! workers and the fixture, and checks the budget's own reported maximum
 //! against them.
 //!
-//! Five properties read it:
+//! Six properties read it:
+//! - [`PAYLOAD_INVENTORY_AGREES`]: every captured runtime payload has a policy entry;
 //! - [`RETAINED_BYTE_BOUND`]: retained wire bytes stay within
 //!   `L + 401·b + Q·b`, after every step;
 //! - [`RESERVED_BYTE_BOUND`]: the byte budget stays within `M + 2·B + h·B`,
@@ -64,12 +65,22 @@ use zakura_network::zakura::ZakuraBlockSyncConfig;
 use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
-    observe::{BlockSyncFact, BlockSyncHolder, BlockSyncRetained, StorageFact, WorkOwner},
+    observe::{
+        BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
+    },
     property::{
         CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Unit, Verdict,
     },
     Observation, ObservationLog,
 };
+
+/// Runtime payload identities and decoded sizes match policy at each captured sequencer boundary.
+///
+/// Sequencer IO enumerates its payload table after applying transition effects.
+/// Policy entries supply the expected identities and cached sizes. The tap records
+/// both sources with stable runtime IDs. This check covers captured boundaries;
+/// driver and backend retention require separate evidence.
+pub const PAYLOAD_INVENTORY_AGREES: &str = "block-sync/payload-inventory-agrees";
 
 /// Retained wire bytes stay within the derived bound.
 pub const RETAINED_BYTE_BOUND: &str = "block-sync/retained-byte-bound";
@@ -344,6 +355,10 @@ pub enum OwnerInput {
     /// The sequencer's snapshot lists `holders`: each holder other than its
     /// input queue, with its body's height and wire bytes.
     Snapshot {
+        /// All runtime payloads, independently read from storage.
+        payloads: Vec<BlockSyncPayload>,
+        /// Payload identities and sizes referenced by policy entries.
+        expected_payloads: Vec<BlockSyncPayload>,
         /// The listed holders, in the snapshot's order.
         holders: Vec<(BodyHolder, u32, u64)>,
     },
@@ -451,10 +466,19 @@ impl OwnerInput {
                 reserved: items.iter().map(|item| item.reserved_bytes).sum(),
             },
             BlockSyncFact::Sequencer {
+                payloads,
                 reorder,
                 applying,
                 submissions,
             } => {
+                let expected_payloads = reorder
+                    .iter()
+                    .chain(applying)
+                    .map(|body| BlockSyncPayload {
+                        id: body.payload_id,
+                        decoded_attributed_memory_bytes: body.policy_decoded_bytes,
+                    })
+                    .collect();
                 let retained = |holder: fn(u64) -> BodyHolder, body: &BlockSyncRetained| {
                     (holder(body.allocation), body.body.height, body.body.bytes)
                 };
@@ -473,6 +497,8 @@ impl OwnerInput {
                     (holder, submission.body.height, submission.body.bytes)
                 });
                 OwnerInput::Snapshot {
+                    payloads: payloads.clone(),
+                    expected_payloads,
                     holders: reorder.chain(applying).chain(submissions).collect(),
                 }
             }
@@ -549,6 +575,10 @@ pub struct OwnerModel {
     budget_gap: Option<String>,
     /// The first holder or handoff input the model couldn't apply.
     holder_gap: Option<String>,
+    /// Whether a completed sequencer boundary supplied a runtime inventory.
+    payloads_observed: bool,
+    /// First mismatch between actual payload storage and policy membership.
+    payload_gap: Option<String>,
 }
 
 /// The largest value each bound's quantity reached.
@@ -710,7 +740,28 @@ impl OwnerModel {
                 self.verified_tip = self.verified_tip.max(height);
             }
             OwnerInput::Links { made, open } => self.links = Some((made, open)),
-            OwnerInput::Snapshot { holders } => self.compare_snapshot(holders),
+            OwnerInput::Snapshot {
+                holders,
+                mut payloads,
+                mut expected_payloads,
+            } => {
+                self.payloads_observed = true;
+                payloads.sort_unstable();
+                expected_payloads.sort_unstable();
+                if payloads != expected_payloads && self.payload_gap.is_none() {
+                    let first = payloads
+                        .iter()
+                        .zip(&expected_payloads)
+                        .position(|(actual, expected)| actual != expected)
+                        .unwrap_or(payloads.len().min(expected_payloads.len()));
+                    self.payload_gap = Some(format!(
+                        "runtime payload inventory differs at {first}: actual {:?}, policy {:?}; counts {} and {}",
+                        payloads.get(first), expected_payloads.get(first),
+                        payloads.len(), expected_payloads.len(),
+                    ));
+                }
+                self.compare_snapshot(holders);
+            }
         }
     }
 
@@ -946,13 +997,23 @@ pub trait OwnerView {
     fn read_owners<T>(&self, read: impl FnOnce(&OwnerModel) -> T) -> T;
 }
 
-/// The five resource properties, all active. A harness registers them on a
+/// The six resource properties, all active. A harness registers them on a
 /// view that holds the node's [`OwnerModel`].
 pub fn resource_properties<S: HasView>() -> Vec<Property<S>>
 where
     S::View: OwnerView,
 {
     vec![
+        Property {
+            id: PropertyId::new(PAYLOAD_INVENTORY_AGREES),
+            claim: "runtime payload identities and measured decoded sizes match policy at each captured sequencer boundary",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status: Status::Active,
+            check: check_payload_inventory::<S>,
+            witness: Some(payload_retained),
+        },
         Property {
             id: PropertyId::new(RETAINED_BYTE_BOUND),
             claim: "retained wire bytes stay within L + 401·B + Q·B",
@@ -1013,6 +1074,29 @@ where
             witness: Some(routine_ended_owing),
         },
     ]
+}
+
+fn check_payload_inventory<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S::View: OwnerView,
+{
+    let (observed, gap) = cx
+        .view()
+        .read_owners(|owners| (owners.payloads_observed, owners.payload_gap.clone()));
+    if let Some(gap) = gap {
+        return cx.violated("runtime payload inventory matches policy", gap);
+    }
+    if observed {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+fn payload_retained(log: &ObservationLog) -> bool {
+    block_sync_facts(log).any(
+        |fact| matches!(fact, BlockSyncFact::Sequencer { payloads, .. } if !payloads.is_empty()),
+    )
 }
 
 /// True if no task can run after a step that left the scheduler at

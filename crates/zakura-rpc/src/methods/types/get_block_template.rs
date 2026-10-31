@@ -1073,7 +1073,7 @@ where
         .await
         .map_err(|error| ErrorObject::new(0, error.to_string()))?
         .call(zakura_consensus::Request::Prepare {
-            block: block.clone(),
+            block: block.clone().into(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;

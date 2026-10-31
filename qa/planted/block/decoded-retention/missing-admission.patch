@@ -1,0 +1,7 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -222,3 +222,3 @@
+             }
+-            let Some(next) = used.checked_add(units) else {
++            let Some(next) = used.checked_add(0) else {
+                 return Err(AdmissionFailure::Capacity);

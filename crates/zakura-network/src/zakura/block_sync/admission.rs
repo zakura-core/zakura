@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use zakura_chain::block;
+use zakura_node_services::block_memory::Admission;
 use zakura_rt::time::Instant;
 
 use super::{
@@ -173,14 +174,33 @@ pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
 /// verified tip — which advances only on commit — so the window cannot escalate with
 /// the download floor.
 fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
+    commit_window_top(snapshot.verified_block_tip)
+}
+
+fn commit_window_top(verified_tip: block::Height) -> block::Height {
     // Valid heights sit far below `u32::MAX`, so the saturation is unreachable; it
     // just keeps the arithmetic total.
     block::Height(
-        snapshot
-            .verified_block_tip
+        verified_tip
             .0
             .saturating_add(COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS),
     )
+}
+
+/// Retained-decode admission for a raw body entering the submission window.
+///
+/// Commit-window heights always decode, because a checkpoint range resolves only
+/// after every block in it is submitted. Refusing one could wedge the verified tip.
+/// Every refused height therefore enters the window as the tip advances.
+pub(super) fn submission_decode_admission(
+    verified_tip: block::Height,
+    height: block::Height,
+) -> Admission {
+    if height <= commit_window_top(verified_tip) {
+        Admission::PipelineExempt
+    } else {
+        Admission::WithinLimit
+    }
 }
 
 /// Wire bytes of block bodies retained by the pipeline: the single formula
@@ -302,12 +322,7 @@ pub(super) fn retain_received_body(
     height: block::Height,
     bytes: u64,
 ) -> bool {
-    let window_high = block::Height(
-        verified_tip
-            .0
-            .saturating_add(COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS),
-    );
-    height <= window_high
+    height <= commit_window_top(verified_tip)
         || (retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
             && bytes <= limit.saturating_sub(retained_bytes)
             && retained_bytes <= limit)
@@ -570,6 +585,49 @@ mod tests {
                 AdmissionOutcome::Admit(_)
             ),
             "the first gated height above the commit window must still be admissible",
+        );
+    }
+
+    #[test]
+    fn every_commit_window_height_can_decode_past_the_pipeline_bound() {
+        let tip = block::Height(1_000);
+        let top = block::Height(tip.0 + COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS);
+        for height in [block::Height(tip.0 + 1), top] {
+            assert_eq!(
+                submission_decode_admission(tip, height),
+                Admission::PipelineExempt
+            );
+        }
+        assert_eq!(
+            submission_decode_admission(tip, block::Height(top.0 + 1)),
+            Admission::WithinLimit
+        );
+    }
+
+    /// The bound has no tunable of its own, and every request gate fits under it.
+    #[test]
+    fn decoded_pipeline_bound_derives_from_the_reactor_budgets() {
+        use super::super::config::{
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
+        };
+
+        let mut config = ZakuraBlockSyncConfig::default();
+        let bound = config.decoded_pipeline_byte_bound();
+        assert_eq!(
+            bound,
+            config.effective_max_reorder_lookahead_bytes()
+                + (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * block::MAX_BLOCK_BYTES
+                    + u64::from(DEFAULT_BS_MAX_RESPONSE_BYTES))
+                    * DESERIALIZED_MEM_FACTOR
+        );
+        assert!(bound > BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES);
+
+        config.max_reorder_lookahead_bytes += 1;
+        assert_eq!(config.decoded_pipeline_byte_bound(), bound + 1);
+        config.max_response_bytes += 1;
+        assert_eq!(
+            config.decoded_pipeline_byte_bound(),
+            bound + 1 + DESERIALIZED_MEM_FACTOR
         );
     }
 

@@ -620,3 +620,123 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
         assert_eq!(pool.reserved_bytes(), 0);
     }
 }
+
+/// The verified tip cannot wait on the byte bound: a commit-window body decodes
+/// and submits while the bound is full. The driver's terminal handoff then frees
+/// the share while downstream retention keeps the retained charge.
+#[tokio::test]
+async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
+    use zakura_node_services::block_memory::Admission;
+
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(8).unwrap(), 1);
+    let blocker = pool
+        .try_admit(
+            Arc::try_unwrap(test_block()).unwrap(),
+            Admission::PipelineExempt,
+        )
+        .unwrap();
+    let blocker_bytes = blocker.decoded_bytes();
+    let mut task = retention_test_task(u64::MAX);
+    task.decoded_pool = pool.clone();
+    let (actions, mut actions_rx) = mpsc::channel(1);
+    task.actions = actions;
+    let block = test_block();
+    let raw = BlockSyncMessage::Block(block.clone())
+        .encode()
+        .unwrap()
+        .into();
+    let mut body = SequencedBody::new_queued(
+        super::super::test_work_owner(),
+        zakura_header_chain::SourceId::from_digest([1; 32]),
+        block::Height(1),
+        block.hash(),
+        block.header.previous_block_hash,
+        BufferedBlockBody::RawFramePayload(raw),
+        BLOCK_MAINNET_1_BYTES.len() as u64,
+        None,
+        ZakuraPeerId::new(vec![1; 32]).unwrap(),
+        Instant::now(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    body.leave_queue();
+    task.handle_accept_body(body);
+    assert_eq!(
+        task.state
+            .sequencer()
+            .applying_decoded_attributed_memory_bytes(),
+        0
+    );
+    task.submit_pending_blocks().await;
+
+    assert_eq!(task.decoded_capacity_blocked, None);
+    let BlockSyncAction::SubmitBlock {
+        block: submitted, ..
+    } = actions_rx.try_recv().expect("the window body submits")
+    else {
+        panic!("the commit-window body must submit");
+    };
+    let decoded_bytes = submitted.view().attributed_memory_size_bytes();
+    assert_eq!(
+        task.state
+            .sequencer()
+            .applying_decoded_attributed_memory_bytes(),
+        decoded_bytes,
+        "the policy total follows the raw body's decode"
+    );
+    assert_eq!(pool.pipeline_bytes(), blocker_bytes + decoded_bytes);
+
+    submitted.leave_pipeline();
+    assert_eq!(pool.pipeline_bytes(), blocker_bytes);
+    assert_eq!(pool.reserved_bytes(), blocker_bytes + decoded_bytes);
+    drop(blocker);
+    assert_eq!(pool.pipeline_bytes(), 0);
+    assert_eq!(pool.reserved_bytes(), decoded_bytes);
+}
+
+/// Raw bodies cost the decoded pool nothing. A refused decode keeps them raw, an
+/// admitted decode charges the measured size once, and reuse charges nothing more.
+#[test]
+fn decoded_byte_totals_follow_raw_to_decoded_changes() {
+    use zakura_node_services::block_memory::Admission;
+
+    let block = test_block();
+    let bytes = block.attributed_memory_size_bytes();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::new(8).unwrap(), bytes);
+    let blocker = pool
+        .try_admit(
+            Arc::try_unwrap(test_block()).unwrap(),
+            Admission::WithinLimit,
+        )
+        .unwrap();
+    let raw: Arc<[u8]> = BlockSyncMessage::Block(block).encode().unwrap().into();
+    let mut body = BufferedBlockBody::RawFramePayload(raw);
+
+    assert_eq!(
+        body.decoded_block(&pool, Admission::WithinLimit)
+            .unwrap_err(),
+        AdmissionFailure::Capacity
+    );
+    assert!(!body.is_decoded(), "refusal keeps the raw fallback");
+    assert_eq!(body.decoded_attributed_memory_size_bytes(), 0);
+    assert_eq!(pool.pipeline_bytes(), bytes);
+
+    blocker.leave_pipeline();
+    assert_eq!(pool.pipeline_bytes(), 0);
+    let decoded = body.decoded_block(&pool, Admission::WithinLimit).unwrap();
+    assert_eq!(body.decoded_attributed_memory_size_bytes(), bytes);
+    assert_eq!(pool.pipeline_bytes(), bytes);
+    let reused = body.decoded_block(&pool, Admission::WithinLimit).unwrap();
+    assert_eq!(pool.pipeline_bytes(), bytes, "reuse does not decode again");
+    assert_eq!(pool.reserved_bytes(), 2 * bytes);
+
+    body.retain_for_backlog_in_place();
+    assert_eq!(body.decoded_attributed_memory_size_bytes(), 0);
+    assert_eq!(pool.pipeline_bytes(), bytes, "live handles keep the charge");
+    drop((decoded, reused));
+    assert_eq!(pool.pipeline_bytes(), 0);
+    assert_eq!(pool.reserved_bytes(), bytes, "the backend holder remains");
+    drop(blocker);
+    assert_eq!(pool.reserved_bytes(), 0);
+    assert!(!pool.is_closed());
+}

@@ -829,9 +829,11 @@ impl ReactorIO {
         view: zakura_header_chain::CommittedHeaderChainView,
     ) {
         synchronize_persisted_body_alarm(&self.registry, Some(&view));
+        let lifecycle = self.state.queries.lifecycle();
         let update = self
             .state
             .observe_committed_view(view, time::Instant::now());
+        self.report_query_gate_change(lifecycle);
 
         if let Some((scope, hash)) = update.alarm_cleared {
             let _ = self
@@ -1388,7 +1390,10 @@ impl ReactorIO {
     /// The action channel's answer reaches [`ReactorState`] before this
     /// returns, so no other input observes the proposal.
     async fn query_needed_blocks_with_options(&mut self, force: bool) {
-        let start = match self.state.open_query(force) {
+        let lifecycle = self.state.queries.lifecycle();
+        let opening = self.state.open_query(force);
+        self.report_query_gate_change(lifecycle);
+        let start = match opening {
             QueryOpening::Closed => return,
             QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
             QueryOpening::NeedsWork => QueryStart::Work(self.query_work_facts()),

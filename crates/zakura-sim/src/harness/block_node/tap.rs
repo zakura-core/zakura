@@ -656,6 +656,7 @@ fn reactor_transition(transition: &ReactorTransition) -> BlockSyncReactorTransit
             scope: (*scope).into(),
             matched: *matched,
         },
+        ReactorTransition::QueryGateChanged => Fact::QueryGateChanged,
         ReactorTransition::RetryElapsed => Fact::RetryElapsed,
         ReactorTransition::View {
             reset,

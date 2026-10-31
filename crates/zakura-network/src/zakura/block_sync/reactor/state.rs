@@ -307,6 +307,9 @@ pub enum ReactorTransition {
         /// Whether it retired the pending query.
         matched: bool,
     },
+    /// A forced opening lifted the retry gate, or a covered range or a
+    /// body-size hint change retired the query state.
+    QueryGateChanged,
     /// The retry gate's deadline passed.
     RetryElapsed,
     /// A Sequencer view asked for a reaction.
@@ -513,6 +516,15 @@ pub(super) enum QueryPlan {
     Dispatch(QueryProposal),
 }
 
+/// The query state a [`ReactorTransition`] reports, for detecting a change
+/// that no input-specific transition names.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct QueryLifecycle {
+    pending: Option<PendingNeededQuery>,
+    retry_at: Option<Instant>,
+    retry_forced: bool,
+}
+
 /// The pending needed-block query, its retry gate, and the hint refresh.
 #[derive(Debug)]
 pub(super) struct QueryState {
@@ -545,6 +557,15 @@ impl QueryState {
 
     pub(super) fn pending(&self) -> Option<PendingNeededQuery> {
         self.pending
+    }
+
+    /// The pending query, the retry gate, and the owed force.
+    pub(super) fn lifecycle(&self) -> QueryLifecycle {
+        QueryLifecycle {
+            pending: self.pending,
+            retry_at: self.retry_at,
+            retry_forced: self.retry_forced,
+        }
     }
 
     #[cfg(any(test, feature = "p2p-fuzz"))]

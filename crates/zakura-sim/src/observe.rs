@@ -1509,6 +1509,9 @@ pub enum BlockSyncReactorTransition {
         /// Whether it retired the pending query.
         matched: bool,
     },
+    /// A forced opening lifted the retry gate, or a covered range or a
+    /// body-size hint change retired the query state.
+    QueryGateChanged,
     /// The retry gate's deadline passed.
     RetryElapsed,
     /// A Sequencer view asked for a reaction.

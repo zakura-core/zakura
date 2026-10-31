@@ -54,9 +54,10 @@ fn buffered_replay_keeps_the_same_transaction_allocation_bound() {
     body.retain_for_backlog_in_place();
     assert!(!body.is_decoded());
     let replayed = body
-        .decoded_block(&zakura_node_services::block_memory::DecodedBlockPool::new(
-            u64::MAX,
-        ))
+        .decoded_block(
+            &zakura_node_services::block_memory::DecodedBlockPool::new(u64::MAX),
+            zakura_node_services::block_memory::Admission::WithinLimit,
+        )
         .unwrap();
     assert_eq!(
         replayed.view().zcash_serialize_to_vec().unwrap(),

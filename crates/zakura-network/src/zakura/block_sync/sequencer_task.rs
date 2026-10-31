@@ -515,7 +515,9 @@ impl SequencerPayloads {
             ),
             _ => None,
         };
-        let block = body.decoded_block(pool)?;
+        let admission =
+            super::admission::submission_decode_admission(sequencer.verified_tip(), height);
+        let block = body.decoded_block(pool, admission)?;
         let decoded_bytes = body.decoded_attributed_memory_size_bytes();
         let intent = sequencer
             .prepare_submit(height, facts.id, decoded_bytes)

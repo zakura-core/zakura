@@ -21,6 +21,7 @@
 //!     workers/<n>/corpus/          libFuzzer's corpus additions
 //!     workers/<n>/artifacts/       libFuzzer's crash, timeout and OOM inputs
 //!     workers/<n>/sim/             the target's saved inputs and traces
+//!     workers/<n>/stats/           each fuzzer process's counts, `stats-<pid>.json`
 //!     workers/<n>/attempts.jsonl   each fuzzer process the worker ran
 //!     workers/<n>/outcome.json     why the worker stopped
 //!     compact-artifacts/           the inputs the compaction's merge crashed on
@@ -59,8 +60,14 @@
 //! generator, format or contract version can't resume: it starts a new
 //! campaign segment with an explicit corpus migration, and the previous
 //! segment's manifests and snapshots stay as they are.
+//!
+//! Each worker's fuzzer processes count their runs in the worker's
+//! `stats/` directory. [`evidence()`] sums those counts per worker and for
+//! the run, and lists every worker, process and file whose counts fall
+//! short.
 
 mod build;
+mod evidence;
 mod manifest;
 mod run;
 mod snapshot;
@@ -68,10 +75,10 @@ mod store;
 mod verify;
 
 pub use build::{build_fuzzer, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
+pub use evidence::{evidence, Evidence, Incomplete, WorkerEvidence};
 pub use manifest::{
     prepare_resume, prepare_start, Budget, FeedbackRecord, HarnessRecord, LimitsRecord, Manifest,
-    Migration, ResumeOptions, SeedsRecord, StartOptions, WorkerPlan, FEEDBACK_LINE, FEEDBACK_VAR,
-    SANITIZER_VARS,
+    Migration, ResumeOptions, SeedsRecord, StartOptions, WorkerPlan, SANITIZER_VARS,
 };
 pub use run::{
     close, read_end, Attempt, AttemptEnd, Compaction, End, FileRecord, Prepared, Recorder, Status,

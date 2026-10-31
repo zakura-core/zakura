@@ -111,19 +111,26 @@ Alternatively, you can install it from GitHub:
 cargo install --git https://github.com/zakura-core/zakura --tag v1.7.0 zakura
 ```
 
-Native x86-64 builds automatically use Pasta field assembly when the build
-CPU supports BMI2 and ADX. This selection happens at build time, so a local
-binary may not run on an older CPU. To build a binary for redistribution, use:
+On x86-64, the Pasta field assembly needs the BMI2 and ADX extensions. Builds
+select it only when the compiler targets both extensions, for example with
+`RUSTFLAGS="-C target-cpu=native"` on a supporting CPU, or
+`RUSTFLAGS="-C target-feature=+adx,+bmi2"`. Without such flags, including in
+default `cargo build --release` and `cargo install` builds, Zakura uses portable
+Pasta arithmetic that runs on any x86-64 CPU. AArch64 builds always use their
+assembly.
+
+A binary built to use the x86-64 assembly exits at startup with an error on a
+CPU that lacks BMI2 or ADX. Official release binaries and Docker images use no
+CPU-specific flags. To keep portable Pasta arithmetic even when building with
+CPU-specific flags, enable the `portable` feature:
 
 ```sh
 cargo build --locked --release --package zakura --features portable
 ```
 
-Official release binaries and Docker runtime images enable `portable` and do
-not require BMI2 or ADX for Pasta arithmetic. This feature does not override
-custom compiler flags such as `-C target-cpu=native`; avoid CPU-specific flags
-when building for other machines. Default local builds keep automatic assembly
-selection, including with `--release`.
+The `portable` feature only affects Pasta arithmetic. Flags such as
+`-C target-cpu=native` can still produce a binary that needs the build
+machine's CPU.
 
 You can start Zakura by running
 

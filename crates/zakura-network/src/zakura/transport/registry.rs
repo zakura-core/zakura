@@ -81,6 +81,11 @@ pub struct SessionLayout {
 }
 
 impl SessionLayout {
+    /// A layout of `streams`, which the caller has validated and ordered by kind.
+    pub(crate) fn from_validated(streams: Arc<[Stream]>) -> Self {
+        Self { streams }
+    }
+
     /// The session's streams, ordered by kind.
     pub fn streams(&self) -> &[Stream] {
         &self.streams
@@ -191,9 +196,7 @@ impl ServiceRegistry {
                     }
                 })?;
                 primary_kind = Some(primary.kind);
-                let layout = SessionLayout {
-                    streams: streams.into(),
-                };
+                let layout = SessionLayout::from_validated(streams.into());
                 for stream in layout.streams.iter() {
                     session_layouts.insert((stream.kind, stream.version), layout.clone());
                 }

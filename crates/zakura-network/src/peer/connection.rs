@@ -409,7 +409,12 @@ impl Handler {
                 )))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
-                Handler::Finished(Ok(Response::BlockHeaders(headers)))
+                Handler::Finished(Ok(Response::BlockHeaders(
+                    headers
+                        .into_iter()
+                        .map(|counted| counted.header.into())
+                        .collect(),
+                )))
             }
 
             (Handler::MempoolTransactionIds, Message::Inv(items))
@@ -636,6 +641,18 @@ where
             .field("last_overload_time", &self.last_overload_time)
             .finish()
     }
+}
+
+/// Copy retained headers into their TCP wire form.
+fn wire_headers(
+    headers: &[zakura_node_services::block_memory::HeaderHandle],
+) -> Vec<block::CountedHeader> {
+    headers
+        .iter()
+        .map(|header| block::CountedHeader {
+            header: Arc::new(**header),
+        })
+        .collect()
 }
 
 impl<S, Tx> Connection<S, Tx>
@@ -1571,7 +1588,12 @@ where
                 }
             }
             Response::BlockHeaders(headers) => {
-                if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
+                // The wire message copies each header. The handles keep their read
+                // admission until the send ends, so their slots also fund the copies.
+                let message = Message::Headers(wire_headers(&headers));
+                let sent = self.peer_tx.send(message).await;
+                drop(headers);
+                if let Err(e) = sent {
                     self.fail_with(e).await
                 }
             }

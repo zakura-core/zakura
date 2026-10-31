@@ -5,6 +5,8 @@
 #![cfg(zakura_sim)]
 
 use std::{
+    collections::BTreeMap,
+    fs,
     path::Path,
     process::{Command, Output},
     sync::{
@@ -20,11 +22,16 @@ use zakura_rt::{sync::atomic::AtomicU64, task::yield_now};
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{
     explore::{
-        abandon_limit, classify, classify_process, input_path, save_failure, save_input, Bucket,
-        Classified, ExploreOutcome, ExploreRun, ProcessClassified, ProcessExit, ProcessFailure,
-        ProcessResult, Worker, DEFAULT_ABANDON_LIMIT, INPUTS_DIR,
+        abandon_limit, classify, classify_process,
+        feedback::Feature,
+        input_path, save_failure, save_input, state,
+        stats::{
+            CleanupCounts, Counts, ProcessStats, Recorder, CHECKPOINT, NOT_RUN, STATS_VERSION,
+        },
+        Bucket, Classified, ExploreOutcome, ExploreRun, ProcessClassified, ProcessExit,
+        ProcessFailure, ProcessResult, Worker, DEFAULT_ABANDON_LIMIT, INPUTS_DIR,
     },
-    harness::{entry, record, HarnessEntry, RecordInput, Subsystem},
+    harness::{entry, record, HarnessEntry, HarnessError, RecordInput, Subsystem},
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
     trace::{FileSink, TraceReader, INPUT_FILE, TRACES_DIR, TRACE_FILE},
     Checker, HarnessFailure, NullSink, ObservationLog, PropertyOutcome, PropertyReport, RunConfig,
@@ -657,4 +664,209 @@ fn abandon_limit_parses() {
     for bad in ["0", "-1", "many"] {
         assert!(abandon_limit(Some(bad)).is_err(), "{bad}");
     }
+}
+
+/// E4b-min: a process's counts keep each part of each run: what the target
+/// did, how the run ended, the drain, cleanup, and every property's
+/// outcome. A scenario the harness couldn't run counts as `not-run`.
+#[test]
+fn stats_count_each_part_of_a_run() {
+    let mut counts = Counts::for_harness(&RESULTS);
+    assert_eq!(counts.properties[KNOWN].status, Status::Known { issue: 1 });
+    assert_eq!(counts.properties[DRAFT].status, Status::Draft);
+    for case in [CLEAN, ACTIVE_CASE, KNOWN_CASE, HARNESS_CASE, ABANDON_CASE] {
+        let (run, _dir) = run_in_process(case, false);
+        counts.record(&run, &classify(&RESULTS, &run), &[]);
+    }
+    let not_run = ExploreRun {
+        scenario: None,
+        result: Err(HarnessError::UnknownHarness("test/none".to_owned())),
+    };
+    counts.record(&not_run, &classify(&RESULTS, &not_run), &[]);
+
+    let map = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(key, n)| ((*key).to_owned(), *n))
+            .collect()
+    };
+    assert_eq!(counts.runs, 6);
+    assert_eq!(
+        counts.outcomes,
+        map(&[
+            ("abandoned", 1),
+            ("clean", 2),
+            ("fail", 1),
+            ("harness-failure", 2)
+        ])
+    );
+    assert_eq!(
+        counts.ends,
+        map(&[
+            ("budget", 1),
+            ("harness", 1),
+            ("idle/quiescent", 2),
+            (NOT_RUN, 1),
+            ("violation", 1)
+        ])
+    );
+    assert_eq!(counts.budget_exits(), 1);
+    assert_eq!(counts.drains_exhausted, 1, "the spinner outlasts the drain");
+    assert_eq!(
+        counts.cleanup,
+        CleanupCounts {
+            abandoned: 1,
+            leaked_tasks: 1,
+            unwound: 0,
+            panicked: 0,
+            unwind_failures: 0,
+        }
+    );
+    let harness_failed = map(&[("harness-failed", 1)]);
+    let property = |id: &str| &counts.properties[id];
+    assert_eq!(property(ACTIVE).violated, 1);
+    assert_eq!(property(ACTIVE).held, 3, "clean, known and abandoned runs");
+    assert_eq!(property(ACTIVE).inconclusive, harness_failed);
+    assert_eq!(property(KNOWN).violated, 1);
+    assert_eq!(property(KNOWN).held, 3, "clean, active and abandoned runs");
+    assert_eq!(property(DRAFT).violated, 0);
+    assert_eq!(property(DRAFT).held, 4);
+    assert_eq!(property(DRAFT).inconclusive, harness_failed);
+    for id in [ACTIVE, KNOWN, DRAFT] {
+        assert_eq!(property(id).not_applicable, 0, "{id}");
+        assert!(property(id).evaluations >= property(id).held, "{id}");
+        assert!(property(id).applied(), "{id}");
+    }
+    assert!(counts.features.is_empty());
+}
+
+/// E4b-min: each property outcome and each cleanup count lands in its own
+/// field. A property the harness doesn't register counts as `Active`; a
+/// property that held without an applicable evaluation never applied; an
+/// assumption that never held or was lost is an assumption loss, and an
+/// open obligation isn't. Features count once per run that reached them,
+/// and total by family.
+#[test]
+fn stats_count_property_outcomes_cleanup_and_features() {
+    let (mut run, _dir) = run_in_process(CLEAN, false);
+    let Ok(report) = &mut run.result else {
+        panic!("the clean case runs: {:?}", run.result.err());
+    };
+    let inconclusive = |reason: &str| PropertyOutcome::Inconclusive {
+        reason: reason.to_owned(),
+    };
+    report.properties = vec![
+        PropertyReport::new("x/held", PropertyOutcome::Held { applicable: 4 }),
+        PropertyReport::new("x/held-zero", PropertyOutcome::Held { applicable: 0 }),
+        PropertyReport::new("x/na", PropertyOutcome::NotApplicable),
+        PropertyReport::new("x/lost", inconclusive("assumption-lost")),
+        PropertyReport::new("x/never", inconclusive("assumptions-never-held")),
+        PropertyReport::new("x/open", inconclusive("obligation-open")),
+    ];
+    report.cleanup.unwound = 2;
+    report.cleanup.panicked = 1;
+    report.cleanup.unwind_failures = 3;
+    let classified = classify(&RESULTS, &run);
+    let features = [
+        Feature::new(1),
+        Feature::new(state::SPAN + 1),
+        Feature::new(65_000),
+    ];
+    let mut counts = Counts::default();
+    counts.record(&run, &classified, &features);
+    counts.record(&run, &classified, &features[..1]);
+
+    let property = |id: &str| &counts.properties[id];
+    assert!(counts
+        .properties
+        .values()
+        .all(|property| property.status == Status::Active));
+    assert_eq!(
+        (property("x/held").held, property("x/held").evaluations),
+        (2, 8)
+    );
+    assert!(property("x/held").applied());
+    assert_eq!(property("x/held-zero").held, 2);
+    assert!(!property("x/held-zero").applied());
+    assert_eq!(property("x/na").not_applicable, 2);
+    assert!(!property("x/na").applied());
+    assert_eq!(property("x/lost").assumption_losses(), 2);
+    assert_eq!(property("x/never").assumption_losses(), 2);
+    assert_eq!(property("x/open").assumption_losses(), 0);
+    assert_eq!(property("x/open").inconclusive["obligation-open"], 2);
+    assert_eq!(
+        counts.cleanup,
+        CleanupCounts {
+            abandoned: 0,
+            leaked_tasks: 0,
+            unwound: 2,
+            panicked: 2,
+            unwind_failures: 2,
+        },
+        "each counts runs, not tasks"
+    );
+    assert_eq!(
+        counts.features,
+        [(1, 2), (state::SPAN + 1, 1), (65_000, 1)].into()
+    );
+    let (distinct, families) = counts.feature_totals();
+    assert_eq!(distinct, 3);
+    assert_eq!(
+        families,
+        [
+            ("feature/completion-cancellation", 1),
+            ("feature/request-reset", 1),
+            ("other", 1)
+        ]
+        .into()
+    );
+}
+
+/// E4b-min: a recorder writes its file at once, with every registered
+/// property and no runs; a checkpoint writes the counts so far, still
+/// incomplete; a checkpoint that isn't due writes nothing; and `finish`
+/// marks the file complete, unless it comes inside a run.
+#[test]
+fn a_recorder_marks_its_file_complete_only_at_finish() {
+    let dir = TempDir::new().unwrap();
+    let stats = dir.path().join("stats");
+    let mut recorder = Recorder::new(&stats, &RESULTS, 42).unwrap();
+    let path = stats.join("stats-42.json");
+    assert_eq!(recorder.path(), path);
+    assert_eq!(ProcessStats::pid_of("stats-42.json"), Some(42));
+    assert_eq!(ProcessStats::pid_of("stats-42.json.partial"), None);
+    let read = || ProcessStats::read(&path).unwrap();
+    let first = read();
+    assert_eq!(
+        (first.version, first.harness.as_str(), first.pid),
+        (STATS_VERSION, Results::NAME, 42)
+    );
+    assert!(!first.complete);
+    assert_eq!(first.counts, Counts::for_harness(&RESULTS));
+
+    let (run, _dir) = run_in_process(CLEAN, false);
+    let classified = classify(&RESULTS, &run);
+    recorder.record(&run, &classified, &[]);
+    recorder.checkpoint().unwrap();
+    assert_eq!(read().counts.runs, 1);
+    assert!(!read().complete);
+    recorder.record(&run, &classified, &[]);
+    recorder.checkpoint_if_due().unwrap();
+    assert_eq!(read().counts.runs, 1, "{CHECKPOINT:?} hasn't passed");
+    // An exit inside a run leaves that run uncounted, so the file stays
+    // incomplete.
+    recorder.begin();
+    recorder.finish().unwrap();
+    assert!(!read().complete);
+    recorder.record(&run, &classified, &[]);
+    recorder.finish().unwrap();
+    let last = read();
+    assert!(last.complete);
+    assert_eq!(&last.counts, recorder.counts());
+    assert_eq!(last.counts.runs, 3);
+
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace("\"version\": 1", "\"version\": 0")).unwrap();
+    let refused = ProcessStats::read(&path).unwrap_err();
+    assert!(refused.contains("stats version 0"), "{refused}");
 }

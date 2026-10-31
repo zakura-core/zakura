@@ -26,7 +26,7 @@
 //! shows that libFuzzer keeps an input for its feature alone.
 
 use std::{
-    sync::atomic::{AtomicU8, Ordering::Relaxed},
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Duration,
 };
 
@@ -41,6 +41,16 @@ use crate::{
     property::{CheckEvent, HasView},
     Observation, ObservationLog, RunConfig, Sim,
 };
+
+/// The variable that turns a fuzz target's semantic feedback `on`, the
+/// default, or `off`. The fuzz package reads it, and a campaign's manifest
+/// sets it.
+pub const FEEDBACK_VAR: &str = "ZAKURA_SIM_FEEDBACK";
+
+/// The start of the line a fuzz target with semantic feedback logs at
+/// startup, followed by `key=value` pairs. A campaign's startup probe reads
+/// the line into its manifest.
+pub const FEEDBACK_LINE: &str = "zakura-sim feedback: ";
 
 /// The feedback backend, for campaign manifests.
 pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
@@ -78,36 +88,76 @@ impl Feature {
     }
 }
 
-/// One counter per feature. The fuzz package places one in libFuzzer's
-/// section. libFuzzer clears the section a word at a time, so the counters
-/// are word-aligned.
+/// One byte-wide counter per feature. The fuzz package places one in
+/// libFuzzer's section, which libFuzzer reads a byte per feature. The
+/// counters are stored as words, 8 to a word in memory order, so clearing
+/// them and finding the nonzero ones take a pass over 8,192 words, not
+/// 65,536 bytes. libFuzzer clears the section a word at a time, so the
+/// counters are word-aligned.
 #[repr(C, align(64))]
-pub struct Counters([AtomicU8; FEATURES]);
+pub struct Counters([AtomicU64; FEATURES / 8]);
 
 impl Counters {
     /// Counters that are all zero.
     pub const fn new() -> Self {
-        Counters([const { AtomicU8::new(0) }; FEATURES])
+        Counters([const { AtomicU64::new(0) }; FEATURES / 8])
     }
 
     /// Sets every counter to zero.
     pub fn clear(&self) {
-        for counter in &self.0 {
-            counter.store(0, Relaxed);
+        for word in &self.0 {
+            word.store(0, Relaxed);
         }
     }
 
     /// `feature`'s count, saturated at 255.
     pub fn get(&self, feature: Feature) -> u8 {
-        self.0[usize::from(feature.0)].load(Relaxed)
+        let (word, shift) = Counters::slot(feature);
+        // The shift picks one byte, so the cast keeps exactly that byte.
+        (self.0[word].load(Relaxed) >> shift) as u8
     }
 
-    /// Every feature with a nonzero count, in index order.
+    /// Every feature with a nonzero count, in index order. Most runs reach
+    /// few features, so it tests a block of words at once, and looks inside
+    /// only a block with a nonzero word.
     pub fn hits(&self) -> Vec<Feature> {
-        (0..=u16::MAX)
-            .map(Feature)
-            .filter(|feature| self.get(*feature) > 0)
-            .collect()
+        let mut hits = Vec::new();
+        let (blocks, []) = self.0.as_chunks::<64>() else {
+            unreachable!("8,192 words make 128 blocks of 64");
+        };
+        for (block, words) in blocks.iter().enumerate() {
+            if words.iter().fold(0, |any, word| any | word.load(Relaxed)) == 0 {
+                continue;
+            }
+            for (offset, counters) in words.iter().enumerate() {
+                let counters = counters.load(Relaxed);
+                if counters == 0 {
+                    continue;
+                }
+                for (byte, count) in counters.to_ne_bytes().into_iter().enumerate() {
+                    if count > 0 {
+                        // The index is below FEATURES, so it fits.
+                        hits.push(Feature(((block * 64 + offset) * 8 + byte) as u16));
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// The word that holds `feature`'s counter, and the shift to its byte
+    /// within the word's value, so the byte sits at the feature's index in
+    /// memory.
+    fn slot(feature: Feature) -> (usize, u32) {
+        let index = usize::from(feature.0);
+        // The byte's position in the word is below 8, so the cast is exact.
+        let byte = (index % 8) as u32;
+        let shift = if cfg!(target_endian = "little") {
+            8 * byte
+        } else {
+            8 * (7 - byte)
+        };
+        (index / 8, shift)
     }
 }
 
@@ -134,8 +184,12 @@ impl FeatureMap {
     /// Counts one hit of `feature`, saturating at 255. The run's thread is
     /// the only writer, so a load and a store suffice.
     pub fn hit(&self, feature: Feature) {
-        let counter = &self.counters.0[usize::from(feature.0)];
-        counter.store(counter.load(Relaxed).saturating_add(1), Relaxed);
+        let (word, shift) = Counters::slot(feature);
+        let counters = &self.counters.0[word];
+        let value = counters.load(Relaxed);
+        if (value >> shift) & 0xff != 0xff {
+            counters.store(value + (1 << shift), Relaxed);
+        }
     }
 }
 
@@ -172,6 +226,12 @@ impl Feedback {
             map: FeatureMap::new(counters),
             collector,
         }
+    }
+
+    /// The counters, which hold the last input's features once its run
+    /// ends.
+    pub fn counters(&self) -> &'static Counters {
+        self.map.counters
     }
 
     /// Clears the counters and makes a fresh collector, so no feature or

@@ -36,7 +36,7 @@ use tracing::{instrument, Instrument, Span};
 use tower::buffer::Buffer;
 
 use zakura_chain::{
-    block::{self, CountedHeader, HeightDiff},
+    block::{self, HeightDiff},
     diagnostic::CodeTimer,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
@@ -3118,20 +3118,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by the StateService.
-            ReadRequest::FindBlockHeaders { known_blocks, stop } => Ok(ReadResponse::BlockHeaders(
-                read::find_chain_headers(
+            ReadRequest::FindBlockHeaders { known_blocks, stop } => {
+                Ok(ReadResponse::BlockHeaders(read::find_chain_headers(
                     state.latest_best_chain(),
                     &state.db,
                     known_blocks,
                     stop,
                     MAX_FIND_BLOCK_HEADERS_RESULTS,
-                )?
-                .into_iter()
-                .map(|header| CountedHeader {
-                    header: Arc::new(*header),
-                })
-                .collect(),
-            )),
+                )?))
+            }
 
             ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();

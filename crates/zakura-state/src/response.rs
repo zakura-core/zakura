@@ -128,7 +128,7 @@ pub enum Response {
     BlockHashes(Vec<block::Hash>),
 
     /// The response to a `FindBlockHeaders` request.
-    BlockHeaders(Vec<block::CountedHeader>),
+    BlockHeaders(Vec<zakura_node_services::block_memory::HeaderHandle>),
 
     /// Response to [`Request::CheckBestChainTipNullifiersAndAnchors`].
     ///
@@ -535,7 +535,7 @@ pub enum ReadResponse {
     BlockHashes(Vec<block::Hash>),
 
     /// The response to a `FindBlockHeaders` request.
-    BlockHeaders(Vec<block::CountedHeader>),
+    BlockHeaders(Vec<zakura_node_services::block_memory::HeaderHandle>),
 
     /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
     HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),

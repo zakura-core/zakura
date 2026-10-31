@@ -181,6 +181,16 @@ impl AsRef<Transaction> for Transaction {
     }
 }
 
+impl Transaction {
+    /// Returns the bytes this transaction's inline value and heap allocations occupy.
+    ///
+    /// This is deterministic accounting, not an exact process RSS measurement.
+    pub fn retained_memory_size_bytes(&self) -> u64 {
+        crate::memory::inline_size_bytes::<Self>()
+            .saturating_add(AttributedMemorySize::attributed_memory_size_bytes(self))
+    }
+}
+
 impl AttributedMemorySize for Transaction {
     fn attributed_memory_size_bytes(&self) -> u64 {
         use Transaction::*;

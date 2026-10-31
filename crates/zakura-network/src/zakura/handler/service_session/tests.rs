@@ -1,6 +1,8 @@
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
-use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths, P2P_V2_ALPN};
+use crate::zakura::{
+    MessageRole, PayloadLen, SessionOpening, SessionPolicy, StreamQueueDepths, P2P_V2_ALPN,
+};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {
@@ -593,6 +595,7 @@ struct RawFixture {
     server: QuicEndpoint,
     client: QuicEndpoint,
     connection: Connection,
+    resources: NodeResources,
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     shutdown: CancellationToken,
     service: Arc<SessionService>,
@@ -701,6 +704,7 @@ impl RawFixture {
             ])?),
         );
         let shutdown = handler.shutdown.clone();
+        let resources = handler.resources.clone();
         let mut limits = local.clamp(&local.initial_limits());
         limits.prelude_timeout = setup_timeout;
         let peer_id = ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?;
@@ -733,6 +737,7 @@ impl RawFixture {
             server,
             client,
             connection,
+            resources,
             serving,
             shutdown,
             service,
@@ -894,6 +899,58 @@ async fn incomplete_three_stream_session_releases_all_arrivals_on_expiry() -> Re
         .is_err());
     assert!(fixture.connection.close_reason().is_none());
     fixture.close().await
+}
+
+/// The node's owner count sees partial setup, an installed session, and
+/// teardown, and connection teardown settles every owner before it returns.
+#[tokio::test]
+async fn owner_counts_follow_partial_setup_and_teardown_settles_them() -> Result<(), BoxError> {
+    let mut fixture =
+        RawFixture::start_with_streams(1, Duration::from_millis(300), &[DATA, REQUESTS, EVENTS])
+            .await?;
+    let owners = fixture.resources.owners().clone();
+    let wait_for = |want: fn(&crate::zakura::transport::OwnerCounts) -> bool| {
+        let owners = owners.clone();
+        async move {
+            timeout(TEST_TIMEOUT, async {
+                while !want(&owners.counts()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        }
+    };
+
+    // Two members wait for the third, counted as setup owners.
+    let first = fixture.offer(REQUESTS, Some(7)).await?;
+    let second = fixture.offer(EVENTS, Some(7)).await?;
+    wait_for(|counts| counts.setup == 2).await?;
+    assert_eq!(owners.counts().installed, 0);
+
+    // Expiry releases both members and no owner survives.
+    wait_for(|counts| counts.total() == 0).await?;
+    drop((first, second));
+
+    // The service defers a new offer until the expired offer's delay passes.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let _members = (
+        fixture.offer(DATA, Some(9)).await?,
+        fixture.offer(REQUESTS, Some(9)).await?,
+        fixture.offer(EVENTS, Some(9)).await?,
+    );
+    wait_for(|counts| counts.installed == 3).await?;
+    let session = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+        .await?
+        .ok_or("the complete offer reaches its service")?;
+    drop(session);
+
+    fixture.close().await?;
+    assert_eq!(
+        owners.counts().total(),
+        0,
+        "connection teardown returned only after its owners settled"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1171,6 +1228,7 @@ fn raw_worker_context(client: &QuicEndpoint, slots: Arc<Semaphore>) -> StreamWor
         message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
         cadence: None,
         precheck: PrecheckSlot::default(),
+        resources: StreamResources::unconstrained(),
         connection_token: cancel.clone(),
         stream_token: cancel.child_token(),
         close_cause: CloseCause::new(),
@@ -1215,7 +1273,9 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
                 None,
             )));
         assert_eq!(
-            timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
+            timeout(TEST_TIMEOUT, inbound_rx.recv())
+                .await?
+                .map(|admitted: AdmittedFrame| admitted.frame),
             Some(frame(1, 0, 0))
         );
         let resources = Arc::new(Semaphore::new(1));
@@ -1256,28 +1316,29 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
     Ok(())
 }
 
+const PING: MessageRule = MessageRule {
+    name: "ping",
+    message_type: LEGACY_REQUEST_PING,
+    payload: PayloadLen::exact(8),
+    role: MessageRole::Request {
+        max_in_flight: 1,
+        cadence: None,
+    },
+};
+const PONG: MessageRule = MessageRule {
+    name: "pong",
+    message_type: LEGACY_RESPONSE_PONG,
+    payload: PayloadLen::exact(8),
+    role: MessageRole::Response {
+        request: PING.message_type,
+        ends_exchange: true,
+    },
+};
+
 /// Each end of a request/response stream admits only its role: the responder
 /// reads requests, and the requester reads responses.
 #[tokio::test]
 async fn request_response_tables_reject_the_other_role_before_payloads() -> Result<(), BoxError> {
-    const PING: MessageRule = MessageRule {
-        name: "ping",
-        message_type: LEGACY_REQUEST_PING,
-        payload: PayloadLen::exact(8),
-        role: MessageRole::Request {
-            max_in_flight: 1,
-            cadence: None,
-        },
-    };
-    const PONG: MessageRule = MessageRule {
-        name: "pong",
-        message_type: LEGACY_RESPONSE_PONG,
-        payload: PayloadLen::exact(8),
-        role: MessageRole::Response {
-            request: PING.message_type,
-            ends_exchange: true,
-        },
-    };
     let _guard = zakura_test::init();
     let (server, client, connection, remote) = raw_connection().await?;
     let stream = Stream {
@@ -1320,8 +1381,10 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
     .expect("the request header is rejected without waiting for its absent payload");
     assert!(cancel.is_cancelled());
 
+    let resources = ConnectionResources::unconstrained();
     let response = write_outbound_request_frame(
         &connection,
+        &resources,
         limits,
         stream,
         42,
@@ -1369,6 +1432,105 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
     Ok(())
 }
 
+/// The requester funds a response before it opens the stream, keeps that funding
+/// through a complete response, and returns it when the frames' owner drops. A
+/// failed exchange returns it at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), BoxError> {
+    use crate::zakura::{transport::NodeResources, transport::ResourceEnvelope};
+    let _guard = zakura_test::init();
+    let (server, client, connection, remote) = raw_connection().await?;
+    let stream = Stream {
+        kind: LEGACY_REQUEST_STREAM_KIND,
+        mode: StreamMode::RequestResponse,
+        messages: Some(&[PING, PONG]),
+        ..DATA
+    };
+    Stream::check_layout(&[stream])?;
+    let limits = raw_worker_context(&client, Arc::new(Semaphore::new(1))).limits;
+    let node = NodeResources::new(ResourceEnvelope::new(1 << 20, 1 << 20, 1));
+    let resources = node.connection();
+
+    // A saturated partition holds the exchange back before its stream opens.
+    let capacity = ResourceEnvelope::new(1 << 20, 1 << 20, 1).compat_response_bytes;
+    let saturated = resources.admit_compat_response(capacity).await;
+    let blocked = write_outbound_request_frame(
+        &connection,
+        &resources,
+        limits,
+        stream,
+        41,
+        PING.message_type,
+        0,
+        vec![0; 8],
+    );
+    assert!(timeout(Duration::from_millis(50), blocked).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(50), remote.accept_bi())
+            .await
+            .is_err(),
+        "an unfunded exchange opens no stream"
+    );
+    drop(saturated);
+    assert_eq!(resources.compat_responses().granted(), 0);
+
+    let response = write_outbound_request_frame(
+        &connection,
+        &resources,
+        limits,
+        stream,
+        42,
+        PING.message_type,
+        0,
+        vec![0; 8],
+    );
+    let responder = async {
+        let (mut send, mut recv) = remote.accept_bi().await?;
+        read_stream_prelude(&mut recv, TEST_TIMEOUT).await?;
+        read_frame(
+            &mut recv,
+            stream.frame_cap,
+            FrameFilter::new(stream.messages, InboundReader::Responder),
+            TEST_TIMEOUT,
+            Some(TEST_TIMEOUT),
+        )
+        .await?;
+        assert!(
+            resources.compat_responses().granted() > 0,
+            "the requester funded the response before the responder saw the request"
+        );
+        let frame = Frame {
+            message_type: PONG.message_type,
+            flags: 0,
+            payload: 42u64.to_le_bytes().to_vec(),
+        };
+        send.write_all(&frame.encode(stream.frame_cap)?).await?;
+        send.finish()?;
+        Ok::<_, BoxError>((send, recv))
+    };
+    let (result, held_stream) = tokio::join!(timeout(TEST_TIMEOUT, response), responder);
+    let _held_stream = held_stream?;
+    let frames = match result? {
+        Ok(frames) => frames,
+        Err(_) => panic!("the peer sent a valid response"),
+    };
+    assert_eq!(node.owners().counts().installed, 1);
+    let (frames, grant) = frames.into_parts();
+    assert_eq!(frames.len(), 1);
+    assert!(
+        resources.compat_responses().granted() > 0,
+        "the grant funds the frames until the decoder finishes"
+    );
+    drop(grant);
+    assert_eq!(resources.compat_responses().granted(), 0);
+    assert_eq!(node.owners().counts().total(), 0);
+
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
 ) -> Result<(), BoxError> {
@@ -1406,6 +1568,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: &peer,
         stream_sem: &permits,
+        resources: &ConnectionResources::unconstrained(),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1516,6 +1679,7 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
         conn: context.conn,
         peer_id: &context.peer_id,
         stream_sem: &slots,
+        resources: &ConnectionResources::unconstrained(),
         open_limiter: &mut open_limiter,
         message_buckets: &mut buckets,
         workers: &mut workers,
@@ -1598,6 +1762,7 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             conn: context.conn,
             peer_id: &context.peer_id,
             stream_sem: &slots,
+            resources: &ConnectionResources::unconstrained(),
             open_limiter: &mut open_limiter,
             message_buckets: &mut buckets,
             workers: &mut workers,
@@ -1792,7 +1957,9 @@ async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(),
             None,
         )));
         assert_eq!(
-            timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
+            timeout(TEST_TIMEOUT, inbound_rx.recv())
+                .await?
+                .map(|admitted: AdmittedFrame| admitted.frame),
             Some(frame(1, 0, 0))
         );
         assert!(outbound_tx.try_reserve_guarded().unwrap().send_request(

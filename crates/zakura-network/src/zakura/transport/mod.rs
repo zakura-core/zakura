@@ -40,7 +40,7 @@ pub(crate) use io::{
 pub(crate) use lifetime::OwnerCounts;
 pub(crate) use lifetime::{
     frame_wire_bytes, ConnectionResources, FrameGate, NodeResources, OwnerPhase, ResourceEnvelope,
-    StreamResources,
+    StreamResources, TransportLimits,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]

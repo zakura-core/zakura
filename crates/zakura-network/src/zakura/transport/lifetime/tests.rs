@@ -133,7 +133,7 @@ fn owners_move_between_phases_and_leave_on_drop() {
 
 #[test]
 fn stream_resources_count_from_setup_and_share_the_connection_budget() {
-    let node = NodeResources::new(ResourceEnvelope::new(10, 10, 4));
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(10, 4)));
     let connection = node.connection();
     let (first, second) = (connection.stream(), connection.stream());
     assert_eq!(node.owners().counts().setup, 2);
@@ -151,23 +151,143 @@ fn stream_resources_count_from_setup_and_share_the_connection_budget() {
     assert_eq!(node.owners().counts(), OwnerCounts::default());
 }
 
+const MIB: u32 = 1 << 20;
+
 #[test]
-fn the_envelope_doubles_each_window_and_stays_within_the_node_budget() {
-    let envelope = ResourceEnvelope::new(32 << 20, 32 << 20, 100);
+fn the_envelope_derives_each_bound_from_windows_connections_and_streams() {
+    let envelope = ResourceEnvelope::new(TransportLimits {
+        receive_window: 32 * MIB,
+        send_window: u64::from(16 * MIB),
+        max_connections: 256,
+        max_pending_handshakes: 32,
+        max_open_streams: 1024,
+        max_frame_bytes: MIB,
+    });
     assert_eq!(envelope.connection_raw_bytes, 64 << 20);
-    assert_eq!(envelope.connection_output_bytes, 64 << 20);
-    assert_eq!(envelope.node_raw_bytes, sizing::node_output_bytes());
-    assert_eq!(envelope.request_workers, 200);
-    // A window larger than the node default raises the node bound with it, so a
-    // grant that clamps to its connection's budget can also finish at the node.
-    let large = ResourceEnvelope::new(1 << 40, 1 << 40, 1);
-    assert_eq!(large.node_raw_bytes, large.connection_raw_bytes);
+    assert_eq!(envelope.connection_output_bytes, 32 << 20);
+    assert_eq!(envelope.node_raw_bytes, 256 * (64 << 20));
+    assert_eq!(envelope.node_output_bytes, 256 * (32 << 20));
+    assert_eq!(envelope.request_executions, 256 * 1024);
+    assert_eq!(envelope.floor_frame_bytes, 2 * 256 * 1024 * (1 << 20));
+    assert_eq!(envelope.transport_credit_bytes, 288 * (48 << 20));
     assert_eq!(
-        envelope.retained_bytes_bound(100, 16, 1 << 20),
+        envelope.transport_memory_bytes(),
         u128::from(envelope.node_raw_bytes)
             + u128::from(envelope.node_output_bytes)
-            + 2 * 100 * 16 * (1 << 20),
+            + envelope.floor_frame_bytes
+            + envelope.transport_credit_bytes,
     );
+}
+
+/// The peer memory budget funds exactly the credit that the transport can hold
+/// at its default windows, and raising a frame budget takes nothing from it.
+#[test]
+fn the_peer_memory_budget_funds_credit_and_no_frame_budget() {
+    let limits = TransportLimits {
+        receive_window: crate::zakura::DEFAULT_ZAKURA_RECEIVE_WINDOW,
+        send_window: crate::zakura::DEFAULT_ZAKURA_SEND_WINDOW,
+        max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        max_pending_handshakes: crate::zakura::DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
+        max_open_streams: 1024,
+        max_frame_bytes: MIB,
+    };
+    let envelope = ResourceEnvelope::new(limits);
+    let budget = u128::from(crate::zakura::DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
+    assert!(envelope.transport_credit_bytes <= budget);
+    assert!(
+        budget - envelope.transport_credit_bytes
+            < u128::from(zakura_quic::connection_memory_bytes(
+                limits.receive_window,
+                limits.send_window,
+            )) + u128::from(zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES),
+        "the budget funds every connection it can",
+    );
+    let more_frames = ResourceEnvelope::new(TransportLimits {
+        max_frame_bytes: 2 * MIB,
+        ..limits
+    });
+    assert_eq!(
+        more_frames.transport_credit_bytes,
+        envelope.transport_credit_bytes
+    );
+}
+
+/// Every connection fills both budgets at once. None of it reaches a floor slot
+/// or waits, so no connection's traffic can pause another's.
+#[test]
+fn every_connection_can_fill_its_budgets_at_once() {
+    const CONNECTIONS: usize = 256;
+    let window = 32 * MIB;
+    let envelope = ResourceEnvelope::new(TransportLimits::with_windows(window, CONNECTIONS));
+    let node = NodeResources::new(envelope);
+    let full = 2 * u64::from(window);
+    let streams: Vec<_> = (0..CONNECTIONS)
+        .map(|_| node.connection().stream())
+        .collect();
+    let grants: Vec<_> = streams
+        .iter()
+        .map(|stream| {
+            (
+                stream.raw.try_admit(full).unwrap(),
+                stream.output.try_admit(full).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(node.raw.granted(), CONNECTIONS as u64 * full);
+    assert_eq!(node.output.granted(), CONNECTIONS as u64 * full);
+    assert_eq!(node.raw.granted(), envelope.node_raw_bytes);
+    drop(grants);
+    assert_eq!(node.raw.granted(), 0);
+}
+
+/// Many connections move several full windows of frames through consumers that
+/// lag one window behind. The node never pauses any of their readers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_conformant_connections_at_full_window_make_progress() {
+    const CONNECTIONS: usize = 256;
+    const FRAME_BYTES: u64 = 1 << 20;
+    let window = 32 * MIB;
+    let frames_per_window = u64::from(window) / FRAME_BYTES;
+    let rounds = 4;
+    let node = NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+        window,
+        CONNECTIONS,
+    )));
+
+    // Every connection holds a full window before any consumer starts.
+    let all_full = Arc::new(tokio::sync::Barrier::new(CONNECTIONS));
+    let mut connections = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let stream = node.connection().stream();
+        let all_full = all_full.clone();
+        connections.push(tokio::spawn(async move {
+            let mut retained = std::collections::VecDeque::new();
+            let mut waited = Duration::ZERO;
+            for frame in 1..=rounds * frames_per_window {
+                let grant = stream.raw.admit(FRAME_BYTES).await;
+                waited += grant.waited();
+                retained.push_back(grant);
+                if frame == frames_per_window {
+                    all_full.wait().await;
+                }
+                // The consumer lags one window behind this reader.
+                // Widening usize to u64 is lossless on supported targets.
+                if retained.len() as u64 > frames_per_window {
+                    retained.pop_front();
+                }
+            }
+            waited
+        }));
+    }
+    let progress = async {
+        for connection in connections {
+            assert_eq!(connection.await.unwrap(), Duration::ZERO);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), progress)
+        .await
+        .expect("no reader waits, so every connection finishes");
+    assert_eq!(node.raw.granted(), 0);
 }
 
 #[derive(Debug, Clone)]

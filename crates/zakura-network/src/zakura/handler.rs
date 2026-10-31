@@ -60,6 +60,7 @@ use super::transport::{
     frame_wire_bytes, sim_arg, sim_chain, transport_observe, worker_framed_channel, AdmittedFrame,
     ConnectionResources, FrameGate, FramedWorkerRecv, NodeResources, OrderedStreamFailure,
     OrderedStreamFailureCause, OwnerPhase, ResourceEnvelope, SessionLayout, StreamResources,
+    TransportLimits,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -609,11 +610,14 @@ impl ZakuraLocalLimits {
 
     /// Returns the transport's byte and worker bounds under these limits.
     pub(crate) fn resource_envelope(&self) -> ResourceEnvelope {
-        ResourceEnvelope::new(
-            u64::from(self.quic.receive_window_bytes),
-            self.quic.send_window_bytes,
-            self.max_connections,
-        )
+        ResourceEnvelope::new(TransportLimits {
+            receive_window: self.quic.receive_window_bytes,
+            send_window: self.quic.send_window_bytes,
+            max_connections: self.max_connections,
+            max_pending_handshakes: self.max_pending_handshakes,
+            max_open_streams: self.max_open_streams,
+            max_frame_bytes: self.max_frame_bytes,
+        })
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
@@ -2341,11 +2345,7 @@ impl ZakuraProtocolHandler {
         let envelope = limits.resource_envelope();
         debug!(
             ?envelope,
-            retained_bytes_bound = %envelope.retained_bytes_bound(
-                limits.max_connections,
-                limits.max_open_streams,
-                limits.max_frame_bytes,
-            ),
+            transport_memory_bytes = %envelope.transport_memory_bytes(),
             "Zakura transport resource envelope"
         );
         Self {
@@ -5338,13 +5338,8 @@ async fn request_stream_worker(
     }
 
     let response_frame_cap = context.outbound_frame_cap;
-    // The execution slot and the raw frame's grant end with the service's call,
-    // which cancelling the connection also ends.
-    let execution = zakura_rt::select! {
-        biased;
-        _ = context.connection_token.cancelled() => return,
-        execution = context.resources.request_workers.reserve() => execution,
-    };
+    // The raw frame's grant ends with the service's call, which cancelling the
+    // connection also ends.
     let response = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
@@ -5357,7 +5352,6 @@ async fn request_stream_worker(
             frame,
         ) => response,
     };
-    drop(execution);
     drop(raw_grant);
     let response_frames = match response {
         Ok(frames) => frames,

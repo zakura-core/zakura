@@ -34,8 +34,8 @@ fn spent_utxos(
 
     block
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .flat_map(|transaction| transaction.inputs())
         .filter_map(transparent::Input::outpoint)
         .map(|outpoint| {
@@ -210,8 +210,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
                 prop_assert_eq!(
                     block
                         .block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .flat_map(|t| t.inputs())
                         .filter_map(|i| i.outpoint())
                         .count(),

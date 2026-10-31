@@ -46,7 +46,7 @@ pub(super) fn restore_backup(
         for block in blocks {
             #[cfg(test)]
             let commit_result = if non_finalized_state
-                .any_chain_contains(&block.block.header.previous_block_hash)
+                .any_chain_contains(&block.block.header().previous_block_hash)
             {
                 non_finalized_state.commit_block(block, finalized_state)
             } else {
@@ -147,7 +147,7 @@ pub(super) async fn run_backup_task(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NonFinalizedBlockBackup {
-    block: Arc<Block>,
+    block: zakura_node_services::block_memory::BlockHandle,
     deferred_pool_balance_change: Amount,
 }
 
@@ -188,7 +188,8 @@ impl NonFinalizedBlockBackup {
             block: Arc::new(
                 Block::zcash_deserialize_from_slice(&mut &block_bytes[..])
                     .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
-            ),
+            )
+            .into(),
             deferred_pool_balance_change: Amount::from_bytes(
                 deferred_pool_balance_change_bytes
                     .try_into()

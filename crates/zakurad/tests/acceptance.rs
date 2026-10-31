@@ -2396,7 +2396,9 @@ async fn validate_regtest_genesis_block() {
         .await;
 
     let genesis_hash = block_verifier_router
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            zakura_node_services::block_memory::BlockHandle::Shared(regtest_genesis_block()),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -2915,7 +2917,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            zakura_node_services::block_memory::BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3041,7 +3043,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            zakura_node_services::block_memory::BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3166,7 +3168,9 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
 
     let genesis_hash = block_verifier_router
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            zakura_node_services::block_memory::BlockHandle::Shared(regtest_genesis_block()),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 

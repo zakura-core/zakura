@@ -12,6 +12,7 @@ use std::{
 };
 
 use tokio::sync::watch;
+use zakura_node_services::block_memory::BlockHandle;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -354,7 +355,7 @@ impl std::str::FromStr for HashOrHeight {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticallyVerifiedBlock {
     /// The block to commit to the state.
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
     /// The hash of the block.
     pub hash: block::Hash,
     /// The height of the block.
@@ -395,7 +396,7 @@ pub struct SemanticallyVerifiedBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockCommitmentData {
     /// The block whose header commits to the prepared body and parent history.
-    pub block: Arc<Block>,
+    pub block: BlockHandle,
     /// The precomputed authorizing-data commitment root, when available.
     pub auth_data_root: Option<AuthDataRoot>,
 }
@@ -445,7 +446,7 @@ pub struct CheckpointVerifiedBlock(pub(crate) SemanticallyVerifiedBlock);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextuallyVerifiedBlock {
     /// The block to commit to the state.
-    pub(crate) block: Arc<Block>,
+    pub(crate) block: BlockHandle,
 
     /// The hash of the block.
     pub(crate) hash: block::Hash,
@@ -542,7 +543,7 @@ pub enum FinalizableBlock {
 /// Note that it's the constructor's responsibility to ensure that all data is valid and verified.
 pub struct FinalizedBlock {
     /// The block to commit to the state.
-    pub(super) block: Arc<Block>,
+    pub(super) block: BlockHandle,
     /// The hash of the block.
     pub(super) hash: block::Hash,
     /// The height of the block.
@@ -598,7 +599,7 @@ impl FinalizableBlock {
 
     #[cfg(test)]
     /// Extract a [`Block`] from a [`FinalizableBlock`] variant.
-    pub fn inner_block(&self) -> Arc<Block> {
+    pub fn inner_block(&self) -> BlockHandle {
         match self {
             FinalizableBlock::Checkpoint {
                 checkpoint_verified,
@@ -619,8 +620,8 @@ impl From<CheckpointVerifiedBlock> for FinalizableBlock {
     }
 }
 
-impl From<Arc<Block>> for FinalizableBlock {
-    fn from(block: Arc<Block>) -> Self {
+impl From<BlockHandle> for FinalizableBlock {
+    fn from(block: BlockHandle) -> Self {
         Self::from(CheckpointVerifiedBlock::from(block))
     }
 }
@@ -665,7 +666,7 @@ impl ContextuallyVerifiedBlock {
             receipt_order,
         } = semantically_verified;
 
-        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+        let chain_value_pool_change = block.view().chain_value_pool_change_from_ordered_utxos(
             network,
             &spent_outputs,
             deferred_pool_balance_change,
@@ -688,10 +689,11 @@ impl CheckpointVerifiedBlock {
     /// Creates a [`CheckpointVerifiedBlock`] from [`Block`] with optional deferred balance and
     /// optional pre-computed hash.
     pub fn new(
-        block: Arc<Block>,
+        block: impl Into<BlockHandle>,
         hash: Option<block::Hash>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Self {
+        let block = block.into();
         let mut block = Self::with_hash(block.clone(), hash.unwrap_or(block.hash()));
         block.0.deferred_pool_balance_change = deferred_pool_balance_change;
         block
@@ -701,11 +703,13 @@ impl CheckpointVerifiedBlock {
     ///
     /// Note: a [`CheckpointVerifiedBlock`] isn't actually finalized
     /// until [`Request::CommitCheckpointVerifiedBlock`] returns success.
-    pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
+    pub fn with_hash(block: impl Into<BlockHandle>, hash: block::Hash) -> Self {
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("checkpoint verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let transaction_hashes: Arc<[_]> =
+            block.view().transactions().map(|tx| tx.hash()).collect();
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
         Self(SemanticallyVerifiedBlock {
@@ -741,7 +745,8 @@ impl CheckpointVerifiedBlock {
 
 impl SemanticallyVerifiedBlock {
     /// Creates [`SemanticallyVerifiedBlock`] from [`Block`] and [`block::Hash`].
-    pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
+    pub fn with_hash(block: impl Into<BlockHandle>, hash: block::Hash) -> Self {
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
@@ -770,14 +775,32 @@ impl SemanticallyVerifiedBlock {
     }
 }
 
+impl From<Arc<Block>> for FinalizableBlock {
+    fn from(block: Arc<Block>) -> Self {
+        Self::from(BlockHandle::from(block))
+    }
+}
+
 impl From<Arc<Block>> for CheckpointVerifiedBlock {
     fn from(block: Arc<Block>) -> Self {
-        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block))
+        Self::from(BlockHandle::from(block))
     }
 }
 
 impl From<Arc<Block>> for SemanticallyVerifiedBlock {
     fn from(block: Arc<Block>) -> Self {
+        Self::from(BlockHandle::from(block))
+    }
+}
+
+impl From<BlockHandle> for CheckpointVerifiedBlock {
+    fn from(block: BlockHandle) -> Self {
+        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block))
+    }
+}
+
+impl From<BlockHandle> for SemanticallyVerifiedBlock {
+    fn from(block: BlockHandle) -> Self {
         let hash = block.hash();
         let height = block
             .coinbase_height()
@@ -799,14 +822,14 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
 }
 
 /// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
-fn transaction_hashes_and_auth_data_root(
-    block: &Block,
+fn transaction_hashes_and_auth_data_root<'a>(
+    block: impl Into<block::BlockView<'a>>,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
     use rayon::prelude::*;
 
     let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .transactions
-        .par_iter()
+        .into()
+        .parallel_transactions()
         .map(|transaction| transaction.txid_and_auth_digest())
         .unzip();
 

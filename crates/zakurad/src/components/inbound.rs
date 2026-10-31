@@ -26,7 +26,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
@@ -227,9 +227,9 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<Arc<Block>>, zn::BoxError> {
+) -> Result<Option<zakura_node_services::block_memory::BlockHandle>, zn::BoxError> {
     if let Some(block) = pending_blocks.get(hash) {
-        return Ok(Some(block));
+        return Ok(Some(block.into()));
     }
 
     let response = state
@@ -670,7 +670,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(zakura_node_services::block_memory::BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();

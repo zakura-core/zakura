@@ -548,7 +548,7 @@ impl TrustedChainSync {
         // blocks above ours. Fetch the missing finalized blocks so the incoming
         // block has a contiguous chain to commit onto.
         if self.non_finalized_state.best_chain().is_none()
-            && self.db.finalized_tip_hash() != block.block.header.previous_block_hash
+            && self.db.finalized_tip_hash() != block.block.header().previous_block_hash
         {
             self.fill_finalized_gap(block.height).await;
         }
@@ -577,7 +577,7 @@ impl TrustedChainSync {
     /// Updating the channels here means bridge blocks committed by
     /// [`Self::fill_finalized_gap`] also advance the published chain tip.
     fn commit(&mut self, block: SemanticallyVerifiedBlock) -> Result<(), ValidateContextError> {
-        if self.db.finalized_tip_hash() == block.block.header.previous_block_hash {
+        if self.db.finalized_tip_hash() == block.block.header().previous_block_hash {
             let _ = self.prune_finalized();
             self.non_finalized_state.commit_new_chain(block, &self.db)?;
         } else {

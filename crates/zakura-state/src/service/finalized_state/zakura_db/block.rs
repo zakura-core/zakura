@@ -881,8 +881,8 @@ impl ZakuraDb {
         // Get a list of the spent UTXOs, before we delete any from the database.
         let outpoints: Vec<transparent::OutPoint> = finalized
             .block
-            .transactions
-            .iter()
+            .view()
+            .transactions()
             .flat_map(|tx| tx.inputs().iter())
             .flat_map(|input| input.outpoint())
             .collect();
@@ -934,8 +934,8 @@ impl ZakuraDb {
                     Some(
                         finalized
                             .block
-                            .transactions
-                            .par_iter()
+                            .view()
+                            .parallel_transactions()
                             .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
                             .collect(),
                     )
@@ -1514,7 +1514,9 @@ impl DiskWriteBatch {
         // Commit authenticated full-block header data.
         let existing_body_header: Option<Arc<block::Header>> =
             db.zs_get(&block_header_by_height, height);
-        if existing_body_header.is_some_and(|existing_header| existing_header != block.header) {
+        if existing_body_header
+            .is_some_and(|existing_header| existing_header.as_ref() != block.header())
+        {
             return Err(CommitBlockError::HeaderChainError {
                 error: format!("full block header conflicts with stored header at {height:?}"),
             }
@@ -1522,7 +1524,7 @@ impl DiskWriteBatch {
         }
 
         // Index the authenticated full-block header, hash, and height.
-        self.zs_insert(&block_header_by_height, height, &block.header);
+        self.zs_insert(&block_header_by_height, height, block.header());
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
 
@@ -1541,17 +1543,17 @@ impl DiskWriteBatch {
             // Serialized off the committer's critical path (overlapped with the
             // spent-UTXO reads in `write_block`); use those bytes directly.
             precomputed
-        } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+        } else if block.view().transactions().len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
             use rayon::prelude::*;
             block
-                .transactions
-                .par_iter()
+                .view()
+                .parallel_transactions()
                 .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
                 .collect()
         } else {
             block
-                .transactions
-                .iter()
+                .view()
+                .transactions()
                 .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
                 .collect()
         };

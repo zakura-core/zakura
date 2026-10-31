@@ -87,13 +87,13 @@ proptest! {
 
             // Reply to first request
             peer_tx
-                .send(Ok(Message::Block(first_block.0)))
+                .send(Ok(Message::Block(zakura_node_services::block_memory::BlockHandle::Shared(first_block.0))))
                 .await
                 .expect("Failed to send response to first block request");
 
             // Reply to second request
             peer_tx
-                .send(Ok(Message::Block(second_block.0.clone())))
+                .send(Ok(Message::Block(zakura_node_services::block_memory::BlockHandle::Shared(second_block.0.clone()))))
                 .await
                 .expect("Failed to send response to second block request");
 
@@ -114,7 +114,7 @@ proptest! {
             );
             let response = response_result.unwrap();
 
-            prop_assert_eq!(response, Response::Blocks(vec![Available((second_block.0, None))]));
+            prop_assert_eq!(response, Response::Blocks(vec![Available((zakura_node_services::block_memory::BlockHandle::Shared(second_block.0), None))]));
 
             // Check the state after the response
             let error = shared_error_slot.try_get_error();

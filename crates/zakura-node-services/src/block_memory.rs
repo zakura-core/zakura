@@ -8,7 +8,7 @@
 use std::{fmt, io, ops::Deref, sync::Arc};
 
 use zakura_chain::{
-    block::{Block, BlockView},
+    block::{self, Block, BlockView, Header},
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
@@ -302,6 +302,218 @@ impl Deref for OwnedBlockTransaction {
     }
 }
 
+/// A retained block passed between verification, state, and readers.
+#[derive(Clone, Debug)]
+pub enum BlockHandle {
+    /// A caller whose admission has not yet migrated to decoded-block ownership.
+    Shared(Arc<Block>),
+    /// A block whose escaping handles retain its decoded-memory charge.
+    Owned(OwnedBlock),
+}
+
+impl BlockHandle {
+    // Only this module may borrow the raw Arc-bearing payload.
+    fn block(&self) -> &Block {
+        match self {
+            Self::Shared(block) => block,
+            Self::Owned(block) => &block.0.block,
+        }
+    }
+
+    /// Borrow payloads without exposing raw shared handles.
+    pub fn view(&self) -> BlockView<'_> {
+        self.block().into()
+    }
+
+    /// Borrow the block header.
+    pub fn header(&self) -> &Header {
+        self.view().header()
+    }
+
+    /// Retain the header with its existing ownership.
+    pub fn retained_header(&self) -> HeaderHandle {
+        match self {
+            Self::Shared(block) => HeaderHandle::Shared(block.header.clone()),
+            Self::Owned(block) => HeaderHandle::Block(block.clone()),
+        }
+    }
+
+    /// Retain the indexed transaction with its existing ownership.
+    pub fn transaction(&self, index: usize) -> Option<TransactionHandle> {
+        match self {
+            Self::Shared(block) => block.transactions.get(index).cloned().map(Into::into),
+            Self::Owned(block) => block.transaction(index).map(Into::into),
+        }
+    }
+
+    /// Retain each transaction with its existing ownership, in block order.
+    pub fn transactions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = TransactionHandle> + DoubleEndedIterator + '_ {
+        (0..self.block().transactions.len()).map(|index| {
+            self.transaction(index)
+                .expect("the index comes from this immutable block")
+        })
+    }
+
+    /// Return the height reported by the coinbase transaction.
+    pub fn coinbase_height(&self) -> Option<block::Height> {
+        self.block().coinbase_height()
+    }
+
+    /// Compute the block hash.
+    pub fn hash(&self) -> block::Hash {
+        self.block().hash()
+    }
+
+    /// Compute the authorizing-data commitment root.
+    pub fn auth_data_root(&self) -> block::merkle::AuthDataRoot {
+        self.block().auth_data_root()
+    }
+}
+
+impl<'a> From<&'a BlockHandle> for BlockView<'a> {
+    fn from(block: &'a BlockHandle) -> Self {
+        block.view()
+    }
+}
+
+impl From<Arc<Block>> for BlockHandle {
+    fn from(block: Arc<Block>) -> Self {
+        Self::Shared(block)
+    }
+}
+
+impl From<OwnedBlock> for BlockHandle {
+    fn from(block: OwnedBlock) -> Self {
+        Self::Owned(block)
+    }
+}
+
+impl fmt::Display for BlockHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.block().fmt(formatter)
+    }
+}
+
+impl PartialEq for BlockHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.block() == other.block()
+    }
+}
+
+impl Eq for BlockHandle {}
+
+impl ZcashSerialize for BlockHandle {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.block().zcash_serialize(writer)
+    }
+}
+
+/// A header retained independently of its originating block handle.
+#[derive(Clone, Debug)]
+pub enum HeaderHandle {
+    /// A header whose admission belongs to a separate header pipeline.
+    Shared(Arc<Header>),
+    /// A header that still retains its block's decoded-memory charge.
+    Block(OwnedBlock),
+}
+
+impl Deref for HeaderHandle {
+    type Target = Header;
+
+    fn deref(&self) -> &Header {
+        match self {
+            Self::Shared(header) => header,
+            Self::Block(block) => &block.0.block.header,
+        }
+    }
+}
+
+impl AsRef<Header> for HeaderHandle {
+    fn as_ref(&self) -> &Header {
+        self
+    }
+}
+
+impl std::borrow::Borrow<Header> for HeaderHandle {
+    fn borrow(&self) -> &Header {
+        self
+    }
+}
+
+impl PartialEq for HeaderHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for HeaderHandle {}
+
+impl From<Arc<Header>> for HeaderHandle {
+    fn from(header: Arc<Header>) -> Self {
+        Self::Shared(header)
+    }
+}
+
+impl ZcashSerialize for HeaderHandle {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.as_ref().zcash_serialize(writer)
+    }
+}
+
+/// The payload retained by transaction verification and its detached workers.
+#[derive(Clone, Debug)]
+pub enum TransactionHandle {
+    /// A caller whose memory admission has not yet migrated to block ownership.
+    Shared(Arc<Transaction>),
+    /// A transaction that retains its block's decoded-memory charge.
+    Owned(OwnedBlockTransaction),
+}
+
+impl Deref for TransactionHandle {
+    type Target = Transaction;
+
+    fn deref(&self) -> &Transaction {
+        match self {
+            Self::Shared(transaction) => transaction,
+            Self::Owned(transaction) => transaction,
+        }
+    }
+}
+
+impl AsRef<Transaction> for TransactionHandle {
+    fn as_ref(&self) -> &Transaction {
+        self
+    }
+}
+
+impl std::borrow::Borrow<Transaction> for TransactionHandle {
+    fn borrow(&self) -> &Transaction {
+        self
+    }
+}
+
+impl PartialEq for TransactionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for TransactionHandle {}
+
+impl From<Arc<Transaction>> for TransactionHandle {
+    fn from(transaction: Arc<Transaction>) -> Self {
+        Self::Shared(transaction)
+    }
+}
+
+impl From<OwnedBlockTransaction> for TransactionHandle {
+    fn from(transaction: OwnedBlockTransaction) -> Self {
+        Self::Owned(transaction)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +536,29 @@ mod tests {
         assert_eq!(pool.reserved_bytes(), bytes);
         assert!(actual.upgrade().is_some());
         drop(transaction);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(actual.upgrade().is_none());
+    }
+
+    #[test]
+    fn escaping_block_parts_keep_the_original_charge() {
+        let block = block();
+        let bytes = block.attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::new(bytes);
+        let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let actual = Arc::downgrade(&owner.0.block.transactions[0]);
+        let handle = BlockHandle::from(owner);
+        let header = handle.retained_header();
+        let transaction = handle.transaction(0).unwrap();
+        assert!(matches!(header, HeaderHandle::Block(_)));
+        assert!(matches!(transaction, TransactionHandle::Owned(_)));
+        assert_eq!(handle.transactions().len(), 1);
+        drop(handle);
+        assert_eq!(pool.reserved_bytes(), bytes);
+        drop(transaction);
+        assert_eq!(pool.reserved_bytes(), bytes);
+        assert!(actual.upgrade().is_some());
+        drop(header);
         assert_eq!(pool.reserved_bytes(), 0);
         assert!(actual.upgrade().is_none());
     }

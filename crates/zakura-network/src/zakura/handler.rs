@@ -11612,7 +11612,10 @@ mod tests {
         assert_codec_frames_validate_at_transport(
             LegacyRequestFrame::BlocksByHash(vec![block.hash()]),
             LegacyRequestKind::Blocks,
-            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            Response::Blocks(vec![InventoryResponse::Available((
+                zakura_node_services::block_memory::BlockHandle::Shared(block),
+                None,
+            ))]),
         )?;
         assert_codec_frames_validate_at_transport(
             LegacyRequestFrame::TransactionsById(vec![tx_id]),

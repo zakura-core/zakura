@@ -5,7 +5,6 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    block::Block,
     ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
 };
@@ -64,11 +63,11 @@ impl NoteCommitmentTrees {
     /// If any of the tree updates cause an error,
     /// it will be returned at the end of the parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    pub fn update_trees_parallel(
+    pub fn update_trees_parallel<'a>(
         &mut self,
-        block: &Arc<Block>,
+        block: impl Into<crate::block::BlockView<'a>>,
     ) -> Result<(), NoteCommitmentTreeError> {
-        let block = block.clone();
+        let block = block.into();
         let height = block
             .coinbase_height()
             .expect("height was already validated");
@@ -119,7 +118,7 @@ impl NoteCommitmentTrees {
             }
         });
 
-        self.update_sprout_tree(&block)?;
+        self.update_sprout_tree(block)?;
 
         if let Some(sapling_result) = sapling_result {
             let (sapling, subtree_root) = sapling_result?;
@@ -149,7 +148,11 @@ impl NoteCommitmentTrees {
     ///
     /// Returns immediately without cloning or recalculating the root when the block has
     /// no Sprout note commitments.
-    pub fn update_sprout_tree(&mut self, block: &Block) -> Result<(), NoteCommitmentTreeError> {
+    pub fn update_sprout_tree<'a>(
+        &mut self,
+        block: impl Into<crate::block::BlockView<'a>>,
+    ) -> Result<(), NoteCommitmentTreeError> {
+        let block = block.into();
         let sprout_note_commitments: Vec<_> = block.sprout_note_commitments().cloned().collect();
         if sprout_note_commitments.is_empty() {
             return Ok(());
@@ -283,7 +286,7 @@ mod tests {
     use halo2::pasta::pallas;
 
     use crate::{
-        block::{Header, Height},
+        block::{Block, Header, Height},
         parameters::{Network, NetworkUpgrade::Nu6_3},
         serialization::ZcashDeserializeInto,
         transaction::{arbitrary::v5_transactions, LockTime, Transaction},

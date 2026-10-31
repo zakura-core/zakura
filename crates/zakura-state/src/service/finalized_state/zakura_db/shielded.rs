@@ -711,7 +711,7 @@ impl DiskWriteBatch {
         }
 
         #[cfg(not(feature = "indexer"))]
-        for transaction in &finalized.block.transactions {
+        for transaction in finalized.block.view().transactions() {
             self.prepare_nullifier_batch(zakura_db, transaction);
         }
     }
@@ -790,9 +790,9 @@ impl DiskWriteBatch {
         // can serve them for header-sync verification (design §6). The Ironwood root itself is
         // sourced separately per commit path just below: the fast path uses the verified
         // supplied root, and the legacy path uses the just-computed per-height tree's root.
-        let sapling_tx = finalized.block.sapling_transactions_count();
-        let orchard_tx = finalized.block.orchard_transactions_count();
-        let ironwood_tx = finalized.block.ironwood_transactions_count();
+        let sapling_tx = finalized.block.view().sapling_transactions_count();
+        let orchard_tx = finalized.block.view().orchard_transactions_count();
+        let ironwood_tx = finalized.block.view().ironwood_transactions_count();
 
         // Record the upgrade height `U` once, on the first block this binary commits: the lowest
         // height in the serving index, and the boundary below which roots are served from the

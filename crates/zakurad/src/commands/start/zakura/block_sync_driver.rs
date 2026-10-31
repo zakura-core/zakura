@@ -1386,7 +1386,7 @@ where
     let height = block.coinbase_height();
     let commit = block_verifier
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(block));
+        .oneshot(zakura_consensus::Request::Commit(block.into()));
     block_commit_outcome(owner, source, height, expected_hash, commit.await)
 }
 
@@ -1410,7 +1410,7 @@ where
 {
     let commit = block_verifier
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(block));
+        .oneshot(zakura_consensus::Request::Commit(block.into()));
 
     tokio::pin!(commit);
     tokio::select! {

@@ -20,7 +20,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use zakura_chain::{
     amount::NonNegative,
-    block::{self, Block, Height},
+    block::{self, Height},
     serialization::DateTime32,
     value_balance::ValueBalance,
 };
@@ -67,7 +67,10 @@ where
 
 /// Returns the tip block of `chain`.
 /// If there is no chain, returns the tip of `db`.
-pub fn tip_block<C>(chain: Option<C>, db: &ZakuraDb) -> Option<Arc<Block>>
+pub fn tip_block<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+) -> Option<zakura_node_services::block_memory::BlockHandle>
 where
     C: AsRef<Chain>,
 {
@@ -79,7 +82,7 @@ where
     // so it is acceptable to return either tip.
     chain
         .and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
-        .or_else(|| db.tip_block())
+        .or_else(|| db.tip_block().map(Into::into))
 }
 
 /// Returns the tip [`Height`] of `chain`.
@@ -538,7 +541,7 @@ fn collect_chain_headers<C>(
     intersection: Option<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<Arc<block::Header>>
+) -> Vec<zakura_node_services::block_memory::HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -626,7 +629,7 @@ pub fn find_chain_headers<C>(
     known_blocks: Vec<block::Hash>,
     stop: Option<block::Hash>,
     max_len: u32,
-) -> Vec<Arc<block::Header>>
+) -> Vec<zakura_node_services::block_memory::HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -681,7 +684,7 @@ pub fn next_median_time_past(
 fn best_relevant_chain(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<Vec<Arc<Block>>, BoxError> {
+) -> Result<Vec<zakura_node_services::block_memory::BlockHandle>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
@@ -714,10 +717,12 @@ fn best_relevant_chain(
 /// The `relevant_chain` has blocks in reverse height order.
 ///
 /// See [`next_median_time_past()`] for details.
-pub(crate) fn calculate_median_time_past(relevant_chain: Vec<Arc<Block>>) -> DateTime32 {
+pub(crate) fn calculate_median_time_past(
+    relevant_chain: Vec<zakura_node_services::block_memory::BlockHandle>,
+) -> DateTime32 {
     let relevant_data: Vec<DateTime<Utc>> = relevant_chain
         .iter()
-        .map(|block| block.header.time)
+        .map(|block| block.header().time)
         .collect();
 
     // > Define the median-time-past of a block to be the median of the nTime fields of the

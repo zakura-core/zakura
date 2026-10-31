@@ -13,14 +13,15 @@
 //! - the shared finalized [`ZakuraDb`] reference.
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
 
 use chrono::{DateTime, Utc};
 
 use zakura_chain::{
-    block::{self, Block, Height},
+    block::{self, Height},
     block_info::BlockInfo,
     serialization::ZcashSerialize as _,
-    transaction::{self, Transaction},
+    transaction::{self},
     transparent::{self, Utxo},
 };
 
@@ -43,7 +44,7 @@ pub fn any_block<'a, C: AsRef<Chain> + 'a>(
     mut chains: impl Iterator<Item = &'a C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<Block>> {
+) -> Option<BlockHandle> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
@@ -52,12 +53,16 @@ pub fn any_block<'a, C: AsRef<Chain> + 'a>(
     chains
         .find_map(|c| c.as_ref().block(hash_or_height))
         .map(|contextual| contextual.block.clone())
-        .or_else(|| db.block(hash_or_height))
+        .or_else(|| db.block(hash_or_height).map(Into::into))
 }
 
 /// Returns the [`Block`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
-pub fn block<C>(chain: Option<C>, db: &ZakuraDb, hash_or_height: HashOrHeight) -> Option<Arc<Block>>
+pub fn block<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockHandle>
 where
     C: AsRef<Chain>,
 {
@@ -70,7 +75,7 @@ pub fn block_and_size<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<(Arc<Block>, usize)>
+) -> Option<(BlockHandle, usize)>
 where
     C: AsRef<Chain>,
 {
@@ -86,7 +91,10 @@ where
             let size = contextual.block.zcash_serialize_to_vec().unwrap().len();
             (contextual.block.clone(), size)
         })
-        .or_else(|| db.block_and_size(hash_or_height))
+        .or_else(|| {
+            db.block_and_size(hash_or_height)
+                .map(|(block, size)| (block.into(), size))
+        })
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
@@ -95,7 +103,7 @@ pub fn block_header<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<block::Header>>
+) -> Option<HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -107,8 +115,8 @@ where
     chain
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
-        .map(|contextual| contextual.block.header.clone())
-        .or_else(|| db.block_header(hash_or_height))
+        .map(|contextual| contextual.block.retained_header())
+        .or_else(|| db.block_header(hash_or_height).map(Into::into))
 }
 
 /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in the
@@ -117,7 +125,7 @@ fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<(Arc<Transaction>, Height, DateTime<Utc>)>
+) -> Option<(TransactionHandle, Height, DateTime<Utc>)>
 where
     C: AsRef<Chain>,
 {
@@ -133,7 +141,10 @@ where
                 .transaction(hash)
                 .map(|(tx, height, time)| (tx.clone(), height, time))
         })
-        .or_else(|| db.transaction(hash))
+        .or_else(|| {
+            db.transaction(hash)
+                .map(|(tx, height, time)| (tx.into(), height, time))
+        })
 }
 
 /// Returns a [`MinedTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -190,7 +201,7 @@ pub fn any_transaction<'a>(
         })
         .or_else(|| {
             db.transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time, true, None))
+                .map(|(tx, height, time)| (tx.into(), height, time, true, None))
         })?;
 
     if in_best_chain {
@@ -348,7 +359,7 @@ pub fn parent_inputs(
             .blocks
             .values()
             .next()
-            .map(|root| root.block.header.previous_block_hash)
+            .map(|root| root.block.header().previous_block_hash)
             == Some(finalized_hash)
     } else {
         root_height <= finalized_height

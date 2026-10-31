@@ -3,7 +3,6 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -36,7 +35,8 @@ use zakura_chain::{
     transparent,
 };
 
-use zakura_node_services::{block_memory::OwnedBlockTransaction, mempool};
+pub use zakura_node_services::block_memory::TransactionHandle;
+use zakura_node_services::mempool;
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
 
@@ -200,52 +200,6 @@ impl
             script_verifier: script::Verifier,
             mempool_setup_rx: oneshot::channel().1,
         }
-    }
-}
-
-/// The payload retained by transaction verification and its detached workers.
-#[derive(Clone, Debug)]
-pub enum TransactionHandle {
-    /// A caller whose memory admission has not yet migrated to block ownership.
-    Shared(Arc<Transaction>),
-    /// A transaction that retains its block's decoded-memory charge.
-    Owned(OwnedBlockTransaction),
-}
-
-impl Deref for TransactionHandle {
-    type Target = Transaction;
-
-    fn deref(&self) -> &Transaction {
-        match self {
-            Self::Shared(transaction) => transaction,
-            Self::Owned(transaction) => transaction,
-        }
-    }
-}
-
-impl AsRef<Transaction> for TransactionHandle {
-    fn as_ref(&self) -> &Transaction {
-        self
-    }
-}
-
-impl PartialEq for TransactionHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for TransactionHandle {}
-
-impl From<Arc<Transaction>> for TransactionHandle {
-    fn from(transaction: Arc<Transaction>) -> Self {
-        Self::Shared(transaction)
-    }
-}
-
-impl From<OwnedBlockTransaction> for TransactionHandle {
-    fn from(transaction: OwnedBlockTransaction) -> Self {
-        Self::Owned(transaction)
     }
 }
 

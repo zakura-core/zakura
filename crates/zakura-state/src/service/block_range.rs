@@ -33,7 +33,7 @@ impl BlockRangeSnapshot {
         &self,
         db: &ZakuraDb,
         height: block::Height,
-    ) -> Option<(Arc<block::Block>, usize)> {
+    ) -> Option<(zakura_node_services::block_memory::BlockHandle, usize)> {
         if height > self.tip? {
             return None;
         }

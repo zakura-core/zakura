@@ -1,5 +1,6 @@
 //! Transaction-related types.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::methods::arrayhex;
@@ -1168,7 +1169,7 @@ impl TransactionObject {
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_transaction(
-        tx: Arc<Transaction>,
+        tx: impl AsRef<Transaction>,
         height: Option<block::Height>,
         confirmations: Option<i64>,
         network: &Network,
@@ -1177,9 +1178,10 @@ impl TransactionObject {
         in_active_chain: Option<bool>,
         txid: transaction::Hash,
     ) -> Self {
+        let tx = tx.as_ref();
         let block_time = block_time.map(|bt| bt.timestamp());
         Self {
-            hex: tx.clone().into(),
+            hex: tx.into(),
             height: if in_active_chain.unwrap_or_default() {
                 height.map(|height| height.0 as i32)
             } else if block_hash.is_some() {

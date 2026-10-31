@@ -758,7 +758,7 @@ where
             // the new block until the next sync round, which is what leaves a mining backend
             // issuing work on an obsolete tip.
             if let Some(expected_height) =
-                tip_child_mismatch(block.header.previous_block_hash, block_height, best_tip)
+                tip_child_mismatch(block.header().previous_block_hash, block_height, best_tip)
             {
                 debug!(
                     ?hash,
@@ -1083,7 +1083,10 @@ mod tests {
                     .cloned()
                     .expect("test network has a block for the requested hash");
 
-                Ok(zn::Response::Blocks(vec![Available((block, None))]))
+                Ok(zn::Response::Blocks(vec![Available((
+                    zakura_node_services::block_memory::BlockHandle::Shared(block),
+                    None,
+                ))]))
             }
         }));
 
@@ -1285,7 +1288,10 @@ mod tests {
                 else {
                     return Err("unexpected network request".into());
                 };
-                Ok(zn::Response::Blocks(vec![Available((substitute, None))]))
+                Ok(zn::Response::Blocks(vec![Available((
+                    zakura_node_services::block_memory::BlockHandle::Shared(substitute),
+                    None,
+                ))]))
             }
         }));
 
@@ -1398,7 +1404,7 @@ mod tests {
                 let block = block.clone();
                 async move {
                     Ok(zn::Response::Blocks(vec![Available((
-                        block,
+                        zakura_node_services::block_memory::BlockHandle::Shared(block),
                         Some(advertiser_addr),
                     ))]))
                 }

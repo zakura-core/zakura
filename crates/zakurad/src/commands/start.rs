@@ -932,7 +932,9 @@ impl StartCmd {
         {
             let genesis_hash = block_verifier_router
                 .clone()
-                .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+                .oneshot(zakura_consensus::Request::Commit(
+                    regtest_genesis_block().into(),
+                ))
                 .await
                 .expect("should validate Regtest genesis block");
 
@@ -5686,7 +5688,9 @@ mod zakura_header_sync_driver_tests {
             .find(|(height, _)| height.0 == WITHHELD)
             .expect("withheld block is part of the test chain");
         legacy_verifier
-            .oneshot(withheld_block.clone())
+            .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
+                withheld_block.clone(),
+            ))
             .await
             .expect("legacy verifier submission completes the checkpoint range");
 
@@ -6011,7 +6015,13 @@ mod zakura_header_sync_driver_tests {
         let mut commits = FuturesUnordered::new();
         for (_height, block) in chain {
             let checkpoint_verifier = checkpoint_verifier.clone();
-            commits.push(async move { checkpoint_verifier.oneshot(block).await });
+            commits.push(async move {
+                checkpoint_verifier
+                    .oneshot(zakura_node_services::block_memory::BlockHandle::Shared(
+                        block,
+                    ))
+                    .await
+            });
         }
         while let Some(result) = commits.next().await {
             result.expect("checkpoint verifier commits the contiguous range");

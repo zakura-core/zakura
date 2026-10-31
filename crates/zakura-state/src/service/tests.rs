@@ -215,6 +215,71 @@ async fn await_block_info_waits_for_checkpoint_commit() {
     assert!(matches!(response, Response::BlockInfo(Some(_))));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charged() {
+    use zakura_node_services::block_memory::{Admission, BlockHandle, DecodedBlockPool};
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let (mut state, read, tip, changes) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let child: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let bytes = child.attributed_memory_size_bytes();
+    let hash = child.hash();
+    let pool = DecodedBlockPool::new(bytes);
+    let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
+    drop(
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
+            BlockHandle::from(child),
+        )),
+    );
+    assert_eq!(state.finalized_state_queued_blocks.len(), 1);
+    assert!(bytes > 0);
+    assert_eq!(pool.reserved_bytes(), bytes);
+
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(genesis.into()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    timeout(limit, async {
+        while tip.best_tip_hash() != Some(hash) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the real writer commits the cancelled caller's child");
+    assert_eq!(
+        pool.reserved_bytes(),
+        bytes,
+        "the published tip retains its transactions"
+    );
+    drop((state, read));
+    assert_eq!(
+        pool.reserved_bytes(),
+        bytes,
+        "tip readers outlive the state worker"
+    );
+    drop((tip, changes));
+    timeout(limit, async {
+        while pool.reserved_bytes() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("state teardown releases its final payload holder");
+}
+
 /// Returns Mainnet blocks 0..=2 with v4 coinbases, so block 2 can reach the non-finalized state.
 fn v4_coinbase_mainnet_chain() -> Vec<Arc<Block>> {
     let mut chain: Vec<Arc<Block>> = Vec::new();
@@ -540,7 +605,7 @@ impl Fixture {
             &self.non_finalized,
             &self.finalized.db,
             crate::BlockCommitmentData {
-                block: child,
+                block: zakura_node_services::block_memory::BlockHandle::Shared(child),
                 auth_data_root: None,
             },
         )
@@ -638,13 +703,19 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
             .take(11)
             .last()
             .expect("the context has a median-time window")
-            .header
+            .view()
+            .header()
             .time;
     Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = too_early;
     let relevant_data =
         super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
             .take(POW_ADJUSTMENT_BLOCK_SPAN)
-            .map(|block| (block.header.difficulty_threshold, block.header.time));
+            .map(|block| {
+                (
+                    block.view().header().difficulty_threshold,
+                    block.view().header().time,
+                )
+            });
     let expected_target =
         AdjustedDifficulty::new_from_block(&child, &fixture.network, relevant_data)
             .expect("the context derives an expected target")
@@ -727,9 +798,14 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
     // `child` extends the finalized tip, so it can be committed as soon as it is queued.
     // `grandchild` can only be released by `child`.
     let child = chain[2].clone().prepare();
-    assert_eq!(child.block.header.previous_block_hash, chain[1].hash());
+    assert_eq!(
+        child.block.view().header().previous_block_hash,
+        chain[1].hash()
+    );
 
-    let mut grandchild_block = (*child.block).clone();
+    let mut grandchild_block = crate::tests::copy_block_fixture(&child.block)
+        .as_ref()
+        .clone();
     Arc::make_mut(&mut grandchild_block.header).previous_block_hash = child.hash;
     let grandchild = Arc::new(grandchild_block).prepare();
     let (grandchild_tx, _grandchild_rx) = tokio::sync::oneshot::channel();
@@ -743,7 +819,9 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
     // Fill the rest of the queue with blocks whose parents this state will never have.
     let mut orphan_count = 0_u64;
     while !state_service.non_finalized_state_queued_blocks.is_full() {
-        let mut orphan_block = (*child.block).clone();
+        let mut orphan_block = crate::tests::copy_block_fixture(&child.block)
+            .as_ref()
+            .clone();
         Arc::make_mut(&mut orphan_block.header)
             .previous_block_hash
             .0[..8]
@@ -802,7 +880,7 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
         .zcash_deserialize_into()
         .expect("the child block vector decodes");
     let block = block.prepare();
-    let ancestor = block.block.header.previous_block_hash;
+    let ancestor = block.block.view().header().previous_block_hash;
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
     let unrelated = block::Hash([0xff; 32]);
     state.remember_failed_ancestor(unrelated, unrelated, NonFinalizedWriteFailureKind::Invalid);
@@ -1589,12 +1667,16 @@ async fn test_populated_state_responds_correctly(
 
         transcript.push((
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block.clone()))),
+            Ok(Response::Block(Some(
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+            ))),
         ));
 
         transcript.push((
             Request::Block(height.into()),
-            Ok(Response::Block(Some(block.clone()))),
+            Ok(Response::Block(Some(
+                zakura_node_services::block_memory::BlockHandle::Shared(block.clone()),
+            ))),
         ));
 
         // Spec: transactions in the genesis block are ignored.
@@ -2154,7 +2236,7 @@ proptest! {
     fn some_block_less_than_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(4, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2171,7 +2253,7 @@ proptest! {
             .coinbase_height()
             .expect("chain contains valid blocks");
 
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(
@@ -2209,7 +2291,7 @@ proptest! {
 
         let response = crate::service::check::legacy_chain(
             nu_activation_height,
-            chain.clone().into_iter().rev(),
+            chain.clone().into_iter().rev().map(Into::into),
             &network,
             TEST_LEGACY_CHAIN_LIMIT,
         ).map_err(|error| error.to_string());
@@ -2228,7 +2310,7 @@ proptest! {
     fn at_least_one_transaction_with_valid_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(Into::into), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2269,7 +2351,7 @@ proptest! {
             // which is not included in the UTXO set
             if block.height > block::Height(0) {
                 let utxos = &block.new_outputs.iter().map(|(k, ordered_utxo)| (*k, ordered_utxo.utxo.clone())).collect();
-                let block_value_pool = &block.block.chain_value_pool_change(&network, utxos, None)?;
+                let block_value_pool = &block.block.view().chain_value_pool_change(&network, utxos, None)?;
                 expected_finalized_value_pool += *block_value_pool;
             }
 
@@ -2296,7 +2378,7 @@ proptest! {
         let mut expected_non_finalized_value_pool = Ok(expected_finalized_value_pool?);
         for block in non_finalized_blocks {
             let utxos = block.new_outputs.clone();
-            let block_value_pool = &block.block.chain_value_pool_change(&network, &transparent::utxos_from_ordered_utxos(utxos), None)?;
+            let block_value_pool = &block.block.view().chain_value_pool_change(&network, &transparent::utxos_from_ordered_utxos(utxos), None)?;
             expected_non_finalized_value_pool += *block_value_pool;
 
             let result_receiver =

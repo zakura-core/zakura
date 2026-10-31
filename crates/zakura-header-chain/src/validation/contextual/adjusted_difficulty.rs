@@ -3,7 +3,7 @@ use std::cmp::{max, min};
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::{Network, NetworkUpgrade},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
     BoundedVec,
@@ -71,14 +71,15 @@ impl AdjustedDifficulty {
     ///
     /// Miners supply block times.
     /// The `time` values might not follow reverse chronological order.
-    pub fn new_from_block<C>(
-        candidate_block: &Block,
+    pub fn new_from_block<'a, C>(
+        candidate_block: impl Into<zakura_chain::block::BlockView<'a>>,
         network: &Network,
         context: C,
     ) -> Result<AdjustedDifficulty, AdjustedDifficultyError>
     where
         C: IntoIterator<Item = (CompactDifficulty, DateTime<Utc>)>,
     {
+        let candidate_block = candidate_block.into();
         let candidate_block_height = candidate_block
             .coinbase_height()
             .ok_or(AdjustedDifficultyError::MissingCoinbaseHeight)?;
@@ -86,7 +87,7 @@ impl AdjustedDifficulty {
             (candidate_block_height - 1).ok_or(AdjustedDifficultyError::Genesis)?;
 
         AdjustedDifficulty::new_from_header_time(
-            candidate_block.header.time,
+            candidate_block.header().time,
             previous_block_height,
             network,
             context,

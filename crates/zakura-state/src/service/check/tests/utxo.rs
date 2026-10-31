@@ -917,8 +917,8 @@ fn new_state_with_mainnet_transparent_data(
             "unexpected invalid block 1, modified with generated transactions: \n\
              converted coinbase: {:?} \n\
              generated non-coinbase: {:?}",
-            block1.block.transactions[0],
-            block1.block.transactions[1],
+            block1.block.transaction(0),
+            block1.block.transaction(1),
         );
         assert_eq!(
             Some((Height(1), block1.hash)),

@@ -149,7 +149,7 @@ pub fn chain_tips(
 
     for blocks in invalidated_branches.values() {
         for invalidated_block in blocks.iter() {
-            let parent = invalidated_block.block.header.previous_block_hash;
+            let parent = invalidated_block.block.header().previous_block_hash;
 
             invalidated_parents.insert(parent);
             invalidated_by_hash.insert(invalidated_block.hash, (invalidated_block.height, parent));
@@ -295,7 +295,7 @@ fn invalidated_fork_height(
     db: &ZakuraDb,
 ) -> Height {
     let mut root_height = root_block.height;
-    let mut parent = root_block.block.header.previous_block_hash;
+    let mut parent = root_block.block.header().previous_block_hash;
 
     // Each step moves to a distinct invalidated block, so the walk cannot take more
     // steps than there are invalidated blocks.

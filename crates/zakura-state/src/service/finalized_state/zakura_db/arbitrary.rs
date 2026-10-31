@@ -42,7 +42,7 @@ impl ZakuraDb {
     /// Artificially prime the note commitment tree anchor sets with anchors
     /// referenced in a block, for testing purposes _only_.
     #[cfg(any(test, feature = "proptest-impl"))]
-    pub fn populate_with_anchors(&self, block: &Block) {
+    pub fn populate_with_anchors<'a>(&self, block: impl Into<zakura_chain::block::BlockView<'a>>) {
         let mut batch = DiskWriteBatch::new();
 
         let sprout_anchors = self.db().cf_handle("sprout_anchors").unwrap();
@@ -55,7 +55,7 @@ impl ZakuraDb {
         // that because the database checks if the tree has a cached root.
         sprout_tree.root();
 
-        for transaction in block.transactions.iter() {
+        for transaction in block.into().transactions() {
             // Sprout
             for joinsplit in transaction.sprout_groth16_joinsplits() {
                 batch.zs_insert(&sprout_anchors, joinsplit.anchor, sprout_tree.clone());

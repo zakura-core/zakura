@@ -1120,7 +1120,7 @@ where
             // block advertiser fills. A `Client` caller that sends one as an ordinary request,
             // such as an isolated connection, gets an error instead of an `inv`.
             (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_)) => {
-                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService.into())))
+                Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
             }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",

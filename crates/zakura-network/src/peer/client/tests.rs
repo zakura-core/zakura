@@ -34,6 +34,8 @@ use crate::{
 };
 
 #[cfg(test)]
+pub(crate) mod connected;
+#[cfg(test)]
 mod vectors;
 
 /// The maximum time a mocked peer connection should be alive during a test.
@@ -313,6 +315,7 @@ where
 
         let client = Client {
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_sender),

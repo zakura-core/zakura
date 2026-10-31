@@ -594,6 +594,9 @@ where
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
 
+    /// Tells the client and peer set whether this connection is free to write a new request.
+    pub(super) request_slot: super::client::RequestSlot,
+
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
@@ -664,6 +667,7 @@ where
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -709,6 +713,11 @@ where
         // TODO: turn this comment into a module-level comment, after splitting the module.
         loop {
             self.update_state_metrics(None);
+
+            // Every state change returns here before the next await, so the slot is current
+            // whenever this task is waiting.
+            self.request_slot
+                .set_busy(!matches!(self.state, State::AwaitingRequest));
 
             match self.state {
                 State::AwaitingRequest => {
@@ -777,6 +786,8 @@ where
                             break;
                         }
                         Either::Right((Some(req), _)) => {
+                            // The request may wait for the peer writer before the state changes.
+                            self.request_slot.set_busy(true);
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -1795,6 +1806,7 @@ where
 
         // Close channels first, so other tasks can start shutting down.
         self.client_rx.close();
+        self.request_slot.set_busy(true);
 
         // Update the shared error slot
         //

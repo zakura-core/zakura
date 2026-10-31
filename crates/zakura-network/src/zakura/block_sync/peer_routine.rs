@@ -333,7 +333,7 @@ enum Disposition {
     RetryMissing,
 }
 
-/// Keeps a receipt charge and its observation live through cancellation.
+/// Keeps a receipt charge live until the synchronous send finishes or unwinds.
 struct ReceiptSettlement {
     funding: Option<crate::zakura::transport::ByteReservation>,
     #[cfg(any(test, zakura_sim))]
@@ -2089,7 +2089,6 @@ impl PeerRoutine {
             .outstanding
             .get(key)
             .expect("the key was just found in the window");
-        let delivery_snapshot = outstanding.delivery_snapshot;
         if outstanding.has_received(height) {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
@@ -2135,10 +2134,7 @@ impl PeerRoutine {
             return;
         }
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
-        let request_start_height = outstanding.request.start_height;
-        let request_range_count = outstanding.request.count;
         let request_elapsed = outstanding.queued_at.elapsed();
-        let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
         // The body's transactions are not validated against the header here;
         // consensus does it on apply (`handle_block_apply_finished` attributes a
@@ -2168,6 +2164,45 @@ impl PeerRoutine {
             // estimate says nothing about that supplier.
             metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
         }
+
+        self.finish_matched_receipt(
+            key,
+            height,
+            hash,
+            block,
+            raw_block_payload,
+            body_wire_bytes,
+            serialized_bytes,
+            request_elapsed,
+            body_permit,
+        );
+    }
+
+    /// Transfer request funding through the body send without a suspension point.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_matched_receipt(
+        &mut self,
+        key: RequestKey,
+        height: block::Height,
+        hash: block::Hash,
+        block: Arc<block::Block>,
+        raw_block_payload: Arc<[u8]>,
+        body_wire_bytes: Option<u64>,
+        serialized_bytes: u64,
+        request_elapsed: Duration,
+        body_permit: mpsc::OwnedPermit<SequencedBody>,
+    ) {
+        let outstanding = self
+            .window
+            .outstanding
+            .get(key)
+            .expect("the validated request remains present until receipt settlement");
+        let outstanding_owner = outstanding.request.owner;
+        let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
+        let delivery_snapshot = outstanding.delivery_snapshot;
+        let request_start_height = outstanding.request.start_height;
+        let request_range_count = outstanding.request.count;
+        let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
         metrics::counter!("sync.block.body.received").increment(1);
         self.record_received(serialized_bytes);
@@ -2262,7 +2297,7 @@ impl PeerRoutine {
     /// report comes before the send, because the sequencer can dequeue the
     /// body as soon as the send succeeds. Reports nothing when `charge` is 0,
     /// because then the budget never counted the body.
-    /// The receipt owner reports the end on completion or cancellation.
+    /// The receipt owner reports the end after the send or during unwind.
     #[cfg(any(test, zakura_sim))]
     fn observe_handoff_started(
         &self,
@@ -2400,6 +2435,29 @@ impl PeerRoutine {
             },
         };
 
+        self.finish_unmatched_receipt(
+            height,
+            hash,
+            block,
+            body_wire_bytes,
+            serialized_bytes,
+            body_permit,
+            raw_block_payload,
+        )
+    }
+
+    /// Claim and send a wanted late body without suspending its funding transfer.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_unmatched_receipt(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        block: Arc<block::Block>,
+        body_wire_bytes: Option<u64>,
+        serialized_bytes: u64,
+        body_permit: mpsc::OwnedPermit<SequencedBody>,
+        raw_block_payload: Arc<[u8]>,
+    ) -> bool {
         let reserved_in_flight = self.work.reserved_in_flight_charge(height);
         let is_pending = self.work.pending_contains(height);
         if reserved_in_flight.is_none() && !is_pending {

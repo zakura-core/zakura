@@ -168,7 +168,7 @@ impl ReactorIO {
         if let Some(observer) = &self.startup.observer.0 {
             observer.observe(super::block_sync_observe::BlockEvent::Reactor {
                 transition,
-                state: self.state.snapshot(),
+                state: Box::new(self.state.snapshot()),
             });
         }
     }

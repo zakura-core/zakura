@@ -23,10 +23,16 @@
 //!   until its decoder finishes, so a response's frames and reassembly copies never
 //!   compete with native traffic for raw frame bytes.
 //!
-//! Waiting here is local backpressure. It never faults a peer. A paused reader
-//! stops granting QUIC credit, and the peer memory budget already funds that
-//! unspent credit. Reading a frame moves its bytes out of QUIC's buffers, so a
-//! raw grant and transport credit never charge the same bytes.
+//! Waiting here is local backpressure. It never faults a peer, and it never
+//! comes from another connection's traffic: the node budgets hold every
+//! connection's budget at once. A paused reader stops granting QUIC credit, and
+//! the peer memory budget already funds that unspent credit. Reading a frame
+//! moves its bytes out of QUIC's buffers, so a raw grant and transport credit
+//! never charge the same bytes, and [`ResourceEnvelope`] adds the two.
+//!
+//! Request-stream executions need no budget here. Each runs on a stream that
+//! holds one of its connection's `max_open_streams` permits, and a connection
+//! keeps its slot until its stream workers settle.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +43,7 @@ use zakura_rt::{
 };
 
 use crate::zakura::{
-    regulation::{sizing, OutputByteBudget, OutputGrant, SlotBudget, SlotPermit},
+    regulation::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit},
     FRAME_HEADER_BYTES,
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
@@ -61,6 +67,23 @@ const COMPAT_RESPONSE_EXCHANGES: u64 = 16;
 #[cfg(test)]
 mod tests;
 
+/// The transport limits that [`ResourceEnvelope`] derives from.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TransportLimits {
+    /// The QUIC receive window of one connection.
+    pub(crate) receive_window: u32,
+    /// The QUIC send window of one connection.
+    pub(crate) send_window: u64,
+    /// Connections the node admits.
+    pub(crate) max_connections: usize,
+    /// QUIC connections the node holds beyond the admitted ones.
+    pub(crate) max_pending_handshakes: usize,
+    /// Streams one connection may hold open.
+    pub(crate) max_open_streams: u16,
+    /// The largest frame a stream carries.
+    pub(crate) max_frame_bytes: u32,
+}
+
 /// The node's transport byte and worker bounds, derived from its transport limits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceEnvelope {
@@ -72,51 +95,74 @@ pub(crate) struct ResourceEnvelope {
     pub(crate) connection_output_bytes: u64,
     /// Queued frame bytes without another owner that the node may retain.
     pub(crate) node_output_bytes: u64,
-    /// Request-stream executions that may run at once across the node.
-    pub(crate) request_workers: usize,
+    /// Request-stream executions that open streams allow at once across the node.
+    pub(crate) request_executions: usize,
     /// Outbound compatibility exchange bytes that the node may retain.
     pub(crate) compat_response_bytes: u64,
+    /// The frames each stream's raw and output floor slots may retain, in bytes.
+    pub(crate) floor_frame_bytes: u128,
+    /// The compatibility results that request executions may hold while they wait
+    /// for output admission, in bytes. Only an open stream bounds them.
+    pub(crate) waiting_result_bytes: u128,
+    /// Unspent transport credit the peer memory budget funds, in bytes.
+    pub(crate) transport_credit_bytes: u128,
 }
 
 impl ResourceEnvelope {
-    /// Bounds for a node with these QUIC windows and connection cap.
+    /// Bounds for a node with these transport limits.
     ///
-    /// Each byte budget is at least twice its QUIC window, as `regulation::sizing`
-    /// requires, so the transport stays the byte limit for a healthy peer.
-    pub(crate) fn new(receive_window: u64, send_window: u64, max_connections: usize) -> Self {
-        let connection_raw_bytes = receive_window.saturating_mul(2).max(1);
-        let connection_output_bytes = send_window.saturating_mul(2).max(1);
+    /// Each connection budget is twice its QUIC window, as `regulation::sizing`
+    /// requires, so the transport stays one connection's byte limit. Each node
+    /// budget holds every admitted connection's budget at once, so a busy peer
+    /// cannot pause another one. A node budget can only bind on frames that a
+    /// retiring service keeps after its connection released its slot.
+    pub(crate) fn new(limits: TransportLimits) -> Self {
+        let connections = limits.max_connections.max(1);
+        // Widening usize, u16, and u32 to u64 or u128 is lossless on supported targets.
+        let node_bytes =
+            |connection_bytes: u64| connection_bytes.saturating_mul(connections as u64);
+        let connection_raw_bytes = u64::from(limits.receive_window).saturating_mul(2).max(1);
+        let connection_output_bytes = limits.send_window.saturating_mul(2).max(1);
+        let streams = connections as u128 * u128::from(limits.max_open_streams);
+        let live_connections = connections.saturating_add(limits.max_pending_handshakes) as u128;
         Self {
             connection_raw_bytes,
-            node_raw_bytes: sizing::node_output_bytes().max(connection_raw_bytes),
+            node_raw_bytes: node_bytes(connection_raw_bytes),
             connection_output_bytes,
-            node_output_bytes: sizing::node_output_bytes().max(connection_output_bytes),
-            request_workers: max_connections.saturating_mul(2).max(1),
+            node_output_bytes: node_bytes(connection_output_bytes),
+            request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             compat_response_bytes: COMPAT_RESPONSE_EXCHANGES * COMPAT_EXCHANGE_MAX_BYTES,
+            floor_frame_bytes: 2 * streams * u128::from(limits.max_frame_bytes),
+            waiting_result_bytes: streams * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128,
+            transport_credit_bytes: live_connections
+                * u128::from(zakura_quic::connection_memory_bytes(
+                    limits.receive_window,
+                    limits.send_window,
+                )),
         }
     }
 
     /// The most frame bytes these bounds allow this module's owners to retain:
     /// the node budgets, the compatibility partition, each stream's raw and output
     /// floor frame, and the compatibility results that wait for output admission
-    /// while they hold an execution slot.
-    ///
-    /// QUIC's own buffers come on top; the peer memory budget funds those.
-    pub(crate) fn retained_bytes_bound(
-        &self,
-        max_connections: usize,
-        max_open_streams: u16,
-        max_frame_bytes: u32,
-    ) -> u128 {
-        let floor_frames = 2 * max_connections as u128 * u128::from(max_open_streams);
-        // Widening usize to u128 is lossless on supported targets.
-        let waiting_results =
-            self.request_workers as u128 * COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u128;
+    /// while they hold a stream.
+    pub(crate) fn retained_frame_bytes(&self) -> u128 {
         u128::from(self.node_raw_bytes)
             + u128::from(self.node_output_bytes)
             + u128::from(self.compat_response_bytes)
-            + waiting_results
-            + floor_frames * u128::from(max_frame_bytes)
+            + self.floor_frame_bytes
+            + self.waiting_result_bytes
+    }
+
+    /// The most transport memory these bounds allow: retained frames, plus the
+    /// bytes QUIC buffers under unspent credit.
+    ///
+    /// The two parts have separate funders. The peer memory budget funds only
+    /// the credit, and no frame budget charges credit, so a byte that a reader
+    /// moves out of QUIC's buffers spends a frame grant and returns its credit.
+    /// Both parts can be full at once: returned credit lets the peer send again.
+    pub(crate) fn transport_memory_bytes(&self) -> u128 {
+        self.retained_frame_bytes() + self.transport_credit_bytes
     }
 }
 
@@ -126,7 +172,6 @@ pub(crate) struct NodeResources {
     envelope: ResourceEnvelope,
     raw: OutputByteBudget,
     output: OutputByteBudget,
-    request_workers: SlotBudget,
     compat_responses: OutputByteBudget,
     owners: OwnerLedger,
 }
@@ -138,8 +183,6 @@ impl NodeResources {
             envelope,
             raw: byte_budget(envelope.node_raw_bytes),
             output: byte_budget(envelope.node_output_bytes),
-            request_workers: SlotBudget::new(envelope.request_workers)
-                .expect("the envelope keeps at least one worker within a semaphore's range"),
             compat_responses: byte_budget(envelope.compat_response_bytes),
             owners: OwnerLedger::default(),
         }
@@ -180,7 +223,6 @@ impl ConnectionResources {
         StreamResources {
             raw: FrameGate::new(self.raw.clone(), self.node.raw.clone()),
             output: FrameGate::new(self.output.clone(), self.node.output.clone()),
-            request_workers: self.node.request_workers.clone(),
             owner: self.node.owners.enter(OwnerPhase::Setup),
         }
     }
@@ -223,17 +265,34 @@ pub(crate) struct StreamResources {
     pub(crate) raw: FrameGate,
     /// Admits queued outbound frames that have no other owner.
     pub(crate) output: FrameGate,
-    /// Bounds request-stream executions across the node.
-    pub(crate) request_workers: SlotBudget,
     /// Counts this stream from setup until its reader has ended.
     pub(crate) owner: OwnerGuard,
+}
+
+#[cfg(test)]
+impl TransportLimits {
+    /// Limits with these windows and connections, and no effect from the rest.
+    pub(crate) fn with_windows(window: u32, max_connections: usize) -> Self {
+        Self {
+            receive_window: window,
+            send_window: u64::from(window),
+            max_connections,
+            max_pending_handshakes: 0,
+            max_open_streams: 1,
+            max_frame_bytes: 1,
+        }
+    }
 }
 
 #[cfg(test)]
 impl ConnectionResources {
     /// Owners that never bind, for tests of other behavior.
     pub(crate) fn unconstrained() -> Self {
-        NodeResources::new(ResourceEnvelope::new(1 << 40, 1 << 40, 1 << 16)).connection()
+        NodeResources::new(ResourceEnvelope::new(TransportLimits::with_windows(
+            u32::MAX,
+            1 << 16,
+        )))
+        .connection()
     }
 }
 

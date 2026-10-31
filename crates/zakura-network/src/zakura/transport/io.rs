@@ -66,7 +66,7 @@ pub struct FramedRecv {
 #[derive(Debug)]
 enum FramedReceiver {
     Plain(mpsc::Receiver<Frame>),
-    Queued(mpsc::Receiver<QueuedFrame>),
+    Queued(mpsc::UnboundedReceiver<QueuedFrame>),
     Admitted(mpsc::Receiver<AdmittedFrame>),
 }
 
@@ -91,7 +91,7 @@ impl FramedRecv {
         }
     }
 
-    fn queued(receiver: mpsc::Receiver<QueuedFrame>) -> Self {
+    fn queued(receiver: mpsc::UnboundedReceiver<QueuedFrame>) -> Self {
         Self {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
@@ -240,7 +240,55 @@ pub struct FramedSend {
 #[derive(Clone, Debug)]
 enum FramedSender {
     Plain(mpsc::Sender<Frame>),
-    Queued(mpsc::Sender<QueuedFrame>),
+    Queued(FrameQueue),
+}
+
+/// The send half of a stream's ordered frame queue.
+///
+/// One channel carries every frame, so a terminal frame stays behind the data
+/// sent before it. An ordinary frame holds one of `slots` until the receiver
+/// dequeues it. A terminal frame takes no slot, because the slot its exchange
+/// held since admission already funds its place. The channel is therefore
+/// bounded by `depth` plus the exchange slots of the stream's service.
+#[derive(Clone, Debug)]
+struct FrameQueue {
+    frames: mpsc::UnboundedSender<QueuedFrame>,
+    slots: SlotBudget,
+    depth: usize,
+}
+
+impl FrameQueue {
+    fn new(depth: usize) -> (Self, mpsc::UnboundedReceiver<QueuedFrame>) {
+        let (frames, receiver) = mpsc::unbounded_channel();
+        let slots =
+            SlotBudget::new(depth).expect("a transport queue has a semaphore-bounded capacity");
+        (
+            Self {
+                frames,
+                slots,
+                depth,
+            },
+            receiver,
+        )
+    }
+
+    /// Wait for an ordinary frame's slot, or `None` once the receiver closes.
+    async fn slot(&self) -> Option<SlotPermit> {
+        zakura_rt::select! {
+            biased;
+            () = self.frames.closed() => None,
+            slot = self.slots.reserve() => Some(slot),
+        }
+    }
+
+    fn try_slot(&self) -> Result<SlotPermit, mpsc::error::TrySendError<()>> {
+        if self.frames.is_closed() {
+            return Err(mpsc::error::TrySendError::Closed(()));
+        }
+        self.slots
+            .try_reserve()
+            .ok_or(mpsc::error::TrySendError::Full(()))
+    }
 }
 
 impl FramedSend {
@@ -254,12 +302,12 @@ impl FramedSend {
         }
     }
 
-    fn queued(sender: mpsc::Sender<QueuedFrame>) -> Self {
-        let response_slots = SlotBudget::new(sender.max_capacity().saturating_sub(1).max(1))
+    fn queued(queue: FrameQueue) -> Self {
+        let response_slots = SlotBudget::new(queue.depth.saturating_sub(1).max(1))
             .expect("a transport queue has a positive semaphore-bounded capacity");
         Self {
             response_slots: Some(response_slots),
-            sender: FramedSender::Queued(sender),
+            sender: FramedSender::Queued(queue),
             session_resources: None,
             output: None,
         }
@@ -293,40 +341,46 @@ impl FramedSend {
         let bytes = frame_wire_bytes(frame.payload.len());
         let admitted = self.output.as_ref().and_then(|gate| gate.try_admit(bytes));
         async move {
-            let sender = match &self.sender {
+            let queue = match &self.sender {
                 FramedSender::Plain(sender) => return sender.send(frame).await,
-                FramedSender::Queued(sender) => sender,
+                FramedSender::Queued(queue) => queue,
             };
             let output = match (admitted, &self.output) {
                 (Some(grant), _) => Some(grant),
                 (None, None) => None,
                 (None, Some(gate)) => zakura_rt::select! {
                     biased;
-                    () = sender.closed() => return Err(mpsc::error::SendError(frame)),
+                    () = queue.frames.closed() => return Err(mpsc::error::SendError(frame)),
                     grant = gate.admit(bytes) => Some(grant),
                 },
             };
             // The queue's order is the order of these sends. Nothing after the
             // send can restate it, because the worker may already hold the frame.
-            match sender.reserve().await {
-                Ok(permit) => {
-                    permit.send(QueuedFrame::plain(frame, output));
-                    Ok(())
-                }
-                Err(_) => Err(mpsc::error::SendError(frame)),
-            }
+            let Some(slot) = queue.slot().await else {
+                return Err(mpsc::error::SendError(frame));
+            };
+            queue
+                .frames
+                .send(QueuedFrame::plain(frame, output, slot))
+                .map_err(|error| mpsc::error::SendError(error.0.into_parts().0))
         }
     }
 
     /// Try to queue a frame without waiting for capacity.
     pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
-        let sender = match &self.sender {
+        let queue = match &self.sender {
             FramedSender::Plain(sender) => return sender.try_send(frame),
-            FramedSender::Queued(sender) => sender,
+            FramedSender::Queued(queue) => queue,
         };
-        if sender.is_closed() {
-            return Err(mpsc::error::TrySendError::Closed(frame));
-        }
+        let slot = match queue.try_slot() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(mpsc::error::TrySendError::Full(frame));
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(mpsc::error::TrySendError::Closed(frame));
+            }
+        };
         let output = match &self.output {
             None => None,
             Some(gate) => match gate.try_admit(frame_wire_bytes(frame.payload.len())) {
@@ -334,19 +388,23 @@ impl FramedSend {
                 None => return Err(mpsc::error::TrySendError::Full(frame)),
             },
         };
-        sender
-            .try_send(QueuedFrame::plain(frame, output))
-            .map_err(map_queued_try_send_error)
+        queue
+            .frames
+            .send(QueuedFrame::plain(frame, output, slot))
+            .map_err(|error| mpsc::error::TrySendError::Closed(error.0.into_parts().0))
     }
 
     /// Reserve queue space before encoding a response or sharing its ownership.
     pub(crate) fn try_reserve_guarded(&self) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
-        let FramedSender::Queued(sender) = &self.sender else {
+        let FramedSender::Queued(queue) = &self.sender else {
             return Err(GuardedReserveError::Unsupported);
         };
-        sender
-            .try_reserve()
-            .map(|permit| GuardedFrameSlot { permit, sender })
+        queue
+            .try_slot()
+            .map(|slot| GuardedFrameSlot {
+                slot,
+                sender: &queue.frames,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(()) => GuardedReserveError::Full,
                 mpsc::error::TrySendError::Closed(()) => GuardedReserveError::Closed,
@@ -357,13 +415,36 @@ impl FramedSend {
     pub(crate) async fn reserve_guarded(
         &self,
     ) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
-        let FramedSender::Queued(sender) = &self.sender else {
+        let FramedSender::Queued(queue) = &self.sender else {
             return Err(GuardedReserveError::Unsupported);
         };
-        sender
-            .reserve()
+        queue
+            .slot()
             .await
-            .map(|permit| GuardedFrameSlot { permit, sender })
+            .map(|slot| GuardedFrameSlot {
+                slot,
+                sender: &queue.frames,
+            })
+            .ok_or(GuardedReserveError::Closed)
+    }
+
+    /// Queue an exchange's terminal frame behind every frame sent before it,
+    /// without waiting for a queue slot.
+    ///
+    /// `guard` must own the slot its exchange has held since admission. Those
+    /// slots bound the terminal frames this queue holds beyond its depth, so
+    /// full data queues and other exchanges' terminals cannot delay this one.
+    pub(crate) fn queue_terminal(
+        &self,
+        frame: Frame,
+        guard: FrameGuard,
+    ) -> Result<(), GuardedReserveError> {
+        let FramedSender::Queued(queue) = &self.sender else {
+            return Err(GuardedReserveError::Unsupported);
+        };
+        queue
+            .frames
+            .send(QueuedFrame::guarded(frame, guard, None))
             .map_err(|_| GuardedReserveError::Closed)
     }
 
@@ -387,7 +468,7 @@ impl FramedSend {
     pub fn capacity(&self) -> usize {
         match &self.sender {
             FramedSender::Plain(sender) => sender.capacity(),
-            FramedSender::Queued(sender) => sender.capacity(),
+            FramedSender::Queued(queue) => queue.slots.available(),
         }
     }
 
@@ -395,7 +476,7 @@ impl FramedSend {
     pub fn max_capacity(&self) -> usize {
         match &self.sender {
             FramedSender::Plain(sender) => sender.max_capacity(),
-            FramedSender::Queued(sender) => sender.max_capacity(),
+            FramedSender::Queued(queue) => queue.depth,
         }
     }
 }
@@ -403,30 +484,35 @@ impl FramedSend {
 /// One reserved queue slot. Dropping it returns capacity without sending a frame.
 #[derive(Debug)]
 pub(crate) struct GuardedFrameSlot<'a> {
-    permit: mpsc::Permit<'a, QueuedFrame>,
-    sender: &'a mpsc::Sender<QueuedFrame>,
+    slot: SlotPermit,
+    sender: &'a mpsc::UnboundedSender<QueuedFrame>,
 }
 
 impl GuardedFrameSlot<'_> {
     /// Transfer a validated frame and its ownership to the reserved queue slot.
+    ///
+    /// A closed queue drops the frame and returns its guard's ownership.
     pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
-        self.permit.send(QueuedFrame::guarded(frame, guard));
+        let _closed = self
+            .sender
+            .send(QueuedFrame::guarded(frame, guard, Some(self.slot)));
     }
 
     /// Publish a request whose ownership must be claimed before its first byte.
     /// A false result requires explicit settlement after publication unlocks:
-    /// Tokio can retain a send made through a permit after its receiver drops.
+    /// the receiver can close during this call and keep the frame unread.
     pub(crate) fn send_request(self, frame: Frame, claim: Arc<dyn FrameWriteClaim>) -> bool {
         if self.sender.is_closed() {
             return false;
         }
-        self.permit.send(QueuedFrame {
+        let sent = self.sender.send(QueuedFrame {
             frame,
             guard: None,
             claim: Some(claim),
             output: None,
+            queue_slot: Some(self.slot),
         });
-        !self.sender.is_closed()
+        sent.is_ok() && !self.sender.is_closed()
     }
 }
 
@@ -488,6 +574,9 @@ pub(crate) struct QueuedFrame {
     claim: Option<Arc<dyn FrameWriteClaim>>,
     /// Funds a frame that has no guard from another owner.
     output: Option<FrameGrant>,
+    /// This frame's place in the queue, which ends when the receiver dequeues
+    /// it. A terminal frame's exchange slot funds its place instead.
+    queue_slot: Option<SlotPermit>,
 }
 
 impl QueuedFrame {
@@ -502,21 +591,23 @@ impl QueuedFrame {
         Some(self.frame)
     }
 
-    fn plain(frame: Frame, output: Option<FrameGrant>) -> Self {
+    fn plain(frame: Frame, output: Option<FrameGrant>, queue_slot: SlotPermit) -> Self {
         Self {
             frame,
             guard: None,
             claim: None,
             output,
+            queue_slot: Some(queue_slot),
         }
     }
 
-    fn guarded(frame: Frame, guard: FrameGuard) -> Self {
+    fn guarded(frame: Frame, guard: FrameGuard, queue_slot: Option<SlotPermit>) -> Self {
         Self {
             frame,
             guard: Some(guard),
             claim: None,
             output: None,
+            queue_slot,
         }
     }
 
@@ -556,6 +647,7 @@ impl QueuedFrame {
             guard: _guard,
             claim,
             output: _output,
+            queue_slot: _,
         } = self;
         let encoded = encode(frame)?;
         if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
@@ -572,39 +664,28 @@ impl QueuedFrame {
 /// Transport-worker receive half for outbound queued frames.
 #[derive(Debug)]
 pub(crate) struct FramedWorkerRecv {
-    receiver: mpsc::Receiver<QueuedFrame>,
+    receiver: mpsc::UnboundedReceiver<QueuedFrame>,
 }
 
 impl FramedWorkerRecv {
-    /// Receive the next outbound queued frame.
+    /// Receive the next outbound queued frame, which frees its queue slot.
     pub(crate) async fn recv(&mut self) -> Option<QueuedFrame> {
-        self.receiver.recv().await
+        let mut queued = self.receiver.recv().await?;
+        queued.queue_slot = None;
+        Some(queued)
     }
 }
 
 /// Build the queue between a service and its transport worker.
 pub(crate) fn worker_framed_channel(depth: usize) -> (FramedSend, FramedWorkerRecv) {
-    let (sender, receiver) = mpsc::channel(depth);
-    (FramedSend::queued(sender), FramedWorkerRecv { receiver })
+    let (queue, receiver) = FrameQueue::new(depth);
+    (FramedSend::queued(queue), FramedWorkerRecv { receiver })
 }
 
 /// Build a bounded in-memory framed channel for scaffolding and tests.
 pub fn framed_channel(depth: usize) -> (FramedSend, FramedRecv) {
-    let (sender, receiver) = mpsc::channel(depth);
-    (FramedSend::queued(sender), FramedRecv::queued(receiver))
-}
-
-fn map_queued_try_send_error(
-    error: mpsc::error::TrySendError<QueuedFrame>,
-) -> mpsc::error::TrySendError<Frame> {
-    match error {
-        mpsc::error::TrySendError::Full(queued) => {
-            mpsc::error::TrySendError::Full(queued.into_parts().0)
-        }
-        mpsc::error::TrySendError::Closed(queued) => {
-            mpsc::error::TrySendError::Closed(queued.into_parts().0)
-        }
-    }
+    let (queue, receiver) = FrameQueue::new(depth);
+    (FramedSend::queued(queue), FramedRecv::queued(receiver))
 }
 
 #[cfg(test)]
@@ -1004,10 +1085,53 @@ mod tests {
         ));
     }
 
-    /// A guarded frame already has an owner, so it takes no output from the
-    /// gate, and a terminal can always queue behind saturated data.
+    /// Each terminal holds its exchange's own place. A queue of ordinary frames
+    /// and another exchange's terminal delay none of them, and each stays behind
+    /// the frames sent before it. Dequeuing still frees only ordinary slots.
     #[tokio::test]
-    async fn terminals_use_the_control_slot_behind_saturated_responses() {
+    async fn terminals_queue_behind_a_full_queue_without_waiting() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender.try_send(frame(1)).unwrap();
+        let owner = Arc::new(());
+        for byte in 2..=4 {
+            sender
+                .queue_terminal(frame(byte), FrameGuard::new(owner.clone()))
+                .unwrap();
+        }
+        assert_eq!(sender.capacity(), 0, "terminals take no ordinary slot");
+        assert!(matches!(
+            sender.try_send(frame(5)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        let mut next = Box::pin(sender.send(frame(5)));
+        assert!(futures::poll!(&mut next).is_pending());
+        for byte in 1..=4 {
+            let queued = receiver.recv().await.unwrap();
+            assert_eq!(queued.frame, frame(byte));
+            drop(queued);
+        }
+        next.await.expect("the first dequeue freed the slot");
+        assert_eq!(receiver.recv().await.unwrap().frame, frame(5));
+        assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_on_a_closed_queue_returns_its_guard() {
+        let (sender, receiver) = worker_framed_channel(1);
+        drop(receiver);
+        let owner = Arc::new(());
+        assert!(matches!(
+            sender.queue_terminal(frame(1), FrameGuard::new(owner.clone())),
+            Err(GuardedReserveError::Closed)
+        ));
+        assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    /// A guarded frame already has an owner, so it takes no output from the
+    /// gate, and control traffic finds the slot that responses leave free.
+    #[tokio::test]
+    async fn control_uses_the_slot_behind_saturated_responses() {
         let (sender, mut receiver, budget) = gated_queue(3, 1);
         let _saturated = budget.hold_free().unwrap();
         for byte in 1..=2 {
@@ -1023,15 +1147,11 @@ mod tests {
         );
         sender
             .try_reserve_guarded()
-            .expect("the terminal finds the free slot")
+            .expect("control finds the free slot")
             .send(frame(3), FrameGuard::new(Arc::new(())));
         for byte in 1..=3 {
             let (received, _guard) = receiver.recv().await.unwrap().into_parts();
-            assert_eq!(
-                received,
-                frame(byte),
-                "the terminal stays behind prior data"
-            );
+            assert_eq!(received, frame(byte), "control stays behind prior data");
         }
     }
 

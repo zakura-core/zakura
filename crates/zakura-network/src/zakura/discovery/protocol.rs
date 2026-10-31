@@ -1585,6 +1585,29 @@ impl ZakuraDiscoveryHandle {
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
         source: Option<NodeId>,
     ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
+        self.import_relayed_batch(records, source, None).await
+    }
+
+    /// Imports a `Peers` answer that `session` received, as
+    /// [`Self::import_peer_records`] does. The lock hold installs nothing once
+    /// `session` is replaced, and rejects the batch's records instead: the
+    /// answer's verification can outlive its session.
+    pub(super) async fn import_session_peer_records(
+        &self,
+        session: &DiscoverySessionKey,
+        records: impl IntoIterator<Item = ZakuraNodeRecord>,
+        source: NodeId,
+    ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
+        self.import_relayed_batch(records, Some(source), Some(session))
+            .await
+    }
+
+    async fn import_relayed_batch(
+        &self,
+        records: impl IntoIterator<Item = ZakuraNodeRecord>,
+        source: Option<NodeId>,
+        session: Option<&DiscoverySessionKey>,
+    ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
         let mut outcome = ImportBatchOutcome::default();
         let batch: Vec<_> = records.into_iter().collect();
         if batch.is_empty() {
@@ -1622,10 +1645,14 @@ impl ZakuraDiscoveryHandle {
         }
 
         let now = current_unix_secs();
-        self.inner
-            .lock()
-            .await
-            .install_relayed(authentic, source, now, &mut outcome);
+        {
+            let mut state = self.inner.lock().await;
+            if session.is_none_or(|session| state.is_current_session(session)) {
+                state.install_relayed(authentic, source, now, &mut outcome);
+            } else {
+                outcome.rejected += authentic.len();
+            }
+        }
         drop(verification_slot);
         Ok(outcome)
     }

@@ -31,10 +31,10 @@ use super::protocol::{
     DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
-use super::requester::{reservation_pool, AdmittedAnswer, Queries};
+use super::requester::{reservation_pool, ClaimedAnswer, Queries};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity};
 use super::state::DiscoverySessionKey;
-use super::trace::{DiscoveryViolationEvent, ViolationStage};
+use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, ViolationStage};
 use super::wire::{PEERS_MAX_BYTES, RULES};
 use crate::zakura::regulation::{CadenceSender, ReservationPool, WriterFence};
 
@@ -703,7 +703,8 @@ async fn read_frame(
     let answer = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
-        .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?;
+        .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?
+        .map(|claimed| TracedAnswer::claimed(claimed, sink));
     if let Flow::Reject(reject) = pipe.run_one(frame) {
         return Err((ViolationStage::Decode, reject));
     }
@@ -712,12 +713,61 @@ async fn read_frame(
     };
     if let Some(answer) = &answer {
         answer
+            .claimed
+            .admitted()
             .check(&message)
             .map_err(|error| (ViolationStage::Answer, SinkReject::protocol(error)))?;
     }
     sink.handle_message(message, answer)
         .await
         .map_err(|reject| (ViolationStage::Handle, reject))
+}
+
+/// A claimed answer that traces how it settles, on every path out of the
+/// reader.
+struct TracedAnswer<'a> {
+    claimed: ClaimedAnswer,
+    sink: &'a DiscoverySink,
+    imported: bool,
+}
+
+impl<'a> TracedAnswer<'a> {
+    fn claimed(claimed: ClaimedAnswer, sink: &'a DiscoverySink) -> Self {
+        let answer = Self {
+            claimed,
+            sink,
+            imported: false,
+        };
+        answer.trace(AnswerPhase::Claimed);
+        answer
+    }
+
+    fn trace(&self, phase: AnswerPhase) {
+        self.sink.trace.emit_event(|| {
+            DiscoveryAnswerEvent::new(
+                self.sink.session.peer_id(),
+                self.sink.key.session_id,
+                self.claimed.admitted().kind(),
+                phase,
+            )
+        });
+    }
+
+    /// Counts the answer toward the session's exchange.
+    fn record_imported(&mut self) {
+        self.sink.state.record_answer(self.claimed.admitted());
+        self.imported = true;
+    }
+}
+
+impl Drop for TracedAnswer<'_> {
+    fn drop(&mut self) {
+        self.trace(if self.imported {
+            AnswerPhase::Imported
+        } else {
+            AnswerPhase::Dropped
+        });
+    }
 }
 
 impl DiscoverySink {
@@ -734,11 +784,12 @@ impl DiscoverySink {
     }
 
     /// Handles one decoded message. An `answer` already passed its query's
-    /// checks, and its import completes its part of the exchange.
+    /// checks, and its import completes its part of the exchange. It settles
+    /// once this returns or the reader drops this future.
     async fn handle_message(
         &self,
         message: DiscoveryMessage,
-        answer: Option<AdmittedAnswer>,
+        answer: Option<TracedAnswer<'_>>,
     ) -> Result<(), SinkReject> {
         if !self.handle.is_current_session(&self.key).await {
             return Ok(());
@@ -753,7 +804,7 @@ impl DiscoverySink {
                 .map_err(SinkReject::protocol)?,
             DiscoveryMessage::Peers { records } => {
                 self.handle
-                    .import_peer_records(records, Some(self.peer_node_id))
+                    .import_session_peer_records(&self.key, records, self.peer_node_id)
                     .await
                     .map_err(SinkReject::protocol)?;
             }
@@ -764,8 +815,8 @@ impl DiscoverySink {
                 .map_err(SinkReject::protocol)?,
             DiscoveryMessage::Services(services) => self.handle_services(services).await?,
         }
-        if let Some(answer) = &answer {
-            self.state.record_answer(answer);
+        if let Some(mut answer) = answer {
+            answer.record_imported();
         }
         Ok(())
     }
@@ -816,6 +867,7 @@ mod tests {
     use std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -2928,7 +2980,7 @@ mod tests {
             let answer = queries
                 .claim(u16::from(message_type), 0)?
                 .expect("the frame answers a live query");
-            state.record_answer(&answer);
+            state.record_answer(answer.admitted());
         }
 
         source_task.await?;
@@ -3509,6 +3561,273 @@ mod tests {
         connection_cancel.cancel();
         wait_for_discovery_inbound_peers(&discovery_handle, 0).await;
         header_task.abort();
+        Ok(())
+    }
+
+    /// A handle with the admitted inbound session 1 on connection `conn_id`,
+    /// and the peer's id and secret.
+    async fn handle_with_session(
+        seed: u8,
+        conn_id: ZakuraConnId,
+    ) -> Result<(ZakuraDiscoveryHandle, ZakuraPeerId, NodeSecretKey), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[seed; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_secret = NodeSecretKey::from_bytes(&[seed + 1; 32]);
+        let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), conn_id, 1),
+                    ServicePeerDirection::Inbound
+                )
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        Ok((handle, peer_id, peer_secret))
+    }
+
+    /// Claims the answer to a `GetPeers` that `queries` sends.
+    async fn claimed_peers_answer(queries: &Queries) -> ClaimedAnswer {
+        let query = GetPeers {
+            limit: 1,
+            wanted_services: Vec::new(),
+            exclude_node_ids: Vec::new(),
+        };
+        queries
+            .send_get_peers(query)
+            .await
+            .expect("the session's first query is sent");
+        queries
+            .claim(u16::from(MSG_DISCOVERY_PEERS), 2)
+            .expect("an empty answer fits its query")
+            .expect("the frame answers a query")
+    }
+
+    /// Past the initial timeout, a delivered answer that waits for verification
+    /// holds the discovery-only close. Its settlement releases the close.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_for_a_delivered_answer() -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(60, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let connection = io.connection_cancel.clone();
+        let answer = claimed_peers_answer(&io.queries).await;
+        let started = tokio::time::Instant::now();
+        let session = tokio::spawn(io.run());
+
+        tokio::time::sleep(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+        )
+        .await;
+        assert!(
+            !connection.is_cancelled(),
+            "the timeout does not revoke the delivered answer"
+        );
+
+        drop(answer);
+        tokio::time::timeout(Duration::from_millis(100), connection.cancelled())
+            .await
+            .expect("the settled answer lets the connection close");
+        assert!(
+            started.elapsed()
+                < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
+        );
+        session.await?;
+        Ok(())
+    }
+
+    /// An answer stuck behind verification cannot hold the connection open past
+    /// the answer deadline.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_at_most_the_deadline_for_a_delivered_answer(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(62, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let connection = io.connection_cancel.clone();
+        let _answer = claimed_peers_answer(&io.queries).await;
+        let session = tokio::spawn(io.run());
+
+        tokio::time::timeout(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+                + DISCOVERY_ANSWER_WRITE_DEADLINE
+                + Duration::from_secs(1),
+            connection.cancelled(),
+        )
+        .await
+        .expect("the deadline closes the connection");
+        session.await?;
+        Ok(())
+    }
+
+    /// An owner that the test or the call count turns on.
+    #[derive(Debug)]
+    struct ChangingOwner {
+        owns: AtomicBool,
+        calls: AtomicUsize,
+        /// The call from which this service owns every connection.
+        owns_from_call: usize,
+    }
+
+    impl ChangingOwner {
+        fn new(owns_from_call: usize) -> Arc<Self> {
+            Arc::new(Self {
+                owns: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                owns_from_call,
+            })
+        }
+    }
+
+    impl Service for ChangingOwner {
+        fn name(&self) -> &'static str {
+            "test-changing-owner"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            &[]
+        }
+
+        fn owns_connection_for_peer(&self, _: &ZakuraPeerId, _: ZakuraConnId) -> bool {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.owns.load(Ordering::SeqCst) || call >= self.owns_from_call
+        }
+
+        fn add_peer(&self, _peer: Peer) {}
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
+
+    /// A service admitted during the answer wait keeps the connection, and the
+    /// session refreshes until it is cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_admitted_during_the_answer_wait_keeps_the_connection(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(64, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (mut io, _states) = test_peer_io(handle, peer_id, send);
+        let owner = ChangingOwner::new(usize::MAX);
+        io.connection_owners = vec![owner.clone()];
+        let connection = io.connection_cancel.clone();
+        let cancel = io.session.cancel_token();
+        let answer = claimed_peers_answer(&io.queries).await;
+        let session = tokio::spawn(io.run());
+
+        tokio::time::sleep(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+        )
+        .await;
+        owner.owns.store(true, Ordering::SeqCst);
+        drop(answer);
+        tokio::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE).await;
+        assert!(!connection.is_cancelled(), "the new owner keeps it open");
+        assert!(
+            !session.is_finished(),
+            "the session refreshes for its owner"
+        );
+
+        cancel.cancel();
+        session.await?;
+        assert!(!connection.is_cancelled(), "the session leaves it open");
+        Ok(())
+    }
+
+    /// A service admitted while the session's removal waits keeps the
+    /// connection: the last read of the owners comes right before the cancel.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_admitted_during_session_removal_keeps_the_connection(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(66, 2).await?;
+        let key = DiscoverySessionKey::new(peer_id.clone(), 2, 1);
+        let (send, _peer_recv) = framed_channel(16);
+        let (mut io, _states) = test_peer_io(handle.clone(), peer_id, send);
+        // The first check after the timeout, the check after the answer wait,
+        // and the check that starts `end` find no owner. The fourth follows
+        // the session's removal.
+        let owner = ChangingOwner::new(4);
+        io.connection_owners = vec![owner.clone()];
+        let connection = io.connection_cancel.clone();
+
+        tokio::spawn(io.run()).await?;
+
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 4);
+        assert!(!handle.is_current_session(&key).await, "the session ended");
+        assert!(!connection.is_cancelled(), "the new owner keeps it open");
+        Ok(())
+    }
+
+    /// A `Peers` answer that outlives its session in verification installs
+    /// nothing, and it still settles.
+    #[tokio::test]
+    async fn a_replaced_session_installs_no_answer_from_verification() -> Result<(), crate::BoxError>
+    {
+        let (handle, peer_id, peer_secret) = handle_with_session(68, 0).await?;
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let relayed = NodeSecretKey::from_bytes(&[70u8; 32]);
+        let (sink, _sent) =
+            discovery_sink_for_session(&handle, &peer_id, peer_secret.public(), 0, 1);
+        let queries = sink.queries.clone();
+        queries
+            .send_get_peers(GetPeers {
+                limit: 1,
+                wanted_services: Vec::new(),
+                exclude_node_ids: Vec::new(),
+            })
+            .await
+            .expect("the session's first query is sent");
+
+        let held = handle.hold_verify_slots();
+        let (to_sink, recv) = framed_channel(4);
+        let reader_peer = peer_id.clone();
+        let reader = tokio::spawn(async move {
+            let mut pipe = discovery_pipe(reader_peer);
+            run_discovery_pipe(&mut pipe, recv, sink).await
+        });
+        to_sink
+            .send(discovery_frame(DiscoveryMessage::Peers {
+                records: vec![signed_discovery_record(&relayed, &handshake)?],
+            })?)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled())
+                .await
+                .is_err(),
+            "the answer waits for a verification slot"
+        );
+
+        assert_eq!(
+            handle
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id, 0, 2),
+                    ServicePeerDirection::Inbound
+                )
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled())
+            .await
+            .expect("the answer settles after its verification");
+        drop(to_sink);
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await??
+            .expect("a replaced session's answer rejects nothing");
+        assert_eq!(handle.record_for(relayed.public()).await, None);
         Ok(())
     }
 }

@@ -20,9 +20,10 @@ const _: () = assert!(SEND_INTERVAL.as_secs() <= DEFAULT_LIVE_SERVICE_SUMMARY_TT
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 pub(in crate::zakura::discovery) const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration =
     Duration::from_secs(2);
-/// How long closing a discovery-only connection waits for this node's
-/// admitted answers. Each answer is small and needs only free output, so a
-/// peer that reads its stream gets them well within this.
+/// How long closing a discovery-only connection waits for this node's admitted
+/// answers and the peer's delivered answers. Each answer is small and needs only
+/// free output or a verification slot, so a peer that reads its stream gets them
+/// well within this.
 pub(in crate::zakura::discovery) const DISCOVERY_ANSWER_WRITE_DEADLINE: Duration =
     Duration::from_secs(2);
 
@@ -114,8 +115,9 @@ pub(super) enum PeerOutput {
     /// Exchange again once `interval` passes, unless the session is cancelled
     /// first.
     Refresh { interval: Duration },
-    /// Wait until this session writes every answer it admitted, the session
-    /// is cancelled, or `deadline` passes.
+    /// Wait until this session writes every answer it admitted and processes
+    /// every answer the peer delivered, the session is cancelled, or `deadline`
+    /// passes.
     WaitForAnswers { deadline: Duration },
     /// Mark the peer's exchange as short-lived.
     MarkShortLived,
@@ -302,10 +304,11 @@ impl PeerState {
             }
             (Phase::MarkingShortLived, PeerInput::ShortLivedMarked) => {
                 self.phase = Phase::Ended;
-                let close = if self.initial == Some(InitialExchange::TimedOut) {
-                    CloseReason::ExchangeTimedOut
-                } else {
+                // The close's answer wait can finish a timed-out exchange.
+                let close = if self.progress.complete() {
                     CloseReason::ExchangeComplete
+                } else {
+                    CloseReason::ExchangeTimedOut
                 };
                 // A retired session is never charged, so a timed-out exchange
                 // that closes its connection settles here.

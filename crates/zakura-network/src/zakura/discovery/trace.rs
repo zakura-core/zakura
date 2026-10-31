@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use super::candidate_dialer::DiscoveryDialResult;
+use super::requester::QueryKind;
 use crate::{
     zakura::{
         trace::{discovery_trace as d_trace, peer_label, DISCOVERY_TABLE},
@@ -89,6 +90,56 @@ impl DiscoveryViolationEvent {
 
 zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryViolationEvent, DISCOVERY_TABLE);
 
+/// How far one claimed query answer got.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AnswerPhase {
+    /// The answer claimed its query, before decode.
+    Claimed,
+    /// The answer's import finished and counted toward the exchange.
+    Imported,
+    /// The answer settled without counting: a rejection, a replaced session,
+    /// or a reader cancelled inside verification.
+    Dropped,
+}
+
+impl AnswerPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Imported => "imported",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct DiscoveryAnswerEvent {
+    event: &'static str,
+    peer: String,
+    session_id: u64,
+    query: &'static str,
+    phase: &'static str,
+}
+
+impl DiscoveryAnswerEvent {
+    pub(super) fn new(
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        query: QueryKind,
+        phase: AnswerPhase,
+    ) -> Self {
+        Self {
+            event: d_trace::DISCOVERY_ANSWER,
+            peer: peer_label(peer),
+            session_id,
+            query: query.label(),
+            phase: phase.label(),
+        }
+    }
+}
+
+zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryAnswerEvent, DISCOVERY_TABLE);
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -104,6 +155,22 @@ mod tests {
                 "event": "discovery_dial_result",
                 "result": "failed",
                 "peer": null,
+            })
+        );
+    }
+
+    #[test]
+    fn answer_schema_names_the_query_and_phase() {
+        let peer = ZakuraPeerId::new(vec![7; 32]).expect("a 32-byte id is a valid peer id");
+        let event = DiscoveryAnswerEvent::new(&peer, 3, QueryKind::Services, AnswerPhase::Dropped);
+        assert_eq!(
+            serde_json::to_value(event).expect("event serializes"),
+            json!({
+                "event": "discovery_answer",
+                "peer": peer_label(&peer),
+                "session_id": 3,
+                "query": "services",
+                "phase": "dropped",
             })
         );
     }

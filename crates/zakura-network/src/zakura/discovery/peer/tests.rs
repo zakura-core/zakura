@@ -215,6 +215,39 @@ fn a_late_completion_settles_a_timed_out_session_as_a_success() {
     );
 }
 
+/// An exchange that the close's answer wait finishes closes as complete, not
+/// as timed out.
+#[test]
+fn an_answer_that_settles_during_the_close_wait_completes_the_exchange() {
+    let mut state = waiting_session();
+    assert_eq!(
+        settle_initial(&mut state, InitialWait::TimedOut),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
+        then(WAIT_FOR_ANSWERS)
+    );
+    complete(&mut state);
+    assert_eq!(
+        state.on_input(PeerInput::AnswersSettled),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
+        then(PeerOutput::MarkShortLived)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::ShortLivedMarked),
+        charged(
+            SessionCharge::Retire,
+            PeerOutput::End {
+                close: Some(CloseReason::ExchangeComplete),
+            },
+        )
+    );
+}
+
 /// A sole owner waits for its admitted answers before it closes. Progress
 /// during that wait does not end the session.
 #[test]
@@ -442,10 +475,10 @@ impl Model {
                 Ownership::Sole => (Line::ShortLived, then(PeerOutput::MarkShortLived)),
             },
             (Line::ShortLived, PeerInput::ShortLivedMarked) => {
-                let reason = if self.continued == Some(true) {
-                    CloseReason::ExchangeTimedOut
-                } else {
+                let reason = if self.complete() {
                     CloseReason::ExchangeComplete
+                } else {
+                    CloseReason::ExchangeTimedOut
                 };
                 (
                     Line::Done,

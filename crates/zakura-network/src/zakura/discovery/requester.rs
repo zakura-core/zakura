@@ -17,12 +17,17 @@
 //! under the one lock that also guards the reservations, so the transport
 //! precheck and the claim read one ledger. Only a claim mints an
 //! [`AdmittedAnswer`].
+//!
+//! A claim ends the query's protocol authority, not its resources. The
+//! [`ClaimedAnswer`] it returns keeps the query's pool entry and its kind
+//! through decode, verification, and import, so a session holds at most one
+//! answer of each kind from its query's first byte until that answer settles.
 
 use std::sync::Arc;
 
 use zakura_rt::{
     collections::HashMap,
-    sync::{CancellationToken, Mutex, MutexGuard, PoisonError},
+    sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
 };
 
 use super::{
@@ -33,8 +38,8 @@ use super::{
 };
 use crate::zakura::{
     regulation::{
-        sizing, ClaimRefused, ReservationPool, Reservations, ResponseCap, ResponsePrecheck,
-        WriterFence,
+        sizing, ClaimRefused, PoolEntry, ReservationPool, Reservations, ResponseCap,
+        ResponsePrecheck, WriterFence,
     },
     wire_codec::{encode_frame, WireMessage},
     FrameRejection, FramedRecv, FramedSend,
@@ -51,6 +56,14 @@ pub(super) enum QueryKind {
 const QUERY_KINDS: [QueryKind; 2] = [QueryKind::Peers, QueryKind::Services];
 
 impl QueryKind {
+    /// The kind's name in trace rows.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Peers => "peers",
+            Self::Services => "services",
+        }
+    }
+
     /// The kind that a `message_type` frame answers, if it answers a query.
     fn answered_by(message_type: u16) -> Option<Self> {
         match u8::try_from(message_type) {
@@ -258,6 +271,78 @@ impl QueryState {
     }
 }
 
+/// How many claimed answers of each kind one session has not settled.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct Settling {
+    peers: usize,
+    services: usize,
+}
+
+impl Settling {
+    fn of(&mut self, kind: QueryKind) -> &mut usize {
+        match kind {
+            QueryKind::Peers => &mut self.peers,
+            QueryKind::Services => &mut self.services,
+        }
+    }
+
+    fn holds(mut self, kind: QueryKind) -> bool {
+        *self.of(kind) > 0
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// One answer that a session has claimed and not settled.
+///
+/// The reader holds it through decode, verification, and import. Dropping it
+/// settles the answer on every path, including a reader cancelled inside
+/// verification. Settlement needs no lock, so a destructor that runs at
+/// shutdown cannot contend with a paused lock holder.
+#[derive(Debug)]
+struct SettlingAnswer {
+    kind: QueryKind,
+    settling: Arc<watch::Sender<Settling>>,
+}
+
+impl SettlingAnswer {
+    fn new(kind: QueryKind, settling: &Arc<watch::Sender<Settling>>) -> Self {
+        settling.send_modify(|settling| *settling.of(kind) += 1);
+        Self {
+            kind,
+            settling: settling.clone(),
+        }
+    }
+}
+
+impl Drop for SettlingAnswer {
+    fn drop(&mut self) {
+        self.settling
+            .send_modify(|settling| *settling.of(self.kind) -= 1);
+    }
+}
+
+/// The runtime owner of one claimed answer: its [`AdmittedAnswer`], the pool
+/// entry its query reserved, and its kind's place in the session.
+#[derive(Debug)]
+#[must_use = "dropping a claimed answer settles it"]
+pub(super) struct ClaimedAnswer {
+    admitted: AdmittedAnswer,
+    /// Frees before `_settling`, so a waiter that settlement wakes finds the
+    /// entry free.
+    _entry: PoolEntry,
+    _settling: SettlingAnswer,
+}
+
+impl ClaimedAnswer {
+    /// The evidence that this answer claimed its live query.
+    pub(super) fn admitted(&self) -> &AdmittedAnswer {
+        &self.admitted
+    }
+}
+
 /// One session's reservations and its live queries. One lock guards both,
 /// so a claim reads what its own query asked.
 #[derive(Debug)]
@@ -279,6 +364,8 @@ impl LiveQueries {
 #[derive(Clone, Debug)]
 pub(super) struct Queries {
     live: Arc<Mutex<LiveQueries>>,
+    /// The session's claimed answers that have not settled.
+    settling: Arc<watch::Sender<Settling>>,
     pool: ReservationPool,
     fence: WriterFence,
     send: FramedSend,
@@ -305,6 +392,7 @@ impl Queries {
         let transport_admits = recv.attach_precheck(Arc::new(QueriesPrecheck(live.clone())));
         Self {
             live,
+            settling: Arc::new(watch::Sender::new(Settling::default())),
             pool,
             fence,
             send,
@@ -347,6 +435,11 @@ impl Queries {
         let (kind, request_type, cap) = (asked.kind(), asked.request_type(), asked.cap());
         {
             let live = &mut *self.lock();
+            // The claim counts its answer under this lock, so this check and
+            // the reservation below read one ledger.
+            if self.settling.borrow().holds(kind) {
+                return Err(QueryUnsent::NotDue);
+            }
             live.state
                 .reserve(asked)
                 .map_err(|QueryLive| QueryUnsent::NotDue)?;
@@ -377,13 +470,14 @@ impl Queries {
     }
 
     /// Claims the live query that a `message_type` frame of `payload_len`
-    /// bytes answers, before its payload is decoded. Returns the admitted
-    /// answer, or `None` if the frame answers no query.
+    /// bytes answers, before its payload is decoded. Returns the claimed
+    /// answer, which keeps the query's resources until it drops, or `None` if
+    /// the frame answers no query.
     pub(super) fn claim(
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Option<AdmittedAnswer>, ClaimRefused> {
+    ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
@@ -391,12 +485,35 @@ impl Queries {
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
-        live.reservations
-            .claim_end(&kind, message_type, payload_len)?;
-        live.state
+        let (_ended, entry) =
+            live.reservations
+                .claim_end_holding_entry(&kind, message_type, payload_len)?;
+        let admitted = live
+            .state
             .claim(kind, payload_len)
-            .expect("every live reservation records its live query")
-            .map(Some)
+            .expect("every live reservation records its live query")?;
+        Ok(Some(ClaimedAnswer {
+            admitted,
+            _entry: entry,
+            _settling: SettlingAnswer::new(kind, &self.settling),
+        }))
+    }
+
+    /// Resolves once this session holds no answer that it was owed and has not
+    /// processed: nothing claimed and unsettled, and nothing the transport
+    /// reader queued. An unanswered query does not hold it, so a silent peer
+    /// costs no wait.
+    pub(super) async fn answers_settled(&self) {
+        let mut settling = self.settling.subscribe();
+        loop {
+            // The sender lives in `self`, so the waits cannot fail.
+            let _ = settling.wait_for(|settling| settling.is_empty()).await;
+            if !self.lock().reservations.has_queued() {
+                return;
+            }
+            // The reader's claim of the queued frame changes the count.
+            let _ = settling.changed().await;
+        }
     }
 
     /// Ends the session's queries: an unwritten query is skipped, and an
@@ -461,7 +578,7 @@ mod tests {
             payload_len: usize,
         ) -> Result<Option<Asked>, ClaimRefused> {
             self.claim(message_type, payload_len)
-                .map(|answer| answer.map(|answer| answer.asked))
+                .map(|answer| answer.map(|answer| answer.admitted.asked.clone()))
         }
     }
 
@@ -894,6 +1011,112 @@ mod tests {
             kind: QueryKind,
             excess: Option<u64>,
         },
+    }
+
+    /// A claim ends the query's protocol authority. The answer keeps the pool
+    /// entry and its kind until it settles, so a refresh cannot stack a second
+    /// answer behind one that waits for verification.
+    #[tokio::test]
+    async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
+        let pool = reservation_pool();
+        let Session {
+            queries,
+            mut written,
+            ..
+        } = session(&pool);
+        queries.send_get_peers(get_peers(1)).await.unwrap();
+        written.recv().await.expect("the query was queued");
+
+        let answer = queries
+            .claim(PEERS, peers_len(1))
+            .expect("the answer fits its query")
+            .expect("the frame answers a query");
+        assert_eq!(pool.held(), 1, "the claimed answer keeps its pool entry");
+        assert!(matches!(
+            queries.claim(PEERS, 2),
+            Err(ClaimRefused::Unsolicited { .. })
+        ));
+        assert!(
+            matches!(
+                queries.send_get_peers(get_peers(1)).await,
+                Err(QueryUnsent::NotDue)
+            ),
+            "an unsettled answer keeps its kind"
+        );
+        queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .expect("the other kind stays independent");
+        assert_eq!(pool.held(), 2);
+
+        drop(answer);
+        assert_eq!(pool.held(), 1, "settlement frees exactly its own entry");
+        queries
+            .send_get_peers(get_peers(1))
+            .await
+            .expect("settlement frees the kind");
+    }
+
+    /// `answers_settled` waits for a claimed answer and ignores a query the
+    /// peer has not answered.
+    #[tokio::test]
+    async fn answers_settled_waits_for_a_claimed_answer_only() {
+        let Session {
+            queries,
+            written: _written,
+            ..
+        } = session(&reservation_pool());
+        queries.send_get_peers(get_peers(1)).await.unwrap();
+        queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .unwrap();
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), queries.answers_settled())
+            .await
+            .expect("an unanswered query holds nothing");
+
+        let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
+        let waiting = queries.clone();
+        let settled = tokio::spawn(async move { waiting.answers_settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the claimed answer holds the wait");
+        drop(answer);
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("settlement wakes the wait")
+            .unwrap();
+    }
+
+    /// A queued answer holds the wait until its claim and settlement, on the
+    /// real transport precheck.
+    #[tokio::test]
+    async fn answers_settled_waits_for_a_frame_the_transport_queued() {
+        let slot = PrecheckSlot::default();
+        let (_peer, recv) = framed_channel(1);
+        let recv = recv.with_precheck(slot.clone());
+        let Session {
+            queries,
+            written: _written,
+            ..
+        } = session_with(reservation_pool(), &recv);
+        queries.send_get_peers(get_peers(1)).await.unwrap();
+        slot.get()
+            .expect("the session attached its precheck")
+            .check(PEERS, peers_len(1))
+            .expect("the transport admits the owed answer");
+
+        let waiting = queries.clone();
+        let settled = tokio::spawn(async move { waiting.answers_settled().await });
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the queued answer holds the wait");
+        let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
+        tokio::task::yield_now().await;
+        assert!(!settled.is_finished(), "the claimed answer holds the wait");
+        drop(answer);
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("settlement wakes the wait")
+            .unwrap();
     }
 
     #[cfg(test)]

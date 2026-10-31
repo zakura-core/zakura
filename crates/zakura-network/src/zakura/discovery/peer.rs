@@ -7,6 +7,10 @@
 //! whether the session closes its connection. IO consults the connection's
 //! admitted service owners and the current session right before it commits
 //! to a close.
+//!
+//! A local timeout never revokes a query's authority. A close first waits, up
+//! to its deadline, for this session's unwritten answers and for the peer's
+//! delivered answers, which can be waiting for a verification slot.
 
 mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -54,7 +58,9 @@ struct SharedInner {
 }
 
 impl SharedPeerState {
-    /// No holder panics, so the lock is never poisoned.
+    /// No holder panics, so the lock is never poisoned. Lock diagnostics name
+    /// the caller's line.
+    #[track_caller]
     fn lock(&self) -> MutexGuard<'_, PeerState> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -173,11 +179,7 @@ impl PeerIO {
     /// Consults the connection's admitted service owners, then whether this
     /// session is still current. Advertised service names never count.
     async fn owners(&self) -> Ownership {
-        if peer_has_other_service_owner(
-            &self.connection_owners,
-            self.session.peer_id(),
-            self.slot.key.conn_id,
-        ) {
+        if self.other_service_owns_connection() {
             return Ownership::Shared;
         }
         if self.handle.is_current_session(&self.slot.key).await {
@@ -185,6 +187,14 @@ impl PeerIO {
         } else {
             Ownership::Superseded
         }
+    }
+
+    fn other_service_owns_connection(&self) -> bool {
+        peer_has_other_service_owner(
+            &self.connection_owners,
+            self.session.peer_id(),
+            self.slot.key.conn_id,
+        )
     }
 
     /// Exchanges again once `interval` passes. Returns false once the session
@@ -203,13 +213,30 @@ impl PeerIO {
         zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => {}
-            () = self.answers.wait() => {}
+            () = self.answers_settled() => {}
             () = zakura_rt::time::sleep(deadline) => {}
+        }
+    }
+
+    /// Resolves once this session wrote every answer it admitted and processed
+    /// every answer the peer delivered. The reader keeps admitting requests
+    /// during the wait, so the written check repeats.
+    async fn answers_settled(&self) {
+        loop {
+            self.answers.wait().await;
+            self.queries.answers_settled().await;
+            if self.answers.is_written() {
+                return;
+            }
         }
     }
 
     /// Ends the session's serving and queries and releases its admission,
     /// then closes the connection if `close` names a reason.
+    ///
+    /// A service can gain the connection while the session's removal waits for
+    /// the discovery lock, so the owners are read again right before the
+    /// cancel, with no wait between the two.
     async fn end(self, close: Option<CloseReason>) {
         let close = match close {
             Some(reason) if self.owners().await == Ownership::Sole => Some(reason),
@@ -218,13 +245,17 @@ impl PeerIO {
         self.session.cancel_token().cancel();
         self.queries.retire();
         self.handle.remove_session(&self.slot.key).await;
-        if let Some(reason) = close {
-            self.close_cause.record(match reason {
-                CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
-                CloseReason::ExchangeComplete => "discovery_exchange_complete",
-            });
-            self.connection_cancel.cancel();
+        let Some(reason) = close else {
+            return;
+        };
+        if self.other_service_owns_connection() {
+            return;
         }
+        self.close_cause.record(match reason {
+            CloseReason::ExchangeTimedOut => "discovery_exchange_timed_out",
+            CloseReason::ExchangeComplete => "discovery_exchange_complete",
+        });
+        self.connection_cancel.cancel();
     }
 
     /// Gossips the current self-record and asks the peer for records and services.

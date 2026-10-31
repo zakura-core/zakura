@@ -54,8 +54,8 @@ pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
     (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES + 2 * MAX_PROTOCOL_MESSAGE_LEN) as u64;
 
 /// Worst-case exchanges the compatibility partition funds at once. A connection
-/// runs one exchange at a time, and a one-object exchange charges about a fifth of
-/// the worst case, so this partition funds about 80 peers' object fetches at once.
+/// runs one exchange at a time. A one-object exchange at the protocol's message limit
+/// charges three message lengths, so this partition funds about 50 of those at once.
 const COMPAT_RESPONSE_EXCHANGES: u64 = 16;
 
 #[cfg(test)]

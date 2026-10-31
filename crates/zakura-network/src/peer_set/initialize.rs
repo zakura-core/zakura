@@ -33,7 +33,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tower::{
     discover::Change,
     layer::Layer,
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
     Service, ServiceExt,
 };
 use tracing::Instrument;
@@ -159,7 +159,7 @@ pub async fn init<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
 ) -> (
-    BoxCloneService<Request, Response, BoxError>,
+    BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
 )
@@ -193,7 +193,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
-    BoxCloneService<Request, Response, BoxError>,
+    BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
     Option<ZakuraEndpoint>,
@@ -235,7 +235,7 @@ pub async fn init_with_zakura<S, C>(
     custom_services: Vec<CustomService>,
 ) -> Result<
     (
-        BoxCloneService<Request, Response, BoxError>,
+        BoxCloneSyncService<Request, Response, BoxError>,
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
@@ -547,7 +547,7 @@ where
                 config.zakura.stream_open_rate_per_second,
             );
             (
-                BoxCloneService::new(spawn_buffer(
+                BoxCloneSyncService::new(spawn_buffer(
                     BoxService::new(dual_stack),
                     constants::PEERSET_BUFFER_SIZE,
                 )),

@@ -1,8 +1,7 @@
 //! Owns the peer set and drives connection maintenance independently of requests.
 
 use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -10,9 +9,9 @@ use futures::{
     future::{poll_fn, BoxFuture},
     FutureExt,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::{CancellationToken, PollSender};
-use tower::{discover::Discover, util::BoxCloneService, Service};
+use tower::{discover::Discover, util::BoxCloneSyncService, Service};
 use zakura_chain::chain_tip::ChainTip;
 
 use super::PeerSet;
@@ -37,14 +36,13 @@ struct Dispatch {
 #[derive(Clone)]
 struct Client {
     sender: PollSender<Dispatch>,
-    error: Arc<Mutex<Option<DriverError>>>,
+    error: watch::Receiver<Option<DriverError>>,
 }
 
 impl Client {
     fn closed(&self) -> BoxError {
         self.error
-            .lock()
-            .expect("driver error lock is never poisoned")
+            .borrow()
             .clone()
             .map(|error| Box::new(error) as BoxError)
             .unwrap_or_else(|| "peer set driver closed".into())
@@ -57,6 +55,9 @@ impl Service<Request> for Client {
     type Future = BoxFuture<'static, Result<Response, BoxError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        if self.error.borrow().is_some() {
+            return Poll::Ready(Err(self.closed()));
+        }
         self.sender.poll_reserve(cx).map_err(|_| self.closed())
     }
 
@@ -73,16 +74,25 @@ impl Service<Request> for Client {
         {
             return futures::future::ready(Err(self.closed())).boxed();
         }
-        let error = self.error.clone();
+        let mut error = self.error.clone();
         async move {
-            let future = response.await.map_err(|_| {
+            let closed = |error: &watch::Receiver<Option<DriverError>>| -> BoxError {
                 error
-                    .lock()
-                    .expect("driver error lock is never poisoned")
+                    .borrow()
                     .clone()
                     .map(|error| Box::new(error) as BoxError)
                     .unwrap_or_else(|| "peer set driver closed".into())
-            })?;
+            };
+            if error.borrow().is_some() {
+                return Err(closed(&error));
+            }
+            // A reserved permit may send after the receiver closes. Watch terminal state as
+            // well as the reply so that such a request cannot wait on an abandoned queue.
+            let future = tokio::select! {
+                biased;
+                _ = error.changed() => return Err(closed(&error)),
+                response = response => response.map_err(|_| closed(&error))?,
+            };
             future.await
         }
         .boxed()
@@ -95,7 +105,7 @@ pub(super) fn spawn<D, C>(
     mut peers: PeerSet<D, C>,
     shutdown: CancellationToken,
 ) -> (
-    BoxCloneService<Request, Response, BoxError>,
+    BoxCloneSyncService<Request, Response, BoxError>,
     BlockAdvertiser<C>,
 )
 where
@@ -109,7 +119,7 @@ where
     advertiser.refresh = Some(refresh);
     let (bans, mut tip) = peers.authorization();
     let mut bans_changed = bans.subscribe();
-    let error = Arc::new(Mutex::new(None));
+    let (failed, error) = watch::channel(None);
     let client = Client {
         sender: PollSender::new(requests),
         error: error.clone(),
@@ -132,12 +142,12 @@ where
                         if pending.is_none() {
                             match incoming.poll_recv(cx) {
                                 Poll::Ready(Some(request)) => pending = Some(request),
-                                Poll::Ready(None) => return Poll::Ready(Ok(false)),
+                                Poll::Ready(None) => return Poll::Ready(Ok::<_, BoxError>(false)),
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
                         let request = pending.as_mut().expect("a pending request was just installed");
-                        if Pin::new(&mut request.reply).poll_closed(cx).is_ready() {
+                        if request.reply.poll_closed(cx).is_ready() {
                             pending.take();
                             return Poll::Ready(Ok(true));
                         }
@@ -152,9 +162,8 @@ where
             Ok(())
         }.await;
         let cause = result.err().unwrap_or_else(|| "peer set shut down".into());
-        *error.lock().expect("driver error lock is never poisoned") =
-            Some(DriverError(Arc::from(cause)));
+        failed.send_replace(Some(DriverError(Arc::from(cause))));
         // Closing queues and dropping the peer set cancels peers and wakes all waiters.
     });
-    (BoxCloneService::new(client), advertiser)
+    (BoxCloneSyncService::new(client), advertiser)
 }

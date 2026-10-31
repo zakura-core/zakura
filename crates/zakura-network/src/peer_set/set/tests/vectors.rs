@@ -1722,13 +1722,9 @@ async fn driver_admits_idle_sidecar_and_keeps_original_duplicate() {
         assert!(adverts.peers.borrow()[0].sender.same_channel(&sender));
         let hash = block::Hash([51; 32]);
         let broadcast = tokio::spawn(adverts.clone().oneshot(Request::AdvertiseMinedBlock(hash)));
-        loop {
-            if let Some(received) = recv_advertise_block(&mut original) {
-                assert_eq!(received, hash);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let advert = original.receive_block_advert().await;
+        assert_eq!(advert.hash, hash);
+        advert.result.send(Ok(())).unwrap();
         assert!(broadcast.await.unwrap().is_ok());
         shutdown.cancel();
         adverts
@@ -1757,7 +1753,7 @@ async fn driver_keeps_discovering_after_connection_churn() {
         let (_ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
         let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
         for _ in 0..rounds {
-            let (client, mut handle) = ClientTestHarness::build()
+            let (client, handle) = ClientTestHarness::build()
                 .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
                 .finish();
             discovery
@@ -1768,7 +1764,7 @@ async fn driver_keeps_discovering_after_connection_churn() {
                 .wait_for(|peers| peers.len() == 1)
                 .await
                 .unwrap();
-            handle.drop_outbound_client_request_receiver();
+            handle.stop_connection_task().await;
             adverts
                 .peers
                 .wait_for(|peers| peers.is_empty())
@@ -1790,4 +1786,181 @@ async fn driver_keeps_discovering_after_connection_churn() {
     })
     .await
     .expect("connection churn never needs ordinary traffic");
+}
+
+/// Authorization updates wake the owner without any ordinary request or refresh request.
+#[tokio::test(start_paused = true)]
+async fn driver_prunes_banned_and_outdated_peers_while_idle() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let mut book = crate::AddressBook::new(
+            "127.0.0.1:1".parse().unwrap(),
+            &Network::Mainnet,
+            1,
+            tracing::Span::none(),
+        );
+        let bans = book.bans();
+        let address: PeerSocketAddr = "127.0.0.2:8233".parse::<SocketAddr>().unwrap().into();
+        book.update(crate::meta_addr::MetaAddr::new_initial_peer(address));
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum, tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let old_version = Version::min_remote_for_height(&Network::Mainnet, None);
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(2)
+            .build();
+        peers.bans = bans.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ordinary, mut adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let (client, _handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        book.update(crate::meta_addr::MetaAddrChange::UpdateMisbehavior {
+            addr: address,
+            score_increment: crate::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        });
+        assert!(bans.contains(address.ip()));
+        adverts
+            .peers
+            .wait_for(|peers| peers.is_empty())
+            .await
+            .unwrap();
+        let other: PeerSocketAddr = "127.0.0.3:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, _other_handle) = ClientTestHarness::build()
+            .with_version(old_version)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: other })
+            .finish();
+        discovery
+            .unbounded_send(Ok(Change::Insert(other, client.into())))
+            .unwrap();
+        adverts
+            .peers
+            .wait_for(|peers| peers.len() == 1)
+            .await
+            .unwrap();
+        let height = NetworkUpgrade::Nu6_3
+            .activation_height(&Network::Mainnet)
+            .unwrap();
+        assert!(Version::min_remote_for_height(&Network::Mainnet, height) > old_version);
+        tip.send_best_tip_height(Some(height));
+        adverts
+            .peers
+            .wait_for(|peers| peers.is_empty())
+            .await
+            .unwrap();
+        shutdown.cancel();
+    })
+    .await
+    .expect("authorization changes prune idle membership promptly");
+}
+
+/// An ordinary request waiting for a peer cannot block refresh, cancellation, or shutdown.
+#[tokio::test(start_paused = true)]
+async fn driver_bounds_requests_and_services_refresh_while_waiting() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _guard) = PeerSetBuilder::new()
+            .with_discover(stream::pending::<
+                Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>,
+            >())
+            .with_minimum_peer_version(minimum)
+            .build();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+        let first = timeout(Duration::from_secs(1), ordinary.ready())
+            .await
+            .expect("ordinary queue capacity becomes available")
+            .unwrap()
+            .call(Request::Peers);
+        tokio::task::yield_now().await;
+        let mut queued = Vec::new();
+        for _ in 0..crate::constants::PEERSET_BUFFER_SIZE {
+            queued.push(
+                timeout(Duration::from_secs(1), ordinary.ready())
+                    .await
+                    .expect("ordinary queue capacity becomes available")
+                    .unwrap()
+                    .call(Request::Peers),
+            );
+        }
+        assert!(
+            ordinary.ready().now_or_never().is_none(),
+            "full request queue applies backpressure"
+        );
+        let (done, ready) = tokio::sync::oneshot::channel();
+        adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+        timeout(Duration::from_secs(1), ready)
+            .await
+            .expect("refresh bypasses full ordinary queue")
+            .unwrap();
+        drop(first);
+        timeout(Duration::from_secs(1), ordinary.ready())
+            .await
+            .expect("ordinary queue capacity becomes available")
+            .unwrap();
+        let waiting_advert =
+            tokio::spawn(adverts.oneshot(Request::AdvertiseMinedBlock(block::Hash([71; 32]))));
+        shutdown.cancel();
+        for result in queued {
+            assert!(timeout(Duration::from_secs(1), result)
+                .await
+                .expect("shutdown releases queued request")
+                .is_err());
+        }
+        assert!(timeout(Duration::from_secs(1), waiting_advert)
+            .await
+            .expect("shutdown releases advertisement")
+            .unwrap()
+            .is_err());
+        assert!(ordinary.call(Request::Peers).await.is_err());
+    })
+    .await
+    .expect("backpressure, refresh and shutdown remain independent");
+}
+
+/// A quiet driver registers wakeups rather than repeatedly polling discovery.
+#[tokio::test(start_paused = true)]
+async fn driver_yields_when_idle() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _init = zakura_test::init();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let count = polls.clone();
+    let discovered = stream::poll_fn(move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        std::task::Poll::<Option<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>>::Pending
+    });
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let (peers, _guard) = PeerSetBuilder::new()
+        .with_discover(discovered)
+        .with_minimum_peer_version(minimum)
+        .build();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+    let (done, ready) = tokio::sync::oneshot::channel();
+    adverts.refresh.as_ref().unwrap().send(done).await.unwrap();
+    timeout(Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = polls.load(Ordering::Relaxed);
+    assert!(before > 0);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(polls.load(Ordering::Relaxed), before);
+    shutdown.cancel();
 }

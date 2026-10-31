@@ -1191,7 +1191,7 @@ fn work_machine_records_and_replays_without_transport() {
     assert!(trace
         .steps
         .iter()
-        .any(|step| step.work.as_ref().unwrap().actual.reserved > 0));
+        .any(|step| matches!(step.machine.as_deref(), Some(zakura_sim::record::machine::MachineStep::Work(work)) if work.actual.reserved > 0)));
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     assert!(matches!(
@@ -1210,13 +1210,13 @@ fn work_machine_records_and_replays_without_transport() {
     );
 
     edit(dir.path(), |lines| {
-        step(lines, 3)["work"]["actual"]["reserved"] = json!(999);
+        step(lines, 3)["machine"]["step"]["actual"]["reserved"] = json!(999);
     });
     assert!(matches!(
         replayed(dir.path(), ReplayOptions::default()),
         Err(ReplayError::Nondeterministic {
             step: 3,
-            field: "work"
+            field: "machine"
         })
     ));
 }
@@ -1263,13 +1263,13 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
 
     let dir = record_named("block/work-ownership", WORK_INPUT);
     edit(dir.path(), |lines| {
-        step(lines, 2).as_object_mut().unwrap().remove("work");
+        step(lines, 2).as_object_mut().unwrap().remove("machine");
     });
     assert!(matches!(
         replayed(dir.path(), ReplayOptions::default()),
         Err(ReplayError::Nondeterministic {
             step: 2,
-            field: "work"
+            field: "machine"
         })
     ));
 }

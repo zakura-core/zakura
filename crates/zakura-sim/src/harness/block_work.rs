@@ -17,7 +17,10 @@ use crate::{
         Assumptions, Capture, HasView, Kind, Property, PropertyId, Registry, RegistryChecker,
         Source, Sources, Status, Verdict,
     },
-    record::{machine::WorkStep, InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION},
+    record::{
+        machine::{MachineStep, WorkStep},
+        InitRecord, StepRecord, CONTRACT_VERSION, FORMAT_VERSION,
+    },
     sim::Pick,
     trace::{
         meta::{BudgetRecord, PropertyRef, SchedulerRecord, RNG},
@@ -220,7 +223,7 @@ fn run_checked(
                 offset: decision.offset,
                 draws: Vec::new(),
                 obs: None,
-                work: Some(Box::new(work)),
+                machine: Some(Box::new(MachineStep::Work(work))),
             }));
         }
         let enabled = [Enabled {
@@ -343,7 +346,7 @@ struct WitnessSink<'a> {
 impl RecordSink for WitnessSink<'_> {
     fn record(&mut self, record: Record) {
         if let Record::Step(step) = &record {
-            if let Some(work) = &step.work {
+            if let Some(MachineStep::Work(work)) = step.machine.as_deref() {
                 self.charged_work |= work
                     .expected
                     .items

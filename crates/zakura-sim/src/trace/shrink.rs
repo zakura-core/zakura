@@ -403,7 +403,8 @@ fn machine_failure<'a>(
     end: Option<&EndRecord>,
 ) -> Option<MachineFailureKey> {
     let mut machine = false;
-    for work in steps.into_iter().filter_map(|step| step.work.as_ref()) {
+    for step in steps.into_iter().filter_map(|step| step.machine.as_deref()) {
+        let crate::record::machine::MachineStep::Work(work) = step;
         machine = true;
         if let Some(failure) = &work.failure {
             return Some(MachineFailureKey::Driver(failure.clone()));

@@ -697,7 +697,7 @@ fn writer_keeps_to_the_line_limit() {
             offset: None,
             draws: Vec::new(),
             obs: None,
-            work: None,
+            machine: None,
         })
     };
     sink.record(Record::Init(InitRecord::default()));
@@ -841,6 +841,19 @@ fn unsupported_format() {
         Invalid::UnsupportedVersion {
             field: "format",
             found: zakura_sim::record::FORMAT_VERSION + 1
+        }
+    );
+}
+
+#[test]
+fn untagged_machine_format_is_rejected() {
+    let dir = recorded(plan());
+    edit_meta(dir.path(), |meta| meta["format"] = json!(20));
+    assert_eq!(
+        invalid(dir.path()),
+        Invalid::UnsupportedVersion {
+            field: "format",
+            found: 20
         }
     );
 }
@@ -1486,7 +1499,7 @@ fn step() -> impl Strategy<Value = StepRecord> {
                 offset,
                 draws,
                 obs,
-                work: None,
+                machine: None,
             },
         )
 }
@@ -1794,7 +1807,7 @@ fn round_trip_edges() {
         offset: None,
         draws: Vec::new(),
         obs: None,
-        work: None,
+        machine: None,
     };
     let bare_end = EndRecord {
         outcome: OutcomeKind::Budget,

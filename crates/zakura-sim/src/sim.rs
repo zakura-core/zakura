@@ -477,7 +477,7 @@ impl Sim {
                     offset: decision.offset,
                     draws,
                     obs: Some(digest(st.log.of_step(st.step))),
-                    work: None,
+                    machine: None,
                 }));
             }
             if let Some(failure) = self.failure.take() {

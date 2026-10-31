@@ -598,7 +598,7 @@ fn skipped_pick_runs_the_default() {
         offset: None,
         draws: Vec::new(),
         obs: None,
-        work: None,
+        machine: None,
     };
     let ping = StepRecord {
         pick: Identity::peer("p1", "ping1").to_string(),
@@ -696,7 +696,7 @@ fn deletion_takes_later_same_source_picks() {
             offset: None,
             draws: Vec::new(),
             obs: None,
-            work: None,
+            machine: None,
         })
     };
     let picks = [

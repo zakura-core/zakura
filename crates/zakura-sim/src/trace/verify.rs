@@ -95,7 +95,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         offset,
         draws,
         obs,
-        work,
+        machine,
     } = recorded;
     [
         ("step", *step == produced.step),
@@ -106,7 +106,7 @@ fn step_difference(recorded: &StepRecord, produced: &StepRecord) -> Option<&'sta
         ("offset", *offset == produced.offset),
         ("draws", *draws == produced.draws),
         ("obs", *obs == produced.obs),
-        ("work", *work == produced.work),
+        ("machine", *machine == produced.machine),
     ]
     .into_iter()
     .find_map(|(field, same)| (!same).then_some(field))
@@ -176,7 +176,7 @@ mod machine_tests {
     use super::*;
     use crate::{
         plan::By,
-        record::machine::{FailurePhase, MachineFailure},
+        record::machine::{FailurePhase, MachineFailure, MachineStep},
     };
 
     #[test]
@@ -194,25 +194,33 @@ mod machine_tests {
                 offset: None,
                 draws: Vec::new(),
                 obs: None,
-                work: Some(Box::new(step.into())),
+                machine: Some(Box::new(MachineStep::Work(step.into()))),
             };
             let json = Record::Step(record.clone()).to_line();
+            let mut encoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(encoded["machine"]["kind"], "work");
+            assert!(encoded["machine"]["step"]["input"].is_array());
+            encoded["machine"]["kind"] = serde_json::json!("unsupported-machine");
+            assert!(serde_json::from_value::<Record>(encoded).is_err());
             let decoded: Record = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, Record::Step(record.clone()));
             assert_eq!(step_difference(&record, &record), None);
             let mut changed = record.clone();
-            changed.work.as_mut().unwrap().actual.reserved += 1;
-            assert_eq!(step_difference(&record, &changed), Some("work"));
+            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap();
+            work.actual.reserved += 1;
+            assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            changed.work.as_mut().unwrap().input[0] ^= 1;
-            assert_eq!(step_difference(&record, &changed), Some("work"));
+            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap();
+            work.input[0] ^= 1;
+            assert_eq!(step_difference(&record, &changed), Some("machine"));
             let mut changed = record.clone();
-            changed.work.as_mut().unwrap().failure = Some(MachineFailure {
+            let MachineStep::Work(work) = changed.machine.as_deref_mut().unwrap();
+            work.failure = Some(MachineFailure {
                 property_failure: true,
                 phase: FailurePhase::Invariant,
                 message: "block/work-ownership: changed owner".into(),
             });
-            assert_eq!(step_difference(&record, &changed), Some("work"));
+            assert_eq!(step_difference(&record, &changed), Some("machine"));
             let json = Record::Step(changed.clone()).to_line();
             assert_eq!(
                 serde_json::from_str::<Record>(&json).unwrap(),

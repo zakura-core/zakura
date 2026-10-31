@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::observe::{WorkOwner, WorkScope};
 
+/// Typed semantic evidence from one transport-free machine operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "step",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum MachineStep {
+    /// Logical block-work ownership and its independent model.
+    Work(WorkStep),
+}
+
 /// Body-work authority, including every generation that controls eligibility.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

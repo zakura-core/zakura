@@ -236,6 +236,15 @@ impl PublisherOwner {
     /// to its encoded frame and its slot's permit.
     fn next_terminal<const HEADER_BYTES: usize>(&mut self) -> Option<OwnedTerminal> {
         let terminal = self.state.next_terminal()?;
+        Some(self.bind_terminal::<HEADER_BYTES>(terminal))
+    }
+
+    /// Bind a terminal outcome state released to its encoded frame and its
+    /// slot's permit.
+    fn bind_terminal<const HEADER_BYTES: usize>(
+        &mut self,
+        terminal: state::Terminal,
+    ) -> OwnedTerminal {
         let permit = self
             .slots
             .terminal(terminal.slot)
@@ -246,12 +255,12 @@ impl PublisherOwner {
             outcome: terminal.outcome,
         }))
         .expect("an outcome for a nonzero subscription ID always encodes");
-        Some(OwnedTerminal {
+        OwnedTerminal {
             frame,
             permit,
             slot: terminal.slot,
             abandons: terminal.abandons,
-        })
+        }
     }
 
     /// Report a capacity refusal for job `key` to state, under the wait for
@@ -476,12 +485,10 @@ enum Admission {
 }
 
 /// How a page in progress finished.
-// The simulator build's sync wrappers make `PushSend` about 376 bytes, past
-// clippy's threshold. One `Progress` is returned per page, so boxing the send
-// would only add an allocation per page in production.
-#[cfg_attr(zakura_sim, allow(clippy::large_enum_variant))]
 enum Progress<'a> {
-    Page(EncodedPage, PushSend<'a>),
+    /// The encoded page and its transport slot, boxed because the slot's send
+    /// handle dwarfs the other variants.
+    Page(Box<(EncodedPage, PushSend<'a>)>),
     CapacityBusy(ServingCapacitySignal),
     Other(Output),
     Closed,
@@ -626,7 +633,8 @@ fn settle(
     match progress {
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
-        Progress::Page(encoded, slot) => {
+        Progress::Page(page) => {
+            let (encoded, slot) = *page;
             if lock(shared).state.commit(key, &encoded.page) {
                 slot.send(encoded.frame);
             }
@@ -735,7 +743,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         {
             return Progress::Other(Output::Retry("left_selected_chain"));
         }
-        Progress::Page(encoded, slot)
+        Progress::Page(Box::new((encoded, slot)))
     })
 }
 
@@ -813,9 +821,7 @@ async fn run_job<const HEADER_BYTES: usize>(
         let reply = acquire(port, owner, job.selected.as_ref(), lease_target, locators).await;
         let path = match reply {
             Ok(AcquirePathReply::Acquired(path)) => *path,
-            Ok(AcquirePathReply::CapacityBusy(signal)) => {
-                return JobResult::CapacityBusy(signal).into()
-            }
+            Ok(AcquirePathReply::CapacityBusy(signal)) => return JobResult::CapacityBusy(signal),
             // The selected chain no longer extends the last header sent.
             Ok(AcquirePathReply::NoLocatorIntersection) if job.following => {
                 return Output::End(HeadersOutcomeCode::SubscriptionSuperseded).into()

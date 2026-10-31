@@ -393,7 +393,10 @@ fn the_owner_holds_a_capacity_signal_only_while_a_stall_waits() {
     machine
         .owner
         .capacity_busy(job.job.key, signal.clone(), None);
-    assert_eq!(machine.owner.capacity_signals(), [signal.clone()]);
+    assert_eq!(
+        machine.owner.capacity_signals(),
+        std::slice::from_ref(&signal)
+    );
     assert_eq!(machine.owner.state.capacity_waits().len(), 1);
 
     signal.release();

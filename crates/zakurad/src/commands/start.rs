@@ -369,6 +369,10 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
+        config
+            .sync
+            .backend_execution_partition()
+            .map_err(|error| eyre!(error))?;
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;

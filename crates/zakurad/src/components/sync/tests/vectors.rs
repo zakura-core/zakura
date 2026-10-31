@@ -4465,3 +4465,31 @@ fn scaled_lookahead_stays_below_the_drop_height() {
         );
     }
 }
+
+#[test]
+fn backend_execution_partition_fits_the_default_limits_and_rejects_excess() {
+    use crate::components::sync::{BackendExecutionError, Config, MAX_BACKEND_BLOCK_VERIFICATIONS};
+
+    let default = Config::default();
+    let partition = default.backend_execution_partition().unwrap();
+    assert_eq!(partition.legacy_full, default.full_verify_concurrency_limit);
+    assert!(partition.total() <= MAX_BACKEND_BLOCK_VERIFICATIONS);
+
+    let excess = Config {
+        full_verify_concurrency_limit: MAX_BACKEND_BLOCK_VERIFICATIONS,
+        ..Config::default()
+    };
+    assert!(matches!(
+        excess.backend_execution_partition(),
+        Err(BackendExecutionError::AboveAllowance { .. })
+    ));
+
+    let overflow = Config {
+        checkpoint_verify_concurrency_limit: usize::MAX,
+        ..Config::default()
+    };
+    assert_eq!(
+        overflow.backend_execution_partition(),
+        Err(BackendExecutionError::Overflow)
+    );
+}

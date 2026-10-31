@@ -882,3 +882,152 @@ fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
         "anchor insert is idempotent"
     );
 }
+
+/// Variable-size disk reads charge decoded bytes to their final holder, separately
+/// from parser memory, and a refusal is not reported as missing data.
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
+    use crate::service::StateService;
+    use std::{num::NonZeroU64, time::Duration};
+    use tokio::time::timeout;
+    use zakura_node_services::block_memory::{
+        AdmissionFailure, PayloadAdmissionFailure, ReadMemoryBudget,
+    };
+
+    let _guard = zakura_test::init();
+    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        Duration::from_secs(10),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let mut db = read.db.clone();
+    let budget = ReadMemoryBudget::new(NonZeroU64::MAX, NonZeroU64::MIN);
+    db.read_memory = budget.clone();
+    let height = Height(0).into();
+
+    let block = db.block(height).unwrap().unwrap();
+    let decoded = genesis.attributed_memory_size_bytes();
+    assert_eq!(budget.retained_bytes(), decoded);
+    assert_eq!(
+        budget.parser_bytes(),
+        0,
+        "the parser charge ended with the read"
+    );
+
+    assert_eq!(
+        db.block(height).unwrap_err(),
+        AdmissionFailure::Capacity,
+        "the first result holds the only retained capacity"
+    );
+    assert_eq!(
+        db.block_and_size(height).unwrap_err(),
+        AdmissionFailure::Capacity
+    );
+    assert_eq!(
+        db.raw_block_result(height).unwrap_err(),
+        PayloadAdmissionFailure::Capacity
+    );
+    let hash = genesis.transactions[0].hash();
+    assert_eq!(
+        db.transaction(hash).unwrap_err(),
+        PayloadAdmissionFailure::Capacity
+    );
+    assert_eq!(budget.retained_bytes(), decoded, "refusals leave no charge");
+    assert_eq!(budget.parser_bytes(), 0);
+
+    let transaction = block.transaction(0).unwrap();
+    drop(block);
+    assert_eq!(budget.retained_bytes(), decoded);
+    drop(transaction);
+    assert_eq!(budget.retained_bytes(), 0);
+
+    let (raw, stored_size) = db
+        .raw_block_result(height)
+        .map(|raw| {
+            let raw = raw.expect("the block is stored");
+            let size = raw.len();
+            (raw, size)
+        })
+        .unwrap();
+    assert_eq!(
+        raw.as_slice(),
+        &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]
+    );
+    assert_eq!(
+        budget.retained_bytes(),
+        u64::try_from(raw.capacity()).unwrap()
+    );
+    drop(raw);
+
+    let (_, size) = db.block_and_size(height).unwrap().unwrap();
+    assert_eq!(size, stored_size, "both read paths report the stored size");
+
+    assert!(db.block(Height(1).into()).unwrap().is_none());
+    assert_eq!(budget.retained_bytes(), 0, "a missing block has no charge");
+    assert_eq!(budget.parser_bytes(), 0);
+}
+
+/// The parser limit refuses rows before a read copies the rest of a block.
+#[tokio::test(flavor = "multi_thread")]
+async fn parser_limit_refuses_reads_while_another_parser_holds_it() {
+    use crate::service::StateService;
+    use std::{num::NonZeroU64, time::Duration};
+    use tokio::time::timeout;
+    use zakura_node_services::block_memory::{
+        AdmissionFailure, DecodedBlockPool, ReadMemoryBudget,
+    };
+
+    let _guard = zakura_test::init();
+    let (mut state, read, _, _) = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        Duration::from_secs(10),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let mut db = read.db.clone();
+    let budget = ReadMemoryBudget::new(NonZeroU64::new(8).unwrap(), NonZeroU64::MAX);
+    db.read_memory = budget.clone();
+
+    let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(4).unwrap());
+    let outer = pool.try_decode_bounded(&budget, |outer_scope| {
+        outer_scope.try_charge(8)?;
+        assert_eq!(
+            db.block(Height(0).into()).unwrap_err(),
+            AdmissionFailure::Capacity,
+            "an active parser holds the whole limit"
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+        assert_eq!(budget.parser_bytes(), 8);
+        Ok(None)
+    });
+    assert!(outer.unwrap().is_none());
+    assert_eq!(budget.parser_bytes(), 0);
+
+    assert!(
+        db.block(Height(0).into()).unwrap().is_some(),
+        "a lone parser finishes above its limit"
+    );
+}

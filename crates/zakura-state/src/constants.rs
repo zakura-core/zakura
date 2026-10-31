@@ -156,6 +156,9 @@ pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
 /// Bulk reads cannot occupy this admission pool.
 pub(crate) const CONTROL_READ_CONCURRENCY: usize = 4;
 
+/// Callers that can wait for a control read worker.
+pub(crate) const CONTROL_READ_WAITERS: usize = 1024;
+
 /// Full disk blocks retained by chain-tip publication, separate from ordinary results.
 /// Old tip subscribers keep their charge; exhaustion refuses operator changes before commit.
 pub(crate) const CHAIN_TIP_BLOCK_RETENTION: u64 = 4;

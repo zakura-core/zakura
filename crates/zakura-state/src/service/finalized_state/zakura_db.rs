@@ -103,7 +103,10 @@ pub struct ZakuraDb {
     format_change_handle: Option<DbFormatChangeThreadHandle>,
 
     /// Shared admission for blocking read-service jobs, including cancelled waiters' jobs.
-    read_workers: Arc<tokio::sync::Semaphore>,
+    read_workers: crate::request::ReadWorkerPool,
+
+    /// Parser and retained-result byte limits for variable-size disk reads.
+    read_memory: zakura_node_services::block_memory::ReadMemoryBudget,
 
     /// Disk block decoding and final-holder admission shared by database clones.
     read_blocks: zakura_node_services::block_memory::DecodedBlockPool,
@@ -121,7 +124,7 @@ pub struct ZakuraDb {
     chain_tip_blocks: zakura_node_services::block_memory::DecodedBlockPool,
 
     /// Admission reserved for bounded chain-tip and depth queries.
-    control_read_workers: Arc<tokio::sync::Semaphore>,
+    control_read_workers: crate::request::ReadWorkerPool,
 
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
@@ -207,6 +210,9 @@ impl ZakuraDb {
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
 
+        // Reject read limits that cannot fund their workers before touching the disk.
+        config.read_capacity_plan()?;
+
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
         //
@@ -246,12 +252,18 @@ impl ZakuraDb {
                 std::num::NonZeroU64::new(crate::constants::CHAIN_TIP_BLOCK_RETENTION)
                     .expect("chain-tip retention has a nonzero fixed allowance"),
             ),
-            read_workers: Arc::new(tokio::sync::Semaphore::new(usize::from(
-                config.read_concurrency_limit.get(),
-            ))),
-            control_read_workers: Arc::new(tokio::sync::Semaphore::new(
+            read_workers: crate::request::ReadWorkerPool::new(
+                usize::from(config.read_concurrency_limit.get()),
+                usize::from(config.read_waiter_limit.get()),
+            ),
+            read_memory: zakura_node_services::block_memory::ReadMemoryBudget::new(
+                config.read_parser_byte_limit,
+                config.read_result_byte_limit,
+            ),
+            control_read_workers: crate::request::ReadWorkerPool::new(
                 crate::constants::CONTROL_READ_CONCURRENCY,
-            )),
+                crate::constants::CONTROL_READ_WAITERS,
+            ),
             debug_skip_format_upgrades,
             format_change_handle: None,
             db: disk_db,
@@ -336,12 +348,12 @@ impl ZakuraDb {
     }
 
     /// Return the shared admission pool for blocking read-service jobs.
-    pub(crate) fn read_worker_capacity(&self) -> Arc<tokio::sync::Semaphore> {
+    pub(crate) fn read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
         self.read_workers.clone()
     }
 
     /// Return the admission pool that bulk reads cannot occupy.
-    pub(crate) fn control_read_worker_capacity(&self) -> Arc<tokio::sync::Semaphore> {
+    pub(crate) fn control_read_worker_capacity(&self) -> crate::request::ReadWorkerPool {
         self.control_read_workers.clone()
     }
 

@@ -42,7 +42,7 @@ use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
-    memory::{vec_capacity_bytes, AttributedMemorySize},
+    memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
@@ -375,6 +375,14 @@ impl ShieldedActionCounts {
 }
 
 impl Transaction {
+    /// Measure this decoded transaction's inline value and nested allocations.
+    ///
+    /// This is deterministic attribution, not exact process memory. It excludes
+    /// allocator overhead and `Arc` control blocks.
+    pub fn decoded_memory_size_bytes(&self) -> u64 {
+        inline_size_bytes::<Self>().saturating_add(self.attributed_memory_size_bytes())
+    }
+
     // identifiers and hashes
 
     /// Compute the hash (mined transaction ID) of this transaction.

@@ -78,7 +78,13 @@ impl BlockRangeSnapshot {
                 return (bytes.len() <= max_bytes).then_some(bytes);
             }
         }
-        db.raw_block_bytes_within(height.into(), max_bytes)
+        // Each worker reads one block at a time, so the worker partition bounds this parser.
+        db.raw_block_bytes_within(
+            height.into(),
+            max_bytes,
+            &mut zakura_node_services::block_memory::ParseScope::statically_bounded(),
+        )
+        .expect("a statically bounded parser scope never refuses a charge")
     }
 }
 
@@ -200,7 +206,7 @@ impl ReadStateService {
 /// cannot release reservations still needed by the read. Move them into
 /// [`OwnedBlockRange`] on completion so they remain with the returned blocks.
 fn spawn_owned_block_range<R, G>(
-    workers: Arc<tokio::sync::Semaphore>,
+    workers: crate::request::ReadWorkerPool,
     start: block::Height,
     count: u32,
     max_response_bytes: u32,

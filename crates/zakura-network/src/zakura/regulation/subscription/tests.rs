@@ -1473,3 +1473,31 @@ fn queued_pages_never_exceed_the_unspent_credit() {
     }
     assert!(admitting.check(message_type::PAGE, 1).is_err());
 }
+
+/// A terminal's future owns its permit from creation, and dropping the future
+/// before its first poll frees the subscription's slot.
+#[tokio::test]
+async fn an_unpolled_terminal_send_frees_its_slot() {
+    let mut publications = opened(1, &[1]);
+    let first = publications.end(&1).unwrap();
+    publications.open(2, 0, LIMIT, 0).unwrap();
+    let _second = publications.end(&2).unwrap();
+    assert!(
+        publications.open(3, 0, LIMIT, 0).is_err(),
+        "both slots are held"
+    );
+
+    let (send, _output) = crate::zakura::transport::worker_framed_channel(1);
+    let frame = crate::zakura::Frame {
+        message_type: message_type::ENDED,
+        flags: 0,
+        payload: vec![0],
+    };
+    let unpolled = first.send(&send, frame);
+    assert!(
+        publications.open(3, 0, LIMIT, 0).is_err(),
+        "the future owns the slot"
+    );
+    drop(unpolled);
+    publications.open(3, 0, LIMIT, 0).unwrap();
+}

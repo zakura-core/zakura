@@ -6866,6 +6866,7 @@ impl ZakuraHandlerError {
 mod tests {
     mod bounded_decoding;
     pub(super) mod connection;
+    mod frame_lifetime;
     mod quic_progress;
     mod read_close_cause;
     mod transport_observer;

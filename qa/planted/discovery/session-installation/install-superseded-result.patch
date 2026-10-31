@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/state.rs b/crates/zakura-network/src/zakura/discovery/state.rs
+index e81d8bc15..eabd65967 100644
+--- a/crates/zakura-network/src/zakura/discovery/state.rs
++++ b/crates/zakura-network/src/zakura/discovery/state.rs
+@@ -482,7 +482,7 @@ impl DiscoveryState {
+         connected: &[NodeId],
+         now: u64,
+     ) -> Result<ImportOutcome, SessionRecordError> {
+-        if !self.is_current_session(session) {
++        if false && !self.is_current_session(session) {
+             return Err(SessionRecordError::Superseded);
+         }
+         Ok(self.install_connected_peer_record(record, connected, now)?)

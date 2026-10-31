@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index f80874e5f..7f0981c95 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -2884,7 +2884,7 @@ impl ZakuraDiscoveryBook {
+                     .filter(|(_, entry)| !entry.is_static)
+                     .min_by_key(|(node_id, entry)| {
+                         (
+-                            entry.last_confirmed.is_some(),
++                            entry.last_confirmed.is_none(),
+                             entry.last_success.unwrap_or(0),
+                             entry.last_seen,
+                             node_id_sort_key(node_id),

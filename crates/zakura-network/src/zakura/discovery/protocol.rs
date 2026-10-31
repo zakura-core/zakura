@@ -2361,7 +2361,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Returns `requester`'s window hash in `epoch`.
-    #[cfg(any(test, feature = "p2p-fuzz"))]
+    #[cfg(test)]
     pub(super) fn window_hash(&self, requester: NodeId, epoch: u64) -> u64 {
         self.disclosure_hash(requester, epoch)
     }

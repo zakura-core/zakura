@@ -108,7 +108,9 @@ pub enum TargetStatus {
     /// The fuzz package maps the target to no harness, or to a harness
     /// that isn't registered.
     Unresolved,
-    /// A required seed of the harness failed validation.
+    /// A required seed of the harness failed validation, or a seed whose
+    /// sidecar doesn't parse or names no registered harness did, since
+    /// [`seed::load`] can't tell that such a seed isn't the harness's.
     SeedsRejected,
     /// The harness has no admitted seed.
     NoSeeds,
@@ -552,7 +554,7 @@ fn check_target(
         return Ok(row.with(
             TargetStatus::SeedsRejected,
             format!(
-                "{} required seeds failed validation; {}: {}",
+                "{} seeds that reject the set failed validation; {}: {}",
                 loaded.rejected.len(),
                 failed.path.display(),
                 failed.error

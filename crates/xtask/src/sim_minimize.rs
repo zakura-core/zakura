@@ -1032,8 +1032,6 @@ pub(super) fn minimize_with(
     write_report(request, report, started)
 }
 
-/// [`minimize_with`]'s steps: fills in `report`, with the wrapper's own
-/// failures as errors.
 /// Records the pinned build in `report`, checks that the harness registers
 /// the property, and confirms the original in fresh processes. Returns
 /// whether the original passed. Otherwise `report` ends
@@ -1093,6 +1091,9 @@ fn check_original(
     Ok(true)
 }
 
+/// [`minimize_with`]'s steps: fills in `report`, with the wrapper's own
+/// failures as errors. Checks the original with [`check_original`], then
+/// runs `tmin` and confirms its candidates.
 fn reduce(
     request: &Request,
     tools: &Tools,

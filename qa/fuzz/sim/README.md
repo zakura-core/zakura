@@ -275,7 +275,8 @@ must name the harness the table maps it to, so a target whose
 - `no-applicable-property`: all of that, except that no seed's run applied
   a property of the harness's own;
 - `unresolved`: the table maps the target to no registered harness;
-- `seeds-rejected`: a required seed of the harness failed validation;
+- `seeds-rejected`: a required seed of the harness, or a seed whose sidecar
+  doesn't say a registered harness, failed validation;
 - `no-seeds`: the harness has no admitted seed;
 - `build-failed`: `cargo fuzz build` failed;
 - `seeds-failed`: the target failed on the seeds, with a panic, a crash, a
@@ -290,9 +291,9 @@ and those that didn't, the optional seeds it quarantined, and the retained
 bypasses under `qa/planted/` whose input runs on the harness, or that there
 are none. `<dir>/readiness.json`
 holds the same report, with each built target's commit, dirty state and
-toolchain from its build identity, and `<dir>/<target>/` holds the binary, the seeds,
-the log and the stats. The command exits 0 only if every target is
-`ready`. A seed run shows that a target builds and runs its harness. It
+toolchain from its build identity, and `<dir>/<target>/` holds the
+binary, the seeds, the log and the stats. The command exits 0 only if
+every target is `ready`. A seed run shows that a target builds and runs its harness. It
 says nothing about how well the target searches.
 
 `cargo xtask planted --targets` runs each retained bypass whose input runs

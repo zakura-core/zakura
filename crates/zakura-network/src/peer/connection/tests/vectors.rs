@@ -1441,7 +1441,7 @@ async fn block_advert_while_awaiting_response() {
         let (
             mut connection,
             mut client_tx,
-            _inbound_service,
+            mut inbound_service,
             mut peer_outbound_messages,
             shared_error_slot,
         ) = new_test_connection();
@@ -1494,9 +1494,20 @@ async fn block_advert_while_awaiting_response() {
         peer_tx
             .try_send(Ok(Message::Inv(vec![InventoryHash::Block(next_hash)])))
             .unwrap();
-        assert_eq!(
-            request_rx.await.unwrap().unwrap(),
-            Response::BlockHashes(vec![next_hash])
+        // A one-hash inv is also a block announcement, so it reaches the inbound service too.
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::AdvertiseBlock(next_hash, None))
+                    .await
+                    .respond(Response::Nil);
+            },
+            async {
+                assert_eq!(
+                    request_rx.await.unwrap().unwrap(),
+                    Response::BlockHashes(vec![next_hash])
+                );
+            }
         );
         assert!(shared_error_slot.try_get_error().is_none());
 
@@ -1610,6 +1621,125 @@ async fn getblocks_response_precedes_ready_block_advert() {
     })
     .await
     .expect("the response and advert are both delivered");
+}
+
+/// Sends a `FindBlocks` request on `client_tx` and waits for its `getblocks` to reach the wire.
+///
+/// Returns the receiver for the request's response.
+async fn send_find_blocks(
+    client_tx: &mut mpsc::Sender<ClientRequest>,
+    peer_outbound_messages: &mut mpsc::Receiver<Message>,
+) -> oneshot::Receiver<Result<Response, crate::peer::SharedPeerError>> {
+    let (request_tx, request_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![block::Hash([1; 32])],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .unwrap();
+    assert!(matches!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks { .. })
+    ));
+    request_rx
+}
+
+/// A one-hash block `inv` that arrives while `getblocks` is pending answers the request and is
+/// also handed to the inbound service as a block advert.
+///
+/// A peer announces a new block with a one-hash `inv`, which the connection cannot tell from a
+/// reply. If it were only the reply, the gossip downloader would never see the block, and the
+/// syncer would fetch it only after every request in its discovery round had finished.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_is_also_gossiped() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::AdvertiseBlock(announced_hash, None))
+                    .await
+                    .respond(Response::Nil);
+            },
+            async {
+                assert_eq!(
+                    request_rx.await.unwrap().unwrap(),
+                    Response::BlockHashes(vec![announced_hash])
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the response and the block advert are both delivered");
+}
+
+/// A block `inv` with several hashes is a `getblocks` reply only, never a block advert.
+#[tokio::test]
+async fn multi_block_inv_during_getblocks_is_only_the_reply() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let hashes = vec![block::Hash([2; 32]), block::Hash([3; 32])];
+        peer_tx
+            .try_send(Ok(Message::Inv(
+                hashes.iter().copied().map(InventoryHash::Block).collect(),
+            )))
+            .unwrap();
+
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(hashes)
+        );
+        inbound_service.expect_no_requests().await;
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered without a block advert");
 }
 
 /// A connection rechecks bans while a request is awaiting its response, and does not write an

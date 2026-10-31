@@ -140,6 +140,10 @@ impl Handler {
     ///
     /// Unexpected messages are left unprocessed, and may be rejected later.
     ///
+    /// A one-hash block `inv` answers a pending `FindBlocks` request and is also
+    /// returned, because it may be a block announcement that the caller still
+    /// has to handle as a request.
+    ///
     /// `addr` responses are limited to avoid peer set takeover. Any excess
     /// addresses are stored in `cached_addrs`.
     fn process_message(
@@ -402,15 +406,23 @@ impl Handler {
 
             // An empty inventory can be a late mempool reply after cancellation.
             // Zakura and zcashd send no message for an empty getblocks result.
+            //
+            // Peers announce a new block with a one-hash `inv`, and a `getblocks` reply is
+            // also an `inv`, so a one-hash `inv` here can be either. It answers the request
+            // either way, and it is also returned so the run loop handles it as a block
+            // advert: the gossip downloader then fetches the block right away, instead of
+            // the syncer fetching it only once its whole discovery round has finished.
             (Handler::FindBlocks, Message::Inv(items))
                 if !items.is_empty()
                     && items
                         .iter()
                         .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
-                )))
+                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                if let [InventoryHash::Block(_)] = items[..] {
+                    ignored_msg = Some(Message::Inv(items));
+                }
+                Handler::Finished(Ok(response))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHeaders(headers)))
@@ -972,8 +984,9 @@ where
 
                             self.update_state_metrics(None);
 
-                            // If the message was not consumed as a response,
-                            // check whether it can be handled as a request.
+                            // If the message was not consumed as a response, or it was a
+                            // block announcement that also answered the response, check
+                            // whether it can be handled as a request.
                             let unused_msg = if let Some(request_msg) = request_msg {
                                 // do NOT instrument with the request span, this is
                                 // independent work

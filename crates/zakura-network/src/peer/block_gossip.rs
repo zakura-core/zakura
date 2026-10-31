@@ -445,6 +445,116 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
+    /// Builds `count` peers whose connections write every queued advert at once, marking it
+    /// advertised as [`Connection`](crate::peer::Connection) does, and report each write.
+    fn connected_peers(
+        count: usize,
+    ) -> (
+        Vec<BlockGossipPeer>,
+        mpsc::UnboundedReceiver<(usize, block::Hash)>,
+    ) {
+        let (writes_tx, writes) = mpsc::unbounded_channel();
+        let peers = (0..count)
+            .map(|index| {
+                let (peer, mut receiver) = peer();
+                let uploads = peer.uploads.clone();
+                let writes_tx = writes_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(advert) = receiver.recv().await {
+                        if advert.result.is_closed() {
+                            continue;
+                        }
+                        uploads.advertised(advert.hash);
+                        let _ = advert.result.send(Ok(()));
+                        let _ = writes_tx.send((index, advert.hash));
+                    }
+                });
+                peer
+            })
+            .collect();
+        (peers, writes)
+    }
+
+    /// What an older broadcast's peers do after its inventory is written.
+    #[derive(Clone, Copy, Debug)]
+    enum OlderBroadcastPeers {
+        /// The peers already have the block, so they never send getdata.
+        NeverRequest,
+        /// The peers requested the block, and its body is still being written.
+        Uploading,
+        /// The body write completed, so the peers are inside the post-write grace.
+        InWriteGrace,
+    }
+
+    /// Returns how long a fresh block's first inventory write waits after an older broadcast
+    /// reached every peer, optionally as overlapping early and committed broadcasts.
+    async fn fresh_inventory_wait(
+        older: OlderBroadcastPeers,
+        early_and_committed: bool,
+    ) -> Duration {
+        let parent = block::Hash([0xa0; 32]);
+        let child = block::Hash([0xb0; 32]);
+        let slots = Arc::new(Semaphore::new(BLOCK_GOSSIP_CONCURRENCY));
+        let (peers, mut writes) = connected_peers(BLOCK_GOSSIP_CONCURRENCY);
+        let mut broadcasts = vec![tokio::spawn(broadcast_block(
+            peers.clone(),
+            parent,
+            true,
+            slots.clone(),
+        ))];
+        if early_and_committed {
+            broadcasts.push(tokio::spawn(broadcast_block(
+                peers.clone(),
+                parent,
+                true,
+                slots.clone(),
+            )));
+        }
+        for _ in 0..BLOCK_GOSSIP_CONCURRENCY {
+            let (index, hash) = writes.recv().await.expect("mock connections stay open");
+            assert_eq!(hash, parent, "each peer gets the parent inventory once");
+            let uploads = &peers[index].uploads;
+            match older {
+                OlderBroadcastPeers::NeverRequest => {}
+                OlderBroadcastPeers::Uploading => uploads.requested(parent),
+                OlderBroadcastPeers::InWriteGrace => {
+                    uploads.requested(parent);
+                    uploads.written(parent);
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+
+        let mined = Instant::now();
+        broadcasts.push(tokio::spawn(broadcast_block(peers, child, true, slots)));
+        let wait = loop {
+            let (_, hash) = writes.recv().await.expect("mock connections stay open");
+            if hash == child {
+                break mined.elapsed();
+            }
+        };
+        broadcasts.iter().for_each(|broadcast| broadcast.abort());
+        wait
+    }
+
+    /// Reproduces the fleet's fresh-block wait: an older broadcast's slot holders delay a new
+    /// block's first inventory until an unrelated timer expires.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_block_inventory_waits_for_older_broadcast_slots() {
+        for (older, early_and_committed, observed) in [
+            (OlderBroadcastPeers::NeverRequest, false, BLOCK_REQUEST_WAIT),
+            (OlderBroadcastPeers::Uploading, false, BLOCK_UPLOAD_WAIT),
+            (OlderBroadcastPeers::InWriteGrace, false, BLOCK_WRITE_GRACE),
+            (OlderBroadcastPeers::NeverRequest, true, BLOCK_REQUEST_WAIT),
+        ] {
+            let wait = fresh_inventory_wait(older, early_and_committed).await;
+            assert_eq!(
+                wait, observed,
+                "{older:?} (early and committed: {early_and_committed}) holds the fresh inventory"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn inventory_does_not_release_slot_and_upload_holds_it_through_grace() {
         let hash = block::Hash([1; 32]);

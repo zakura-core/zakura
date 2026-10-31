@@ -449,6 +449,10 @@ pub enum StorageFact {
         request: StorageRequest,
         /// A digest of the request.
         digest: String,
+        /// The header-sync reactor's port call that submitted it, or `None`
+        /// for an operation no reactor call's poll submitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
     },
     /// The caller dropped its call while the operation was pending.
     CallerDropped {
@@ -659,6 +663,10 @@ pub enum StorageFact {
         /// defers actions.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         deferred: Vec<StorageRequest>,
+        /// Those of `dropped` whose call still existed, which can leave no
+        /// drop receipt. Only header storage reports them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        callers_alive: Vec<u64>,
     },
 }
 
@@ -1160,10 +1168,9 @@ pub enum ReactorFact {
         /// The call's number.
         call: u64,
         /// How it ended: `replied`, `port-error`, `timed-out`,
-        /// `not-submitted` or `port-panicked`.
+        /// `not-submitted`, `port-panicked` or `dropped`.
         end: String,
-        /// The storage operation the call is paired with. The tap doesn't
-        /// pair calls, so it always logs `None`.
+        /// The storage operation the call is paired with.
         op: Option<u64>,
     },
     /// The reactor finished processing a call's completion.

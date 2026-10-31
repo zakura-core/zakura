@@ -403,6 +403,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id: id.0,
             request: request(&asked),
             digest: hex(&request_digest),
+            call: fact.call,
         },
         FactKind::CallerDropped { id } => StorageFact::CallerDropped { id: id.0 },
         FactKind::ReplyTaken { id } => StorageFact::ReplyTaken { id: id.0 },
@@ -420,9 +421,13 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::Lease(fact) => lease_fact(fact),
         // Mapped like any fact. Shutdown at the end of a run happens after
         // the log is frozen and is never observed.
-        FactKind::ShutDown { dropped } => StorageFact::ShutDown {
+        FactKind::ShutDown {
+            dropped,
+            callers_alive,
+        } => StorageFact::ShutDown {
             dropped: dropped.into_iter().map(|id| id.0).collect(),
             deferred: Vec::new(),
+            callers_alive: callers_alive.into_iter().map(|id| id.0).collect(),
         },
     };
     Observation::Storage {

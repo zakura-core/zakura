@@ -240,6 +240,7 @@ impl ZakuraDb {
     /// Decode a stored block and report its serialized size. `scope` funds raw rows and
     /// decoded transactions as this read allocates them. Each raw row returns its charge
     /// after decoding. Missing or pruned bodies return `Ok(None)`.
+    #[allow(clippy::unwrap_in_result)]
     fn decode_stored_block(
         &self,
         hash_or_height: HashOrHeight,

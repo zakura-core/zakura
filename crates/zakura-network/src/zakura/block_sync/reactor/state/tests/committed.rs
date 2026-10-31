@@ -267,12 +267,11 @@ fn only_misbehavior_reports_are_optional_actions() {
         ..base_spec()
     };
     let _ = observe(&mut state, &alarmed, time::Instant::now());
-    let scope = state.body_work_scope();
     let start = match state.open_query(true) {
         QueryOpening::NeedsWork => QueryStart::Work(work(Some(1), 0, 1)),
         other => panic!("a forced refill opens, got {other:?}"),
     };
-    let QueryPlan::Dispatch(query) = state.propose_query(true, start, scope) else {
+    let QueryPlan::Dispatch(query) = state.propose_query(true, start) else {
         panic!("the committed view authorizes the query");
     };
     let restart = state

@@ -9,10 +9,13 @@ use std::time::Duration;
 
 #[cfg(test)]
 use proptest::prelude::*;
-use zakura_header_chain::{BodyWorkAuthority, HeaderGeneration, HeaderWorkAuthority};
+use zakura_header_chain::{
+    BodyWorkAuthority, BodyWorkEpoch, ChainScore, EngineMode, FrontierSet, HeaderGeneration,
+    SuffixWork, VerifiedGeneration,
+};
 
 use super::*;
-use crate::zakura::block_sync::{sequencer_task::initial_view, test_work_scope};
+use crate::zakura::block_sync::sequencer_task::initial_view;
 
 fn hash(domain: u8, raw: u32) -> block::Hash {
     let mut hash = [domain; 32];
@@ -30,18 +33,60 @@ fn header_hash(height: u32) -> block::Hash {
     hash(0xB0, height)
 }
 
-/// The `generation`th authority after the base test authority.
-fn authority(generation: u8) -> BodyWorkAuthority {
-    let base = test_work_scope();
-    BodyWorkAuthority {
-        header: HeaderWorkAuthority {
-            header_generation: HeaderGeneration::new(
-                base.header.header_generation.get() + u64::from(generation),
-            ),
-            ..base.header
+/// A committed view whose body-work authority is the `generation`th test authority.
+fn authority_view(generation: u8) -> CommittedHeaderChainView {
+    let frontier = Frontier {
+        height: block::Height(0),
+        hash: verified_hash(0),
+    };
+    CommittedHeaderChainView::new(
+        EngineSnapshot {
+            mode: EngineMode::Integrated,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(2 + u64::from(generation)),
+            verified_generation: VerifiedGeneration::new(3),
+            frontiers: FrontierSet {
+                finalized: frontier,
+                header_best: frontier,
+                verified_best: frontier,
+            },
+            header_best_score: ChainScore::new(SuffixWork::zero(), frontier.hash),
+            oldest_retained_height: frontier.height,
+            alarms: Default::default(),
         },
-        ..base
+        BodyWorkEpoch::new(1),
+    )
+}
+
+/// The `generation`th test authority.
+fn authority(generation: u8) -> BodyWorkAuthority {
+    BodyWorkAuthority::for_view(&authority_view(generation))
+}
+
+/// Make `scope` the authority of `state`'s committed view. The view's other
+/// fields stay out of the query policy, and the state's verified tip never
+/// diverges from its header tip.
+fn set_authority(state: &mut ReactorState, scope: Option<BodyWorkAuthority>) {
+    if state.body_work_scope() != scope {
+        state.committed_view = scope.map(|scope| {
+            let generation = (0..=u8::MAX)
+                .find(|generation| authority(*generation) == scope)
+                .expect("the tests name only the generated authorities");
+            authority_view(generation)
+        });
     }
+}
+
+/// Classify a reply under the committed authority `current`.
+fn complete_query(
+    state: &mut ReactorState,
+    query_id: NonZeroU64,
+    scope: BodyWorkAuthority,
+    body_anchor: Frontier,
+    current: Option<BodyWorkAuthority>,
+) -> NeededReply {
+    set_authority(state, current);
+    state.complete_needed_query(query_id, scope, body_anchor)
 }
 
 fn frontiers(tip: u32) -> BlockSyncFrontiers {
@@ -116,7 +161,8 @@ fn refill_answered(
         QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
         QueryOpening::NeedsWork => QueryStart::Work(facts),
     };
-    let QueryPlan::Dispatch(proposal) = state.propose_query(force, start, scope) else {
+    set_authority(state, scope);
+    let QueryPlan::Dispatch(proposal) = state.propose_query(force, start) else {
         return Refill::Held;
     };
     let query = proposal.query();
@@ -221,7 +267,13 @@ fn rejected_replacement_then_old_reply_completes_old_query() {
         now,
     );
 
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0), Some(authority(0)));
+    let reply = complete_query(
+        &mut state,
+        a.query_id,
+        a.scope,
+        anchor(0),
+        Some(authority(0)),
+    );
 
     assert_eq!(reply, NeededReply::Accept(a));
     assert_eq!(state.queries.pending(), None);
@@ -253,7 +305,13 @@ fn unrelated_stale_reply_keeps_replacement_query() {
     ));
     assert_ne!(a.query_id, b.query_id);
 
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0), Some(authority(0)));
+    let reply = complete_query(
+        &mut state,
+        a.query_id,
+        a.scope,
+        anchor(0),
+        Some(authority(0)),
+    );
     assert_eq!(reply, NeededReply::Stale);
     assert!(!state.queries.fail(a.query_id, a.scope, now));
     assert_eq!(state.queries.pending(), Some(b));
@@ -273,7 +331,13 @@ fn matching_reply_under_stale_authority_retires_query() {
         now,
     ));
 
-    let reply = state.complete_needed_query(a.query_id, a.scope, anchor(0), Some(authority(1)));
+    let reply = complete_query(
+        &mut state,
+        a.query_id,
+        a.scope,
+        anchor(0),
+        Some(authority(1)),
+    );
 
     assert_eq!(reply, NeededReply::StaleAuthority);
     assert_eq!(state.queries.pending(), None);
@@ -322,8 +386,13 @@ fn anchor_change_during_query_takes_frontier_path() {
             now,
         ));
 
-        let reply =
-            state.complete_needed_query(a.query_id, a.scope, body_anchor, Some(authority(0)));
+        let reply = complete_query(
+            &mut state,
+            a.query_id,
+            a.scope,
+            body_anchor,
+            Some(authority(0)),
+        );
 
         assert_eq!(reply, expected);
         assert_eq!(state.queries.pending(), None);
@@ -654,9 +723,13 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
         (first.from, first.limit, first.hint_revision),
         (block::Height(1), NEEDED_BLOCK_REFILL_LIMIT, Some(7))
     );
-    let NeededReply::Accept(first) =
-        state.complete_needed_query(first.query_id, first.scope, anchor(0), Some(authority(0)))
-    else {
+    let NeededReply::Accept(first) = complete_query(
+        &mut state,
+        first.query_id,
+        first.scope,
+        anchor(0),
+        Some(authority(0)),
+    ) else {
         panic!("the reply matches the pending query and its anchor");
     };
     assert!(state.queries.advance_hint_refresh(&first));
@@ -670,8 +743,13 @@ fn hint_refresh_walks_its_interval_in_query_batches() {
         now,
     ));
     assert_eq!((second.from, second.limit), (block::Height(4_001), 1_000));
-    let _ =
-        state.complete_needed_query(second.query_id, second.scope, anchor(0), Some(authority(0)));
+    let _ = complete_query(
+        &mut state,
+        second.query_id,
+        second.scope,
+        anchor(0),
+        Some(authority(0)),
+    );
     assert!(!state.queries.advance_hint_refresh(&second));
     assert_eq!(state.queries.hint_refresh(), None);
 }
@@ -1183,7 +1261,8 @@ fn run(
                     AnchorKind::OtherHash => (model.verified_tip, hash(0xCC, model.verified_tip)),
                 };
                 let query_id = NonZeroU64::new(id).expect("model query IDs start at one");
-                let actual = state.complete_needed_query(
+                let actual = complete_query(
+                    &mut state,
                     query_id,
                     authority(scope),
                     Frontier {

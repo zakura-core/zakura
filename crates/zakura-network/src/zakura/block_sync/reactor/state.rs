@@ -118,17 +118,12 @@ impl ReactorState {
     ///
     /// `work` carries the shared-owner facts that [`QueryOpening::NeedsWork`]
     /// asks for. A hint refresh needs none.
-    pub(super) fn propose_query(
-        &self,
-        force: bool,
-        start: QueryStart,
-        scope: Option<BodyWorkAuthority>,
-    ) -> QueryPlan {
+    pub(super) fn propose_query(&self, force: bool, start: QueryStart) -> QueryPlan {
         self.queries.propose(QueryRequest {
             force,
             best_header_tip: self.progress.best_header_tip,
             best_header_hash: self.progress.best_header_hash,
-            scope,
+            scope: self.body_work_scope(),
             diverged: self.verified_tip_diverged(),
             start,
         })
@@ -149,7 +144,7 @@ impl ReactorState {
     }
 
     /// Classify a needed-block reply against the pending query and the current
-    /// body-work authority `current_scope`.
+    /// body-work authority.
     ///
     /// An unrelated reply leaves the pending query in place. A matching reply
     /// always retires the pending query, even when its authority or anchor is
@@ -159,12 +154,11 @@ impl ReactorState {
         query_id: NonZeroU64,
         scope: BodyWorkAuthority,
         body_anchor: Frontier,
-        current_scope: Option<BodyWorkAuthority>,
     ) -> NeededReply {
         let Some(query) = self.queries.complete(query_id, scope) else {
             return NeededReply::Stale;
         };
-        if current_scope != Some(scope) {
+        if self.body_work_scope() != Some(scope) {
             return NeededReply::StaleAuthority;
         }
         let progress = &self.progress;

@@ -1155,13 +1155,10 @@ impl ReactorIO {
         body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        let current_scope = self.state.body_work_scope();
-        let completed_query = match self.state.complete_needed_query(
-            query_id,
-            scope,
-            body_anchor,
-            current_scope,
-        ) {
+        let completed_query = match self
+            .state
+            .complete_needed_query(query_id, scope, body_anchor)
+        {
             NeededReply::Stale => {
                 metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
                     .increment(1);
@@ -1365,10 +1362,7 @@ impl ReactorIO {
             QueryOpening::Refresh(refresh) => QueryStart::Refresh(refresh),
             QueryOpening::NeedsWork => QueryStart::Work(self.query_work_facts()),
         };
-        let proposal = match self
-            .state
-            .propose_query(force, start, self.state.body_work_scope())
-        {
+        let proposal = match self.state.propose_query(force, start) {
             QueryPlan::Idle | QueryPlan::Covered => return,
             QueryPlan::NoAuthority => {
                 tracing::error!(

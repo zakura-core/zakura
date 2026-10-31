@@ -5,9 +5,18 @@
 //! Single-stream sessions retain their existing prelude without a wire identifier.
 
 use super::*;
-use crate::zakura::transport::SessionLayout;
+use crate::zakura::{transport::SessionLayout, SessionStep};
 use zakura_node_services::task::erased;
 use zakura_rt::sync::Barrier;
+
+mod state;
+pub(super) use state::{
+    may_open_ordered_stream, ConnectionRoles, DemandChange, DemandWait, RemoteCompletion,
+    ServiceSessionState, SessionExit,
+};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state::{replay_service_session_bytes, ServiceSessionReplaySummary};
+use state::{MemberArrival, MemberReservation, PendingState};
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.
 ///
@@ -115,18 +124,15 @@ impl PreparedStream {
     }
 }
 
-/// Incomplete setup retains every arrived stream under the first arrival's deadline.
-struct PendingSession {
-    id: u64,
-    streams: Vec<PreparedStream>,
-    deadline: Instant,
-}
-
-/// At most one incomplete offer per service session on this connection.
+/// The streams of incomplete inbound service sessions, held under the
+/// decisions of their [`PendingState`].
+///
+/// Each offer's arrived members stay here, keeping their stream permits and
+/// shared reservation, until the state completes or drops the offer.
 #[derive(Default)]
 pub(super) struct PendingSessions {
-    sessions: HashMap<u16, PendingSession>,
-    retry_after: HashMap<u16, Instant>,
+    state: PendingState,
+    streams: HashMap<u16, Vec<PreparedStream>>,
 }
 
 impl PendingSessions {
@@ -138,16 +144,17 @@ impl PendingSessions {
         direction: ServicePeerDirection,
     ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
         let kind = layout.primary().kind;
-        if self
-            .retry_after
-            .get(&kind)
-            .is_some_and(|retry| *retry > Instant::now())
-        {
-            return Err(crate::zakura::SessionFull);
-        }
-        match self.sessions.get(&kind) {
-            Some(pending) => Ok(pending.streams[0].context.session_resources.clone()),
-            None => registry
+        match self.state.reservation(kind, Instant::now()) {
+            MemberReservation::Deferred => Err(crate::zakura::SessionFull),
+            MemberReservation::Share => Ok(self
+                .streams
+                .get(&kind)
+                .and_then(|arrived| arrived.first())
+                .expect("an incomplete offer retains its first member")
+                .context
+                .session_resources
+                .clone()),
+            MemberReservation::Reserve => registry
                 .service_for_kind(kind)
                 .expect("a selected session has an owning service")
                 .reserve_session(direction),
@@ -155,20 +162,24 @@ impl PendingSessions {
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
-        self.sessions.values().map(|session| session.deadline).min()
+        self.state.deadline()
     }
 
     /// Expiry releases every arrived member and briefly defers another offer.
     pub(super) fn expire(&mut self, now: Instant) {
-        self.retry_after.retain(|_, retry| *retry > now);
-        for (kind, session) in self
-            .sessions
-            .extract_if(|_, session| session.deadline <= now)
-        {
-            self.retry_after.insert(
-                kind,
-                now + session.streams[0].context.limits.prelude_timeout,
-            );
+        for (kind, wire_id) in self.state.expiring(now) {
+            let arrived = self.streams.get(&kind).and_then(|arrived| arrived.first());
+            if let Some(member) = arrived {
+                trace_session_step(
+                    &member.context.conn,
+                    &member.context.close_cause,
+                    kind,
+                    SessionStep::OfferExpired { wire_id },
+                );
+            }
+        }
+        for kind in self.state.expire(now) {
+            self.streams.remove(&kind);
         }
     }
 
@@ -180,41 +191,59 @@ impl PendingSessions {
         incoming: PreparedStream,
     ) -> Result<Option<Vec<PreparedStream>>, ZakuraHandlerError> {
         let kind = layout.primary().kind;
-        // Remove first so every invalid continuation releases the existing offer.
-        let pending = self.sessions.remove(&kind);
-        if (layout.is_multi_stream() && id == 0) || !layout.streams().contains(&incoming.stream) {
-            return Err(ZakuraHandlerError::InvalidServiceSession);
-        }
-        let mut pending = pending.unwrap_or_else(|| PendingSession {
+        trace_session_step(
+            &incoming.context.conn,
+            &incoming.context.close_cause,
+            kind,
+            SessionStep::MemberArrived {
+                wire_id: id,
+                member: incoming.stream.kind,
+            },
+        );
+        // Every outcome except `Waiting` drops the arrived members.
+        let mut arrived = self.streams.remove(&kind).unwrap_or_default();
+        let arrival = self.state.arrive(
+            layout,
             id,
-            streams: Vec::with_capacity(layout.streams().len()),
-            deadline: Instant::now() + incoming.context.limits.prelude_timeout,
-        });
-        if pending.id != id {
-            // A retry can arrive before the abandoned offer's reset. Reject both
-            // offers and back off without closing unrelated service sessions.
-            self.retry_after.insert(
-                kind,
-                Instant::now() + incoming.context.limits.prelude_timeout,
-            );
-            return Ok(None);
-        }
-        if Instant::now() >= pending.deadline
-            || pending.streams.iter().any(|s| {
-                s.stream.kind == incoming.stream.kind || !layout.streams().contains(&s.stream)
-            })
-        {
-            return Err(ZakuraHandlerError::InvalidServiceSession);
-        }
-        pending.streams.push(incoming);
-        if pending.streams.len() == layout.streams().len() {
-            pending.streams.sort_unstable_by_key(|s| s.stream.kind);
-            Ok(Some(pending.streams))
-        } else {
-            self.sessions.insert(kind, pending);
-            Ok(None)
+            incoming.stream,
+            incoming.context.limits.prelude_timeout,
+            Instant::now(),
+        )?;
+        match arrival {
+            MemberArrival::Conflict => Ok(None),
+            MemberArrival::Waiting => {
+                arrived.push(incoming);
+                self.streams.insert(kind, arrived);
+                Ok(None)
+            }
+            MemberArrival::Complete => {
+                arrived.push(incoming);
+                arrived.sort_unstable_by_key(|s| s.stream.kind);
+                Ok(Some(arrived))
+            }
         }
     }
+}
+
+/// Record one lifecycle step under the identity that names it.
+pub(super) fn trace_session_step(
+    conn: &ZakuraConnTrace,
+    close_cause: &CloseCause,
+    kind: u16,
+    step: SessionStep,
+) {
+    conn.trace_stream(step.label(), step.identity(), Some(stream_kind_label(kind)));
+    debug!(stream_kind = kind, ?step, "Zakura service session step");
+    #[cfg(any(test, zakura_sim))]
+    if let Some(tap) = close_cause.tap() {
+        tap.emit(crate::zakura::TransportEvent::SessionLifecycle {
+            conn_id: tap.conn_id(),
+            kind,
+            step,
+        });
+    }
+    #[cfg(not(any(test, zakura_sim)))]
+    let _ = close_cause;
 }
 
 /// Run all members independently and report exit only after every worker finishes.
@@ -250,6 +279,11 @@ pub(super) fn spawn_service_session(
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =
             bounded_stream_queue_depths(queue_depth, prepared.context.queue_depths);
+        prepared
+            .context
+            .resources
+            .owner
+            .advance(OwnerPhase::Installed);
         let (inbound_tx, inbound_rx) = mpsc::channel(inbound_depth);
         let (sender, outbound_rx) = worker_framed_channel(outbound_depth);
         if prepared.context.messages.is_some() {
@@ -260,10 +294,12 @@ pub(super) fn spawn_service_session(
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,
-            recv: FramedRecv::new(inbound_rx)
+            recv: FramedRecv::admitted(inbound_rx)
                 .with_failure_cause(failure_cause.clone())
                 .with_precheck(prepared.context.precheck.clone()),
-            send: sender.with_session_resources(prepared.context.session_resources.clone()),
+            send: sender
+                .with_session_resources(prepared.context.session_resources.clone())
+                .with_output_gate(prepared.context.resources.output.clone()),
         });
         let failure_cause = failure_cause.clone();
         let application_drain = application_drain.clone();
@@ -310,6 +346,7 @@ impl ZakuraProtocolHandler {
         stream: Stream,
         session_id: Option<u64>,
         stream_sem: &Arc<Semaphore>,
+        resources: &ConnectionResources,
         message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
         connection_token: CancellationToken,
@@ -323,6 +360,7 @@ impl ZakuraProtocolHandler {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("ordered stream permit"))?;
+        let stream_resources = resources.stream();
         let io = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
             .await
             .map_err(|_| ZakuraHandlerError::Timeout("open ordered service stream"))??;
@@ -377,6 +415,7 @@ impl ZakuraProtocolHandler {
             message_bucket,
             cadence,
             precheck: PrecheckSlot::default(),
+            resources: stream_resources,
             stream_token: connection_token.child_token(),
             connection_token,
             close_cause,

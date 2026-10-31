@@ -1233,15 +1233,17 @@ impl Service<Request> for Mempool {
                 Request::AwaitOutput(outpoint) => {
                     trace!(?req, "got mempool request");
 
-                    let response_fut = storage.pending_outputs.queue(outpoint);
-
-                    if let Some(output) = storage.created_output(&outpoint) {
-                        storage.pending_outputs.respond(&outpoint, output)
-                    }
+                    // A created output answers immediately, without a waiter slot.
+                    let response_fut = if let Some(output) = storage.created_output(&outpoint) {
+                        storage.pending_outputs.respond(&outpoint, output.clone());
+                        async move { Ok(Response::UnspentOutput(output)) }.boxed()
+                    } else {
+                        storage.pending_outputs.queue(outpoint).boxed()
+                    };
 
                     trace!("answered mempool request");
 
-                    response_fut.boxed()
+                    response_fut
                 }
 
                 Request::FullTransactions => {

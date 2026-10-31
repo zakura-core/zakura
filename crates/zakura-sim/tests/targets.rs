@@ -283,3 +283,44 @@ fn each_shortfall_gets_its_own_status() {
         TargetStatus::Unaccounted
     );
 }
+
+/// The suite row's variables can't change where the target writes its
+/// stats or the simulator's artifacts, or set the filter or the
+/// abandonment limit, which would let a failing seed pass.
+#[test]
+fn row_variables_dont_override_the_checks() {
+    use zakura_sim::{
+        campaign::{smoke_command, DeclaredTarget},
+        explore::{stats::STATS_VAR, ABANDON_LIMIT_VAR, EXPECT_VAR},
+        trace::ARTIFACTS_VAR,
+    };
+    let target = DeclaredTarget {
+        name: "discovery_wait_complete".to_owned(),
+        args: Vec::new(),
+        env: vec![
+            format!("{STATS_VAR}=/elsewhere"),
+            format!("{ARTIFACTS_VAR}=/elsewhere"),
+            format!("{EXPECT_VAR}=discovery/wait-complete-wakes"),
+            format!("{ABANDON_LIMIT_VAR}=1000"),
+            "ASAN_OPTIONS=detect_leaks=0".to_owned(),
+        ],
+    };
+    let dir = Path::new("/out/discovery_wait_complete");
+    let command = smoke_command(
+        Path::new("/out/fuzzer"),
+        &target,
+        &[PathBuf::from("/out/seed")],
+        dir,
+        std::time::Duration::from_secs(60),
+    );
+    let envs: std::collections::BTreeMap<_, _> = command
+        .get_envs()
+        .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+        .collect();
+    let get = |name: &str| envs.get(std::ffi::OsStr::new(name)).cloned();
+    assert_eq!(get(STATS_VAR), Some(Some(dir.join("stats").into())));
+    assert_eq!(get(ARTIFACTS_VAR), Some(Some(dir.join("sim").into())));
+    assert_eq!(get(EXPECT_VAR), Some(None));
+    assert_eq!(get(ABANDON_LIMIT_VAR), Some(None));
+    assert_eq!(get("ASAN_OPTIONS"), Some(Some("detect_leaks=0".into())));
+}

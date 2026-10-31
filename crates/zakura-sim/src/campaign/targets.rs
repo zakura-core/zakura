@@ -559,23 +559,7 @@ fn check_target(
         Err(error) => return Ok(row.with(TargetStatus::BuildFailed, error.to_string())),
     }
 
-    let mut command = Command::new(&fuzzer);
-    command
-        .arg(format!("-timeout={}", options.child.as_secs().max(1)))
-        .arg(format!(
-            "-artifact_prefix={}/",
-            dir.join("artifacts").display()
-        ))
-        .args(&target.args)
-        .args(&files)
-        .env(STATS_VAR, &stats_dir)
-        .env(ARTIFACTS_VAR, dir.join("sim"))
-        .env_remove(EXPECT_VAR)
-        .env_remove(ABANDON_LIMIT_VAR);
-    for variable in &target.env {
-        let (name, value) = variable.split_once('=').unwrap_or((variable, ""));
-        command.env(name, value);
-    }
+    let command = smoke_command(&fuzzer, target, &files, &dir, options.child);
     fs::create_dir_all(dir.join("artifacts"))
         .map_err(CampaignError::io(format!("creating {}", dir.display())))?;
     // Each seed gets libFuzzer's timeout twice, for its leak check's rerun.
@@ -593,6 +577,40 @@ fn check_target(
     row.status = status;
     row.detail = detail;
     Ok(row)
+}
+
+/// The command that runs `fuzzer`, `target`'s build, once on the seed
+/// files `files`, with libFuzzer's `-timeout` at `child`, the row's
+/// arguments and variables, and its files under `dir`.
+///
+/// The row's variables come first, so they can't change the stats
+/// directory or the simulator's artifacts, or set `ZAKURA_SIM_EXPECT` or
+/// `ZAKURA_SIM_ABANDON_LIMIT`, which would let a failing seed pass.
+pub fn smoke_command(
+    fuzzer: &Path,
+    target: &DeclaredTarget,
+    files: &[PathBuf],
+    dir: &Path,
+    child: Duration,
+) -> Command {
+    let mut command = Command::new(fuzzer);
+    for variable in &target.env {
+        let (name, value) = variable.split_once('=').unwrap_or((variable, ""));
+        command.env(name, value);
+    }
+    command
+        .arg(format!("-timeout={}", child.as_secs().max(1)))
+        .arg(format!(
+            "-artifact_prefix={}/",
+            dir.join("artifacts").display()
+        ))
+        .args(&target.args)
+        .args(files)
+        .env(STATS_VAR, dir.join("stats"))
+        .env(ARTIFACTS_VAR, dir.join("sim"))
+        .env_remove(EXPECT_VAR)
+        .env_remove(ABANDON_LIMIT_VAR);
+    command
 }
 
 impl TargetReadiness {

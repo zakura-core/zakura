@@ -29,6 +29,8 @@ use crate::zakura::{
 };
 
 mod plan;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use plan::{replay_block_fill_bytes, BlockFillReplaySummary};
 #[cfg(test)]
 mod tests;
 

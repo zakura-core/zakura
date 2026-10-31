@@ -51,6 +51,8 @@ use std::{sync::Arc, time::Duration};
 use zakura_chain::{block, serialization::ZcashSerialize};
 
 mod fill;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fill::{replay_block_fill_bytes, BlockFillReplaySummary};
 mod io;
 #[cfg(test)]
 mod requester_tests;

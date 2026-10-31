@@ -9,6 +9,7 @@ simulator step loop.
 | `block_work_ownership` | `block/work-ownership` | 1 |
 | `block_peer_registry` | `block/peer-registry` | 1 |
 | `block_retry_authority` | `block/retry-authority` | 1 |
+| `block_fill` | `block/fill-retry-run`, `block/fill-retained-funding`, `block/fill-commit-window` | 1 |
 
 Each decoder reads at most 512 bytes. Each model checks the state after every
 operation. The colocated tests retain nonzero witnesses and planted failures.
@@ -25,6 +26,10 @@ This package preserves the three drivers from PR #1679, change
 `d17393bea6a5f32633fb29b82426fd7b82b1b086`, at reviewed head
 `d4fc17f468487d03b3b554dade009bf2538be95b`. The head's later witness-message
 correction remains intact. Decoder 1 keeps the original byte interpretation.
+`block_fill` comes from PR #1677, head
+`7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and
+its funding check now runs through queue admission. The driver takes up to 30
+items, which the one-block production cap does not reach.
 The request-lifecycle target follows the B4 pure-state port. Other machine
 targets follow their owning delivery packets. Shared replay integration and
 campaign scheduling remain open. No fuzz campaign blocks PR CI.

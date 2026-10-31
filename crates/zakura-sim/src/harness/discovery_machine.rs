@@ -391,7 +391,12 @@ fn witness(
     let report = run(target, value, input, &mut evidence)
         .map_err(|error| WitnessError::HarnessEnd(error.to_string()))?;
     crate::witness::judge(&report, property, Status::Active, expect)?;
-    if expect != Expect::Applicable && !evidence.reached.complete(target) {
+    let reached = match expect {
+        Expect::Holds => evidence.reached.complete(target),
+        Expect::Violated => evidence.reached.last_step_applied_rule,
+        Expect::Applicable => true,
+    };
+    if !reached {
         return Err(WitnessError::LostTriggerHistory);
     }
     Ok(())
@@ -399,8 +404,13 @@ fn witness(
 
 /// The model's facts show that the input reached each resource-bearing rule,
 /// including when a mutation stops the real owner from applying it.
+///
+/// A passing run reaches every rule. A violation ends its history at the first
+/// failure, so a failing run needs only its last step to apply a rule. A
+/// replacement bug, for example, stops the history before any eviction.
 #[derive(Default)]
 struct Reached {
+    last_step_applied_rule: bool,
     installed: bool,
     replaced: bool,
     evicted: bool,
@@ -429,13 +439,19 @@ impl Reached {
                     }
                 }
                 self.sampled |= !book.sample.is_empty();
+                self.last_step_applied_rule =
+                    !book.expected.changes.is_empty() || !book.sample.is_empty();
             }
             MachineStep::DiscoveryState(state) => {
                 let installation = state.expected.installation.as_deref();
-                self.stale_result |= installation == Some("superseded");
-                self.current_result |=
+                let stale_result = installation == Some("superseded");
+                let current_result =
                     installation.is_some_and(|result| result.starts_with("installed:"));
-                self.retained_hint |= !state.expected.hints.is_empty();
+                let retained_hint = !state.expected.hints.is_empty();
+                self.stale_result |= stale_result;
+                self.current_result |= current_result;
+                self.retained_hint |= retained_hint;
+                self.last_step_applied_rule = stale_result || current_result || retained_hint;
             }
         }
     }

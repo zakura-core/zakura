@@ -287,7 +287,7 @@ fn admit_kept(
         }),
     );
     let (low, high) = (shifted(kept.first()?.0), shifted(kept.last()?.0));
-    let request_id = std::num::NonZeroU64::new(1).unwrap();
+    let request_id = std::num::NonZeroU64::MIN;
     let take = queue.take_request(low, high, kept.len(), u64::MAX, 1, request_id);
     let cancel = zakura_rt::sync::CancellationToken::new();
     let funded = take.admit(shifted(download_floor), cancel).ok()?;

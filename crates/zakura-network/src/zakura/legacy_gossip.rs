@@ -35,6 +35,7 @@ use zakura_node_services::task::erased;
 
 use crate::{
     constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
+    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     protocol::{
         external::{InventoryHash, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
@@ -105,8 +106,12 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 /// Queue slots do not bound variable-size payloads. A queued transaction can be as
 /// large as a protocol message, so the in-flight limit binds first for wire-maximum
 /// requests, and the queue holds many more ordinary ones.
-const LEGACY_INBOUND_RETAINED_BYTES: u32 =
-    (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u32;
+const LEGACY_INBOUND_RETAINED_BYTES: u64 =
+    // Widening usize to u64 is lossless on supported targets.
+    (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
+/// Callers that can run inbound service work at once: every request handler, and the
+/// serial gossip worker.
+pub(crate) const LEGACY_INBOUND_CALLERS: usize = LEGACY_REQUEST_IN_FLIGHT_LIMIT + 1;
 /// Inventory fetches that one request client runs at once, including retries.
 const LEGACY_CLIENT_INVENTORY_SLOTS: usize = 256;
 /// Other requests that one request client runs at once. They have a partition of
@@ -2499,40 +2504,6 @@ impl LegacyClientSlots {
     }
 }
 
-/// Decoded work that the inbound queue and its handlers may retain, in bytes.
-///
-/// A charge travels with its work item, and it ends when the item's handler ends.
-/// A refusal has the same effect as a full queue: gossip drops and a request gets a
-/// local failure. Neither faults the peer.
-#[derive(Clone, Debug)]
-struct LegacyInboundBudget {
-    bytes: Arc<Semaphore>,
-    capacity: u32,
-}
-
-impl LegacyInboundBudget {
-    fn new(capacity: u32) -> Self {
-        Self {
-            // Widening u32 to usize is lossless on supported targets.
-            bytes: Arc::new(Semaphore::new(capacity as usize)),
-            capacity,
-        }
-    }
-
-    /// Charge `bytes` now, or nothing. A larger item clamps to the whole budget, so
-    /// it can still enter an idle budget.
-    fn try_charge(&self, bytes: u64) -> Option<OwnedSemaphorePermit> {
-        let bytes = u32::try_from(bytes).map_or(self.capacity, |bytes| bytes.min(self.capacity));
-        self.bytes.clone().try_acquire_many_owned(bytes).ok()
-    }
-}
-
-/// The bytes one queued work item holds beside the queue's fixed slot.
-fn vec_retained_bytes<T>(items: &Vec<T>) -> u64 {
-    // Widening usize to u64 is lossless on supported targets.
-    items.capacity().saturating_mul(std::mem::size_of::<T>()) as u64
-}
-
 impl LegacyGossipFrame {
     /// The heap bytes this decoded frame retains while it waits for a handler.
     fn retained_bytes(&self) -> u64 {
@@ -2667,7 +2638,7 @@ impl LegacyGossipForwarder {
 #[derive(Debug)]
 pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
-    inbound_budget: LegacyInboundBudget,
+    inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
     trace: ZakuraTrace,
 }
@@ -2707,7 +2678,7 @@ impl LegacyGossipSink {
         let outbound = outbound_for_supervisor(&supervisor);
         Self {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             trace,
         }
@@ -2717,7 +2688,7 @@ impl LegacyGossipSink {
 impl LegacyGossipSink {
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
-        inbound_budget: &LegacyInboundBudget,
+        inbound_budget: &InboundBudget,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
@@ -3030,7 +3001,7 @@ struct LegacyGossipInbound {
     peer_id: ZakuraPeerId,
     frame: LegacyGossipFrame,
     /// Funds `frame` until this item's handler ends.
-    _charge: OwnedSemaphorePermit,
+    _charge: InboundCharge,
 }
 
 #[derive(Debug)]
@@ -3040,7 +3011,7 @@ struct LegacyRequestInbound {
     frame: LegacyRequestFrame,
     response_tx: oneshot::Sender<Result<Response, BoxError>>,
     /// Funds `frame` until this item's handler ends.
-    _charge: OwnedSemaphorePermit,
+    _charge: InboundCharge,
 }
 
 async fn legacy_gossip_worker<Inbound>(
@@ -3768,19 +3739,19 @@ mod tests {
     }
 
     /// A charge of no bytes, for a work item that a test builds by hand.
-    fn free_charge() -> OwnedSemaphorePermit {
-        LegacyInboundBudget::new(1)
+    fn free_charge() -> InboundCharge {
+        InboundBudget::new(1)
             .try_charge(0)
             .expect("zero bytes always fit")
     }
 
     /// A sink with a chosen inbound budget, whose queue the test drains itself.
-    fn budgeted_sink(capacity: u32) -> (LegacyGossipSink, mpsc::Receiver<LegacyInboundWork>) {
+    fn budgeted_sink(capacity: u64) -> (LegacyGossipSink, mpsc::Receiver<LegacyInboundWork>) {
         let (inbound_tx, inbound_rx) = mpsc::channel(8);
         let supervisor = ZakuraSupervisorHandle::new(8);
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(capacity),
+            inbound_budget: InboundBudget::new(capacity),
             outbound: outbound_for_supervisor(&supervisor),
             trace: ZakuraTrace::noop(),
         };
@@ -3798,11 +3769,11 @@ mod tests {
         let ids = vec![legacy_tx_id(1), legacy_tx_id(2)];
         let bytes = vec_retained_bytes(&ids);
         let frame = LegacyGossipFrame::AdvertiseTransactionIds(ids.clone()).encode_frame()?;
-        let (sink, mut queue) = budgeted_sink(u32::try_from(bytes)?);
+        let (sink, mut queue) = budgeted_sink(bytes);
 
         sink.deliver(inbound_peer(), ZAKURA_STREAM_GOSSIP, frame.clone())
             .map_err(|_| "a frame within the budget is accepted")?;
-        assert_eq!(sink.inbound_budget.bytes.available_permits(), 0);
+        assert_eq!(sink.inbound_budget.available(), 0);
 
         sink.deliver(inbound_peer(), ZAKURA_STREAM_GOSSIP, frame.clone())
             .map_err(|_| "a refusal drops the frame without faulting the peer")?;
@@ -3811,12 +3782,12 @@ mod tests {
             queue.try_recv().is_err(),
             "the refused frame was not queued"
         );
-        assert_eq!(sink.inbound_budget.bytes.available_permits(), 0);
+        assert_eq!(sink.inbound_budget.available(), 0);
 
         drop(queued);
         assert_eq!(
-            sink.inbound_budget.bytes.available_permits(),
-            usize::try_from(bytes)?,
+            sink.inbound_budget.available(),
+            bytes,
             "the charge ends with the work item"
         );
         Ok(())
@@ -3853,15 +3824,13 @@ mod tests {
                 request_id: 1,
                 frame: held,
                 response_tx,
-                _charge: LegacyInboundBudget::new(1)
-                    .try_charge(0)
-                    .expect("zero fits"),
+                _charge: InboundBudget::new(1).try_charge(0).expect("zero fits"),
             }))
             .expect("the queue has one slot");
         let supervisor = ZakuraSupervisorHandle::new(8);
         let sink = LegacyGossipSink {
             inbound_tx: full_tx,
-            inbound_budget: LegacyInboundBudget::new(1 << 20),
+            inbound_budget: InboundBudget::new(1 << 20),
             outbound: outbound_for_supervisor(&supervisor),
             trace: ZakuraTrace::noop(),
         };
@@ -3876,7 +3845,7 @@ mod tests {
             )
             .await;
         assert!(matches!(refused, Err(SinkReject::Local(_))));
-        assert_eq!(sink.inbound_budget.bytes.available_permits(), 1 << 20);
+        assert_eq!(sink.inbound_budget.available(), 1 << 20);
         Ok(())
     }
 
@@ -3934,14 +3903,14 @@ mod tests {
     /// A budget clamps an item larger than itself, so the item enters when idle.
     #[test]
     fn the_inbound_budget_clamps_one_oversized_item() {
-        let budget = LegacyInboundBudget::new(10);
+        let budget = InboundBudget::new(10);
         let held = budget
             .try_charge(u64::MAX)
             .expect("an idle budget admits it");
-        assert_eq!(budget.bytes.available_permits(), 0);
+        assert_eq!(budget.available(), 0);
         assert!(budget.try_charge(1).is_none());
         drop(held);
-        assert_eq!(budget.bytes.available_permits(), 10);
+        assert_eq!(budget.available(), 10);
     }
 
     /// Saturated inventory fetches never delay the control partition, and a waiter
@@ -4103,12 +4072,115 @@ mod tests {
         }
     }
 
+    /// C.1 and C.2: first-seen state has a fixed capacity, whatever a peer advertises.
+    #[tokio::test]
+    async fn first_seen_state_evicts_at_its_capacity() {
+        let cache = FirstSeenCache::new(2, Duration::from_secs(60));
+        let hashes: Vec<_> = (1..=3).map(block_hash).collect();
+        for hash in &hashes {
+            assert!(cache
+                .record_first_seen(&LegacyGossipFrame::AdvertiseBlock(*hash))
+                .await
+                .is_some());
+        }
+        assert_eq!(cache.inner.lock().await.entries.len(), 2);
+        assert!(
+            cache
+                .unseen(&LegacyGossipFrame::AdvertiseBlock(hashes[0]))
+                .await
+                .is_some(),
+            "the oldest entry left the cache"
+        );
+    }
+
+    /// C.2: a transaction advertisement above the protocol's inventory limit stops at
+    /// its count, before its vector exists.
+    #[test]
+    fn an_oversized_transaction_advertisement_stops_at_its_count() -> Result<(), BoxError> {
+        let count = usize::try_from(MAX_TX_INV_IN_SENT_MESSAGE)? + 1;
+        let mut payload = Vec::new();
+        CompactSizeMessage::try_from(count)?.zcash_serialize(&mut payload)?;
+        let frame = Frame {
+            message_type: MSG_ADVERTISE_TX_IDS,
+            flags: 0,
+            payload,
+        };
+        assert!(LegacyGossipFrame::decode_frame(frame).is_err());
+        Ok(())
+    }
+
+    /// C.3, C.4, and C.9 to C.11: a request refused by its inbound row becomes a local
+    /// failure on its stream. The handler ends, and its queue slot and charge return.
+    #[tokio::test]
+    async fn a_row_refusal_is_a_local_request_failure() -> Result<(), BoxError> {
+        use crate::inbound_resources::{InboundRow, InboundRowAdmission, InboundRowRefused};
+
+        let frames = [
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+                InboundRow::BlocksByHash,
+            ),
+            (
+                LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(1)]),
+                InboundRow::TransactionsById,
+            ),
+            (
+                LegacyRequestFrame::FindBlocks {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+                InboundRow::FindBlocks,
+            ),
+            (
+                LegacyRequestFrame::FindHeaders {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+                InboundRow::FindHeaders,
+            ),
+            (
+                LegacyRequestFrame::MempoolTransactionIds,
+                InboundRow::MempoolTransactionIds,
+            ),
+        ];
+        for (frame, row) in frames {
+            let inner =
+                tower::service_fn(|_request: Request| async { Ok::<_, BoxError>(Response::Nil) });
+            let inbound = InboundRowAdmission::new(inner, 0);
+            let (response_tx, response_rx) = oneshot::channel();
+            let permits = Arc::new(Semaphore::new(1));
+            let budget = InboundBudget::new(1 << 20);
+            let request = LegacyRequestInbound {
+                peer_id: inbound_peer(),
+                request_id: 1,
+                frame,
+                response_tx,
+                _charge: budget.charge_committed(10),
+            };
+            handle_legacy_request(
+                inbound,
+                request,
+                permits.clone().try_acquire_owned()?,
+                ZakuraTrace::noop(),
+            )
+            .await;
+            let refused = response_rx.await?.expect_err("the row has no slots");
+            assert_eq!(
+                refused.downcast_ref::<InboundRowRefused>(),
+                Some(&InboundRowRefused(row))
+            );
+            assert_eq!(permits.available_permits(), 1);
+            assert_eq!(budget.used(), 0);
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     enum LegacyOwnerRow {
-        /// `LegacyInboundBudget` funds it from enqueue until its handler ends.
+        /// `InboundBudget` funds it from enqueue until its handler ends.
         InboundQueue,
         /// The request worker's raw grant and execution slot fund it, and
-        /// `LegacyInboundBudget` funds its decoded copy.
+        /// `InboundBudget` funds its decoded copy.
         RequestStream,
         /// The requester's `CompatResponseGrant` funds it through decoding.
         ResponseExchange,
@@ -5977,7 +6049,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6004,7 +6076,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6028,7 +6100,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6130,7 +6202,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6186,7 +6258,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: LegacyGossipOutbound::default(),
             trace: ZakuraTrace::noop(),
         };
@@ -6232,7 +6304,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6287,7 +6359,7 @@ mod tests {
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
         };
@@ -6397,7 +6469,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let sink = LegacyGossipSink {
             inbound_tx,
-            inbound_budget: LegacyInboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
+            inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound: LegacyGossipOutbound::default(),
             trace: ZakuraTrace::noop(),
         };

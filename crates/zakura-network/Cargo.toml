@@ -136,3 +136,13 @@ required-features = ["internal-bench"]
 name = "supervised_spawn"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_work_ownership"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "block_work_allocations"
+harness = false
+required-features = ["internal-bench"]

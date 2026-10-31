@@ -30,7 +30,7 @@ use zakura_rt::{
 use super::dialer::native_discovery_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
-use super::trace::{DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
+use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
     ZakuraTrace,
@@ -555,7 +555,12 @@ fn dial_finish(
 
 fn trace_dial_phase(trace: &ZakuraTrace, attempt: DialAttemptKey, phase: DialPhase) {
     trace.emit_event(|| {
-        DiscoveryDialPhaseEvent::new(attempt.node_id.as_bytes(), attempt.sequence(), phase)
+        DiscoveryDialPhaseEvent::new(
+            attempt.node_id.as_bytes(),
+            DialOwner::Candidate,
+            attempt.sequence(),
+            phase,
+        )
     });
 }
 

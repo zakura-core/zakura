@@ -111,7 +111,7 @@ impl ReservationPool {
     }
 
     /// Entries in use across the node.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(crate) fn held(&self) -> usize {
         self.entries.reserved()
     }

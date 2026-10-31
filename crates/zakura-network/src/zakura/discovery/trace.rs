@@ -12,10 +12,30 @@ use crate::{
     BoxError,
 };
 
-/// How far one candidate dial attempt got.
+/// The dial loop that owns an attempt. Each loop numbers its attempts on its
+/// own, so a row's owner and attempt number together name the attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DialOwner {
+    /// The candidate dialer, which numbers attempts across all its peers.
+    Candidate,
+    /// One peer's redial supervisor, which numbers that peer's attempts.
+    Redial,
+}
+
+impl DialOwner {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Redial => "redial",
+        }
+    }
+}
+
+/// How far one dial attempt got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DialPhase {
-    /// The dialer recorded the attempt and reserved its IPs.
+    /// The attempt's owner recorded it. The candidate dialer has also reserved
+    /// its IPs by then.
     Recorded,
     /// The peer appeared in the registrations during the attempt.
     RegistrationSeen,
@@ -46,18 +66,20 @@ impl DialPhase {
 pub(super) struct DiscoveryDialPhaseEvent {
     event: &'static str,
     peer: Option<String>,
+    owner: &'static str,
     attempt: u64,
     phase: &'static str,
 }
 
 impl DiscoveryDialPhaseEvent {
-    pub(super) fn new(node_id: &[u8], attempt: u64, phase: DialPhase) -> Self {
+    pub(super) fn new(node_id: &[u8], owner: DialOwner, attempt: u64, phase: DialPhase) -> Self {
         let peer = ZakuraPeerId::new(node_id.to_vec())
             .map(|peer| peer_label(&peer))
             .ok();
         Self {
             event: d_trace::DISCOVERY_DIAL_PHASE,
             peer,
+            owner: owner.label(),
             attempt,
             phase: phase.label(),
         }
@@ -216,12 +238,18 @@ mod tests {
     #[test]
     fn dial_phase_schema_carries_the_attempt_identity() {
         let peer = ZakuraPeerId::new(vec![7; 32]).expect("a 32-byte id is a valid peer id");
-        let event = DiscoveryDialPhaseEvent::new(&[7; 32], 5, DialPhase::WorkerCancelled);
+        let event = DiscoveryDialPhaseEvent::new(
+            &[7; 32],
+            DialOwner::Candidate,
+            5,
+            DialPhase::WorkerCancelled,
+        );
         assert_eq!(
             serde_json::to_value(event).expect("event serializes"),
             json!({
                 "event": "discovery_dial_phase",
                 "peer": peer_label(&peer),
+                "owner": "candidate",
                 "attempt": 5,
                 "phase": "worker_cancelled",
             })

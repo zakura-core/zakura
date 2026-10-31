@@ -785,12 +785,17 @@ impl DiscoverySink {
 
     /// Handles one decoded message. An `answer` already passed its query's
     /// checks, and its import completes its part of the exchange. It settles
-    /// once this returns or the reader drops this future.
+    /// once this returns or the reader drops this future, and so does a `Hello`
+    /// that holds the session's close while it verifies.
     async fn handle_message(
         &self,
         message: DiscoveryMessage,
         answer: Option<TracedAnswer<'_>>,
     ) -> Result<(), SinkReject> {
+        // Taken before the first wait, and dropped after the Hello's progress is
+        // recorded, so a close that this releases finds the exchange complete.
+        let _hello = matches!(message, DiscoveryMessage::Hello { .. })
+            .then(|| self.queries.verifying_hello());
         if !self.handle.is_current_session(&self.key).await {
             return Ok(());
         }
@@ -3650,6 +3655,111 @@ mod tests {
                 < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
         );
         session.await?;
+        Ok(())
+    }
+
+    /// Past the initial timeout, a `Hello` in verification holds the
+    /// discovery-only close. Its settlement releases the close.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_for_a_hello_in_verification() -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(72, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let connection = io.connection_cancel.clone();
+        let hello = io.queries.verifying_hello();
+        let started = tokio::time::Instant::now();
+        let session = tokio::spawn(io.run());
+
+        tokio::time::sleep(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+        )
+        .await;
+        assert!(
+            !connection.is_cancelled(),
+            "the timeout does not drop the Hello in verification"
+        );
+
+        drop(hello);
+        tokio::time::timeout(Duration::from_millis(100), connection.cancelled())
+            .await
+            .expect("the settled Hello lets the connection close");
+        assert!(
+            started.elapsed()
+                < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
+        );
+        session.await?;
+        Ok(())
+    }
+
+    /// A `Hello` stuck behind verification cannot hold the connection open past
+    /// the answer deadline.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_close_waits_at_most_the_deadline_for_a_hello() -> Result<(), crate::BoxError>
+    {
+        let (handle, peer_id, _) = handle_with_session(74, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let connection = io.connection_cancel.clone();
+        let _hello = io.queries.verifying_hello();
+        let session = tokio::spawn(io.run());
+
+        tokio::time::timeout(
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+                + DISCOVERY_ANSWER_WRITE_DEADLINE
+                + Duration::from_secs(1),
+            connection.cancelled(),
+        )
+        .await
+        .expect("the deadline closes the connection");
+        session.await?;
+        Ok(())
+    }
+
+    /// The reader holds the settled wait from a `Hello`'s decode until its
+    /// progress is recorded, so the wait never sees a dropped `Hello`.
+    #[tokio::test]
+    async fn the_reader_holds_the_settled_wait_for_a_hello_in_verification(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, peer_secret) = handle_with_session(76, 0).await?;
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let (sink, _sent) =
+            discovery_sink_for_session(&handle, &peer_id, peer_secret.public(), 0, 1);
+        let queries = sink.queries.clone();
+        let state = sink.state.clone();
+
+        let held = handle.hold_verify_slots();
+        let (to_sink, recv) = framed_channel(4);
+        let reader_peer = peer_id.clone();
+        let reader = tokio::spawn(async move {
+            let mut pipe = discovery_pipe(reader_peer);
+            run_discovery_pipe(&mut pipe, recv, sink).await
+        });
+        to_sink
+            .send(discovery_frame(DiscoveryMessage::Hello {
+                record: signed_discovery_record(&peer_secret, &handshake)?,
+            })?)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled())
+                .await
+                .is_err(),
+            "the Hello waits for a verification slot"
+        );
+        assert!(!state.progress().hello);
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled())
+            .await
+            .expect("the Hello settles after its verification");
+        assert!(
+            state.progress().hello,
+            "the Hello counted before it settled"
+        );
+        drop(to_sink);
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await??
+            .expect("an authentic Hello rejects nothing");
         Ok(())
     }
 

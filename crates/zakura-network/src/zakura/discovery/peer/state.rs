@@ -21,9 +21,9 @@ const _: () = assert!(SEND_INTERVAL.as_secs() <= DEFAULT_LIVE_SERVICE_SUMMARY_TT
 pub(in crate::zakura::discovery) const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration =
     Duration::from_secs(2);
 /// How long closing a discovery-only connection waits for this node's admitted
-/// answers and the peer's delivered answers. Each answer is small and needs only
-/// free output or a verification slot, so a peer that reads its stream gets them
-/// well within this.
+/// answers and the peer's delivered answers and `Hello`. Each is small and needs
+/// only free output or a verification slot, so a peer that reads its stream gets
+/// them well within this.
 pub(in crate::zakura::discovery) const DISCOVERY_ANSWER_WRITE_DEADLINE: Duration =
     Duration::from_secs(2);
 
@@ -116,7 +116,7 @@ pub(super) enum PeerOutput {
     /// first.
     Refresh { interval: Duration },
     /// Wait until this session writes every answer it admitted and processes
-    /// every answer the peer delivered, the session is cancelled, or `deadline`
+    /// every answer and `Hello` it read, the session is cancelled, or `deadline`
     /// passes.
     WaitForAnswers { deadline: Duration },
     /// Mark the peer's exchange as short-lived.

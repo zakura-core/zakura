@@ -7,7 +7,6 @@
 use std::{
     any::Any,
     cmp::Reverse,
-    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::{catch_unwind, AssertUnwindSafe},
     time::Duration,
@@ -18,8 +17,7 @@ use proptest::prelude::*;
 use rand_10::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use zakura_quic::{NodeId, NodeSecretKey};
-
-use std::collections::HashSet;
+use zakura_rt::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use super::protocol::RecordVerdict;

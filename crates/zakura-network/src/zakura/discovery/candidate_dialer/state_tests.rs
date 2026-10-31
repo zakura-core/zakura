@@ -5,7 +5,6 @@
 //! checks.
 
 use std::{
-    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -13,6 +12,7 @@ use std::{
 #[cfg(test)]
 use proptest::prelude::*;
 use zakura_quic::{NodeId, NodeSecretKey};
+use zakura_rt::collections::{HashMap, HashSet};
 use zakura_rt::time::Instant;
 
 #[cfg(test)]
@@ -56,6 +56,7 @@ fn settle(
 
 // Worked scenario: an attempt's settlement releases the IPs it reserved, not
 // the ones its node advertises now.
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn panicked_attempt_releases_its_original_reservations() {
     let a = node_id(1);
@@ -105,6 +106,7 @@ async fn panicked_attempt_releases_its_original_reservations() {
 
 // Worked scenario: a duplicate completion of a settled attempt changes
 // nothing, even when a newer attempt to the same node is in flight.
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn duplicate_completion_leaves_the_next_attempt_in_flight() {
     let node = node_id(1);
@@ -144,6 +146,7 @@ async fn duplicate_completion_leaves_the_next_attempt_in_flight() {
 
 // A local limit pauses the next round for one tick without backing off the
 // candidate's IPs.
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn local_limit_pauses_without_backing_off() {
     let node = node_id(1);
@@ -166,6 +169,7 @@ async fn local_limit_pauses_without_backing_off() {
     assert!(state.begin_round(now + Duration::from_secs(1)));
 }
 
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
     let failing_node = node_id(1);
@@ -239,6 +243,7 @@ async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
 // V12 F-305587: an ALPN mismatch from one stale address used to put every
 // address of the record into the ten-minute floor. The floor now lives on
 // the node in the discovery book, and each address gets the ordinary backoff.
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
     let node = node_id(1);
@@ -266,6 +271,7 @@ async fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
 
 // V12 F-58: a record can pair one live endpoint with decoy addresses. A
 // success through the live endpoint must not reset the decoys' backoff.
+#[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn success_clears_backoff_only_for_the_admitted_ip() {
     let node = node_id(1);

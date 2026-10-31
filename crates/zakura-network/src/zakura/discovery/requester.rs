@@ -22,6 +22,10 @@
 //! [`ClaimedAnswer`] it returns keeps the query's pool entry and its kind
 //! through decode, verification, and import, so a session holds at most one
 //! answer of each kind from its query's first byte until that answer settles.
+//!
+//! A `Hello` holds no reservation and asks nothing of this ledger. The session
+//! counts one in verification beside its claimed answers, so a closing session
+//! waits for its own verdict on both.
 
 use std::sync::Arc;
 
@@ -271,11 +275,13 @@ impl QueryState {
     }
 }
 
-/// How many claimed answers of each kind one session has not settled.
+/// What one session delivered and has not settled: its claimed answers of each
+/// kind, and each `Hello` in verification.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct Settling {
     peers: usize,
     services: usize,
+    hellos: usize,
 }
 
 impl Settling {
@@ -321,6 +327,22 @@ impl Drop for SettlingAnswer {
     fn drop(&mut self) {
         self.settling
             .send_modify(|settling| *settling.of(self.kind) -= 1);
+    }
+}
+
+/// One `Hello` that a session's reader is verifying.
+///
+/// It holds a closing session's wait and nothing else: no reservation, no pool
+/// entry, and no query kind. Dropping it settles the `Hello` on every path.
+#[derive(Debug)]
+#[must_use = "dropping the hold settles the Hello"]
+pub(super) struct SettlingHello {
+    settling: Arc<watch::Sender<Settling>>,
+}
+
+impl Drop for SettlingHello {
+    fn drop(&mut self) {
+        self.settling.send_modify(|settling| settling.hellos -= 1);
     }
 }
 
@@ -499,10 +521,19 @@ impl Queries {
         }))
     }
 
-    /// Resolves once this session holds no answer that it was owed and has not
-    /// processed: nothing claimed and unsettled, and nothing the transport
+    /// Counts one `Hello` in verification until the returned hold drops.
+    pub(super) fn verifying_hello(&self) -> SettlingHello {
+        self.settling.send_modify(|settling| settling.hellos += 1);
+        SettlingHello {
+            settling: self.settling.clone(),
+        }
+    }
+
+    /// Resolves once this session holds nothing it read and has not processed:
+    /// no claimed answer, no `Hello` in verification, and no answer the transport
     /// reader queued. An unanswered query does not hold it, so a silent peer
-    /// costs no wait.
+    /// costs no wait. A `Hello` the reader has not reached holds no reservation,
+    /// so it does not hold this either.
     pub(super) async fn answers_settled(&self) {
         let mut settling = self.settling.subscribe();
         loop {
@@ -549,20 +580,26 @@ impl ResponsePrecheck for QueriesPrecheck {
 }
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use tests::{replay_discovery_query_bytes, DiscoveryQueryReplaySummary};
+pub use tests::{
+    replay_discovery_query_bytes, replay_discovery_settlement_bytes, DiscoveryQueryReplaySummary,
+    DiscoverySettlementReplaySummary,
+};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod tests {
-    use std::collections::{hash_map::Entry, HashMap, HashSet};
+    use std::collections::VecDeque;
+
+    use futures::FutureExt;
+    use zakura_rt::collections::{hash_map::Entry, HashMap, HashSet};
 
     use super::*;
-    use crate::zakura::discovery::protocol::ZakuraServiceId;
+    use crate::zakura::{
+        discovery::protocol::ZakuraServiceId, framed_channel, regulation::PrecheckSlot, CloseCause,
+    };
     #[cfg(test)]
     use crate::zakura::{
         discovery::protocol::{DiscoveryServiceSummary, ServiceSummaryEnvelope, Services},
-        framed_channel,
-        regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-        CloseCause,
+        regulation::UNFINISHED_EXCHANGE,
     };
 
     #[cfg(test)]
@@ -582,7 +619,6 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     fn get_peers(limit: u16) -> GetPeers {
         GetPeers {
             limit,
@@ -634,6 +670,7 @@ mod tests {
 
     /// A query is sent only once its previous answer arrives, and each
     /// answer claims its reservation exactly once.
+    #[cfg(test)]
     #[tokio::test]
     async fn one_get_peers_is_live_and_its_answer_claims_it_once() {
         let Session {
@@ -693,6 +730,7 @@ mod tests {
     /// A `GetServices` reservation is independent of the `GetPeers` one. Its
     /// answer claims it once, returns the query, and stays within
     /// `42 + min(n, 8) × 294` bytes.
+    #[cfg(test)]
     #[tokio::test]
     async fn get_services_is_reserved_beside_get_peers_and_claimed_once() {
         let Session {
@@ -796,6 +834,7 @@ mod tests {
     /// The transport reader queues a `Services` only while a `GetServices`
     /// is owed, and refuses one above its reservation. A live `GetPeers`
     /// lends it no credit.
+    #[cfg(test)]
     #[tokio::test]
     async fn the_transport_reader_queues_only_owed_services() {
         let slot = PrecheckSlot::default();
@@ -838,6 +877,7 @@ mod tests {
     /// The transport reader queues at most the one `Peers` this node is owed,
     /// even while a `GetServices` is owed too. Its claim releases the queued
     /// answer.
+    #[cfg(test)]
     #[tokio::test]
     async fn the_transport_reader_queues_at_most_the_owed_peers() {
         let slot = PrecheckSlot::default();
@@ -894,6 +934,7 @@ mod tests {
 
     /// A query that is never written gives its reservation and pool entry
     /// back, so the next exchange can send one.
+    #[cfg(test)]
     #[tokio::test]
     async fn an_unwritten_query_gives_its_reservation_back() {
         let pool = reservation_pool();
@@ -922,6 +963,7 @@ mod tests {
     }
 
     /// A full node-wide pool defers the query to the next exchange.
+    #[cfg(test)]
     #[tokio::test]
     async fn a_full_pool_defers_the_query() {
         let pool = ReservationPool::new(1).expect("one entry is a valid pool");
@@ -935,6 +977,7 @@ mod tests {
 
     /// Retiring the queries closes the connection only when a written query
     /// is unanswered, and returns every reservation to the pool.
+    #[cfg(test)]
     #[tokio::test]
     async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
         let pool = reservation_pool();
@@ -1016,6 +1059,7 @@ mod tests {
     /// A claim ends the query's protocol authority. The answer keeps the pool
     /// entry and its kind until it settles, so a refresh cannot stack a second
     /// answer behind one that waits for verification.
+    #[cfg(test)]
     #[tokio::test]
     async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
         let pool = reservation_pool();
@@ -1057,8 +1101,38 @@ mod tests {
             .expect("settlement frees the kind");
     }
 
+    /// A `Hello` in verification holds the settled wait, and it takes no pool
+    /// entry and blocks no query.
+    #[cfg(test)]
+    #[tokio::test]
+    async fn a_hello_in_verification_holds_only_the_settled_wait() {
+        let pool = reservation_pool();
+        let Session {
+            queries,
+            written: _written,
+            ..
+        } = session(&pool);
+
+        let hello = queries.verifying_hello();
+        assert_eq!(pool.held(), 0);
+        queries
+            .send_get_peers(get_peers(1))
+            .await
+            .expect("a Hello in verification blocks no query");
+        let waiting = queries.clone();
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
+        assert!(!settled.is_finished(), "the Hello holds the wait");
+        drop(hello);
+        zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
+            .await
+            .expect("settlement wakes the wait")
+            .unwrap();
+    }
+
     /// `answers_settled` waits for a claimed answer and ignores a query the
     /// peer has not answered.
+    #[cfg(test)]
     #[tokio::test]
     async fn answers_settled_waits_for_a_claimed_answer_only() {
         let Session {
@@ -1077,8 +1151,8 @@ mod tests {
 
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
         let waiting = queries.clone();
-        let settled = tokio::spawn(async move { waiting.answers_settled().await });
-        tokio::task::yield_now().await;
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the claimed answer holds the wait");
         drop(answer);
         zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
@@ -1089,6 +1163,7 @@ mod tests {
 
     /// A queued answer holds the wait until its claim and settlement, on the
     /// real transport precheck.
+    #[cfg(test)]
     #[tokio::test]
     async fn answers_settled_waits_for_a_frame_the_transport_queued() {
         let slot = PrecheckSlot::default();
@@ -1106,11 +1181,11 @@ mod tests {
             .expect("the transport admits the owed answer");
 
         let waiting = queries.clone();
-        let settled = tokio::spawn(async move { waiting.answers_settled().await });
-        tokio::task::yield_now().await;
+        let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the queued answer holds the wait");
         let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
-        tokio::task::yield_now().await;
+        zakura_rt::task::yield_now().await;
         assert!(!settled.is_finished(), "the claimed answer holds the wait");
         drop(answer);
         zakura_rt::time::timeout(std::time::Duration::from_secs(5), settled)
@@ -1325,6 +1400,529 @@ mod tests {
             }
         }
         summary
+    }
+
+    const SETTLEMENT: &str = "discovery/answer-settlement";
+
+    /// The most operations one decoder-v2 history runs.
+    const SETTLEMENT_MAX_OPS: usize = 512;
+
+    /// One step of a decoder-v2 settlement history.
+    #[derive(Clone, Copy, Debug)]
+    enum SettlementOp {
+        /// Send a query of `kind`, sized by `size`.
+        Query { kind: QueryKind, size: usize },
+        /// The transport writes the oldest queued query.
+        Write,
+        /// The transport admits an answer to `kind`, at its query's cap or one
+        /// byte above it.
+        Deliver { kind: QueryKind, excess: bool },
+        /// The reader takes the admitted answer to `kind` and claims its query.
+        Claim(QueryKind),
+        /// An unsettled answer of `kind` settles, in the current session or a
+        /// retired one.
+        Settle { kind: QueryKind, retired: bool },
+        /// The reader starts verifying a `Hello`.
+        HelloBegin,
+        /// The `Hello` in verification settles.
+        HelloEnd,
+        /// The session ends and a new session starts on a new connection, on
+        /// the same pool. A reader can outlive its session's retirement, so a
+        /// claimed answer stays unsettled.
+        Retire,
+    }
+
+    fn decode_settlement(data: &[u8]) -> impl Iterator<Item = SettlementOp> + '_ {
+        data.iter().take(SETTLEMENT_MAX_OPS).map(|byte| {
+            let kind = if byte & 1 == 0 {
+                QueryKind::Peers
+            } else {
+                QueryKind::Services
+            };
+            let argument = byte >> 4;
+            match (byte >> 1) % 8 {
+                0 => SettlementOp::Query {
+                    kind,
+                    size: usize::from(argument) % 4,
+                },
+                1 => SettlementOp::Write,
+                2 => SettlementOp::Deliver {
+                    kind,
+                    excess: argument & 1 == 1,
+                },
+                3 => SettlementOp::Claim(kind),
+                4 => SettlementOp::Settle {
+                    kind,
+                    retired: argument & 1 == 1,
+                },
+                5 => SettlementOp::HelloBegin,
+                6 => SettlementOp::HelloEnd,
+                _ => SettlementOp::Retire,
+            }
+        })
+    }
+
+    /// Applicable operations in a decoder-v2 settlement history.
+    #[derive(Debug, Default, Eq, PartialEq)]
+    pub struct DiscoverySettlementReplaySummary {
+        /// Operations checked against the model.
+        pub transitions: usize,
+        /// Queries sent.
+        pub sent: usize,
+        /// Queries that were not due: their kind was live or unsettled, or the
+        /// pool was full.
+        pub not_due: usize,
+        /// Queries the transport wrote.
+        pub written: usize,
+        /// Answers the transport admitted.
+        pub delivered: usize,
+        /// Answers the transport refused.
+        pub refused: usize,
+        /// Answers that claimed their query and began settling.
+        pub claimed: usize,
+        /// Admitted answers that the claim refused above their query's cap.
+        pub oversized: usize,
+        /// Answers that settled.
+        pub settled: usize,
+        /// `Hello` holds taken.
+        pub hellos: usize,
+        /// Operations that had nothing to act on.
+        pub stale: usize,
+        /// Sessions retired.
+        pub retired: usize,
+        /// Retirements that closed their connection.
+        pub closed: usize,
+    }
+
+    /// The model's view of one live query.
+    struct SettlementQuery {
+        asked: Asked,
+        written: bool,
+        /// The payload length of the answer the transport admitted.
+        delivered: Option<usize>,
+    }
+
+    /// One session under test, and the model's view of it.
+    struct SettlementSession {
+        queries: Queries,
+        /// The transport's precheck slot for this session's answers.
+        precheck: PrecheckSlot,
+        /// The peer's end of the stream that carries this session's queries.
+        written: FramedRecv,
+        connection: CancellationToken,
+        /// Keeps the answer stream's channel open.
+        _answer_stream: (FramedSend, FramedRecv),
+        live: HashMap<QueryKind, SettlementQuery>,
+        /// The kinds of the queued queries that a claim has not abandoned.
+        unwritten: VecDeque<QueryKind>,
+        answers: Vec<ClaimedAnswer>,
+        hello: Option<SettlingHello>,
+    }
+
+    impl SettlementSession {
+        fn new(pool: &ReservationPool) -> Self {
+            let precheck = PrecheckSlot::default();
+            let (answer_send, answer_recv) = framed_channel(1);
+            let answer_recv = answer_recv.with_precheck(precheck.clone());
+            let (send, written) = framed_channel(SETTLEMENT_MAX_OPS);
+            let connection = CancellationToken::new();
+            let fence = WriterFence::new(connection.clone(), CloseCause::new());
+            let queries = Queries::new(
+                pool.clone(),
+                fence,
+                &answer_recv,
+                send,
+                CancellationToken::new(),
+            );
+            Self {
+                queries,
+                precheck,
+                written,
+                connection,
+                _answer_stream: (answer_send, answer_recv),
+                live: HashMap::new(),
+                unwritten: VecDeque::new(),
+                answers: Vec::new(),
+                hello: None,
+            }
+        }
+
+        fn answers_of(&self, kind: QueryKind) -> usize {
+            self.answers
+                .iter()
+                .filter(|answer| answer.admitted().kind() == kind)
+                .count()
+        }
+
+        /// Sends the query, whose future has queue room and never waits.
+        fn send(&self, asked: Asked) -> Result<(), QueryUnsent> {
+            let sending = match asked {
+                Asked::Peers { limit } => {
+                    self.queries.send_get_peers(get_peers(limit)).left_future()
+                }
+                Asked::Services(query) => self.queries.send_get_services(query).right_future(),
+            };
+            sending
+                .now_or_never()
+                .expect("a query waits only for queue room, and the queue holds every operation")
+        }
+
+        /// The session's claimed answers, `Hello`, and queued answers hold the
+        /// close wait exactly when the model says they do.
+        fn check_close_wait(&self) {
+            let holds = !self.answers.is_empty()
+                || self.hello.is_some()
+                || self.live.values().any(|query| query.delivered.is_some());
+            assert_eq!(
+                self.queries.answers_settled().now_or_never().is_none(),
+                holds,
+                "{SETTLEMENT}: the close wait disagrees with the model"
+            );
+        }
+
+        /// The session's ledger matches the model. A session holds at most one
+        /// answer of each kind.
+        fn check_ledger(&self) {
+            let settling = *self.queries.settling.borrow();
+            assert_eq!(
+                settling,
+                Settling {
+                    peers: self.answers_of(QueryKind::Peers),
+                    services: self.answers_of(QueryKind::Services),
+                    hellos: usize::from(self.hello.is_some()),
+                },
+                "{SETTLEMENT}"
+            );
+            assert!(
+                settling.peers <= 1 && settling.services <= 1,
+                "{SETTLEMENT}: a kind stacked two answers"
+            );
+            for kind in QUERY_KINDS {
+                assert!(
+                    !(self.live.contains_key(&kind) && settling.holds(kind)),
+                    "{SETTLEMENT}: a query is live beside its kind's unsettled answer"
+                );
+            }
+            let live = self.queries.lock();
+            assert_eq!(live.state.len(), self.live.len(), "{SETTLEMENT}");
+            assert_eq!(live.reservations.len(), self.live.len(), "{SETTLEMENT}");
+        }
+    }
+
+    /// The most entries the driver's pool holds: enough for the current
+    /// session's two queries, and one unsettled answer beside them.
+    const SETTLEMENT_POOL: usize = 3;
+
+    /// The largest answer that the transport admits for a kind's row, restated
+    /// from the wire caps.
+    fn model_row_cap(kind: QueryKind) -> u64 {
+        match kind {
+            QueryKind::Peers => 2 + 32 * 648,
+            QueryKind::Services => 42 + 8 * 294,
+        }
+    }
+
+    fn answer_type(kind: QueryKind) -> u16 {
+        u16::from(match kind {
+            QueryKind::Peers => MSG_DISCOVERY_PEERS,
+            QueryKind::Services => MSG_DISCOVERY_SERVICES,
+        })
+    }
+
+    /// Replay decoder-v2 bytes against the settlement model. Each byte chooses a
+    /// kind, an operation, and a bounded argument. Read at most 512 bytes.
+    pub fn replay_discovery_settlement_bytes(data: &[u8]) -> DiscoverySettlementReplaySummary {
+        run_settlement(decode_settlement(data), |_, _| {})
+    }
+
+    fn run_settlement(
+        ops: impl IntoIterator<Item = SettlementOp>,
+        mut after_step: impl FnMut(&Queries, &ReservationPool),
+    ) -> DiscoverySettlementReplaySummary {
+        let pool = ReservationPool::new(SETTLEMENT_POOL).expect("the pool size is valid");
+        let mut session = SettlementSession::new(&pool);
+        // Retired sessions that still hold unsettled answers.
+        let mut retired: Vec<SettlementSession> = Vec::new();
+        let mut summary = DiscoverySettlementReplaySummary::default();
+
+        for op in ops {
+            summary.transitions += 1;
+            match op {
+                SettlementOp::Query { kind, size } => {
+                    let held = pool.held();
+                    let due = !session.live.contains_key(&kind)
+                        && session.answers_of(kind) == 0
+                        && held < SETTLEMENT_POOL;
+                    // A `GetPeers` limit of zero asks for nothing, so sizes
+                    // start at one.
+                    let asked = asked_for(kind, size + usize::from(kind == QueryKind::Peers));
+                    match (session.send(asked.clone()), due) {
+                        (Ok(()), true) => {
+                            summary.sent += 1;
+                            session.live.insert(
+                                kind,
+                                SettlementQuery {
+                                    asked,
+                                    written: false,
+                                    delivered: None,
+                                },
+                            );
+                            session.unwritten.push_back(kind);
+                        }
+                        (Err(QueryUnsent::NotDue), false) => summary.not_due += 1,
+                        (sent, due) => {
+                            panic!("{SETTLEMENT}: due {due} disagrees with send {sent:?}")
+                        }
+                    }
+                }
+                SettlementOp::Write => {
+                    match (session.written.try_recv(), session.unwritten.pop_front()) {
+                        (Ok(frame), Some(kind)) => {
+                            summary.written += 1;
+                            let query = session
+                                .live
+                                .get_mut(&kind)
+                                .expect("an unwritten frame's query is live");
+                            assert_eq!(
+                                frame.message_type,
+                                query.asked.request_type(),
+                                "{SETTLEMENT}"
+                            );
+                            query.written = true;
+                        }
+                        (Err(_), None) => summary.stale += 1,
+                        (frame, kind) => {
+                            panic!("{SETTLEMENT}: write {frame:?} disagrees with model {kind:?}")
+                        }
+                    }
+                }
+                SettlementOp::Deliver { kind, excess } => {
+                    let query = session.live.get(&kind);
+                    let len = query.map_or(2, |query| model_cap(&query.asked) + u64::from(excess));
+                    let checked = session
+                        .precheck
+                        .get()
+                        .expect("the session attached its precheck")
+                        .check(
+                            answer_type(kind),
+                            usize::try_from(len).expect("test caps fit usize"),
+                        );
+                    let session_query = session.live.get_mut(&kind);
+                    match (session_query, checked) {
+                        (None, Err(FrameRejection::Unsolicited)) => summary.refused += 1,
+                        (Some(_), Err(FrameRejection::AboveReservation { .. }))
+                            if len > model_row_cap(kind) =>
+                        {
+                            summary.refused += 1;
+                        }
+                        (Some(query), Err(FrameRejection::AboveOwed { .. }))
+                            if query.delivered.is_some() =>
+                        {
+                            summary.refused += 1;
+                        }
+                        (Some(query), Ok(()))
+                            if query.delivered.is_none() && len <= model_row_cap(kind) =>
+                        {
+                            summary.delivered += 1;
+                            query.delivered =
+                                Some(usize::try_from(len).expect("test caps fit usize"));
+                        }
+                        (query, checked) => panic!(
+                            "{SETTLEMENT}: live {} disagrees with admission {checked:?}",
+                            query.is_some()
+                        ),
+                    }
+                }
+                SettlementOp::Claim(kind) => {
+                    // The reader sees only the frames the transport admitted.
+                    let delivered = session.live.get(&kind).and_then(|query| query.delivered);
+                    if let Some(len) = delivered {
+                        let query = session
+                            .live
+                            .remove(&kind)
+                            .expect("the delivered answer's query is live");
+                        session.unwritten.retain(|unwritten| *unwritten != kind);
+                        let cap = model_cap(&query.asked);
+                        match session.queries.claim(answer_type(kind), len) {
+                            Ok(Some(answer)) if len as u64 <= cap => {
+                                summary.claimed += 1;
+                                assert_eq!(answer.admitted().kind(), kind, "{SETTLEMENT}");
+                                session.answers.push(answer);
+                            }
+                            Err(ClaimRefused::OverBytes { bytes })
+                                if len as u64 > cap && bytes == cap =>
+                            {
+                                summary.oversized += 1;
+                            }
+                            claimed => {
+                                panic!("{SETTLEMENT}: length {len} above cap {cap} got {claimed:?}")
+                            }
+                        }
+                    } else {
+                        summary.stale += 1;
+                    }
+                }
+                SettlementOp::Settle {
+                    kind,
+                    retired: settle_retired,
+                } => {
+                    let holder = if settle_retired {
+                        retired.iter_mut().find(|old| old.answers_of(kind) > 0)
+                    } else {
+                        Some(&mut session)
+                    };
+                    let position = holder.and_then(|holder| {
+                        holder
+                            .answers
+                            .iter()
+                            .position(|answer| answer.admitted().kind() == kind)
+                            .map(|position| (holder, position))
+                    });
+                    if let Some((holder, position)) = position {
+                        summary.settled += 1;
+                        drop(holder.answers.remove(position));
+                    } else {
+                        summary.stale += 1;
+                    }
+                    retired.retain(|old| !old.answers.is_empty());
+                }
+                SettlementOp::HelloBegin => {
+                    // The reader handles one frame at a time.
+                    if session.hello.is_none() {
+                        summary.hellos += 1;
+                        session.hello = Some(session.queries.verifying_hello());
+                    } else {
+                        summary.stale += 1;
+                    }
+                }
+                SettlementOp::HelloEnd => {
+                    if session.hello.take().is_none() {
+                        summary.stale += 1;
+                    }
+                }
+                SettlementOp::Retire => {
+                    summary.retired += 1;
+                    let closes = session.live.values().any(|query| query.written);
+                    session.queries.retire();
+                    assert_eq!(session.connection.is_cancelled(), closes, "{SETTLEMENT}");
+                    summary.closed += usize::from(closes);
+                    let mut ended = std::mem::replace(&mut session, SettlementSession::new(&pool));
+                    ended.live.clear();
+                    ended.unwritten.clear();
+                    ended.hello = None;
+                    if !ended.answers.is_empty() {
+                        retired.push(ended);
+                    }
+                }
+            }
+
+            after_step(&session.queries, &pool);
+            let unsettled: usize = std::iter::once(&session)
+                .chain(&retired)
+                .map(|held| held.answers.len())
+                .sum();
+            assert_eq!(
+                pool.held(),
+                session.live.len() + unsettled,
+                "{SETTLEMENT}: each live query and unsettled answer holds one pool entry"
+            );
+            for held in std::iter::once(&session).chain(&retired) {
+                held.check_ledger();
+                held.check_close_wait();
+            }
+        }
+
+        session.queries.retire();
+        drop(session);
+        drop(retired);
+        assert_eq!(
+            pool.held(),
+            0,
+            "{SETTLEMENT}: a settled history holds nothing"
+        );
+        summary
+    }
+
+    #[cfg(test)]
+    proptest::proptest! {
+        #[test]
+        fn settlement_bytes_match_the_model(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=SETTLEMENT_MAX_OPS)) {
+            replay_discovery_settlement_bytes(&bytes);
+        }
+    }
+
+    /// Exercises each hold: a live query and an unsettled answer each refuse
+    /// the next query of their kind, an answer outlives its retired session, a
+    /// retirement with a written unanswered query closes its connection, and the
+    /// transport and the claim each refuse an answer.
+    #[cfg(test)]
+    const SETTLEMENT_WITNESS: [u8; 21] = [
+        16, 2, 4, 16, 6, 16, 10, 14, 12, 16, 2, 14, 24, 17, 21, 7, 16, 4, 4, 10, 12,
+    ];
+
+    #[test]
+    #[allow(
+        clippy::print_stdout,
+        reason = "CI retains these applicability counters"
+    )]
+    fn settlement_witness_exercises_holds_and_retirement() {
+        let summary = replay_discovery_settlement_bytes(&SETTLEMENT_WITNESS);
+        assert_eq!(
+            summary,
+            DiscoverySettlementReplaySummary {
+                transitions: 21,
+                sent: 4,
+                not_due: 2,
+                written: 2,
+                delivered: 3,
+                refused: 1,
+                claimed: 1,
+                oversized: 1,
+                settled: 1,
+                hellos: 2,
+                stale: 1,
+                retired: 2,
+                closed: 1,
+            }
+        );
+        assert_eq!(
+            replay_discovery_settlement_bytes(&[]),
+            DiscoverySettlementReplaySummary::default()
+        );
+        println!("tier=Machine target=discovery_query decoder=2 {summary:?}");
+    }
+
+    /// The pool bounds a session's queries while answers of retired sessions
+    /// hold their entries.
+    #[test]
+    fn settlement_pool_defers_a_query_behind_retired_answers() {
+        // Three retired sessions each leave one unsettled `Peers` answer, then
+        // the full pool defers the next query until one settles.
+        let one_retired_answer = [16, 4, 6, 14];
+        let mut bytes: Vec<u8> = one_retired_answer.repeat(3);
+        bytes.extend([16, 24, 16]);
+        let summary = replay_discovery_settlement_bytes(&bytes);
+        assert_eq!(summary.not_due, 1);
+        assert_eq!(summary.settled, 1);
+        assert_eq!(summary.sent, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "discovery/answer-settlement")]
+    fn settlement_witness_rejects_a_ledger_that_counts_a_phantom_hello() {
+        run_settlement(decode_settlement(&[10]), |queries, _| {
+            queries
+                .settling
+                .send_modify(|settling| settling.hellos += 1);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "discovery/answer-settlement")]
+    fn settlement_witness_rejects_leaking_a_pool_entry() {
+        run_settlement(decode_settlement(&[16]), |_, pool| {
+            std::mem::forget(pool.try_entry());
+        });
     }
 
     #[cfg(test)]

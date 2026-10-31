@@ -207,17 +207,30 @@ connection ownership across scheduled IO.
 
 | Target | Local property ID | Applicability witness |
 | --- | --- | --- |
-| `discovery_query` | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
+| `discovery_query` (decoder 1) | `discovery/query-ownership` | `query_witness_exercises_ownership_and_caps` |
+| `discovery_query` (decoder 2) | `discovery/answer-settlement` | `settlement_witness_exercises_holds_and_retirement` |
 | `discovery_candidate` | `discovery/dial-attempts` | `candidate_witness_exercises_identity_backoff_and_local_limits` |
 
-Both decoder-v1 targets share their existing proptest models with cargo-fuzz.
-They read at most 512 bytes and report zero applicability for empty histories.
+These decoders share their existing proptest models with cargo-fuzz. They read
+at most 512 bytes and report zero applicability for empty histories.
 
 `discovery_query` decodes reservation, queue, release and claim operations.
 Its model calculates wire caps independently and checks that an answer claims
 its own reservation once. Its witness exercises refusal, unsent release, an
 exact-cap answer, an oversized answer and a stale claim. Planted failures lose
 a reservation or release a queued query.
+
+`discovery_query` replays every input under decoder 1 and then decoder 2, so
+its corpus keeps its decoder-1 meaning. Decoder 2 drives the real `Queries` of
+successive sessions on one pool: queries, writes, the transport's admission,
+claims, settlements, `Hello` holds and retirement. Its model checks that each
+claimed answer keeps its pool entry and its kind until it settles, including
+after its session retires. It also checks that the close wait resolves exactly
+when nothing delivered is unsettled, and that retirement closes the connection
+exactly when a written query is unanswered. Its witness exercises each of those
+holds. Planted failures count a settling `Hello` that does not exist or leak a
+pool entry. It does not run a reader, so it does not check that the reader takes
+the `Hello` hold.
 
 `discovery_candidate` decodes triples into dial, completion, duplicate, round
 and logical-time operations. Its model tracks canonical IP reservations and

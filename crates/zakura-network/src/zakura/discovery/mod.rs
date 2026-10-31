@@ -50,7 +50,10 @@ pub(crate) use runtime::{
 pub use service::{DiscoveryPeerSession, DiscoveryService};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
-pub use requester::{replay_discovery_query_bytes, DiscoveryQueryReplaySummary};
+pub use requester::{
+    replay_discovery_query_bytes, replay_discovery_settlement_bytes, DiscoveryQueryReplaySummary,
+    DiscoverySettlementReplaySummary,
+};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use candidate_dialer::{replay_candidate_dial_bytes, CandidateDialReplaySummary};

@@ -21,26 +21,12 @@ use zakura_sim::{
     domain::discovery::{
         is_source, wait_complete_wakes, WaitState, WAIT_COMPLETE_WAKES as PROPERTY,
     },
-    harness::{
-        discovery::{run_config, spawn, Spawned, WaitComplete},
-        run_harness, HarnessError,
-    },
+    harness::discovery::{run_config, spawn, Spawned, WaitComplete},
     property::{Assumptions, Registry, RegistryChecker, Source, Sources, Tee},
     record::DrawRecord,
     record::Record,
-    MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
+    Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
-
-/// Runs the harness under `plan`.
-fn run_wait_complete(plan: PlanInput) -> RunReport {
-    match run_harness::<WaitComplete>(&Default::default(), plan, &mut MemorySink::default(), None) {
-        Ok(report) => report,
-        Err(HarnessError::Run { failure, .. }) => {
-            panic!("the run hit a harness failure: {failure}")
-        }
-        Err(error) => panic!("{error}"),
-    }
-}
 
 /// The registry's check of [`PROPERTY`] alone, for runs outside the
 /// harness.
@@ -251,10 +237,24 @@ fn the_peer_record_enters_the_book() {
     );
 }
 
+/// The sweep covers the worker counts that change how the source and the sink
+/// interleave.
 #[test]
 fn seed_sweep_wakes() {
-    for plan in inputs(200, 64) {
-        assert_wakes(&run_wait_complete(plan));
+    for workers in [1, 2, 4] {
+        for plan in inputs(200, 64) {
+            let mut config = run_config();
+            config.scheduler.workers = workers;
+            let (report, _) = recorded(
+                config,
+                plan,
+                |sim| {
+                    spawn(sim);
+                },
+                &mut wakes_checker(),
+            );
+            assert_wakes(&report);
+        }
     }
 }
 

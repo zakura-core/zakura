@@ -1,0 +1,15 @@
+--- a/crates/zakura-network/src/zakura/discovery/candidate_dialer.rs
++++ b/crates/zakura-network/src/zakura/discovery/candidate_dialer.rs
+@@ -383,7 +383,11 @@
+     let (admitted_ip_tx, admitted_ip_rx) = oneshot::channel();
+     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
+         let endpoint = endpoint.clone();
+-        async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
++        async move {
++            spawn_erased_named("unowned_discovery_dial", async move {
++                native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await
++            }).await.expect("the planted nested task does not panic")
++        }
+     }));
+     DialWatch {
+         attempt,

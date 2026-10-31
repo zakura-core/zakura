@@ -1,13 +1,22 @@
 //! Supervised native Zakura dialing and redial policy.
+//!
+//! [`RedialState`] owns one peer's redial policy. [`RedialIO`] owns the dial
+//! attempts and the registration watch.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
 use zakura_rt::{sync::watch, time::Instant};
 
-use crate::zakura::{
-    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
-};
+use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
+
+mod state;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod state_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use state_tests::{replay_redial_bytes, RedialReplaySummary};
+
+use state::{RedialNext, RedialStart, RedialState};
 
 /// A connection that served at least this long is treated as healthy, so the
 /// next re-dial after it drops starts from the initial (fast) backoff again
@@ -95,7 +104,8 @@ enum DialResult {
     /// Failed to establish, or served only briefly (e.g. a duplicate was closed).
     Failed,
     /// The peer speaks another ALPN; wait at least
-    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`](crate::zakura::ZAKURA_ALPN_MISMATCH_BACKOFF)
+    /// before the next dial.
     AlpnMismatch,
     /// This node hit one of its own limits before sending the peer anything
     /// (`ZakuraHandlerError::is_pre_dial_limit`). Retry after the initial
@@ -133,10 +143,7 @@ pub(crate) async fn native_dial_supervised(
         Box::pin(async move {
             let started = Instant::now();
             match super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits).await {
-                Ok(()) if started.elapsed() >= ZAKURA_REDIAL_HEALTHY_CONNECTION => {
-                    DialResult::Healthy
-                }
-                Ok(()) => DialResult::Failed,
+                Ok(()) => DialResult::lasting(started.elapsed()),
                 Err(error) if error.is_alpn_mismatch() => {
                     tracing::debug!(
                         ?error,
@@ -170,134 +177,123 @@ pub(crate) async fn native_dial_supervised(
 
 /// Retry/backoff loop shared by configured bootstrap peers and the upgrade dial.
 ///
-/// Before each dial it skips a peer that is already registered (it may have
-/// dialed us first) so the two directions do not churn duplicate connections.
-/// Exits when `policy.max_attempts` consecutive attempts fail, when a
-/// `connect_once` peer connects or finishes serving, or when the supervisor's
-/// registration watch closes (node shutdown). `dial` is injected so the loop is
-/// unit-testable without real network I/O.
+/// [`RedialState`] chooses each step; see [`RedialIO::run`]. `dial` is injected
+/// so the loop is unit-testable without real network I/O.
 async fn run_dial_supervisor<F>(
     peer_id: ZakuraPeerId,
-    mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: watch::Receiver<Vec<ZakuraPeerId>>,
     policy: RedialPolicy,
-    mut dial: F,
+    dial: F,
 ) where
     F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
 {
-    let mut backoff = policy.initial_backoff;
-    let mut failures = 0usize;
+    RedialIO {
+        peer_id,
+        registered,
+        dial,
+    }
+    .run(RedialState::new(policy))
+    .await
+}
 
-    loop {
-        // Already connected (possibly an inbound dial from the same peer).
-        let already_registered = registered
-            .borrow_and_update()
-            .iter()
-            .any(|id| id == &peer_id);
+/// One supervised peer's runtime resources: its dial attempts and the
+/// supervisor's registration watch. [`RedialState`] decides what they do.
+struct RedialIO<F> {
+    peer_id: ZakuraPeerId,
+    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    dial: F,
+}
 
-        let mut attempt = if already_registered {
-            if !policy.redial_after_drop {
-                // Wait for it to deregister, then re-dial promptly.
-                zakura_rt::select! {
-                    changed = registered.changed() => {
-                        if changed.is_err() {
+impl<F> RedialIO<F>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
+{
+    /// Runs attempts until `state` stops them or the registration watch closes.
+    ///
+    /// Before each dial it skips a peer that is already registered (it may have
+    /// dialed us first) so the two directions do not churn duplicate connections.
+    /// Exits when `policy.max_attempts` consecutive attempts fail, when a
+    /// `connect_once` peer connects or finishes serving, or when the supervisor's
+    /// registration watch closes (node shutdown).
+    async fn run(mut self, mut state: RedialState) {
+        loop {
+            let mut attempt = match state.start(self.peer_is_registered()) {
+                RedialStart::Dial => (self.dial)().await,
+                RedialStart::AwaitRegisteredSettle(timeout) => {
+                    // Wait for it to deregister, then re-dial promptly.
+                    zakura_rt::select! {
+                        changed = self.registered.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            state.registration_changed();
+                            continue;
+                        }
+                        _ = zakura_rt::time::sleep(timeout) => {
                             return;
                         }
-                        backoff = policy.initial_backoff;
-                        failures = 0;
-                        continue;
                     }
-                    _ = zakura_rt::time::sleep(policy.registered_settle_timeout) => {
+                }
+                // A maintained dial owns this peer, so score the registration the
+                // same way a dial this loop drove is scored. Two things matter.
+                //
+                // Wait for *this* peer to deregister rather than for any peer-set
+                // change: on a busy node an unrelated peer connecting is not this
+                // connection ending.
+                //
+                // Then require the registration to have lasted before crediting it
+                // as healthy. A peer that shares no service beyond discovery is
+                // closed as soon as its discovery exchange completes
+                // (`discovery_exchange_complete`), and the deregistration for the
+                // connection this loop just dialed often lands after the dial
+                // future returns. Resetting the backoff on that registration made
+                // every such peer re-dial at once, forever.
+                RedialStart::ScoreRegistration => {
+                    let Some(registered_for) =
+                        wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
+                    else {
+                        return;
+                    };
+                    DialResult::lasting(registered_for)
+                }
+            };
+
+            // The connection deregistration can land after the dial future returns.
+            // Wait for the watch to catch up before applying this attempt's result,
+            // so the residual registration does not become a second attempt on the
+            // next loop iteration. A concurrent registration that remains healthy
+            // can still upgrade a failed dial to a healthy connection.
+            if state.waits_for_lagging_deregistration() && self.peer_is_registered() {
+                let Some(registered_for) =
+                    wait_for_peer_deregistration(&mut self.registered, &self.peer_id).await
+                else {
+                    return;
+                };
+                attempt = attempt.with_lagging_registration(registered_for);
+            }
+
+            match state.record(attempt) {
+                RedialNext::Stop => return,
+                RedialNext::RedialNow => {}
+                // Back off, but wake early only if the peer appears in the supervisor
+                // from another connection. Ignore unrelated peer-set changes,
+                // including the deregistration from the failed attempt we just
+                // observed.
+                RedialNext::RetryAfter(wait) => {
+                    if !sleep_unless_registered(&mut self.registered, &self.peer_id, wait).await {
                         return;
                     }
                 }
             }
-
-            // A maintained dial owns this peer, so score the registration the
-            // same way a dial this loop drove is scored. Two things matter.
-            //
-            // Wait for *this* peer to deregister rather than for any peer-set
-            // change: on a busy node an unrelated peer connecting is not this
-            // connection ending.
-            //
-            // Then require the registration to have lasted before crediting it
-            // as healthy. A peer that shares no service beyond discovery is
-            // closed as soon as its discovery exchange completes
-            // (`discovery_exchange_complete`), and the deregistration for the
-            // connection this loop just dialed often lands after the dial
-            // future returns. Resetting the backoff on that registration made
-            // every such peer re-dial at once, forever.
-            let Some(registered_for) =
-                wait_for_peer_deregistration(&mut registered, &peer_id).await
-            else {
-                return;
-            };
-            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
-                DialResult::Healthy
-            } else {
-                DialResult::Failed
-            }
-        } else {
-            dial().await
-        };
-
-        // The connection deregistration can land after the dial future returns.
-        // Wait for the watch to catch up before applying this attempt's result,
-        // so the residual registration does not become a second attempt on the
-        // next loop iteration. A concurrent registration that remains healthy
-        // can still upgrade a failed dial to a healthy connection.
-        if policy.redial_after_drop
-            && registered
-                .borrow_and_update()
-                .iter()
-                .any(|id| id == &peer_id)
-        {
-            let Some(registered_for) =
-                wait_for_peer_deregistration(&mut registered, &peer_id).await
-            else {
-                return;
-            };
-            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
-                attempt = DialResult::Healthy;
-            }
         }
+    }
 
-        match attempt {
-            DialResult::Healthy => {
-                if !policy.redial_after_drop {
-                    return;
-                }
-                backoff = policy.initial_backoff;
-                failures = 0;
-                continue;
-            }
-            DialResult::LocalLimit => {
-                if !sleep_unless_registered(&mut registered, &peer_id, policy.initial_backoff).await
-                {
-                    return;
-                }
-                continue;
-            }
-            DialResult::Failed | DialResult::AlpnMismatch => {}
-        }
-
-        failures += 1;
-        if policy.max_attempts.is_some_and(|max| failures >= max) {
-            return;
-        }
-
-        // Back off, but wake early only if the peer appears in the supervisor
-        // from another connection. Ignore unrelated peer-set changes,
-        // including the deregistration from the failed attempt we just
-        // observed.
-        let wait = if attempt == DialResult::AlpnMismatch {
-            backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
-        } else {
-            backoff
-        };
-        if !sleep_unless_registered(&mut registered, &peer_id, wait).await {
-            return;
-        }
-        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+    /// Whether the peer is registered now, marking the watch seen.
+    fn peer_is_registered(&mut self) -> bool {
+        self.registered
+            .borrow_and_update()
+            .iter()
+            .any(|id| id == &self.peer_id)
     }
 }
 
@@ -350,6 +346,7 @@ async fn wait_for_peer_deregistration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zakura::ZAKURA_ALPN_MISMATCH_BACKOFF;
 
     fn redial_test_peer_id() -> ZakuraPeerId {
         ZakuraPeerId::new(vec![9u8; 32]).expect("32-byte node id is valid")

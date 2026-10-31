@@ -1,0 +1,11 @@
+--- a/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/publisher/state.rs
+@@ -579,7 +579,7 @@
+                 subscription: id,
+                 seen: job.selected.clone(),
+             });
+-            return Some(job);
++            return None;
+         }
+         None
+     }

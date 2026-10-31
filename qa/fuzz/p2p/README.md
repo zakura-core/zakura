@@ -118,7 +118,6 @@ refills, query refusal, retry expiry, and authority changes. Decoder 2 of
 committed corpus uses decoder 1. Both decide pure
 transitions. Runtime witnesses cover the action channel and storage waits.
 
-
 `block_fill` comes from PR #1677, head
 `7aef27b246dcf8f0d3625d598553d2a827411ea0`. Decoder 1 keeps that byte layout, and
 its funding check now runs through queue admission. The driver takes up to 30

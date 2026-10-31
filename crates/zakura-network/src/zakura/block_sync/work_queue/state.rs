@@ -462,16 +462,19 @@ impl WorkQueueState {
 
     /// Publish a claim that [`Self::is_unpublished_claim`] accepted: its funded
     /// estimate transfers into the ledger. Returns the transferred bytes.
+    /// A missing item returns `None` after accounting for the transferred prefix;
+    /// the runtime must close admission and retain any unmatched funding.
     pub(in crate::zakura::block_sync) fn publish_claim(
         &mut self,
         items: &[(block::Height, WorkItem)],
-    ) -> u64 {
+    ) -> Option<u64> {
         let mut transferred = 0u64;
+        let mut complete = true;
         for (height, _) in items {
-            let item = self
-                .in_flight
-                .get_mut(height)
-                .expect("every provisional item was checked under the caller's lock");
+            let Some(item) = self.in_flight.get_mut(height) else {
+                complete = false;
+                break;
+            };
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
             let charge = item.estimated_bytes;
@@ -479,7 +482,7 @@ impl WorkQueueState {
             transferred = transferred.saturating_add(charge);
         }
         self.reserved_bytes = self.reserved_bytes.saturating_add(transferred);
-        transferred
+        complete.then_some(transferred)
     }
 
     /// Whether `owner` still holds a reservation on every height of its claim.

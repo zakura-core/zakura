@@ -346,7 +346,7 @@ impl UnpublishedRequest {
                 return None;
             }
             let transferred = inner.state.publish_claim(&claim.items);
-            if transferred != funded_bytes {
+            if transferred != Some(funded_bytes) {
                 claim.work.budget.close(BudgetClosure::Funding {
                     logical: inner.state.reserved_bytes(),
                     funded: inner.funding.bytes(),

@@ -159,6 +159,8 @@ pub(crate) enum ReservationError {
 /// The local accounting failure that permanently closes a budget generation.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(crate) enum BudgetClosure {
+    #[error("queue transition poisoned the accounting lock")]
+    QueuePoisoned,
     #[error("ownership transfer crossed budgets")]
     WrongBudget,
     #[error("{operation} cannot transfer {amount} bytes from {owned} owned bytes")]

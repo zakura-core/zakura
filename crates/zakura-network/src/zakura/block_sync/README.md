@@ -101,6 +101,11 @@ reopen the budget or erase unmatched funding.
 
 The first closure emits an error with its cause, current charge, and budget limit.
 A funding audit also includes the logical and funded totals in that cause.
+A lock acquisition that finds a poisoned queue closes the same budget generation.
+Cleanup recovers the guard so request owners can settle during unwind. The queue
+notifies closure waiters after unlocking. Retained receipts and unrelated
+reservations remain charged until their own owners finish.
+
 The sequencer publishes `accounting_closed` in its view and block-state trace.
 Fill passes report `accounting_closed` separately from capacity exhaustion.
 Typed admission refusals also distinguish cancellation and stale claims.

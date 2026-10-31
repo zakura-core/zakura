@@ -1413,7 +1413,7 @@ fn accounting_closure_wakes_after_the_queue_unlocks() {
         }
     }
 
-    for operation in 0..5 {
+    for operation in 0..6 {
         let mut f = Fixture::new();
         let reader = f.budget.closure_reader();
         let mut closed = Box::pin(reader.closed());
@@ -1473,6 +1473,14 @@ fn accounting_closure_wakes_after_the_queue_unlocks() {
                     panic!("interrupted accounting failure");
                 }));
                 assert!(result.is_err());
+            }
+            5 => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _inner = f.work.lock();
+                    panic!("interrupt the queue before accounting closure");
+                }));
+                assert!(result.is_err());
+                assert!(!f.work.audit_funding(), "poison closes admission");
             }
             _ => unreachable!(),
         }
@@ -1714,4 +1722,117 @@ impl WorkQueue {
     ) -> crate::zakura::transport::ByteReservation {
         self.lock().funding.split(bytes).unwrap()
     }
+}
+
+/// Exercise destructor unwinding in a child so a regression cannot abort the test runner.
+#[test]
+fn poisoned_queue_owner_unwind_does_not_abort() {
+    const CHILD: &str = "ZAKURA_POISONED_QUEUE_OWNER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = format!(
+            "{}::poisoned_queue_owner_unwind_does_not_abort",
+            module_path!().strip_prefix("zakura_network::").unwrap()
+        );
+        for phase in ["taken", "admitted", "queued", "started"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, phase)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "owner {phase} aborted or failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        return;
+    }
+
+    fn unwind_owner<T>(owner: T, work: &WorkQueue) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = owner;
+            let _inner = work.lock();
+            panic!("interrupt a queue transition while retaining its request owner");
+        }));
+        assert!(result.is_err());
+    }
+
+    let phase = std::env::var(CHILD).unwrap();
+    let mut f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let original = f.take(1).publish(|_| {}).unwrap();
+    assert!(original.try_start());
+    original.written();
+    let receipt = f
+        .work
+        .begin_receipt_for_owner(original.owner(), block::Height(1))
+        .unwrap()
+        .unwrap();
+    f.reset();
+    drop(original);
+    assert_eq!(f.budget.reserved(), 117, "retained receipt survives reset");
+    f.refill();
+    let taken = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(2).unwrap(),
+    );
+    if phase == "taken" {
+        unwind_owner(taken, &f.work);
+    } else {
+        let admitted = taken.admit(block::Height(0), f.cancel.clone()).unwrap();
+        assert_eq!(f.budget.reserved(), 317);
+        if phase == "admitted" {
+            unwind_owner(admitted, &f.work);
+        } else {
+            let request = admitted.publish(|_| {}).unwrap();
+            if phase == "started" {
+                assert!(request.try_start());
+            }
+            unwind_owner(request, &f.work);
+        }
+    }
+    assert!(
+        f.work.inner.is_poisoned(),
+        "the interrupted lock remains poisoned"
+    );
+    assert!(
+        f.budget.is_closed(),
+        "poison must close admission during owner cleanup"
+    );
+    assert_eq!(f.budget.available(), 0);
+    assert_eq!(
+        f.budget.reserved(),
+        117,
+        "cleanup preserves unrelated and old receipt funding"
+    );
+    assert_eq!(f.work.reserved_bytes(), 0);
+    assert!(f.work.lock().request_writes.is_empty());
+    let replacement = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(3).unwrap(),
+    );
+    assert!(matches!(
+        replacement.admit(block::Height(0), CancellationToken::new()),
+        Err(AdmitRefusal::AccountingClosed)
+    ));
+    f.reset();
+    assert!(
+        !f.work.audit_funding(),
+        "reset never reopens a poisoned generation"
+    );
+    assert_eq!(f.budget.reserved(), 117);
+    drop(receipt);
+    assert_eq!(f.budget.reserved(), 17);
+    drop(unrelated);
+    assert_eq!(f.budget.reserved(), 0);
 }

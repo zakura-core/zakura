@@ -87,7 +87,9 @@ fn publish(state: &mut WorkQueueState, items: &[(block::Height, WorkItem)]) -> u
         .owner
         .unwrap_or_else(|| panic!("{PROPERTY}: a request take binds an owner"));
     assert!(state.is_unpublished_claim(owner, items));
-    state.publish_claim(items)
+    state
+        .publish_claim(items)
+        .expect("validated claim publishes")
 }
 
 #[cfg(test)]
@@ -698,7 +700,11 @@ fn apply(state: &mut WorkQueueState, model: &mut Model, claims: &mut Vec<Claim>,
             );
             if current {
                 let expected = model.publish(claim.owner, &claim.raw_heights);
-                assert_eq!(state.publish_claim(&claim.items), expected, "{PROPERTY}");
+                assert_eq!(
+                    state.publish_claim(&claim.items),
+                    Some(expected),
+                    "{PROPERTY}"
+                );
             }
             assert_eq!(
                 state.is_published_claim(claim.owner, heights_of(&claim.items)),
@@ -1249,3 +1255,16 @@ pub use funding::{
     trace_work_funding_bytes, FundingReceiptView, FundingRequestPhase, FundingRequestView,
     WorkFundingHistory, WorkFundingStep, WorkFundingView,
 };
+
+#[cfg(test)]
+#[test]
+fn missing_publish_item_preserves_transferred_charge() {
+    let mut state = new_state();
+    extend(&mut state, authority(0), &[(1, 100), (2, 200)]);
+    let items = take(&mut state, 1, 2, 1, 1);
+    state.in_flight.remove(&height(2));
+    assert_eq!(state.publish_claim(&items), None);
+    assert_eq!(state.reserved_bytes(), 100);
+    assert_eq!(state.reserved_bytes_scanned(), 100);
+    assert_eq!(state.reserved_above(height(0)), (100, 1));
+}

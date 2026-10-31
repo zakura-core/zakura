@@ -300,10 +300,12 @@ impl WorkQueue {
     }
 
     fn lock(&self) -> WorkQueueGuard<'_> {
-        let inner = self
-            .inner
-            .lock()
-            .expect("work queue mutex is never poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // Cleanup can acquire this lock during unwind. Keep the interrupted
+            // ledger and its funding, but prevent further admission/publication.
+            self.budget.close(BudgetClosure::QueuePoisoned);
+            poisoned.into_inner()
+        });
         let reserved_bytes = inner.state.reserved_bytes();
         WorkQueueGuard {
             inner,

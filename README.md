@@ -111,9 +111,13 @@ Alternatively, you can install it from GitHub:
 cargo install --git https://github.com/zakura-core/zakura --tag v1.7.0 zakura
 ```
 
-Native x86-64 builds automatically use Pasta field assembly when the build
-CPU supports BMI2 and ADX. This selection happens at build time, so a local
-binary may not run on an older CPU. To build a binary for redistribution, use:
+x86-64 builds use Pasta field assembly when the Rust target features include
+BMI2 and ADX, for example with `-C target-cpu=native` on a CPU that has them, or
+when built with `--features x86_64-asm`. A default build for the generic
+`x86_64-unknown-linux-gnu` target has neither, so it uses portable arithmetic
+even on a CPU that supports BMI2 and ADX. This selection happens at build time,
+so a binary built with assembly will not run on an older CPU. To build a binary
+for redistribution, use:
 
 ```sh
 cargo build --locked --release --package zakura --features portable

@@ -17,6 +17,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -34,6 +35,10 @@ BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
 BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
 DEFAULT_BUILD_CACHE_RETAIN = 12
 DATA_MOUNT = Path("/mnt/data")
+# zakurad feature that forces Pasta's x86-64 assembly field arithmetic, and the
+# CPU flags that assembly needs on the host that runs the binary.
+PASTA_ASM_FEATURE = "x86_64-asm"
+PASTA_ASM_CPU_FLAGS = ("adx", "bmi2")
 NETWORK_SYSCTL_CONF = SCRIPT_DIR.parent / "sysctl" / "60-zakura-network.conf"
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
@@ -91,6 +96,10 @@ DEFAULTS = {
     # Extra cargo features for this node's zakurad build, e.g. ["internal-miner"].
     # Each distinct (commit, features) pair is built and cached separately.
     "build_features": [],
+    # Build with Pasta's x86-64 assembly (BMI2+ADX) when the build host is
+    # x86-64 and the commit's zakurad has the feature. Deploys then refuse hosts
+    # whose CPU lacks those flags; set false for such a host.
+    "pasta_asm": True,
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -160,6 +169,7 @@ class Node:
     container_name: str
     release_state_publisher: bool = False
     port: object = None
+    pasta_asm: bool = True
     # resolved at runtime
     sha: str = ""
 
@@ -262,6 +272,8 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
                            for f in build_features)):
             raise DeployError(f"{name}: build_features must be a list of cargo feature names")
         build_features = sorted(set(build_features))
+        if not isinstance(merged["pasta_asm"], bool):
+            raise DeployError(f"{name}: pasta_asm must be a boolean")
         if not isinstance(merged["internal_miner"], bool):
             raise DeployError(f"{name}: internal_miner must be a boolean")
         if merged["internal_miner"] and (not merged["miner_address"]
@@ -314,6 +326,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             container_name=merged["container_name"],
             release_state_publisher=publisher,
             port=merged["port"],
+            pasta_asm=merged["pasta_asm"],
         ))
 
     if only:
@@ -482,15 +495,65 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
     return target
 
 
+def commit_has_zakurad_feature(root: Path, sha: str, feature: str) -> bool:
+    """Whether the zakurad manifest at `sha` declares `feature`; older commits may not."""
+    result = run(["git", "show", f"{sha}:crates/zakurad/Cargo.toml"],
+                 cwd=root, capture=True, check=False)
+    if result.returncode != 0:
+        return False
+    return feature in tomllib.loads(result.stdout).get("features", {})
+
+
+def build_host_is_x86_64() -> bool:
+    return platform.machine().lower() in ("x86_64", "amd64")
+
+
+def add_pasta_asm_feature(root: Path, node: Node) -> None:
+    """Add the Pasta assembly feature to a resolved node's build when it can apply.
+
+    The feature only changes x86-64 builds, so other build hosts keep the
+    portable arithmetic and their nodes skip the CPU check.
+    """
+    if not node.pasta_asm or PASTA_ASM_FEATURE in node.build_features or not build_host_is_x86_64():
+        return
+    if not commit_has_zakurad_feature(root, node.sha, PASTA_ASM_FEATURE):
+        print(f"[build] {node.name}: {node.sha[:9]} predates zakurad's {PASTA_ASM_FEATURE} "
+              f"feature; building portable Pasta arithmetic")
+        return
+    node.build_features = sorted([*node.build_features, PASTA_ASM_FEATURE])
+
+
+def require_pasta_asm_cpu(node: Node) -> None:
+    """Refuse to install a Pasta assembly binary on a host whose CPU cannot run it."""
+    flags = " ".join(PASTA_ASM_CPU_FLAGS)
+    script = (
+        '[ "$(uname -m)" = x86_64 ] || exit 3\n'
+        f"for flag in {flags}; do\n"
+        '  grep -m1 "^flags" /proc/cpuinfo | grep -qw "$flag" || exit 4\n'
+        "done\n"
+    )
+    proc = ssh_capture_script(node, script)
+    if proc.returncode in (3, 4):
+        raise DeployError(
+            f"host CPU lacks x86-64 {'/'.join(PASTA_ASM_CPU_FLAGS)} required by the "
+            f"{PASTA_ASM_FEATURE} build; set pasta_asm = false for this node"
+        )
+    if proc.returncode != 0:
+        raise DeployError(f"CPU feature check failed (rc={proc.returncode})")
+
+
 def build_nodes(nodes: list[Node], *, force: bool = False) -> dict[str, Path]:
     """Resolve + build every distinct commit and feature set once.
 
-    Returns build_key(sha, features) -> binary path; a featureless build's key is its sha.
+    Adds the Pasta assembly feature to each node's build_features first, so the
+    feature is part of the cache key. Returns build_key(sha, features) -> binary
+    path; a featureless build's key is its sha.
     """
     root = repo_root()
     builds: dict[str, Path] = {}
     for node in nodes:
         node.sha = resolve_sha(root, node.commit)
+        add_pasta_asm_feature(root, node)
     for node in nodes:
         key = build_key(node.sha, node.build_features)
         if key not in builds:
@@ -1155,6 +1218,8 @@ def cmd_deploy(args) -> int:
     def work(node: Node) -> tuple[str, bool, str]:
         binary = by_sha[build_key(node.sha, node.build_features)]
         try:
+            if PASTA_ASM_FEATURE in node.build_features:
+                require_pasta_asm_cpu(node)
             if node.release_state_publisher:
                 deploy_publisher(node, binary, exporters[node.sha])
                 return (node.name, True, f"deployed node and exporter {node.sha[:9]}, publication verified")

@@ -138,7 +138,8 @@ async fn getblocks_storage_read_probe() {
                 tip.0.saturating_sub(200_000).max(retained.0),
             ));
             let cpu_start = cpu_seconds();
-            let deadline = Instant::now() + Duration::from_secs(seconds);
+            let began_case = Instant::now();
+            let deadline = began_case + Duration::from_secs(seconds);
             let control = control_reads.then(|| {
                 let state = state.clone();
                 tokio::spawn(async move {
@@ -236,6 +237,7 @@ async fn getblocks_storage_read_probe() {
             };
             assert!(!control_reads || !control_latencies.is_empty());
             control_latencies.sort_unstable();
+            let elapsed_seconds = began_case.elapsed().as_secs_f64();
             let cpu = cpu_seconds().zip(cpu_start).map(|(end, start)| end - start);
             total.latencies_us.sort_unstable();
             total.encode_us.sort_unstable();
@@ -247,10 +249,11 @@ async fn getblocks_storage_read_probe() {
             };
             let percentile = |p: usize| at(&total.latencies_us, p);
             // Float conversions are lossy only far beyond these counts.
-            let per_second = |value: u64| value as f64 / seconds as f64;
+            let per_second = |value: u64| value as f64 / elapsed_seconds;
             eprintln!(
                 "storage_probe shape={shape} count={count} concurrency={concurrency} \
-                 cold_cache={drop_caches} encode={encode} reads_per_s={:.0} blocks_per_s={:.0} \
+                 cold_cache={drop_caches} encode={encode} elapsed_s={elapsed_seconds:.6} \
+                 reads_per_s={:.0} blocks_per_s={:.0} \
                  mb_per_s={:.2} p50_us={} p99_us={} max_us={} encode_p50_us={} encode_p99_us={} \
                  control_reads={} control_p99_us={} control_max_us={} \
                  cpu_s={cpu:?} rss_kib={:?}",
